@@ -30,6 +30,21 @@ class ChatBase(ABC):
         pass
 
     @abstractmethod
+    def structure_message(self, messages: list):
+        '''
+        Structure the message for the api with prompt and history messages
+        '''
+        pass
+
+    @abstractmethod
+    def set_system_prompt(self, prompt: str):
+        '''
+        Set the system prompt
+        '''
+        pass
+
+
+    @abstractmethod
     def extract_code(self, response: str):
         '''
         Extract the code from the response
