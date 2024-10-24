@@ -1,62 +1,56 @@
 import os
-import openai
+from groq import Groq
 from model.ChatBase import ChatBase
 import logging
 import random
 from datetime import datetime
 import time
 
-# save logging information to specified file
-
+# Save logging information to specified file
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-#check if the log folder exists
+# Check if the log folder exists
 if not os.path.exists('log'):
     os.makedirs('log')
-current_time = datetime.now().strftime("%Y%m%d-%H%M%S")
-file_handler = logging.FileHandler(f'./log/openai-{current_time}.log')
+
+current_time = datetime.now().strftime("%Y%m%d%H%M%S")
+file_handler = logging.FileHandler(f'./log/groq-{current_time}.log')
 file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 
 logger.addHandler(file_handler)
 
-class OpenAiChat(ChatBase):
+class GroqChat(ChatBase):
     '''
-    The openai chatting class
+    The Groq chatting class
     '''
-    def __init__(self, api_key: str = os.getenv("OPENAI_API_MY_SETUP"), system_prompt: str = "You are a helpful assistant.", max_chat_history: int = 10, max_retry = 10, base_delay: int = 1, temperature: float = 0, max_tokens: int = 400, top_p: int = 1, frequency_penalty=0, presence_penalty=0) -> None:
+    def __init__(self, api_key: str = os.getenv("GROQ_API_MY_GENERAL"), system_prompt: str = "You are a helpful assistant.", max_chat_history: int = 10, max_retry: int = 10, base_delay: int = 1) -> None:
         '''
-        Initialize the openai api client
+        Initialize the Groq chat
         '''
-        self.client = openai.OpenAI(api_key=api_key)
+        self.client = Groq(api_key=api_key)
         self.max_chat_history = max_chat_history
         self.max_retry = max_retry
         self.base_delay = base_delay
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.top_p = top_p
-        self.frequency_penalty = frequency_penalty
-        self.presence_penalty = presence_penalty
         self.messages_queue = []
         self.system_prompt = system_prompt
 
-
     def retry_with_exponential_backoff(self, func, *args, retries=0, **kwargs):
         '''
-        处理 OpenAI 异常并使用指数退避策略重试请求
+        Handle Groq exceptions and retry the request with exponential backoff
         '''
         try:
             return func(*args, **kwargs)
-        except openai.APIError as e:
+        except Exception as e:
             retries += 1
             if retries > self.max_retry:
-                logger.error(f"reach max retry {self.max_retry}, last error: {e}")
+                logger.error(f"Reached max retry {self.max_retry}, last error: {e}")
                 raise
 
             delay = (2 ** retries + random.random()) * self.base_delay
-            logger.error(f"OpenAI API exception: {e}")
+            logger.error(f"Groq API exception: {e}")
             logger.info(f"Now is the {retries} times retry, wait for {delay:.2f} sec...")
             time.sleep(delay)
             
@@ -64,25 +58,18 @@ class OpenAiChat(ChatBase):
 
     def get_response(self, message: list, model: str):
         '''
-        Get the response from the openai api
+        Get the response from the Groq API
         '''
         self.structure_message(message)
         try:
             response = self.retry_with_exponential_backoff(
-                self.client.chat.completions.create, 
-                model=model, 
-                messages=self.messages_queue, 
-                temperature=self.temperature, 
-                max_tokens=self.max_tokens, 
-                top_p=self.top_p, 
-                frequency_penalty=self.frequency_penalty, 
-                presence_penalty=self.presence_penalty    
+                self.client.chat.completions.create,
+                model=model,
+                messages=self.messages_queue
             )
-            return response.choices[0].message
-        except openai.APIError as e:
-            logger.error(f"OpenAI API error occurred: {e}")
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error(f"Error occurred while getting OpenAI API response: {e}")
+            logger.error(f"Error occurred while getting Groq API response: {e}")
             raise
 
     def structure_message(self, message):
@@ -109,21 +96,19 @@ class OpenAiChat(ChatBase):
             self.messages_queue.insert(0, {"role": "system", "content": self.system_prompt})
 
         return self.messages_queue
-        
 
     def set_system_prompt(self, prompt: str):
         '''
         Set the system prompt
         '''
         self.system_prompt = prompt
-        # check if the system prompt is already in the messages queue
+        # Check if the system prompt is already in the messages queue
         if not any(message["role"] == "system" and message["content"] == prompt for message in self.messages_queue):
-            self.messages_queue.append({"role": "system", "content": prompt})
+            self.messages_queue.insert(0, {"role": "system", "content": prompt})
         else:
             logger.info("System prompt already in the messages queue")
-            # chage the system prompt in the messages queue
-            self.messages_queue[0]["content"] = prompt          
-
+            # Change the system prompt in the messages queue
+            self.messages_queue[0]["content"] = prompt
 
     def extract_code(self, response: str):
         '''
@@ -137,9 +122,3 @@ class OpenAiChat(ChatBase):
         Evaluate the response and code
         '''
         return response
-    
-
-# Example usage
-if __name__ == "__main__":
-    chat = OpenAiChat()
-    response = chat.get_response(["please write a bash code to create the new docker container with the name 'my_container' and the image 'my_image', you don't need to explain it."], model="gpt-4o-mini")
