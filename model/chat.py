@@ -2,6 +2,7 @@
 from model.openai.OpenAiChat import OpenAiChat
 from model.ollama.OllamaChat import OllamaChat
 from model.groq.GroqChat import GroqChat
+from model.claude.ClaudeChat import ClaudeChat
 
 
 class Chat():
@@ -17,6 +18,8 @@ class Chat():
             self.chat = OllamaChat()
         if service_provider == "groq":
             self.chat = GroqChat()
+        if service_provider == "claude":
+            self.chat = ClaudeChat()
         
     def get_response(self, message: list, model: str):
         '''
