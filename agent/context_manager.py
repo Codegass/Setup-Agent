@@ -164,13 +164,35 @@ class BranchContext(BaseContext):
 class ContextManager:
     """Manages the context switching and persistence."""
     
-    def __init__(self, workspace_path: str = "/workspace"):
+    def __init__(self, workspace_path: str = "/workspace", orchestrator=None):
         self.workspace_path = Path(workspace_path)
         self.contexts_dir = self.workspace_path / ".setup_agent" / "contexts"
-        self.contexts_dir.mkdir(parents=True, exist_ok=True)
+        self.orchestrator = orchestrator
+        
+        # Initialize contexts directory using orchestrator if available
+        if self.orchestrator:
+            self._ensure_contexts_dir_in_container()
+        else:
+            # Fallback to local directory creation (for testing or non-container usage)
+            self.contexts_dir.mkdir(parents=True, exist_ok=True)
         
         self.current_context: Optional[BaseContext] = None
         self.trunk_context: Optional[TrunkContext] = None
+    
+    def _ensure_contexts_dir_in_container(self):
+        """Ensure the contexts directory exists in the container."""
+        if not self.orchestrator:
+            return
+        
+        # Create the contexts directory in the container
+        contexts_path = str(self.contexts_dir)
+        result = self.orchestrator.execute_command(f"mkdir -p {contexts_path}")
+        
+        if result.get('success', False):
+            logger.info(f"Created contexts directory in container: {contexts_path}")
+        else:
+            logger.error(f"Failed to create contexts directory: {result.get('output', '')}")
+            raise RuntimeError(f"Cannot create contexts directory in container: {contexts_path}")
         
     def create_trunk_context(self, goal: str, project_url: str, project_name: str) -> TrunkContext:
         """Create the main trunk context."""
@@ -262,25 +284,60 @@ class ContextManager:
     
     def _find_existing_trunk_context(self, project_name: str) -> Optional[TrunkContext]:
         """Find existing trunk context for a project."""
-        for context_file in self.contexts_dir.glob("trunk_*.json"):
-            try:
-                with open(context_file, 'r') as f:
-                    data = json.load(f)
-                    if data.get('project_name') == project_name:
-                        return TrunkContext(**data)
-            except Exception as e:
-                logger.warning(f"Failed to load context file {context_file}: {e}")
+        if self.orchestrator:
+            # Search in container
+            result = self.orchestrator.execute_command(
+                f"find {self.contexts_dir} -name 'trunk_*.json' -type f 2>/dev/null || true"
+            )
+            if result.get('success', False) and result.get('output', '').strip():
+                context_files = result['output'].strip().split('\n')
+                
+                for context_file in context_files:
+                    if context_file.strip():
+                        try:
+                            cat_result = self.orchestrator.execute_command(f"cat {context_file}")
+                            if cat_result.get('success', False):
+                                data = json.loads(cat_result['output'])
+                                if data.get('project_name') == project_name:
+                                    return TrunkContext(**data)
+                        except Exception as e:
+                            logger.warning(f"Failed to load context file {context_file}: {e}")
+        else:
+            # Fallback to local file system
+            for context_file in self.contexts_dir.glob("trunk_*.json"):
+                try:
+                    with open(context_file, 'r') as f:
+                        data = json.load(f)
+                        if data.get('project_name') == project_name:
+                            return TrunkContext(**data)
+                except Exception as e:
+                    logger.warning(f"Failed to load context file {context_file}: {e}")
         return None
     
     def _save_context(self, context: BaseContext):
-        """Save a context to disk."""
+        """Save a context to disk (in container if orchestrator is available)."""
         filename = f"{context.context_id}.json"
         filepath = self.contexts_dir / filename
         
         try:
-            with open(filepath, 'w') as f:
-                json.dump(context.model_dump(), f, default=str, indent=2)
-            logger.debug(f"Saved context: {context.context_id}")
+            context_data = json.dumps(context.model_dump(), default=str, indent=2)
+            
+            if self.orchestrator:
+                # Save in container using orchestrator
+                escaped_data = context_data.replace("'", "'\"'\"'")
+                result = self.orchestrator.execute_command(
+                    f"echo '{escaped_data}' > {filepath}"
+                )
+                if result.get('success', False):
+                    logger.debug(f"Saved context in container: {context.context_id}")
+                else:
+                    logger.error(f"Failed to save context in container: {result.get('output', '')}")
+            else:
+                # Fallback to local file system
+                with open(filepath, 'w') as f:
+                    f.write(context_data)
+                logger.debug(f"Saved context locally: {context.context_id}")
+                
         except Exception as e:
             logger.error(f"Failed to save context {context.context_id}: {e}")
     

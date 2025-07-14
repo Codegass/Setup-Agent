@@ -167,6 +167,10 @@ class ReActEngine:
                 temperature = self.config.thinking_temperature
                 max_tokens = self.config.thinking_max_tokens
                 
+                # Log detailed request in verbose mode
+                if self.config.verbose:
+                    self._log_llm_request(model, prompt, temperature, max_tokens, use_thinking_model)
+                
                 # Special handling for o1 models
                 if "o1" in model:
                     response = litellm.completion(
@@ -187,6 +191,10 @@ class ReActEngine:
                 temperature = self.config.action_temperature
                 max_tokens = self.config.action_max_tokens
                 
+                # Log detailed request in verbose mode
+                if self.config.verbose:
+                    self._log_llm_request(model, prompt, temperature, max_tokens, use_thinking_model)
+                
                 response = litellm.completion(
                     model=model,
                     messages=[{"role": "user", "content": prompt}],
@@ -196,6 +204,10 @@ class ReActEngine:
             
             content = response.choices[0].message.content
             
+            # Log detailed response in verbose mode
+            if self.config.verbose:
+                self._log_llm_response(model, content, response)
+            
             self.agent_logger.info(f"LLM Response from {model}: {len(content)} chars")
             logger.debug(f"Model used: {model}, Response length: {len(content)}")
             
@@ -203,6 +215,8 @@ class ReActEngine:
             
         except Exception as e:
             logger.error(f"LLM request failed: {e}")
+            if self.config.verbose:
+                self._log_llm_error(e)
             return None
     
     def _build_initial_system_prompt(self) -> str:
@@ -342,6 +356,10 @@ IMPORTANT GUIDELINES:
                 self.agent_logger.info(f"💭 THOUGHT ({step.model_used}): {step.content[:100]}...")
                 logger.info(f"💭 THOUGHT: {step.content[:100]}...")
                 
+                # Detailed logging in verbose mode
+                if self.config.verbose:
+                    self._log_react_step_verbose(step)
+                
                 # Log to branch context if we're in one
                 if isinstance(self.context_manager.current_context, BranchContext):
                     self.context_manager.current_context.add_log_entry(f"Thought: {step.content[:200]}...")
@@ -349,6 +367,10 @@ IMPORTANT GUIDELINES:
             elif step.step_type == StepType.ACTION:
                 self.agent_logger.info(f"🔧 ACTION: {step.content}")
                 logger.info(f"🔧 ACTION: {step.content}")
+                
+                # Detailed logging in verbose mode
+                if self.config.verbose:
+                    self._log_react_step_verbose(step)
                 
                 if step.tool_name not in self.tools:
                     error_msg = f"Unknown tool: {step.tool_name}"
@@ -358,9 +380,18 @@ IMPORTANT GUIDELINES:
                 
                 # Execute the tool
                 tool = self.tools[step.tool_name]
+                
+                # Log tool execution in verbose mode
+                if self.config.verbose:
+                    self._log_tool_execution_verbose(step.tool_name, step.tool_params)
+                
                 result = tool.safe_execute(**(step.tool_params or {}))
                 
                 step.tool_result = result
+                
+                # Log tool result in verbose mode
+                if self.config.verbose:
+                    self._log_tool_result_verbose(step.tool_name, result)
                 
                 # Add observation step
                 self._add_observation_step(str(result))
@@ -464,6 +495,149 @@ IMPORTANT GUIDELINES:
         from datetime import datetime
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    def _log_llm_request(self, model: str, prompt: str, temperature: float, max_tokens: int, is_thinking: bool):
+        """Log detailed LLM request in verbose mode."""
+        from config.logger import create_verbose_logger
+        
+        verbose_logger = create_verbose_logger("react_llm")
+        
+        log_entry = {
+            "event": "llm_request",
+            "model": model,
+            "model_type": "thinking" if is_thinking else "action",
+            "iteration": self.current_iteration,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "prompt_length": len(prompt),
+            "prompt_preview": prompt[:200] + "..." if len(prompt) > 200 else prompt,
+            "timestamp": self._get_timestamp()
+        }
+        
+        verbose_logger.info(f"🤖 LLM REQUEST: {json.dumps(log_entry, indent=2)}")
+        
+        # Also save full prompt to container file if we have access
+        if hasattr(self.context_manager, 'orchestrator') and self.context_manager.orchestrator:
+            prompt_file = f"/workspace/.setup_agent/llm_traces/iteration_{self.current_iteration}_request.txt"
+            escaped_prompt = prompt.replace("'", "'\"'\"'")
+            self.context_manager.orchestrator.execute_command(
+                f"mkdir -p /workspace/.setup_agent/llm_traces && echo '{escaped_prompt}' > {prompt_file}"
+            )
+    
+    def _log_llm_response(self, model: str, content: str, response):
+        """Log detailed LLM response in verbose mode."""
+        from config.logger import create_verbose_logger
+        
+        verbose_logger = create_verbose_logger("react_llm")
+        
+        # Extract usage information if available
+        usage_info = {}
+        if hasattr(response, 'usage') and response.usage:
+            usage_info = {
+                "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
+                "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
+                "total_tokens": getattr(response.usage, 'total_tokens', 0)
+            }
+        
+        log_entry = {
+            "event": "llm_response",
+            "model": model,
+            "iteration": self.current_iteration,
+            "response_length": len(content),
+            "response_preview": content[:500] + "..." if len(content) > 500 else content,
+            "usage": usage_info,
+            "timestamp": self._get_timestamp()
+        }
+        
+        verbose_logger.info(f"🤖 LLM RESPONSE: {json.dumps(log_entry, indent=2)}")
+        
+        # Also save full response to container file if we have access
+        if hasattr(self.context_manager, 'orchestrator') and self.context_manager.orchestrator:
+            response_file = f"/workspace/.setup_agent/llm_traces/iteration_{self.current_iteration}_response.txt"
+            escaped_content = content.replace("'", "'\"'\"'")
+            self.context_manager.orchestrator.execute_command(
+                f"echo '{escaped_content}' > {response_file}"
+            )
+    
+    def _log_llm_error(self, error: Exception):
+        """Log LLM errors in verbose mode."""
+        from config.logger import create_verbose_logger
+        
+        verbose_logger = create_verbose_logger("react_llm")
+        
+        error_entry = {
+            "event": "llm_error",
+            "iteration": self.current_iteration,
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "timestamp": self._get_timestamp()
+        }
+        
+        verbose_logger.error(f"🚨 LLM ERROR: {json.dumps(error_entry, indent=2)}")
+    
+    def _log_react_step_verbose(self, step: ReActStep):
+        """Log detailed ReAct step information in verbose mode."""
+        from config.logger import create_verbose_logger
+        
+        verbose_logger = create_verbose_logger("react_steps")
+        
+        step_entry = {
+            "event": "react_step",
+            "step_type": step.step_type,
+            "iteration": self.current_iteration,
+            "step_number": len(self.steps),
+            "model_used": step.model_used,
+            "content_length": len(step.content),
+            "content": step.content,
+            "tool_name": step.tool_name,
+            "tool_params": step.tool_params,
+            "timestamp": step.timestamp
+        }
+        
+        verbose_logger.info(f"📝 REACT STEP: {json.dumps(step_entry, indent=2, default=str)}")
+    
+    def _log_tool_execution_verbose(self, tool_name: str, params: dict):
+        """Log detailed tool execution information in verbose mode."""
+        from config.logger import create_verbose_logger
+        
+        verbose_logger = create_verbose_logger("react_tools")
+        
+        execution_entry = {
+            "event": "tool_execution_start",
+            "tool_name": tool_name,
+            "iteration": self.current_iteration,
+            "parameters": params,
+            "timestamp": self._get_timestamp()
+        }
+        
+        verbose_logger.info(f"🔧 TOOL EXECUTION: {json.dumps(execution_entry, indent=2, default=str)}")
+    
+    def _log_tool_result_verbose(self, tool_name: str, result):
+        """Log detailed tool result information in verbose mode."""
+        from config.logger import create_verbose_logger
+        
+        verbose_logger = create_verbose_logger("react_tools")
+        
+        result_entry = {
+            "event": "tool_execution_result",
+            "tool_name": tool_name,
+            "iteration": self.current_iteration,
+            "success": result.success,
+            "output_length": len(result.output) if result.output else 0,
+            "output_preview": result.output[:200] + "..." if result.output and len(result.output) > 200 else result.output,
+            "error": result.error if hasattr(result, 'error') else None,
+            "timestamp": self._get_timestamp()
+        }
+        
+        verbose_logger.info(f"🔧 TOOL RESULT: {json.dumps(result_entry, indent=2, default=str)}")
+        
+        # Save full tool output to container file if we have access
+        if hasattr(self.context_manager, 'orchestrator') and self.context_manager.orchestrator and result.output:
+            output_file = f"/workspace/.setup_agent/tool_traces/iteration_{self.current_iteration}_{tool_name}_output.txt"
+            escaped_output = result.output.replace("'", "'\"'\"'")
+            self.context_manager.orchestrator.execute_command(
+                f"mkdir -p /workspace/.setup_agent/tool_traces && echo '{escaped_output}' > {output_file}"
+            )
+
     def get_execution_summary(self) -> Dict[str, Any]:
         """Get a summary of the execution."""
         thinking_actions = len([s for s in self.steps if s.model_used and "o1" in s.model_used])

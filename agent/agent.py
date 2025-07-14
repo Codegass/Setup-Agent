@@ -10,6 +10,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
 
 from config import Config
+from config.logger import create_agent_logger, create_command_logger, get_session_logger
 from tools import BashTool, FileIOTool, WebSearchTool, ContextTool
 from docker_orch.orch import DockerOrchestrator
 from .context_manager import ContextManager
@@ -25,8 +26,25 @@ class SetupAgent:
         self.max_iterations = max_iterations
         self.console = Console()
         
-        # Initialize context manager
-        self.context_manager = ContextManager(workspace_path=config.workspace_path)
+        # Context manager will be initialized after Docker setup
+        self.context_manager = None
+        self.tools = None
+        self.react_engine = None
+        
+        # Create specialized agent logger
+        self.agent_logger = create_agent_logger("setup_agent")
+        self.agent_logger.info("Setup Agent initialized (context manager will be initialized after Docker setup)")
+    
+    def _initialize_context_and_tools(self):
+        """Initialize context manager, tools, and react engine after Docker is ready."""
+        if self.context_manager is not None:
+            return  # Already initialized
+        
+        # Initialize context manager with container-based workspace
+        self.context_manager = ContextManager(
+            workspace_path=self.config.workspace_path,
+            orchestrator=self.orchestrator  # Pass orchestrator for container operations
+        )
         
         # Initialize tools
         self.tools = self._initialize_tools()
@@ -37,7 +55,7 @@ class SetupAgent:
             tools=self.tools
         )
         
-        logger.info("Setup Agent initialized")
+        self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
     
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
@@ -55,6 +73,10 @@ class SetupAgent:
                      interactive: bool = False) -> bool:
         """Setup a project from scratch."""
         
+        # Create command-specific logger
+        cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
+        cmd_logger.info(f"Starting project setup: {project_name}")
+        
         self.console.print(Panel.fit(
             f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
             f"[dim]Repository: {project_url}[/dim]\n"
@@ -66,6 +88,9 @@ class SetupAgent:
             # Step 1: Setup Docker environment
             if not self._setup_docker_environment(project_name):
                 return False
+            
+            # Step 1.5: Initialize context manager and tools now that Docker is ready
+            self._initialize_context_and_tools()
             
             # Step 2: Initialize trunk context
             trunk_context = self.context_manager.create_trunk_context(
@@ -84,11 +109,24 @@ class SetupAgent:
             # Step 5: Cleanup and summary
             self._provide_setup_summary(success)
             
+            cmd_logger.info(f"Project setup completed: success={success}")
+            
+            # Cleanup command logger
+            session_logger = get_session_logger()
+            if session_logger:
+                session_logger.cleanup_command_logger(cmd_logger_id)
+            
             return success
             
         except Exception as e:
-            logger.error(f"Setup failed: {e}", exc_info=True)
+            cmd_logger.error(f"Setup failed: {e}", exc_info=True)
             self.console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
+            
+            # Cleanup command logger
+            session_logger = get_session_logger()
+            if session_logger:
+                session_logger.cleanup_command_logger(cmd_logger_id)
+            
             return False
     
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
@@ -104,6 +142,9 @@ class SetupAgent:
             # Step 1: Ensure Docker container is running
             if not self._ensure_container_running(project_name):
                 return False
+            
+            # Step 1.5: Initialize context manager and tools now that Docker is ready
+            self._initialize_context_and_tools()
             
             # Step 2: Load existing trunk context
             trunk_context = self.context_manager.load_or_create_trunk_context(
@@ -132,6 +173,10 @@ class SetupAgent:
     def run_task(self, project_name: str, task_description: str) -> bool:
         """Run a specific task on an existing project."""
         
+        # Create command-specific logger
+        cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
+        cmd_logger.info(f"Starting task execution: {task_description}")
+        
         self.console.print(Panel.fit(
             f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
             f"[dim]Task: {task_description}[/dim]",
@@ -142,6 +187,9 @@ class SetupAgent:
             # Step 1: Ensure Docker container is running
             if not self._ensure_container_running(project_name):
                 return False
+            
+            # Step 1.5: Initialize context manager and tools now that Docker is ready
+            self._initialize_context_and_tools()
             
             # Step 2: Load existing trunk context
             trunk_context = self.context_manager.load_or_create_trunk_context(
@@ -190,14 +238,26 @@ Please start by checking the current context and then proceed with the task.
             # Step 7: Provide execution summary
             self._provide_task_summary(success, task_description)
             
+            cmd_logger.info(f"Task execution completed: success={success}")
+            
+            # Cleanup command logger
+            session_logger = get_session_logger()
+            if session_logger:
+                session_logger.cleanup_command_logger(cmd_logger_id)
+            
             return success
             
         except Exception as e:
-            logger.error(f"Task execution failed: {e}", exc_info=True)
+            cmd_logger.error(f"Task execution failed: {e}", exc_info=True)
             self.console.print(f"[bold red]❌ Task execution failed: {e}[/bold red]")
             
             # Update last comment with error
             error_comment = f"Task failed: {task_description} - Error: {str(e)[:100]}"
+            
+            # Cleanup command logger
+            session_logger = get_session_logger()
+            if session_logger:
+                session_logger.cleanup_command_logger(cmd_logger_id)
             self.orchestrator.update_last_comment(error_comment)
             
             return False

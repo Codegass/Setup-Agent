@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from loguru import logger
 from pydantic import BaseModel, Field
 
 
@@ -49,6 +48,9 @@ class Config(BaseModel):
     # Logging configuration
     log_level: LogLevel = Field(default=LogLevel.INFO)
     log_file: Optional[str] = Field(default="logs/sag.log")
+    verbose: bool = Field(default=False)  # Enable verbose debugging output
+    log_rotation: str = Field(default="50 MB")  # Log file rotation size
+    log_retention: str = Field(default="30 days")  # Log file retention period
     
     # Docker configuration
     docker_base_image: str = Field(default="ubuntu:22.04")
@@ -65,21 +67,20 @@ class Config(BaseModel):
         env_file = Path(".env")
         if env_file.exists():
             load_dotenv(env_file)
-            logger.info("Loaded configuration from .env file")
         
         return cls(
             # Thinking model config
-            thinking_model=os.getenv("SAG_THINKING_MODEL", "o1-preview"),
+            thinking_model=os.getenv("SAG_THINKING_MODEL", "o4-mini"),
             thinking_provider=os.getenv("SAG_THINKING_PROVIDER", "openai"),
             thinking_temperature=float(os.getenv("SAG_THINKING_TEMPERATURE", "0.1")),
-            thinking_max_tokens=int(os.getenv("SAG_MAX_THINKING_TOKENS", "8000")),
+            thinking_max_tokens=int(os.getenv("SAG_MAX_THINKING_TOKENS", "10000")),
             reasoning_effort=os.getenv("SAG_REASONING_EFFORT", "medium"),
             
             # Action model config
             action_model=os.getenv("SAG_ACTION_MODEL", "gpt-4o"),
             action_provider=os.getenv("SAG_ACTION_PROVIDER", "openai"),
             action_temperature=float(os.getenv("SAG_ACTION_TEMPERATURE", "0.3")),
-            action_max_tokens=int(os.getenv("SAG_MAX_ACTION_TOKENS", "2000")),
+            action_max_tokens=int(os.getenv("SAG_MAX_ACTION_TOKENS", "10000")),
             
             # API Keys
             openai_api_key=os.getenv("OPENAI_API_KEY"),
@@ -96,6 +97,9 @@ class Config(BaseModel):
             # System config
             log_level=LogLevel(os.getenv("SAG_LOG_LEVEL", "INFO")),
             log_file=os.getenv("SAG_LOG_FILE", "logs/sag.log"),
+            verbose=os.getenv("SAG_VERBOSE", "false").lower() in ("true", "1", "yes"),
+            log_rotation=os.getenv("SAG_LOG_ROTATION", "50 MB"),
+            log_retention=os.getenv("SAG_LOG_RETENTION", "30 days"),
             docker_base_image=os.getenv("SAG_DOCKER_BASE_IMAGE", "ubuntu:22.04"),
             workspace_path=os.getenv("SAG_WORKSPACE_PATH", "/workspace"),
             max_iterations=int(os.getenv("SAG_MAX_ITERATIONS", "50")),
@@ -126,55 +130,10 @@ class Config(BaseModel):
             return f"{provider}/{model}"
 
 
-def setup_logging(config: Config) -> None:
-    """Setup logging configuration with comprehensive coverage."""
-    
-    # Remove default logger
-    logger.remove()
-    
-    # Ensure log directory exists
-    if config.log_file:
-        log_path = Path(config.log_file)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Console logger with rich formatting
-    logger.add(
-        sys.stderr,
-        level=config.log_level.value,
-        format="<green>{time:HH:mm:ss}</green> | "
-               "<level>{level: <8}</level> | "
-               "<cyan>{name}</cyan>:<cyan>{function}</cyan> | "
-               "<level>{message}</level>",
-        colorize=True,
-        filter=lambda record: record["level"].name != "DEBUG" or config.log_level == LogLevel.DEBUG
-    )
-    
-    # File logger with detailed information
-    if config.log_file:
-        logger.add(
-            config.log_file,
-            level="DEBUG",  # File logs everything
-            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-            rotation="50 MB",
-            retention="30 days",
-            compression="gz",
-            enqueue=True,  # Thread-safe logging
-        )
-        
-        # Separate file for agent execution traces
-        agent_log_file = str(Path(config.log_file).parent / "agent_execution.log")
-        logger.add(
-            agent_log_file,
-            level="INFO",
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-            filter=lambda record: "AGENT_TRACE" in record.get("extra", {}),
-            rotation="100 MB",
-            retention="7 days",
-        )
-    
-    logger.info(f"Logging setup complete. Level: {config.log_level.value}")
-    if config.log_file:
-        logger.info(f"Log file: {config.log_file}")
+def setup_logging(config: Config):
+    """Setup logging configuration using the new session-based system."""
+    from .logger import setup_session_logging
+    return setup_session_logging(config)
 
 
 def setup_litellm_environment(config: Config) -> None:
@@ -197,7 +156,7 @@ def setup_litellm_environment(config: Config) -> None:
         os.environ["AZURE_API_BASE"] = config.azure_api_base
         os.environ["AZURE_API_VERSION"] = config.azure_api_version
     
-    logger.info("LiteLLM environment configured")
+    # LiteLLM environment configured
 
 
 # Global configuration instance
@@ -224,4 +183,5 @@ def set_config(config: Config) -> None:
 
 def create_agent_logger(context_id: str):
     """Create a specialized logger for agent execution traces."""
-    return logger.bind(AGENT_TRACE=True, context_id=context_id)
+    from .logger import create_agent_logger as _create_agent_logger
+    return _create_agent_logger(context_id)

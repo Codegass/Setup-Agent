@@ -30,8 +30,13 @@ console = Console()
     type=click.Path(),
     help="Path to log file"
 )
+@click.option(
+    "--verbose", 
+    is_flag=True,
+    help="Enable verbose debugging output with detailed logs"
+)
 @click.pass_context
-def cli(ctx, log_level, log_file):
+def cli(ctx, log_level, log_file, verbose):
     """SAG: Setup-Agent - LLM Powered project setup automation."""
     
     # Create configuration
@@ -42,13 +47,23 @@ def cli(ctx, log_level, log_file):
         config.log_level = LogLevel(log_level)
     if log_file:
         config.log_file = log_file
+    if verbose:
+        config.verbose = verbose
     
-    # Set global config
+    # Set global config (this also initializes session logging)
     set_config(config)
     
     # Ensure context object exists
     ctx.ensure_object(dict)
     ctx.obj['config'] = config
+    
+    # Show session logging info in verbose mode
+    if config.verbose and ctx.invoked_subcommand not in ['list', 'version']:
+        from config.logger import get_session_logger
+        session_logger = get_session_logger()
+        if session_logger:
+            logger.info(f"Session ID: {session_logger.session_id}")
+            logger.info(f"Logs directory: {session_logger.session_log_dir}")
     
     # Display welcome message for main commands
     if ctx.invoked_subcommand not in ['list']:
