@@ -24,7 +24,7 @@ In software development, configuring a new project—especially a large open-sou
 
 The "brain" of SAG is an enhanced ReAct (Reasoning-Acting) engine. By separating the "thinking" and "acting" phases and using different models for each, it achieves more effective decision-making:
 
-- **Thinking Model**: Responsible for analyzing complex problems, creating high-level plans, and learning from errors. It thinks deeper and sees further.
+- **Thinking Model**: Responsible for analyzing complex problems, creating high-level plans, and learning from errors. It thinks deeper and sees further. Supports advanced reasoning features like OpenAI's `o1` models and Anthropic's Claude thinking capabilities.
 - **Action Model**: Responsible for precisely executing the plan laid out by the thinking model, whether that's calling a tool, generating code, or running a command. It's focused on "doing."
 
 This architecture allows SAG to be both thoughtful and agile when tackling unfamiliar projects.
@@ -121,8 +121,11 @@ SAG provides a clean and powerful set of CLI commands.
 All configuration is managed through the `.env` file in the project's root directory.
 
 **Key Configuration Options:**
-- `SAG_THINKING_MODEL`: The "thinking model" for planning and analysis. A powerful model is recommended (e.g., `o1-preview`, `claude-3-opus-20240229`).
+- `SAG_THINKING_MODEL`: The "thinking model" for planning and analysis. A powerful model is recommended (e.g., `o1-preview`, `claude-sonnet-4-20250514`).
 - `SAG_ACTION_MODEL`: The "action model" for task execution. A fast and cost-effective model is recommended (e.g., `gpt-4o`, `claude-3-5-sonnet-20240620`).
+- `SAG_THINKING_PROVIDER`: The provider for the thinking model (`openai`, `anthropic`, etc.).
+- `SAG_REASONING_EFFORT`: For thinking models, controls reasoning depth (`low`, `medium`, `high`).
+- `SAG_THINKING_BUDGET_TOKENS`: For Claude models, controls thinking budget (1024, 2048, 4096).
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.: API keys for the respective LLM providers.
 - `SAG_LOG_LEVEL`: Sets the logging verbosity. `DEBUG` mode is highly detailed and includes LiteLLM's internal logs.
 - `SAG_MAX_ITERATIONS`: The maximum number of iterations for a single `run` or `project` command to prevent infinite loops.

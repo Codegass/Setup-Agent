@@ -9,8 +9,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.panel import Panel
 
-from config import Config
-from config.logger import create_agent_logger, create_command_logger, get_session_logger
+from config import Config, create_agent_logger, create_command_logger, get_session_logger
 from tools import BashTool, FileIOTool, WebSearchTool, ContextTool
 from docker_orch.orch import DockerOrchestrator
 from .context_manager import ContextManager

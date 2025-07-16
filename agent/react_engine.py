@@ -9,7 +9,7 @@ import litellm
 from loguru import logger
 from pydantic import BaseModel
 
-from config import get_config, create_agent_logger
+from config import get_config, create_agent_logger, create_verbose_logger
 from tools import BaseTool, ToolResult
 from .context_manager import ContextManager, BranchContext, TrunkContext
 
@@ -171,15 +171,21 @@ class ReActEngine:
                 if self.config.verbose:
                     self._log_llm_request(model, prompt, temperature, max_tokens, use_thinking_model)
                 
-                # Special handling for o1 models
-                if "o1" in model:
+                # Get thinking configuration based on provider
+                thinking_config = self.config.get_thinking_config()
+                
+                # Special handling for different thinking models
+                if thinking_config:
+                    # For models with thinking capabilities (o1, claude)
                     response = litellm.completion(
                         model=model,
                         messages=[{"role": "user", "content": prompt}],
-                        reasoning_effort=self.config.reasoning_effort,
-                        max_completion_tokens=max_tokens,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        **thinking_config
                     )
                 else:
+                    # For regular models
                     response = litellm.completion(
                         model=model,
                         messages=[{"role": "user", "content": prompt}],
@@ -497,7 +503,6 @@ IMPORTANT GUIDELINES:
     
     def _log_llm_request(self, model: str, prompt: str, temperature: float, max_tokens: int, is_thinking: bool):
         """Log detailed LLM request in verbose mode."""
-        from config.logger import create_verbose_logger
         
         verbose_logger = create_verbose_logger("react_llm")
         
@@ -525,7 +530,6 @@ IMPORTANT GUIDELINES:
     
     def _log_llm_response(self, model: str, content: str, response):
         """Log detailed LLM response in verbose mode."""
-        from config.logger import create_verbose_logger
         
         verbose_logger = create_verbose_logger("react_llm")
         
@@ -560,7 +564,6 @@ IMPORTANT GUIDELINES:
     
     def _log_llm_error(self, error: Exception):
         """Log LLM errors in verbose mode."""
-        from config.logger import create_verbose_logger
         
         verbose_logger = create_verbose_logger("react_llm")
         
@@ -576,7 +579,6 @@ IMPORTANT GUIDELINES:
     
     def _log_react_step_verbose(self, step: ReActStep):
         """Log detailed ReAct step information in verbose mode."""
-        from config.logger import create_verbose_logger
         
         verbose_logger = create_verbose_logger("react_steps")
         
@@ -597,7 +599,6 @@ IMPORTANT GUIDELINES:
     
     def _log_tool_execution_verbose(self, tool_name: str, params: dict):
         """Log detailed tool execution information in verbose mode."""
-        from config.logger import create_verbose_logger
         
         verbose_logger = create_verbose_logger("react_tools")
         
@@ -613,7 +614,6 @@ IMPORTANT GUIDELINES:
     
     def _log_tool_result_verbose(self, tool_name: str, result):
         """Log detailed tool result information in verbose mode."""
-        from config.logger import create_verbose_logger
         
         verbose_logger = create_verbose_logger("react_tools")
         

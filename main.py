@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from config import get_config, set_config, Config, LogLevel
+from config import get_config, set_config, Config, LogLevel, get_session_logger
 from docker_orch.orch import DockerOrchestrator
 from agent.agent import SetupAgent
 
@@ -59,7 +59,6 @@ def cli(ctx, log_level, log_file, verbose):
     
     # Show session logging info in verbose mode
     if config.verbose and ctx.invoked_subcommand not in ['list', 'version']:
-        from config.logger import get_session_logger
         session_logger = get_session_logger()
         if session_logger:
             logger.info(f"Session ID: {session_logger.session_id}")
