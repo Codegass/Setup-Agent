@@ -59,6 +59,9 @@ class ReActEngine:
         # Configure LiteLLM
         self._setup_litellm()
 
+        # Check function calling support
+        self._check_function_calling_support()
+
         logger.info("ReAct Engine initialized with dual model support")
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
@@ -73,6 +76,160 @@ class ReActEngine:
             litellm.set_verbose = True
 
         logger.info("LiteLLM configured")
+
+    def _check_function_calling_support(self):
+        """Check if the configured models support function calling."""
+        action_model = self.config.get_litellm_model_name("action")
+        thinking_model = self.config.get_litellm_model_name("thinking")
+
+        # Check action model function calling support
+        self.supports_function_calling = litellm.supports_function_calling(action_model)
+
+        # Determine if this is a Claude model
+        self.is_claude_model = (
+            "claude" in action_model.lower() or "anthropic" in action_model.lower()
+        )
+
+        if self.supports_function_calling:
+            model_type = "Claude" if self.is_claude_model else "OpenAI"
+            logger.info(f"Action model {action_model} supports {model_type} function calling")
+        else:
+            logger.warning(
+                f"Action model {action_model} does not support function calling, falling back to prompt-based approach"
+            )
+            # Enable fallback for models without function calling support
+            litellm.add_function_to_prompt = True
+
+        # Check parallel function calling support
+        self.supports_parallel_function_calling = litellm.supports_parallel_function_calling(
+            action_model
+        )
+        if self.supports_parallel_function_calling:
+            logger.info(f"Action model {action_model} supports parallel function calling")
+        else:
+            logger.info(f"Action model {action_model} does not support parallel function calling")
+
+    def _build_tools_schema(self) -> List[Dict[str, Any]]:
+        """Build function calling schema from tools (supports both OpenAI and Claude formats)."""
+        tools_schema = []
+
+        for tool in self.tools.values():
+            # Use the enhanced tool's parameter schema if available
+            if hasattr(tool, "get_parameter_schema"):
+                schema = tool.get_parameter_schema()
+            else:
+                # Fallback to basic schema for regular tools
+                schema = {"type": "object", "properties": {}, "required": []}
+
+            if self.is_claude_model:
+                # Claude format - direct tool definition
+                tool_def = {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": schema,
+                }
+            else:
+                # OpenAI format - nested function definition
+                tool_def = {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": schema,
+                    },
+                }
+
+            tools_schema.append(tool_def)
+
+        return tools_schema
+
+    def _handle_function_calling_response(self, response, model: str) -> str:
+        """Handle function calling response and convert to ReAct format (supports both OpenAI and Claude formats)."""
+        try:
+            message = response.choices[0].message
+
+            # Extract thinking content if available
+            content_parts = []
+            if message.content:
+                content_parts.append(f"THOUGHT: {message.content}")
+
+            # Handle both OpenAI and Claude function calling formats
+            if self.is_claude_model:
+                # Claude format - tool_calls may be in different structure
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    for tool_call in message.tool_calls:
+                        function_name = tool_call.get("name") or tool_call.get("function", {}).get(
+                            "name"
+                        )
+                        function_args = tool_call.get("input") or tool_call.get("function", {}).get(
+                            "arguments"
+                        )
+
+                        # Parse function arguments if they're a string
+                        if isinstance(function_args, str):
+                            try:
+                                function_args = json.loads(function_args)
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    f"Failed to parse Claude function arguments: {function_args}"
+                                )
+                                function_args = {}
+
+                        if function_name:
+                            # Format as ReAct ACTION
+                            content_parts.append(f"ACTION: {function_name}")
+                            content_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
+                            logger.debug(
+                                f"Claude function call: {function_name} with args: {function_args}"
+                            )
+
+            else:
+                # OpenAI format - standard tool_calls structure
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    for tool_call in message.tool_calls:
+                        function_name = tool_call.function.name
+                        
+                        # Strip OpenAI namespace prefix if present
+                        if function_name.startswith("functions."):
+                            function_name = function_name[10:]  # Remove "functions." prefix
+
+                        # Parse function arguments
+                        try:
+                            function_args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                f"Failed to parse OpenAI function arguments: {tool_call.function.arguments}"
+                            )
+                            function_args = {}
+
+                        # Format as ReAct ACTION
+                        content_parts.append(f"ACTION: {function_name}")
+                        content_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
+                        logger.debug(
+                            f"OpenAI function call: {function_name} with args: {function_args}"
+                        )
+
+            result = "\n\n".join(content_parts)
+
+            # Log function calling usage
+            if self.config.verbose:
+                tool_count = (
+                    len(message.tool_calls)
+                    if hasattr(message, "tool_calls") and message.tool_calls
+                    else 0
+                )
+                model_type = "Claude" if self.is_claude_model else "OpenAI"
+                logger.info(
+                    f"{model_type} function calling response from {model}: {tool_count} tool calls"
+                )
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Failed to handle function calling response: {e}")
+            # Fallback to regular content
+            content = response.choices[0].message.content
+            return content if content is not None else ""
 
     def run_react_loop(self, initial_prompt: str, max_iterations: Optional[int] = None) -> bool:
         """Run the main ReAct loop."""
@@ -138,31 +295,30 @@ class ReActEngine:
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step."""
-        # Use thinking model for:
-        # 1. First step (initial analysis)
-        # 2. When we haven't had a thinking step in the last 5 iterations
-        # 3. When we encounter errors or complex situations
-
+        # Use thinking model ONLY for pure reasoning, not for tool execution
+        # The thinking model should only be used for complex analysis and planning
+        
+        # For now, let's primarily use the action model which has function calling support
+        # Use thinking model only for the very first step for initial analysis
         if self.current_iteration == 1:
             return True
 
         # Check if we've had thinking steps recently
         recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
-        thinking_steps = [s for s in recent_steps if s.model_used and "o1" in s.model_used]
+        thinking_model_name = self.config.get_litellm_model_name("thinking")
+        thinking_steps = [s for s in recent_steps if s.model_used and thinking_model_name in s.model_used]
 
-        if not thinking_steps:
-            return True
-
-        # Check for recent errors
+        # Use thinking model when we encounter many errors (need deep analysis)
         recent_errors = [
             s
             for s in recent_steps
             if s.step_type == StepType.ACTION and s.tool_result and not s.tool_result.success
         ]
 
-        if len(recent_errors) >= 2:
+        if len(recent_errors) >= 3:  # Increased threshold
             return True
 
+        # Otherwise, use action model which has function calling support
         return False
 
     def _get_llm_response(self, prompt: str, use_thinking_model: bool = False) -> Optional[str]:
@@ -218,12 +374,39 @@ class ReActEngine:
                         model, prompt, temperature, max_tokens, use_thinking_model
                     )
 
-                response = litellm.completion(
-                    model=model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                # Build parameters for the request
+                request_params = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+
+                # Add function calling support if available
+                if self.supports_function_calling and not use_thinking_model:
+                    tools_schema = self._build_tools_schema()
+                    if tools_schema:
+                        request_params["tools"] = tools_schema
+
+                        # Different tool_choice format for Claude vs OpenAI
+                        if self.is_claude_model:
+                            request_params["tool_choice"] = {"type": "auto"}
+                        else:
+                            request_params["tool_choice"] = "auto"
+
+                        model_type = "Claude" if self.is_claude_model else "OpenAI"
+                        logger.debug(
+                            f"Using {model_type} function calling with {len(tools_schema)} tools"
+                        )
+
+                response = litellm.completion(**request_params)
+
+            # Handle function calling response
+            if (
+                hasattr(response.choices[0].message, "tool_calls")
+                and response.choices[0].message.tool_calls
+            ):
+                return self._handle_function_calling_response(response, model)
 
             content = response.choices[0].message.content
 
@@ -231,10 +414,11 @@ class ReActEngine:
             if self.config.verbose:
                 self._log_llm_response(model, content, response)
 
-            self.agent_logger.info(f"LLM Response from {model}: {len(content)} chars")
-            logger.debug(f"Model used: {model}, Response length: {len(content)}")
+            content_str = content if content is not None else ""
+            self.agent_logger.info(f"LLM Response from {model}: {len(content_str)} chars")
+            logger.debug(f"Model used: {model}, Response length: {len(content_str)}")
 
-            return content
+            return content_str
 
         except Exception as e:
             logger.error(f"LLM request failed: {e}")
@@ -269,9 +453,9 @@ AVAILABLE TOOLS:
         # Add tool descriptions with usage examples
         for tool in self.tools.values():
             prompt += f"\n- {tool.name}: {tool.description}"
-            if hasattr(tool, 'get_usage_example'):
+            if hasattr(tool, "get_usage_example"):
                 prompt += f"\n  Usage: {tool.get_usage_example()}"
-        
+
         # Add explicit tool name clarification
         prompt += """
 
@@ -439,7 +623,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
                 # Log tool execution in verbose mode
                 if self.config.verbose:
-                    self._log_tool_execution_verbose(step.tool_name, step.tool_params)
+                    self._log_tool_execution_verbose(step.tool_name, step.tool_params or {})
 
                 result = tool.safe_execute(**(step.tool_params or {}))
 

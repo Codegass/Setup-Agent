@@ -7,9 +7,10 @@ from typing import Any, Dict
 from loguru import logger
 
 from .base import BaseTool, ToolResult
+from .enhanced_base import EnhancedBaseTool
 
 
-class FileIOTool(BaseTool):
+class FileIOTool(EnhancedBaseTool):
     """Tool for file input/output operations."""
 
     def __init__(self):

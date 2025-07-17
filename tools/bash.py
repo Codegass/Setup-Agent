@@ -7,9 +7,10 @@ from typing import Any, Dict
 from loguru import logger
 
 from .base import BaseTool, ToolResult
+from .enhanced_base import EnhancedBaseTool
 
 
-class BashTool(BaseTool):
+class BashTool(EnhancedBaseTool):
     """Tool for executing bash commands."""
 
     def __init__(self):

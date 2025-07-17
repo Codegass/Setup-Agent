@@ -165,3 +165,4 @@ uv.lock
 # Claude Code
 Claude.md
 .claude
+FUNCTION_CALLING_SUPPORT.md

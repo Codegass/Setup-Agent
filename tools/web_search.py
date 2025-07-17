@@ -8,9 +8,10 @@ import requests
 from loguru import logger
 
 from .base import BaseTool, ToolResult
+from .enhanced_base import EnhancedBaseTool
 
 
-class WebSearchTool(BaseTool):
+class WebSearchTool(EnhancedBaseTool):
     """Tool for searching the web for information."""
 
     def __init__(self):

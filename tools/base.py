@@ -13,13 +13,24 @@ class ToolResult(BaseModel):
     success: bool
     output: str
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    suggestions: list = []
+    documentation_links: list = []
+    raw_output: Optional[str] = None
     metadata: Dict[str, Any] = {}
 
     def __str__(self) -> str:
         if self.success:
             return self.output
         else:
-            return f"Error: {self.error}"
+            result = f"Error: {self.error}"
+            if self.error_code:
+                result += f" (Code: {self.error_code})"
+            if self.suggestions:
+                result += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in self.suggestions)
+            if self.documentation_links:
+                result += f"\n\nDocumentation:\n" + "\n".join(f"• {link}" for link in self.documentation_links)
+            return result
 
 
 class BaseTool(ABC):
