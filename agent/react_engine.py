@@ -266,9 +266,24 @@ CRITICAL CONTEXT MANAGEMENT RULES:
 AVAILABLE TOOLS:
 """
 
-        # Add tool descriptions
+        # Add tool descriptions with usage examples
         for tool in self.tools.values():
             prompt += f"\n- {tool.name}: {tool.description}"
+            if hasattr(tool, 'get_usage_example'):
+                prompt += f"\n  Usage: {tool.get_usage_example()}"
+        
+        # Add explicit tool name clarification
+        prompt += """
+
+CRITICAL: ONLY USE THESE EXACT TOOL NAMES:
+- bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
+- file_io: Read and write files (NOT read_file or write_file)
+- web_search: Search the web for information
+- manage_context: Manage context switching (NOT context)
+- maven: Execute Maven commands (NOT mvn)
+- project_setup: Clone repositories and setup projects (NOT git_clone or clone)
+
+ANY OTHER TOOL NAMES WILL RESULT IN ERROR!"""
 
         prompt += f"""
 
@@ -311,6 +326,16 @@ IMPORTANT GUIDELINES:
 7. Use web_search when you encounter unknown errors or need documentation
 8. Be methodical and thorough in your approach
 9. When encountering errors, think carefully about the root cause before retrying
+
+MANDATORY WORKFLOW FOR PROJECT SETUP:
+1. ALWAYS start with: manage_context(action="get_info")
+2. ALWAYS clone repository with: project_setup(action="clone", repository_url="https://github.com/apache/commons-cli.git")
+3. ALWAYS detect project type: project_setup(action="detect_project_type")
+4. For Maven projects: maven(command="compile") or maven(command="test")
+5. For shell commands: bash(command="ls -la")
+6. For reading files: file_io(action="read", file_path="/path/to/file")
+
+NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
 """
 

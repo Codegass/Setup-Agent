@@ -11,7 +11,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from config import Config, create_agent_logger, create_command_logger, get_session_logger
 from docker_orch.orch import DockerOrchestrator
-from tools import BashTool, ContextTool, FileIOTool, WebSearchTool
+from tools import BashTool, FileIOTool, WebSearchTool
 
 from .context_manager import ContextManager
 from .react_engine import ReActEngine
@@ -58,7 +58,18 @@ class SetupAgent:
 
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
-        tools = [BashTool(), FileIOTool(), WebSearchTool(), ContextTool(self.context_manager)]
+        from tools.enhanced_context_tool import EnhancedContextTool
+        from tools.maven_tool import MavenTool
+        from tools.project_setup_tool import ProjectSetupTool
+        
+        tools = [
+            BashTool(),
+            FileIOTool(),
+            WebSearchTool(),
+            EnhancedContextTool(self.context_manager),
+            MavenTool(self.orchestrator),
+            ProjectSetupTool(self.orchestrator)
+        ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
         return tools
