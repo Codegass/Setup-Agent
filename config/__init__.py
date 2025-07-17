@@ -2,7 +2,13 @@
 
 from typing import Optional
 
-from .logger import setup_session_logging, create_agent_logger, create_command_logger, get_session_logger, create_verbose_logger
+from .logger import (
+    create_agent_logger,
+    create_command_logger,
+    create_verbose_logger,
+    get_session_logger,
+    setup_session_logging,
+)
 from .models import LogLevel
 from .settings import Config, setup_litellm_environment
 
@@ -37,7 +43,7 @@ def set_config(config: Config) -> None:
 # Convenience exports
 __all__ = [
     "Config",
-    "LogLevel", 
+    "LogLevel",
     "get_config",
     "set_config",
     "setup_logging",

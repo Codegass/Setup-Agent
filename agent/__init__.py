@@ -1,13 +1,7 @@
 """Agent package for Setup-Agent."""
 
 from .agent import SetupAgent
+from .context_manager import BranchContext, ContextManager, TrunkContext
 from .react_engine import ReActEngine
-from .context_manager import ContextManager, TrunkContext, BranchContext
 
-__all__ = [
-    'SetupAgent',
-    'ReActEngine', 
-    'ContextManager',
-    'TrunkContext',
-    'BranchContext'
-]
+__all__ = ["SetupAgent", "ReActEngine", "ContextManager", "TrunkContext", "BranchContext"]
