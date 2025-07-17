@@ -161,3 +161,7 @@ uv.lock
 
 # log
 /logs
+
+# Claude Code
+Claude.md
+.claude
