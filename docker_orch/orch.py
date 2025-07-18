@@ -435,6 +435,8 @@ class DockerOrchestrator:
                 "setup-agent.project": self.project_name,
                 "setup-agent.created": datetime.now().isoformat(),
             },
+            # Add a command to keep container running
+            "command": ["/bin/bash", "-c", f"mkdir -p {self.config.workspace_path} && while true; do sleep 30; done"],
         }
 
         return config

@@ -1,6 +1,6 @@
 """Context management tool for the agent."""
 
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from loguru import logger
 
@@ -326,3 +326,27 @@ Tips:
 • Task IDs must match those in the TODO list
 • You can only create branch contexts from trunk context
 """
+
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        """Get the parameters schema for this tool."""
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["get_info", "create_branch", "switch_to_trunk"],
+                    "description": "The action to perform",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID for creating branch context (required for 'create_branch')",
+                    "default": None,
+                },
+                "summary": {
+                    "type": "string", 
+                    "description": "Summary of work done (optional for 'switch_to_trunk')",
+                    "default": None,
+                },
+            },
+            "required": ["action"],
+        }

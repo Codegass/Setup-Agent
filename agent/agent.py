@@ -62,6 +62,7 @@ class SetupAgent:
         from tools.maven_tool import MavenTool
         from tools.project_setup_tool import ProjectSetupTool
         from tools.system_tool import SystemTool
+        from tools.report_tool import ReportTool
         
         tools = [
             BashTool(self.orchestrator),
@@ -70,7 +71,8 @@ class SetupAgent:
             ContextTool(self.context_manager),
             MavenTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
-            SystemTool(self.orchestrator)
+            SystemTool(self.orchestrator),
+            ReportTool(self.orchestrator)
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
@@ -110,12 +112,8 @@ class SetupAgent:
                 goal=goal, project_url=project_url, project_name=project_name
             )
 
-            # Step 3: Analyze project and create initial TODO list
-            if not self._analyze_project_and_create_todos(project_url, project_name):
-                return False
-
-            # Step 4: Run the main setup loop
-            success = self._run_setup_loop(interactive)
+            # Step 3: Run the unified setup process
+            success = self._run_unified_setup(project_url, project_name, goal, interactive)
 
             # Step 5: Cleanup and summary
             self._provide_setup_summary(success)
@@ -324,66 +322,38 @@ Please start by checking the current context and then proceed with the task.
             logger.error(f"Failed to ensure container running: {e}")
             return False
 
-    def _analyze_project_and_create_todos(self, project_url: str, project_name: str) -> bool:
-        """Analyze the project and create initial TODO list."""
+    def _run_unified_setup(self, project_url: str, project_name: str, goal: str, interactive: bool = False) -> bool:
+        """Run the unified project setup process."""
 
-        # Create initial prompt for project analysis
-        initial_prompt = f"""
+        # Create comprehensive setup prompt
+        setup_prompt = f"""
 I need to setup the project '{project_name}' from the repository: {project_url}
 
-My goal is to analyze this project and create a comprehensive TODO list for setting it up.
+My goal: {goal}
 
-First, I should:
-1. Use manage_context tool to check my current context
-2. Clone the repository using bash tool
-3. Analyze the project structure (README, package files, etc.)
-4. Create a detailed TODO list based on the project requirements
-5. Begin working on the tasks systematically
+I should complete this setup systematically:
 
-Please start by checking the current context and then proceed with the setup.
+1. INITIAL SETUP:
+   - Check my current context using manage_context tool
+   - Clone the repository from {project_url} using project_setup tool
+   - Analyze the project structure and identify project type
+
+2. PROJECT BUILD & TEST:
+   - If it's a Maven project: compile and run tests using maven tool
+   - If it's a Node.js project: install dependencies and run tests
+   - If it's a Python project: set up environment and run tests
+   - Handle any dependency installation issues using system tool
+
+3. COMPLETION:
+   - Once build and tests are successful, generate a completion report using report tool
+   - Include summary of what was accomplished and project status
+
+Be methodical and use the appropriate tools for each step. The repository URL is already provided: {project_url}
 """
 
-        self.console.print("[dim]🔍 Analyzing project and creating TODO list...[/dim]")
+        self.console.print("[dim]🚀 Starting project setup process...[/dim]")
 
-        # Run initial analysis
-        success = self.react_engine.run_react_loop(
-            initial_prompt=initial_prompt,
-            max_iterations=self.max_iterations,  # Use configured max iterations
-        )
-
-        if success:
-            self.console.print("[green]✅ Project analysis completed[/green]")
-            return True
-        else:
-            self.console.print("[red]❌ Project analysis failed[/red]")
-            return False
-
-    def _run_setup_loop(self, interactive: bool = False) -> bool:
-        """Run the main setup loop."""
-
-        self.console.print("[dim]🚀 Starting main setup process...[/dim]")
-
-        # Create main setup prompt
-        main_prompt = """
-Continue with the project setup process. 
-
-Current status:
-- You should have a trunk context with a TODO list
-- Work through the TODO list systematically
-- Use branch contexts for focused work on individual tasks
-- Return to trunk context after completing each task with a summary
-
-Your approach should be:
-1. Check current context and TODO list status
-2. If in trunk context: select next pending task and create branch context
-3. If in branch context: work on the current task with focus
-4. Switch back to trunk when task is complete with summary
-5. Repeat until all tasks are completed
-
-Be thorough and methodical. Use web search when you encounter unknown issues.
-"""
-
-        # Run the main setup loop
+        # Run the unified setup process
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -392,7 +362,7 @@ Be thorough and methodical. Use web search when you encounter unknown issues.
             task = progress.add_task("Running setup process...", total=None)
 
             success = self.react_engine.run_react_loop(
-                initial_prompt=main_prompt, max_iterations=self.max_iterations
+                initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
 
             if success:

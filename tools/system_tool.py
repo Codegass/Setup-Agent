@@ -19,8 +19,7 @@ class SystemTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
 
-    def execute(self, action: str, packages: Optional[List[str]] = None, 
-                container_name: Optional[str] = None) -> ToolResult:
+    def execute(self, action: str, packages: Optional[List[str]] = None) -> ToolResult:
         """Execute system management operations."""
         
         if action not in ["install", "update", "detect_missing", "install_missing"]:
@@ -39,13 +38,24 @@ class SystemTool(BaseTool):
 
         try:
             if action == "install":
-                return self._install_packages(packages or [], container_name)
+                if not packages:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="Packages list is required for 'install' action",
+                        error_code="MISSING_PACKAGES",
+                        suggestions=["Provide a list of packages to install"]
+                    )
+                return self._install_packages(packages)
+            
             elif action == "update":
-                return self._update_packages(container_name)
+                return self._update_packages()
+            
             elif action == "detect_missing":
-                return self._detect_missing_dependencies(container_name)
+                return self._detect_missing_tools()
+                
             elif action == "install_missing":
-                return self._install_missing_dependencies(container_name)
+                return self._install_missing_dependencies()
                 
         except Exception as e:
             error_msg = f"System operation failed: {str(e)}"
@@ -62,18 +72,17 @@ class SystemTool(BaseTool):
                 ]
             )
 
-    def _install_packages(self, packages: List[str], container_name: Optional[str] = None) -> ToolResult:
+    def _install_packages(self, packages: List[str]) -> ToolResult:
         """Install system packages using apt-get."""
         if not packages:
             return ToolResult(
-                success=False,
-                output="",
-                error="No packages specified for installation",
-                error_code="NO_PACKAGES"
+                success=True,
+                output="No packages to install",
+                metadata={"packages": []}
             )
 
         # Update package lists first
-        update_result = self._update_packages(container_name)
+        update_result = self._update_packages()
         if not update_result.success:
             logger.warning(f"Failed to update package lists: {update_result.error}")
 
@@ -85,8 +94,7 @@ class SystemTool(BaseTool):
         
         result = self.docker_orchestrator.execute_command(
             command=command,
-            container_name=container_name,
-            timeout=300  # 5 minutes timeout for installations
+            timeout=300
         )
 
         if result["exit_code"] == 0:
@@ -117,7 +125,7 @@ class SystemTool(BaseTool):
                 }
             )
 
-    def _update_packages(self, container_name: Optional[str] = None) -> ToolResult:
+    def _update_packages(self) -> ToolResult:
         """Update package lists."""
         command = "apt-get update"
         
@@ -125,7 +133,6 @@ class SystemTool(BaseTool):
         
         result = self.docker_orchestrator.execute_command(
             command=command,
-            container_name=container_name,
             timeout=120
         )
 
@@ -149,35 +156,27 @@ class SystemTool(BaseTool):
                 metadata={"exit_code": result["exit_code"], "command": command}
             )
 
-    def _detect_missing_dependencies(self, container_name: Optional[str] = None) -> ToolResult:
-        """Detect missing dependencies by checking common tools."""
-        missing_tools = []
+    def _detect_missing_tools(self) -> ToolResult:
+        """Detect missing development tools and dependencies."""
         
         # Common development tools to check
-        tools_to_check = {
-            "maven": ["mvn", "maven"],
-            "gradle": ["gradle"],
-            "node": ["nodejs", "npm"],
-            "python": ["python3", "pip3"],
-            "git": ["git"],
-            "curl": ["curl"],
-            "wget": ["wget"],
-            "unzip": ["unzip"],
-            "zip": ["zip"]
-        }
+        required_tools = [
+            "git", "curl", "wget", "python3", "pip", "node", "npm",
+            "java", "javac", "mvn", "make", "gcc", "g++"
+        ]
         
-        for tool, packages in tools_to_check.items():
-            # Check if tool is available
+        missing_tools = []
+        
+        for tool in required_tools:
             check_result = self.docker_orchestrator.execute_command(
                 command=f"which {tool}",
-                container_name=container_name,
                 timeout=10
             )
             
             if check_result["exit_code"] != 0:
                 missing_tools.append({
                     "tool": tool,
-                    "packages": packages,
+                    "packages": [tool], # Assuming a package name is the tool itself
                     "check_command": f"which {tool}"
                 })
 
@@ -201,11 +200,11 @@ class SystemTool(BaseTool):
                 metadata={"missing_tools": [], "total_missing": 0}
             )
 
-    def _install_missing_dependencies(self, container_name: Optional[str] = None) -> ToolResult:
-        """Automatically install missing dependencies."""
+    def _install_missing_dependencies(self) -> ToolResult:
+        """Detect and install missing dependencies automatically."""
         
         # First detect what's missing
-        detect_result = self._detect_missing_dependencies(container_name)
+        detect_result = self._detect_missing_tools()
         if not detect_result.success:
             return detect_result
         
@@ -227,7 +226,7 @@ class SystemTool(BaseTool):
         packages_to_install = list(set(packages_to_install))
         
         # Install all missing packages
-        install_result = self._install_packages(packages_to_install, container_name)
+        install_result = self._install_packages(packages_to_install)
         
         if install_result.success:
             return ToolResult(
@@ -316,11 +315,6 @@ class SystemTool(BaseTool):
                     "items": {"type": "string"},
                     "description": "List of packages to install (required for 'install' action)",
                     "default": []
-                },
-                "container_name": {
-                    "type": "string",
-                    "description": "Name of the container to operate on (optional)",
-                    "default": None
                 }
             },
             "required": ["action"]

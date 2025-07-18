@@ -58,6 +58,14 @@ class ReActEngine:
         self.recent_tool_executions = []
         self.max_recent_executions = 10
         self._force_thinking_next = False
+        
+        # State memory for successful operations
+        self.successful_states = {
+            'working_directory': None,  # Last successful working directory
+            'cloned_repos': set(),      # Set of successfully cloned repo URLs
+            'project_type': None,       # Detected project type
+            'maven_success': False,     # Whether maven operations succeeded
+        }
 
         # Agent logger for detailed traces
         self.agent_logger = create_agent_logger("react_engine")
@@ -287,6 +295,11 @@ class ReActEngine:
                 if self._is_task_complete():
                     self.agent_logger.info("Task completed successfully")
                     return True
+                
+                # Check if we should strongly suggest completion (rule-based)
+                completion_suggestion = self._check_completion_suggestion()
+                if completion_suggestion:
+                    self._add_strong_completion_guidance(completion_suggestion)
 
                 # Check for context switching guidance
                 self._check_context_switching_guidance()
@@ -499,23 +512,50 @@ class ReActEngine:
                         function_name = None
                         function_args = {}
                         
-                        # Standard format: {"name": "tool_name", "arguments": {...}}
-                        if 'name' in json_obj and 'arguments' in json_obj:
+                        # Format 1: {"tool": "tool_name", "action": "action_name", ...}
+                        if 'tool' in json_obj:
+                            function_name = json_obj['tool']
+                            # Convert all other fields to arguments, with special handling for common patterns
+                            function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
+                            
+                            # If there's only an action, it might be a parameter
+                            if len(function_args) == 1 and 'action' in function_args:
+                                function_args = {'action': function_args['action']}
+                        
+                        # Format 2: Standard format: {"name": "tool_name", "arguments": {...}}
+                        elif 'name' in json_obj and 'arguments' in json_obj:
                             function_name = json_obj['name']
                             function_args = json_obj['arguments']
                         
-                        # Alternative format: {"tool": "tool_name", "action": "action_name", ...}
-                        elif 'tool' in json_obj:
-                            function_name = json_obj['tool']
-                            # Convert all other fields to arguments
-                            function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
-                        
-                        # Single tool name format: {"manage_context": {...}}
+                        # Format 3: Single tool name format: {"manage_context": {...}}
                         elif len(json_obj) == 1:
                             tool_name = list(json_obj.keys())[0]
                             if tool_name in self.tools:
                                 function_name = tool_name
                                 function_args = json_obj[tool_name] if isinstance(json_obj[tool_name], dict) else {}
+                        
+                        # Format 4: Simple parameter object (assume it's for the last mentioned tool)
+                        elif not function_name and any(key in json_obj for key in ['action', 'command', 'path', 'query']):
+                            # Try to infer tool based on parameters
+                            if 'action' in json_obj:
+                                if json_obj.get('action') in ['read', 'write', 'append']:
+                                    function_name = 'file_io'
+                                elif json_obj.get('action') in ['get_info', 'switch_to_trunk', 'create_branch']:
+                                    function_name = 'manage_context'
+                                elif json_obj.get('action') in ['clone', 'detect_project_type']:
+                                    function_name = 'project_setup'
+                                function_args = json_obj
+                            elif 'command' in json_obj:
+                                # Check if it's a maven command or bash command
+                                command = json_obj.get('command', '').lower()
+                                if any(cmd in command for cmd in ['compile', 'test', 'package', 'clean', 'install']):
+                                    function_name = 'maven'
+                                else:
+                                    function_name = 'bash'
+                                function_args = json_obj
+                            elif 'query' in json_obj:
+                                function_name = 'web_search'
+                                function_args = json_obj
                         
                         if function_name:
                             # Format as ReAct ACTION
@@ -538,7 +578,7 @@ class ReActEngine:
                             function_name = None
                             function_args = {}
                             
-                            # Try different JSON formats
+                            # Try different JSON formats (same logic as above)
                             if 'name' in json_obj and 'arguments' in json_obj:
                                 function_name = json_obj['name']
                                 function_args = json_obj['arguments']
@@ -953,6 +993,10 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     
                     # Track this execution
                     self._track_tool_execution(tool_signature, result.success)
+                    
+                    # Update successful states for future reference
+                    if result.success:
+                        self._update_successful_states(step.tool_name, validated_params, result)
 
                 step.tool_result = result
 
@@ -1167,41 +1211,177 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         """Fix common parameter naming issues."""
         fixed_params = params.copy()
         
-        # Common parameter name mappings
+        # Common parameter name mappings (removed conflicting mappings)
         name_mappings = {
-            # Command variations
-            'cmd': 'command',
-            'exec': 'command',
-            'run': 'command',
-            
-            # Path variations
-            'file': 'path',
-            'filepath': 'path',
-            'file_path': 'path',
-            'dir': 'path',
-            'directory': 'path',
-            'working_dir': 'working_directory',
-            
-            # Action variations
+            # Action variations (file_io, context tools)
             'op': 'action',
             'operation': 'action',
             'method': 'action',
+            'type': 'action',
             
-            # Query variations
+            # Query variations (web_search tool)
             'search': 'query',
             'q': 'query',
             'term': 'query',
             'search_term': 'query',
+            'keywords': 'query',
+            
+            # URL variations (project_setup tool)
+            'url': 'repository_url',
+            'repo_url': 'repository_url',
+            'git_url': 'repository_url',
+            'repository': 'repository_url',
+            'repo': 'repository_url',
+            'git_repo': 'repository_url',
+            
+            # Target directory variations (project_setup tool)
+            'destination': 'target_directory',
+            'dest': 'target_directory',
+            'target_dir': 'target_directory',
+            'output_dir': 'target_directory',
+            'clone_dir': 'target_directory',
+            
+            # Maven/build specific (non-conflicting)
+            'options': 'properties',
+            'opts': 'properties',
+            'maven_options': 'properties',
+            'build_options': 'properties',
+            
+            # Context specific
+            'context_type': 'action',
+            'name': 'task_id',
+            'parameters': 'summary',
+            'task_name': 'task_id',
+            'id': 'task_id',
+            
+            # Content variations (file_io tool)
+            'data': 'content',
+            'text': 'content',
+            'body': 'content',
+            'file_content': 'content',
         }
         
-        # Apply mappings if target parameter exists in schema
+        # Tool-specific mappings for better accuracy
+        tool_specific_mappings = {
+            'bash': {
+                'cmd': 'command',
+                'script': 'command',
+                'exec': 'command',
+                'shell': 'command',
+                'run': 'command',
+                'execute': 'command',
+                'bash_command': 'command',
+                'shell_command': 'command',
+                'dir': 'working_directory',
+                'cwd': 'working_directory',
+                'working_dir': 'working_directory',
+                'workdir': 'working_directory',
+                'work_dir': 'working_directory',
+            },
+            'file_io': {
+                'file': 'path',
+                'filename': 'path',
+                'filepath': 'path',
+                'file_path': 'path',
+                'operation': 'action',
+                'op': 'action',
+                'data': 'content',
+                'text': 'content',
+            },
+            'project_setup': {
+                'url': 'repository_url',
+                'repo': 'repository_url',
+                'destination': 'target_directory',
+                'dest': 'target_directory',
+                'output': 'target_directory',
+            },
+            'maven': {
+                'goals': 'command',
+                'options': 'properties',
+                'dir': 'working_directory',
+                'project_dir': 'working_directory',
+            },
+            'manage_context': {
+                'type': 'action',
+                'operation': 'action',
+                'context_type': 'action',
+                'name': 'task_id',
+                'id': 'task_id',
+            }
+        }
+        
+        # Apply tool-specific mappings first (higher priority)
+        if tool_name in tool_specific_mappings:
+            tool_mappings = tool_specific_mappings[tool_name]
+            for old_name, new_name in tool_mappings.items():
+                if old_name in fixed_params and new_name in properties:
+                    # If target parameter exists but old parameter has a non-default value, use the old value
+                    if new_name in fixed_params:
+                        # Check if the existing value is a default/placeholder value
+                        existing_value = fixed_params[new_name]
+                        old_value = fixed_params[old_name]
+                        if (existing_value in ['help', '', None] or 
+                            str(existing_value).strip() == '' or
+                            (isinstance(existing_value, str) and len(old_value) > len(existing_value))):
+                            fixed_params[new_name] = old_value
+                            logger.info(f"🔧 Tool-specific rename (override): '{old_name}' → '{new_name}' for {tool_name}")
+                        else:
+                            logger.debug(f"🔧 Skipping rename '{old_name}' → '{new_name}' (target has value: {existing_value})")
+                    else:
+                        # Target doesn't exist, normal mapping
+                        fixed_params[new_name] = fixed_params[old_name]
+                        logger.info(f"🔧 Tool-specific rename: '{old_name}' → '{new_name}' for {tool_name}")
+                    
+                    # Always delete the old parameter
+                    del fixed_params[old_name]
+        
+        # Apply general mappings if target parameter exists in schema
+        mappings_applied = []
         for old_name, new_name in name_mappings.items():
             if old_name in fixed_params and new_name in properties and new_name not in fixed_params:
                 fixed_params[new_name] = fixed_params[old_name]
                 del fixed_params[old_name]
+                mappings_applied.append(f"{old_name} → {new_name}")
                 logger.info(f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}")
         
+        # Log all mappings applied for debugging
+        if mappings_applied:
+            logger.debug(f"Parameter mappings applied for {tool_name}: {', '.join(mappings_applied)}")
+        
         return fixed_params
+
+    def _update_successful_states(self, tool_name: str, params: Dict[str, Any], result: ToolResult):
+        """Update successful states based on tool execution results."""
+        try:
+            if tool_name == "bash" and params.get("working_directory"):
+                # Remember successful working directory
+                self.successful_states['working_directory'] = params['working_directory']
+                logger.debug(f"Updated successful working directory: {params['working_directory']}")
+            
+            elif tool_name == "maven" and params.get("working_directory"):
+                # Remember successful Maven working directory
+                if "BUILD SUCCESS" in (result.output or ""):
+                    self.successful_states['working_directory'] = params['working_directory']
+                    self.successful_states['maven_success'] = True
+                    logger.info(f"Maven success recorded for directory: {params['working_directory']}")
+            
+            elif tool_name == "project_setup":
+                # Remember cloned repositories and project type
+                if params.get("repository_url"):
+                    self.successful_states['cloned_repos'].add(params['repository_url'])
+                    logger.debug(f"Recorded cloned repo: {params['repository_url']}")
+                
+                # Check for project type detection in output
+                output = result.output or ""
+                if "maven" in output.lower() or "pom.xml" in output.lower():
+                    self.successful_states['project_type'] = 'maven'
+                    logger.debug("Detected Maven project type")
+                elif "gradle" in output.lower() or "build.gradle" in output.lower():
+                    self.successful_states['project_type'] = 'gradle'
+                    logger.debug("Detected Gradle project type")
+        
+        except Exception as e:
+            logger.warning(f"Failed to update successful states: {e}")
 
     def _apply_basic_parameter_fixes(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Apply basic parameter fixes when schema is not available."""
@@ -1237,7 +1417,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         return fixed_params
 
     def _apply_tool_specific_fixes(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply tool-specific parameter fixes."""
+        """Apply tool-specific parameter fixes using state memory."""
         fixed_params = params.copy()
         
         if tool_name == "project_setup":
@@ -1246,11 +1426,33 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 if self.repository_url:
                     fixed_params["repository_url"] = self.repository_url
                     logger.info(f"🔧 Auto-injected repository URL: {self.repository_url}")
+            
+            # Prevent duplicate cloning
+            if (fixed_params.get("action") == "clone" and 
+                fixed_params.get("repository_url") in self.successful_states['cloned_repos']):
+                logger.warning(f"🔧 Repository already cloned, changing action to detect_project_type")
+                fixed_params["action"] = "detect_project_type"
         
         elif tool_name == "maven":
             # Ensure maven has a valid command
             if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
-                fixed_params["command"] = "compile"
+                # Use intelligent default based on current state
+                if self.successful_states['maven_success']:
+                    fixed_params["command"] = "test"  # If compile succeeded before, try test
+                else:
+                    fixed_params["command"] = "compile"  # Start with compile
+            
+            # Auto-inject successful working directory for Maven operations
+            if "working_directory" not in fixed_params:
+                if self.successful_states['working_directory']:
+                    fixed_params["working_directory"] = self.successful_states['working_directory']
+                    logger.info(f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}")
+                else:
+                    # Try to infer from repository URL
+                    if self.repository_url:
+                        repo_name = self.repository_url.split('/')[-1].replace('.git', '')
+                        fixed_params["working_directory"] = f"/workspace/{repo_name}"
+                        logger.info(f"🔧 Inferred working directory from repo: /workspace/{repo_name}")
             
             # Convert common typos
             command = fixed_params.get("command", "")
@@ -1265,10 +1467,14 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             # Ensure bash has a command
             if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
                 fixed_params["command"] = "pwd"
-                
-            # Add working directory if not specified
+            
+            # Auto-inject successful working directory for bash operations
             if "working_directory" not in fixed_params:
-                fixed_params["working_directory"] = "/workspace"
+                if self.successful_states['working_directory']:
+                    fixed_params["working_directory"] = self.successful_states['working_directory']
+                    logger.info(f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}")
+                else:
+                    fixed_params["working_directory"] = "/workspace"
                 
         elif tool_name == "file_io":
             # Ensure file_io has an action
@@ -1276,9 +1482,9 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 fixed_params["action"] = "read"
                 
             # If reading but no file path, default to current directory listing
-            if fixed_params.get("action") == "read" and not fixed_params.get("file_path"):
+            if fixed_params.get("action") == "read" and not fixed_params.get("path"):
                 fixed_params["action"] = "list"
-                fixed_params["file_path"] = "/workspace"
+                fixed_params["path"] = self.successful_states['working_directory'] or "/workspace"
         
         return fixed_params
 
@@ -1287,6 +1493,10 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         if result.success:
             # For successful results, preserve key status information
             formatted = f"✅ {tool_name} executed successfully"
+            
+            # Add command information for bash tool
+            if tool_name == "bash" and result.metadata and "command" in result.metadata:
+                formatted += f"\nCommand: {result.metadata['command']}"
             
             # Add complete output
             if result.output:
@@ -1312,6 +1522,10 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             # For failed results, show error and suggestions
             error_msg = result.error if result.error else "Unknown error occurred"
             formatted = f"❌ {tool_name} failed: {error_msg}"
+            
+            # Add command information for failed bash tool
+            if tool_name == "bash" and result.metadata and "command" in result.metadata:
+                formatted += f"\nCommand: {result.metadata['command']}"
             
             if result.suggestions:
                 formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])
@@ -1376,13 +1590,14 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         recent_tool_count = len(tool_executions)
         recent_failures = sum(1 for exec_info in tool_executions if not exec_info["success"])
         
+        # More lenient thresholds to avoid blocking legitimate operations
         # Block if: 
-        # 1. Exact same call attempted 2+ times, OR
-        # 2. Same tool failed 3+ times recently, OR  
-        # 3. Same tool called 5+ times in recent executions
-        return (exact_match_count >= 2 or 
-                recent_failures >= 3 or 
-                recent_tool_count >= 5)
+        # 1. Exact same call attempted 3+ times, OR
+        # 2. Same tool failed 5+ times recently, OR  
+        # 3. Same tool called 8+ times in recent executions
+        return (exact_match_count >= 3 or 
+                recent_failures >= 5 or 
+                recent_tool_count >= 8)
 
     def _track_tool_execution(self, tool_signature: str, success: bool):
         """Track tool execution to detect repetitive patterns."""
@@ -1411,6 +1626,22 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
     def _is_task_complete(self) -> bool:
         """Check if the current task is complete."""
+        # Check for report tool completion signal (highest priority)
+        recent_steps = self.steps[-3:] if len(self.steps) >= 3 else self.steps
+        
+        for step in recent_steps:
+            if step.step_type == StepType.ACTION and step.tool_name == "report":
+                if step.tool_result and step.tool_result.success:
+                    metadata = step.tool_result.metadata or {}
+                    if metadata.get("completion_signal") or metadata.get("task_completed"):
+                        logger.info("Task completion detected via report tool")
+                        return True
+        
+        # Check for successful Maven test completion (rule-based completion)
+        if self._check_maven_completion():
+            logger.info("Task completion detected via Maven success criteria")
+            return True
+        
         # Look at recent steps for completion indicators
         recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
 
@@ -1426,6 +1657,9 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                         "done",
                         "successfully completed",
                         "all tasks completed",
+                        "build and test complete",
+                        "maven build successful",
+                        "tests passed successfully",
                     ]
                 ):
                     return True
@@ -1438,10 +1672,133 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     and step.tool_params.get("summary")
                 ):
                     summary = step.tool_params.get("summary", "").lower()
-                    if "completed" in summary or "success" in summary:
+                    if "completed" in summary or "success" in summary or "finished" in summary:
                         return True
 
         return False
+
+    def _check_maven_completion(self) -> bool:
+        """Check if Maven project has been successfully built and tested."""
+        # Look for successful Maven test execution in recent steps
+        recent_steps = self.steps[-10:] if len(self.steps) >= 10 else self.steps
+        
+        maven_compile_success = False
+        maven_test_success = False
+        
+        for step in recent_steps:
+            if (step.step_type == StepType.ACTION and 
+                step.tool_name == "maven" and 
+                step.tool_result and step.tool_result.success):
+                
+                output = step.tool_result.output or ""
+                command = step.tool_params.get("command", "") if step.tool_params else ""
+                
+                # Check for successful compilation
+                if ("compile" in command.lower() and 
+                    "BUILD SUCCESS" in output):
+                    maven_compile_success = True
+                    logger.debug("Maven compile success detected")
+                
+                # Check for successful test execution
+                if ("test" in command.lower() and 
+                    "BUILD SUCCESS" in output and
+                    "Tests run:" in output):
+                    
+                    # Parse test results
+                    import re
+                    test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
+                    if test_match:
+                        total, failures, errors = map(int, test_match.groups())
+                        if failures == 0 and errors == 0 and total > 0:
+                            maven_test_success = True
+                            logger.info(f"Maven test success detected: {total} tests, 0 failures, 0 errors")
+        
+        # Consider task complete if test succeeded (test usually includes compilation)
+        # OR if both compile and test succeeded explicitly
+        if maven_test_success or (maven_compile_success and maven_test_success):
+            logger.info("Maven project completion criteria met: test successful")
+            # Add completion guidance for the agent
+            self._add_completion_guidance("Maven build and test completed successfully")
+            return True
+            
+        return False
+
+    def _add_completion_guidance(self, reason: str):
+        """Add guidance to help agent recognize task completion."""
+        guidance = (f"SYSTEM GUIDANCE: Task completion detected! {reason}. "
+                   f"You should now generate a completion report using the report tool "
+                   f"with a summary of what was accomplished, then the system will stop.")
+        
+        guidance_step = ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content=guidance,
+            timestamp=self._get_timestamp(),
+        )
+        self.steps.append(guidance_step)
+        
+        self.agent_logger.info(f"🏁 COMPLETION GUIDANCE: {guidance}")
+        logger.info(f"🏁 COMPLETION GUIDANCE: Task completion detected - {reason}")
+
+    def _check_completion_suggestion(self) -> str:
+        """Check if we should strongly suggest task completion."""
+        # Check if Maven build and test succeeded but no report generated yet
+        if (self.successful_states['maven_success'] and 
+            not self._has_report_been_generated()):
+            
+            # Look for recent Maven test success
+            recent_steps = self.steps[-10:] if len(self.steps) >= 10 else self.steps
+            for step in recent_steps:
+                if (step.step_type == StepType.ACTION and 
+                    step.tool_name == "maven" and 
+                    step.tool_result and step.tool_result.success):
+                    
+                    output = step.tool_result.output or ""
+                    if ("test" in step.tool_params.get("command", "").lower() and
+                        "BUILD SUCCESS" in output and
+                        "Tests run:" in output):
+                        
+                        # Parse test results to confirm no failures
+                        import re
+                        test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
+                        if test_match:
+                            total, failures, errors = map(int, test_match.groups())
+                            if failures == 0 and errors == 0 and total > 0:
+                                return f"Maven build and test completed successfully ({total} tests passed)"
+        
+        # Check if we've been running for many iterations without progress
+        if self.current_iteration >= 15 and not self._has_report_been_generated():
+            # Check if we have any clear successes
+            if self.successful_states['cloned_repos'] or self.successful_states['maven_success']:
+                return "Task has been running for many iterations with some successes"
+        
+        return None
+    
+    def _has_report_been_generated(self) -> bool:
+        """Check if a report has already been generated."""
+        for step in self.steps:
+            if (step.step_type == StepType.ACTION and 
+                step.tool_name == "report" and 
+                step.tool_result and step.tool_result.success):
+                return True
+        return False
+    
+    def _add_strong_completion_guidance(self, reason: str):
+        """Add strong guidance to push agent toward completion."""
+        guidance = (f"🚨 URGENT COMPLETION NOTICE: {reason}. "
+                   f"You MUST now call the report tool to generate a completion summary. "
+                   f"Example: report(action='generate_completion_report', "
+                   f"summary='Maven project successfully built and tested'). "
+                   f"This will complete the task and stop further iterations.")
+        
+        guidance_step = ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content=guidance,
+            timestamp=self._get_timestamp(),
+        )
+        self.steps.append(guidance_step)
+        
+        self.agent_logger.info(f"🚨 URGENT COMPLETION: {guidance}")
+        logger.info(f"🚨 URGENT COMPLETION: Strong completion guidance added - {reason}")
 
     def _check_context_switching_guidance(self):
         """Check if we should provide context switching guidance."""
@@ -1472,18 +1829,34 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         """Build the prompt for the next iteration."""
         prompt = "CONVERSATION HISTORY:\n\n"
 
-        # Add recent steps (last 10 to keep context manageable)
-        recent_steps = self.steps[-10:] if len(self.steps) > 10 else self.steps
+        # Limit recent steps to avoid context window overflow
+        # Keep the most recent steps, but cap the total length
+        max_steps = 7  # Start with fewer steps to stay within context window
+        
+        # If we have more steps, take the first few and the most recent ones
+        if len(self.steps) > max_steps * 2:
+            # Take first 2 steps (usually context and first action) and last max_steps
+            recent_steps = self.steps[:2] + self.steps[-max_steps:]
+            prompt += "... (earlier steps omitted for brevity) ...\n\n"
+        elif len(self.steps) > max_steps:
+            # Just take the most recent steps
+            recent_steps = self.steps[-max_steps:]
+        else:
+            recent_steps = self.steps
 
         for step in recent_steps:
             if step.step_type == StepType.THOUGHT:
-                prompt += f"THOUGHT: {step.content}\n\n"
+                # Truncate very long thoughts to keep context manageable
+                content = step.content[:5000] + "..." if len(step.content) > 5000 else step.content
+                prompt += f"THOUGHT: {content}\n\n"
             elif step.step_type == StepType.ACTION:
                 prompt += f"ACTION: {step.tool_name}\n"
                 if step.tool_params:
                     prompt += f"PARAMETERS: {json.dumps(step.tool_params)}\n\n"
             elif step.step_type == StepType.OBSERVATION:
-                prompt += f"OBSERVATION: {step.content}\n\n"
+                # Truncate very long observations to keep context manageable
+                content = step.content[:5000] + "..." if len(step.content) > 5000 else step.content
+                prompt += f"OBSERVATION: {content}\n\n"
             elif step.step_type == StepType.SYSTEM_GUIDANCE:
                 prompt += f"SYSTEM GUIDANCE: {step.content}\n\n"
 

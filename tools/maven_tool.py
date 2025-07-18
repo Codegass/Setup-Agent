@@ -374,3 +374,46 @@ For debugging:
 • maven(command="dependency:tree")  # Analyze dependencies
 • maven(command="help:effective-pom")  # See effective POM
 """
+    
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        """Get the parameters schema for this tool."""
+        return {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "Maven command (e.g., 'clean', 'compile', 'test', 'package', 'install')",
+                },
+                "goals": {
+                    "type": "string",
+                    "description": "Additional goals to run (e.g., 'clean compile', 'test-compile')",
+                    "default": None,
+                },
+                "profiles": {
+                    "type": "string",
+                    "description": "Maven profiles to activate (e.g., 'dev,test')",
+                    "default": None,
+                },
+                "properties": {
+                    "type": "string",
+                    "description": "Maven properties (e.g., 'skipTests=true,maven.test.skip=true')",
+                    "default": None,
+                },
+                "raw_output": {
+                    "type": "boolean",
+                    "description": "Whether to return raw Maven output for detailed analysis",
+                    "default": False,
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Directory to execute Maven in",
+                    "default": "/workspace",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Command timeout in seconds",
+                    "default": 300,
+                },
+            },
+            "required": ["command"],
+        }
