@@ -6,17 +6,18 @@ from typing import Dict, Any, Optional
 
 from loguru import logger
 
-from .enhanced_base import EnhancedBaseTool, ToolResult, ToolError
+from .base import BaseTool, ToolResult, ToolError
 
 
-class MavenTool(EnhancedBaseTool):
+class MavenTool(BaseTool):
     """Maven build tool with enhanced error handling and raw output access."""
     
     def __init__(self, orchestrator):
         super().__init__(
             name="maven",
             description="Execute Maven commands with comprehensive error analysis and raw output access. "
-                       "Supports all Maven lifecycle phases, dependency management, and build analysis."
+                       "Supports all Maven lifecycle phases, dependency management, and build analysis. "
+                       "Automatically installs Maven if not present."
         )
         self.orchestrator = orchestrator
     
@@ -42,6 +43,12 @@ class MavenTool(EnhancedBaseTool):
             working_directory: Directory to execute Maven in
             timeout: Command timeout in seconds
         """
+        
+        # Check if Maven is installed, install if not
+        if not self._is_maven_installed():
+            install_result = self._install_maven()
+            if not install_result.success:
+                return install_result
         
         # Build Maven command
         maven_cmd = self._build_maven_command(command, goals, profiles, properties)
@@ -116,6 +123,60 @@ class MavenTool(EnhancedBaseTool):
             cmd_parts.append(command)
         
         return " ".join(cmd_parts)
+    
+    def _is_maven_installed(self) -> bool:
+        """Check if Maven is installed."""
+        try:
+            result = self.orchestrator.execute_command("which mvn")
+            return result["exit_code"] == 0
+        except Exception:
+            return False
+    
+    def _install_maven(self) -> ToolResult:
+        """Install Maven automatically."""
+        logger.info("Maven not found, installing automatically...")
+        
+        try:
+            # Update package lists
+            update_result = self.orchestrator.execute_command("apt-get update")
+            if update_result["exit_code"] != 0:
+                logger.warning("Failed to update package lists, continuing anyway...")
+            
+            # Install Maven
+            install_result = self.orchestrator.execute_command("apt-get install -y maven")
+            
+            if install_result["exit_code"] == 0:
+                logger.info("Maven installed successfully")
+                return ToolResult(
+                    success=True,
+                    output="Maven installed successfully",
+                    metadata={"auto_installed": True}
+                )
+            else:
+                return ToolResult(
+                    success=False,
+                    output=install_result["output"],
+                    error="Failed to install Maven automatically",
+                    error_code="MAVEN_INSTALL_FAILED",
+                    suggestions=[
+                        "Check network connectivity",
+                        "Try running: apt-get update && apt-get install -y maven",
+                        "Verify package repositories are accessible"
+                    ],
+                    documentation_links=["https://maven.apache.org/install.html"]
+                )
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                output="",
+                error=f"Failed to install Maven: {str(e)}",
+                error_code="MAVEN_INSTALL_ERROR",
+                suggestions=[
+                    "Check Docker container permissions",
+                    "Verify apt-get is available",
+                    "Try manual installation"
+                ]
+            )
     
     def _analyze_maven_output(self, output: str, exit_code: int) -> Dict[str, Any]:
         """Analyze Maven output for key information."""

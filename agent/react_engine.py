@@ -39,10 +39,11 @@ class ReActStep(BaseModel):
 class ReActEngine:
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
-    def __init__(self, context_manager: ContextManager, tools: List[BaseTool]):
+    def __init__(self, context_manager: ContextManager, tools: List[BaseTool], repository_url: str = None):
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
+        self.repository_url = repository_url
 
         # ReAct state
         self.steps: List[ReActStep] = []
@@ -52,6 +53,11 @@ class ReActEngine:
         # Context switching guidance
         self.steps_since_context_switch = 0
         self.context_switch_threshold = self.config.context_switch_threshold
+
+        # Tool execution tracking to avoid repetitive calls
+        self.recent_tool_executions = []
+        self.max_recent_executions = 10
+        self._force_thinking_next = False
 
         # Agent logger for detailed traces
         self.agent_logger = create_agent_logger("react_engine")
@@ -65,6 +71,13 @@ class ReActEngine:
         logger.info("ReAct Engine initialized with dual model support")
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
+        if repository_url:
+            logger.info(f"Repository URL: {repository_url}")
+
+    def set_repository_url(self, repository_url: str):
+        """Set the repository URL for the current project."""
+        self.repository_url = repository_url
+        logger.info(f"Repository URL set: {repository_url}")
 
     def _setup_litellm(self):
         """Setup LiteLLM configuration."""
@@ -264,6 +277,7 @@ class ReActEngine:
 
                 if not parsed_steps:
                     logger.warning("No valid steps parsed from LLM response")
+                    logger.warning(f"Raw response was: {repr(response)}")
                     continue
 
                 # Execute the steps
@@ -276,6 +290,10 @@ class ReActEngine:
 
                 # Check for context switching guidance
                 self._check_context_switching_guidance()
+                
+                # Check if model needs explicit action guidance
+                if self._needs_action_guidance():
+                    self._add_action_guidance()
 
                 # Build prompt for next iteration
                 current_prompt = self._build_next_prompt()
@@ -295,6 +313,12 @@ class ReActEngine:
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step."""
+        # Check if thinking model was explicitly requested due to repetitive execution
+        if self._force_thinking_next:
+            self._force_thinking_next = False  # Reset the flag
+            logger.info("Using thinking model due to repetitive execution detection")
+            return True
+        
         # Use thinking model ONLY for pure reasoning, not for tool execution
         # The thinking model should only be used for complex analysis and planning
         
@@ -368,6 +392,13 @@ class ReActEngine:
                 temperature = self.config.action_temperature
                 max_tokens = self.config.action_max_tokens
 
+                # Special handling for O-series models (only support temperature=1)
+                if (
+                    "o4" in self.config.action_model.lower()
+                    or "o1" in self.config.action_model.lower()
+                ):
+                    temperature = 1.0
+
                 # Log detailed request in verbose mode
                 if self.config.verbose:
                     self._log_llm_request(
@@ -383,7 +414,8 @@ class ReActEngine:
                 }
 
                 # Add function calling support if available
-                if self.supports_function_calling and not use_thinking_model:
+                # For o4-mini and other supported models, use function calling for all steps
+                if self.supports_function_calling:
                     tools_schema = self._build_tools_schema()
                     if tools_schema:
                         request_params["tools"] = tools_schema
@@ -398,14 +430,26 @@ class ReActEngine:
                         logger.debug(
                             f"Using {model_type} function calling with {len(tools_schema)} tools"
                         )
+                        
+                        # Log first tool schema for debugging
+                        if tools_schema and self.config.verbose:
+                            logger.debug(f"First tool schema: {json.dumps(tools_schema[0], indent=2)}")
 
                 response = litellm.completion(**request_params)
 
+            # Debug logging for function calling response
+            message = response.choices[0].message
+            logger.debug(f"Response message attributes: {dir(message)}")
+            logger.debug(f"Has tool_calls: {hasattr(message, 'tool_calls')}")
+            if hasattr(message, 'tool_calls'):
+                logger.debug(f"Tool calls value: {message.tool_calls}")
+            
             # Handle function calling response
             if (
                 hasattr(response.choices[0].message, "tool_calls")
                 and response.choices[0].message.tool_calls
             ):
+                logger.debug("Using function calling response handler")
                 return self._handle_function_calling_response(response, model)
 
             content = response.choices[0].message.content
@@ -416,7 +460,18 @@ class ReActEngine:
 
             content_str = content if content is not None else ""
             self.agent_logger.info(f"LLM Response from {model}: {len(content_str)} chars")
+            
+            # Always log the full response content
+            logger.info(f"Full LLM Response from {model}:")
+            logger.info(content_str)
             logger.debug(f"Model used: {model}, Response length: {len(content_str)}")
+
+            # Fallback: Try to parse JSON function calls in content if function calling was expected
+            if self.supports_function_calling and content_str.strip():
+                parsed_content = self._try_parse_json_function_calls(content_str)
+                if parsed_content:
+                    logger.debug("Successfully parsed JSON function calls from content")
+                    return parsed_content
 
             return content_str
 
@@ -425,6 +480,153 @@ class ReActEngine:
             if self.config.verbose:
                 self._log_llm_error(e)
             return None
+
+    def _try_parse_json_function_calls(self, content: str) -> Optional[str]:
+        """Try to parse JSON function calls from content when function calling format is not used."""
+        try:
+            # Look for JSON patterns that might be function calls
+            lines = content.strip().split('\n')
+            parsed_parts = []
+            i = 0
+            
+            while i < len(lines):
+                stripped = lines[i].strip()
+                
+                # Check if this line contains a JSON object with various formats
+                if stripped.startswith('{') and stripped.endswith('}'):
+                    try:
+                        json_obj = json.loads(stripped)
+                        function_name = None
+                        function_args = {}
+                        
+                        # Standard format: {"name": "tool_name", "arguments": {...}}
+                        if 'name' in json_obj and 'arguments' in json_obj:
+                            function_name = json_obj['name']
+                            function_args = json_obj['arguments']
+                        
+                        # Alternative format: {"tool": "tool_name", "action": "action_name", ...}
+                        elif 'tool' in json_obj:
+                            function_name = json_obj['tool']
+                            # Convert all other fields to arguments
+                            function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
+                        
+                        # Single tool name format: {"manage_context": {...}}
+                        elif len(json_obj) == 1:
+                            tool_name = list(json_obj.keys())[0]
+                            if tool_name in self.tools:
+                                function_name = tool_name
+                                function_args = json_obj[tool_name] if isinstance(json_obj[tool_name], dict) else {}
+                        
+                        if function_name:
+                            # Format as ReAct ACTION
+                            parsed_parts.append(f"ACTION: {function_name}")
+                            parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
+                            logger.debug(f"Parsed JSON function call: {function_name} with args: {function_args}")
+                            i += 1
+                            continue
+                            
+                    except json.JSONDecodeError:
+                        # Not valid JSON, treat as regular content
+                        pass
+                
+                # Check for "ACTION:" followed by JSON on the next line
+                if stripped == 'ACTION:' and i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if next_line.startswith('{') and next_line.endswith('}'):
+                        try:
+                            json_obj = json.loads(next_line)
+                            function_name = None
+                            function_args = {}
+                            
+                            # Try different JSON formats
+                            if 'name' in json_obj and 'arguments' in json_obj:
+                                function_name = json_obj['name']
+                                function_args = json_obj['arguments']
+                            elif 'tool' in json_obj:
+                                function_name = json_obj['tool']
+                                function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
+                            
+                            if function_name:
+                                parsed_parts.append(f"ACTION: {function_name}")
+                                parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
+                                logger.debug(f"Parsed ACTION JSON: {function_name} with args: {function_args}")
+                                i += 2  # Skip both lines
+                                continue
+                        except json.JSONDecodeError:
+                            pass
+                
+                # Check for patterns like "ACTION: {json}" 
+                if stripped.startswith('ACTION:'):
+                    action_part = stripped[7:].strip()
+                    if action_part.startswith('{') and action_part.endswith('}'):
+                        try:
+                            json_obj = json.loads(action_part)
+                            function_name = None
+                            function_args = {}
+                            
+                            # Try different JSON formats
+                            if 'name' in json_obj and 'arguments' in json_obj:
+                                function_name = json_obj['name']
+                                function_args = json_obj['arguments']
+                            elif 'tool' in json_obj:
+                                function_name = json_obj['tool']
+                                function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
+                            
+                            if function_name:
+                                parsed_parts.append(f"ACTION: {function_name}")
+                                parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
+                                logger.debug(f"Parsed ACTION JSON: {function_name} with args: {function_args}")
+                                i += 1
+                                continue
+                        except json.JSONDecodeError:
+                            pass
+                
+                # Check for markdown code blocks with JSON
+                if stripped.startswith('```json') and i + 1 < len(lines):
+                    # Find the end of the code block
+                    json_lines = []
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip().startswith('```'):
+                        json_lines.append(lines[j])
+                        j += 1
+                    
+                    if json_lines:
+                        try:
+                            json_content = '\n'.join(json_lines).strip()
+                            json_obj = json.loads(json_content)
+                            function_name = None
+                            function_args = {}
+                            
+                            # Try different JSON formats
+                            if 'name' in json_obj and 'arguments' in json_obj:
+                                function_name = json_obj['name']
+                                function_args = json_obj['arguments']
+                            elif 'tool' in json_obj:
+                                function_name = json_obj['tool']
+                                function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
+                            
+                            if function_name:
+                                parsed_parts.append(f"ACTION: {function_name}")
+                                parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
+                                logger.debug(f"Parsed JSON code block: {function_name} with args: {function_args}")
+                                i = j + 1  # Skip past the closing ```
+                                continue
+                        except json.JSONDecodeError:
+                            pass
+                
+                # Keep non-JSON lines as-is (thoughts, etc.)
+                if stripped and not stripped.startswith('```'):
+                    parsed_parts.append(stripped)
+                
+                i += 1
+            
+            if parsed_parts:
+                return '\n'.join(parsed_parts)
+                
+        except Exception as e:
+            logger.warning(f"Failed to parse JSON function calls: {e}")
+            
+        return None
 
     def _build_initial_system_prompt(self) -> str:
         """Build the initial system prompt with context and tool information."""
@@ -439,7 +641,18 @@ Your workflow follows the ReAct (Reasoning and Acting) pattern:
 2. ACTION: Use a tool to take action
 3. OBSERVATION: Observe the results and plan next steps
 
-CRITICAL CONTEXT MANAGEMENT RULES:
+"""
+
+        # Add repository URL at the very beginning if available
+        if self.repository_url:
+            prompt += f"""🚨 IMPORTANT PROJECT INFORMATION 🚨
+Repository URL: {self.repository_url}
+This URL is ALREADY PROVIDED - DO NOT ASK FOR IT AGAIN!
+Your first action should be to clone this repository using the project_setup tool.
+
+"""
+
+        prompt += """CRITICAL CONTEXT MANAGEMENT RULES:
 - You work with TWO types of contexts: TRUNK (main) and BRANCH (sub-task)
 - TRUNK context: Contains the overall goal and TODO list
 - BRANCH context: For focused work on specific tasks
@@ -459,15 +672,16 @@ AVAILABLE TOOLS:
         # Add explicit tool name clarification
         prompt += """
 
-CRITICAL: ONLY USE THESE EXACT TOOL NAMES:
+AVAILABLE TOOLS:
 - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
 - file_io: Read and write files (NOT read_file or write_file)
 - web_search: Search the web for information
 - manage_context: Manage context switching (NOT context)
 - maven: Execute Maven commands (NOT mvn)
 - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
+- system: Install system packages and dependencies
 
-ANY OTHER TOOL NAMES WILL RESULT IN ERROR!"""
+Use these tools as needed to complete your tasks."""
 
         prompt += f"""
 
@@ -488,7 +702,29 @@ Current Task: {context_info.get('task', 'Not specified')}
 Current Focus: {context_info.get('focus', 'Not specified')}
 """
 
-        prompt += """
+        # Add different instructions based on function calling support
+        if self.supports_function_calling:
+            prompt += """
+
+RESPONSE FORMAT:
+You have access to function calling capabilities. Use the tools directly - they will be executed automatically.
+
+IMPORTANT GUIDELINES:
+1. USE THE TOOLS! Don't just think about using them - actually call them!
+2. Use the available tools through function calling to execute actions
+3. You can provide reasoning in your response content before or after tool calls
+4. Use manage_context tool to switch contexts when appropriate
+5. In TRUNK context: analyze TODO list and create branch contexts for tasks
+6. In BRANCH context: focus on the specific task, use detailed logging
+7. Always provide summaries when returning to trunk context
+8. Use bash tool for system operations, file_io for file operations
+9. Use web_search when you encounter unknown errors or need documentation
+10. When encountering errors, think carefully about the root cause before retrying
+
+MANDATORY WORKFLOW FOR PROJECT SETUP:
+1. Start by using the tools - don't ask questions, take action!"""
+        else:
+            prompt += """
 
 RESPONSE FORMAT:
 Always respond in this exact format:
@@ -512,8 +748,17 @@ IMPORTANT GUIDELINES:
 9. When encountering errors, think carefully about the root cause before retrying
 
 MANDATORY WORKFLOW FOR PROJECT SETUP:
-1. ALWAYS start with: manage_context(action="get_info")
-2. ALWAYS clone repository with: project_setup(action="clone", repository_url="https://github.com/apache/commons-cli.git")
+1. ALWAYS start with: manage_context(action="get_info")"""
+
+        # Add repository URL instruction if available
+        if self.repository_url:
+            prompt += f"""
+2. ALWAYS clone repository with: project_setup(action="clone", repository_url="{self.repository_url}")"""
+        else:
+            prompt += """
+2. ALWAYS clone repository with: project_setup(action="clone", repository_url="<REPOSITORY_URL>")"""
+
+        prompt += """
 3. ALWAYS detect project type: project_setup(action="detect_project_type")
 4. For Maven projects: maven(command="compile") or maven(command="test")
 5. For shell commands: bash(command="ls -la")
@@ -532,8 +777,15 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             "thinking" if was_thinking_model else "action"
         )
 
+        # Log the raw response for debugging
+        logger.debug(f"Parsing LLM response: {repr(response)}")
+
         # Split response into sections
         sections = re.split(r"\n\n(?=THOUGHT:|ACTION:|OBSERVATION:)", response.strip())
+        
+        logger.debug(f"Split response into {len(sections)} sections")
+        for i, section in enumerate(sections):
+            logger.debug(f"Section {i+1}: {section}")
 
         for section in sections:
             section = section.strip()
@@ -559,6 +811,20 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     continue
 
                 tool_name = action_lines[0][7:].strip()
+                
+                # Check for invalid tool names
+                if not tool_name or tool_name.lower() in ["none", "null", ""]:
+                    # Convert to a thought with guidance
+                    thought_content = "I need to take action but haven't specified a valid tool."
+                    steps.append(
+                        ReActStep(
+                            step_type=StepType.THOUGHT,
+                            content=thought_content,
+                            timestamp=self._get_timestamp(),
+                            model_used=model_used,
+                        )
+                    )
+                    continue
 
                 # Look for PARAMETERS line
                 params = {}
@@ -583,6 +849,22 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     )
                 )
 
+        # If no steps were parsed, try to extract at least a thought
+        if not steps and response.strip():
+            # Try to extract any content as a thought
+            content = response.strip()
+            if content:
+                logger.info(f"Parsing failed, treating entire response as thought")
+                logger.info(f"Full response content: {content}")
+                steps.append(
+                    ReActStep(
+                        step_type=StepType.THOUGHT,
+                        content=content,
+                        timestamp=self._get_timestamp(),
+                        model_used=model_used,
+                    )
+                )
+
         return steps
 
     def _execute_steps(self, steps: List[ReActStep]) -> bool:
@@ -591,8 +873,8 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             self.steps.append(step)
 
             if step.step_type == StepType.THOUGHT:
-                self.agent_logger.info(f"💭 THOUGHT ({step.model_used}): {step.content[:100]}...")
-                logger.info(f"💭 THOUGHT: {step.content[:100]}...")
+                self.agent_logger.info(f"💭 THOUGHT ({step.model_used}): {step.content}")
+                logger.info(f"💭 THOUGHT: {step.content}")
 
                 # Detailed logging in verbose mode
                 if self.config.verbose:
@@ -601,7 +883,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 # Log to branch context if we're in one
                 if isinstance(self.context_manager.current_context, BranchContext):
                     self.context_manager.current_context.add_log_entry(
-                        f"Thought: {step.content[:200]}..."
+                        f"Thought: {step.content}"
                     )
 
             elif step.step_type == StepType.ACTION:
@@ -618,14 +900,59 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     self._add_observation_step(error_msg)
                     continue
 
-                # Execute the tool
+                # Execute the tool with parameter validation and self-healing
                 tool = self.tools[step.tool_name]
+                
+                # Validate and fix parameters
+                validated_params = self._validate_and_fix_parameters(step.tool_name, step.tool_params or {})
 
-                # Log tool execution in verbose mode
-                if self.config.verbose:
-                    self._log_tool_execution_verbose(step.tool_name, step.tool_params or {})
+                # Check for repetitive tool execution
+                tool_signature = f"{step.tool_name}:{str(sorted(validated_params.items()))}"
+                if self._is_repetitive_execution(tool_signature):
+                    logger.warning(f"Detected repetitive execution of {step.tool_name}, adding guidance and triggering thinking model")
+                    
+                    # Force a switch to thinking model in next iteration
+                    self._force_thinking_next = True
+                    
+                    # Provide detailed guidance
+                    recent_executions = [e for e in self.recent_tool_executions 
+                                       if e["signature"].startswith(step.tool_name + ':')]
+                    failure_count = sum(1 for e in recent_executions if not e["success"])
+                    
+                    guidance_msg = (f"Tool {step.tool_name} has been executed repeatedly with {failure_count} failures. "
+                                  f"This suggests the current approach is not working. ")
+                    
+                    if step.tool_name == "maven":
+                        guidance_msg += ("Consider checking the project structure, examining build errors in detail, "
+                                       "or switching to bash tool to investigate the issue manually.")
+                    elif step.tool_name == "bash":
+                        guidance_msg += ("Consider checking command syntax, working directory, or using file_io "
+                                       "to examine files before executing commands.")
+                    else:
+                        guidance_msg += ("Consider examining the error messages, changing parameters, "
+                                       "or using a different tool to achieve the same goal.")
+                    
+                    result = ToolResult(
+                        success=False,
+                        output="",
+                        error=guidance_msg,
+                        error_code="REPETITIVE_EXECUTION",
+                        suggestions=[
+                            "Use thinking model to analyze the root cause of repeated failures",
+                            "Try a different approach or tool to achieve the same goal",
+                            "Examine the full error output using raw_output=true if available",
+                            "Use file_io or bash tools to investigate the environment manually"
+                        ]
+                    )
+                else:
+                    # Log tool execution in verbose mode
+                    if self.config.verbose:
+                        self._log_tool_execution_verbose(step.tool_name, validated_params)
 
-                result = tool.safe_execute(**(step.tool_params or {}))
+                    result = tool.safe_execute(**validated_params)
+                    
+                    # Track this execution
+                    self._track_tool_execution(tool_signature, result.success)
 
                 step.tool_result = result
 
@@ -633,8 +960,8 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 if self.config.verbose:
                     self._log_tool_result_verbose(step.tool_name, result)
 
-                # Add observation step
-                self._add_observation_step(str(result))
+                # Add observation step with improved formatting
+                self._add_observation_step(self._format_tool_result(step.tool_name, result))
 
                 # Log to branch context if we're in one
                 if isinstance(self.context_manager.current_context, BranchContext):
@@ -644,6 +971,433 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
         return True
 
+    def _validate_and_fix_parameters(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and fix tool parameters with self-healing capability."""
+        if tool_name not in self.tools:
+            logger.error(f"Unknown tool: {tool_name}")
+            return params
+            
+        tool = self.tools[tool_name]
+        
+        # Handle completely empty parameters
+        if not params:
+            params = {}
+        
+        # Get the tool's parameter schema
+        try:
+            if hasattr(tool, 'get_parameter_schema'):
+                schema = tool.get_parameter_schema()
+            elif hasattr(tool, '_get_parameters_schema'):
+                schema = tool._get_parameters_schema()
+            else:
+                # No schema available, apply basic fixes
+                return self._apply_basic_parameter_fixes(tool_name, params)
+                
+            # Validate and fix parameters
+            validated_params = self._fix_parameters_against_schema(params, schema, tool_name)
+            
+            # Apply additional tool-specific fixes
+            validated_params = self._apply_tool_specific_fixes(tool_name, validated_params)
+            
+            # Log parameter fixes if any were made
+            if validated_params != params:
+                logger.info(f"🔧 Parameter self-healing applied for {tool_name}")
+                logger.debug(f"Original params: {params}")
+                logger.debug(f"Fixed params: {validated_params}")
+                
+            return validated_params
+            
+        except Exception as e:
+            logger.warning(f"Failed to validate parameters for {tool_name}: {e}")
+            return self._apply_basic_parameter_fixes(tool_name, params)
+
+    def _fix_parameters_against_schema(self, params: Dict[str, Any], schema: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
+        """Fix parameters against a schema with intelligent defaults."""
+        fixed_params = params.copy()
+        
+        # Get schema properties
+        properties = schema.get('properties', {})
+        required = schema.get('required', [])
+        
+        # Fix missing required parameters
+        for param_name in required:
+            if param_name not in fixed_params or fixed_params[param_name] is None:
+                default_value = self._get_smart_default(param_name, properties.get(param_name, {}), tool_name)
+                if default_value is not None:
+                    fixed_params[param_name] = default_value
+                    logger.info(f"🔧 Added missing required parameter '{param_name}' with default: {default_value}")
+        
+        # Fix parameter types
+        for param_name, param_value in fixed_params.items():
+            if param_name in properties:
+                prop_schema = properties[param_name]
+                expected_type = prop_schema.get('type')
+                
+                # Try to convert to expected type
+                if expected_type and param_value is not None:
+                    converted_value = self._convert_parameter_type(param_value, expected_type, param_name)
+                    if converted_value != param_value:
+                        fixed_params[param_name] = converted_value
+                        logger.info(f"🔧 Converted parameter '{param_name}' from {type(param_value).__name__} to {expected_type}")
+        
+        # Handle common parameter naming issues
+        fixed_params = self._fix_parameter_names(fixed_params, properties, tool_name)
+        
+        return fixed_params
+
+    def _get_smart_default(self, param_name: str, param_schema: Dict[str, Any], tool_name: str) -> Any:
+        """Get smart default values for common parameters."""
+        param_type = param_schema.get('type', 'string')
+        
+        # Check if there's a default in the schema
+        if 'default' in param_schema:
+            return param_schema['default']
+        
+        # Smart defaults based on parameter names and tool types
+        smart_defaults = {
+            # Command-related parameters
+            'command': 'help' if tool_name == 'bash' else None,
+            'cmd': 'help',
+            'timeout': 60,
+            
+            # File-related parameters
+            'action': self._get_tool_specific_action_default(tool_name),
+            'path': '/workspace',
+            'file_path': '/workspace',
+            'directory': '/workspace',
+            'working_directory': '/workspace',
+            
+            # Web search parameters
+            'query': 'help' if tool_name == 'web_search' else None,
+            'max_results': 5,
+            
+            # System parameters
+            'packages': [] if param_type == 'array' else None,
+            
+            # Maven parameters
+            'goals': None,
+            'profiles': None,
+            'properties': None,
+            'raw_output': False,
+            
+            # Context management
+            'context_type': 'branch',
+            'summary': 'Task in progress',
+            
+            # Project setup parameters - DO NOT provide defaults for URLs
+            # These should come from the user's actual repository URL
+            'repository_url': None,
+            'url': None,
+            'repo_url': None,
+            
+            # Generic defaults by type
+            'boolean': False,
+            'integer': 0,
+            'array': [],
+            'object': {}
+        }
+        
+        # Try parameter name first
+        if param_name in smart_defaults:
+            return smart_defaults[param_name]
+        
+        # Try parameter type
+        if param_type in smart_defaults:
+            return smart_defaults[param_type]
+        
+        return None
+
+    def _get_tool_specific_action_default(self, tool_name: str) -> str:
+        """Get tool-specific default action."""
+        tool_action_defaults = {
+            'file_io': 'read',
+            'project_setup': 'clone',
+            'system': 'install_missing',
+            'manage_context': 'get_info',
+            'maven': 'compile',
+            'bash': None,
+            'web_search': None
+        }
+        return tool_action_defaults.get(tool_name, 'list')
+
+    def _convert_parameter_type(self, value: Any, expected_type: str, param_name: str) -> Any:
+        """Convert parameter to expected type."""
+        try:
+            if expected_type == 'string':
+                return str(value)
+            elif expected_type == 'integer':
+                if isinstance(value, str):
+                    # Try to extract number from string
+                    import re
+                    match = re.search(r'\d+', value)
+                    if match:
+                        return int(match.group())
+                return int(value)
+            elif expected_type == 'boolean':
+                if isinstance(value, str):
+                    return value.lower() in ['true', '1', 'yes', 'on']
+                return bool(value)
+            elif expected_type == 'array':
+                if isinstance(value, str):
+                    # Try to parse as JSON array or split by common delimiters
+                    try:
+                        import json
+                        return json.loads(value)
+                    except:
+                        # Split by common delimiters
+                        return [item.strip() for item in value.split(',')]
+                elif not isinstance(value, list):
+                    return [value]
+                return value
+            elif expected_type == 'object':
+                if isinstance(value, str):
+                    try:
+                        import json
+                        return json.loads(value)
+                    except:
+                        return {}
+                return value if isinstance(value, dict) else {}
+        except Exception as e:
+            logger.warning(f"Failed to convert parameter '{param_name}' to {expected_type}: {e}")
+            return value
+        
+        return value
+
+    def _fix_parameter_names(self, params: Dict[str, Any], properties: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
+        """Fix common parameter naming issues."""
+        fixed_params = params.copy()
+        
+        # Common parameter name mappings
+        name_mappings = {
+            # Command variations
+            'cmd': 'command',
+            'exec': 'command',
+            'run': 'command',
+            
+            # Path variations
+            'file': 'path',
+            'filepath': 'path',
+            'file_path': 'path',
+            'dir': 'path',
+            'directory': 'path',
+            'working_dir': 'working_directory',
+            
+            # Action variations
+            'op': 'action',
+            'operation': 'action',
+            'method': 'action',
+            
+            # Query variations
+            'search': 'query',
+            'q': 'query',
+            'term': 'query',
+            'search_term': 'query',
+        }
+        
+        # Apply mappings if target parameter exists in schema
+        for old_name, new_name in name_mappings.items():
+            if old_name in fixed_params and new_name in properties and new_name not in fixed_params:
+                fixed_params[new_name] = fixed_params[old_name]
+                del fixed_params[old_name]
+                logger.info(f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}")
+        
+        return fixed_params
+
+    def _apply_basic_parameter_fixes(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply basic parameter fixes when schema is not available."""
+        fixed_params = params.copy()
+        
+        # Tool-specific basic fixes
+        if tool_name == "maven":
+            if not fixed_params.get("command"):
+                fixed_params["command"] = "compile"
+        elif tool_name == "bash":
+            if not fixed_params.get("command"):
+                fixed_params["command"] = "pwd"  # Safe default
+        elif tool_name == "file_io":
+            if not fixed_params.get("action"):
+                fixed_params["action"] = "read"
+            if not fixed_params.get("file_path") and fixed_params.get("action") == "read":
+                fixed_params["file_path"] = "/workspace"
+        elif tool_name == "manage_context":
+            if not fixed_params.get("action"):
+                fixed_params["action"] = "get_info"
+        elif tool_name == "project_setup":
+            if not fixed_params.get("action"):
+                # If we have a repository URL, default to clone
+                if self.repository_url:
+                    fixed_params["action"] = "clone"
+                    fixed_params["repository_url"] = self.repository_url
+                else:
+                    fixed_params["action"] = "detect_project_type"
+        elif tool_name == "web_search":
+            if not fixed_params.get("query"):
+                fixed_params["query"] = "help"
+        
+        return fixed_params
+
+    def _apply_tool_specific_fixes(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply tool-specific parameter fixes."""
+        fixed_params = params.copy()
+        
+        if tool_name == "project_setup":
+            # Auto-inject repository URL if available and action is clone
+            if fixed_params.get("action") == "clone" and not fixed_params.get("repository_url"):
+                if self.repository_url:
+                    fixed_params["repository_url"] = self.repository_url
+                    logger.info(f"🔧 Auto-injected repository URL: {self.repository_url}")
+        
+        elif tool_name == "maven":
+            # Ensure maven has a valid command
+            if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
+                fixed_params["command"] = "compile"
+            
+            # Convert common typos
+            command = fixed_params.get("command", "")
+            if command in ["test", "tests"]:
+                fixed_params["command"] = "test"
+            elif command in ["build", "compile"]:
+                fixed_params["command"] = "compile" 
+            elif command in ["install", "package"]:
+                fixed_params["command"] = "package"
+                
+        elif tool_name == "bash":
+            # Ensure bash has a command
+            if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
+                fixed_params["command"] = "pwd"
+                
+            # Add working directory if not specified
+            if "working_directory" not in fixed_params:
+                fixed_params["working_directory"] = "/workspace"
+                
+        elif tool_name == "file_io":
+            # Ensure file_io has an action
+            if not fixed_params.get("action"):
+                fixed_params["action"] = "read"
+                
+            # If reading but no file path, default to current directory listing
+            if fixed_params.get("action") == "read" and not fixed_params.get("file_path"):
+                fixed_params["action"] = "list"
+                fixed_params["file_path"] = "/workspace"
+        
+        return fixed_params
+
+    def _format_tool_result(self, tool_name: str, result: ToolResult) -> str:
+        """Format tool result for observation with key information preservation."""
+        if result.success:
+            # For successful results, preserve key status information
+            formatted = f"✅ {tool_name} executed successfully"
+            
+            # Add complete output
+            if result.output:
+                # For Maven tool, show full output but with key info highlighted
+                if tool_name == "maven":
+                    formatted += self._extract_maven_key_info(result.output)
+                    # Add full output if different from key info
+                    maven_key_info = self._extract_maven_key_info(result.output)
+                    if len(maven_key_info) < len(result.output):
+                        formatted += f"\n\nFull Maven Output:\n{result.output}"
+                else:
+                    # For other tools, show complete output
+                    formatted += f"\n\nOutput: {result.output}"
+            
+            # Add metadata if available
+            if result.metadata:
+                if "exit_code" in result.metadata:
+                    formatted += f"\nExit code: {result.metadata['exit_code']}"
+                if "auto_installed" in result.metadata:
+                    formatted += f"\nAuto-installed: {result.metadata['auto_installed']}"
+                    
+        else:
+            # For failed results, show error and suggestions
+            error_msg = result.error if result.error else "Unknown error occurred"
+            formatted = f"❌ {tool_name} failed: {error_msg}"
+            
+            if result.suggestions:
+                formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])
+                
+            if result.error_code:
+                formatted += f"\nError code: {result.error_code}"
+            
+            # Add full raw output if available and error message is unclear
+            if result.raw_output and (not result.error or len(result.error.strip()) < 10):
+                formatted += f"\n\nRaw output: {result.raw_output}"
+                
+        return formatted
+
+    def _extract_maven_key_info(self, output: str) -> str:
+        """Extract key information from Maven output."""
+        key_info = ""
+        
+        # Look for success/failure patterns
+        if "BUILD SUCCESS" in output:
+            key_info += "\n🎉 Build completed successfully"
+        elif "BUILD FAILURE" in output:
+            key_info += "\n❌ Build failed"
+            
+        # Look for test results
+        if "Tests run:" in output:
+            import re
+            test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
+            if test_match:
+                total, failures, errors = test_match.groups()
+                key_info += f"\n📊 Tests: {total} run, {failures} failures, {errors} errors"
+                
+        # Look for compilation info
+        if "Compilation failure" in output:
+            key_info += "\n⚠️ Compilation failures detected"
+        elif "Nothing to compile" in output:
+            key_info += "\n✅ All classes up to date"
+            
+        # Look for artifacts
+        if "Building jar:" in output:
+            key_info += "\n📦 JAR artifact created"
+            
+        # Add full output if no key info found
+        if not key_info:
+            key_info = f"\n\nFull Output:\n{output}"
+            
+        return key_info
+
+    def _is_repetitive_execution(self, tool_signature: str) -> bool:
+        """Check if this tool execution is repetitive."""
+        # Count recent executions of the same tool with same parameters
+        exact_match_count = sum(1 for exec_info in self.recent_tool_executions 
+                               if exec_info["signature"] == tool_signature)
+        
+        # Extract tool name from signature
+        tool_name = tool_signature.split(':')[0]
+        
+        # Count recent executions of the same tool (regardless of parameters)
+        tool_executions = [exec_info for exec_info in self.recent_tool_executions 
+                          if exec_info["signature"].startswith(tool_name + ':')]
+        
+        # Check for patterns that indicate repetitive execution
+        recent_tool_count = len(tool_executions)
+        recent_failures = sum(1 for exec_info in tool_executions if not exec_info["success"])
+        
+        # Block if: 
+        # 1. Exact same call attempted 2+ times, OR
+        # 2. Same tool failed 3+ times recently, OR  
+        # 3. Same tool called 5+ times in recent executions
+        return (exact_match_count >= 2 or 
+                recent_failures >= 3 or 
+                recent_tool_count >= 5)
+
+    def _track_tool_execution(self, tool_signature: str, success: bool):
+        """Track tool execution to detect repetitive patterns."""
+        execution_info = {
+            "signature": tool_signature,
+            "success": success,
+            "timestamp": self._get_timestamp()
+        }
+        
+        self.recent_tool_executions.append(execution_info)
+        
+        # Keep only recent executions to prevent memory bloat
+        if len(self.recent_tool_executions) > self.max_recent_executions:
+            self.recent_tool_executions.pop(0)
+
     def _add_observation_step(self, observation: str):
         """Add an observation step."""
         obs_step = ReActStep(
@@ -651,10 +1405,9 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         )
         self.steps.append(obs_step)
 
-        # Log observation with truncation for console
-        truncated_obs = observation[:200] + "..." if len(observation) > 200 else observation
-        self.agent_logger.info(f"👁️ OBSERVATION: {truncated_obs}")
-        logger.info(f"👁️ OBSERVATION: {truncated_obs}")
+        # Log full observation content without truncation
+        self.agent_logger.info(f"👁️ OBSERVATION: {observation}")
+        logger.info(f"👁️ OBSERVATION: {observation}")
 
     def _is_task_complete(self) -> bool:
         """Check if the current task is complete."""
@@ -734,6 +1487,55 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             elif step.step_type == StepType.SYSTEM_GUIDANCE:
                 prompt += f"SYSTEM GUIDANCE: {step.content}\n\n"
 
+        # Check if we need to provide format guidance
+        thoughts_without_actions = 0
+        for step in reversed(recent_steps):
+            if step.step_type == StepType.THOUGHT:
+                thoughts_without_actions += 1
+            elif step.step_type == StepType.ACTION:
+                break
+        
+        if thoughts_without_actions >= 3:
+            # Model seems stuck in thinking without acting
+            if self.supports_function_calling:
+                prompt += """
+IMPORTANT: You have been thinking without taking action. Please use the available tools to make progress. 
+Use function calling to execute actions. Here's a reminder of available tools:
+- project_setup: Clone repositories and setup projects
+- manage_context: Manage context switching
+- bash: Execute shell commands
+- file_io: Read and write files
+- maven: Execute Maven commands
+- web_search: Search the web for information
+- system: Install system packages
+
+"""
+                # Add specific guidance based on repository URL
+                if self.repository_url:
+                    prompt += f"""The repository URL is already set: {self.repository_url}
+
+USE ONE OF THESE ACTIONS NOW:
+1. Clone the repository:
+   Call project_setup with action="clone" and repository_url="{self.repository_url}"
+
+2. Or check context first:
+   Call manage_context with action="get_info"
+
+DO NOT ask for the repository URL - it's already provided above!
+"""
+            else:
+                prompt += """
+IMPORTANT: You must take ACTION now. Use this format:
+
+ACTION: [tool_name]
+PARAMETERS: {"param1": "value1", "param2": "value2"}
+
+For example:
+ACTION: project_setup
+PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspace"}
+
+"""
+
         prompt += "Continue with your next THOUGHT and ACTION:\n\n"
         return prompt
 
@@ -742,6 +1544,72 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         from datetime import datetime
 
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _needs_action_guidance(self) -> bool:
+        """Check if the model needs explicit action guidance."""
+        # Count recent thoughts without actions
+        recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
+        thoughts_count = 0
+        actions_count = 0
+        
+        for step in reversed(recent_steps):
+            if step.step_type == StepType.THOUGHT:
+                thoughts_count += 1
+                # Check if the thought mentions needing repository URL
+                if any(phrase in step.content.lower() for phrase in [
+                    "need the repository url",
+                    "need access to",
+                    "please share",
+                    "could you",
+                    "waiting for",
+                    "require the url"
+                ]):
+                    return True
+            elif step.step_type == StepType.ACTION:
+                actions_count += 1
+                
+        # Need guidance if too many thoughts without actions
+        return thoughts_count >= 3 and actions_count == 0
+
+    def _add_action_guidance(self):
+        """Add explicit action guidance to help the model."""
+        if self.repository_url:
+            guidance = f"""SYSTEM GUIDANCE: You seem to be stuck. The repository URL is: {self.repository_url}
+
+Take ACTION NOW using function calling. Here's exactly what to do:
+
+Option 1: Clone the repository immediately:
+- Use project_setup tool with action="clone" and repository_url="{self.repository_url}"
+
+Option 2: Check context first:
+- Use manage_context tool with action="get_info"
+
+Option 3: If already cloned, navigate to the project:
+- Use bash tool with command="cd /workspace && ls -la"
+
+STOP asking for the repository URL - it's already provided above!"""
+        else:
+            guidance = """SYSTEM GUIDANCE: You need to take action. Use the available tools:
+
+1. manage_context - Check your current context
+2. bash - Execute shell commands
+3. file_io - Read and write files
+4. web_search - Search for information
+5. maven - Run Maven commands
+6. project_setup - Clone and setup projects
+7. system - Install packages
+
+Use function calling to execute these tools!"""
+
+        guidance_step = ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content=guidance,
+            timestamp=self._get_timestamp(),
+        )
+        self.steps.append(guidance_step)
+        
+        self.agent_logger.info(f"🔔 SYSTEM GUIDANCE: Added explicit action guidance")
+        logger.info(f"🔔 SYSTEM GUIDANCE: Model needs explicit action guidance")
 
     def _log_llm_request(
         self, model: str, prompt: str, temperature: float, max_tokens: int, is_thinking: bool
@@ -758,7 +1626,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             "temperature": temperature,
             "max_tokens": max_tokens,
             "prompt_length": len(prompt),
-            "prompt_preview": prompt[:200] + "..." if len(prompt) > 200 else prompt,
+            "full_prompt": prompt,  # Show full prompt instead of preview
             "timestamp": self._get_timestamp(),
         }
 
@@ -793,7 +1661,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             "model": model,
             "iteration": self.current_iteration,
             "response_length": len(content),
-            "response_preview": content[:500] + "..." if len(content) > 500 else content,
+            "full_response": content,  # Show full response instead of preview
             "usage": usage_info,
             "timestamp": self._get_timestamp(),
         }
@@ -871,11 +1739,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             "iteration": self.current_iteration,
             "success": result.success,
             "output_length": len(result.output) if result.output else 0,
-            "output_preview": (
-                result.output[:200] + "..."
-                if result.output and len(result.output) > 200
-                else result.output
-            ),
+            "full_output": result.output,  # Show full output instead of preview
             "error": result.error if hasattr(result, "error") else None,
             "timestamp": self._get_timestamp(),
         }

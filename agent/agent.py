@@ -20,10 +20,10 @@ from .react_engine import ReActEngine
 class SetupAgent:
     """Main agent that orchestrates project setup."""
 
-    def __init__(self, config: Config, orchestrator: DockerOrchestrator, max_iterations: int = 50):
+    def __init__(self, config: Config, orchestrator: DockerOrchestrator, max_iterations: Optional[int] = None):
         self.config = config
         self.orchestrator = orchestrator
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else config.max_iterations
         self.console = Console()
 
         # Context manager will be initialized after Docker setup
@@ -51,24 +51,26 @@ class SetupAgent:
         # Initialize tools
         self.tools = self._initialize_tools()
 
-        # Initialize ReAct engine
+        # Initialize ReAct engine (repository URL will be set later)
         self.react_engine = ReActEngine(context_manager=self.context_manager, tools=self.tools)
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
 
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
-        from tools.enhanced_context_tool import EnhancedContextTool
+        from tools.context_tool import ContextTool
         from tools.maven_tool import MavenTool
         from tools.project_setup_tool import ProjectSetupTool
+        from tools.system_tool import SystemTool
         
         tools = [
-            BashTool(),
+            BashTool(self.orchestrator),
             FileIOTool(),
             WebSearchTool(),
-            EnhancedContextTool(self.context_manager),
+            ContextTool(self.context_manager),
             MavenTool(self.orchestrator),
-            ProjectSetupTool(self.orchestrator)
+            ProjectSetupTool(self.orchestrator),
+            SystemTool(self.orchestrator)
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
@@ -99,6 +101,9 @@ class SetupAgent:
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
             self._initialize_context_and_tools()
+
+            # Step 1.6: Set repository URL for ReAct engine
+            self.react_engine.set_repository_url(project_url)
 
             # Step 2: Initialize trunk context
             trunk_context = self.context_manager.create_trunk_context(
@@ -227,7 +232,7 @@ I should:
 Please start by checking the current context and then proceed with the task.
 """
 
-            self.console.print(f"[dim]🔧 Executing task: {task_description[:50]}...[/dim]")
+            self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
 
             # Step 5: Run the task execution loop
             success = self.react_engine.run_react_loop(
@@ -343,7 +348,7 @@ Please start by checking the current context and then proceed with the setup.
         # Run initial analysis
         success = self.react_engine.run_react_loop(
             initial_prompt=initial_prompt,
-            max_iterations=10,  # Limit iterations for initial analysis
+            max_iterations=self.max_iterations,  # Use configured max iterations
         )
 
         if success:

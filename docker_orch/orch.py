@@ -56,8 +56,9 @@ class DockerOrchestrator:
                 return True
 
             # Create volume if it doesn't exist
-            if not self._volume_exists():
-                self._create_volume()
+            # Skip volume creation - we're not using volumes anymore
+            # if not self._volume_exists():
+            #     self._create_volume()
 
             # Prepare container configuration
             container_config = self._get_container_config()
@@ -156,10 +157,11 @@ class DockerOrchestrator:
                 container.remove()
 
             # Remove volume
-            if self._volume_exists():
-                logger.info(f"Removing volume {self.volume_name}")
-                volume = self.client.volumes.get(self.volume_name)
-                volume.remove()
+            # Skip volume removal - we're not using volumes anymore
+            # if self._volume_exists():
+            #     logger.info(f"Removing volume {self.volume_name}")
+            #     volume = self.client.volumes.get(self.volume_name)
+            #     volume.remove()
 
             logger.info(f"Project {self.project_name} removed successfully")
             return success
@@ -345,7 +347,7 @@ class DockerOrchestrator:
             # Note: This creates a new image, but we'll use a simple approach
             # by stopping and recreating the container with new labels
 
-            logger.info(f"Updated last comment for {self.container_name}: {comment[:50]}...")
+            logger.info(f"Updated last comment for {self.container_name}: {comment}")
 
             # For now, we'll store the comment in a volume file
             # This is simpler than recreating the container
@@ -426,7 +428,8 @@ class DockerOrchestrator:
             "stdin_open": True,
             "tty": True,
             "working_dir": self.config.workspace_path,
-            "volumes": {self.volume_name: {"bind": self.config.workspace_path, "mode": "rw"}},
+            # Remove volume mount - files will be stored inside container
+            # "volumes": {self.volume_name: {"bind": self.config.workspace_path, "mode": "rw"}},
             "environment": {"DEBIAN_FRONTEND": "noninteractive", "TERM": "xterm-256color"},
             "labels": {
                 "setup-agent.project": self.project_name,

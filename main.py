@@ -99,8 +99,7 @@ def list():
 
             # Get last comment from agent
             last_comment = project.get("last_comment", "No comment available")
-            if len(last_comment) > 50:
-                last_comment = last_comment[:47] + "..."
+                            # Show full comment without truncation
 
             table.add_row(
                 project["project_name"],
@@ -157,9 +156,7 @@ def project(ctx, repo_url, name, goal):
             return
 
         # Initialize agent
-        agent = SetupAgent(
-            config=config, orchestrator=orchestrator, max_iterations=config.max_iterations
-        )
+        agent = SetupAgent(config=config, orchestrator=orchestrator)
 
         # Run the setup
         success = agent.setup_project(project_url=repo_url, project_name=name, goal=goal)
@@ -184,7 +181,7 @@ def project(ctx, repo_url, name, goal):
 @cli.command()
 @click.argument("docker_name")
 @click.option("--task", required=True, help="Specific task or requirement for the agent")
-@click.option("--max-iterations", default=30, type=int, help="Maximum number of agent iterations")
+@click.option("--max-iterations", default=None, type=int, help="Maximum number of agent iterations")
 @click.pass_context
 def run(ctx, docker_name, task, max_iterations):
     """Run a specific task on an existing SAG project."""
@@ -214,7 +211,8 @@ def run(ctx, docker_name, task, max_iterations):
             return
 
         # Initialize agent
-        agent = SetupAgent(config=config, orchestrator=orchestrator, max_iterations=max_iterations)
+        final_max_iterations = max_iterations if max_iterations is not None else config.max_iterations
+        agent = SetupAgent(config=config, orchestrator=orchestrator, max_iterations=final_max_iterations)
 
         # Run the task
         success = agent.run_task(project_name=project_name, task_description=task)

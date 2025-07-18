@@ -7,54 +7,67 @@ from typing import Any, Dict
 from loguru import logger
 
 from .base import BaseTool, ToolResult
-from .enhanced_base import EnhancedBaseTool
 
 
-class BashTool(EnhancedBaseTool):
+class BashTool(BaseTool):
     """Tool for executing bash commands."""
 
-    def __init__(self):
+    def __init__(self, docker_orchestrator=None):
         super().__init__(
             name="bash",
             description="Execute shell commands in the container. Use for file operations, "
             "package installation, git operations, and other system tasks.",
         )
+        self.docker_orchestrator = docker_orchestrator
 
-    def execute(self, command: str, timeout: int = 60) -> ToolResult:
+    def execute(self, command: str, timeout: int = 60, working_directory: str = None) -> ToolResult:
         """Execute a bash command."""
         if not command.strip():
             return ToolResult(success=False, output="", error="Empty command provided")
 
         logger.debug(f"Executing bash command: {command}")
+        if working_directory:
+            logger.debug(f"Working directory: {working_directory}")
 
         try:
-            # Use shell=True to support complex commands with pipes, redirects, etc.
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd="/workspace",  # Always run commands in workspace
-            )
+            # Use docker orchestrator if available
+            if self.docker_orchestrator:
+                result = self.docker_orchestrator.execute_command(command, workdir=working_directory)
+                
+                return ToolResult(
+                    success=result["exit_code"] == 0,
+                    output=result["output"],
+                    error=None if result["exit_code"] == 0 else f"Command failed with exit code {result['exit_code']}",
+                    metadata={"exit_code": result["exit_code"], "command": command, "timeout": timeout},
+                )
+            else:
+                # Fallback to local execution
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=working_directory or "/workspace",  # Use provided directory or default
+                )
 
-            # Combine stdout and stderr for complete output
-            output = ""
-            if result.stdout:
-                output += result.stdout
-            if result.stderr:
-                if output:
-                    output += "\n--- STDERR ---\n"
-                output += result.stderr
+                # Combine stdout and stderr for complete output
+                output = ""
+                if result.stdout:
+                    output += result.stdout
+                if result.stderr:
+                    if output:
+                        output += "\n--- STDERR ---\n"
+                    output += result.stderr
 
-            success = result.returncode == 0
+                success = result.returncode == 0
 
-            return ToolResult(
-                success=success,
-                output=output,
-                error=None if success else f"Command failed with exit code {result.returncode}",
-                metadata={"exit_code": result.returncode, "command": command, "timeout": timeout},
-            )
+                return ToolResult(
+                    success=success,
+                    output=output,
+                    error=None if success else f"Command failed with exit code {result.returncode}",
+                    metadata={"exit_code": result.returncode, "command": command, "timeout": timeout},
+                )
 
         except subprocess.TimeoutExpired:
             error_msg = f"Command timed out after {timeout} seconds"
@@ -83,6 +96,11 @@ class BashTool(EnhancedBaseTool):
                     "type": "integer",
                     "description": "Timeout in seconds (default: 60)",
                     "default": 60,
+                },
+                "working_directory": {
+                    "type": "string",
+                    "description": "Working directory for command execution (default: /workspace)",
+                    "default": None,
                 },
             },
             "required": ["command"],

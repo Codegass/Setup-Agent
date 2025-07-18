@@ -192,7 +192,7 @@ class ContextManager:
         contexts_path = str(self.contexts_dir)
         result = self.orchestrator.execute_command(f"mkdir -p {contexts_path}")
 
-        if result.get("success", False):
+        if result.get("success") or result.get("exit_code") == 0:
             logger.info(f"Created contexts directory in container: {contexts_path}")
         else:
             logger.error(f"Failed to create contexts directory: {result.get('output', '')}")
@@ -286,14 +286,14 @@ class ContextManager:
             result = self.orchestrator.execute_command(
                 f"find {self.contexts_dir} -name 'trunk_*.json' -type f 2>/dev/null || true"
             )
-            if result.get("success", False) and result.get("output", "").strip():
+            if (result.get("success") or result.get("exit_code") == 0) and result.get("output", "").strip():
                 context_files = result["output"].strip().split("\n")
 
                 for context_file in context_files:
                     if context_file.strip():
                         try:
                             cat_result = self.orchestrator.execute_command(f"cat {context_file}")
-                            if cat_result.get("success", False):
+                            if cat_result.get("success") or cat_result.get("exit_code") == 0:
                                 data = json.loads(cat_result["output"])
                                 if data.get("project_name") == project_name:
                                     return TrunkContext(**data)
@@ -320,13 +320,44 @@ class ContextManager:
             context_data = json.dumps(context.model_dump(), default=str, indent=2)
 
             if self.orchestrator:
-                # Save in container using orchestrator
-                escaped_data = context_data.replace("'", "'\"'\"'")
-                result = self.orchestrator.execute_command(f"echo '{escaped_data}' > {filepath}")
-                if result.get("success", False):
+                # Save in container using a temporary file approach for reliability
+                import tempfile
+                import base64
+                
+                # Encode the JSON data to avoid shell escaping issues
+                encoded_data = base64.b64encode(context_data.encode('utf-8')).decode('ascii')
+                
+                # Create command to decode and save the context
+                save_command = f"""python3 -c "
+import base64
+import os
+import json
+
+# Decode the data
+encoded_data = '{encoded_data}'
+decoded_data = base64.b64decode(encoded_data).decode('utf-8')
+
+# Ensure directory exists
+os.makedirs(os.path.dirname('{filepath}'), exist_ok=True)
+
+# Write the context data
+with open('{filepath}', 'w') as f:
+    f.write(decoded_data)
+
+print('Context saved successfully')
+" """
+                result = self.orchestrator.execute_command(save_command)
+                if result.get("success") or result.get("exit_code") == 0:
                     logger.debug(f"Saved context in container: {context.context_id}")
+                    # Verify the file was written correctly
+                    verify_result = self.orchestrator.execute_command(f"test -f {filepath} && echo 'exists'")
+                    if verify_result.get("exit_code") == 0:
+                        logger.debug(f"Context file verified in container: {filepath}")
+                    else:
+                        logger.warning(f"Context file verification failed: {filepath}")
                 else:
                     logger.error(f"Failed to save context in container: {result.get('output', '')}")
+                    logger.error(f"Command exit code: {result.get('exit_code')}")
             else:
                 # Fallback to local file system
                 with open(filepath, "w") as f:

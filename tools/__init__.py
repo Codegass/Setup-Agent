@@ -2,8 +2,10 @@
 
 from .base import BaseTool, ToolResult
 from .bash import BashTool
-# from .context_tool import ContextTool  # Using enhanced version
+from .context_tool import ContextTool
 from .file_io import FileIOTool
 from .web_search import WebSearchTool
+from .maven_tool import MavenTool
+from .project_setup_tool import ProjectSetupTool
 
-__all__ = ["BaseTool", "ToolResult", "BashTool", "FileIOTool", "WebSearchTool"]
+__all__ = ["BaseTool", "ToolResult", "BashTool", "FileIOTool", "WebSearchTool", "ContextTool", "MavenTool", "ProjectSetupTool"]

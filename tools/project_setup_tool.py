@@ -6,10 +6,10 @@ from typing import Dict, Any, Optional, List
 
 from loguru import logger
 
-from .enhanced_base import EnhancedBaseTool, ToolResult, ToolError
+from .base import BaseTool, ToolResult, ToolError
 
 
-class ProjectSetupTool(EnhancedBaseTool):
+class ProjectSetupTool(BaseTool):
     """Tool for project setup tasks like cloning repositories and installing dependencies."""
     
     def __init__(self, orchestrator):
