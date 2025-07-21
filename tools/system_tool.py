@@ -93,8 +93,7 @@ class SystemTool(BaseTool):
         logger.info(f"Installing packages: {packages_str}")
         
         result = self.docker_orchestrator.execute_command(
-            command=command,
-            timeout=300
+            command=command
         )
 
         if result["exit_code"] == 0:
@@ -132,8 +131,7 @@ class SystemTool(BaseTool):
         logger.info("Updating package lists")
         
         result = self.docker_orchestrator.execute_command(
-            command=command,
-            timeout=120
+            command=command
         )
 
         if result["exit_code"] == 0:
@@ -169,8 +167,7 @@ class SystemTool(BaseTool):
         
         for tool in required_tools:
             check_result = self.docker_orchestrator.execute_command(
-                command=f"which {tool}",
-                timeout=10
+                command=f"which {tool}"
             )
             
             if check_result["exit_code"] != 0:

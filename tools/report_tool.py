@@ -59,6 +59,7 @@ class ReportTool(BaseTool):
             else:
                 return ToolResult(
                     success=False,
+                    output="",
                     error=f"Invalid action '{action}'. Use 'generate' to create report.",
                     suggestions=["Use action='generate' to create the final report"]
                 )
@@ -67,6 +68,7 @@ class ReportTool(BaseTool):
             logger.error(f"Failed to generate report: {e}")
             return ToolResult(
                 success=False,
+                output="",
                 error=f"Report generation failed: {str(e)}",
                 suggestions=["Check if all required information is available"]
             )

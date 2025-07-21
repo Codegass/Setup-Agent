@@ -527,6 +527,19 @@ class ReActEngine:
                             function_name = json_obj['name']
                             function_args = json_obj['arguments']
                         
+                        # Format 2.5: Model thinking format: {"thought": "...", "action": "tool_name", "action_args": {...}}
+                        elif 'action' in json_obj and 'action_args' in json_obj:
+                            function_name = json_obj['action']
+                            function_args = json_obj['action_args']
+                            # Also include the thought as a separate line if present
+                            if 'thought' in json_obj:
+                                parsed_parts.append(f"THOUGHT: {json_obj['thought']}")
+                        
+                        # Format 2.6: Alternative args format: {"action": "tool_name", "args": {...}}
+                        elif 'action' in json_obj and 'args' in json_obj:
+                            function_name = json_obj['action']
+                            function_args = json_obj['args']
+                        
                         # Format 3: Single tool name format: {"manage_context": {...}}
                         elif len(json_obj) == 1:
                             tool_name = list(json_obj.keys())[0]
@@ -717,6 +730,10 @@ AVAILABLE TOOLS:
 - file_io: Read and write files (NOT read_file or write_file)
 - web_search: Search the web for information
 - manage_context: Manage context switching (NOT context)
+  • Valid actions: get_info, create_branch, switch_to_trunk
+  • For create_branch: REQUIRES task_id parameter (e.g., task_id="build_project")
+  • For switch_to_trunk: Optional summary parameter
+  • Example: manage_context(action="get_info")
 - maven: Execute Maven commands (NOT mvn)
 - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
 - system: Install system packages and dependencies
@@ -753,7 +770,10 @@ IMPORTANT GUIDELINES:
 1. USE THE TOOLS! Don't just think about using them - actually call them!
 2. Use the available tools through function calling to execute actions
 3. You can provide reasoning in your response content before or after tool calls
-4. Use manage_context tool to switch contexts when appropriate
+4. Use manage_context tool correctly:
+   • NEVER use "switch" action - use "switch_to_trunk" instead
+   • For create_branch: ALWAYS provide task_id parameter
+   • For get_info: No additional parameters needed
 5. In TRUNK context: analyze TODO list and create branch contexts for tasks
 6. In BRANCH context: focus on the specific task, use detailed logging
 7. Always provide summaries when returning to trunk context
@@ -778,7 +798,10 @@ Wait for OBSERVATION, then continue with next THOUGHT/ACTION cycle.
 
 IMPORTANT GUIDELINES:
 1. Always start with THOUGHT to explain your reasoning
-2. Use manage_context tool to switch contexts when appropriate
+2. Use manage_context tool correctly:
+   • NEVER use "switch" action - use "switch_to_trunk" instead
+   • For create_branch: ALWAYS provide task_id parameter
+   • For get_info: No additional parameters needed
 3. In TRUNK context: analyze TODO list and create branch contexts for tasks
 4. In BRANCH context: focus on the specific task, use detailed logging
 5. Always provide summaries when returning to trunk context
@@ -1307,6 +1330,11 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 'context_type': 'action',
                 'name': 'task_id',
                 'id': 'task_id',
+                'target': 'action',  # Map target to action for switch-like operations
+                'switch': 'action',  # Map switch to action
+                'task_name': 'task_id',
+                'branch_name': 'task_id',
+                'description': 'summary',
             }
         }
         
@@ -1485,6 +1513,29 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             if fixed_params.get("action") == "read" and not fixed_params.get("path"):
                 fixed_params["action"] = "list"
                 fixed_params["path"] = self.successful_states['working_directory'] or "/workspace"
+                
+        elif tool_name == "manage_context":
+            # Fix common action name errors
+            action = fixed_params.get("action", "")
+            if action == "switch":
+                # Convert "switch" to "switch_to_trunk" as default
+                fixed_params["action"] = "switch_to_trunk"
+                logger.info(f"🔧 Converted action 'switch' to 'switch_to_trunk' for manage_context")
+            elif action == "info":
+                fixed_params["action"] = "get_info"
+                logger.info(f"🔧 Converted action 'info' to 'get_info' for manage_context")
+            elif action == "create":
+                fixed_params["action"] = "create_branch"
+                logger.info(f"🔧 Converted action 'create' to 'create_branch' for manage_context")
+            
+            # Ensure required parameters for create_branch
+            if fixed_params.get("action") == "create_branch":
+                if not fixed_params.get("task_id"):
+                    # Generate a default task_id if missing
+                    summary = fixed_params.get("summary", "default_task")
+                    task_id = summary.replace(" ", "_").lower()[:20]
+                    fixed_params["task_id"] = task_id
+                    logger.info(f"🔧 Generated missing task_id: {task_id}")
         
         return fixed_params
 

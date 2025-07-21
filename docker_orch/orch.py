@@ -14,7 +14,7 @@ from config import get_config
 
 
 class DockerOrchestrator:
-    """Orchestrates Docker containers and volumes for project setup."""
+    """Orchestrates Docker containers for project setup."""
 
     def __init__(self, base_image: str = None, project_name: str = None):
         self.config = get_config()
@@ -30,13 +30,13 @@ class DockerOrchestrator:
             logger.error(f"Failed to initialize Docker client: {e}")
             raise
 
-        # Container and volume names (SAG naming convention)
+        # Container names (SAG naming convention)
         if self.project_name:
             self.container_name = f"sag-{self.project_name}"
             self.volume_name = f"sag-{self.project_name}-vol"
         else:
-            self.container_name = None
-            self.volume_name = None
+            self.container_name = "sag-default"
+            self.volume_name = "sag-default-vol"
 
         logger.info(f"Docker Orchestrator initialized for project: {project_name}")
 
@@ -420,6 +420,8 @@ class DockerOrchestrator:
             logger.error(f"Failed to get comment from volume: {e}")
             return "Error reading comment"
 
+
+    ## TODO：Need to add default java and python related config 
     def _get_container_config(self) -> Dict[str, Any]:
         """Get container configuration."""
 
