@@ -1381,10 +1381,18 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         mappings_applied = []
         for old_name, new_name in name_mappings.items():
             if old_name in fixed_params and new_name in properties and new_name not in fixed_params:
-                fixed_params[new_name] = fixed_params[old_name]
+                # Extract value from nested structure if needed (fix for parameters->summary mapping issue)
+                old_value = fixed_params[old_name]
+                if isinstance(old_value, dict) and len(old_value) == 1 and new_name in old_value:
+                    # Handle case where we have {'summary': {'summary': '...'}} -> extract the inner value
+                    fixed_params[new_name] = old_value[new_name]
+                    logger.info(f"🔧 Extracted nested value from '{old_name}' to '{new_name}' for {tool_name}")
+                else:
+                    fixed_params[new_name] = old_value
+                    logger.info(f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}")
+                
                 del fixed_params[old_name]
                 mappings_applied.append(f"{old_name} → {new_name}")
-                logger.info(f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}")
         
         # Log all mappings applied for debugging
         if mappings_applied:
@@ -1795,7 +1803,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                                 return f"Maven build and test completed successfully ({total} tests passed)"
         
         # Check if we've been running for many iterations without progress
-        if self.current_iteration >= 15 and not self._has_report_been_generated():
+        if self.current_iteration >= 25 and not self._has_report_been_generated():
             # Check if we have any clear successes
             if self.successful_states['cloned_repos'] or self.successful_states['maven_success']:
                 return "Task has been running for many iterations with some successes"
@@ -1815,7 +1823,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         """Add strong guidance to push agent toward completion."""
         guidance = (f"🚨 URGENT COMPLETION NOTICE: {reason}. "
                    f"You MUST now call the report tool to generate a completion summary. "
-                   f"Example: report(action='generate_completion_report', "
+                   f"Example: report(action='generate', "
                    f"summary='Maven project successfully built and tested'). "
                    f"This will complete the task and stop further iterations.")
         

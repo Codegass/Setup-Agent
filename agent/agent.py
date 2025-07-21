@@ -72,11 +72,17 @@ class SetupAgent:
             MavenTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
-            ReportTool(self.orchestrator)
+            ReportTool(self.orchestrator, execution_history_callback=self._get_execution_history)
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
         return tools
+
+    def _get_execution_history(self):
+        """Get execution history for report verification."""
+        if hasattr(self, 'react_engine') and self.react_engine:
+            return self.react_engine.steps
+        return []
 
     def setup_project(
         self, project_url: str, project_name: str, goal: str, interactive: bool = False

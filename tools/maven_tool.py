@@ -130,6 +130,26 @@ class MavenTool(BaseTool):
         
         return " ".join(cmd_parts)
     
+    def _ensure_maven_in_path(self):
+        """Ensure Maven is accessible in PATH for bash tool compatibility."""
+        try:
+            # Check if mvn is already in PATH
+            which_result = self.orchestrator.execute_command("which mvn")
+            if which_result["exit_code"] == 0:
+                mvn_path = which_result["output"].strip()
+                logger.debug(f"Maven found at: {mvn_path}")
+                
+                # Create symlink in /usr/local/bin if not already there
+                if not mvn_path.startswith("/usr/local/bin"):
+                    self.orchestrator.execute_command(f"ln -sf {mvn_path} /usr/local/bin/mvn")
+                    logger.info("Created symlink for mvn in /usr/local/bin")
+                
+                # Update PATH environment variable for current session
+                self.orchestrator.execute_command("export PATH=/usr/local/bin:$PATH")
+                
+        except Exception as e:
+            logger.warning(f"Failed to ensure Maven in PATH: {e}")
+
     def _is_maven_installed(self) -> bool:
         """Check if Maven is installed."""
         try:
@@ -152,11 +172,13 @@ class MavenTool(BaseTool):
             install_result = self.orchestrator.execute_command("apt-get install -y maven")
             
             if install_result["exit_code"] == 0:
-                logger.info("Maven installed successfully")
+                # Ensure mvn is in PATH for bash tool compatibility
+                self._ensure_maven_in_path()
+                logger.info("Maven installed successfully and added to PATH")
                 return ToolResult(
                     success=True,
-                    output="Maven installed successfully",
-                    metadata={"auto_installed": True}
+                    output="Maven installed successfully and added to PATH",
+                    metadata={"auto_installed": True, "path_updated": True}
                 )
             else:
                 return ToolResult(
@@ -343,9 +365,12 @@ class MavenTool(BaseTool):
             if tests["failures"] > 0 or tests["errors"] > 0:
                 error_message += f"\nTest failures: {tests['failures']}, Test errors: {tests['errors']}"
         
+        # Extract key error lines for immediate visibility
+        error_output = self._extract_key_error_lines(output)
+        
         return ToolResult(
             success=False,
-            output="",
+            output=error_output,  # Show key error lines immediately
             error=error_message,
             error_code=error_code,
             suggestions=error_suggestions,
@@ -354,10 +379,63 @@ class MavenTool(BaseTool):
             metadata={
                 "command": command,
                 "exit_code": exit_code,
-                "analysis": analysis
+                "analysis": analysis,
+                "key_errors_extracted": True
             }
         )
     
+    def _extract_key_error_lines(self, output: str) -> str:
+        """Extract key error lines from Maven output for immediate visibility."""
+        if not output:
+            return "No output available"
+        
+        lines = output.split('\n')
+        key_lines = []
+        
+        # Look for critical error patterns
+        error_patterns = [
+            r'\[ERROR\].*compilation.*failed',
+            r'\[ERROR\].*Failed to execute goal',
+            r'\[ERROR\].*Cannot resolve dependencies',
+            r'\[ERROR\].*No compiler is provided',
+            r'\[ERROR\].*Java compiler.*error',
+            r'\[ERROR\].*Tests in error',
+            r'\[ERROR\].*BUILD FAILURE',
+            r'mvn: command not found',
+            r'No pom\.xml found',
+            r'COMPILATION ERROR',
+            r'Test.*FAILED',
+        ]
+        
+        # Extract lines matching error patterns
+        for line in lines:
+            for pattern in error_patterns:
+                if re.search(pattern, line, re.IGNORECASE):
+                    key_lines.append(line.strip())
+                    break
+        
+        # If no specific patterns found, get last 10 lines that contain ERROR or FAIL
+        if not key_lines:
+            for line in reversed(lines):
+                if any(word in line.upper() for word in ['ERROR', 'FAIL', 'EXCEPTION']):
+                    key_lines.insert(0, line.strip())
+                    if len(key_lines) >= 10:
+                        break
+        
+        # Fallback: get last 20 lines if still nothing
+        if not key_lines:
+            key_lines = [line.strip() for line in lines[-20:] if line.strip()]
+        
+        result = "🚨 Key Maven Error Information:\n\n"
+        if key_lines:
+            result += "\n".join(key_lines[:15])  # Limit to 15 lines to avoid overflow
+            if len(key_lines) > 15:
+                result += f"\n... and {len(key_lines) - 15} more error lines (use raw_output=true for full details)"
+        else:
+            result += "No specific error patterns detected. Use raw_output=true for full Maven output."
+        
+        return result
+
     def get_usage_example(self) -> str:
         """Get usage examples for Maven tool."""
         return """
