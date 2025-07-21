@@ -21,6 +21,12 @@ class MavenTool(BaseTool):
         )
         self.orchestrator = orchestrator
     
+    def _extract_key_info(self, output: str, tool_name: str) -> str:
+        """Override to use Maven-specific extraction."""
+        if tool_name == "maven" or tool_name == self.name:
+            return self._extract_maven_key_info(output)
+        return output
+    
     def execute(
         self,
         command: str,

@@ -29,6 +29,7 @@ class Task(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     notes: str = ""
+    key_results: str = ""  # Stores key results after task completion
 
 
 class ContextType(str, Enum):
@@ -98,11 +99,34 @@ class TrunkContext(BaseContext):
         return False
 
     def get_next_pending_task(self) -> Optional[Task]:
-        """Get the next pending task from the TODO list."""
+        """Get the next pending task from the TODO list (strict order)."""
+        # Strict order execution: only return the first pending task
+        # If there are incomplete tasks ahead, cannot execute later tasks
         for task in self.todo_list:
             if task.status == TaskStatus.PENDING:
                 return task
+            elif task.status == TaskStatus.IN_PROGRESS:
+                # If there's a task in progress, cannot start new tasks
+                return None
+            elif task.status in [TaskStatus.FAILED]:
+                # If there's a failed task, cannot continue with subsequent tasks
+                return None
         return None
+    
+    def can_start_task(self, task_id: str) -> bool:
+        """Check if the specified task can be started (strict order validation)"""
+        next_task = self.get_next_pending_task()
+        return next_task is not None and next_task.id == task_id
+    
+    def update_task_key_results(self, task_id: str, key_results: str) -> bool:
+        """Update the key results of a task"""
+        for task in self.todo_list:
+            if task.id == task_id:
+                task.key_results = key_results
+                self.update_timestamp()
+                logger.info(f"Updated key results for task {task_id}")
+                return True
+        return False
 
     def get_progress_summary(self) -> str:
         """Get a summary of current progress."""
@@ -117,8 +141,10 @@ class TrunkContext(BaseContext):
         )
 
 
+# DEPRECATED: Legacy BranchContext class - replaced by BranchContextHistory
+# Kept for backward compatibility but should not be used in new code
 class BranchContext(BaseContext):
-    """Sub-context for working on specific tasks."""
+    """DEPRECATED: Sub-context for working on specific tasks. Use BranchContextHistory instead."""
 
     parent_context_id: str
     task_id: str
@@ -165,6 +191,60 @@ class BranchContext(BaseContext):
         return summary
 
 
+class BranchContextHistory(BaseModel):
+    """Branch task history file for storing all events during single task execution."""
+    
+    task_id: str
+    task_description: str
+    created_at: datetime = Field(default_factory=datetime.now)
+    last_updated: datetime = Field(default_factory=datetime.now)
+    
+    # Key information inherited from previous task
+    previous_task_summary: str = ""
+    
+    # Core: records all events during task execution
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    
+    # Metadata for compression
+    token_count: int = 0
+    entry_count: int = 0
+    context_window_threshold: int = 15000  # Token threshold for compression reminder
+    
+    def add_entry(self, entry: Dict[str, Any]) -> bool:
+        """Add new history entry, returns whether compression is needed"""
+        self.history.append(entry)
+        self.entry_count += 1
+        self.last_updated = datetime.now()
+        
+        # Simple token count estimation (can use more precise methods in actual implementation)
+        entry_text = json.dumps(entry, ensure_ascii=False)
+        self.token_count += len(entry_text) // 4  # Rough estimation
+        
+        # Check if compression is needed
+        return self.token_count > self.context_window_threshold
+    
+    def replace_history(self, new_history: List[Dict[str, Any]]):
+        """Replace current history with compressed history"""
+        self.history = new_history
+        self.entry_count = len(new_history)
+        self.last_updated = datetime.now()
+        
+        # Recalculate token count
+        total_text = json.dumps(new_history, ensure_ascii=False)
+        self.token_count = len(total_text) // 4
+    
+    def get_summary_info(self) -> Dict[str, Any]:
+        """Get summary information of history records"""
+        return {
+            "task_id": self.task_id,
+            "task_description": self.task_description,
+            "entry_count": self.entry_count,
+            "token_count": self.token_count,
+            "needs_compression": self.token_count > self.context_window_threshold,
+            "last_updated": self.last_updated.isoformat()
+        }
+
+
 class ContextManager:
     """Manages the context switching and persistence."""
 
@@ -180,8 +260,9 @@ class ContextManager:
             # Fallback to local directory creation (for testing or non-container usage)
             self.contexts_dir.mkdir(parents=True, exist_ok=True)
 
-        self.current_context: Optional[BaseContext] = None
-        self.trunk_context: Optional[TrunkContext] = None
+        # New design: no longer maintain current_context, but operate files directly
+        self.current_task_id: Optional[str] = None  # Currently executing task ID
+        self.trunk_context_file: Optional[str] = None  # Trunk context file path
 
     def _ensure_contexts_dir_in_container(self):
         """Ensure the contexts directory exists in the container."""
@@ -198,89 +279,337 @@ class ContextManager:
             logger.error(f"Failed to create contexts directory: {result.get('output', '')}")
             raise RuntimeError(f"Cannot create contexts directory in container: {contexts_path}")
 
-    def create_trunk_context(self, goal: str, project_url: str, project_name: str) -> TrunkContext:
-        """Create the main trunk context."""
+    def create_trunk_context(self, goal: str, project_url: str, project_name: str, tasks: List[str] = None) -> TrunkContext:
+        """Create the main trunk context with optional task list."""
         context_id = f"trunk_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        self.trunk_context = TrunkContext(
+        trunk_context = TrunkContext(
             context_id=context_id, goal=goal, project_url=project_url, project_name=project_name
         )
 
-        self.current_context = self.trunk_context
-        self._save_context(self.trunk_context)
+        # If task list is provided, add to TODO list
+        if tasks:
+            for i, task_desc in enumerate(tasks, 1):
+                task_id = f"task_{i}"
+                task = Task(id=task_id, description=task_desc)
+                trunk_context.todo_list.append(task)
 
-        logger.info(f"Created trunk context: {context_id}")
-        return self.trunk_context
+        # Save to file
+        filename = f"{context_id}.json"
+        self.trunk_context_file = str(self.contexts_dir / filename)
+        self._save_trunk_context(trunk_context)
 
-    def create_branch_context(self, task_id: str, task_description: str) -> BranchContext:
-        """Create a new branch context for a specific task."""
-        if not self.trunk_context:
+        logger.info(f"Created trunk context: {context_id} with {len(trunk_context.todo_list)} tasks")
+        return trunk_context
+
+    def load_trunk_context(self) -> Optional[TrunkContext]:
+        """Load the trunk context from file."""
+        if not self.trunk_context_file or not Path(self.trunk_context_file).exists():
+            return None
+        
+        try:
+            if self.orchestrator:
+                # Load from container
+                cat_result = self.orchestrator.execute_command(f"cat {self.trunk_context_file}")
+                if cat_result.get("success") or cat_result.get("exit_code") == 0:
+                    data = json.loads(cat_result["output"])
+                    return TrunkContext(**data)
+            else:
+                # Load from local file system
+                with open(self.trunk_context_file, "r") as f:
+                    data = json.load(f)
+                    return TrunkContext(**data)
+        except Exception as e:
+            logger.error(f"Failed to load trunk context: {e}")
+        return None
+
+    def _save_trunk_context(self, trunk_context: TrunkContext):
+        """Save trunk context to file."""
+        if not self.trunk_context_file:
+            raise ValueError("No trunk context file path set")
+        
+        try:
+            context_data = json.dumps(trunk_context.model_dump(), default=str, indent=2)
+            
+            if self.orchestrator:
+                # Save in container
+                import base64
+                encoded_data = base64.b64encode(context_data.encode('utf-8')).decode('ascii')
+                
+                save_command = f"""python3 -c "
+import base64
+import os
+
+# Decode the data
+encoded_data = '{encoded_data}'
+decoded_data = base64.b64decode(encoded_data).decode('utf-8')
+
+# Ensure directory exists
+os.makedirs(os.path.dirname('{self.trunk_context_file}'), exist_ok=True)
+
+# Write the context data
+with open('{self.trunk_context_file}', 'w') as f:
+    f.write(decoded_data)
+
+print('Trunk context saved successfully')
+" """
+                result = self.orchestrator.execute_command(save_command)
+                if not (result.get("success") or result.get("exit_code") == 0):
+                    raise Exception(f"Failed to save trunk context: {result.get('output', '')}")
+            else:
+                # Save to local file system
+                Path(self.trunk_context_file).parent.mkdir(parents=True, exist_ok=True)
+                with open(self.trunk_context_file, "w") as f:
+                    f.write(context_data)
+            
+            logger.debug(f"Saved trunk context to: {self.trunk_context_file}")
+        except Exception as e:
+            logger.error(f"Failed to save trunk context: {e}")
+            raise
+
+    def start_new_branch(self, task_id: str) -> Dict[str, Any]:
+        """Start a new branch task."""
+        # Load trunk context
+        trunk_context = self.load_trunk_context()
+        if not trunk_context:
             raise ValueError("No trunk context exists")
 
-        context_id = f"branch_{task_id}_{datetime.now().strftime('%H%M%S')}"
-
-        branch_context = BranchContext(
-            context_id=context_id,
-            parent_context_id=self.trunk_context.context_id,
+        # Validate if task can be started (strict order)
+        if not trunk_context.can_start_task(task_id):
+            next_task = trunk_context.get_next_pending_task()
+            if next_task:
+                raise ValueError(f"Cannot start task {task_id}. Must complete {next_task.id} first.")
+            else:
+                raise ValueError(f"Task {task_id} cannot be started. Check task status.")
+        
+        # Find task information
+        task = None
+        for t in trunk_context.todo_list:
+            if t.id == task_id:
+                task = t
+                break
+        
+        if not task:
+            raise ValueError(f"Task {task_id} not found in TODO list")
+        
+        # Get key results from previous completed task
+        previous_summary = ""
+        for i, t in enumerate(trunk_context.todo_list):
+            if t.id == task_id and i > 0:
+                prev_task = trunk_context.todo_list[i-1]
+                if prev_task.status == TaskStatus.COMPLETED and prev_task.key_results:
+                    previous_summary = f"Previous task ({prev_task.id}): {prev_task.key_results}"
+                break
+        
+        # Create branch history file
+        branch_history = BranchContextHistory(
             task_id=task_id,
-            task_description=task_description,
+            task_description=task.description,
+            previous_task_summary=previous_summary
         )
+        
+        # Save branch history file
+        branch_file = str(self.contexts_dir / f"{task_id}.json")
+        self._save_branch_history(branch_history, branch_file)
+        
+        # Update task status in trunk context
+        trunk_context.update_task_status(task_id, TaskStatus.IN_PROGRESS)
+        self._save_trunk_context(trunk_context)
+        
+        # Set current task
+        self.current_task_id = task_id
+        
+        logger.info(f"Started branch task: {task_id}")
+        
+        return {
+            "task_id": task_id,
+            "task_description": task.description,
+            "previous_summary": previous_summary,
+            "branch_file": branch_file
+        }
 
-        # Update task status to in-progress
-        self.trunk_context.update_task_status(task_id, TaskStatus.IN_PROGRESS)
-        self._save_context(self.trunk_context)
+    def load_branch_history(self, task_id: str) -> Optional[BranchContextHistory]:
+        """Load branch history from file."""
+        branch_file = str(self.contexts_dir / f"{task_id}.json")
+        
+        try:
+            if self.orchestrator:
+                # Load from container
+                cat_result = self.orchestrator.execute_command(f"cat {branch_file}")
+                if cat_result.get("success") or cat_result.get("exit_code") == 0:
+                    data = json.loads(cat_result["output"])
+                    return BranchContextHistory(**data)
+            else:
+                # Load from local file system
+                if Path(branch_file).exists():
+                    with open(branch_file, "r") as f:
+                        data = json.load(f)
+                        return BranchContextHistory(**data)
+        except Exception as e:
+            logger.error(f"Failed to load branch history for {task_id}: {e}")
+        return None
 
-        self.current_context = branch_context
-        self._save_context(branch_context)
+    def _save_branch_history(self, branch_history: BranchContextHistory, branch_file: str):
+        """Save branch history to file."""
+        try:
+            context_data = json.dumps(branch_history.model_dump(), default=str, indent=2)
+            
+            if self.orchestrator:
+                # Save in container
+                import base64
+                encoded_data = base64.b64encode(context_data.encode('utf-8')).decode('ascii')
+                
+                save_command = f"""python3 -c "
+import base64
+import os
 
-        logger.info(f"Created branch context: {context_id} for task: {task_description}")
-        return branch_context
+# Decode the data
+encoded_data = '{encoded_data}'
+decoded_data = base64.b64decode(encoded_data).decode('utf-8')
 
-    def switch_to_trunk(self, summary: str = "") -> TrunkContext:
-        """Switch back to the trunk context, optionally with a summary."""
-        if not self.trunk_context:
+# Ensure directory exists
+os.makedirs(os.path.dirname('{branch_file}'), exist_ok=True)
+
+# Write the context data
+with open('{branch_file}', 'w') as f:
+    f.write(decoded_data)
+
+print('Branch history saved successfully')
+" """
+                result = self.orchestrator.execute_command(save_command)
+                if not (result.get("success") or result.get("exit_code") == 0):
+                    raise Exception(f"Failed to save branch history: {result.get('output', '')}")
+            else:
+                # Save to local file system
+                Path(branch_file).parent.mkdir(parents=True, exist_ok=True)
+                with open(branch_file, "w") as f:
+                    f.write(context_data)
+            
+            logger.debug(f"Saved branch history to: {branch_file}")
+        except Exception as e:
+            logger.error(f"Failed to save branch history: {e}")
+            raise
+
+    def add_to_branch_history(self, task_id: str, new_entry: Dict[str, Any]) -> Dict[str, Any]:
+        """Add entry to branch history, returns status info (including compression needs)"""
+        # Load branch history
+        branch_history = self.load_branch_history(task_id)
+        if not branch_history:
+            raise ValueError(f"No branch history found for task {task_id}")
+        
+        # Add timestamp
+        if "timestamp" not in new_entry:
+            new_entry["timestamp"] = datetime.now().isoformat()
+        
+        # Add entry and check if compression is needed
+        needs_compression = branch_history.add_entry(new_entry)
+        
+        # Save updated history
+        branch_file = str(self.contexts_dir / f"{task_id}.json")
+        self._save_branch_history(branch_history, branch_file)
+        
+        result = {
+            "success": True,
+            "entry_count": branch_history.entry_count,
+            "token_count": branch_history.token_count,
+            "needs_compression": needs_compression
+        }
+        
+        if needs_compression:
+            result["compression_warning"] = f"Context size ({branch_history.token_count} tokens) exceeds threshold ({branch_history.context_window_threshold}). Consider compression."
+        
+        logger.debug(f"Added entry to branch {task_id}, total entries: {branch_history.entry_count}")
+        return result
+
+    def compact_branch_history(self, task_id: str, compacted_history: List[Dict[str, Any]]) -> bool:
+        """Replace current history with compressed history"""
+        # Load branch history
+        branch_history = self.load_branch_history(task_id)
+        if not branch_history:
+            raise ValueError(f"No branch history found for task {task_id}")
+        
+        # Replace history
+        branch_history.replace_history(compacted_history)
+        
+        # Save updated history
+        branch_file = str(self.contexts_dir / f"{task_id}.json")
+        self._save_branch_history(branch_history, branch_file)
+        
+        logger.info(f"Compacted branch history for {task_id}: {len(compacted_history)} entries, {branch_history.token_count} tokens")
+        return True
+
+    def complete_branch(self, task_id: str, summary: str) -> Dict[str, Any]:
+        """Complete branch task, update trunk context, and return next task info"""
+        # Load trunk context
+        trunk_context = self.load_trunk_context()
+        if not trunk_context:
             raise ValueError("No trunk context exists")
 
-        # If we're coming from a branch context, process the summary
-        if self.current_context and isinstance(self.current_context, BranchContext) and summary:
-
-            # Update the trunk with the summary
-            self.trunk_context.progress_summary += f"\n\n{summary}"
-
-            # Update task status based on summary
-            if "completed" in summary.lower() or "success" in summary.lower():
-                self.trunk_context.update_task_status(
-                    self.current_context.task_id, TaskStatus.COMPLETED, summary
-                )
-            elif "failed" in summary.lower() or "error" in summary.lower():
-                self.trunk_context.update_task_status(
-                    self.current_context.task_id, TaskStatus.FAILED, summary
-                )
-
-        self.current_context = self.trunk_context
-        self.trunk_context.increment_step()
-        self._save_context(self.trunk_context)
-
-        logger.info("Switched to trunk context")
-        return self.trunk_context
-
-    def load_or_create_trunk_context(
-        self, goal: str, project_url: str, project_name: str
-    ) -> TrunkContext:
-        """Load existing trunk context or create a new one."""
-        # Try to find existing trunk context for this project
-        existing_context = self._find_existing_trunk_context(project_name)
-
-        if existing_context:
-            self.trunk_context = existing_context
-            self.current_context = existing_context
-            logger.info(f"Loaded existing trunk context: {existing_context.context_id}")
-            return existing_context
+        # Update task status and key results
+        trunk_context.update_task_status(task_id, TaskStatus.COMPLETED, summary)
+        trunk_context.update_task_key_results(task_id, summary)
+        
+        # Save trunk context
+        self._save_trunk_context(trunk_context)
+        
+        # Clear current task
+        self.current_task_id = None
+        
+        # Get next task
+        next_task = trunk_context.get_next_pending_task()
+        
+        result = {
+            "completed_task": task_id,
+            "summary": summary,
+            "progress": trunk_context.get_progress_summary()
+        }
+        
+        if next_task:
+            result["next_task"] = {
+                "id": next_task.id,
+                "description": next_task.description,
+                "status": next_task.status
+            }
         else:
-            return self.create_trunk_context(goal, project_url, project_name)
+            result["all_tasks_completed"] = True
+        
+        logger.info(f"Completed task {task_id}")
+        return result
 
-    def _find_existing_trunk_context(self, project_name: str) -> Optional[TrunkContext]:
-        """Find existing trunk context for a project."""
+    def get_current_context_info(self) -> Dict[str, Any]:
+        """Get current context information - new implementation"""
+        if self.current_task_id:
+            # Currently in branch task
+            branch_history = self.load_branch_history(self.current_task_id)
+            if branch_history:
+                return {
+                    "context_type": "branch",
+                    "task_id": self.current_task_id,
+                    "task_description": branch_history.task_description,
+                    "entry_count": branch_history.entry_count,
+                    "token_count": branch_history.token_count,
+                    "needs_compression": branch_history.token_count > branch_history.context_window_threshold,
+                    "last_updated": branch_history.last_updated.isoformat()
+                }
+        
+        # Currently in trunk context
+        trunk_context = self.load_trunk_context()
+        if trunk_context:
+            next_task = trunk_context.get_next_pending_task()
+            return {
+                "context_type": "trunk",
+                "context_id": trunk_context.context_id,
+                "goal": trunk_context.goal,
+                "progress": trunk_context.get_progress_summary(),
+                "next_task": next_task.description if next_task else "No pending tasks",
+                "next_task_id": next_task.id if next_task else None,
+                "last_updated": trunk_context.last_updated.isoformat()
+            }
+        
+        return {"error": "No active context"}
+
+    def find_existing_trunk_context(self, project_name: str) -> Optional[str]:
+        """Find existing trunk context file path"""
         if self.orchestrator:
             # Search in container
             result = self.orchestrator.execute_command(
@@ -296,7 +625,8 @@ class ContextManager:
                             if cat_result.get("success") or cat_result.get("exit_code") == 0:
                                 data = json.loads(cat_result["output"])
                                 if data.get("project_name") == project_name:
-                                    return TrunkContext(**data)
+                                    self.trunk_context_file = context_file.strip()
+                                    return context_file.strip()
                         except Exception as e:
                             logger.warning(f"Failed to load context file {context_file}: {e}")
         else:
@@ -306,98 +636,23 @@ class ContextManager:
                     with open(context_file, "r") as f:
                         data = json.load(f)
                         if data.get("project_name") == project_name:
-                            return TrunkContext(**data)
+                            self.trunk_context_file = str(context_file)
+                            return str(context_file)
                 except Exception as e:
                     logger.warning(f"Failed to load context file {context_file}: {e}")
         return None
 
-    def _save_context(self, context: BaseContext):
-        """Save a context to disk (in container if orchestrator is available)."""
-        filename = f"{context.context_id}.json"
-        filepath = self.contexts_dir / filename
-
-        try:
-            context_data = json.dumps(context.model_dump(), default=str, indent=2)
-
-            if self.orchestrator:
-                # Save in container using a temporary file approach for reliability
-                import tempfile
-                import base64
-                
-                # Encode the JSON data to avoid shell escaping issues
-                encoded_data = base64.b64encode(context_data.encode('utf-8')).decode('ascii')
-                
-                # Create command to decode and save the context
-                save_command = f"""python3 -c "
-import base64
-import os
-import json
-
-# Decode the data
-encoded_data = '{encoded_data}'
-decoded_data = base64.b64decode(encoded_data).decode('utf-8')
-
-# Ensure directory exists
-os.makedirs(os.path.dirname('{filepath}'), exist_ok=True)
-
-# Write the context data
-with open('{filepath}', 'w') as f:
-    f.write(decoded_data)
-
-print('Context saved successfully')
-" """
-                result = self.orchestrator.execute_command(save_command)
-                if result.get("success") or result.get("exit_code") == 0:
-                    logger.debug(f"Saved context in container: {context.context_id}")
-                    # Verify the file was written correctly
-                    verify_result = self.orchestrator.execute_command(f"test -f {filepath} && echo 'exists'")
-                    if verify_result.get("exit_code") == 0:
-                        logger.debug(f"Context file verified in container: {filepath}")
-                    else:
-                        logger.warning(f"Context file verification failed: {filepath}")
-                else:
-                    logger.error(f"Failed to save context in container: {result.get('output', '')}")
-                    logger.error(f"Command exit code: {result.get('exit_code')}")
-            else:
-                # Fallback to local file system
-                with open(filepath, "w") as f:
-                    f.write(context_data)
-                logger.debug(f"Saved context locally: {context.context_id}")
-
-        except Exception as e:
-            logger.error(f"Failed to save context {context.context_id}: {e}")
-
-    def get_current_context_info(self) -> Dict[str, Any]:
-        """Get information about the current context."""
-        if not self.current_context:
-            return {"error": "No active context"}
-
-        info = {
-            "context_id": self.current_context.context_id,
-            "context_type": self.current_context.context_type,
-            "step_count": self.current_context.step_count,
-            "last_updated": self.current_context.last_updated.isoformat(),
-        }
-
-        if isinstance(self.current_context, TrunkContext):
-            info.update(
-                {
-                    "goal": self.current_context.goal,
-                    "progress": self.current_context.get_progress_summary(),
-                    "next_task": (
-                        self.current_context.get_next_pending_task().description
-                        if self.current_context.get_next_pending_task()
-                        else "No pending tasks"
-                    ),
-                }
-            )
-        elif isinstance(self.current_context, BranchContext):
-            info.update(
-                {
-                    "task": self.current_context.task_description,
-                    "focus": self.current_context.current_focus,
-                    "log_entries": len(self.current_context.detailed_log),
-                }
-            )
-
-        return info
+    def load_or_create_trunk_context(self, goal: str, project_url: str, project_name: str, tasks: List[str] = None) -> TrunkContext:
+        """Load or create trunk context"""
+        # Try to find existing trunk context
+        existing_file = self.find_existing_trunk_context(project_name)
+        
+        if existing_file:
+            self.trunk_context_file = existing_file
+            trunk_context = self.load_trunk_context()
+            if trunk_context:
+                logger.info(f"Loaded existing trunk context: {trunk_context.context_id}")
+                return trunk_context
+        
+        # No existing context found, create new one
+        return self.create_trunk_context(goal, project_url, project_name, tasks)

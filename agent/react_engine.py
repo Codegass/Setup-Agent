@@ -311,9 +311,8 @@ class ReActEngine:
                 # Build prompt for next iteration
                 current_prompt = self._build_next_prompt()
 
-                # Update context step count
-                if self.context_manager.current_context:
-                    self.context_manager.current_context.increment_step()
+                # Step count is now automatically managed by branch history updates
+                # No manual step increment needed in new design
 
                 self.steps_since_context_switch += 1
 
@@ -727,7 +726,7 @@ AVAILABLE TOOLS:
 
 AVAILABLE TOOLS:
 - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
-- file_io: Read and write files (NOT read_file or write_file)
+- file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
 - web_search: Search the web for information
 - manage_context: Manage context switching (NOT context)
   • Valid actions: get_info, create_branch, switch_to_trunk
@@ -944,10 +943,15 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     self._log_react_step_verbose(step)
 
                 # Log to branch context if we're in one
-                if isinstance(self.context_manager.current_context, BranchContext):
-                    self.context_manager.current_context.add_log_entry(
-                        f"Thought: {step.content}"
-                    )
+                if self.context_manager.current_task_id:
+                    # Add thought to branch history using new context management system
+                    try:
+                        self.context_manager.add_to_branch_history(
+                            self.context_manager.current_task_id,
+                            {"type": "thought", "content": step.content}
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to log thought to branch history: {e}")
 
             elif step.step_type == StepType.ACTION:
                 self.agent_logger.info(f"🔧 ACTION: {step.content}")
@@ -1031,10 +1035,20 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 self._add_observation_step(self._format_tool_result(step.tool_name, result))
 
                 # Log to branch context if we're in one
-                if isinstance(self.context_manager.current_context, BranchContext):
-                    self.context_manager.current_context.add_log_entry(
-                        f"Action: {step.tool_name} - {'Success' if result.success else 'Failed'}"
-                    )
+                if self.context_manager.current_task_id:
+                    # Add action result to branch history using new context management system
+                    try:
+                        self.context_manager.add_to_branch_history(
+                            self.context_manager.current_task_id,
+                            {
+                                "type": "action",
+                                "tool_name": step.tool_name,
+                                "success": result.success,
+                                "output": result.output[:500] if result.output else ""  # Truncate long outputs
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to log action to branch history: {e}")
 
         return True
 
@@ -1540,7 +1554,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         return fixed_params
 
     def _format_tool_result(self, tool_name: str, result: ToolResult) -> str:
-        """Format tool result for observation with key information preservation."""
+        """Format tool result for observation. Output truncation is now handled in BaseTool."""
         if result.success:
             # For successful results, preserve key status information
             formatted = f"✅ {tool_name} executed successfully"
@@ -1549,18 +1563,9 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             if tool_name == "bash" and result.metadata and "command" in result.metadata:
                 formatted += f"\nCommand: {result.metadata['command']}"
             
-            # Add complete output
+            # Add output (already processed by BaseTool truncation)
             if result.output:
-                # For Maven tool, show full output but with key info highlighted
-                if tool_name == "maven":
-                    formatted += self._extract_maven_key_info(result.output)
-                    # Add full output if different from key info
-                    maven_key_info = self._extract_maven_key_info(result.output)
-                    if len(maven_key_info) < len(result.output):
-                        formatted += f"\n\nFull Maven Output:\n{result.output}"
-                else:
-                    # For other tools, show complete output
-                    formatted += f"\n\nOutput: {result.output}"
+                formatted += f"\n\nOutput: {result.output}"
             
             # Add metadata if available
             if result.metadata:
@@ -1568,6 +1573,11 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     formatted += f"\nExit code: {result.metadata['exit_code']}"
                 if "auto_installed" in result.metadata:
                     formatted += f"\nAuto-installed: {result.metadata['auto_installed']}"
+                # Show truncation info if applicable
+                if result.metadata.get("output_truncated"):
+                    original_len = result.metadata.get("original_length", 0)
+                    truncated_len = result.metadata.get("truncated_length", 0)
+                    formatted += f"\n📏 Output truncated: {original_len} → {truncated_len} chars"
                     
         else:
             # For failed results, show error and suggestions
@@ -1590,39 +1600,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 
         return formatted
 
-    def _extract_maven_key_info(self, output: str) -> str:
-        """Extract key information from Maven output."""
-        key_info = ""
-        
-        # Look for success/failure patterns
-        if "BUILD SUCCESS" in output:
-            key_info += "\n🎉 Build completed successfully"
-        elif "BUILD FAILURE" in output:
-            key_info += "\n❌ Build failed"
-            
-        # Look for test results
-        if "Tests run:" in output:
-            import re
-            test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
-            if test_match:
-                total, failures, errors = test_match.groups()
-                key_info += f"\n📊 Tests: {total} run, {failures} failures, {errors} errors"
-                
-        # Look for compilation info
-        if "Compilation failure" in output:
-            key_info += "\n⚠️ Compilation failures detected"
-        elif "Nothing to compile" in output:
-            key_info += "\n✅ All classes up to date"
-            
-        # Look for artifacts
-        if "Building jar:" in output:
-            key_info += "\n📦 JAR artifact created"
-            
-        # Add full output if no key info found
-        if not key_info:
-            key_info = f"\n\nFull Output:\n{output}"
-            
-        return key_info
+
 
     def _is_repetitive_execution(self, tool_signature: str) -> bool:
         """Check if this tool execution is repetitive."""
@@ -1855,7 +1833,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         """Check if we should provide context switching guidance."""
         if self.steps_since_context_switch >= self.context_switch_threshold:
             # Check if we're in a branch context and haven't switched recently
-            if isinstance(self.context_manager.current_context, BranchContext):
+            if self.context_manager.current_task_id:
                 guidance = (
                     f"SYSTEM GUIDANCE: You have been working on the current task for "
                     f"{self.steps_since_context_switch} steps. Consider if the sub-task "

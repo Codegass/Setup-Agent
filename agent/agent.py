@@ -66,7 +66,7 @@ class SetupAgent:
         
         tools = [
             BashTool(self.orchestrator),
-            FileIOTool(),
+            FileIOTool(self.orchestrator),  # 传递DockerOrchestrator
             WebSearchTool(),
             ContextTool(self.context_manager),
             MavenTool(self.orchestrator),

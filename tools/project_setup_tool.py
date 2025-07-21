@@ -20,6 +20,185 @@ class ProjectSetupTool(BaseTool):
         )
         self.orchestrator = orchestrator
     
+    def _extract_key_info(self, output: str, tool_name: str) -> str:
+        """Override to use project-setup-specific extraction."""
+        if tool_name == "project_setup" or tool_name == self.name:
+            return self._extract_project_setup_key_info(output)
+        return output
+
+    def _extract_project_setup_key_info(self, output: str) -> str:
+        """Extract key information from project setup output."""
+        if not output or len(output) <= self.max_output_length:
+            return output
+        
+        lines = output.split('\n')
+        
+        # Check if this is git clone output
+        if self._is_git_clone_output(lines):
+            return self._extract_git_clone_info(lines, output)
+        
+        # Check if this is project analysis output
+        elif self._is_project_analysis_output(lines):
+            return self._extract_project_analysis_info(lines, output)
+        
+        # For other cases, use general truncation
+        return output
+
+    def _is_git_clone_output(self, lines: list) -> bool:
+        """Check if output looks like git clone output."""
+        git_patterns = [
+            'cloning into',
+            'remote: counting objects',
+            'remote: compressing objects',
+            'receiving objects',
+            'resolving deltas',
+            'checking out files'
+        ]
+        
+        content_lower = '\n'.join(lines).lower()
+        return any(pattern in content_lower for pattern in git_patterns)
+
+    def _is_project_analysis_output(self, lines: list) -> bool:
+        """Check if output looks like project analysis output."""
+        analysis_patterns = [
+            'pom.xml',
+            'build.gradle',
+            'package.json',
+            'requirements.txt',
+            'detected project type',
+            'dependencies found'
+        ]
+        
+        content_lower = '\n'.join(lines).lower()
+        return any(pattern in content_lower for pattern in analysis_patterns)
+
+    def _extract_git_clone_info(self, lines: list, original_output: str) -> str:
+        """Extract key info from git clone output."""
+        summary = []
+        
+        # Look for key git clone indicators
+        clone_target = ""
+        progress_info = []
+        completion_info = []
+        
+        for line in lines:
+            line_lower = line.lower()
+            
+            if 'cloning into' in line_lower:
+                clone_target = line.strip()
+                
+            elif any(progress in line_lower for progress in ['receiving objects', 'resolving deltas', 'counting objects']):
+                if len(progress_info) < 5:  # Limit progress lines
+                    progress_info.append(line.strip())
+                    
+            elif any(completion in line_lower for completion in ['done', 'completed', 'checking out']):
+                completion_info.append(line.strip())
+        
+        summary.append("🔄 Git Clone Summary:")
+        
+        if clone_target:
+            summary.append(f"📂 {clone_target}")
+        
+        if progress_info:
+            summary.append(f"\n📊 Progress indicators:")
+            summary.extend(progress_info)
+        
+        if completion_info:
+            summary.append(f"\n✅ Completion status:")
+            summary.extend(completion_info[:3])  # Show first 3 completion messages
+        
+        # Show first and last lines for full context
+        if len(lines) > 20:
+            summary.append(f"\nFirst 10 lines:")
+            summary.extend(lines[:10])
+            summary.append(f"\n... [middle output truncated] ...")
+            summary.append(f"\nLast 10 lines:")
+            summary.extend(lines[-10:])
+        else:
+            summary.append(f"\nFull output:")
+            summary.extend(lines)
+        
+        summary.append(f"\n💡 Use 'file_io' to list directory contents or 'bash' to verify clone status.")
+        
+        return '\n'.join(summary)
+
+    def _extract_project_analysis_info(self, lines: list, original_output: str) -> str:
+        """Extract key info from project analysis output."""
+        summary = []
+        
+        # Look for project type indicators
+        project_types = []
+        config_files = []
+        dependencies = []
+        structure_info = []
+        
+        for line in lines:
+            line_lower = line.lower().strip()
+            
+            # Project type detection
+            if 'maven' in line_lower or 'pom.xml' in line_lower:
+                project_types.append("Maven")
+                if 'pom.xml' in line_lower:
+                    config_files.append(line.strip())
+                    
+            elif 'gradle' in line_lower or 'build.gradle' in line_lower:
+                project_types.append("Gradle")
+                if 'build.gradle' in line_lower:
+                    config_files.append(line.strip())
+                    
+            elif 'npm' in line_lower or 'package.json' in line_lower:
+                project_types.append("Node.js")
+                if 'package.json' in line_lower:
+                    config_files.append(line.strip())
+                    
+            elif 'python' in line_lower or 'requirements.txt' in line_lower:
+                project_types.append("Python")
+                if 'requirements.txt' in line_lower:
+                    config_files.append(line.strip())
+            
+            # Dependencies
+            elif any(dep_indicator in line_lower for dep_indicator in ['dependency', 'dependencies', 'import', 'require']):
+                if len(dependencies) < 5:
+                    dependencies.append(line.strip())
+            
+            # Structure info
+            elif any(structure_word in line_lower for structure_word in ['src/', 'lib/', 'target/', 'build/', 'node_modules/']):
+                if len(structure_info) < 10:
+                    structure_info.append(line.strip())
+        
+        summary.append("🔍 Project Analysis Summary:")
+        
+        if project_types:
+            unique_types = list(set(project_types))
+            summary.append(f"📋 Project Types: {', '.join(unique_types)}")
+        
+        if config_files:
+            summary.append(f"⚙️ Configuration Files:")
+            summary.extend(config_files[:5])  # Show first 5 config files
+            
+        if dependencies:
+            summary.append(f"\n📦 Dependencies Found:")
+            summary.extend(dependencies[:5])  # Show first 5 dependencies
+            
+        if structure_info:
+            summary.append(f"\n📁 Project Structure:")
+            summary.extend(structure_info[:8])  # Show first 8 structure items
+        
+        # Show sample of full output
+        if len(lines) > 30:
+            summary.append(f"\nAnalysis Output (first 15 lines):")
+            summary.extend(lines[:15])
+            summary.append(f"\n... [analysis truncated, {len(lines)} total lines] ...")
+            summary.append(f"\nAnalysis Output (last 10 lines):")
+            summary.extend(lines[-10:])
+        else:
+            summary.append(f"\nFull Analysis Output:")
+            summary.extend(lines)
+        
+        summary.append(f"\n💡 Use 'file_io' to examine specific config files or 'bash' to explore project structure.")
+        
+        return '\n'.join(summary)
+    
     def execute(
         self,
         action: str,

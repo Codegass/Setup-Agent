@@ -44,6 +44,22 @@ To solve the problem of context loss in complex tasks, SAG implements a hierarch
 
 This system enables SAG to switch between high-level planning and low-level execution seamlessly, ensuring stability and coherence throughout long-running tasks.
 
+### 3. Hierarchical Tool-belt Design
+
+At first glance, a single `bash` tool could handle all system interactions. However, relying solely on a low-level tool would force the AI agent to manage immense complexity, from remembering command syntax to parsing raw text output—a process that is both inefficient and error-prone.
+
+SAG adopts a hierarchical tool-belt design to address this, creating layers of abstraction that empower the agent to work more intelligently:
+
+-   **Low-Level Foundational Tools**: At the base is the `BashTool`. It provides unrestricted, granular control, much like an assembly language for system operations. It is the ultimate fallback for tasks that have no specialized tool.
+
+-   **Mid-Level Specialized Tools**: These tools encapsulate domain-specific knowledge. For example:
+    -   `SystemTool` understands system package management (`apt-get`), abstracting away the need to manually form `install` or `update` commands.
+    -   `MavenTool` is an expert in Java's Maven build system. It knows about goals, profiles, and properties, and can intelligently parse Maven's verbose output to determine if a build succeeded, failed, or had test errors.
+
+-   **High-Level Workflow Tools**: At the top layer, tools like `ProjectSetupTool` orchestrate complex, multi-step workflows. Its `clone` action doesn't just run `git clone`; it also automatically detects the project type (Maven, Node.js, Python), suggests the next appropriate actions, and can even trigger dependency installation, compressing a long chain of human-like reasoning into a single, intent-driven command.
+
+This layered approach allows the agent to delegate complexity. Instead of figuring out *how* to do something with basic commands, it can focus on *what* it needs to achieve, leading to faster, more reliable, and more sophisticated automation.
+
 ## 🏗️ System Architecture
 
 SAG is composed of several core components:
