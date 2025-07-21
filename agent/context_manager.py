@@ -69,6 +69,8 @@ class TrunkContext(BaseContext):
     progress_summary: str = ""
 
     def __init__(self, **data):
+        # Remove context_type from data if it exists to avoid conflicts
+        data.pop('context_type', None)
         super().__init__(context_type=ContextType.TRUNK, **data)
 
     def add_task(self, description: str) -> str:
@@ -153,6 +155,8 @@ class BranchContext(BaseContext):
     current_focus: str = ""
 
     def __init__(self, **data):
+        # Remove context_type from data if it exists to avoid conflicts
+        data.pop('context_type', None)
         super().__init__(context_type=ContextType.BRANCH, **data)
 
     def add_log_entry(self, entry: str):
@@ -271,10 +275,23 @@ class ContextManager:
 
         # Create the contexts directory in the container
         contexts_path = str(self.contexts_dir)
-        result = self.orchestrator.execute_command(f"mkdir -p {contexts_path}")
+        
+        # Create directory with proper permissions
+        create_cmd = f"mkdir -p {contexts_path} && chmod 755 {contexts_path}"
+        result = self.orchestrator.execute_command(create_cmd)
 
         if result.get("success") or result.get("exit_code") == 0:
             logger.info(f"Created contexts directory in container: {contexts_path}")
+            
+            # Verify the directory exists and is writable
+            test_cmd = f"test -d {contexts_path} && test -w {contexts_path}"
+            test_result = self.orchestrator.execute_command(test_cmd)
+            
+            if not (test_result.get("success") or test_result.get("exit_code") == 0):
+                # Try to fix permissions
+                chmod_cmd = f"chmod 755 {contexts_path}"
+                self.orchestrator.execute_command(chmod_cmd)
+                logger.warning(f"Fixed permissions for contexts directory: {contexts_path}")
         else:
             logger.error(f"Failed to create contexts directory: {result.get('output', '')}")
             raise RuntimeError(f"Cannot create contexts directory in container: {contexts_path}")
@@ -304,18 +321,30 @@ class ContextManager:
 
     def load_trunk_context(self) -> Optional[TrunkContext]:
         """Load the trunk context from file."""
-        if not self.trunk_context_file or not Path(self.trunk_context_file).exists():
+        if not self.trunk_context_file:
             return None
         
         try:
             if self.orchestrator:
+                # Check file existence in container
+                check_cmd = f"test -f {self.trunk_context_file}"
+                check_result = self.orchestrator.execute_command(check_cmd)
+                if not (check_result.get("success") or check_result.get("exit_code") == 0):
+                    logger.warning(f"Trunk context file not found in container: {self.trunk_context_file}")
+                    return None
+
                 # Load from container
                 cat_result = self.orchestrator.execute_command(f"cat {self.trunk_context_file}")
                 if cat_result.get("success") or cat_result.get("exit_code") == 0:
                     data = json.loads(cat_result["output"])
                     return TrunkContext(**data)
+                else:
+                    logger.error(f"Failed to read trunk context from container: {cat_result.get('output')}")
+                    return None
             else:
                 # Load from local file system
+                if not Path(self.trunk_context_file).exists():
+                    return None
                 with open(self.trunk_context_file, "r") as f:
                     data = json.load(f)
                     return TrunkContext(**data)
@@ -332,30 +361,23 @@ class ContextManager:
             context_data = json.dumps(trunk_context.model_dump(), default=str, indent=2)
             
             if self.orchestrator:
-                # Save in container
-                import base64
-                encoded_data = base64.b64encode(context_data.encode('utf-8')).decode('ascii')
+                # SIMPLIFIED: Save trunk context using cat with heredoc (consistent with branch history)
+                # Create directory first
+                dir_path = str(Path(self.trunk_context_file).parent)
+                mkdir_result = self.orchestrator.execute_command(f"mkdir -p {dir_path}")
+                if not (mkdir_result.get("success") or mkdir_result.get("exit_code") == 0):
+                    logger.warning(f"Failed to create directory {dir_path}: {mkdir_result.get('output', '')}")
                 
-                save_command = f"""python3 -c "
-import base64
-import os
-
-# Decode the data
-encoded_data = '{encoded_data}'
-decoded_data = base64.b64decode(encoded_data).decode('utf-8')
-
-# Ensure directory exists
-os.makedirs(os.path.dirname('{self.trunk_context_file}'), exist_ok=True)
-
-# Write the context data
-with open('{self.trunk_context_file}', 'w') as f:
-    f.write(decoded_data)
-
-print('Trunk context saved successfully')
-" """
+                # Use cat with heredoc - much simpler and more transparent
+                save_command = f"""cat > {self.trunk_context_file} << 'CONTEXT_EOF'
+{context_data}
+CONTEXT_EOF"""
+                
                 result = self.orchestrator.execute_command(save_command)
                 if not (result.get("success") or result.get("exit_code") == 0):
                     raise Exception(f"Failed to save trunk context: {result.get('output', '')}")
+                    
+                logger.debug(f"Saved trunk context using heredoc to: {self.trunk_context_file}")
             else:
                 # Save to local file system
                 Path(self.trunk_context_file).parent.mkdir(parents=True, exist_ok=True)
@@ -434,11 +456,21 @@ print('Trunk context saved successfully')
         
         try:
             if self.orchestrator:
+                # Check file existence in container
+                check_cmd = f"test -f {branch_file}"
+                check_result = self.orchestrator.execute_command(check_cmd)
+                if not (check_result.get("success") or check_result.get("exit_code") == 0):
+                    logger.warning(f"Branch history file not found in container: {branch_file}")
+                    return None
+
                 # Load from container
                 cat_result = self.orchestrator.execute_command(f"cat {branch_file}")
                 if cat_result.get("success") or cat_result.get("exit_code") == 0:
                     data = json.loads(cat_result["output"])
                     return BranchContextHistory(**data)
+                else:
+                    logger.error(f"Failed to read branch history from container: {cat_result.get('output')}")
+                    return None
             else:
                 # Load from local file system
                 if Path(branch_file).exists():
@@ -455,30 +487,23 @@ print('Trunk context saved successfully')
             context_data = json.dumps(branch_history.model_dump(), default=str, indent=2)
             
             if self.orchestrator:
-                # Save in container
-                import base64
-                encoded_data = base64.b64encode(context_data.encode('utf-8')).decode('ascii')
+                # SIMPLIFIED: Save in container using cat with heredoc (much cleaner!)
+                # Create directory first
+                dir_path = str(Path(branch_file).parent)
+                mkdir_result = self.orchestrator.execute_command(f"mkdir -p {dir_path}")
+                if not (mkdir_result.get("success") or mkdir_result.get("exit_code") == 0):
+                    logger.warning(f"Failed to create directory {dir_path}: {mkdir_result.get('output', '')}")
                 
-                save_command = f"""python3 -c "
-import base64
-import os
-
-# Decode the data
-encoded_data = '{encoded_data}'
-decoded_data = base64.b64decode(encoded_data).decode('utf-8')
-
-# Ensure directory exists
-os.makedirs(os.path.dirname('{branch_file}'), exist_ok=True)
-
-# Write the context data
-with open('{branch_file}', 'w') as f:
-    f.write(decoded_data)
-
-print('Branch history saved successfully')
-" """
+                # Use cat with heredoc to write file - much simpler and more transparent
+                save_command = f"""cat > {branch_file} << 'CONTEXT_EOF'
+{context_data}
+CONTEXT_EOF"""
+                
                 result = self.orchestrator.execute_command(save_command)
                 if not (result.get("success") or result.get("exit_code") == 0):
                     raise Exception(f"Failed to save branch history: {result.get('output', '')}")
+                    
+                logger.debug(f"Saved branch history using heredoc to: {branch_file}")
             else:
                 # Save to local file system
                 Path(branch_file).parent.mkdir(parents=True, exist_ok=True)
@@ -491,13 +516,25 @@ print('Branch history saved successfully')
             raise
 
     def add_to_branch_history(self, task_id: str, new_entry: Dict[str, Any]) -> Dict[str, Any]:
-        """Add entry to branch history, returns status info (including compression needs)"""
+        """Add entry to branch history with type safety, returns status info (including compression needs)"""
         # Load branch history
         branch_history = self.load_branch_history(task_id)
         if not branch_history:
             raise ValueError(f"No branch history found for task {task_id}")
         
-        # Add timestamp
+        # CRITICAL FIX: Ensure new_entry is always a dictionary
+        if not isinstance(new_entry, dict):
+            # Handle non-dict entries by wrapping them safely
+            if isinstance(new_entry, str):
+                new_entry = {"content": new_entry}
+            else:
+                new_entry = {"data": str(new_entry)}
+            logger.info(f"🔧 Context entry auto-wrapped: {type(new_entry).__name__} → dict")
+        
+        # Ensure we have a mutable copy
+        new_entry = dict(new_entry)
+        
+        # Add timestamp safely
         if "timestamp" not in new_entry:
             new_entry["timestamp"] = datetime.now().isoformat()
         
@@ -577,7 +614,7 @@ print('Branch history saved successfully')
         return result
 
     def get_current_context_info(self) -> Dict[str, Any]:
-        """Get current context information - new implementation"""
+        """Get current context information - improved implementation that auto-discovers trunk context"""
         if self.current_task_id:
             # Currently in branch task
             branch_history = self.load_branch_history(self.current_task_id)
@@ -592,8 +629,14 @@ print('Branch history saved successfully')
                     "last_updated": branch_history.last_updated.isoformat()
                 }
         
-        # Currently in trunk context
+        # Currently in trunk context - auto-discover trunk context file
         trunk_context = self.load_trunk_context()
+        
+        # If trunk_context_file is not set, try to find it automatically
+        if not trunk_context and not self.trunk_context_file:
+            self._auto_discover_trunk_context()
+            trunk_context = self.load_trunk_context()
+        
         if trunk_context:
             next_task = trunk_context.get_next_pending_task()
             return {
@@ -607,6 +650,34 @@ print('Branch history saved successfully')
             }
         
         return {"error": "No active context"}
+
+    def _auto_discover_trunk_context(self) -> bool:
+        """Auto-discover trunk context file when trunk_context_file is not set"""
+        try:
+            if self.orchestrator:
+                # Search in container
+                result = self.orchestrator.execute_command(
+                    f"find {self.contexts_dir} -name 'trunk_*.json' -type f 2>/dev/null | head -1"
+                )
+                if (result.get("success") or result.get("exit_code") == 0) and result.get("output", "").strip():
+                    found_file = result["output"].strip()
+                    if found_file:
+                        self.trunk_context_file = found_file
+                        logger.info(f"Auto-discovered trunk context file: {found_file}")
+                        return True
+            else:
+                # Fallback to local file system
+                trunk_files = list(self.contexts_dir.glob("trunk_*.json"))
+                if trunk_files:
+                    # Use the most recent trunk context file
+                    trunk_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                    self.trunk_context_file = str(trunk_files[0])
+                    logger.info(f"Auto-discovered trunk context file: {self.trunk_context_file}")
+                    return True
+        except Exception as e:
+            logger.warning(f"Failed to auto-discover trunk context: {e}")
+        
+        return False
 
     def find_existing_trunk_context(self, project_name: str) -> Optional[str]:
         """Find existing trunk context file path"""

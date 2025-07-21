@@ -212,43 +212,81 @@ class DockerOrchestrator:
             logger.error(f"Failed to connect to container: {e}")
             raise
 
-    def execute_command(self, command: str, workdir: str = None, environment: Dict[str, str] = None) -> Dict[str, Any]:
-        """Execute a command in the container."""
+    def execute_command(self, command: str, workdir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Execute a command in the container.
+
+        Args:
+            command: The command to execute.
+            workdir: The working directory to execute the command in.
+
+        Returns:
+            A dictionary with the result of the command execution.
+        """
+        # Ensure container is running and get container object
+        if not self.is_container_running():
+            if not self.container_exists():
+                raise RuntimeError(f"Container {self.container_name} does not exist. Create it first.")
+            if not self.start_container():
+                raise RuntimeError(f"Failed to start container {self.container_name}")
+        
+        # Get the container object
+        container = self.client.containers.get(self.container_name)
+
+        # Build the command to be executed in the container with proper environment loading
+        # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
+        wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        exec_command = ["/bin/bash", "-c", wrapped_command]
+        
+        logger.info(f"Executing command in container: {command}")
+        if workdir:
+            logger.info(f"Working directory: {workdir}")
 
         try:
-            container = self.client.containers.get(self.container_name)
+            # Execute the command
+            result = container.exec_run(exec_command, workdir=workdir)
 
-            if container.status != "running":
-                raise RuntimeError(f"Container {self.container_name} is not running")
+            # Decode output
+            output = result.output.decode("utf-8").strip()
+            exit_code = result.exit_code
 
-            # Prepare environment variables
-            env_vars = {}
-            if environment:
-                env_vars.update(environment)
+            logger.debug(f"Command finished with exit code: {exit_code}")
             
-            # Add PATH update to include common binary locations
-            current_path = env_vars.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-            if "/usr/local/bin" not in current_path:
-                env_vars["PATH"] = f"/usr/local/bin:{current_path}"
-
-            # Execute command with environment variables
-            result = container.exec_run(
-                command, 
-                workdir=workdir or self.config.workspace_path, 
-                stdout=True, 
-                stderr=True,
-                environment=env_vars if env_vars else None
-            )
+            # CRITICAL: Fallback truncation at orchestrator level - prevent context pollution
+            original_length = len(output)
+            if original_length > 10000:  # ~100 lines threshold
+                lines = output.split('\n')
+                if len(lines) > 100:
+                    truncated = '\n'.join(lines[:25]) + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n" + '\n'.join(lines[-25:])
+                    logger.warning(f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution")
+                    output = truncated
+            
+            # Smart debug logging: show structure of truncated output
+            if original_length > 10000 and len(output.split('\n')) <= 60:  # If we applied truncation
+                # For truncated output, show the structure more clearly
+                output_lines = output.split('\n')
+                if len(output_lines) > 10:
+                    debug_display = '\n'.join(output_lines[:5]) + f"\n... [Truncated output: showing first 5 + last 5 lines of {len(output_lines)} total] ...\n" + '\n'.join(output_lines[-5:])
+                else:
+                    debug_display = output
+                logger.debug(f"Command output (showing truncation structure):\n{debug_display}")
+            else:
+                # For normal output, use character limit
+                debug_output = output[:500] + "..." if len(output) > 500 else output
+                logger.debug(f"Command output (truncated for logs):\n{debug_output}")
 
             return {
-                "exit_code": result.exit_code,
-                "output": result.output.decode("utf-8") if result.output else "",
-                "success": result.exit_code == 0,
+                "success": exit_code == 0,
+                "exit_code": exit_code,
+                "output": output
             }
-
         except Exception as e:
-            logger.error(f"Failed to execute command in container: {e}")
-            return {"exit_code": -1, "output": "", "error": str(e), "success": False}
+            logger.error(f"Failed to execute command '{command}': {e}")
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": str(e)
+            }
 
     def get_container_info(self) -> Optional[Dict[str, Any]]:
         """Get container information."""
@@ -522,20 +560,49 @@ class DockerOrchestrator:
         try:
             logger.info("Setting up container environment")
 
-            # Update package lists and install basic tools
+            # Update package lists and install essential tools (including grep)
             setup_commands = [
-                "apt-get update",
-                "apt-get install -y curl wget git nano vim python3 python3-pip nodejs npm build-essential",
+                "apt-get update -qq",  # Quiet mode to reduce output
+                "apt-get install -y -qq curl wget git nano vim python3 python3-pip nodejs npm build-essential grep findutils",  # Added grep and findutils explicitly
                 f"mkdir -p {self.config.workspace_path}",
                 f"chown -R root:root {self.config.workspace_path}",
+                "which grep && echo 'grep installed successfully' || echo 'ERROR: grep not found'",  # Verify grep installation
             ]
 
-            for command in setup_commands:
+            for i, command in enumerate(setup_commands):
+                logger.info(f"Running setup step {i+1}/{len(setup_commands)}: {command.split()[0]}...")
                 result = self.execute_command(command)
+                
                 if not result["success"]:
                     logger.warning(f"Setup command failed: {command}")
-                    logger.warning(f"Output: {result.get('output', '')}")
+                    logger.warning(f"Exit code: {result.get('exit_code', 'unknown')}")
+                    
+                    # For package installation failures, provide more context
+                    if "apt-get" in command:
+                        logger.error("Package installation failed - this may cause issues later")
+                        logger.info("Trying alternative approach...")
+                        # Don't fail completely, but log the issue
                     # Continue with other commands even if one fails
+                else:
+                    logger.info(f"✅ Setup step {i+1} completed successfully")
+
+            # Verify essential tools are available
+            verification_commands = [
+                "grep --version | head -1",
+                "git --version",
+                "curl --version | head -1",
+                "python3 --version",
+            ]
+            
+            logger.info("Verifying essential tools...")
+            for cmd in verification_commands:
+                result = self.execute_command(cmd)
+                if result["success"]:
+                    tool_name = cmd.split()[0]
+                    logger.info(f"✅ {tool_name} is available")
+                else:
+                    tool_name = cmd.split()[0]
+                    logger.warning(f"⚠️ {tool_name} verification failed")
 
             logger.info("Container environment setup completed")
             return True

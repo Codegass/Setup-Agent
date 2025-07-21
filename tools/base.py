@@ -79,6 +79,14 @@ class BaseTool(ABC):
         for param_name, param in sig.parameters.items():
             if param_name == "self":
                 continue
+            
+            # Skip **kwargs parameters as they are handled specially
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                continue
+            
+            # Skip *args parameters as they are not supported in JSON schema
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                continue
 
             param_info = {
                 "type": "string",  # Default to string

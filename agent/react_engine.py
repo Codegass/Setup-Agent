@@ -59,6 +59,9 @@ class ReActEngine:
         self.max_recent_executions = 10
         self._force_thinking_next = False
         
+        # CRITICAL: Flag to force thinking after successful tool execution
+        self._force_thinking_after_success = False
+        
         # State memory for successful operations
         self.successful_states = {
             'working_directory': None,  # Last successful working directory
@@ -325,6 +328,12 @@ class ReActEngine:
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step."""
+        # CRITICAL: Check if thinking model was requested after successful tool execution
+        if self._force_thinking_after_success:
+            self._force_thinking_after_success = False  # Reset the flag
+            logger.info("Using thinking model to analyze successful tool execution results")
+            return True
+            
         # Check if thinking model was explicitly requested due to repetitive execution
         if self._force_thinking_next:
             self._force_thinking_next = False  # Reset the flag
@@ -1036,6 +1045,11 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
                 # Add observation step with improved formatting
                 self._add_observation_step(self._format_tool_result(step.tool_name, result))
+                
+                # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
+                if result.success:
+                    self._force_thinking_after_success = True
+                    logger.debug(f"✅ Tool {step.tool_name} succeeded - forcing thinking on next iteration")
 
                 # Log to branch context if we're in one
                 if self.context_manager.current_task_id:
@@ -1271,8 +1285,15 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                         import json
                         return json.loads(value)
                     except:
-                        return {}
-                return value if isinstance(value, dict) else {}
+                        # CRITICAL FIX: Don't lose the original string value!
+                        # For manage_context entry parameter, wrap string in meaningful object
+                        if param_name == 'entry':
+                            return {"content": value}  # Preserve the original string as content
+                        elif 'description' in param_name.lower() or 'content' in param_name.lower():
+                            return {"description": value}
+                        else:
+                            return {"value": value}  # Fallback: preserve in generic wrapper
+                return value if isinstance(value, dict) else {"value": value}
         except Exception as e:
             logger.warning(f"Failed to convert parameter '{param_name}' to {expected_type}: {e}")
             return value
@@ -1387,7 +1408,19 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 'switch': 'action',  # Map switch to action
                 'task_name': 'task_id',
                 'branch_name': 'task_id',
-                'description': 'summary',
+                # CRITICAL FIX: Map content-related parameters to 'entry' for add_context action
+                'description': 'entry',  # Fixed: was incorrectly mapped to 'summary'
+                'content': 'entry',
+                'data': 'entry',
+                'info': 'entry',
+                'details': 'entry',
+                'context': 'entry',
+                'observation': 'entry',
+                'result': 'entry',
+                # For complete_task action, these should map to summary  
+                'completion_summary': 'summary',
+                'task_summary': 'summary',
+                'results': 'summary',
             }
         }
         
@@ -1583,18 +1616,69 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 fixed_params["path"] = self.successful_states['working_directory'] or "/workspace"
                 
         elif tool_name == "manage_context":
-            # Fix common action name errors
+            # Fix common action name errors with comprehensive alias mapping
             action = fixed_params.get("action", "")
-            if action == "switch":
-                # Convert "switch" to "switch_to_trunk" as default
-                fixed_params["action"] = "switch_to_trunk"
-                logger.info(f"🔧 Converted action 'switch' to 'switch_to_trunk' for manage_context")
-            elif action == "info":
-                fixed_params["action"] = "get_info"
-                logger.info(f"🔧 Converted action 'info' to 'get_info' for manage_context")
-            elif action == "create":
-                fixed_params["action"] = "create_branch"
-                logger.info(f"🔧 Converted action 'create' to 'create_branch' for manage_context")
+            
+            # Map common variations to correct actions
+            action_aliases = {
+                # Start task aliases
+                "start": "start_task",
+                "begin": "start_task",
+                "create": "start_task",
+                "create_branch": "start_task",
+                "new": "start_task",
+                "new_task": "start_task",
+                
+                # Get info aliases
+                "info": "get_info",
+                "status": "get_info",
+                "current": "get_info",
+                "check": "get_info",
+                
+                # Complete task aliases
+                "complete": "complete_task",
+                "finish": "complete_task",
+                "end": "complete_task",
+                "done": "complete_task",
+                "complete_branch": "complete_task",
+                "switch_to_trunk": "complete_task",
+                "failure": "complete_task",
+                "failed": "complete_task",
+                
+                # Add context aliases
+                "add": "add_context",
+                "record": "add_context",
+                "log": "add_context",
+                
+                # Get context aliases
+                "get": "get_full_context",
+                "show": "get_full_context",
+                "view": "get_full_context",
+                "history": "get_full_context",
+                
+                # Compact context aliases
+                "compress": "compact_context",
+                "compact": "compact_context",
+                "reduce": "compact_context"
+            }
+            
+            if action in action_aliases:
+                original_action = action
+                fixed_params["action"] = action_aliases[action]
+                logger.info(f"🔧 Converted action '{original_action}' to '{action_aliases[action]}' for manage_context")
+                
+                # Add default summary for completion actions
+                if action_aliases[action] == "complete_task" and not fixed_params.get("summary"):
+                    if action in ["failure", "failed"]:
+                        fixed_params["summary"] = "Task failed to complete successfully due to encountered issues"
+                    else:
+                        fixed_params["summary"] = "Task completed with mixed results"
+                    logger.info(f"🔧 Added default summary for complete_task action")
+            elif action == "switch_to_trunk":
+                # This is correct, but ensure we have a summary if needed
+                if not fixed_params.get("summary"):
+                    fixed_params["summary"] = "Switching back to trunk context"
+                    logger.info(f"🔧 Added default summary for switch_to_trunk action")
             
             # Ensure required parameters for create_branch
             if fixed_params.get("action") == "create_branch":
@@ -1604,6 +1688,19 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     task_id = summary.replace(" ", "_").lower()[:20]
                     fixed_params["task_id"] = task_id
                     logger.info(f"🔧 Generated missing task_id: {task_id}")
+            
+            # For start_task, ensure we have task_id
+            elif fixed_params.get("action") == "start_task":
+                if not fixed_params.get("task_id"):
+                    # Auto-inject the correct next task ID based on context
+                    fixed_params["task_id"] = "task_1"  # Default to first task
+                    logger.info("🔧 Auto-injected default task_id: task_1 for start_task")
+                    
+            # For complete_task, ensure we have summary
+            elif fixed_params.get("action") == "complete_task":
+                if not fixed_params.get("summary"):
+                    fixed_params["summary"] = "Task completed with mixed results"
+                    logger.info(f"🔧 Added default summary for complete_task action")
         
         return fixed_params
 
@@ -1725,38 +1822,41 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             logger.info("Task completion detected via Maven success criteria")
             return True
         
-        # Look at recent steps for completion indicators
+        # Look at recent steps for EXPLICIT completion indicators
         recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
 
         for step in recent_steps:
             if step.step_type == StepType.THOUGHT:
                 content_lower = step.content.lower()
+                # Only consider overall completion phrases, not individual task completion
                 if any(
                     phrase in content_lower
                     for phrase in [
-                        "task completed",
-                        "setup complete",
-                        "finished",
-                        "done",
-                        "successfully completed",
                         "all tasks completed",
+                        "project setup complete", 
+                        "setup finished",
                         "build and test complete",
-                        "maven build successful",
-                        "tests passed successfully",
+                        "maven build successful and report generated",
+                        "final report completed"
                     ]
                 ):
+                    logger.info(f"Task completion detected via thought: {step.content[:100]}...")
                     return True
 
             elif step.step_type == StepType.ACTION and step.tool_name == "manage_context":
-                # If we're switching to trunk with a completion summary
-                if (
-                    step.tool_params
-                    and step.tool_params.get("action") == "switch_to_trunk"
-                    and step.tool_params.get("summary")
-                ):
-                    summary = step.tool_params.get("summary", "").lower()
-                    if "completed" in summary or "success" in summary or "finished" in summary:
-                        return True
+                # Only consider trunk context operations that indicate ALL tasks are done
+                if step.tool_params and step.tool_params.get("action") == "complete_task":
+                    # Check if this was the completion of the LAST task
+                    if step.tool_result and step.tool_result.success and step.tool_result.metadata:
+                        metadata = step.tool_result.metadata
+                        # Only complete if there are no more tasks OR if explicit completion signal
+                        if (metadata.get("all_tasks_completed") or 
+                            not metadata.get("next_task")):
+                            logger.info("Task completion detected: all TODO tasks completed")
+                            return True
+                
+                # Don't treat individual branch task completion as overall completion
+                # The agent should continue with the next task in the TODO list
 
         return False
 
@@ -1993,6 +2093,10 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
 """
 
         prompt += "Continue with your next THOUGHT and ACTION:\n\n"
+        
+        # Apply memory protection to prevent critical info loss due to context pollution
+        prompt = self._inject_memory_protection(prompt)
+        
         return prompt
 
     def _get_timestamp(self) -> str:
@@ -2246,3 +2350,101 @@ Use function calling to execute these tools!"""
                 ]
             ),
         }
+
+    def _preserve_critical_info(self) -> str:
+        """
+        Preserve critical information that should not be forgotten due to context pollution.
+        This acts as a 'short-term memory' protection mechanism.
+        """
+        critical_info = []
+        
+        # Always preserve repository URL if we have it
+        if self.repository_url:
+            critical_info.append(f"🔗 Repository URL: {self.repository_url}")
+        
+        # ENHANCED: Preserve dynamic project state information
+        if self.successful_states.get('working_directory'):
+            critical_info.append(f"📁 Working Directory: {self.successful_states['working_directory']}")
+        
+        # Preserve project structure awareness
+        if self.successful_states.get('project_name'):
+            critical_info.append(f"📦 Project Name: {self.successful_states['project_name']}")
+        
+        # Preserve build system information with more details
+        build_system = self.successful_states.get('build_system')
+        if build_system:
+            status_indicator = " (working)" if self.successful_states.get('maven_success') else ""
+            critical_info.append(f"🔧 Build System: {build_system}{status_indicator}")
+        
+        # Preserve critical project structure findings
+        if self.successful_states.get('has_pom_xml'):
+            critical_info.append("📄 Found: pom.xml (Maven project confirmed)")
+        
+        if self.successful_states.get('repository_cloned'):
+            critical_info.append("✅ Repository: Successfully cloned")
+        
+        # Preserve successful tool states
+        successful_tools = []
+        for tool, success in [
+            ('project_setup', 'project_setup' in self.successful_states.get('tools_used', [])),
+            ('maven', self.successful_states.get('maven_success', False)),
+            ('git', 'git' in self.successful_states.get('tools_used', [])),
+        ]:
+            if success:
+                successful_tools.append(tool)
+        
+        if successful_tools:
+            critical_info.append(f"✅ Working Tools: {', '.join(successful_tools)}")
+        
+        # CRITICAL: Preserve task plan to prevent context pollution from causing hallucinated task IDs
+        try:
+            trunk_context = self.context_manager.load_trunk_context()
+            if trunk_context and trunk_context.todo_list:
+                current_task = None
+                next_task = None
+                completed_count = 0
+                
+                for task in trunk_context.todo_list:
+                    if task.status.value == "completed":
+                        completed_count += 1
+                    elif task.status.value == "in_progress":
+                        current_task = task
+                    elif task.status.value == "pending" and not next_task:
+                        next_task = task
+                
+                plan_summary = [f"📋 TASK PLAN ({completed_count}/{len(trunk_context.todo_list)} completed):"]
+                
+                if current_task:
+                    plan_summary.append(f"  🔄 CURRENT: {current_task.id} - {current_task.description}")
+                
+                if next_task:
+                    plan_summary.append(f"  ⏭️ NEXT: {next_task.id} - {next_task.description}")
+                
+                # Show available task IDs to prevent hallucinations
+                all_task_ids = [task.id for task in trunk_context.todo_list]
+                plan_summary.append(f"  📝 VALID IDs: {', '.join(all_task_ids)}")
+                
+                critical_info.extend(plan_summary)
+                
+        except Exception as e:
+            # Don't let context loading errors break the memory protection
+            critical_info.append("⚠️ Task plan unavailable - use manage_context(action='get_info')")
+        
+        if critical_info:
+            return "\n🧠 CRITICAL MEMORY (preserved to prevent context pollution losses):\n" + "\n".join(critical_info) + "\n"
+        return ""
+
+    def _inject_memory_protection(self, prompt: str) -> str:
+        """
+        Inject critical information preservation into prompts to combat context pollution.
+        """
+        critical_memory = self._preserve_critical_info()
+        if critical_memory:
+            # Insert critical memory after the initial system prompt but before the current situation
+            insertion_point = prompt.find("Current situation:")
+            if insertion_point != -1:
+                return prompt[:insertion_point] + critical_memory + "\n" + prompt[insertion_point:]
+            else:
+                # Fallback: add at the beginning
+                return critical_memory + "\n" + prompt
+        return prompt

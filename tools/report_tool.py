@@ -11,7 +11,7 @@ from .base import BaseTool, ToolResult
 class ReportTool(BaseTool):
     """Tool for generating comprehensive project setup reports and marking task completion."""
 
-    def __init__(self, docker_orchestrator=None, execution_history_callback=None):
+    def __init__(self, docker_orchestrator=None, execution_history_callback=None, context_manager=None):
         super().__init__(
             name="report",
             description="Generate comprehensive project setup report and mark task as complete. "
@@ -20,6 +20,7 @@ class ReportTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
         self.execution_history_callback = execution_history_callback
+        self.context_manager = context_manager
 
     def execute(
         self,
@@ -42,6 +43,17 @@ class ReportTool(BaseTool):
 
         try:
             if action == "generate":
+                # CRITICAL: Verify all prerequisite tasks are completed before generating report
+                context_validation = self._validate_context_prerequisites()
+                if not context_validation["valid"]:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=context_validation["error"],
+                        suggestions=context_validation["suggestions"],
+                        error_code="PREREQUISITE_TASKS_INCOMPLETE"
+                    )
+                
                 report, verified_status = self._generate_comprehensive_report(summary, status, details)
                 
                 # Mark this as a completion signal for the ReAct engine
@@ -96,6 +108,83 @@ class ReportTool(BaseTool):
         
         return console_report, verified_status
 
+    def _validate_context_prerequisites(self) -> Dict[str, Any]:
+        """
+        Validate that all prerequisite tasks are completed before generating report.
+        This prevents premature report generation when tasks are still in progress.
+        """
+        if not self.context_manager:
+            # If no context manager available, allow report generation (backward compatibility)
+            logger.warning("No context manager available for prerequisite validation")
+            return {"valid": True}
+        
+        try:
+            # Load trunk context to check task statuses
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context:
+                return {
+                    "valid": False,
+                    "error": "Cannot generate report: No project plan found",
+                    "suggestions": [
+                        "Ensure the project has been properly initialized",
+                        "Use manage_context to check current project state"
+                    ]
+                }
+            
+            # Check each task status
+            incomplete_tasks = []
+            for task in trunk_context.todo_list:
+                if task.status.value != "completed":
+                    incomplete_tasks.append({
+                        "id": task.id,
+                        "description": task.description,
+                        "status": task.status.value
+                    })
+            
+            if incomplete_tasks:
+                # Format error message with specific incomplete tasks
+                task_details = []
+                for task in incomplete_tasks:
+                    task_details.append(f"  • {task['id']}: {task['description']} (status: {task['status']})")
+                
+                error_msg = (
+                    f"Cannot generate report because {len(incomplete_tasks)} task(s) are not yet complete:\n" +
+                    "\n".join(task_details) +
+                    "\n\nAll tasks must be completed before generating the final report."
+                )
+                
+                suggestions = [
+                    f"Complete the incomplete task(s) first",
+                    "Use manage_context to check and complete pending tasks",
+                    "If a task is currently in progress, use complete_task() to finish it"
+                ]
+                
+                # Add specific suggestion for current task if in progress
+                current_task = self.context_manager.current_task_id
+                if current_task:
+                    current_task_desc = None
+                    for task in incomplete_tasks:
+                        if task["id"] == current_task:
+                            current_task_desc = task["description"]
+                            break
+                    if current_task_desc:
+                        suggestions.insert(0, f"You are currently working on {current_task}: {current_task_desc}. Complete this task first.")
+                
+                return {
+                    "valid": False,
+                    "error": error_msg,
+                    "suggestions": suggestions
+                }
+            
+            # All tasks are completed
+            logger.info("✅ All prerequisite tasks completed, allowing report generation")
+            return {"valid": True}
+            
+        except Exception as e:
+            logger.error(f"Failed to validate context prerequisites: {e}")
+            # In case of error, allow report generation but log the issue
+            return {"valid": True}
+
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
         """Verify the claimed status against actual execution history."""
         if not self.execution_history_callback:
@@ -137,8 +226,18 @@ class ReportTool(BaseTool):
                 actual_accomplishments['total_actions'] += 1
                 
                 # Handle both object and dict format for tool_result
-                success = getattr(tool_result, 'success', tool_result.get('success', False)) if hasattr(tool_result, 'get') or hasattr(tool_result, 'success') else False
-                output = getattr(tool_result, 'output', tool_result.get('output', '')) if hasattr(tool_result, 'get') or hasattr(tool_result, 'output') else ''
+                if hasattr(tool_result, 'success'):
+                    # ToolResult object
+                    success = tool_result.success
+                    output = tool_result.output
+                elif isinstance(tool_result, dict):
+                    # Dictionary format
+                    success = tool_result.get('success', False)
+                    output = tool_result.get('output', '')
+                else:
+                    # Unknown format, assume failure
+                    success = False
+                    output = str(tool_result)
                 
                 if success:
                     actual_accomplishments['successful_actions'] += 1

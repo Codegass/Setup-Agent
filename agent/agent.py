@@ -72,7 +72,7 @@ class SetupAgent:
             MavenTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
-            ReportTool(self.orchestrator, execution_history_callback=self._get_execution_history)
+            ReportTool(self.orchestrator, execution_history_callback=self._get_execution_history, context_manager=self.context_manager)
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
@@ -120,9 +120,28 @@ class SetupAgent:
                 "Compile and test the project",
                 "Generate completion report"
             ]
-            trunk_context = self.context_manager.create_trunk_context(
-                goal=goal, project_url=project_url, project_name=project_name, tasks=initial_tasks
-            )
+            
+            logger.info("Creating trunk context...")
+            self.agent_logger.info(f"Creating trunk context for project: {project_name}")
+            
+            try:
+                trunk_context = self.context_manager.create_trunk_context(
+                    goal=goal, project_url=project_url, project_name=project_name, tasks=initial_tasks
+                )
+                
+                # Verify trunk context was created successfully
+                context_info = self.context_manager.get_current_context_info()
+                if context_info.get("error"):
+                    raise Exception(f"Failed to verify trunk context: {context_info['error']}")
+                
+                self.agent_logger.info(f"✅ Trunk context created successfully: {trunk_context.context_id}")
+                logger.info(f"Trunk context created with {len(initial_tasks)} tasks")
+                
+            except Exception as e:
+                self.agent_logger.error(f"❌ Failed to create trunk context: {e}")
+                logger.error(f"Trunk context creation failed: {e}")
+                self.console.print(f"[bold red]❌ Failed to create project context: {e}[/bold red]")
+                return False
 
             # Step 3: Run the unified setup process
             success = self._run_unified_setup(project_url, project_name, goal, interactive)
@@ -170,11 +189,29 @@ class SetupAgent:
             self._initialize_context_and_tools()
 
             # Step 2: Load existing trunk context
-            trunk_context = self.context_manager.load_or_create_trunk_context(
-                goal=f"Continue working on {project_name}",
-                project_url="",  # Will be loaded from existing context
-                project_name=project_name,
-            )
+            logger.info(f"Loading or creating trunk context for project: {project_name}")
+            self.agent_logger.info(f"Loading context for project: {project_name}")
+            
+            try:
+                trunk_context = self.context_manager.load_or_create_trunk_context(
+                    goal=f"Continue working on {project_name}",
+                    project_url="",  # Will be loaded from existing context
+                    project_name=project_name,
+                )
+                
+                # Verify context was loaded/created successfully
+                context_info = self.context_manager.get_current_context_info()
+                if context_info.get("error"):
+                    raise Exception(f"Failed to load/create context: {context_info['error']}")
+                
+                self.agent_logger.info(f"✅ Context loaded successfully: {context_info.get('context_id', 'unknown')}")
+                logger.info(f"Trunk context ready for project: {project_name}")
+                
+            except Exception as e:
+                self.agent_logger.error(f"❌ Failed to load/create context: {e}")
+                logger.error(f"Context loading failed: {e}")
+                self.console.print(f"[bold red]❌ Failed to load project context: {e}[/bold red]")
+                return False
 
             # Step 3: Add additional request as new task if provided
             if additional_request:
@@ -217,11 +254,29 @@ class SetupAgent:
             self._initialize_context_and_tools()
 
             # Step 2: Load existing trunk context
-            trunk_context = self.context_manager.load_or_create_trunk_context(
-                goal=f"Complete task: {task_description}",
-                project_url="",  # Will be loaded from existing context
-                project_name=project_name,
-            )
+            logger.info(f"Loading or creating trunk context for project: {project_name}")
+            self.agent_logger.info(f"Loading context for project: {project_name}")
+            
+            try:
+                trunk_context = self.context_manager.load_or_create_trunk_context(
+                    goal=f"Complete task: {task_description}",
+                    project_url="",  # Will be loaded from existing context
+                    project_name=project_name,
+                )
+                
+                # Verify context was loaded/created successfully
+                context_info = self.context_manager.get_current_context_info()
+                if context_info.get("error"):
+                    raise Exception(f"Failed to load/create context: {context_info['error']}")
+                
+                self.agent_logger.info(f"✅ Context loaded successfully: {context_info.get('context_id', 'unknown')}")
+                logger.info(f"Trunk context ready for project: {project_name}")
+                
+            except Exception as e:
+                self.agent_logger.error(f"❌ Failed to load/create context: {e}")
+                logger.error(f"Context loading failed: {e}")
+                self.console.print(f"[bold red]❌ Failed to load project context: {e}[/bold red]")
+                return False
 
             # Step 3: Add the specific task
             trunk_context.add_task(task_description)
@@ -462,21 +517,27 @@ Be methodical and use the appropriate tools for each step. The repository URL is
         )
 
         # Show TODO list status if in trunk context
-        if context_info.get("context_type") == "trunk" and self.context_manager.trunk_context:
+        if context_info.get("context_type") == "trunk":
+            # Load trunk context to show TODO list
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context and trunk_context.todo_list:
+                    self.console.print("\n[bold]Final TODO List Status:[/bold]")
 
-            self.console.print("\n[bold]Final TODO List Status:[/bold]")
+                    for task in trunk_context.todo_list:
+                        status_icon = {
+                            "pending": "⏳",
+                            "in_progress": "🔄",
+                            "completed": "✅",
+                            "failed": "❌",
+                        }.get(str(task.status).split('.')[-1].lower(), "❓")
 
-            for task in self.context_manager.trunk_context.todo_list:
-                status_icon = {
-                    "pending": "⏳",
-                    "in_progress": "🔄",
-                    "completed": "✅",
-                    "failed": "❌",
-                }.get(task.status, "❓")
-
-                self.console.print(f"  {status_icon} {task.description}")
-                if task.notes:
-                    self.console.print(f"    [dim]Notes: {task.notes}[/dim]")
+                        self.console.print(f"  {status_icon} {task.description}")
+                        if task.notes:
+                            self.console.print(f"    [dim]Notes: {task.notes}[/dim]")
+            except Exception as e:
+                logger.warning(f"Failed to load trunk context for TODO display: {e}")
+                self.console.print(f"\n[dim]Could not load TODO list status[/dim]")
 
         # Log detailed summary
         logger.info(f"Setup summary: {exec_summary}")

@@ -484,10 +484,19 @@ class ProjectSetupTool(BaseTool):
         
         if project_type['type'] == 'maven':
             # Install Java and Maven
-            install_cmd = "apt update && apt install -y default-jdk maven"
+            logger.info("Installing dependencies for Maven project: default-jdk, maven")
+            
+            # 1. Update package lists
+            logger.info("Updating package lists with apt-get update...")
+            update_result = self.orchestrator.execute_command("apt-get update")
+            if not update_result["success"]:
+                logger.warning(f"apt-get update failed, but proceeding with install: {update_result['output']}")
+
+            # 2. Install packages
+            install_cmd = "DEBIAN_FRONTEND=noninteractive apt-get install -y default-jdk maven"
             result = self.orchestrator.execute_command(install_cmd, workdir=directory)
             
-            if result["exit_code"] == 0:
+            if result["success"]:
                 # Setup Java environment after installation
                 self._setup_java_environment()
                 

@@ -2,11 +2,11 @@
 
 import shlex
 import subprocess
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, ToolError
 
 
 class BashTool(BaseTool):
@@ -62,15 +62,55 @@ class BashTool(BaseTool):
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use bash-specific extraction with grep result optimization."""
         if tool_name == "bash" or tool_name == self.name:
-            return self._extract_bash_key_info(output)
+            # Note: We can't access the original command here, so this is a fallback
+            return self._extract_bash_key_info(output, "")
         return output
 
-    def _extract_bash_key_info(self, output: str) -> str:
-        """Extract key information from bash output, especially optimized for grep results."""
+    def _extract_bash_key_info(self, output: str, command: str = "") -> str:
+        """Extract key information from bash output with aggressive truncation for verbose commands."""
         if not output:
             return output
             
         lines = output.split('\n')
+        total_lines = len(lines)
+        
+        # CRITICAL: Detect verbose package management commands by COMMAND, not output
+        command_lower = command.lower()
+        is_verbose_package_cmd = any(pattern in command_lower for pattern in [
+            'apt-get install', 'apt install', 'yum install', 'dnf install',
+            'npm install', 'pip install', 'cargo install', 'go get'
+        ])
+        
+        if is_verbose_package_cmd and total_lines > 50:
+            # For verbose package commands, use AGGRESSIVE truncation
+            logger.info(f"🔧 Detected verbose package command with {total_lines} lines, applying aggressive truncation")
+            
+            # Keep only: head (25 lines) + tail (25 lines) = 50 lines total
+            key_start = lines[:25]
+            key_end = lines[-25:]
+            
+            # Extract critical status lines from the middle if any
+            critical_lines = []
+            for line in lines[10:-10]:  # Skip already included start/end
+                line_lower = line.lower()
+                if any(critical in line_lower for critical in [
+                    'error:', 'failed:', 'could not', 'unable to', 'permission denied',
+                    'build success', 'build failure', 'completed successfully',
+                    'warning:', 'critical:'
+                ]):
+                    critical_lines.append(line)
+                    if len(critical_lines) >= 5:  # Limit critical lines to prevent spam
+                        break
+            
+            result_parts = []
+            result_parts.extend(key_start)
+            if critical_lines:
+                result_parts.append(f"\n... [Key status messages from {total_lines} lines] ...")
+                result_parts.extend(critical_lines)
+            result_parts.append(f"\n... [Skipped {total_lines - 50 - len(critical_lines)} lines of verbose output] ...")
+            result_parts.extend(key_end)
+            
+            return '\n'.join(result_parts)
         
         # If this looks like grep output, preserve more context
         if any(line.strip() and ':' in line for line in lines[:10]):
@@ -89,147 +129,133 @@ class BashTool(BaseTool):
                     result += f"\n... [Showing first {len(key_lines)} matches out of {len(lines)} total lines]"
                 return result
         
-        # For other bash commands, use general extraction
+        # For regular commands, extract key information
         key_lines = []
         error_lines = []
+        line_count = 0
         
         for line in lines:
             line_lower = line.lower()
+            line_count += 1
             
-            # Capture errors and important status
+            # Stop processing if we've seen too many lines (prevent context pollution)
+            if line_count > 100:
+                key_lines.append(f"... [Stopped processing after 100 lines, total: {total_lines}]")
+                break
+            
+            # Capture errors and important status (high priority)
             if any(keyword in line_lower for keyword in [
                 'error:', 'exception:', 'failed:', 'warning:', 'critical:',
-                'success:', 'completed:', 'installed:', 'removed:', 'updated:'
+                'build success', 'build failure', 'success:', 'completed:'
             ]):
                 if 'error' in line_lower or 'exception' in line_lower or 'failed' in line_lower:
                     error_lines.append(f"🚨 {line.strip()}")
                 else:
                     key_lines.append(f"✅ {line.strip()}")
             
-            # File operations
+            # File operations (medium priority)
             elif any(keyword in line_lower for keyword in [
                 'created:', 'copied:', 'moved:', 'deleted:', 'modified:'
             ]):
                 key_lines.append(f"📁 {line.strip()}")
             
-            # Package management
+            # Package management (low priority - be selective)
             elif any(keyword in line_lower for keyword in [
-                'installing', 'removing', 'upgrading', 'package'
+                'installed successfully', 'removed successfully', 'updated successfully',
+                'package not found', 'dependency error'
             ]):
                 key_lines.append(f"📦 {line.strip()}")
             
-            # Git operations
+            # Git operations (medium priority)
             elif any(keyword in line_lower for keyword in [
                 'commit', 'push', 'pull', 'branch', 'merge'
             ]):
                 key_lines.append(f"🔄 {line.strip()}")
         
-        # Combine results
-        result_lines = error_lines + key_lines
+        # Combine results with strict limits
+        result_lines = error_lines[:10] + key_lines[:30]  # Limit to prevent bloat
         if result_lines:
+            if total_lines > len(result_lines) + 10:
+                result_lines.append(f"... [Extracted {len(result_lines)} key lines from {total_lines} total]")
             return '\n'.join(result_lines)
         
-        # If no key patterns found, return truncated original
-        if len(output) > 2000:
-            return output[:1000] + "\n... [Content truncated] ..." + output[-500:]
+        # If no key patterns found, apply strict truncation
+        if len(output) > 1500:  # Reduced from 2000
+            truncated = output[:800] + "\n... [Output truncated to prevent context pollution] ..." + output[-400:]
+            logger.info(f"🔧 Applied fallback truncation: {len(output)} chars → {len(truncated)} chars")
+            return truncated
         
         return output
 
-    def execute(self, command: str, timeout: int = 60, working_directory: str = None) -> ToolResult:
-        """Execute a bash command with enhanced grep support."""
-        if not command.strip():
-            return ToolResult(success=False, output="", error="Empty command provided")
+    def execute(self, command: str, working_directory: Optional[str] = None) -> ToolResult:
+        """
+        Execute a bash command in the container.
 
-        # Enhance grep commands with helpful flags
-        enhanced_command = self._enhance_grep_command(command)
+        Args:
+            command: The command to execute.
+            working_directory: The directory to execute the command in.
+        """
+        if not command:
+            return ToolResult.error("Command cannot be empty.", error_code="EMPTY_COMMAND")
+            
+        logger.info(f"Executing bash command: {command}")
         
-        logger.debug(f"Executing bash command: {enhanced_command}")
-        if working_directory:
-            logger.debug(f"Working directory: {working_directory}")
-
-        try:
-            # Use docker orchestrator if available
-            if self.docker_orchestrator:
-                # Ensure proper environment for bash commands, especially for mvn
-                environment = {
-                    "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
-                }
-                
-                # Source environment files to get Java and Maven paths
-                wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {enhanced_command}"
-                
-                result = self.docker_orchestrator.execute_command(
-                    wrapped_command, 
-                    workdir=working_directory,
-                    environment=environment
-                )
-                
-                return ToolResult(
-                    success=result["exit_code"] == 0,
-                    output=result["output"],
-                    error=None if result["exit_code"] == 0 else f"Command failed with exit code {result['exit_code']}",
-                    metadata={
-                        "exit_code": result["exit_code"], 
-                        "command": enhanced_command, 
-                        "original_command": command,
-                        "timeout": timeout,
-                        "is_grep": "grep" in command.lower(),
-                        "wrapped_command": wrapped_command
-                    },
-                )
-            else:
-                # Fallback to local execution
-                result = subprocess.run(
-                    enhanced_command,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    cwd=working_directory or "/workspace",
-                )
-
-                # Combine stdout and stderr for complete output
-                output = ""
-                if result.stdout:
-                    output += result.stdout
-                if result.stderr:
-                    if output:
-                        output += "\n--- STDERR ---\n"
-                    output += result.stderr
-
-                success = result.returncode == 0
-
-                return ToolResult(
-                    success=success,
-                    output=output,
-                    error=None if success else f"Command failed with exit code {result.returncode}",
-                    metadata={
-                        "exit_code": result.returncode, 
-                        "command": enhanced_command,
-                        "original_command": command, 
-                        "timeout": timeout,
-                        "is_grep": "grep" in command.lower()
-                    },
-                )
-
-        except subprocess.TimeoutExpired:
-            error_msg = f"Command timed out after {timeout} seconds"
-            logger.warning(f"Bash command timeout: {enhanced_command}")
+        # Use the orchestrator to execute the command with the specified working directory
+        result = self.docker_orchestrator.execute_command(command, workdir=working_directory)
+        
+        if result["success"]:
+            # Apply our custom bash-specific extraction based on COMMAND, not output
+            extracted_output = self._extract_bash_key_info(result["output"], command)
             return ToolResult(
-                success=False,
-                output="",
-                error=error_msg,
-                metadata={"timeout": timeout, "command": enhanced_command, "original_command": command},
+                success=True, 
+                output=extracted_output, 
+                metadata={"exit_code": result["exit_code"], "original_command": command}
             )
+        else:
+            exit_code = result['exit_code']
+            output = result['output']
+            
+            # Provide more specific error messages based on exit code
+            if exit_code == 127:
+                error_message = "Command Not Found (exit code 127)"
+                suggestions = [
+                    "The command was not found in the system PATH.",
+                    "Check if the command is installed: which <command>",
+                    "For Java tools like 'mvn', ensure JAVA_HOME and M2_HOME are set.",
+                    "Try 'echo $PATH' to check the current PATH environment variable.",
+                    "Install the missing command or verify the spelling.",
+                ]
+            elif exit_code == 126:
+                error_message = "Permission Denied (exit code 126)"
+                suggestions = [
+                    "The command file exists but is not executable.",
+                    "Try 'chmod +x <command>' to make it executable.",
+                    "Check file permissions with 'ls -la <command>'.",
+                ]
+            elif exit_code == 2:
+                error_message = "File Not Found (exit code 2)"
+                suggestions = [
+                    "The specified file or directory does not exist.",
+                    "Check the path and filename for typos.",
+                    "Use 'ls -la' to verify the file exists.",
+                ]
+            else:
+                error_message = f"Command failed with exit code {exit_code}"
+                suggestions = [
+                    "Check the command syntax for errors.",
+                    "Verify that the command and its arguments are correct.",
+                    f"Ensure the working directory '{working_directory}' exists.",
+                    "Try running a simpler command like 'ls -la' to test connectivity."
+                ]
+            
+            if output:
+                error_message += f"\nOutput:\n{output}"
 
-        except Exception as e:
-            error_msg = f"Failed to execute command: {str(e)}"
-            logger.error(f"Bash command execution error: {error_msg}")
-            return ToolResult(
-                success=False, 
-                output="", 
-                error=error_msg, 
-                metadata={"command": enhanced_command, "original_command": command}
+            raise ToolError(
+                message=error_message,
+                suggestions=suggestions,
+                error_code="COMMAND_FAILED",
+                raw_output=output
             )
 
     def _enhance_grep_command(self, command: str) -> str:

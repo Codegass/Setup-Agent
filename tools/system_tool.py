@@ -55,7 +55,11 @@ class SystemTool(BaseTool):
                 return self._detect_missing_tools()
                 
             elif action == "install_missing":
-                return self._install_missing_dependencies()
+                if packages:
+                    # Smart install: search for packages that provide the specified commands
+                    return self._smart_install_commands(packages)
+                else:
+                    return self._install_missing_dependencies()
                 
         except Exception as e:
             error_msg = f"System operation failed: {str(e)}"
@@ -248,6 +252,148 @@ class SystemTool(BaseTool):
                     "failed_packages": packages_to_install
                 }
             )
+
+    def _smart_install_commands(self, commands: List[str]) -> ToolResult:
+        """
+        Intelligently install packages that provide the specified commands.
+        This solves issues like trying to install 'javac' when 'default-jdk' is needed.
+        """
+        logger.info(f"Smart installing commands: {commands}")
+        
+        # Common command-to-package mappings
+        command_mappings = {
+            'javac': ['default-jdk', 'openjdk-11-jdk', 'openjdk-8-jdk'],
+            'java': ['default-jre', 'openjdk-11-jre', 'openjdk-8-jre'],
+            'mvn': ['maven'],
+            'node': ['nodejs'],
+            'npm': ['npm'],
+            'python3': ['python3'],
+            'pip3': ['python3-pip'],
+            'git': ['git'],
+            'curl': ['curl'],
+            'wget': ['wget'],
+            'gcc': ['build-essential', 'gcc'],
+            'g++': ['build-essential', 'g++'],
+            'make': ['build-essential', 'make'],
+            'cmake': ['cmake'],
+            'docker': ['docker.io', 'docker-ce'],
+            'zip': ['zip'],
+            'unzip': ['unzip'],
+            'vim': ['vim'],
+            'nano': ['nano'],
+            'grep': ['grep'],
+            'find': ['findutils'],
+            'which': ['debianutils'],
+            'awk': ['gawk'],
+            'sed': ['sed'],
+        }
+        
+        packages_to_install = []
+        search_results = []
+        
+        for command in commands:
+            command = command.strip()
+            
+            # First, check if command already exists
+            check_result = self.docker_orchestrator.execute_command(f"which {command}")
+            if check_result["exit_code"] == 0:
+                search_results.append(f"✅ {command}: already available at {check_result['output'].strip()}")
+                continue
+            
+            # Check our known mappings first
+            if command in command_mappings:
+                packages = command_mappings[command]
+                packages_to_install.extend(packages)
+                search_results.append(f"📦 {command}: mapped to {', '.join(packages)}")
+                continue
+            
+            # Try to search for package using apt-file or dpkg
+            package_search_result = self._search_package_for_command(command)
+            if package_search_result:
+                packages_to_install.extend(package_search_result)
+                search_results.append(f"🔍 {command}: found in {', '.join(package_search_result)}")
+            else:
+                # Fallback: try installing the command name directly
+                packages_to_install.append(command)
+                search_results.append(f"⚠️ {command}: trying direct install (fallback)")
+        
+        # Remove duplicates while preserving order
+        unique_packages = []
+        for pkg in packages_to_install:
+            if pkg not in unique_packages:
+                unique_packages.append(pkg)
+        
+        if not unique_packages:
+            return ToolResult(
+                success=True,
+                output="All requested commands are already available.\n" + "\n".join(search_results),
+                metadata={"commands": commands, "packages_installed": [], "search_results": search_results}
+            )
+        
+        # Install the discovered packages
+        logger.info(f"Installing packages for commands: {unique_packages}")
+        install_result = self._install_packages(unique_packages)
+        
+        # Enhance the output with search information
+        if install_result.success:
+            enhanced_output = f"Smart installation completed!\n\n"
+            enhanced_output += f"Command analysis:\n" + "\n".join(search_results) + "\n\n"
+            enhanced_output += f"Installed packages: {', '.join(unique_packages)}\n\n"
+            enhanced_output += install_result.output
+            
+            return ToolResult(
+                success=True,
+                output=enhanced_output,
+                metadata={
+                    "commands": commands,
+                    "packages_installed": unique_packages,
+                    "search_results": search_results,
+                    "install_output": install_result.output
+                }
+            )
+        else:
+            return install_result
+    
+    def _search_package_for_command(self, command: str) -> List[str]:
+        """
+        Search for packages that provide a specific command.
+        Uses multiple fallback strategies.
+        """
+        packages = []
+        
+        # Strategy 1: Try apt-file if available
+        apt_file_result = self.docker_orchestrator.execute_command(f"apt-file search bin/{command}")
+        if apt_file_result["exit_code"] == 0 and apt_file_result["output"]:
+            # Parse apt-file output: "package: /usr/bin/command"
+            for line in apt_file_result["output"].split('\n'):
+                if f'bin/{command}' in line and ':' in line:
+                    package = line.split(':')[0].strip()
+                    if package and package not in packages:
+                        packages.append(package)
+        
+        # Strategy 2: Try dpkg search if apt-file failed
+        if not packages:
+            dpkg_result = self.docker_orchestrator.execute_command(f"dpkg -S $(which {command} 2>/dev/null) 2>/dev/null")
+            if dpkg_result["exit_code"] == 0 and dpkg_result["output"]:
+                for line in dpkg_result["output"].split('\n'):
+                    if ':' in line:
+                        package = line.split(':')[0].strip()
+                        if package and package not in packages:
+                            packages.append(package)
+        
+        # Strategy 3: Try command-not-found if available
+        if not packages:
+            cnf_result = self.docker_orchestrator.execute_command(f"command-not-found {command} 2>&1 | grep 'apt install' || true")
+            if cnf_result["exit_code"] == 0 and cnf_result["output"]:
+                # Extract package names from "apt install package1 package2" suggestions
+                import re
+                matches = re.findall(r'apt install\s+([^\n]+)', cnf_result["output"])
+                for match in matches:
+                    suggested_packages = match.strip().split()
+                    packages.extend(suggested_packages)
+        
+        # Return up to 3 most relevant packages to avoid installing too much
+        return packages[:3] if packages else []
 
     def _analyze_install_error(self, error_output: str) -> Dict[str, Any]:
         """Analyze installation error output and provide suggestions."""
