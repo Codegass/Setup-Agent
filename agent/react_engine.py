@@ -781,7 +781,9 @@ IMPORTANT GUIDELINES:
 10. When encountering errors, think carefully about the root cause before retrying
 
 MANDATORY WORKFLOW FOR PROJECT SETUP:
-1. Start by using the tools - don't ask questions, take action!"""
+1. Start by using the tools - don't ask questions, take action!
+2. If this is a new project setup (no existing context), immediately clone the repository
+3. Do NOT wait for user input or ask what to do - be proactive and start working!"""
         else:
             prompt += """
 
@@ -810,7 +812,8 @@ IMPORTANT GUIDELINES:
 9. When encountering errors, think carefully about the root cause before retrying
 
 MANDATORY WORKFLOW FOR PROJECT SETUP:
-1. ALWAYS start with: manage_context(action="get_info")"""
+1. For new projects: IMMEDIATELY clone the repository (skip manage_context if no existing tasks)
+2. For existing projects: start with manage_context(action="get_info")"""
 
         # Add repository URL instruction if available
         if self.repository_url:
@@ -1080,6 +1083,38 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             # Apply additional tool-specific fixes
             validated_params = self._apply_tool_specific_fixes(tool_name, validated_params)
             
+            # Check for unexpected parameters and provide warnings
+            expected_params = set(schema.get('properties', {}).keys())
+            actual_params = set(validated_params.keys())
+            unexpected_params = actual_params - expected_params
+            
+            if unexpected_params:
+                logger.warning(f"🚨 Unexpected parameters for {tool_name}: {unexpected_params}")
+                logger.warning(f"Expected parameters: {expected_params}")
+                
+                # Only remove parameters that are clearly invalid, keep potentially useful ones
+                params_to_remove = []
+                for param in unexpected_params:
+                    param_value = validated_params[param]
+                    
+                    # Keep parameters that might be useful extensions
+                    if tool_name == "maven" and param in ["pom_file", "maven_home", "java_home"]:
+                        logger.info(f"🔧 Keeping potentially useful Maven parameter: {param}={param_value}")
+                        continue
+                    elif tool_name == "bash" and param in ["env", "environment"]:
+                        logger.info(f"🔧 Keeping potentially useful bash parameter: {param}={param_value}")
+                        continue
+                    elif tool_name == "system" and param in ["sudo", "force"]:
+                        logger.info(f"🔧 Keeping potentially useful system parameter: {param}={param_value}")
+                        continue
+                    else:
+                        # Remove clearly invalid parameters
+                        params_to_remove.append(param)
+                
+                for param in params_to_remove:
+                    logger.warning(f"🔧 Removing invalid parameter: {param}={validated_params[param]}")
+                    del validated_params[param]
+            
             # Log parameter fixes if any were made
             if validated_params != params:
                 logger.info(f"🔧 Parameter self-healing applied for {tool_name}")
@@ -1314,6 +1349,8 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 'working_dir': 'working_directory',
                 'workdir': 'working_directory',
                 'work_dir': 'working_directory',
+                'directory': 'working_directory',
+                'path': 'working_directory',  # Sometimes confused
             },
             'file_io': {
                 'file': 'path',
@@ -1337,6 +1374,8 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 'options': 'properties',
                 'dir': 'working_directory',
                 'project_dir': 'working_directory',
+                'cmd': 'command',  # Common mistake
+                'maven_command': 'command',
             },
             'manage_context': {
                 'type': 'action',
@@ -1420,6 +1459,13 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 if params.get("repository_url"):
                     self.successful_states['cloned_repos'].add(params['repository_url'])
                     logger.debug(f"Recorded cloned repo: {params['repository_url']}")
+                    
+                    # Set working directory based on cloned repository
+                    if params.get("action") == "clone":
+                        repo_name = params['repository_url'].split('/')[-1].replace('.git', '')
+                        clone_dir = f"/workspace/{repo_name}"
+                        self.successful_states['working_directory'] = clone_dir
+                        logger.info(f"Updated working directory after clone: {clone_dir}")
                 
                 # Check for project type detection in output
                 output = result.output or ""

@@ -212,7 +212,7 @@ class DockerOrchestrator:
             logger.error(f"Failed to connect to container: {e}")
             raise
 
-    def execute_command(self, command: str, workdir: str = None) -> Dict[str, Any]:
+    def execute_command(self, command: str, workdir: str = None, environment: Dict[str, str] = None) -> Dict[str, Any]:
         """Execute a command in the container."""
 
         try:
@@ -221,9 +221,23 @@ class DockerOrchestrator:
             if container.status != "running":
                 raise RuntimeError(f"Container {self.container_name} is not running")
 
-            # Execute command
+            # Prepare environment variables
+            env_vars = {}
+            if environment:
+                env_vars.update(environment)
+            
+            # Add PATH update to include common binary locations
+            current_path = env_vars.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+            if "/usr/local/bin" not in current_path:
+                env_vars["PATH"] = f"/usr/local/bin:{current_path}"
+
+            # Execute command with environment variables
             result = container.exec_run(
-                command, workdir=workdir or self.config.workspace_path, stdout=True, stderr=True
+                command, 
+                workdir=workdir or self.config.workspace_path, 
+                stdout=True, 
+                stderr=True,
+                environment=env_vars if env_vars else None
             )
 
             return {

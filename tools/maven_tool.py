@@ -35,7 +35,9 @@ class MavenTool(BaseTool):
         properties: str = None,
         raw_output: bool = False,
         working_directory: str = "/workspace",
-        timeout: int = 300
+        timeout: int = 300,
+        pom_file: str = None,
+        **kwargs  # Accept any additional parameters
     ) -> ToolResult:
         """
         Execute Maven commands with comprehensive error handling.
@@ -56,8 +58,16 @@ class MavenTool(BaseTool):
             if not install_result.success:
                 return install_result
         
+        # If pom_file is specified, extract directory and use it as working_directory
+        if pom_file and pom_file.endswith("pom.xml"):
+            import os
+            pom_dir = os.path.dirname(pom_file)
+            if pom_dir and pom_dir != working_directory:
+                working_directory = pom_dir
+                logger.info(f"🔧 Using directory from pom_file: {working_directory}")
+        
         # Build Maven command
-        maven_cmd = self._build_maven_command(command, goals, profiles, properties)
+        maven_cmd = self._build_maven_command(command, goals, profiles, properties, pom_file)
         
         # Execute the command
         try:
@@ -109,7 +119,7 @@ class MavenTool(BaseTool):
                 error_code="MAVEN_EXECUTION_ERROR"
             )
     
-    def _build_maven_command(self, command: str, goals: str, profiles: str, properties: str) -> str:
+    def _build_maven_command(self, command: str, goals: str, profiles: str, properties: str, pom_file: str = None) -> str:
         """Build the complete Maven command."""
         cmd_parts = ["mvn"]
         
@@ -121,6 +131,10 @@ class MavenTool(BaseTool):
         if properties:
             for prop in properties.split(","):
                 cmd_parts.append(f"-D{prop.strip()}")
+        
+        # Add pom file if specified
+        if pom_file:
+            cmd_parts.extend(["-f", pom_file])
         
         # Add command and goals
         if goals:
@@ -144,11 +158,59 @@ class MavenTool(BaseTool):
                     self.orchestrator.execute_command(f"ln -sf {mvn_path} /usr/local/bin/mvn")
                     logger.info("Created symlink for mvn in /usr/local/bin")
                 
-                # Update PATH environment variable for current session
-                self.orchestrator.execute_command("export PATH=/usr/local/bin:$PATH")
+                # Update system-wide PATH by modifying profile
+                profile_commands = [
+                    "echo 'export PATH=/usr/local/bin:$PATH' >> /etc/profile",
+                    "echo 'export PATH=/usr/local/bin:$PATH' >> /root/.bashrc",
+                    "chmod +x /usr/local/bin/mvn"
+                ]
+                
+                for cmd in profile_commands:
+                    result = self.orchestrator.execute_command(cmd)
+                    if not result["success"]:
+                        logger.warning(f"Failed to execute: {cmd}")
+                
+                logger.info("Updated system PATH to include /usr/local/bin")
                 
         except Exception as e:
             logger.warning(f"Failed to ensure Maven in PATH: {e}")
+
+    def _setup_java_environment(self):
+        """Setup JAVA_HOME environment variable for newly installed JDK."""
+        try:
+            # Find JAVA_HOME for the latest JDK
+            find_java_result = self.orchestrator.execute_command("find /usr/lib/jvm -name 'java-*-openjdk*' -type d | sort -V | tail -1")
+            
+            if find_java_result["exit_code"] == 0 and find_java_result["output"].strip():
+                java_home = find_java_result["output"].strip()
+                logger.info(f"Found Java installation at: {java_home}")
+                
+                # Set JAVA_HOME system-wide
+                java_env_commands = [
+                    f"echo 'export JAVA_HOME={java_home}' >> /etc/profile",
+                    f"echo 'export JAVA_HOME={java_home}' >> /root/.bashrc",
+                    f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile",
+                    f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /root/.bashrc"
+                ]
+                
+                for cmd in java_env_commands:
+                    result = self.orchestrator.execute_command(cmd)
+                    if not result["success"]:
+                        logger.warning(f"Failed to execute: {cmd}")
+                
+                # Also update current session environment
+                self.orchestrator.execute_command(f"export JAVA_HOME={java_home}")
+                self.orchestrator.execute_command(f"export PATH=$JAVA_HOME/bin:$PATH")
+                
+                logger.info(f"Set JAVA_HOME to {java_home}")
+                return java_home
+            else:
+                logger.warning("Could not find Java installation directory")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"Failed to setup Java environment: {e}")
+            return None
 
     def _is_maven_installed(self) -> bool:
         """Check if Maven is installed."""
@@ -497,6 +559,11 @@ For debugging:
                     "type": "integer",
                     "description": "Command timeout in seconds",
                     "default": 300,
+                },
+                "pom_file": {
+                    "type": "string",
+                    "description": "Path to specific pom.xml file to use",
+                    "default": None,
                 },
             },
             "required": ["command"],

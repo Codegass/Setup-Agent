@@ -42,13 +42,14 @@ class ReportTool(BaseTool):
 
         try:
             if action == "generate":
-                report = self._generate_comprehensive_report(summary, status, details)
+                report, verified_status = self._generate_comprehensive_report(summary, status, details)
                 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
                     "task_completed": True,
                     "completion_signal": True,
                     "status": status,
+                    "verified_status": verified_status,  # Include the verified status
                     "timestamp": datetime.now().isoformat(),
                 }
                 
@@ -75,7 +76,7 @@ class ReportTool(BaseTool):
                 suggestions=["Check if all required information is available"]
             )
 
-    def _generate_comprehensive_report(self, summary: str, status: str, details: str) -> str:
+    def _generate_comprehensive_report(self, summary: str, status: str, details: str) -> tuple[str, str]:
         """Generate a comprehensive project setup report."""
         
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -93,7 +94,7 @@ class ReportTool(BaseTool):
         # Save markdown report to workspace
         self._save_markdown_report(markdown_report, timestamp)
         
-        return console_report
+        return console_report, verified_status
 
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
         """Verify the claimed status against actual execution history."""
@@ -121,12 +122,12 @@ class ReportTool(BaseTool):
             # Parse execution steps - handle both dict and object formats
             for step in history:
                 # Handle ReActStep objects
-                if hasattr(step, 'step_type') and step.step_type == 'ACTION' and hasattr(step, 'tool_result'):
+                if hasattr(step, 'step_type') and step.step_type == 'action' and hasattr(step, 'tool_result'):
                     tool_name = step.tool_name
                     tool_result = step.tool_result
                     tool_params = step.tool_params
                 # Handle dict format
-                elif isinstance(step, dict) and step.get('step_type') == 'ACTION' and step.get('tool_result'):
+                elif isinstance(step, dict) and step.get('step_type') == 'action' and step.get('tool_result'):
                     tool_name = step.get('tool_name')
                     tool_result = step.get('tool_result')
                     tool_params = step.get('tool_params', {})
@@ -135,7 +136,11 @@ class ReportTool(BaseTool):
                     
                 actual_accomplishments['total_actions'] += 1
                 
-                if tool_result.success:
+                # Handle both object and dict format for tool_result
+                success = getattr(tool_result, 'success', tool_result.get('success', False)) if hasattr(tool_result, 'get') or hasattr(tool_result, 'success') else False
+                output = getattr(tool_result, 'output', tool_result.get('output', '')) if hasattr(tool_result, 'get') or hasattr(tool_result, 'output') else ''
+                
+                if success:
                     actual_accomplishments['successful_actions'] += 1
                     actual_accomplishments['tools_successful'].append(tool_name)
                     
@@ -148,7 +153,6 @@ class ReportTool(BaseTool):
                     
                     elif tool_name == 'maven':
                         command = tool_params.get('command', '').lower()
-                        output = tool_result.output or ''
                         
                         if 'compile' in command and 'BUILD SUCCESS' in output:
                             actual_accomplishments['maven_compile_success'] = True

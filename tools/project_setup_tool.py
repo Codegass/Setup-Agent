@@ -488,9 +488,12 @@ class ProjectSetupTool(BaseTool):
             result = self.orchestrator.execute_command(install_cmd, workdir=directory)
             
             if result["exit_code"] == 0:
+                # Setup Java environment after installation
+                self._setup_java_environment()
+                
                 return {
                     'success': True,
-                    'installed': 'Java JDK and Maven',
+                    'installed': 'Java JDK and Maven with environment setup',
                     'output': result["output"]
                 }
             else:
@@ -505,6 +508,39 @@ class ProjectSetupTool(BaseTool):
             'success': False,
             'error': f"Auto-installation not implemented for project type: {project_type['type']}"
         }
+
+    def _setup_java_environment(self):
+        """Setup JAVA_HOME environment variable for newly installed JDK."""
+        try:
+            # Find JAVA_HOME for the latest JDK
+            find_java_result = self.orchestrator.execute_command("find /usr/lib/jvm -name 'java-*-openjdk*' -type d | sort -V | tail -1")
+            
+            if find_java_result["exit_code"] == 0 and find_java_result["output"].strip():
+                java_home = find_java_result["output"].strip()
+                logger.info(f"Found Java installation at: {java_home}")
+                
+                # Set JAVA_HOME system-wide
+                java_env_commands = [
+                    f"echo 'export JAVA_HOME={java_home}' >> /etc/profile",
+                    f"echo 'export JAVA_HOME={java_home}' >> /root/.bashrc",
+                    f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile",
+                    f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /root/.bashrc"
+                ]
+                
+                for cmd in java_env_commands:
+                    result = self.orchestrator.execute_command(cmd)
+                    if not result["success"]:
+                        logger.warning(f"Failed to execute: {cmd}")
+                
+                logger.info(f"Set JAVA_HOME to {java_home}")
+                return java_home
+            else:
+                logger.warning("Could not find Java installation directory")
+                return None
+                
+        except Exception as e:
+            logger.warning(f"Failed to setup Java environment: {e}")
+            return None
     
     def _handle_clone_error(self, output: str, repository_url: str, target_directory: str, command: str) -> ToolResult:
         """Handle git clone errors with specific suggestions."""

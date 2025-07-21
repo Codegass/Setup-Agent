@@ -39,7 +39,7 @@ class ContextTool(BaseTool):
             new_context: Compacted context history (required for 'compact_context')
         """
         
-        valid_actions = ["get_info", "start_task", "add_context", "get_full_context", "compact_context", "complete_task"]
+        valid_actions = ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "switch_to_trunk"]
         
         if action not in valid_actions:
             raise ToolError(
@@ -62,7 +62,7 @@ class ContextTool(BaseTool):
         try:
             if action == "get_info":
                 return self._get_context_info()
-            elif action == "start_task":
+            elif action in ["start_task", "create_branch"]:
                 return self._start_task(task_id)
             elif action == "add_context":
                 return self._add_context(entry)
@@ -70,7 +70,7 @@ class ContextTool(BaseTool):
                 return self._get_full_context()
             elif action == "compact_context":
                 return self._compact_context(new_context)
-            elif action == "complete_task":
+            elif action in ["complete_task", "switch_to_trunk"]:
                 return self._complete_task(summary)
                 
         except Exception as e:
@@ -464,7 +464,7 @@ Tips:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_info", "start_task", "add_context", "get_full_context", "compact_context", "complete_task"],
+                    "enum": ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "switch_to_trunk"],
                     "description": "Action to execute",
                 },
                 "task_id": {

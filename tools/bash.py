@@ -17,8 +17,8 @@ class BashTool(BaseTool):
     • Find function definitions: grep -r "def function_name" .
     • Search for class declarations: grep -r "class ClassName" .
     • Find imports: grep -r "import module_name" .
-    • Search for specific patterns: grep -r "error\|exception\|fail" .
-    • Find configuration: grep -r "config\|setting" .
+    • Search for specific patterns: grep -r "error\\|exception\\|fail" .
+    • Find configuration: grep -r "config\\|setting" .
     
     ESSENTIAL GREP PATTERNS:
     • Basic search: grep "pattern" file.txt
@@ -34,11 +34,11 @@ class BashTool(BaseTool):
     • Invert match: grep -v "pattern" file.txt
     
     INVESTIGATION WORKFLOWS:
-    1. Project Overview: grep -r "def\|class\|import" . --include="*.py" | head -20
-    2. Error Investigation: grep -r -i "error\|exception\|fail" . --include="*.py" -C 2
-    3. Configuration Discovery: grep -r "config\|setting\|env" . --exclude-dir=".git"
-    4. API Endpoints: grep -r "route\|endpoint\|@app" . --include="*.py"
-    5. Database Queries: grep -r "SELECT\|INSERT\|UPDATE\|DELETE" . -i
+    1. Project Overview: grep -r "def\\|class\\|import" . --include="*.py" | head -20
+    2. Error Investigation: grep -r -i "error\\|exception\\|fail" . --include="*.py" -C 2
+    3. Configuration Discovery: grep -r "config\\|setting\\|env" . --exclude-dir=".git"
+    4. API Endpoints: grep -r "route\\|endpoint\\|@app" . --include="*.py"
+    5. Database Queries: grep -r "SELECT\\|INSERT\\|UPDATE\\|DELETE" . -i
     
     ADVANCED GREP TECHNIQUES:
     • Regex patterns: grep -E "^[A-Z]+_[A-Z]+" config.txt
@@ -150,7 +150,19 @@ class BashTool(BaseTool):
         try:
             # Use docker orchestrator if available
             if self.docker_orchestrator:
-                result = self.docker_orchestrator.execute_command(enhanced_command, workdir=working_directory)
+                # Ensure proper environment for bash commands, especially for mvn
+                environment = {
+                    "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+                }
+                
+                # Source environment files to get Java and Maven paths
+                wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {enhanced_command}"
+                
+                result = self.docker_orchestrator.execute_command(
+                    wrapped_command, 
+                    workdir=working_directory,
+                    environment=environment
+                )
                 
                 return ToolResult(
                     success=result["exit_code"] == 0,
@@ -161,7 +173,8 @@ class BashTool(BaseTool):
                         "command": enhanced_command, 
                         "original_command": command,
                         "timeout": timeout,
-                        "is_grep": "grep" in command.lower()
+                        "is_grep": "grep" in command.lower(),
+                        "wrapped_command": wrapped_command
                     },
                 )
             else:
@@ -265,7 +278,7 @@ GREP INVESTIGATION EXAMPLES:
 • Case insensitive: grep -rni "error" .
 
 🎯 PATTERN MATCHING:
-• Multiple patterns: grep -rn "error\|exception\|fail" .
+• Multiple patterns: grep -rn "error\\|exception\\|fail" .
 • Regex pattern: grep -rn "def [a-z_]*test" .
 • Whole words: grep -rnw "test" .
 • Start of line: grep -rn "^class " .
@@ -282,11 +295,11 @@ GREP INVESTIGATION EXAMPLES:
 • Invert match: grep -rnv "pattern" .
 
 🚀 ADVANCED INVESTIGATIONS:
-• Find all APIs: grep -rn "@app\|@route\|def.*api" . --include="*.py"
-• Database queries: grep -rni "select\|insert\|update\|delete" .
-• Configuration: grep -rn "config\|setting\|env" . --exclude-dir=".git"
-• Error handling: grep -rn "try:\|except\|raise" . --include="*.py" -A 2
-• Find TODOs: grep -rn "TODO\|FIXME\|HACK" .
+• Find all APIs: grep -rn "@app\\|@route\\|def.*api" . --include="*.py"
+• Database queries: grep -rni "select\\|insert\\|update\\|delete" .
+• Configuration: grep -rn "config\\|setting\\|env" . --exclude-dir=".git"
+• Error handling: grep -rn "try:\\|except\\|raise" . --include="*.py" -A 2
+• Find TODOs: grep -rn "TODO\\|FIXME\\|HACK" .
 
 💡 PRO TIPS:
 • Use -C 2 to see context around matches
@@ -304,7 +317,7 @@ GREP INVESTIGATION EXAMPLES:
                     "type": "string", 
                     "description": "The bash command to execute. For grep investigations, use patterns like: "
                     "'grep -rn \"pattern\" .' for recursive search, "
-                    "'grep -rni \"error|exception\" . --include=\"*.py\"' for specific file types, "
+                    "'grep -rni \"error\\|exception\" . --include=\"*.py\"' for specific file types, "
                     "'grep -rn -C 3 \"function_name\" .' for context around matches. "
                     "See get_grep_examples() for comprehensive patterns."
                 },

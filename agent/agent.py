@@ -113,9 +113,15 @@ class SetupAgent:
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url)
 
-            # Step 2: Initialize trunk context
+            # Step 2: Initialize trunk context with initial tasks
+            initial_tasks = [
+                "Clone the repository and analyze project structure",
+                "Install dependencies and build environment",
+                "Compile and test the project",
+                "Generate completion report"
+            ]
             trunk_context = self.context_manager.create_trunk_context(
-                goal=goal, project_url=project_url, project_name=project_name
+                goal=goal, project_url=project_url, project_name=project_name, tasks=initial_tasks
             )
 
             # Step 3: Run the unified setup process
@@ -371,12 +377,49 @@ Be methodical and use the appropriate tools for each step. The repository URL is
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
 
-            if success:
+            # Check if a report was generated and get the verified status
+            verified_success = self._get_verified_final_status(success)
+
+            if verified_success:
                 progress.update(task, description="✅ Setup process completed")
             else:
                 progress.update(task, description="❌ Setup process incomplete")
 
-        return success
+        return verified_success
+
+    def _get_verified_final_status(self, react_engine_success: bool) -> bool:
+        """Get the verified final status by checking report tool results."""
+        # If ReAct engine failed outright, it's definitely a failure
+        if not react_engine_success:
+            return False
+        
+        # Check if a report was generated and what its verified status was
+        if hasattr(self, 'react_engine') and self.react_engine and self.react_engine.steps:
+            for step in reversed(self.react_engine.steps):
+                if (hasattr(step, 'step_type') and step.step_type == 'action' and 
+                    hasattr(step, 'tool_name') and step.tool_name == 'report' and
+                    hasattr(step, 'tool_result') and step.tool_result and step.tool_result.success):
+                    
+                    # Check the metadata for the verified status
+                    metadata = step.tool_result.metadata or {}
+                    verified_status = metadata.get('verified_status')
+                    
+                    if verified_status:
+                        logger.info(f"🔍 Using verified status from report tool: {verified_status}")
+                        return verified_status == 'success'
+                    else:
+                        # Fallback to checking report output for status indicators
+                        output = step.tool_result.output or ""
+                        if "Status: FAILED" in output:
+                            logger.info("🔍 Report shows FAILED status - treating as failure")
+                            return False
+                        elif "Status: SUCCESS" in output:
+                            logger.info("🔍 Report shows SUCCESS status - treating as success")
+                            return True
+        
+        # If no report was found, fall back to ReAct engine result
+        logger.warning("🔍 No report tool result found, using ReAct engine result")
+        return react_engine_success
 
     def _provide_setup_summary(self, success: bool):
         """Provide a summary of the setup process."""
