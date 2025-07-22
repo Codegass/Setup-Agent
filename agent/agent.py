@@ -11,7 +11,6 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from config import Config, create_agent_logger, create_command_logger, get_session_logger
 from docker_orch.orch import DockerOrchestrator
-from tools import BashTool, FileIOTool, WebSearchTool
 
 from .context_manager import ContextManager
 from .react_engine import ReActEngine
@@ -59,6 +58,9 @@ class SetupAgent:
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
         from tools.context_tool import ContextTool
+        from tools.bash import BashTool
+        from tools.file_io import FileIOTool
+        from tools.web_search import WebSearchTool
         from tools.maven_tool import MavenTool
         from tools.project_setup_tool import ProjectSetupTool
         from tools.system_tool import SystemTool
@@ -407,6 +409,7 @@ I should complete this setup systematically:
 
 2. PROJECT BUILD & TEST:
    - If it's a Maven project: compile and run tests using maven tool
+   - If it's a Gradle project: compile and run tests using gradle tool
    - If it's a Node.js project: install dependencies and run tests
    - If it's a Python project: set up environment and run tests
    - Handle any dependency installation issues using system tool
@@ -559,7 +562,7 @@ Be methodical and use the appropriate tools for each step. The repository URL is
             )
 
     def _provide_task_summary(self, success: bool, task_description: str):
-        """Provide a summary of task execution."""
+        """Provide a summary of task execution in the terminal final output, this will not shown in the log"""
 
         # Get execution summary
         summary = self.react_engine.get_execution_summary()

@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any, List
 
 from loguru import logger
 
-from agent.context_manager import ContextManager, BranchContextHistory
+from agent.context_manager import ContextManager, BranchContextHistory, TaskStatus
 
 from .base import BaseTool, ToolResult, ToolError
 
@@ -20,138 +20,69 @@ class ContextTool(BaseTool):
         )
         self.context_manager = context_manager
 
-    def _translate_action(self, action: str) -> str:
-        """
-        Translate Agent's mental model actions to actual tool actions.
-        This prevents 'ghost wall' loops caused by mental model misalignment.
-        """
-        # Mental model translation map
-        action_translations = {
-            # Agent thinks in terms of "branches" but tool uses "tasks"
-            'branch_start': 'start_task',
-            'create_branch': 'start_task', 
-            'start_branch': 'start_task',
-            'begin_task': 'start_task',
-            
-            # Agent thinks about "ending branches" but tool auto-switches context
-            'branch_end': 'complete_task',
-            'end_branch': 'complete_task',
-            'finish_task': 'complete_task',
-            'end_task': 'complete_task',
-            
-            # Common variations for switching back to trunk
-            'return_to_trunk': 'switch_to_trunk',
-            'switch_trunk': 'switch_to_trunk',
-            'back_to_main': 'switch_to_trunk',
-            
-            # Context retrieval variations
-            'get_context': 'get_info',
-            'context_info': 'get_info',
-            'show_context': 'get_info',
-            'current_context': 'get_info',
-            
-            # History management variations
-            'add_entry': 'add_context',
-            'log_context': 'add_context',
-            'record_context': 'add_context',
-            
-            'get_history': 'get_full_context',
-            'full_history': 'get_full_context',
-            'show_history': 'get_full_context',
-            
-            'compress_context': 'compact_context',
-            'compact_history': 'compact_context',
-            'compress_history': 'compact_context',
-        }
-        
-        # Return translated action or original if no translation needed
-        translated = action_translations.get(action.lower(), action)
-        return translated
-
-    def _get_action_suggestion(self, original_action: str, translated_action: str) -> str:
-        """
-        Generate intelligent suggestion message for invalid actions.
-        Helps Agent understand correct mental model.
-        """
-        # Common misunderstanding mappings with explanations
-        common_mistakes = {
-            'branch_start': "Did you mean 'start_task'? Use start_task(task_id='task_X') to begin working on a task.",
-            'create_branch': "Did you mean 'start_task'? Use start_task(task_id='task_X') to begin working on a task.",
-            'start_branch': "Did you mean 'start_task'? Use start_task(task_id='task_X') to begin working on a task.",
-            'begin_task': "Did you mean 'start_task'? Use start_task(task_id='task_X') to begin working on a task.",
-            
-            'branch_end': "Did you mean 'complete_task'? Use complete_task(summary='...') to finish the current task.",
-            'end_branch': "Did you mean 'complete_task'? Use complete_task(summary='...') to finish the current task.",
-            'finish_task': "Did you mean 'complete_task'? Use complete_task(summary='...') to finish the current task.",
-            'end_task': "Did you mean 'complete_task'? Use complete_task(summary='...') to finish the current task.",
-            
-            'get_context': "Did you mean 'get_info'? Use get_info() to see current context and task status.",
-            'context_info': "Did you mean 'get_info'? Use get_info() to see current context and task status.",
-            'show_context': "Did you mean 'get_info'? Use get_info() to see current context and task status.",
-            
-            'add_entry': "Did you mean 'add_context'? Use add_context(entry={...}) to record information.",
-            'log_context': "Did you mean 'add_context'? Use add_context(entry={...}) to record information.",
-        }
-        
-        # Check for specific mistake
-        suggestion = common_mistakes.get(original_action.lower())
-        if suggestion:
-            return suggestion
-        
-        # Generic fallback
-        if original_action.lower() != translated_action.lower():
-            return f"Did you mean '{translated_action}'? "
-        
-        return f"Must be one of: {', '.join(['get_info', 'start_task', 'add_context', 'get_full_context', 'compact_context', 'complete_task'])}"
-
     def execute(
         self,
         action: str,
         task_id: Optional[str] = None,
         entry: Optional[Dict[str, Any]] = None,
         summary: Optional[str] = None,
-        new_context: Optional[List[Dict[str, Any]]] = None
+        new_context: Optional[List[Dict[str, Any]]] = None,
+        key_results: Optional[str] = None
     ) -> ToolResult:
         """
         Execute context management actions.
         
         Args:
-            action: The action to perform ('get_info', 'start_task', 'add_context', 'get_full_context', 'compact_context', 'complete_task')
+            action: The action to perform ('get_info', 'start_task', 'add_context', 'get_full_context', 'compact_context', 'complete_task', 'complete_with_results')
             task_id: Task ID (required for 'start_task', 'complete_task')
             entry: Context entry to add (required for 'add_context')
-            summary: Summary of work done (required for 'complete_task')
+            summary: Summary of work done (required for 'complete_task', 'complete_with_results')
             new_context: Compacted context history (required for 'compact_context')
+            key_results: Key results to record (required for 'complete_with_results')
         """
         
-        # CRITICAL: Translate Agent's mental model to actual tool actions
-        # This prevents "ghost wall" loops caused by mental model misalignment
-        original_action = action
-        action = self._translate_action(action)
-        
-        if original_action != action:
-            logger.info(f"🔄 Action translated: '{original_action}' → '{action}' (mental model alignment)")
-        
-        valid_actions = ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "switch_to_trunk"]
+        valid_actions = ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "complete_with_results", "switch_to_trunk"]
         
         if action not in valid_actions:
-            # CRITICAL: Provide intelligent suggestions for mental model misalignment
-            suggestions_msg = self._get_action_suggestion(original_action, action)
+            # CRITICAL: Provide intelligent error guidance to fix common mental model mistakes
+            suggested_action = None
+            helpful_message = f"Invalid action '{action}'. Must be one of: {', '.join(valid_actions)}"
             
-            raise ToolError(
-                message=f"Invalid action '{original_action}'. {suggestions_msg}",
-                suggestions=[
-                    f"Use one of the valid actions: {', '.join(valid_actions)}",
-                    "💡 WORKFLOW: start_task(task_id) → [work] → complete_task(summary)",
-                    "• get_info: Get current context information",
-                    "• start_task: Start a new branch task (NOT branch_start)",
-                    "• add_context: Add entry to current task history", 
+            # Smart suggestions based on common mental model errors
+            if action in ["branch_start", "create_branch", "start_branch"]:
+                suggested_action = "start_task"
+                helpful_message = f"Invalid action '{action}'. Did you mean 'start_task'? Use 'start_task' to begin working on a task."
+            elif action in ["branch_end", "end_branch", "finish_branch", "close_branch"]:
+                suggested_action = "complete_task"
+                helpful_message = f"Invalid action '{action}'. Did you mean 'complete_task'? Use 'complete_task' to finish your current task."
+            elif action in ["switch_trunk", "return_trunk", "back_to_trunk"]:
+                suggested_action = "complete_task"
+                helpful_message = f"Invalid action '{action}'. Use 'complete_task' to finish your task and automatically return to trunk context."
+            
+            suggestions = [
+                f"Use one of the valid actions: {', '.join(valid_actions)}",
+                "🔄 CORRECT WORKFLOW: start_task(task_id) → [work on task] → complete_task(summary)",
+                "💡 No need for 'branch_start' or 'branch_end' - the system handles context switching automatically"
+            ]
+            
+            if suggested_action:
+                suggestions.insert(0, f"✅ Try '{suggested_action}' instead of '{action}'")
+            
+            suggestions.extend([
+                                    "• get_info: Get current context information",
+                    "• start_task: Start a new branch task",
+                    "• add_context: Add entry to current task history",
                     "• get_full_context: Get complete task history",
                     "• compact_context: Replace history with compressed version",
-                    "• complete_task: Complete current task and return to trunk (NOT branch_end)"
-                ],
+                    "• complete_task: Complete current task and return to trunk",
+                    "• complete_with_results: Complete task and record key results (RECOMMENDED)"
+            ])
+            
+            raise ToolError(
+                message=helpful_message,
+                suggestions=suggestions,
                 documentation_links=[
-                    "Context Management Guide: Use get_info first to understand current state",
-                    "IMPORTANT: No 'branch_start' or 'branch_end' actions exist. Use 'start_task' and 'complete_task'."
+                    "Context Management Guide: Use get_info first to understand current state"
                 ],
                 error_code="INVALID_ACTION"
             )
@@ -169,6 +100,8 @@ class ContextTool(BaseTool):
                 return self._compact_context(new_context)
             elif action in ["complete_task", "switch_to_trunk"]:
                 return self._complete_task(summary)
+            elif action == "complete_with_results":
+                return self._complete_task_with_results(summary, key_results)
                 
         except Exception as e:
             raise ToolError(
@@ -603,6 +536,153 @@ class ContextTool(BaseTool):
                 error_code="COMPLETE_TASK_ERROR"
             )
 
+    def _complete_task_with_results(self, summary: Optional[str], key_results: Optional[str]) -> ToolResult:
+        """
+        Complete current task with key results recording - ATOMIC operation to prevent state/action separation.
+        This is the RECOMMENDED way to complete tasks as it enforces proper state management.
+        """
+        if not summary:
+            raise ToolError(
+                message="summary is required for completing a task",
+                suggestions=[
+                    "Provide a summary of what was accomplished",
+                    "Include key results and important findings"
+                ],
+                error_code="MISSING_SUMMARY"
+            )
+            
+        if not key_results:
+            raise ToolError(
+                message="key_results is required for complete_with_results",
+                suggestions=[
+                    "Provide specific key results that will be useful for next tasks",
+                    "Examples: 'Cloned repo to /workspace/project', 'Found pom.xml, Maven project confirmed'",
+                    "Be specific about file locations, project types, or important discoveries"
+                ],
+                error_code="MISSING_KEY_RESULTS"
+            )
+        
+        if not self.context_manager.current_task_id:
+            raise ToolError(
+                message="No active task to complete",
+                suggestions=[
+                    "Use start_task action to begin working on a task"
+                ],
+                error_code="NO_ACTIVE_TASK"
+            )
+            
+        # CRITICAL: Validate that we're completing the correct task (same validation as regular complete_task)
+        current_task_id = self.context_manager.current_task_id
+        
+        trunk_context = self.context_manager.load_trunk_context()
+        if not trunk_context:
+            raise ToolError(
+                message="Cannot complete task: trunk context not found",
+                suggestions=[
+                    "Ensure trunk context is properly initialized"
+                ],
+                error_code="NO_TRUNK_CONTEXT"
+            )
+        
+        # Find the current task and verify it's in progress
+        current_task = None
+        for task in trunk_context.todo_list:
+            if task.id == current_task_id:
+                current_task = task
+                break
+        
+        if not current_task:
+            raise ToolError(
+                message=f"Current task {current_task_id} not found in project plan",
+                suggestions=[
+                    "Use get_info to check current context state"
+                ],
+                error_code="TASK_NOT_FOUND"
+            )
+        
+        if current_task.status.value != "in_progress":
+            raise ToolError(
+                message=f"Cannot complete task {current_task_id}: status is {current_task.status.value}, not in_progress",
+                suggestions=[
+                    f"Task {current_task_id} must be in progress to be completed",
+                    "Use get_info to check task status"
+                ],
+                error_code="TASK_NOT_IN_PROGRESS"
+            )
+        
+        try:
+            # CRITICAL FIX: True atomic operation - do all updates in one transaction
+            # Load the most recent trunk context to avoid lost updates
+            fresh_trunk_context = self.context_manager.load_trunk_context()
+            if not fresh_trunk_context:
+                raise Exception("Failed to load fresh trunk context for atomic update")
+            
+            # Perform all updates on the fresh context
+            fresh_trunk_context.update_task_status(current_task_id, TaskStatus.COMPLETED, summary)
+            fresh_trunk_context.update_task_key_results(current_task_id, key_results)
+            
+            # Save once with all updates
+            self.context_manager._save_trunk_context(fresh_trunk_context)
+            
+            # Clear current task in context manager
+            self.context_manager.current_task_id = None
+            
+            # Generate result info using the updated context
+            next_task = fresh_trunk_context.get_next_pending_task()
+            result = {
+                "completed_task": current_task_id,
+                "summary": summary,
+                "progress": fresh_trunk_context.get_progress_summary()
+            }
+            
+            if next_task:
+                result["next_task"] = {
+                    "id": next_task.id,
+                    "description": next_task.description,
+                    "status": next_task.status
+                }
+            else:
+                result["all_tasks_completed"] = True
+            
+            output = f"✅ Task completed atomically: {current_task_id}\n\n"
+            output += f"📋 Completion summary:\n{summary}\n\n"
+            output += f"🔑 Key results recorded:\n{key_results}\n\n"
+            output += f"📊 Project progress:\n{result['progress']}\n\n"
+            
+            if result.get('next_task'):
+                next_task = result['next_task']
+                output += f"➡️ Next task available:\n"
+                output += f"• ID: {next_task['id']}\n"
+                output += f"• Description: {next_task['description']}\n"
+                output += f"• Status: {next_task['status']}\n\n"
+                output += f"🚀 Start next task with:\n"
+                output += f"manage_context(action='start_task', task_id='{next_task['id']}')\n\n"
+                output += f"💡 IMPORTANT: The key results above will be available to guide your next task!\n"
+            elif result.get('all_tasks_completed'):
+                output += f"🎉 All tasks completed! Project setup finished.\n"
+                output += f"📋 Generate final report with:\n"
+                output += f"report(summary='All tasks completed successfully', status='success')\n"
+            
+            # Enhanced metadata for better tracking
+            enhanced_result = dict(result)
+            enhanced_result.update({
+                "key_results": key_results,
+                "atomic_completion": True,
+                "completion_method": "complete_with_results"
+            })
+            
+            return ToolResult(
+                success=True,
+                output=output,
+                metadata=enhanced_result
+            )
+            
+        except Exception as e:
+            raise ToolError(
+                message=f"Failed to complete task with results: {str(e)}",
+                error_code="COMPLETE_WITH_RESULTS_ERROR"
+            )
+
     def _format_context_info(self, info: dict) -> str:
         """Format context information"""
         output = f"📋 Current Context Information\n\n"
@@ -657,17 +737,25 @@ Context Management Tool Usage Examples:
 5. Compress context:
    manage_context(action="compact_context", new_context=[{"summary": "Completed project analysis"}])
 
-6. Complete task:
+6. Complete task (RECOMMENDED - atomic):
+   manage_context(action="complete_with_results", summary="Successfully configured development environment", key_results="Maven project detected at /workspace/commons-cli, pom.xml confirmed, Java 11 environment ready")
+
+6b. Complete task (basic):
    manage_context(action="complete_task", summary="Successfully configured development environment")
 
-Workflow:
-Trunk → start_task → Branch → add_context (multiple) → [optional: compact_context] → complete_task → Trunk
+CORRECT WORKFLOW:
+Trunk → start_task(task_id) → Branch → [work on task] → complete_with_results(summary, key_results) → Trunk (automatic)
 
-Tips:
-• Execute tasks in strict order, cannot skip
-• Record important thought processes and results timely
+IMPORTANT:
+• USE complete_with_results instead of complete_task - it's ATOMIC and prevents state/action separation!
+• key_results should be specific and useful for next tasks (file locations, project types, important discoveries)
+• NO 'branch_start', 'branch_end', 'create_branch', or 'switch_to_trunk' actions exist!
+• Context switching is AUTOMATIC when you use start_task and complete_with_results
+• Execute tasks in strict order from TODO list, cannot skip
+• Record important thought processes and results using add_context
 • Use compression when context becomes too long
-• Provide detailed summary when completing tasks
+• The key_results from previous tasks will be available to guide your next task
+• ALWAYS use complete_with_results after finishing technical work to avoid "ghost" states
 """
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
@@ -677,7 +765,7 @@ Tips:
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "switch_to_trunk"],
+                    "enum": ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "complete_with_results", "switch_to_trunk"],
                     "description": "Action to execute",
                 },
                 "task_id": {
@@ -692,7 +780,12 @@ Tips:
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Task completion summary (required for complete_task)",
+                    "description": "Task completion summary (required for complete_task and complete_with_results)",
+                    "default": None,
+                },
+                "key_results": {
+                    "type": "string",
+                    "description": "Key results to record for future tasks (required for complete_with_results)",
                     "default": None,
                 },
                 "new_context": {

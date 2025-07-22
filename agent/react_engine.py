@@ -4,6 +4,7 @@ import json
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+from typing_extensions import deprecated
 
 import litellm
 from loguru import logger
@@ -12,7 +13,9 @@ from pydantic import BaseModel
 from config import create_agent_logger, create_verbose_logger, get_config
 from tools import BaseTool, ToolResult
 
-from .context_manager import BranchContext, ContextManager, TrunkContext
+from tools.base import BaseTool, ToolResult
+from .context_manager import BranchContext, ContextManager, TrunkContext, BranchContextHistory
+from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
 
 
 class StepType(str, Enum):
@@ -78,6 +81,13 @@ class ReActEngine:
 
         # Check function calling support
         self._check_function_calling_support()
+        
+        # PERFORMANCE: Cache trunk context to avoid frequent file I/O
+        self._cached_trunk_context = None
+        self._trunk_context_cache_timestamp = None
+        
+        # Initialize the centralized state evaluator
+        self.state_evaluator = AgentStateEvaluator(self.context_manager)
 
         logger.info("ReAct Engine initialized with dual model support")
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
@@ -264,6 +274,10 @@ class ReActEngine:
         # Initialize with the initial prompt
         self.steps = []
         self.current_iteration = 0
+        
+        # PERFORMANCE: Initialize trunk context cache at start
+        self._invalidate_trunk_cache()  # Ensure fresh start
+        self._get_cached_trunk_context()  # Load initial cache
 
         # Start with initial thought using thinking model
         current_prompt = self._build_initial_system_prompt() + "\n\n" + initial_prompt
@@ -293,23 +307,31 @@ class ReActEngine:
 
                 # Execute the steps
                 success = self._execute_steps(parsed_steps)
-
-                # Check for completion
-                if self._is_task_complete():
+                
+                # CENTRALIZED STATE EVALUATION: Replace all scattered checks
+                state_analysis = self.state_evaluator.evaluate(
+                    steps=self.steps,
+                    current_iteration=self.current_iteration,
+                    recent_tool_executions=self.recent_tool_executions,
+                    steps_since_context_switch=self.steps_since_context_switch
+                )
+                
+                # Handle guidance based on state analysis
+                if state_analysis.needs_guidance:
+                    self._add_system_guidance(state_analysis.guidance_message, state_analysis.guidance_priority)
+                
+                # Check for task completion
+                if state_analysis.is_task_complete:
                     self.agent_logger.info("Task completed successfully")
                     return True
-                
-                # Check if we should strongly suggest completion (rule-based)
-                completion_suggestion = self._check_completion_suggestion()
-                if completion_suggestion:
-                    self._add_strong_completion_guidance(completion_suggestion)
 
+                # DEPRECATED: Legacy checks now handled by state_evaluator
                 # Check for context switching guidance
-                self._check_context_switching_guidance()
+                # self._check_context_switching_guidance()
                 
                 # Check if model needs explicit action guidance
-                if self._needs_action_guidance():
-                    self._add_action_guidance()
+                # if self._needs_action_guidance():
+                #     self._add_action_guidance()
 
                 # Build prompt for next iteration
                 current_prompt = self._build_next_prompt()
@@ -327,7 +349,7 @@ class ReActEngine:
             return False
 
     def _should_use_thinking_model(self) -> bool:
-        """Determine if we should use the thinking model for this step."""
+        """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""
         # CRITICAL: Check if thinking model was requested after successful tool execution
         if self._force_thinking_after_success:
             self._force_thinking_after_success = False  # Reset the flag
@@ -340,30 +362,40 @@ class ReActEngine:
             logger.info("Using thinking model due to repetitive execution detection")
             return True
         
-        # Use thinking model ONLY for pure reasoning, not for tool execution
-        # The thinking model should only be used for complex analysis and planning
+        # CRITICAL: ReAct Architecture Enforcement
+        # Thinking model = ANALYSIS and PLANNING (after observations)
+        # Action model = EXECUTION (after thinking)
         
-        # For now, let's primarily use the action model which has function calling support
-        # Use thinking model only for the very first step for initial analysis
-        if self.current_iteration == 1:
+        # Always start with thinking model for initial analysis
+        if len(self.steps) == 0:
+            logger.info("Using thinking model for initial analysis")
             return True
 
-        # Check if we've had thinking steps recently
-        recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
-        thinking_model_name = self.config.get_litellm_model_name("thinking")
-        thinking_steps = [s for s in recent_steps if s.model_used and thinking_model_name in s.model_used]
+        # ENFORCE PROPER REACT SEQUENCE: OBSERVATION → THINKING → ACTION → OBSERVATION
+        last_step = self.steps[-1] if self.steps else None
+        
+        if last_step and last_step.step_type == StepType.OBSERVATION:
+            # After observation, always analyze with thinking model
+            logger.info("Using thinking model to analyze observation results")
+            return True
+            
+        if last_step and last_step.step_type == StepType.THOUGHT:
+            # After thinking, switch to action model for execution
+            logger.info("Switching to action model for tool execution after analysis")
+            return False
 
-        # Use thinking model when we encounter many errors (need deep analysis)
+        # Use thinking model when we encounter errors (need analysis)
+        recent_steps = self.steps[-3:] if len(self.steps) >= 3 else self.steps
         recent_errors = [
-            s
-            for s in recent_steps
+            s for s in recent_steps
             if s.step_type == StepType.ACTION and s.tool_result and not s.tool_result.success
         ]
 
-        if len(recent_errors) >= 3:  # Increased threshold
+        if len(recent_errors) >= 2:  # Lower threshold for quicker analysis
+            logger.info("Using thinking model due to recent errors requiring analysis")
             return True
 
-        # Otherwise, use action model which has function calling support
+        # Default to action model for execution
         return False
 
     def _get_llm_response(self, prompt: str, use_thinking_model: bool = False) -> Optional[str]:
@@ -381,10 +413,13 @@ class ReActEngine:
                 ):
                     temperature = 1.0
 
+                # CRITICAL: Create specialized prompt for thinking model
+                thinking_prompt = self._build_thinking_model_prompt(prompt)
+
                 # Log detailed request in verbose mode
                 if self.config.verbose:
                     self._log_llm_request(
-                        model, prompt, temperature, max_tokens, use_thinking_model
+                        model, thinking_prompt, temperature, max_tokens, use_thinking_model
                     )
 
                 # Get thinking configuration based on provider
@@ -395,7 +430,7 @@ class ReActEngine:
                     # For models with thinking capabilities (o1, claude)
                     response = litellm.completion(
                         model=model,
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": thinking_prompt}],
                         temperature=temperature,
                         max_tokens=max_tokens,
                         **thinking_config,
@@ -404,7 +439,7 @@ class ReActEngine:
                     # For regular models
                     response = litellm.completion(
                         model=model,
-                        messages=[{"role": "user", "content": prompt}],
+                        messages=[{"role": "user", "content": thinking_prompt}],
                         temperature=temperature,
                         max_tokens=max_tokens,
                     )
@@ -420,16 +455,19 @@ class ReActEngine:
                 ):
                     temperature = 1.0
 
+                # CRITICAL: Create specialized prompt for action model
+                action_prompt = self._build_action_model_prompt(prompt)
+
                 # Log detailed request in verbose mode
                 if self.config.verbose:
                     self._log_llm_request(
-                        model, prompt, temperature, max_tokens, use_thinking_model
+                        model, action_prompt, temperature, max_tokens, use_thinking_model
                     )
 
                 # Build parameters for the request
                 request_params = {
                     "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": [{"role": "user", "content": action_prompt}],
                     "temperature": temperature,
                     "max_tokens": max_tokens,
                 }
@@ -714,12 +752,17 @@ Your first action should be to clone this repository using the project_setup too
 """
 
         prompt += """CRITICAL CONTEXT MANAGEMENT RULES:
-- You work with TWO types of contexts: TRUNK (main) and BRANCH (sub-task)
-- TRUNK context: Contains the overall goal and TODO list
-- BRANCH context: For focused work on specific tasks
-- ALWAYS use manage_context tool to switch between contexts appropriately
-- When starting a new task from TODO list, create a branch context
-- When completing a task, return to trunk context with a summary
+- You work with TWO types of contexts: TRUNK (main) and BRANCH (task-specific)
+- TRUNK context: Contains the overall goal and TODO list of tasks
+- BRANCH context: For focused work on ONE specific task from the TODO list
+- WORKFLOW: start_task(task_id) → [work on task] → complete_with_results(summary, key_results)
+- Use start_task to begin working on a task (automatically creates branch context)
+- Use complete_with_results to finish a task (automatically returns to trunk context)
+- CRITICAL: ALWAYS use complete_with_results immediately after finishing technical work!
+- This prevents "ghost states" where work is done but not officially recorded
+- NO need for 'branch_start', 'branch_end', 'create_branch' - the system handles context switching!
+- Context switching is AUTOMATIC - you only specify which task to work on
+- The key_results from completed tasks will guide your next actions
 
 AVAILABLE TOOLS:
 """
@@ -737,11 +780,13 @@ AVAILABLE TOOLS:
 - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
 - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
 - web_search: Search the web for information
-- manage_context: Manage context switching (NOT context)
-  • Valid actions: get_info, create_branch, switch_to_trunk
-  • For create_branch: REQUIRES task_id parameter (e.g., task_id="build_project")
-  • For switch_to_trunk: Optional summary parameter
-  • Example: manage_context(action="get_info")
+- manage_context: Manage task workflow and context (NOT context)
+  • Valid actions: get_info, start_task, complete_task, complete_with_results, add_context, get_full_context
+  • start_task: Begin work on a specific task ID from TODO list
+  • complete_with_results: RECOMMENDED - Finish current task with key results (ATOMIC operation)
+  • complete_task: Basic task completion (use complete_with_results instead)
+  • get_info: Check current context and available tasks
+  • Example: manage_context(action="complete_with_results", summary="...", key_results="...")
 - maven: Execute Maven commands (NOT mvn)
 - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
 - system: Install system packages and dependencies
@@ -834,9 +879,20 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
         prompt += """
 3. ALWAYS detect project type: project_setup(action="detect_project_type")
-4. For Maven projects: maven(command="compile") or maven(command="test")
-5. For shell commands: bash(command="ls -la")
-6. For reading files: file_io(action="read", file_path="/path/to/file")
+4. 📖 CRITICAL: Read project documentation to understand setup requirements:
+   • Check for README.md: file_io(action="read", file_path="README.md")
+   • Also check README.txt, docs/ folder, or INSTALL files if README.md doesn't exist
+   • Look for build instructions, dependencies, testing commands, and setup requirements
+   • This step is ESSENTIAL for understanding how to properly configure the project!
+5. For Maven projects: maven(command="compile") or maven(command="test")
+6. For shell commands: bash(command="ls -la")
+7. For reading files: file_io(action="read", file_path="/path/to/file")
+
+💡 PROJECT SETUP BEST PRACTICES:
+- ALWAYS read documentation before making assumptions about build systems
+- Follow the project's own setup instructions from README/docs
+- Use the project's recommended testing commands
+- Check for specific environment requirements (Java version, Node.js, etc.)
 
 NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
@@ -925,19 +981,27 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
         # If no steps were parsed, try to extract at least a thought
         if not steps and response.strip():
-            # Try to extract any content as a thought
             content = response.strip()
-            if content:
-                logger.info(f"Parsing failed, treating entire response as thought")
-                logger.info(f"Full response content: {content}")
-                steps.append(
-                    ReActStep(
-                        step_type=StepType.THOUGHT,
-                        content=content,
-                        timestamp=self._get_timestamp(),
-                        model_used=model_used,
-                    )
+            logger.info(f"Parsing failed, treating entire response as thought")
+            logger.info(f"Full response content: {content}")
+            
+            # CRITICAL: Maintain ReAct structure - thinking should lead to action in next iteration
+            # Add system guidance to ensure proper model role separation
+            if was_thinking_model:
+                # Thinking model should not attempt actions - guide towards pure analysis
+                enhanced_content = content + "\n\n[SYSTEM: This was pure analysis. Next step should be action execution by action model.]"
+            else:
+                # Action model failed to format properly - provide formatting guidance
+                enhanced_content = content + "\n\n[SYSTEM: Action model must use proper tool call format: ACTION: tool_name, PARAMETERS: {...}]"
+            
+            steps.append(
+                ReActStep(
+                    step_type=StepType.THOUGHT,
+                    content=enhanced_content,
+                    timestamp=self._get_timestamp(),
+                    model_used=model_used,
                 )
+            )
 
         return steps
 
@@ -1036,6 +1100,13 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     # Update successful states for future reference
                     if result.success:
                         self._update_successful_states(step.tool_name, validated_params, result)
+                        
+                        # PERFORMANCE: Invalidate trunk cache if context state changed
+                        if step.tool_name == "manage_context":
+                            action = validated_params.get("action", "")
+                            if action in ["start_task", "complete_task", "complete_with_results"]:
+                                self._invalidate_trunk_cache()
+                                logger.debug(f"Trunk cache invalidated after {action}")
 
                 step.tool_result = result
 
@@ -1753,6 +1824,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 
 
 
+    @deprecated("This is no longer used")
     def _is_repetitive_execution(self, tool_signature: str) -> bool:
         """Check if this tool execution is repetitive."""
         # Count recent executions of the same tool with same parameters
@@ -1803,6 +1875,9 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         # Log full observation content without truncation
         self.agent_logger.info(f"👁️ OBSERVATION: {observation}")
         logger.info(f"👁️ OBSERVATION: {observation}")
+        
+        # DEPRECATED: Task completion detection now handled by state_evaluator
+        # self._check_task_completion_opportunity(observation)
 
     def _is_task_complete(self) -> bool:
         """Check if the current task is complete."""
@@ -1965,6 +2040,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                 return True
         return False
     
+    @deprecated("This is no longer used")
     def _add_strong_completion_guidance(self, reason: str):
         """Add strong guidance to push agent toward completion."""
         guidance = (f"🚨 URGENT COMPLETION NOTICE: {reason}. "
@@ -1983,6 +2059,7 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
         self.agent_logger.info(f"🚨 URGENT COMPLETION: {guidance}")
         logger.info(f"🚨 URGENT COMPLETION: Strong completion guidance added - {reason}")
 
+    @deprecated("This is no longer used")
     def _check_context_switching_guidance(self):
         """Check if we should provide context switching guidance."""
         if self.steps_since_context_switch >= self.context_switch_threshold:
@@ -2105,6 +2182,7 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
 
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    @deprecated("This is no longer used")
     def _needs_action_guidance(self) -> bool:
         """Check if the model needs explicit action guidance."""
         # Count recent thoughts without actions
@@ -2131,6 +2209,7 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
         # Need guidance if too many thoughts without actions
         return thoughts_count >= 3 and actions_count == 0
 
+    @deprecated("This is no longer used")
     def _add_action_guidance(self):
         """Add explicit action guidance to help the model."""
         if self.repository_url:
@@ -2398,7 +2477,8 @@ Use function calling to execute these tools!"""
         
         # CRITICAL: Preserve task plan to prevent context pollution from causing hallucinated task IDs
         try:
-            trunk_context = self.context_manager.load_trunk_context()
+            # Use cached trunk context to avoid frequent file I/O
+            trunk_context = self._get_cached_trunk_context()
             if trunk_context and trunk_context.todo_list:
                 current_task = None
                 next_task = None
@@ -2424,6 +2504,21 @@ Use function calling to execute these tools!"""
                 all_task_ids = [task.id for task in trunk_context.todo_list]
                 plan_summary.append(f"  📝 VALID IDs: {', '.join(all_task_ids)}")
                 
+                # CRITICAL: Add previous task's key results as context for next task
+                previous_task_results = []
+                for task in trunk_context.todo_list:
+                    if task.status.value == "completed" and task.key_results:
+                        previous_task_results.append(f"    - {task.id}: {task.key_results}")
+                
+                if previous_task_results:
+                    plan_summary.append("  🔑 PREVIOUS_TASK_RESULTS:")
+                    plan_summary.extend(previous_task_results)
+                
+                # CRITICAL: Add clear workflow guidance to prevent mental model confusion
+                plan_summary.append("  💡 WORKFLOW: start_task(task_id) → [work on task] → complete_with_results(summary, key_results)")
+                plan_summary.append("  ⚠️ USE complete_with_results (ATOMIC) instead of complete_task!")
+                plan_summary.append("  ⚠️ NO 'branch_start' or 'branch_end' - context switching is automatic!")
+                
                 critical_info.extend(plan_summary)
                 
         except Exception as e:
@@ -2448,3 +2543,247 @@ Use function calling to execute these tools!"""
                 # Fallback: add at the beginning
                 return critical_memory + "\n" + prompt
         return prompt
+
+    @deprecated("This is no longer used")
+    def _check_task_completion_opportunity(self, observation: str):
+        """
+        Check if the observation indicates a task completion opportunity.
+        Reminds Agent to use complete_with_results to avoid state/action separation.
+        """
+        if not self.context_manager.current_task_id:
+            return  # Not in a task context
+            
+        # Define completion signals for different types of work
+        completion_signals = {
+            'repository_cloned': [
+                'successfully cloned',
+                'cloning into',
+                'clone completed',
+                'repository cloned'
+            ],
+            'project_detected': [
+                'found pom.xml',
+                'maven project detected',
+                'package.json found',
+                'project type:'
+            ],
+            'build_success': [
+                'BUILD SUCCESS',
+                'Tests run:',
+                'compilation successful',
+                'all tests passed'
+            ],
+            'environment_setup': [
+                'environment configured',
+                'dependencies installed',
+                'setup completed'
+            ]
+        }
+        
+        observation_lower = observation.lower()
+        detected_signals = []
+        
+        for signal_type, patterns in completion_signals.items():
+            for pattern in patterns:
+                if pattern.lower() in observation_lower:
+                    detected_signals.append(signal_type)
+                    break
+        
+        if detected_signals:
+            # Add a system guidance to remind about state updates
+            guidance_content = (
+                f"🚨 TASK COMPLETION DETECTED: {', '.join(detected_signals)}\n"
+                f"CRITICAL REMINDER: If this completes your current task ({self.context_manager.current_task_id}), "
+                f"you MUST immediately call:\n"
+                f"manage_context(action='complete_with_results', summary='...', key_results='...')\n"
+                f"Do NOT continue to other tasks without updating the official task status!\n"
+                f"This prevents 'ghost states' where work is done but not recorded."
+            )
+            
+            guidance_step = ReActStep(
+                step_type=StepType.SYSTEM_GUIDANCE,
+                content=guidance_content,
+                timestamp=self._get_timestamp()
+            )
+            self.steps.append(guidance_step)
+            
+            logger.info(f"🚨 Task completion opportunity detected: {detected_signals}")
+            self.agent_logger.info(f"🚨 TASK COMPLETION GUIDANCE: {guidance_content}")
+
+    def _get_cached_trunk_context(self):
+        """
+        Get trunk context with intelligent caching to avoid frequent file I/O.
+        Only reloads when necessary (every 5 steps or after context changes).
+        """
+        current_step = len(self.steps)
+        
+        # Cache for 5 steps or if cache is empty
+        if (self._cached_trunk_context is None or 
+            self._trunk_context_cache_timestamp is None or 
+            current_step - self._trunk_context_cache_timestamp >= 5):
+            
+            try:
+                self._cached_trunk_context = self.context_manager.load_trunk_context()
+                self._trunk_context_cache_timestamp = current_step
+                logger.debug(f"Refreshed trunk context cache at step {current_step}")
+            except Exception as e:
+                logger.warning(f"Failed to refresh trunk context cache: {e}")
+                # Keep using old cache if refresh fails
+        
+        return self._cached_trunk_context
+
+    def _invalidate_trunk_cache(self):
+        """Invalidate trunk context cache when we know it has changed."""
+        self._cached_trunk_context = None
+        self._trunk_context_cache_timestamp = None
+        logger.debug("Trunk context cache invalidated")
+
+    def _add_system_guidance(self, guidance_message: str, priority: int = 5):
+        """
+        Add system guidance with priority handling.
+        Higher priority messages are more prominent.
+        """
+        # Add visual emphasis based on priority
+        if priority >= 9:
+            prefix = "🚨 CRITICAL GUIDANCE"
+        elif priority >= 7:
+            prefix = "⚠️ IMPORTANT GUIDANCE"
+        else:
+            prefix = "💡 SYSTEM GUIDANCE"
+            
+        full_message = f"{prefix} (Priority: {priority}):\n{guidance_message}"
+        
+        guidance_step = ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content=full_message,
+            timestamp=self._get_timestamp(),
+        )
+        self.steps.append(guidance_step)
+        
+        self.agent_logger.info(f"{prefix}: {guidance_message[:100]}...")
+        logger.info(f"{prefix} added with priority {priority}")
+
+    def test_state_evaluator_integration(self):
+        """Test method to verify state evaluator is working correctly."""
+        logger.info("Testing state evaluator integration...")
+        
+        # Simulate some steps
+        test_steps = [
+            ReActStep(step_type=StepType.THOUGHT, content="Test thought", timestamp=self._get_timestamp()),
+            ReActStep(step_type=StepType.ACTION, content="Test action", timestamp=self._get_timestamp()),
+            ReActStep(step_type=StepType.OBSERVATION, content="BUILD SUCCESS", timestamp=self._get_timestamp())
+        ]
+        
+        # Test evaluation
+        analysis = self.state_evaluator.evaluate(
+            steps=test_steps,
+            current_iteration=1,
+            recent_tool_executions=[],
+            steps_since_context_switch=5
+        )
+        
+        logger.info(f"State analysis: {analysis.status}, needs_guidance: {analysis.needs_guidance}")
+        return analysis
+
+    def _build_thinking_model_prompt(self, base_prompt: str) -> str:
+        """
+        Build specialized prompt for thinking model.
+        Thinking model should ONLY reason and analyze, never call tools.
+        """
+        thinking_instructions = """
+🧠 THINKING MODEL INSTRUCTIONS:
+You are in THINKING MODE. Your role is to analyze, reason, and plan - NOT to take actions.
+
+CRITICAL RULES FOR REACT ARCHITECTURE:
+1. ✅ OUTPUT ONLY THOUGHTS - Never attempt tool calls or function invocations
+2. ✅ Your job is ANALYSIS and PLANNING - not execution
+3. ✅ End your response with what ACTION should be taken next
+4. ✅ The ACTION MODEL will handle tool execution based on your analysis
+5. ✅ Do NOT format ACTION/PARAMETERS - that's the action model's job
+
+YOUR OUTPUT FORMAT:
+Provide pure reasoning and analysis. Always end with a clear recommendation:
+"Based on this analysis, the next action should be: [describe what tool should be used and why]"
+
+NEVER INCLUDE:
+- Function calls or tool invocations  
+- ACTION: statements
+- PARAMETERS: blocks
+- JSON formatting
+- Any executable commands
+
+REACT FLOW: THINKING → [hand off to ACTION MODEL] → OBSERVATION → [back to THINKING]
+
+EXAMPLE OF CORRECT THINKING OUTPUT:
+"I need to analyze the current project state. Looking at the context, I can see that task_1 requires cloning the repository. The repository URL is already provided: https://github.com/apache/commons-cli.git. 
+
+The agent needs to start by cloning the repository to establish the workspace, then immediately read the project documentation to understand the proper setup process.
+
+The logical sequence should be:
+1. Clone the repository to /workspace
+2. Read README.md to understand setup requirements  
+3. Look for build instructions and dependencies
+4. Follow the project's own setup instructions
+5. Execute build and test commands as recommended in documentation
+
+Based on this analysis, the next action should be: Use the project_setup tool with action='clone' to download the repository, since this is the foundational step that enables all subsequent work."
+
+Remember: You are the THINKING brain, not the ACTING hands. Analyze and recommend, don't execute.
+
+---
+
+CURRENT SITUATION TO ANALYZE:
+"""
+        
+        return thinking_instructions + base_prompt
+        
+    def _build_action_model_prompt(self, base_prompt: str) -> str:
+        """
+        Build specialized prompt for action model.
+        Action model should execute tools based on reasoning.
+        """
+        action_instructions = """
+🔧 ACTION MODEL INSTRUCTIONS:
+You are in ACTION MODE. Your role is to execute specific actions based on thinking model analysis.
+
+CRITICAL RULES FOR REACT ARCHITECTURE:
+1. ✅ EXECUTE the action recommended by the thinking model
+2. ✅ Use proper tool calling format (ACTION: tool_name, PARAMETERS: {...})
+3. ✅ Don't re-analyze - the thinking model already did that
+4. ✅ Focus on precise tool execution, not deep reasoning
+5. ✅ Your job is DOING, not thinking
+
+REACT FLOW: [THINKING complete] → ACTION (you) → OBSERVATION → [back to THINKING]
+
+RESPONSE FORMAT (when function calling is supported):
+Use function calling directly to execute the recommended tool. Minimal reasoning needed.
+
+RESPONSE FORMAT (when function calling not supported):
+ACTION: [tool_name]
+PARAMETERS: [JSON object with required parameters]
+
+CRITICAL: If the thinking model recommended a specific tool and action, execute it precisely.
+
+AVAILABLE TOOLS AND THEIR PURPOSE:
+- project_setup: Clone repositories and detect project types
+- bash: Execute shell commands for system operations
+- maven: Run Maven build commands
+- file_io: Read and write files
+- manage_context: Manage task workflow and completion
+
+📖 PROJECT SETUP ACTION PRIORITIES:
+1. After cloning, IMMEDIATELY read project documentation:
+   • file_io(action="read", file_path="README.md") 
+   • Look for setup instructions, build commands, dependencies
+   • Check for testing procedures and environment requirements
+2. Follow the project's own instructions rather than making assumptions
+3. Use the exact commands recommended in the documentation
+
+Remember: You are the ACTING hands, not the thinking brain. Execute the planned actions efficiently.
+
+---
+
+EXECUTE ACTIONS FOR:
+"""
+        
+        return action_instructions + base_prompt

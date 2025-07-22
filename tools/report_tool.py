@@ -131,10 +131,18 @@ class ReportTool(BaseTool):
                     ]
                 }
             
-            # Check each task status
+            # Check each task status - CRITICAL: Exclude reporting tasks to avoid logical deadlock
             incomplete_tasks = []
             for task in trunk_context.todo_list:
                 if task.status.value != "completed":
+                    # CRITICAL FIX: Allow reporting task to be in_progress when calling report tool
+                    # This prevents the chicken-and-egg problem where the report tool can't run
+                    # until the "generate report" task is complete, but the task can't be completed
+                    # without running the report tool.
+                    if self._is_reporting_task(task):
+                        logger.debug(f"Allowing reporting task {task.id} to be in_progress during report generation")
+                        continue  # Skip reporting tasks from the prerequisite check
+                    
                     incomplete_tasks.append({
                         "id": task.id,
                         "description": task.description,
@@ -184,6 +192,50 @@ class ReportTool(BaseTool):
             logger.error(f"Failed to validate context prerequisites: {e}")
             # In case of error, allow report generation but log the issue
             return {"valid": True}
+
+    def _is_reporting_task(self, task) -> bool:
+        """
+        Determine if a task is related to report generation.
+        This prevents logical deadlock where report tool can't run until reporting task is complete.
+        """
+        reporting_keywords = [
+            "report", "completion", "summary", "generate", "final", 
+            "document", "conclude", "finish", "wrap"
+        ]
+        
+        task_description = task.description.lower()
+        return any(keyword in task_description for keyword in reporting_keywords)
+
+    def _reconcile_status(self, claimed_status: str, evidence_status: str, accomplishments: dict) -> str:
+        """
+        Intelligently reconcile claimed status with evidence-based status.
+        This prevents overly harsh status downgrades while maintaining accuracy.
+        """
+        # If evidence strongly contradicts claim, trust evidence
+        if evidence_status == "failed" and claimed_status == "success":
+            if accomplishments.get('successful_actions', 0) == 0:
+                logger.info("🔍 Evidence shows complete failure, overriding success claim")
+                return "failed"
+        
+        # If agent claims success but evidence shows partial, check for late recoveries
+        if claimed_status == "success" and evidence_status == "partial":
+            # Check if there were late successful attempts that might not be captured
+            # by the simple metric-based assessment
+            total_actions = accomplishments.get('total_actions', 0)
+            successful_actions = accomplishments.get('successful_actions', 0)
+            
+            if total_actions > 0:
+                success_rate = successful_actions / total_actions
+                if success_rate >= 0.5:  # At least half successful
+                    logger.info("🤝 Agent's success claim supported by decent success rate, accepting it")
+                    return claimed_status
+        
+        # If agent claims partial but evidence shows success, trust evidence
+        if claimed_status in ["partial", "failed"] and evidence_status == "success":
+            return evidence_status
+        
+        # For other cases, prefer agent's assessment unless evidence is drastically different
+        return claimed_status
 
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
         """Verify the claimed status against actual execution history."""
@@ -271,10 +323,16 @@ class ReportTool(BaseTool):
             # Determine actual status based on accomplishments
             actual_status = self._determine_actual_status(actual_accomplishments)
             
-            # Log verification results if there's a discrepancy
+            # CRITICAL FIX: Smart status reconciliation instead of harsh override
+            # If agent claims success but evidence suggests otherwise, use smart reconciliation
             if actual_status != claimed_status:
                 logger.warning(f"🔍 Status verification: Claimed '{claimed_status}' but evidence suggests '{actual_status}'")
                 logger.info(f"🔍 Actual accomplishments: {actual_accomplishments}")
+                
+                # SMART RECONCILIATION: Consider agent's assessment and context
+                reconciled_status = self._reconcile_status(claimed_status, actual_status, actual_accomplishments)
+                logger.info(f"🤝 Status reconciled: Using '{reconciled_status}' as final status")
+                return reconciled_status, actual_accomplishments
             
             return actual_status, actual_accomplishments
             
@@ -486,111 +544,207 @@ class ReportTool(BaseTool):
         return info
     
     def _generate_markdown_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None) -> str:
-        """Generate markdown-formatted report."""
+        """Generate markdown-formatted report based on actual project context and execution results."""
         
         report_lines = [
-            "# 🎯 项目设置报告",
+            "# 🎯 Project Setup Report",
             "",
-            f"**生成时间:** {timestamp}",
-            f"**状态:** {status.upper()}",
+            f"**Generated:** {timestamp}",
+            f"**Status:** {status.upper()}",
             "",
         ]
         
-        # Add project information
+        # Add project information from actual context
         if project_info:
             report_lines.extend([
-                "## 📂 项目信息",
+                "## 📂 Project Information",
                 "",
-                f"- **项目目录:** {project_info.get('directory', 'Unknown')}",
-                f"- **项目类型:** {project_info.get('type', 'Unknown')}",
-                f"- **构建系统:** {project_info.get('build_system', 'Unknown')}",
+                f"- **Project Directory:** {project_info.get('directory', 'Unknown')}",
+                f"- **Project Type:** {project_info.get('type', 'Unknown')}",
+                f"- **Build System:** {project_info.get('build_system', 'Unknown')}",
                 "",
             ])
         
-        # Add summary
+        # Add agent's summary - this should be provided by the agent based on actual work done
         if summary:
             report_lines.extend([
-                "## 📋 总结",
+                "## 📋 Executive Summary",
                 "",
                 summary,
                 "",
             ])
         
-        # Add completed tasks
-        report_lines.extend([
-            "## ✅ 已完成任务",
-            "",
-            "- ✅ Docker环境设置",
-            "- ✅ 项目仓库克隆",
-            "- ✅ 开发环境配置",
-        ])
+        # Generate task completion status from trunk context
+        task_status_section = self._generate_task_status_section(actual_accomplishments)
+        if task_status_section:
+            report_lines.extend(task_status_section)
         
-        # Add build/test status based on overall status
-        if status == "success":
-            report_lines.extend([
-                "- ✅ 项目编译",
-                "- ✅ 测试执行",
-            ])
-        elif status == "partial":
-            report_lines.extend([
-                "- ⚠️ 项目编译（部分成功）",
-                "- ⚠️ 测试执行（存在问题）",
-            ])
-        else:
-            report_lines.extend([
-                "- ❌ 项目编译（失败）",
-                "- ❌ 测试执行（失败）",
-            ])
-        
-        report_lines.append("")
-        
-        # Add details if provided
+        # Add execution details - this should be filled by agent analysis
         if details:
             report_lines.extend([
-                "## 📝 详细信息",
+                "## 📝 Execution Details",
                 "",
                 details,
                 "",
             ])
         
-        # Add next steps based on status
-        if status == "success":
-            report_lines.extend([
-                "## 🚀 项目就绪",
-                "",
-                "- 项目已成功设置并测试完成",
-                "- 所有依赖项已安装并配置",
-                "- 现在可以开始开发或部署",
-                "",
-            ])
-        elif status == "partial":
-            report_lines.extend([
-                "## ⚠️ 部分成功",
-                "",
-                "- 基本设置已完成，但仍存在一些问题",
-                "- 请查看日志以了解具体错误详情",
-                "- 可能需要手动干预以实现完整功能",
-                "",
-            ])
-        else:
-            report_lines.extend([
-                "## ❌ 设置问题",
-                "",
-                "- 项目设置遇到了重大问题",
-                "- 请检查错误日志和依赖项要求",
-                "- 可能需要手动故障排除",
-                "",
-            ])
+        # Generate technical accomplishments from actual results
+        tech_section = self._generate_technical_accomplishments_section(actual_accomplishments)
+        if tech_section:
+            report_lines.extend(tech_section)
+        
+        # Generate next steps based on actual status and context
+        next_steps_section = self._generate_next_steps_section(status, actual_accomplishments)
+        if next_steps_section:
+            report_lines.extend(next_steps_section)
         
         report_lines.extend([
             "---",
             "",
-            "**任务完成。设置代理已结束。**",
+            "**Task completed. Setup Agent has finished.**",
             "",
-            f"*此报告由 Setup-Agent 于 {timestamp} 自动生成*",
+            f"*This report was automatically generated by Setup-Agent at {timestamp}*",
         ])
         
         return "\n".join(report_lines)
+
+    def _generate_task_status_section(self, actual_accomplishments: dict = None) -> list:
+        """Generate task completion status section based on trunk context."""
+        if not self.context_manager:
+            return []
+        
+        try:
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context or not trunk_context.todo_list:
+                return []
+            
+            section_lines = [
+                "## ✅ Task Completion Status",
+                "",
+            ]
+            
+            for task in trunk_context.todo_list:
+                if task.status.value == "completed":
+                    icon = "✅"
+                    status_text = "Completed"
+                    if task.key_results:
+                        status_text += f" - {task.key_results}"
+                elif task.status.value == "in_progress":
+                    icon = "🔄"
+                    status_text = "In Progress"
+                elif task.status.value == "failed":
+                    icon = "❌"
+                    status_text = "Failed"
+                else:
+                    icon = "⏳"
+                    status_text = "Pending"
+                
+                section_lines.append(f"- {icon} **{task.description}** - {status_text}")
+            
+            section_lines.append("")
+            return section_lines
+            
+        except Exception as e:
+            logger.warning(f"Failed to generate task status section: {e}")
+            return []
+
+    def _generate_technical_accomplishments_section(self, actual_accomplishments: dict = None) -> list:
+        """Generate technical accomplishments section based on actual execution results."""
+        if not actual_accomplishments:
+            return []
+        
+        section_lines = [
+            "## 🔧 Technical Accomplishments",
+            "",
+        ]
+        
+        # Repository and project setup
+        if actual_accomplishments.get('repository_cloned'):
+            section_lines.append("- ✅ **Repository Cloned** - Source code successfully downloaded")
+        
+        if actual_accomplishments.get('project_detected'):
+            section_lines.append("- ✅ **Project Type Detected** - Build system and structure identified")
+        
+        # Build and compilation
+        if actual_accomplishments.get('maven_compile_success'):
+            section_lines.append("- ✅ **Compilation Successful** - Project builds without errors")
+        elif actual_accomplishments.get('repository_cloned'):
+            section_lines.append("- ⚠️ **Compilation Issues** - Build encountered problems")
+        
+        # Testing
+        if actual_accomplishments.get('maven_test_success'):
+            section_lines.append("- ✅ **Tests Passed** - All test suites executed successfully")
+        elif actual_accomplishments.get('maven_compile_success'):
+            section_lines.append("- ⚠️ **Test Issues** - Some tests failed or couldn't run")
+        
+        # Tool usage summary
+        successful_tools = actual_accomplishments.get('tools_successful', [])
+        if successful_tools:
+            unique_tools = list(set(successful_tools))
+            section_lines.append(f"- 🛠️ **Tools Used** - {', '.join(unique_tools)}")
+        
+        # Success rate
+        total_actions = actual_accomplishments.get('total_actions', 0)
+        successful_actions = actual_accomplishments.get('successful_actions', 0)
+        if total_actions > 0:
+            success_rate = (successful_actions / total_actions) * 100
+            section_lines.append(f"- 📊 **Success Rate** - {successful_actions}/{total_actions} actions ({success_rate:.1f}%)")
+        
+        section_lines.append("")
+        return section_lines
+
+    def _generate_next_steps_section(self, status: str, actual_accomplishments: dict = None) -> list:
+        """Generate next steps section based on actual status and context."""
+        section_lines = []
+        
+        if status == "success":
+            section_lines.extend([
+                "## 🚀 Project Ready",
+                "",
+                "- ✅ Project has been successfully set up and tested",
+                "- ✅ All dependencies are installed and configured",
+                "- ✅ Development environment is ready for use",
+                "- 🎯 **Next Steps:** You can now start development or deployment",
+                "",
+            ])
+        elif status == "partial":
+            section_lines.extend([
+                "## ⚠️ Partial Success",
+                "",
+                "- ⚠️ Basic setup completed, but some issues remain",
+                "- 📋 Review the execution details for specific error information",
+                "- 🔧 Manual intervention may be required for full functionality",
+            ])
+            
+            # Add specific recommendations based on what failed
+            if actual_accomplishments:
+                if not actual_accomplishments.get('maven_compile_success'):
+                    section_lines.append("- 🔨 **Recommended:** Check build dependencies and configuration")
+                if not actual_accomplishments.get('maven_test_success'):
+                    section_lines.append("- 🧪 **Recommended:** Review test failures and fix any issues")
+            
+            section_lines.append("")
+        else:
+            section_lines.extend([
+                "## ❌ Setup Issues",
+                "",
+                "- ❌ Project setup encountered significant problems",
+                "- 📋 Check error logs and dependency requirements",
+                "- 🔧 Manual troubleshooting may be required",
+            ])
+            
+            # Add specific recommendations based on what failed
+            if actual_accomplishments:
+                if not actual_accomplishments.get('repository_cloned'):
+                    section_lines.append("- 📥 **Critical:** Repository clone failed - check URL and access")
+                elif not actual_accomplishments.get('project_detected'):
+                    section_lines.append("- 🔍 **Critical:** Project type detection failed - verify project structure")
+                elif not actual_accomplishments.get('maven_compile_success'):
+                    section_lines.append("- 🔨 **Critical:** Build compilation failed - check dependencies")
+            
+            section_lines.append("")
+        
+        return section_lines
     
     def _save_markdown_report(self, markdown_content: str, timestamp: str):
         """Save markdown report to workspace."""
@@ -654,20 +808,35 @@ class ReportTool(BaseTool):
         return """
 Report Tool Usage Examples:
 
+IMPORTANT: The summary and details should be based on your actual work and analysis, not generic text.
+
 1. Generate successful completion report:
-   report(action="generate", summary="Successfully built and tested Maven project", status="success")
+   report(action="generate", 
+          summary="Successfully cloned Apache Commons CLI repository, detected Maven project structure, compiled all modules with zero errors, and executed 127 tests with 100% pass rate. Environment is fully configured and ready for development.",
+          status="success",
+          details="Cloned repository from https://github.com/apache/commons-cli.git to /workspace/commons-cli. Detected Maven multi-module project with 3 modules. All dependencies resolved successfully. Build completed in 45 seconds. All 127 unit tests passed including integration tests.")
 
 2. Generate partial success report:
-   report(action="generate", summary="Project setup completed with some test failures", status="partial", details="3 out of 100 tests failed")
+   report(action="generate", 
+          summary="Repository cloned and project compiled successfully, but 3 test failures prevent complete validation. Core functionality appears working.",
+          status="partial", 
+          details="Maven compilation succeeded for all modules. However, 3 out of 127 tests failed due to timestamp-related assertions in DateUtilsTest. These appear to be flaky tests and don't affect core CLI parsing functionality.")
 
 3. Generate failure report:
-   report(action="generate", summary="Setup failed due to missing dependencies", status="failed", details="Unable to resolve Maven dependencies")
+   report(action="generate", 
+          summary="Setup failed due to Maven dependency resolution errors. Unable to complete project build.",
+          status="failed", 
+          details="Repository cloning succeeded, but Maven build failed with 'Could not resolve dependency org.apache.commons:commons-parent:pom:52'. Network connectivity to Maven Central appears to be the issue.")
 
-4. Simple completion report:
-   report()  # Uses defaults: action="generate", status="success"
+CRITICAL GUIDELINES:
+- Always analyze the actual execution results and provide specific, factual details
+- Include concrete numbers (test counts, build times, error counts)
+- Mention specific file paths, URLs, and technical details discovered
+- Don't use generic phrases - base everything on what actually happened
+- The report content will be dynamically enhanced with task status and technical accomplishments
 
 Note: 
 - Using this tool marks the task as completed and stops the ReAct loop
 - Automatically generates both console output and a Markdown file in /workspace
-- The MD file is named setup-report-YYYYMMDD-HHMMSS.md for easy identification
+- Report includes dynamic sections based on trunk context and execution results
 """ 
