@@ -1,6 +1,6 @@
 """Agent State Evaluator for intelligent state analysis and guidance generation."""
 
-from typing import Optional, List, Dict, Any
+from typing import List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
 

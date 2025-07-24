@@ -320,12 +320,21 @@ class ContextManager:
         return trunk_context
 
     def load_trunk_context(self) -> Optional[TrunkContext]:
-        """Load the trunk context from file."""
+        """Load the trunk context from file with improved Docker API access."""
         if not self.trunk_context_file:
             return None
         
         try:
             if self.orchestrator:
+                # IMPROVED: Try Docker API first, fallback to cat command
+                json_data = self._load_json_via_docker_api(self.trunk_context_file)
+                
+                if json_data:
+                    return TrunkContext(**json_data)
+                
+                # Fallback to original cat method if Docker API fails
+                logger.info("Using fallback cat method for trunk context")
+                
                 # Check file existence in container
                 check_cmd = f"test -f {self.trunk_context_file}"
                 check_result = self.orchestrator.execute_command(check_cmd)
@@ -333,7 +342,7 @@ class ContextManager:
                     logger.warning(f"Trunk context file not found in container: {self.trunk_context_file}")
                     return None
 
-                # Load from container
+                # Load from container using cat (with improved truncation protection)
                 cat_result = self.orchestrator.execute_command(f"cat {self.trunk_context_file}")
                 if cat_result.get("success") or cat_result.get("exit_code") == 0:
                     data = json.loads(cat_result["output"])
@@ -450,12 +459,54 @@ CONTEXT_EOF"""
             "branch_file": branch_file
         }
 
+    def _load_json_via_docker_api(self, file_path: str) -> Optional[dict]:
+        """
+        使用Docker API直接从容器文件系统读取JSON文件
+        这比使用cat命令更高效，也避免了truncation问题
+        """
+        try:
+            container = self.orchestrator.client.containers.get(self.orchestrator.container_name)
+            
+            # 直接从容器文件系统获取文件
+            archive, stat = container.get_archive(file_path)
+            
+            # 解压tar数据
+            import tarfile
+            import io
+            tar_stream = io.BytesIO()
+            for chunk in archive:
+                tar_stream.write(chunk)
+            tar_stream.seek(0)
+            
+            # 提取JSON文件内容
+            with tarfile.open(fileobj=tar_stream, mode='r') as tar:
+                # 获取文件名（去掉路径）
+                filename = file_path.split('/')[-1]
+                file_data = tar.extractfile(filename).read()
+                json_data = json.loads(file_data.decode('utf-8'))
+                
+                logger.debug(f"Successfully loaded JSON via Docker API: {file_path}")
+                return json_data
+                
+        except Exception as e:
+            logger.debug(f"Docker API access failed for {file_path}: {e}, falling back to cat command")
+            return None
+
     def load_branch_history(self, task_id: str) -> Optional[BranchContextHistory]:
-        """Load branch history from file."""
+        """Load branch history from file with improved Docker API access."""
         branch_file = str(self.contexts_dir / f"{task_id}.json")
         
         try:
             if self.orchestrator:
+                # IMPROVED: Try Docker API first, fallback to cat command
+                json_data = self._load_json_via_docker_api(branch_file)
+                
+                if json_data:
+                    return BranchContextHistory(**json_data)
+                
+                # Fallback to original cat method if Docker API fails
+                logger.info(f"Using fallback cat method for {task_id}")
+                
                 # Check file existence in container
                 check_cmd = f"test -f {branch_file}"
                 check_result = self.orchestrator.execute_command(check_cmd)
@@ -463,7 +514,7 @@ CONTEXT_EOF"""
                     logger.warning(f"Branch history file not found in container: {branch_file}")
                     return None
 
-                # Load from container
+                # Load from container using cat (with improved truncation protection)
                 cat_result = self.orchestrator.execute_command(f"cat {branch_file}")
                 if cat_result.get("success") or cat_result.get("exit_code") == 0:
                     data = json.loads(cat_result["output"])
@@ -712,6 +763,147 @@ CONTEXT_EOF"""
                 except Exception as e:
                     logger.warning(f"Failed to load context file {context_file}: {e}")
         return None
+
+    def update_todo_list_dynamically(self, new_tasks: List[str], preserve_completed: bool = True) -> bool:
+        """
+        Dynamically update the todo list with new tasks.
+        
+        Args:
+            new_tasks: List of new task descriptions
+            preserve_completed: Whether to preserve completed/in_progress tasks
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            trunk_context = self.load_trunk_context()
+            if not trunk_context:
+                logger.error("No trunk context found for dynamic update")
+                return False
+
+            if preserve_completed:
+                # 保留已完成和进行中的任务
+                preserved_tasks = [
+                    task for task in trunk_context.todo_list 
+                    if task.status.value in ["completed", "in_progress"]
+                ]
+                trunk_context.todo_list = preserved_tasks
+            else:
+                # 清空所有任务
+                trunk_context.todo_list = []
+
+            # 添加新任务
+            for task_desc in new_tasks:
+                trunk_context.add_task(task_desc)
+
+            # 保存更新后的context
+            self._save_trunk_context(trunk_context)
+            logger.info(f"Successfully updated todo list with {len(new_tasks)} new tasks")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to update todo list dynamically: {e}")
+            return False
+
+    def get_todo_list_status(self) -> Dict[str, Any]:
+        """
+        Get comprehensive status of the todo list.
+        
+        Returns:
+            Dict with task counts and status information
+        """
+        try:
+            trunk_context = self.load_trunk_context()
+            if not trunk_context:
+                return {"error": "No trunk context found"}
+
+            status = {
+                "total_tasks": len(trunk_context.todo_list),
+                "completed": 0,
+                "in_progress": 0,
+                "pending": 0,
+                "failed": 0,
+                "tasks": []
+            }
+
+            for task in trunk_context.todo_list:
+                status[task.status.value] += 1
+                status["tasks"].append({
+                    "id": task.id,
+                    "description": task.description,
+                    "status": task.status.value,
+                    "created_at": task.created_at.isoformat() if task.created_at else None,
+                    "started_at": task.started_at.isoformat() if task.started_at else None,
+                    "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                    "key_results": task.key_results
+                })
+
+            return status
+
+        except Exception as e:
+            logger.error(f"Failed to get todo list status: {e}")
+            return {"error": f"Failed to get status: {str(e)}"}
+
+    def validate_execution_plan_completeness(self) -> Dict[str, Any]:
+        """
+        Validate that the execution plan includes essential components.
+        Ensures that critical tasks like final reporting are not forgotten.
+        
+        Returns:
+            Dict with validation results and suggestions
+        """
+        try:
+            trunk_context = self.load_trunk_context()
+            if not trunk_context:
+                return {"valid": False, "error": "No trunk context found"}
+
+            task_descriptions = [task.description.lower() for task in trunk_context.todo_list]
+            
+            validation = {
+                "valid": True,
+                "warnings": [],
+                "missing_components": [],
+                "recommendations": []
+            }
+
+            # Check for essential components
+            essential_components = {
+                "setup_environment": ["environment", "setup", "install", "dependencies"],
+                "build_project": ["build", "compile", "maven", "gradle"],
+                "run_tests": ["test", "testing", "verify"],
+                "generate_report": ["report", "completion", "summary", "generate"]
+            }
+
+            for component, keywords in essential_components.items():
+                found = any(
+                    any(keyword in desc for keyword in keywords)
+                    for desc in task_descriptions
+                )
+                
+                if not found:
+                    validation["missing_components"].append(component)
+                    
+                    if component == "generate_report":
+                        validation["warnings"].append(
+                            "⚠️ CRITICAL: No final report generation task found! "
+                            "This is essential for proper completion."
+                        )
+                        validation["recommendations"].append(
+                            "Add a final task: 'Generate comprehensive setup completion report'"
+                        )
+                    elif component == "run_tests":
+                        validation["warnings"].append(
+                            "⚠️ No testing task found - consider adding test execution"
+                        )
+
+            if validation["missing_components"]:
+                validation["valid"] = False
+
+            return validation
+
+        except Exception as e:
+            logger.error(f"Failed to validate execution plan: {e}")
+            return {"valid": False, "error": f"Validation failed: {str(e)}"}
 
     def load_or_create_trunk_context(self, goal: str, project_url: str, project_name: str, tasks: List[str] = None) -> TrunkContext:
         """Load or create trunk context"""

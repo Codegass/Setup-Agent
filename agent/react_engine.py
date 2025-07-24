@@ -789,7 +789,19 @@ AVAILABLE TOOLS:
   • Example: manage_context(action="complete_with_results", summary="...", key_results="...")
 - maven: Execute Maven commands (NOT mvn)
 - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
+- project_analyzer: 🆕 INTELLIGENT PROJECT ANALYSIS - Analyze cloned projects and generate smart execution plans
+  • Use AFTER cloning to understand project requirements and create optimized task lists
+  • Reads documentation, analyzes Maven (pom.xml) and Gradle (build.gradle/build.gradle.kts) configs
+  • Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), generates dynamic plans
+  • Example: project_analyzer(action="analyze") - Essential for intelligent setup!
 - system: Install system packages and dependencies
+
+🧠 INTELLIGENT SETUP WORKFLOW (MANDATORY):
+1. Clone repository with project_setup tool
+2. 🔍 IMMEDIATELY use project_analyzer tool to analyze the project
+3. The analyzer will automatically update your task plan based on project specifics
+4. Execute the generated intelligent task plan
+5. Generate final report
 
 Use these tools as needed to complete your tasks."""
 
@@ -879,20 +891,24 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
         prompt += """
 3. ALWAYS detect project type: project_setup(action="detect_project_type")
-4. 📖 CRITICAL: Read project documentation to understand setup requirements:
-   • Check for README.md: file_io(action="read", file_path="README.md")
-   • Also check README.txt, docs/ folder, or INSTALL files if README.md doesn't exist
-   • Look for build instructions, dependencies, testing commands, and setup requirements
-   • This step is ESSENTIAL for understanding how to properly configure the project!
-5. For Maven projects: maven(command="compile") or maven(command="test")
-6. For shell commands: bash(command="ls -la")
-7. For reading files: file_io(action="read", file_path="/path/to/file")
+4. 🔍 CRITICAL: INTELLIGENT PROJECT ANALYSIS - Use project_analyzer tool immediately after cloning:
+   • project_analyzer(action="analyze") - This is MANDATORY for intelligent setup!
+   • The analyzer will read README.md, analyze Maven (pom.xml) and Gradle (build.gradle/build.gradle.kts) configs
+   • Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock) for both Maven and Gradle
+   • It automatically generates optimized execution plan based on project specifics
+   • The trunk context will be updated with intelligent task list
+   • This step is ESSENTIAL for understanding project requirements!
+5. Execute the dynamically generated intelligent task plan
+6. For Maven projects: maven(command="compile") or maven(command="test") (as recommended by analyzer)
+7. For shell commands: bash(command="ls -la")
+8. For reading files: file_io(action="read", file_path="/path/to/file")
 
-💡 PROJECT SETUP BEST PRACTICES:
-- ALWAYS read documentation before making assumptions about build systems
-- Follow the project's own setup instructions from README/docs
-- Use the project's recommended testing commands
-- Check for specific environment requirements (Java version, Node.js, etc.)
+💡 PROJECT SETUP BEST PRACTICES (UPDATED):
+- ALWAYS use project_analyzer after cloning - this is the key innovation!
+- Follow the project's own setup instructions discovered by the analyzer
+- Use the project's recommended testing commands from documentation
+- Check for specific environment requirements automatically detected
+- The analyzer replaces manual documentation reading with intelligent automation
 
 NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
 

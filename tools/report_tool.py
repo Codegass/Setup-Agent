@@ -393,44 +393,102 @@ class ReportTool(BaseTool):
                 "",
             ])
         
-        # Add status indicators based on actual accomplishments
+        # CRITICAL FIX: Use actual TODO list from trunk context instead of hardcoded tasks
         report_lines.extend([
-            "✅ COMPLETED TASKS:",
+            "✅ TASK COMPLETION STATUS:",
         ])
         
-        # Use actual accomplishments if available
+        # Try to get actual task status from trunk context first
+        todo_list_used = False
+        if self.context_manager:
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context and trunk_context.todo_list:
+                    todo_list_used = True
+                    
+                    for task in trunk_context.todo_list:
+                        if task.status.value == "completed":
+                            icon = "✅"
+                            status_text = "Completed"
+                            if task.key_results:
+                                status_text += f" - {task.key_results}"
+                        elif task.status.value == "in_progress":
+                            icon = "🔄"
+                            status_text = "In Progress"
+                        elif task.status.value == "failed":
+                            icon = "❌"
+                            status_text = "Failed"
+                        else:
+                            icon = "⏳"
+                            status_text = "Pending"
+                        
+                        report_lines.append(f"   • {icon} {task.description} - {status_text}")
+                        
+            except Exception as e:
+                logger.warning(f"Failed to load trunk context for console report: {e}")
+        
+        # Fallback to technical accomplishments if no TODO list available
+        if not todo_list_used:
+            logger.info("Using technical accomplishments as fallback for task status")
+            
+            # Use actual accomplishments if available
+            if actual_accomplishments:
+                # Environment setup
+                if actual_accomplishments.get('environment_setup'):
+                    report_lines.append("   • ✅ Docker environment setup")
+                else:
+                    report_lines.append("   • ❌ Docker environment setup")
+                
+                # Repository cloning
+                if actual_accomplishments.get('repository_cloned'):
+                    report_lines.append("   • ✅ Project repository cloning")
+                else:
+                    report_lines.append("   • ❌ Project repository cloning")
+                
+                # Project detection
+                if actual_accomplishments.get('project_detected'):
+                    report_lines.append("   • ✅ Development environment configuration")
+                else:
+                    report_lines.append("   • ⚠️ Development environment configuration (partial)")
+                
+                # Compilation status
+                if actual_accomplishments.get('maven_compile_success'):
+                    report_lines.append("   • ✅ Project compilation")
+                else:
+                    report_lines.append("   • ❌ Project compilation (failed)")
+                
+                # Test execution status
+                if actual_accomplishments.get('maven_test_success'):
+                    report_lines.append("   • ✅ Test execution")
+                else:
+                    report_lines.append("   • ❌ Test execution (failed)")
+            else:
+                # Final fallback to old behavior if no accomplishments data
+                report_lines.extend([
+                    "   • ✅ Docker environment setup",
+                    "   • ✅ Project repository cloning",
+                    "   • ✅ Development environment configuration",
+                ])
+                
+                # Add build/test status based on overall status
+                if status == "success":
+                    report_lines.extend([
+                        "   • ✅ Project compilation",
+                        "   • ✅ Test execution",
+                    ])
+                elif status == "partial":
+                    report_lines.extend([
+                        "   • ⚠️ Project compilation (partial)",
+                        "   • ⚠️ Test execution (some issues)",
+                    ])
+                else:
+                    report_lines.extend([
+                        "   • ❌ Project compilation (failed)",
+                        "   • ❌ Test execution (failed)",
+                    ])
+        
+        # Add execution statistics if available
         if actual_accomplishments:
-            # Environment setup
-            if actual_accomplishments.get('environment_setup'):
-                report_lines.append("   • ✅ Docker environment setup")
-            else:
-                report_lines.append("   • ❌ Docker environment setup")
-            
-            # Repository cloning
-            if actual_accomplishments.get('repository_cloned'):
-                report_lines.append("   • ✅ Project repository cloning")
-            else:
-                report_lines.append("   • ❌ Project repository cloning")
-            
-            # Project detection
-            if actual_accomplishments.get('project_detected'):
-                report_lines.append("   • ✅ Development environment configuration")
-            else:
-                report_lines.append("   • ⚠️ Development environment configuration (partial)")
-            
-            # Compilation status
-            if actual_accomplishments.get('maven_compile_success'):
-                report_lines.append("   • ✅ Project compilation")
-            else:
-                report_lines.append("   • ❌ Project compilation (failed)")
-            
-            # Test execution status
-            if actual_accomplishments.get('maven_test_success'):
-                report_lines.append("   • ✅ Test execution")
-            else:
-                report_lines.append("   • ❌ Test execution (failed)")
-            
-            # Add execution statistics
             total = actual_accomplishments.get('total_actions', 0)
             successful = actual_accomplishments.get('successful_actions', 0)
             if total > 0:
@@ -441,30 +499,6 @@ class ReportTool(BaseTool):
                     f"   • Total actions executed: {total}",
                     f"   • Successful actions: {successful}",
                     f"   • Success rate: {success_rate:.1f}%",
-                ])
-        else:
-            # Fallback to old behavior if no accomplishments data
-            report_lines.extend([
-                "   • ✅ Docker environment setup",
-                "   • ✅ Project repository cloning",
-                "   • ✅ Development environment configuration",
-            ])
-            
-            # Add build/test status based on overall status
-            if status == "success":
-                report_lines.extend([
-                    "   • ✅ Project compilation",
-                    "   • ✅ Test execution",
-                ])
-            elif status == "partial":
-                report_lines.extend([
-                    "   • ⚠️ Project compilation (partial)",
-                    "   • ⚠️ Test execution (some issues)",
-                ])
-            else:
-                report_lines.extend([
-                    "   • ❌ Project compilation (failed)",
-                    "   • ❌ Test execution (failed)",
                 ])
         
         report_lines.append("")

@@ -212,6 +212,63 @@ class DockerOrchestrator:
             logger.error(f"Failed to connect to container: {e}")
             raise
 
+    def _is_json_content(self, output: str, command: str) -> bool:
+        """
+        检测是否为JSON内容，避免对JSON文件进行破坏性截断
+        """
+        # 如果command包含.json文件路径
+        if '.json' in command and ('cat' in command or 'head' in command or 'tail' in command):
+            return True
+        
+        # 如果输出内容看起来像JSON结构
+        stripped = output.strip()
+        if stripped.startswith('{') and stripped.endswith('}'):
+            try:
+                import json
+                json.loads(stripped)  # 验证是否为有效JSON
+                return True
+            except json.JSONDecodeError:
+                pass
+        
+        return False
+
+    def _smart_json_truncate(self, json_content: str, max_entries: int = 10) -> str:
+        """
+        智能截断JSON内容，保持JSON有效性
+        主要针对context history文件进行安全压缩
+        """
+        try:
+            import json
+            data = json.loads(json_content)
+            
+            # 如果是branch context history，可以安全截断history数组
+            if isinstance(data, dict) and 'history' in data and isinstance(data['history'], list):
+                history = data['history']
+                if len(history) > max_entries:
+                    # 保留前5个和后5个history条目，中间标记截断
+                    truncated_count = len(history) - max_entries
+                    data['history'] = (
+                        history[:5] + 
+                        [{"type": "truncated", "message": f"[SMART TRUNCATION: {truncated_count} entries omitted to prevent context pollution]", "timestamp": "system"}] +
+                        history[-5:]
+                    )
+                    # 更新元数据
+                    data['entry_count'] = len(data['history'])
+                    # 重新计算token count
+                    if 'token_count' in data:
+                        data['token_count'] = len(json.dumps(data)) // 4
+                    
+                    logger.info(f"📊 Applied smart JSON truncation: {len(history)} → {len(data['history'])} entries")
+                    return json.dumps(data, indent=2)
+            
+            # 如果无法安全截断，返回原内容（但会有警告）
+            logger.warning("🚨 Large JSON file detected but cannot be safely truncated - preserving integrity")
+            return json_content
+            
+        except json.JSONDecodeError:
+            # 如果不是有效JSON，返回原内容
+            return json_content
+
     def execute_command(self, command: str, workdir: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute a command in the container.
@@ -252,14 +309,21 @@ class DockerOrchestrator:
 
             logger.debug(f"Command finished with exit code: {exit_code}")
             
-            # CRITICAL: Fallback truncation at orchestrator level - prevent context pollution
+            # IMPROVED: JSON-aware truncation logic
             original_length = len(output)
             if original_length > 10000:  # ~100 lines threshold
                 lines = output.split('\n')
                 if len(lines) > 100:
-                    truncated = '\n'.join(lines[:25]) + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n" + '\n'.join(lines[-25:])
-                    logger.warning(f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution")
-                    output = truncated
+                    # Check if this is JSON content that needs protection
+                    if self._is_json_content(output, command):
+                        # For JSON files, apply smart truncation that preserves validity
+                        output = self._smart_json_truncate(output, max_entries=10)
+                        logger.info(f"🔧 Applied JSON-aware truncation to preserve file integrity")
+                    else:
+                        # Apply normal truncation for non-JSON content
+                        truncated = '\n'.join(lines[:25]) + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n" + '\n'.join(lines[-25:])
+                        logger.warning(f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution")
+                        output = truncated
             
             # Smart debug logging: show structure of truncated output
             if original_length > 10000 and len(output.split('\n')) <= 60:  # If we applied truncation

@@ -65,6 +65,7 @@ class SetupAgent:
         from tools.project_setup_tool import ProjectSetupTool
         from tools.system_tool import SystemTool
         from tools.report_tool import ReportTool
+        from tools.project_analyzer import ProjectAnalyzerTool
         
         tools = [
             BashTool(self.orchestrator),
@@ -74,6 +75,7 @@ class SetupAgent:
             MavenTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
+            ProjectAnalyzerTool(self.orchestrator, self.context_manager),  # 🆕 添加项目分析工具
             ReportTool(self.orchestrator, execution_history_callback=self._get_execution_history, context_manager=self.context_manager)
         ]
 
@@ -115,15 +117,13 @@ class SetupAgent:
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url)
 
-            # Step 2: Initialize trunk context with initial tasks
+            # Step 2: Initialize trunk context with intelligent planning approach
+            # 🆕 INTELLIGENT PLANNING: Start with analysis task that will generate dynamic execution plan
             initial_tasks = [
-                "Clone the repository and analyze project structure",
-                "Install dependencies and build environment",
-                "Compile and test the project",
-                "Generate completion report"
+                "Clone repository and analyze project to generate intelligent execution plan"
             ]
             
-            logger.info("Creating trunk context...")
+            logger.info("Creating trunk context with intelligent planning approach...")
             self.agent_logger.info(f"Creating trunk context for project: {project_name}")
             
             try:
@@ -137,7 +137,7 @@ class SetupAgent:
                     raise Exception(f"Failed to verify trunk context: {context_info['error']}")
                 
                 self.agent_logger.info(f"✅ Trunk context created successfully: {trunk_context.context_id}")
-                logger.info(f"Trunk context created with {len(initial_tasks)} tasks")
+                logger.info(f"Trunk context created with intelligent planning task (dynamic tasks will be generated after project analysis)")
                 
             except Exception as e:
                 self.agent_logger.error(f"❌ Failed to create trunk context: {e}")
@@ -394,34 +394,56 @@ Please start by checking the current context and then proceed with the task.
     def _run_unified_setup(self, project_url: str, project_name: str, goal: str, interactive: bool = False) -> bool:
         """Run the unified project setup process."""
 
-        # Create comprehensive setup prompt
+        # Create comprehensive setup prompt with intelligent planning approach
         setup_prompt = f"""
 I need to setup the project '{project_name}' from the repository: {project_url}
 
 My goal: {goal}
 
-I should complete this setup systematically:
+🧠 INTELLIGENT SETUP WORKFLOW - I should complete this setup using smart analysis:
 
-1. INITIAL SETUP:
+1. INITIAL CONTEXT CHECK:
    - Check my current context using manage_context tool
+   - Understand the current task plan and proceed with task execution
+
+2. REPOSITORY CLONING (if not done):
    - Clone the repository from {project_url} using project_setup tool
-   - Analyze the project structure and identify project type
+   - Verify the project was cloned successfully
 
-2. PROJECT BUILD & TEST:
-   - If it's a Maven project: compile and run tests using maven tool
-   - If it's a Gradle project: compile and run tests using gradle tool
-   - If it's a Node.js project: install dependencies and run tests
-   - If it's a Python project: set up environment and run tests
-   - Handle any dependency installation issues using system tool
+3. 🔍 CRITICAL: INTELLIGENT PROJECT ANALYSIS:
+   - Use project_analyzer tool to comprehensively analyze the cloned project
+   - This will automatically:
+     • Read README.md and documentation files
+     • Analyze build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts, package.json, etc.)
+     • Detect Java version requirements, dependencies, and test frameworks for Maven and Gradle projects
+     • Identify project type and build system (Maven, Gradle, npm, etc.)
+     • Generate optimized execution plan based on project specifics
+     • Update the trunk context with intelligent task list
 
-3. COMPLETION:
-   - Once build and tests are successful, generate a completion report using report tool
-   - Include summary of what was accomplished and project status
+4. EXECUTE INTELLIGENT PLAN:
+   - After project analysis, the trunk context will be updated with specific tasks
+   - Execute each task in the generated plan systematically
+   - Use appropriate tools for each detected project type:
+     • Maven projects: maven tool for compile/test
+     • Node.js projects: bash tool for npm commands
+     • Python projects: bash/system tools for pip/poetry
+   - Follow the project's own documented setup instructions
 
-Be methodical and use the appropriate tools for each step. The repository URL is already provided: {project_url}
+5. COMPLETION:
+   - Generate comprehensive report using report tool
+   - Include summary of analysis findings and setup results
+
+🎯 KEY ADVANTAGES OF THIS APPROACH:
+- Reads project documentation BEFORE making assumptions
+- Adapts to specific project requirements automatically
+- Uses project's own recommended build/test commands
+- Generates optimal task sequence for each unique project
+
+The repository URL is already provided: {project_url}
+START by checking context, then clone if needed, then IMMEDIATELY analyze the project!
 """
 
-        self.console.print("[dim]🚀 Starting project setup process...[/dim]")
+        self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
 
         # Run the unified setup process
         with Progress(
