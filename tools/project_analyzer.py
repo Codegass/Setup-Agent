@@ -26,6 +26,7 @@ class ProjectAnalyzerTool(BaseTool):
         self,
         action: str = "analyze",
         project_path: str = "/workspace",
+        directory: str = None,  # Support legacy parameter name
         update_context: bool = True
     ) -> ToolResult:
         """
@@ -34,15 +35,56 @@ class ProjectAnalyzerTool(BaseTool):
         Args:
             action: Action to perform ('analyze' for full analysis)
             project_path: Path to the project directory in container
+            directory: Legacy parameter name (mapped to project_path)
             update_context: Whether to update the trunk context with new tasks
         """
+        
+        # Handle legacy parameter name 'directory'
+        if directory is not None:
+            project_path = directory
+            logger.info(f"⚠️ Using legacy parameter 'directory', mapped to project_path: {project_path}")
         
         logger.info(f"Starting project analysis at: {project_path}")
 
         try:
             if action == "analyze":
-                analysis_result = self._perform_comprehensive_analysis(project_path)
+                # Step 1: Validate and discover project path
+                validated_path = self._validate_and_discover_project_path(project_path)
+                if not validated_path:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error=f"No valid project found at {project_path} or in common subdirectories",
+                        suggestions=[
+                            "Ensure the project has been cloned successfully",
+                            "Check if the project contains build files (pom.xml, build.gradle, package.json, etc.)",
+                            "Try specifying the exact project directory path",
+                            "Use bash tool to list directory contents: bash(command='ls -la /workspace')"
+                        ],
+                        error_code="PROJECT_NOT_FOUND"
+                    )
                 
+                logger.info(f"✅ Using validated project path: {validated_path}")
+                
+                # Step 2: Perform comprehensive analysis
+                analysis_result = self._perform_comprehensive_analysis(validated_path)
+                
+                # Step 3: Validate analysis results
+                if not self._is_analysis_valid(analysis_result):
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="Project analysis failed to detect valid project structure",
+                        suggestions=[
+                            "Verify the project is properly structured",
+                            "Check if build files are accessible",
+                            "Ensure the project directory is correct",
+                            "Try manual analysis with bash tool"
+                        ],
+                        error_code="ANALYSIS_FAILED"
+                    )
+                
+                # Step 4: Update context if requested
                 if update_context and self.context_manager:
                     success = self._update_trunk_context_with_plan(analysis_result)
                     if success:
@@ -70,7 +112,12 @@ class ProjectAnalyzerTool(BaseTool):
                 success=False,
                 output="",
                 error=f"Project analysis failed: {str(e)}",
-                suggestions=["Check if project is properly cloned and accessible"]
+                suggestions=[
+                    "Check if project is properly cloned and accessible",
+                    "Verify Docker container has access to the project directory",
+                    "Try using bash tool to manually inspect the project structure"
+                ],
+                error_code="ANALYSIS_EXCEPTION"
             )
 
     def _perform_comprehensive_analysis(self, project_path: str) -> Dict[str, Any]:
@@ -524,6 +571,14 @@ class ProjectAnalyzerTool(BaseTool):
         build_system = analysis.get("build_system", "unknown")
         java_version = analysis.get("java_version")
         documentation = analysis.get("documentation", {})
+        existing_files = analysis.get("existing_files", [])
+
+        logger.info(f"Generating execution plan for {project_type} project with {build_system} build system")
+
+        # Handle unknown projects with fallback strategies
+        if project_type == "unknown" or build_system == "unknown":
+            logger.warning("Project type or build system unknown, generating fallback plan")
+            return self._generate_fallback_execution_plan(analysis)
 
         # 基础环境准备任务
         if java_version:
@@ -556,6 +611,13 @@ class ProjectAnalyzerTool(BaseTool):
                 "priority": "high",
                 "type": "dependencies"
             })
+        elif project_type == "Python":
+            plan.append({
+                "id": "install_dependencies",
+                "description": "Install Python dependencies using pip/poetry",
+                "priority": "high",
+                "type": "dependencies"
+            })
 
         # 构建任务
         build_commands = documentation.get("build_commands", [])
@@ -577,6 +639,13 @@ class ProjectAnalyzerTool(BaseTool):
             plan.append({
                 "id": "build_project",
                 "description": "Compile project using Gradle",
+                "priority": "high",
+                "type": "build"
+            })
+        elif project_type == "Node.js":
+            plan.append({
+                "id": "build_project",
+                "description": "Build project using npm/yarn build scripts",
                 "priority": "high",
                 "type": "build"
             })
@@ -611,6 +680,18 @@ class ProjectAnalyzerTool(BaseTool):
                 "priority": "high",
                 "type": "test"
             })
+        elif project_type == "Node.js":
+            plan.append({
+                "id": "run_tests",
+                "description": "Execute project tests using npm/yarn test scripts",
+                "priority": "high",
+                "type": "test"
+            })
+
+        # 确保至少有基本的任务
+        if not plan:
+            logger.warning("No specific tasks generated, adding basic setup tasks")
+            plan = self._generate_basic_setup_plan(analysis)
 
         # 最终报告任务（确保始终存在）
         plan.append({
@@ -620,11 +701,157 @@ class ProjectAnalyzerTool(BaseTool):
             "type": "report"
         })
 
+        logger.info(f"Generated {len(plan)} tasks in execution plan")
         return plan
 
+    def _generate_fallback_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
+        """为未知项目类型生成fallback执行计划"""
+        plan = []
+        existing_files = analysis.get("existing_files", [])
+        project_path = analysis.get("project_path", "/workspace")
+
+        logger.info("Generating fallback execution plan for unknown project type")
+
+        # 检查是否有任何构建文件
+        if "pom.xml" in existing_files:
+            plan.extend([
+                {
+                    "id": "analyze_maven_project",
+                    "description": "Analyze Maven project structure and dependencies",
+                    "priority": "high",
+                    "type": "analysis"
+                },
+                {
+                    "id": "setup_maven_environment",
+                    "description": "Setup Maven build environment and install dependencies",
+                    "priority": "high",
+                    "type": "environment"
+                },
+                {
+                    "id": "build_maven_project",
+                    "description": "Compile Maven project",
+                    "priority": "high",
+                    "type": "build"
+                },
+                {
+                    "id": "test_maven_project",
+                    "description": "Execute Maven project tests",
+                    "priority": "high",
+                    "type": "test"
+                }
+            ])
+        elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
+            plan.extend([
+                {
+                    "id": "analyze_gradle_project",
+                    "description": "Analyze Gradle project structure and dependencies",
+                    "priority": "high",
+                    "type": "analysis"
+                },
+                {
+                    "id": "setup_gradle_environment",
+                    "description": "Setup Gradle build environment and install dependencies",
+                    "priority": "high",
+                    "type": "environment"
+                },
+                {
+                    "id": "build_gradle_project",
+                    "description": "Compile Gradle project",
+                    "priority": "high",
+                    "type": "build"
+                },
+                {
+                    "id": "test_gradle_project",
+                    "description": "Execute Gradle project tests",
+                    "priority": "high",
+                    "type": "test"
+                }
+            ])
+        elif "package.json" in existing_files:
+            plan.extend([
+                {
+                    "id": "analyze_nodejs_project",
+                    "description": "Analyze Node.js project dependencies and scripts",
+                    "priority": "high",
+                    "type": "analysis"
+                },
+                {
+                    "id": "install_npm_dependencies",
+                    "description": "Install Node.js dependencies using npm/yarn",
+                    "priority": "high",
+                    "type": "dependencies"
+                },
+                {
+                    "id": "build_nodejs_project",
+                    "description": "Build Node.js project",
+                    "priority": "high",
+                    "type": "build"
+                },
+                {
+                    "id": "test_nodejs_project",
+                    "description": "Execute Node.js project tests",
+                    "priority": "high",
+                    "type": "test"
+                }
+            ])
+        else:
+            # 完全未知的项目，使用通用方法
+            plan.extend([
+                {
+                    "id": "manual_project_exploration",
+                    "description": f"Manually explore project structure at {project_path}",
+                    "priority": "high",
+                    "type": "exploration"
+                },
+                {
+                    "id": "identify_build_system",
+                    "description": "Identify project build system and requirements",
+                    "priority": "high",
+                    "type": "analysis"
+                },
+                {
+                    "id": "setup_development_environment",
+                    "description": "Setup appropriate development environment",
+                    "priority": "high",
+                    "type": "environment"
+                },
+                {
+                    "id": "attempt_project_build",
+                    "description": "Attempt to build project using identified tools",
+                    "priority": "medium",
+                    "type": "build"
+                }
+            ])
+
+        return plan
+
+    def _generate_basic_setup_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
+        """生成基本的setup计划作为最后的fallback"""
+        return [
+            {
+                "id": "verify_project_structure",
+                "description": "Verify project structure and identify key components",
+                "priority": "high",
+                "type": "verification"
+            },
+            {
+                "id": "setup_basic_environment",
+                "description": "Setup basic development environment",
+                "priority": "high",
+                "type": "environment"
+            },
+            {
+                "id": "manual_build_attempt",
+                "description": "Attempt manual project build",
+                "priority": "medium",
+                "type": "build"
+            }
+        ]
+
     def _update_trunk_context_with_plan(self, analysis: Dict[str, Any]) -> bool:
-        """更新trunk context的todo list"""
+        """更新trunk context的todo list（安全版本）"""
         if not self.context_manager:
+            logger.warning("No context manager available for updating trunk context")
             return False
 
         try:
@@ -635,37 +862,104 @@ class ProjectAnalyzerTool(BaseTool):
 
             execution_plan = analysis.get("execution_plan", [])
             if not execution_plan:
-                logger.warning("No execution plan generated")
+                logger.warning("No execution plan generated, trunk context unchanged")
                 return False
 
-            # 清除现有的pending任务（保留已完成的）
-            remaining_tasks = [task for task in trunk_context.todo_list if task.status.value != "pending"]
-            trunk_context.todo_list = remaining_tasks
+            # 验证执行计划的质量
+            if not self._is_execution_plan_valid(execution_plan):
+                logger.warning("Generated execution plan appears invalid, preserving existing tasks")
+                return False
 
-            # 添加新的智能任务
-            for plan_item in execution_plan:
-                task_description = plan_item.get("description", "Unknown task")
-                trunk_context.add_task(task_description)
+            # 获取当前pending任务数量
+            current_pending = len([task for task in trunk_context.todo_list if task.status.value == "pending"])
+            logger.info(f"Current pending tasks: {current_pending}, new plan has {len(execution_plan)} tasks")
 
-            # 保存更新后的context
-            self.context_manager._save_trunk_context(trunk_context)
-            logger.info(f"Successfully updated trunk context with {len(execution_plan)} new tasks")
-            return True
+            # 只有在新计划看起来合理时才替换现有任务
+            if len(execution_plan) >= 3:  # 至少3个任务才认为是合理的计划
+                # 清除现有的pending任务（保留已完成的和进行中的）
+                remaining_tasks = [task for task in trunk_context.todo_list 
+                                 if task.status.value not in ["pending"]]
+                trunk_context.todo_list = remaining_tasks
+
+                # 添加新的智能任务
+                for plan_item in execution_plan:
+                    task_description = plan_item.get("description", "Unknown task")
+                    task_type = plan_item.get("type", "general")
+                    logger.debug(f"Adding task: {task_description} (type: {task_type})")
+                    trunk_context.add_task(task_description)
+
+                # 保存更新后的context
+                self.context_manager._save_trunk_context(trunk_context)
+                logger.info(f"✅ Successfully updated trunk context with {len(execution_plan)} new intelligent tasks")
+                return True
+            else:
+                logger.warning(f"Execution plan too short ({len(execution_plan)} tasks), preserving existing tasks")
+                return False
 
         except Exception as e:
             logger.error(f"Failed to update trunk context: {e}")
             return False
 
+    def _is_execution_plan_valid(self, execution_plan: List[Dict[str, str]]) -> bool:
+        """验证执行计划是否有效"""
+        if not execution_plan or len(execution_plan) < 2:
+            logger.debug("Execution plan too short")
+            return False
+
+        # 检查是否只有报告任务（这通常意味着分析失败）
+        non_report_tasks = [task for task in execution_plan 
+                           if task.get("type") != "report" and 
+                           "report" not in task.get("description", "").lower()]
+        
+        if len(non_report_tasks) < 2:
+            logger.debug("Execution plan contains mostly report tasks")
+            return False
+
+        # 检查是否有实际的构建/测试任务
+        has_build_or_test = any(
+            task.get("type") in ["build", "test", "dependencies", "environment"] or
+            any(keyword in task.get("description", "").lower() 
+                for keyword in ["build", "compile", "test", "install", "setup"])
+            for task in execution_plan
+        )
+
+        if not has_build_or_test:
+            logger.debug("Execution plan lacks build/test tasks")
+            return False
+
+        logger.debug("Execution plan validation passed")
+        return True
+
     def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
         """格式化分析输出"""
         output = "🔍 PROJECT ANALYSIS COMPLETED\n\n"
         
+        # 分析路径信息
+        project_path = analysis.get('project_path', 'Unknown')
+        output += f"📁 Analyzed Path: {project_path}\n"
+        
         # 基本信息
-        output += f"📂 Project Type: {analysis.get('project_type', 'Unknown')}\n"
-        output += f"🔧 Build System: {analysis.get('build_system', 'Unknown')}\n"
+        project_type = analysis.get('project_type', 'Unknown')
+        build_system = analysis.get('build_system', 'Unknown')
+        output += f"📂 Project Type: {project_type}\n"
+        output += f"🔧 Build System: {build_system}\n"
+        
+        # 显示发现的文件
+        existing_files = analysis.get('existing_files', [])
+        if existing_files:
+            output += f"📄 Project Files Found: {', '.join(existing_files[:5])}\n"
+            if len(existing_files) > 5:
+                output += f"    ... and {len(existing_files) - 5} more files\n"
+        else:
+            output += f"⚠️ No project files detected\n"
         
         if analysis.get('java_version'):
             output += f"☕ Java Version: {analysis['java_version']}\n"
+        
+        # 依赖信息
+        dependencies = analysis.get('dependencies', [])
+        if dependencies:
+            output += f"📦 Dependencies: {len(dependencies)} found ({', '.join(dependencies[:3])}...)\n"
         
         # 文档分析
         doc = analysis.get('documentation', {})
@@ -678,20 +972,59 @@ class ProjectAnalyzerTool(BaseTool):
         if doc.get('test_commands'):
             output += f"🧪 Test Commands Found: {', '.join(doc['test_commands'][:3])}\n"
         
+        # 测试框架
+        test_framework = analysis.get('test_framework', 'unknown')
+        if test_framework != 'unknown':
+            output += f"🧪 Test Framework: {test_framework}\n"
+        
         # 执行计划
         execution_plan = analysis.get('execution_plan', [])
         if execution_plan:
+            # 分析计划类型
+            plan_types = [task.get('type', 'general') for task in execution_plan]
+            type_counts = {}
+            for t in plan_types:
+                type_counts[t] = type_counts.get(t, 0) + 1
+            
             output += f"\n📋 GENERATED EXECUTION PLAN ({len(execution_plan)} tasks):\n"
             for i, task in enumerate(execution_plan, 1):
-                output += f"  {i}. {task.get('description', 'Unknown task')}\n"
+                task_type = task.get('type', 'general')
+                task_desc = task.get('description', 'Unknown task')
+                priority = task.get('priority', 'medium')
+                type_emoji = {
+                    'environment': '🔧',
+                    'dependencies': '📦',
+                    'build': '🔨',
+                    'test': '🧪',
+                    'report': '📊',
+                    'analysis': '🔍',
+                    'exploration': '🗺️'
+                }.get(task_type, '📋')
+                output += f"  {i}. {type_emoji} {task_desc} [{priority}]\n"
+            
+            # 显示计划质量指标
+            non_report_tasks = [t for t in execution_plan if t.get('type') != 'report']
+            if len(non_report_tasks) >= 3:
+                output += f"\n✅ Plan Quality: Good ({len(non_report_tasks)} actionable tasks)\n"
+            else:
+                output += f"\n⚠️ Plan Quality: Limited ({len(non_report_tasks)} actionable tasks)\n"
+        else:
+            output += f"\n❌ No execution plan generated\n"
         
         # Context更新状态
         if analysis.get('context_updated'):
             output += f"\n✅ Trunk context updated with new intelligent task plan\n"
-        elif 'context_error' in analysis:
-            output += f"\n⚠️ Context update failed: {analysis['context_error']}\n"
+        elif analysis.get('context_updated') == False:
+            context_error = analysis.get('context_error', 'Unknown error')
+            output += f"\n⚠️ Context update failed: {context_error}\n"
         
-        output += f"\n🎯 Ready to execute intelligent project setup plan!"
+        # 最终状态
+        if project_type != 'Unknown' and build_system != 'Unknown' and execution_plan:
+            output += f"\n🎯 Ready to execute intelligent project setup plan!"
+        elif project_type == 'Unknown' or build_system == 'Unknown':
+            output += f"\n⚠️ Project analysis incomplete - manual investigation may be needed"
+        else:
+            output += f"\n❌ Analysis failed - please check project structure and try again"
         
         return output
 
@@ -710,6 +1043,11 @@ class ProjectAnalyzerTool(BaseTool):
                     "type": "string",
                     "description": "Path to the project directory in container",
                     "default": "/workspace",
+                },
+                "directory": {
+                    "type": "string",
+                    "description": "Legacy parameter name for project_path (automatically mapped)",
+                    "default": None,
                 },
                 "update_context": {
                     "type": "boolean",
@@ -734,24 +1072,141 @@ Project Analyzer Tool Usage Examples:
 3. Analyze without updating context:
    project_analyzer(action="analyze", update_context=False)
 
+4. Legacy parameter support (automatically mapped):
+   project_analyzer(action="analyze", directory="/workspace/project")
+
+ENHANCED FEATURES:
+✅ Smart path discovery - automatically finds project in subdirectories
+✅ Robust error handling - validates project structure before analysis  
+✅ Parameter compatibility - supports both 'project_path' and 'directory'
+✅ Intelligent fallback plans - generates meaningful tasks even for unknown projects
+✅ Context safety - preserves existing tasks if analysis fails
+✅ Plan validation - ensures generated plans are actionable
+
 WORKFLOW:
 1. First clone the repository using project_setup tool
 2. Then use project_analyzer to understand the project and generate intelligent plan
 3. Execute the dynamically generated tasks
 
 WHAT IT ANALYZES:
-- Project type (Java, Node.js, Python, etc.)
-- Build system (Maven, Gradle, npm, etc.)
+- Project type (Java, Node.js, Python, Rust, Go, etc.)
+- Build system (Maven, Gradle, npm, pip, Cargo, etc.)
 - Java version requirements from README and config files
 - Maven dependencies from pom.xml
 - Gradle dependencies from build.gradle/build.gradle.kts (supports both Groovy and Kotlin DSL)
-- Test frameworks (JUnit, TestNG, Spock) for both Maven and Gradle projects
+- Test frameworks (JUnit, TestNG, Spock, Jest, pytest) for various project types
 - Gradle plugins and Maven profiles
 - Documentation and setup instructions
-- Generates optimized execution plan based on findings
+- Source code structure and organization
+
+ROBUST ERROR HANDLING:
+- Validates project path and discovers actual project location
+- Handles parameter name variations (project_path vs directory)
+- Generates fallback plans for unknown project types
+- Preserves existing context if analysis fails
+- Provides detailed diagnostic information
 
 OUTPUT:
-- Comprehensive project analysis
+- Comprehensive project analysis with path validation
 - Dynamically generated task list optimized for the specific project
-- Updates trunk context with intelligent execution plan
+- Plan quality assessment and validation
+- Safe context updates with rollback protection
+- Detailed diagnostic information for troubleshooting
 """ 
+
+    def _validate_and_discover_project_path(self, initial_path: str) -> Optional[str]:
+        """Validate project path and discover actual project location if needed."""
+        if not self.docker_orchestrator:
+            logger.warning("No orchestrator available for path validation")
+            return initial_path
+        
+        # List of paths to check (in order of preference)
+        candidate_paths = [initial_path]
+        
+        # If initial path is /workspace, also check common subdirectories
+        if initial_path == "/workspace":
+            # Get list of subdirectories in workspace
+            result = self.docker_orchestrator.execute_command("find /workspace -maxdepth 1 -type d")
+            if result.get("success"):
+                subdirs = [line.strip() for line in result.get("output", "").split('\n') 
+                          if line.strip() and line.strip() != "/workspace"]
+                candidate_paths.extend(subdirs)
+        
+        # Check each candidate path for project indicators
+        for path in candidate_paths:
+            if self._is_valid_project_directory(path):
+                logger.info(f"✅ Found valid project at: {path}")
+                return path
+            else:
+                logger.debug(f"❌ No project found at: {path}")
+        
+        return None
+    
+    def _is_valid_project_directory(self, path: str) -> bool:
+        """Check if a directory contains valid project indicators."""
+        if not self.docker_orchestrator:
+            return False
+        
+        # Check if directory exists
+        result = self.docker_orchestrator.execute_command(f"test -d {path}")
+        if result.get("exit_code") != 0:
+            logger.debug(f"Directory does not exist: {path}")
+            return False
+        
+        # Check for common project files
+        project_indicators = [
+            "pom.xml",           # Maven
+            "build.gradle",      # Gradle (Groovy)
+            "build.gradle.kts",  # Gradle (Kotlin)
+            "package.json",      # Node.js
+            "requirements.txt",  # Python
+            "pyproject.toml",    # Python Poetry
+            "Cargo.toml",        # Rust
+            "go.mod",           # Go
+            "CMakeLists.txt",   # CMake
+            "Makefile",         # Make
+            "composer.json",    # PHP
+            "Gemfile",          # Ruby
+        ]
+        
+        for indicator in project_indicators:
+            result = self.docker_orchestrator.execute_command(f"test -f {path}/{indicator}")
+            if result.get("exit_code") == 0:
+                logger.debug(f"Found project indicator {indicator} in {path}")
+                return True
+        
+        # Check for source code directories as secondary indicators
+        source_dirs = ["src", "lib", "app", "source"]
+        for src_dir in source_dirs:
+            result = self.docker_orchestrator.execute_command(f"test -d {path}/{src_dir}")
+            if result.get("exit_code") == 0:
+                # Check if it contains actual source files
+                result = self.docker_orchestrator.execute_command(
+                    f"find {path}/{src_dir} -name '*.java' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.go' -o -name '*.rs' | head -1"
+                )
+                if result.get("success") and result.get("output", "").strip():
+                    logger.debug(f"Found source files in {path}/{src_dir}")
+                    return True
+        
+        return False
+    
+    def _is_analysis_valid(self, analysis: Dict[str, Any]) -> bool:
+        """Validate that the analysis produced meaningful results."""
+        # Check if we detected a valid project type
+        if analysis.get("project_type") == "unknown" and analysis.get("build_system") == "unknown":
+            logger.warning("Analysis failed to detect project type and build system")
+            return False
+        
+        # Check if we found any project files
+        existing_files = analysis.get("existing_files", [])
+        if not existing_files:
+            logger.warning("Analysis found no project files")
+            return False
+        
+        # Check if execution plan was generated
+        execution_plan = analysis.get("execution_plan", [])
+        if not execution_plan or len(execution_plan) < 2:
+            logger.warning("Analysis generated insufficient execution plan")
+            return False
+        
+        return True 

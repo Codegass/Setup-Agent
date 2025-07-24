@@ -454,7 +454,7 @@ class MavenTool(BaseTool):
         lines = output.split('\n')
         key_lines = []
         
-        # Look for critical error patterns
+        # Look for critical error patterns (expanded list)
         error_patterns = [
             r'\[ERROR\].*compilation.*failed',
             r'\[ERROR\].*Failed to execute goal',
@@ -463,38 +463,83 @@ class MavenTool(BaseTool):
             r'\[ERROR\].*Java compiler.*error',
             r'\[ERROR\].*Tests in error',
             r'\[ERROR\].*BUILD FAILURE',
+            r'\[ERROR\].*could not find or load main class',
+            r'\[ERROR\].*package .* does not exist',
+            r'\[ERROR\].*cannot find symbol',
+            r'\[ERROR\].*class .* is public, should be declared in a file named',
+            r'\[ERROR\].*dependency resolution failed',
+            r'\[ERROR\].*artifact .* not found',
             r'mvn: command not found',
             r'No pom\.xml found',
             r'COMPILATION ERROR',
             r'Test.*FAILED',
+            r'.*\.java:\d+: error:',  # Java compilation errors with line numbers
+            r'Exception in thread',
+            r'Caused by:',
+            r'BUILD FAILURE',
+            r'BUILD ERROR',
         ]
         
-        # Extract lines matching error patterns
-        for line in lines:
+        # Extract lines matching error patterns with some context
+        for i, line in enumerate(lines):
             for pattern in error_patterns:
                 if re.search(pattern, line, re.IGNORECASE):
                     key_lines.append(line.strip())
+                    # Add next 2 lines for context if they contain useful information
+                    for j in range(1, 3):
+                        if i + j < len(lines) and lines[i + j].strip():
+                            next_line = lines[i + j].strip()
+                            # Only add if it looks like error context (starts with space, contains specific keywords, etc.)
+                            if (next_line.startswith(' ') or 
+                                any(word in next_line.lower() for word in ['at ', 'symbol:', 'location:', 'required:', 'found:']) or
+                                re.search(r'^\s*\^', next_line)):  # Compilation error pointer
+                                key_lines.append(next_line)
                     break
         
-        # If no specific patterns found, get last 10 lines that contain ERROR or FAIL
+        # If no specific patterns found, get lines containing ERROR, FAIL, EXCEPTION with context
         if not key_lines:
-            for line in reversed(lines):
+            for i, line in enumerate(lines):
                 if any(word in line.upper() for word in ['ERROR', 'FAIL', 'EXCEPTION']):
-                    key_lines.insert(0, line.strip())
-                    if len(key_lines) >= 10:
+                    # Add previous line for context if available
+                    if i > 0 and lines[i-1].strip():
+                        key_lines.append(lines[i-1].strip())
+                    key_lines.append(line.strip())
+                    # Add next line for context if available
+                    if i + 1 < len(lines) and lines[i+1].strip():
+                        key_lines.append(lines[i+1].strip())
+                    if len(key_lines) >= 15:  # Limit to avoid too much output
                         break
         
-        # Fallback: get last 20 lines if still nothing
+        # Enhanced fallback: get last meaningful lines if still nothing
         if not key_lines:
-            key_lines = [line.strip() for line in lines[-20:] if line.strip()]
+            # Look for the last non-empty, non-trivial lines
+            meaningful_lines = []
+            for line in reversed(lines):
+                stripped = line.strip()
+                if (stripped and 
+                    not stripped.startswith('[INFO]') and
+                    not stripped.startswith('--------') and
+                    len(stripped) > 5):  # Skip very short lines
+                    meaningful_lines.insert(0, stripped)
+                    if len(meaningful_lines) >= 15:
+                        break
+            key_lines = meaningful_lines
         
-        result = "🚨 Key Maven Error Information:\n\n"
+        result = "🚨 Maven Build Error Details:\n\n"
         if key_lines:
-            result += "\n".join(key_lines[:15])  # Limit to 15 lines to avoid overflow
-            if len(key_lines) > 15:
-                result += f"\n... and {len(key_lines) - 15} more error lines (use raw_output=true for full details)"
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_lines = []
+            for line in key_lines:
+                if line not in seen:
+                    seen.add(line)
+                    unique_lines.append(line)
+            
+            result += "\n".join(unique_lines[:20])  # Increased limit for better context
+            if len(unique_lines) > 20:
+                result += f"\n... and {len(unique_lines) - 20} more lines (use raw_output=true for full details)"
         else:
-            result += "No specific error patterns detected. Use raw_output=true for full Maven output."
+            result += "No error information could be extracted. Use raw_output=true for full Maven output."
         
         return result
 

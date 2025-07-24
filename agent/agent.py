@@ -118,12 +118,18 @@ class SetupAgent:
             self.react_engine.set_repository_url(project_url)
 
             # Step 2: Initialize trunk context with intelligent planning approach
-            # 🆕 INTELLIGENT PLANNING: Start with analysis task that will generate dynamic execution plan
+            # 🆕 ENHANCED PLANNING: Split complex task into clear, executable steps
+            # This ensures each critical step is executed independently and cannot be skipped
+            # 🎯 CORE FOCUS: Build and Test success are the PRIMARY objectives of setup
             initial_tasks = [
-                "Clone repository and analyze project to generate intelligent execution plan"
+                "Clone repository and setup basic environment (use project_setup tool)",
+                "CRITICAL: Analyze project structure using project_analyzer tool and generate intelligent execution plan",
+                "🚨 CORE SETUP: Execute build tasks and ensure compilation success (use maven/gradle tools)",
+                "🚨 CORE SETUP: Execute test suite and ensure all tests pass (use maven/gradle tools)", 
+                "Generate final completion report with build and test results (use report tool)"
             ]
             
-            logger.info("Creating trunk context with intelligent planning approach...")
+            logger.info("Creating trunk context with enhanced multi-step planning approach...")
             self.agent_logger.info(f"Creating trunk context for project: {project_name}")
             
             try:
@@ -137,7 +143,7 @@ class SetupAgent:
                     raise Exception(f"Failed to verify trunk context: {context_info['error']}")
                 
                 self.agent_logger.info(f"✅ Trunk context created successfully: {trunk_context.context_id}")
-                logger.info(f"Trunk context created with intelligent planning task (dynamic tasks will be generated after project analysis)")
+                logger.info(f"Trunk context created with {len(initial_tasks)} explicit tasks (project_analyzer will be called in task_2)")
                 
             except Exception as e:
                 self.agent_logger.error(f"❌ Failed to create trunk context: {e}")

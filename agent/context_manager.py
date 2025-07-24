@@ -690,6 +690,21 @@ CONTEXT_EOF"""
         
         if trunk_context:
             next_task = trunk_context.get_next_pending_task()
+            
+            # Convert todo_list to dictionary format for display
+            todo_list_dict = []
+            for task in trunk_context.todo_list:
+                todo_list_dict.append({
+                    "id": task.id,
+                    "description": task.description,
+                    "status": task.status.value,
+                    "created_at": task.created_at.isoformat() if task.created_at else None,
+                    "started_at": task.started_at.isoformat() if task.started_at else None,
+                    "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+                    "notes": task.notes,
+                    "key_results": task.key_results
+                })
+            
             return {
                 "context_type": "trunk",
                 "context_id": trunk_context.context_id,
@@ -697,6 +712,7 @@ CONTEXT_EOF"""
                 "progress": trunk_context.get_progress_summary(),
                 "next_task": next_task.description if next_task else "No pending tasks",
                 "next_task_id": next_task.id if next_task else None,
+                "todo_list": todo_list_dict,  # 🆕 Added for human-friendly display
                 "last_updated": trunk_context.last_updated.isoformat()
             }
         

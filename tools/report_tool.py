@@ -209,33 +209,48 @@ class ReportTool(BaseTool):
     def _reconcile_status(self, claimed_status: str, evidence_status: str, accomplishments: dict) -> str:
         """
         Intelligently reconcile claimed status with evidence-based status.
-        This prevents overly harsh status downgrades while maintaining accuracy.
+        CRITICAL FIX: Base success on actual build/test results, not action success rate.
         """
-        # If evidence strongly contradicts claim, trust evidence
-        if evidence_status == "failed" and claimed_status == "success":
-            if accomplishments.get('successful_actions', 0) == 0:
-                logger.info("🔍 Evidence shows complete failure, overriding success claim")
-                return "failed"
+        # CRITICAL CHANGE: For project setup, evidence-based assessment is AUTHORITATIVE
+        # We should never override technical evidence with action success rates
         
-        # If agent claims success but evidence shows partial, check for late recoveries
-        if claimed_status == "success" and evidence_status == "partial":
-            # Check if there were late successful attempts that might not be captured
-            # by the simple metric-based assessment
-            total_actions = accomplishments.get('total_actions', 0)
-            successful_actions = accomplishments.get('successful_actions', 0)
+        # If evidence shows failed, always use that (something core didn't work)
+        if evidence_status == "failed":
+            logger.warning("🚨 Evidence shows project setup failed - technical issues detected")
+            return "failed"
+        
+        # CRITICAL: If evidence shows partial (e.g., build succeeded but tests failed)
+        # NEVER upgrade to success based on action count - technical results are definitive
+        if evidence_status == "partial":
+            # For Maven projects, partial means either:
+            # 1. Compilation succeeded but tests failed (need to identify failed tests)
+            # 2. Project was cloned but build failed
+            # 3. Some components worked but critical ones didn't
             
-            if total_actions > 0:
-                success_rate = successful_actions / total_actions
-                if success_rate >= 0.5:  # At least half successful
-                    logger.info("🤝 Agent's success claim supported by decent success rate, accepting it")
-                    return claimed_status
+            maven_compile_success = accomplishments.get('maven_compile_success', False)
+            maven_test_success = accomplishments.get('maven_test_success', False)
+            
+            if maven_compile_success and not maven_test_success:
+                logger.warning("🔨 Build succeeded but tests failed - this is PARTIAL success, not full success")
+                logger.warning("💡 Need to identify which tests failed and why")
+            elif not maven_compile_success:
+                logger.warning("🚨 Build compilation failed - cannot be considered success")
+                
+            # NEVER upgrade partial to success based on action success rate
+            logger.info(f"🎯 Evidence-based status '{evidence_status}' is definitive for technical assessments")
+            return "partial"
         
-        # If agent claims partial but evidence shows success, trust evidence
-        if claimed_status in ["partial", "failed"] and evidence_status == "success":
-            return evidence_status
+        # If evidence shows success, trust it (all builds and tests passed)
+        if evidence_status == "success":
+            logger.info("✅ Evidence confirms genuine success - all builds and tests passed")
+            return "success"
         
-        # For other cases, prefer agent's assessment unless evidence is drastically different
-        return claimed_status
+        # Fallback: if evidence is unclear, prefer the more conservative assessment
+        if claimed_status == "success" and evidence_status != "success":
+            logger.warning("🤔 Claimed success but evidence unclear - defaulting to partial")
+            return "partial"
+        
+        return evidence_status or claimed_status
 
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
         """Verify the claimed status against actual execution history."""
@@ -257,7 +272,8 @@ class ReportTool(BaseTool):
                 'tools_successful': [],
                 'tools_failed': [],
                 'total_actions': 0,
-                'successful_actions': 0
+                'successful_actions': 0,
+                'test_details': {} # Initialize for detailed test analysis
             }
             
             # Parse execution steps - handle both dict and object formats
@@ -313,10 +329,20 @@ class ReportTool(BaseTool):
                             import re
                             test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
                             if test_match:
-                                failures = int(test_match.group(2))
-                                errors = int(test_match.group(3))
-                                if failures == 0 and errors == 0:
-                                    actual_accomplishments['maven_test_success'] = True
+                                total_tests = int(test_match.group(1))
+                                failed_tests = int(test_match.group(2))
+                                test_errors = int(test_match.group(3))
+                                actual_accomplishments['test_details'] = {
+                                    'total_tests': total_tests,
+                                    'failed_tests': [],
+                                    'test_errors': []
+                                }
+                                if failed_tests > 0:
+                                    actual_accomplishments['test_details']['failed_tests'] = [f"Test {i+1}" for i in range(failed_tests)]
+                                if test_errors > 0:
+                                    actual_accomplishments['test_details']['test_errors'] = [f"Error {i+1}" for i in range(test_errors)]
+                                # CRITICAL FIX: Only mark as success if NO failures and NO errors
+                                actual_accomplishments['maven_test_success'] = (failed_tests == 0 and test_errors == 0)
                 else:
                     actual_accomplishments['tools_failed'].append(tool_name)
             
@@ -341,26 +367,75 @@ class ReportTool(BaseTool):
             return claimed_status, {}
 
     def _determine_actual_status(self, accomplishments: dict) -> str:
-        """Determine the actual status based on verifiable accomplishments."""
-        # For Maven projects, success means compilation and tests both passed
-        if accomplishments.get('maven_test_success'):
-            return "success"  # Test success implies compilation success too
-        elif accomplishments.get('maven_compile_success'):
-            return "partial"  # Compilation worked but tests didn't run or failed
-        elif accomplishments.get('repository_cloned') and accomplishments.get('project_detected'):
-            return "partial"  # Basic setup worked but build failed
-        elif accomplishments.get('repository_cloned'):
-            return "partial"  # At least repository was cloned
+        """
+        Determine the actual status based on verifiable accomplishments.
+        ENHANCED: Detailed analysis of build and test results with failure attribution.
+        """
+        # CRITICAL: Maven project success requires BOTH compilation AND all tests passing
+        maven_compile_success = accomplishments.get('maven_compile_success', False)
+        maven_test_success = accomplishments.get('maven_test_success', False)
+        
+        # Analyze test results in detail
+        test_details = accomplishments.get('test_details', {})
+        failed_tests = test_details.get('failed_tests', [])
+        test_errors = test_details.get('test_errors', [])
+        total_tests = test_details.get('total_tests', 0)
+        
+        if maven_test_success and maven_compile_success:
+            logger.info("✅ Complete success: Compilation and all tests passed")
+            return "success"
+        elif maven_compile_success and not maven_test_success:
+            # Compilation succeeded but tests failed - this is PARTIAL success
+            if total_tests > 0:
+                failed_count = len(failed_tests) + len(test_errors)
+                logger.warning(f"🔨 Partial success: Build OK, but {failed_count}/{total_tests} tests failed")
+                
+                # Log specific test failures for debugging
+                if failed_tests:
+                    logger.warning(f"❌ Failed tests: {', '.join(failed_tests[:5])}")  # Show first 5
+                if test_errors:
+                    logger.warning(f"💥 Test errors: {', '.join(test_errors[:3])}")  # Show first 3
+            else:
+                logger.warning("🔨 Partial success: Build OK, but test execution had issues")
+            return "partial"
+        elif not maven_compile_success:
+            logger.warning("🚨 Build compilation failed - cannot proceed to testing")
+            
+            # Check what we DID accomplish
+            if accomplishments.get('project_detected'):
+                logger.info("📋 Project was detected and analyzed correctly")
+                return "partial"  # At least project setup worked
+            elif accomplishments.get('repository_cloned'):
+                logger.info("📥 Repository was cloned successfully")
+                return "partial"  # Basic setup worked
+            else:
+                logger.error("💥 Complete failure - even basic setup failed")
+                return "failed"
+        
+        # For non-Maven projects or unclear situations
+        repository_cloned = accomplishments.get('repository_cloned', False)
+        project_detected = accomplishments.get('project_detected', False)
+        environment_setup = accomplishments.get('environment_setup', False)
+        
+        if repository_cloned and project_detected and environment_setup:
+            logger.info("📋 Basic project setup completed successfully")
+            return "partial"  # Good foundation but no build/test validation
+        elif repository_cloned:
+            logger.warning("📥 Repository cloned but project analysis incomplete")
+            return "partial"
         else:
-            # Look at success rate
+            # Last resort: check action success rate (only as fallback indicator)
             total = accomplishments.get('total_actions', 0)
             successful = accomplishments.get('successful_actions', 0)
             if total > 0:
                 success_rate = successful / total
-                if success_rate >= 0.7:
-                    return "partial"
+                logger.warning(f"📊 Fallback assessment based on {success_rate:.1%} action success rate")
+                if success_rate >= 0.8:
+                    return "partial"  # High success rate suggests partial completion
                 else:
                     return "failed"
+            
+            logger.error("💥 No clear indicators of success")
             return "failed"
 
     def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None) -> str:

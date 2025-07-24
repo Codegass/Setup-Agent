@@ -228,10 +228,14 @@ class ContextTool(BaseTool):
                 output += f"• Previous Task Results: {result['previous_summary']}\n"
             
             output += f"\n📝 Branch history file created: {result['branch_file']}\n\n"
-            output += f"💡 Next steps:\n"
+            
+            # 🆕 ENHANCED: Show updated TODO list status after task start
+            output += self._get_compact_todo_status_update(f"Started task {task_id}")
+            
+            output += f"\n💡 Next steps:\n"
             output += f"• Use add_context() to record thoughts and tool results\n"
             output += f"• Use get_full_context() to review complete history\n"
-            output += f"• Use complete_task() to summarize and switch to next task\n"
+            output += f"• Use complete_with_results() to summarize and switch to next task\n"
             
             return ToolResult(
                 success=True,
@@ -443,7 +447,7 @@ class ContextTool(BaseTool):
             )
 
     def _complete_task(self, summary: Optional[str]) -> ToolResult:
-        """Complete current task with strict validation to prevent task ID confusion"""
+        """Complete current task with strict validation AND state recovery to prevent task ID confusion"""
         if not summary:
             raise ToolError(
                 message="summary is required for completing a task",
@@ -454,14 +458,28 @@ class ContextTool(BaseTool):
                 error_code="MISSING_SUMMARY"
             )
         
+        # ENHANCED: State recovery mechanism for robustness
         if not self.context_manager.current_task_id:
-            raise ToolError(
-                message="No active task to complete",
-                suggestions=[
-                    "Use start_task action to begin working on a task"
-                ],
-                error_code="NO_ACTIVE_TASK"
-            )
+            # Try to recover state before failing
+            recovery_result = self._attempt_state_recovery()
+            if recovery_result["recovered"]:
+                logger.warning(f"🔧 Recovered state: {recovery_result['message']}")
+                # Continue with the recovered task ID
+            else:
+                # Enhanced error with diagnostic information
+                diagnostic_info = self._diagnose_context_state()
+                
+                raise ToolError(
+                    message="No active task to complete",
+                    suggestions=[
+                        "Use start_task action to begin working on a task",
+                        f"Current context state: {diagnostic_info['state']}",
+                        f"Available tasks: {', '.join(diagnostic_info['available_tasks'])}",
+                        "Try get_info action to see current context status",
+                        "If context is corrupted, restart with start_task"
+                    ],
+                    error_code="NO_ACTIVE_TASK"
+                )
             
         # CRITICAL: Validate that we're completing the correct task
         # This prevents the agent from completing wrong tasks due to cognitive confusion
@@ -473,7 +491,9 @@ class ContextTool(BaseTool):
             raise ToolError(
                 message="Cannot complete task: trunk context not found",
                 suggestions=[
-                    "Ensure trunk context is properly initialized"
+                    "Ensure trunk context is properly initialized",
+                    "Check if context files exist in .setup_agent/contexts/",
+                    "Try restarting the agent or recreating context"
                 ],
                 error_code="NO_TRUNK_CONTEXT"
             )
@@ -486,10 +506,15 @@ class ContextTool(BaseTool):
                 break
         
         if not current_task:
+            # Enhanced error with recovery suggestions
+            all_task_ids = [task.id for task in trunk_context.todo_list]
             raise ToolError(
                 message=f"Current task {current_task_id} not found in project plan",
                 suggestions=[
-                    "Use get_info to check current context state"
+                    "Use get_info to check current context state",
+                    f"Available tasks in plan: {', '.join(all_task_ids)}",
+                    f"Try start_task with a valid task ID from: {all_task_ids}",
+                    "Context may be corrupted - verify task plan integrity"
                 ],
                 error_code="TASK_NOT_FOUND"
             )
@@ -540,6 +565,7 @@ class ContextTool(BaseTool):
         """
         Complete current task with key results recording - ATOMIC operation to prevent state/action separation.
         This is the RECOMMENDED way to complete tasks as it enforces proper state management.
+        ENHANCED: Add validation to ensure critical tasks are properly completed.
         """
         if not summary:
             raise ToolError(
@@ -562,14 +588,28 @@ class ContextTool(BaseTool):
                 error_code="MISSING_KEY_RESULTS"
             )
         
+        # ENHANCED: State recovery mechanism for robustness (same as _complete_task)
         if not self.context_manager.current_task_id:
-            raise ToolError(
-                message="No active task to complete",
-                suggestions=[
-                    "Use start_task action to begin working on a task"
-                ],
-                error_code="NO_ACTIVE_TASK"
-            )
+            # Try to recover state before failing
+            recovery_result = self._attempt_state_recovery()
+            if recovery_result["recovered"]:
+                logger.warning(f"🔧 Recovered state: {recovery_result['message']}")
+                # Continue with the recovered task ID
+            else:
+                # Enhanced error with diagnostic information
+                diagnostic_info = self._diagnose_context_state()
+                
+                raise ToolError(
+                    message="No active task to complete",
+                    suggestions=[
+                        "Use start_task action to begin working on a task",
+                        f"Current context state: {diagnostic_info['state']}",
+                        f"Available tasks: {', '.join(diagnostic_info['available_tasks'])}",
+                        "Try get_info action to see current context status",
+                        "If context is corrupted, restart with start_task"
+                    ],
+                    error_code="NO_ACTIVE_TASK"
+                )
             
         # CRITICAL: Validate that we're completing the correct task (same validation as regular complete_task)
         current_task_id = self.context_manager.current_task_id
@@ -608,6 +648,15 @@ class ContextTool(BaseTool):
                     "Use get_info to check task status"
                 ],
                 error_code="TASK_NOT_IN_PROGRESS"
+            )
+        
+        # ENHANCED: Task-specific completion validation
+        validation_result = self._validate_task_completion(current_task, summary, key_results)
+        if not validation_result["valid"]:
+            raise ToolError(
+                message=f"Task completion validation failed: {validation_result['reason']}",
+                suggestions=validation_result["suggestions"],
+                error_code="TASK_COMPLETION_VALIDATION_FAILED"
             )
         
         try:
@@ -649,9 +698,12 @@ class ContextTool(BaseTool):
             output += f"🔑 Key results recorded:\n{key_results}\n\n"
             output += f"📊 Project progress:\n{result['progress']}\n\n"
             
+            # 🆕 ENHANCED: Show updated TODO list status after task completion
+            output += self._get_compact_todo_status_update(f"Completed task {current_task_id}")
+            
             if result.get('next_task'):
                 next_task = result['next_task']
-                output += f"➡️ Next task available:\n"
+                output += f"\n➡️ Next task available:\n"
                 output += f"• ID: {next_task['id']}\n"
                 output += f"• Description: {next_task['description']}\n"
                 output += f"• Status: {next_task['status']}\n\n"
@@ -659,7 +711,7 @@ class ContextTool(BaseTool):
                 output += f"manage_context(action='start_task', task_id='{next_task['id']}')\n\n"
                 output += f"💡 IMPORTANT: The key results above will be available to guide your next task!\n"
             elif result.get('all_tasks_completed'):
-                output += f"🎉 All tasks completed! Project setup finished.\n"
+                output += f"\n🎉 All tasks completed! Project setup finished.\n"
                 output += f"📋 Generate final report with:\n"
                 output += f"report(summary='All tasks completed successfully', status='success')\n"
             
@@ -684,7 +736,7 @@ class ContextTool(BaseTool):
             )
 
     def _format_context_info(self, info: dict) -> str:
-        """Format context information"""
+        """Format context information with enhanced human-readable todo list display."""
         output = f"📋 Current Context Information\n\n"
         
         if info["context_type"] == "trunk":
@@ -692,7 +744,10 @@ class ContextTool(BaseTool):
             output += f"• Context ID: {info['context_id']}\n"
             output += f"• Project Goal: {info['goal']}\n"
             output += f"• Project Progress: {info['progress']}\n"
-            output += f"• Next Task: {info['next_task']}\n"
+            
+            # 🆕 ENHANCED: Human-friendly TODO list display with visual borders
+            if 'todo_list' in info and info['todo_list']:
+                output += self._format_human_friendly_todo_list(info['todo_list'])
             
             if info.get('next_task_id'):
                 output += f"\n💡 Start next task:\n"
@@ -712,21 +767,135 @@ class ContextTool(BaseTool):
             output += f"• add_context() - Add thoughts or results\n"
             output += f"• get_full_context() - View complete history\n"
             output += f"• compact_context() - Compress history\n"
-            output += f"• complete_task() - Complete task\n"
+            output += f"• complete_with_results() - Complete task with key results\n"
         
         output += f"\n⏰ Last updated: {info['last_updated']}\n"
         return output
 
+    def _format_human_friendly_todo_list(self, todo_list: List[Dict[str, Any]]) -> str:
+        """
+        Format TODO list in human-readable format with borders and checkboxes.
+        Makes it easy to track project setup progress at a glance.
+        """
+        if not todo_list:
+            return "\n📋 No tasks in TODO list\n"
+        
+        # Calculate box width based on longest task description
+        max_width = max(len(task.get('description', '')) for task in todo_list)
+        box_width = min(max(max_width + 10, 60), 100)  # Between 60-100 chars
+        
+        output = f"\n{'=' * box_width}\n"
+        output += f"📋 PROJECT SETUP TODO LIST ({len(todo_list)} tasks)\n"
+        output += f"{'=' * box_width}\n"
+        
+        for i, task in enumerate(todo_list, 1):
+            status = task.get('status', 'pending')
+            description = task.get('description', 'No description')
+            task_id = task.get('id', f'task_{i}')
+            
+            # Status checkbox
+            if status == 'completed':
+                checkbox = '✅ [x]'
+                status_icon = '✅'
+            elif status == 'in_progress':
+                checkbox = '🔄 [~]'
+                status_icon = '🔄'
+            elif status == 'failed':
+                checkbox = '❌ [!]'
+                status_icon = '❌'
+            else:  # pending
+                checkbox = '⭕ [ ]'
+                status_icon = '⭕'
+            
+            # Highlight CORE SETUP tasks
+            if any(keyword in description for keyword in ['🚨 CORE SETUP', 'build', 'test']):
+                priority_marker = ' 🚨'
+                if status == 'completed':
+                    priority_marker = ' 🎯✅'
+            else:
+                priority_marker = ''
+            
+            # Format task line
+            task_line = f"{checkbox} {task_id}: {description}{priority_marker}"
+            
+            # Truncate if too long, but preserve important parts
+            if len(task_line) > box_width - 4:
+                truncated_desc = description[:box_width - 20] + "..."
+                task_line = f"{checkbox} {task_id}: {truncated_desc}{priority_marker}"
+            
+            output += f"│ {task_line:<{box_width-4}} │\n"
+            
+            # Add additional info for in-progress/completed tasks
+            if status in ['in_progress', 'completed']:
+                started_at = task.get('started_at', '')
+                if started_at:
+                    time_info = f"   ⏰ Started: {started_at[:19] if len(started_at) > 19 else started_at}"
+                    output += f"│ {time_info:<{box_width-4}} │\n"
+                
+                if status == 'completed':
+                    completed_at = task.get('completed_at', '')
+                    key_results = task.get('key_results', '')
+                    if completed_at:
+                        time_info = f"   ✅ Completed: {completed_at[:19] if len(completed_at) > 19 else completed_at}"
+                        output += f"│ {time_info:<{box_width-4}} │\n"
+                    if key_results:
+                        # Show first 60 chars of key results
+                        results_preview = key_results[:60] + "..." if len(key_results) > 60 else key_results
+                        results_info = f"   🔑 Results: {results_preview}"
+                        output += f"│ {results_info:<{box_width-4}} │\n"
+        
+        output += f"{'=' * box_width}\n"
+        
+        # Summary statistics
+        completed = sum(1 for task in todo_list if task.get('status') == 'completed')
+        in_progress = sum(1 for task in todo_list if task.get('status') == 'in_progress')
+        failed = sum(1 for task in todo_list if task.get('status') == 'failed')
+        pending = len(todo_list) - completed - in_progress - failed
+        
+        # Highlight CORE SETUP progress
+        core_tasks = [task for task in todo_list if '🚨 CORE SETUP' in task.get('description', '')]
+        core_completed = sum(1 for task in core_tasks if task.get('status') == 'completed')
+        
+        output += f"📊 Progress: {completed}/{len(todo_list)} completed"
+        if in_progress > 0:
+            output += f", {in_progress} in progress"
+        if failed > 0:
+            output += f", {failed} failed"
+        if pending > 0:
+            output += f", {pending} pending"
+        output += f"\n"
+        
+        if core_tasks:
+            output += f"🚨 CORE SETUP: {core_completed}/{len(core_tasks)} build/test tasks completed\n"
+        
+        output += f"{'=' * box_width}\n"
+        
+        return output
+
     def get_usage_example(self) -> str:
-        """Get usage examples"""
+        """Get usage examples with enhanced human-friendly TODO list features"""
         return """
-Context Management Tool Usage Examples:
+Context Management Tool Usage Examples (Enhanced with Human-Friendly TODO List):
 
-1. Check current status:
+1. Check current status with visual TODO list:
    manage_context(action="get_info")
+   
+   This will show a beautifully formatted TODO list like:
+   ===============================================================
+   📋 PROJECT SETUP TODO LIST (5 tasks)
+   ===============================================================
+   │ ✅ [x] task_1: Clone repository and setup basic environment      │
+   │ 🔄 [~] task_2: CRITICAL: Analyze project structure... 🚨         │
+   │ ⭕ [ ] task_3: 🚨 CORE SETUP: Execute build tasks... 🚨          │
+   │ ⭕ [ ] task_4: 🚨 CORE SETUP: Execute test suite... 🚨           │
+   │ ⭕ [ ] task_5: Generate final completion report                   │
+   ===============================================================
+   📊 Progress: 1/5 completed, 1 in progress, 3 pending
+   🚨 CORE SETUP: 0/2 build/test tasks completed
+   ===============================================================
 
-2. Start new task:
-   manage_context(action="start_task", task_id="task_1")
+2. Start new task (with TODO status update):
+   manage_context(action="start_task", task_id="task_2")
 
 3. Add thought process:
    manage_context(action="add_context", entry={"thought": "Analyzing project structure", "observation": "Found config files"})
@@ -734,26 +903,34 @@ Context Management Tool Usage Examples:
 4. View complete history:
    manage_context(action="get_full_context")
 
-5. Compress context:
-   manage_context(action="compact_context", new_context=[{"summary": "Completed project analysis"}])
+5. Complete task with validation (RECOMMENDED - atomic):
+   manage_context(action="complete_with_results", 
+                  summary="Successfully built all modules with Maven", 
+                  key_results="BUILD SUCCESS: All 15 modules compiled without errors. Tests: 247 passed, 0 failed.")
 
-6. Complete task (RECOMMENDED - atomic):
-   manage_context(action="complete_with_results", summary="Successfully configured development environment", key_results="Maven project detected at /workspace/commons-cli, pom.xml confirmed, Java 11 environment ready")
-
-6b. Complete task (basic):
-   manage_context(action="complete_task", summary="Successfully configured development environment")
+   🚨 CRITICAL for CORE SETUP tasks: Summary and key_results MUST include explicit success confirmation!
 
 CORRECT WORKFLOW:
 Trunk → start_task(task_id) → Branch → [work on task] → complete_with_results(summary, key_results) → Trunk (automatic)
 
+🚨 CORE SETUP TASK GUIDELINES:
+• For build tasks: Include "BUILD SUCCESS" or "compilation successful" in summary
+• For test tasks: Include test counts and "Tests run: X, Failures: 0" format
+• CORE SETUP tasks have STRICT validation - must provide clear evidence of success
+• Failure indicators will prevent task completion until issues are resolved
+
+ENHANCED FEATURES:
+• Human-readable TODO list with [x], [~], [ ] checkboxes
+• Visual borders and progress tracking
+• CORE SETUP task highlighting with 🚨 markers
+• Compact status updates after each task start/completion
+• Strict validation for critical build and test tasks
+
 IMPORTANT:
 • USE complete_with_results instead of complete_task - it's ATOMIC and prevents state/action separation!
-• key_results should be specific and useful for next tasks (file locations, project types, important discoveries)
-• NO 'branch_start', 'branch_end', 'create_branch', or 'switch_to_trunk' actions exist!
+• key_results should be specific and useful for next tasks (file locations, build results, test outcomes)
+• CORE SETUP tasks are CRITICAL - provide explicit success confirmation
 • Context switching is AUTOMATIC when you use start_task and complete_with_results
-• Execute tasks in strict order from TODO list, cannot skip
-• Record important thought processes and results using add_context
-• Use compression when context becomes too long
 • The key_results from previous tasks will be available to guide your next task
 • ALWAYS use complete_with_results after finishing technical work to avoid "ghost" states
 """
@@ -797,3 +974,398 @@ IMPORTANT:
             },
             "required": ["action"],
         }
+
+    def _attempt_state_recovery(self) -> Dict[str, Any]:
+        """
+        Attempt to recover from inconsistent context state.
+        This is critical for robustness when context manager state is lost.
+        """
+        try:
+            logger.info("🔧 Attempting state recovery...")
+            
+            # Load trunk context to check for in-progress tasks
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context:
+                return {"recovered": False, "message": "No trunk context found"}
+            
+            # Look for tasks marked as in_progress
+            in_progress_tasks = [task for task in trunk_context.todo_list if task.status.value == "in_progress"]
+            
+            if len(in_progress_tasks) == 1:
+                # Found exactly one in-progress task - this is likely our current task
+                recovered_task = in_progress_tasks[0]
+                self.context_manager.current_task_id = recovered_task.id
+                
+                logger.info(f"✅ Recovered active task: {recovered_task.id}")
+                return {
+                    "recovered": True,
+                    "message": f"Recovered active task: {recovered_task.id} ({recovered_task.description})",
+                    "task_id": recovered_task.id
+                }
+            elif len(in_progress_tasks) > 1:
+                # Multiple in-progress tasks - this is inconsistent state
+                task_ids = [task.id for task in in_progress_tasks]
+                logger.warning(f"⚠️ Multiple in-progress tasks found: {task_ids}")
+                
+                # Use the most recent one (assuming task IDs are sequential)
+                recovered_task = max(in_progress_tasks, key=lambda t: t.id)
+                self.context_manager.current_task_id = recovered_task.id
+                
+                return {
+                    "recovered": True,
+                    "message": f"Recovered from inconsistent state: chose most recent task {recovered_task.id}",
+                    "task_id": recovered_task.id,
+                    "warning": f"Multiple in-progress tasks detected: {task_ids}"
+                }
+            else:
+                # No in-progress tasks - check if we can start the next pending task
+                next_task = trunk_context.get_next_pending_task()
+                if next_task:
+                    return {
+                        "recovered": False,
+                        "message": f"No active tasks, but {next_task.id} is ready to start",
+                        "suggestion": f"Use start_task with task_id='{next_task.id}'"
+                    }
+                else:
+                    return {
+                        "recovered": False,
+                        "message": "No in-progress tasks and no pending tasks available"
+                    }
+                    
+        except Exception as e:
+            logger.error(f"State recovery failed: {e}")
+            return {"recovered": False, "message": f"Recovery failed: {str(e)}"}
+
+    def _diagnose_context_state(self) -> Dict[str, Any]:
+        """
+        Diagnose current context state to provide useful diagnostic information.
+        Helps agents and users understand what went wrong and how to fix it.
+        """
+        try:
+            diagnosis = {
+                "state": "unknown",
+                "available_tasks": [],
+                "issues": [],
+                "recommendations": []
+            }
+            
+            # Check trunk context
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context:
+                diagnosis["state"] = "no_trunk_context"
+                diagnosis["issues"].append("Trunk context file not found or corrupted")
+                diagnosis["recommendations"].append("Recreate context with proper initialization")
+                return diagnosis
+            
+            # Analyze task states
+            total_tasks = len(trunk_context.todo_list)
+            completed_tasks = len([t for t in trunk_context.todo_list if t.status.value == "completed"])
+            in_progress_tasks = [t for t in trunk_context.todo_list if t.status.value == "in_progress"]
+            pending_tasks = [t for t in trunk_context.todo_list if t.status.value == "pending"]
+            
+            diagnosis["available_tasks"] = [t.id for t in trunk_context.todo_list]
+            
+            if len(in_progress_tasks) > 1:
+                diagnosis["state"] = "multiple_active"
+                diagnosis["issues"].append(f"Multiple tasks marked as in-progress: {[t.id for t in in_progress_tasks]}")
+                diagnosis["recommendations"].append("Complete or reset one of the in-progress tasks")
+            elif len(in_progress_tasks) == 1:
+                diagnosis["state"] = "task_active_but_not_tracked"
+                active_task = in_progress_tasks[0]
+                diagnosis["issues"].append(f"Task {active_task.id} is marked in-progress but not tracked in memory")
+                diagnosis["recommendations"].append(f"Continue with task {active_task.id} or use get_info to check status")
+            elif pending_tasks:
+                diagnosis["state"] = "ready_for_next_task"
+                next_task = pending_tasks[0]
+                diagnosis["recommendations"].append(f"Start next task: {next_task.id}")
+            elif completed_tasks == total_tasks:
+                diagnosis["state"] = "all_tasks_completed"
+                diagnosis["recommendations"].append("All tasks completed - generate final report")
+            else:
+                diagnosis["state"] = "unclear"
+                diagnosis["issues"].append("Context state is unclear or corrupted")
+                
+            # Check for context file inconsistencies
+            if self.context_manager.current_task_id:
+                current_task_file = self.context_manager.contexts_dir / f"{self.context_manager.current_task_id}.json"
+                if not current_task_file.exists():
+                    diagnosis["issues"].append(f"Task file missing for current task: {self.context_manager.current_task_id}")
+                    
+            return diagnosis
+            
+        except Exception as e:
+            logger.error(f"Context diagnosis failed: {e}")
+            return {
+                "state": "diagnosis_failed",
+                "available_tasks": [],
+                "issues": [f"Diagnosis failed: {str(e)}"],
+                "recommendations": ["Try restarting context management or recreating context"]
+            }
+
+    def _validate_task_completion(self, task: Any, summary: str, key_results: str) -> Dict[str, Any]:
+        """
+        Validate that a task has been properly completed based on its description and expected outcomes.
+        CRITICAL for ensuring project_analyzer and other key tasks are not prematurely completed.
+        """
+        try:
+            task_id = task.id
+            task_description = task.description.lower()
+            summary_lower = summary.lower()
+            key_results_lower = key_results.lower()
+            
+            logger.info(f"🔍 Validating completion of {task_id}: {task.description}")
+            
+            validation_result = {
+                "valid": True,
+                "reason": "",
+                "suggestions": []
+            }
+            
+            # Task-specific validation rules
+            if "project_analyzer" in task_description or "analyze project" in task_description:
+                # CRITICAL: Ensure project_analyzer tool was actually used
+                if not self._check_project_analyzer_execution():
+                    validation_result.update({
+                        "valid": False,
+                        "reason": "Task requires project_analyzer tool execution but no evidence found",
+                        "suggestions": [
+                            "Use project_analyzer tool with action='analyze' before completing this task",
+                            "The project_analyzer tool must be called to generate intelligent execution plan",
+                            "Do not complete this task until project_analyzer has created additional tasks"
+                        ]
+                    })
+                    return validation_result
+                
+                # Check if additional tasks were generated (evidence of proper analysis)
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context and len(trunk_context.todo_list) <= 4:  # Original 4 tasks
+                    validation_result.update({
+                        "valid": False,
+                        "reason": "Project analysis should generate additional tasks but todo list unchanged",
+                        "suggestions": [
+                            "Ensure project_analyzer tool generated additional tasks",
+                            "The analysis should expand the todo list with specific build/test tasks",
+                            "Check if project_analyzer completed successfully with update_context=True"
+                        ]
+                    })
+                    return validation_result
+            
+            elif "clone repository" in task_description:
+                # Verify repository was actually cloned
+                required_indicators = ["cloned", "repository", "workspace"]
+                missing_indicators = [ind for ind in required_indicators 
+                                   if ind not in summary_lower and ind not in key_results_lower]
+                
+                if missing_indicators:
+                    validation_result.update({
+                        "valid": False,
+                        "reason": f"Repository cloning task missing evidence: {missing_indicators}",
+                        "suggestions": [
+                            "Ensure repository was successfully cloned to workspace",
+                            "Include repository path and project type in key results",
+                            "Use project_setup tool with action='clone' before completing"
+                        ]
+                    })
+                    return validation_result
+            
+            elif "build and test" in task_description:
+                # Verify build/test tasks were executed
+                build_indicators = ["maven", "gradle", "build", "compile", "test"]
+                has_build_evidence = any(ind in summary_lower or ind in key_results_lower 
+                                       for ind in build_indicators)
+                
+                if not has_build_evidence:
+                    validation_result.update({
+                        "valid": False,
+                        "reason": "Build and test task missing evidence of build tool execution",
+                        "suggestions": [
+                            "Execute Maven or Gradle commands before completing this task",
+                            "Include build results and test outcomes in summary",
+                            "Use maven or gradle tools to perform actual build and test"
+                        ]
+                    })
+                    return validation_result
+            
+            # 🚨 ENHANCED: Specific validation for CORE SETUP tasks (build/test)
+            elif "🚨 CORE SETUP" in task_description:
+                if "build tasks" in task_description or "compilation success" in task_description:
+                    # STRICT validation for build tasks
+                    success_indicators = ["success", "successful", "build success", "compilation successful"]
+                    failure_indicators = ["failed", "error", "failure", "unsuccessful", "compilation failed"]
+                    
+                    has_success = any(ind in summary_lower or ind in key_results_lower for ind in success_indicators)
+                    has_failure = any(ind in summary_lower or ind in key_results_lower for ind in failure_indicators)
+                    
+                    if has_failure:
+                        validation_result.update({
+                            "valid": False,
+                            "reason": "🚨 CORE SETUP build task indicates failure - cannot mark as completed",
+                            "suggestions": [
+                                "Fix build errors before completing this CORE SETUP task",
+                                "Ensure compilation succeeds completely for all modules",
+                                "Check build logs and resolve all compilation issues",
+                                "This is a CRITICAL task for project setup success"
+                            ]
+                        })
+                        return validation_result
+                        
+                    if not has_success:
+                        validation_result.update({
+                            "valid": False,
+                            "reason": "🚨 CORE SETUP build task missing explicit success confirmation",
+                            "suggestions": [
+                                "Include explicit BUILD SUCCESS confirmation in summary",
+                                "Provide clear evidence of successful compilation (e.g., 'BUILD SUCCESS')",
+                                "Confirm all modules compiled without errors",
+                                "This is a CRITICAL task - success must be clearly documented"
+                            ]
+                        })
+                        return validation_result
+                        
+                elif "test suite" in task_description or "all tests pass" in task_description:
+                    # STRICT validation for test tasks  
+                    test_indicators = ["test", "passed", "success", "all tests", "tests run"]
+                    failure_indicators = ["failed", "error", "failure", "unsuccessful", "test failed"]
+                    
+                    has_test_evidence = any(ind in summary_lower or ind in key_results_lower for ind in test_indicators)
+                    has_failure = any(ind in summary_lower or ind in key_results_lower for ind in failure_indicators)
+                    
+                    if has_failure:
+                        validation_result.update({
+                            "valid": False,
+                            "reason": "🚨 CORE SETUP test task indicates test failures - cannot mark as completed",
+                            "suggestions": [
+                                "Fix failing tests before completing this CORE SETUP task",
+                                "Ensure all tests pass completely",
+                                "Check test logs and resolve all test failures",
+                                "This is a CRITICAL task for project setup success"
+                            ]
+                        })
+                        return validation_result
+                        
+                    if not has_test_evidence:
+                        validation_result.update({
+                            "valid": False,
+                            "reason": "🚨 CORE SETUP test task missing evidence of test execution and success",
+                            "suggestions": [
+                                "Execute complete test suite and include results in summary",
+                                "Provide clear evidence that all tests passed",
+                                "Include test count and success confirmation (e.g., 'Tests run: X, Failures: 0')",
+                                "This is a CRITICAL task - test success must be clearly documented"
+                            ]
+                        })
+                        return validation_result
+            
+            elif "report" in task_description:
+                # Verify report generation
+                if "report" not in summary_lower and "completion" not in summary_lower:
+                    validation_result.update({
+                        "valid": False,
+                        "reason": "Report generation task missing evidence of report creation",
+                        "suggestions": [
+                            "Use report tool to generate completion report",
+                            "Include report status in task summary",
+                            "Ensure final project status is documented"
+                        ]
+                    })
+                    return validation_result
+            
+            logger.info(f"✅ Task {task_id} validation passed")
+            return validation_result
+            
+        except Exception as e:
+            logger.error(f"Task validation failed: {e}")
+            return {
+                "valid": False,
+                "reason": f"Validation error: {str(e)}",
+                "suggestions": ["Check task completion manually", "Verify all required steps were completed"]
+            }
+
+    def _check_project_analyzer_execution(self) -> bool:
+        """
+        Check if project_analyzer tool was actually executed by examining branch history.
+        """
+        try:
+            if not self.context_manager.current_task_id:
+                return False
+            
+            # Load branch history for current task
+            branch_history = self.context_manager.load_branch_history(self.context_manager.current_task_id)
+            if not branch_history:
+                return False
+            
+            # Check if any history entry indicates project_analyzer usage
+            for entry in branch_history.history:
+                if isinstance(entry, dict):
+                    # Check for action entries that mention project_analyzer
+                    if (entry.get("type") == "action" and 
+                        entry.get("tool_name") == "project_analyzer"):
+                        logger.info("✅ Found evidence of project_analyzer execution in branch history")
+                        return True
+                    
+                    # Check for content that mentions project_analyzer
+                    content = str(entry.get("content", "")).lower()
+                    if "project_analyzer" in content:
+                        logger.info("✅ Found reference to project_analyzer in branch history")
+                        return True
+            
+            logger.warning("❌ No evidence of project_analyzer execution found in branch history")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to check project_analyzer execution: {e}")
+            return False
+
+    def _get_compact_todo_status_update(self, action_message: str) -> str:
+        """
+        Helper to get a compact update of the current TODO list status.
+        This is useful for showing the state after a task start/completion.
+        """
+        try:
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context:
+                return "\n📋 Unable to load TODO list status\n"
+
+            # Count task statuses
+            completed = len([t for t in trunk_context.todo_list if t.status.value == 'completed'])
+            in_progress = len([t for t in trunk_context.todo_list if t.status.value == 'in_progress'])
+            pending = len([t for t in trunk_context.todo_list if t.status.value == 'pending'])
+            failed = len([t for t in trunk_context.todo_list if t.status.value == 'failed'])
+            total = len(trunk_context.todo_list)
+
+            # Count CORE SETUP tasks
+            core_tasks = [t for t in trunk_context.todo_list if '🚨 CORE SETUP' in t.description]
+            core_completed = len([t for t in core_tasks if t.status.value == 'completed'])
+
+            output = f"\n╭─── 📋 TODO LIST UPDATE: {action_message} ───╮\n"
+            output += f"│ Progress: {completed}/{total} completed"
+            if in_progress > 0:
+                output += f", {in_progress} active"
+            if pending > 0:
+                output += f", {pending} pending"
+            if failed > 0:
+                output += f", {failed} failed"
+            output += f" │\n"
+            
+            if core_tasks:
+                output += f"│ 🚨 CORE SETUP: {core_completed}/{len(core_tasks)} build/test tasks done │\n"
+
+            # Show current task status
+            current_task = self.context_manager.current_task_id
+            if current_task:
+                output += f"│ 🔄 Current: {current_task} │\n"
+
+            # Show next task
+            next_task = trunk_context.get_next_pending_task()
+            if next_task:
+                output += f"│ ⏭️ Next: {next_task.id} │\n"
+            elif completed == total:
+                output += f"│ ✅ All tasks completed! │\n"
+
+            output += f"╰────────────────────────────────────────────╯\n"
+            
+            return output
+            
+        except Exception as e:
+            logger.error(f"Failed to get compact TODO status: {e}")
+            return f"\n📋 TODO status update failed: {str(e)}\n"

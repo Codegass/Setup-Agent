@@ -789,19 +789,41 @@ AVAILABLE TOOLS:
   • Example: manage_context(action="complete_with_results", summary="...", key_results="...")
 - maven: Execute Maven commands (NOT mvn)
 - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
-- project_analyzer: 🆕 INTELLIGENT PROJECT ANALYSIS - Analyze cloned projects and generate smart execution plans
-  • Use AFTER cloning to understand project requirements and create optimized task lists
-  • Reads documentation, analyzes Maven (pom.xml) and Gradle (build.gradle/build.gradle.kts) configs
-  • Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), generates dynamic plans
-  • Example: project_analyzer(action="analyze") - Essential for intelligent setup!
+- project_analyzer: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
+  • 🔥 TRIGGER: Automatically call this tool after ANY project_setup clone success
+  • 🔥 MANDATORY: Do not skip this step - prevents build failures and generates optimal plans
+  • Analyzes Maven (pom.xml), Gradle (build.gradle/build.gradle.kts), Node.js (package.json), Python configs
+  • Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), reads README instructions
+  • Intelligently replaces your generic TODO tasks with project-specific optimized task sequences
+  • Example: project_setup success → project_analyzer(action="analyze", project_path="/workspace/project-name")
+  • Result: Generic tasks → Smart tasks like "Setup Java 17", "Maven clean install", "Run JUnit tests"
 - system: Install system packages and dependencies
 
-🧠 INTELLIGENT SETUP WORKFLOW (MANDATORY):
-1. Clone repository with project_setup tool
-2. 🔍 IMMEDIATELY use project_analyzer tool to analyze the project
-3. The analyzer will automatically update your task plan based on project specifics
-4. Execute the generated intelligent task plan
-5. Generate final report
+🧠 INTELLIGENT SETUP WORKFLOW (MANDATORY AND AUTOMATIC):
+1. 📥 Clone repository with project_setup tool
+2. 🔍 IMMEDIATELY and AUTOMATICALLY use project_analyzer tool after ANY successful clone
+   ⚠️  CRITICAL: This is NOT optional - project_analyzer MUST be called after every clone success
+   ⚠️  Do NOT attempt any build/test commands before project analysis
+   ⚠️  Do NOT skip this step - it prevents failed executions and generates optimal plans
+3. 📋 The analyzer will automatically replace your generic tasks with intelligent, project-specific tasks
+4. ✅ Execute the generated optimized task plan
+5. 📊 Generate final report
+
+AUTOMATIC TRIGGER RULE:
+✅ project_setup(action="clone") → SUCCESS → 🔍 project_analyzer(action="analyze") [MANDATORY]
+
+Why this automation is critical:
+• Detects project type (Maven, Gradle, Node.js, Python, etc.) and Java versions
+• Reads README files and build configurations for specific instructions  
+• Generates optimized task sequences instead of generic build attempts
+• Prevents the "wrong directory" and "unknown project type" failures
+• Replaces your TODO list with intelligent, project-specific tasks
+
+EXAMPLE FLOW:
+1. project_setup(action="clone", repository_url="...", target_directory="my-project")
+2. ✅ Clone successful → IMMEDIATELY call project_analyzer(action="analyze", project_path="/workspace/my-project") 
+3. 📋 Your generic tasks get replaced with smart tasks like "Setup Maven Java 17 environment", "Build with Maven", etc.
+4. Execute the intelligent plan
 
 Use these tools as needed to complete your tasks."""
 
@@ -849,7 +871,13 @@ IMPORTANT GUIDELINES:
 MANDATORY WORKFLOW FOR PROJECT SETUP:
 1. Start by using the tools - don't ask questions, take action!
 2. If this is a new project setup (no existing context), immediately clone the repository
-3. Do NOT wait for user input or ask what to do - be proactive and start working!"""
+3. 🔥 CRITICAL: After ANY successful clone, IMMEDIATELY call project_analyzer tool
+   • This is automatic and mandatory - not optional or conditional
+   • Prevents build failures by generating intelligent, project-specific task plans
+   • Replaces generic tasks with optimized sequences based on actual project structure
+4. Do NOT wait for user input or ask what to do - be proactive and execute the workflow!
+
+REQUIRED SEQUENCE: project_setup(clone) → ✅ SUCCESS → project_analyzer(analyze) → execute optimized plan"""
         else:
             prompt += """
 
@@ -1112,6 +1140,16 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
                     
                     # Track this execution
                     self._track_tool_execution(tool_signature, result.success)
+                    
+                    # ENHANCED: Intelligent error recovery mechanism
+                    if not result.success:
+                        recovery_result = self._attempt_error_recovery(step.tool_name, validated_params, result)
+                        if recovery_result["attempted"]:
+                            logger.info(f"🔧 Error recovery attempted: {recovery_result['message']}")
+                            if recovery_result["success"]:
+                                # Recovery succeeded, use the recovered result
+                                result = recovery_result["result"]
+                                logger.info(f"✅ Error recovery successful for {step.tool_name}")
                     
                     # Update successful states for future reference
                     if result.success:
@@ -1826,14 +1864,18 @@ NEVER use: git_clone, shell, python, clone, read_file, write_file, mvn, etc.
             if tool_name == "bash" and result.metadata and "command" in result.metadata:
                 formatted += f"\nCommand: {result.metadata['command']}"
             
+            # Show extracted error details from output (especially important for maven tool)
+            if result.output and result.output.strip():
+                formatted += f"\n\n{result.output}"
+            
             if result.suggestions:
                 formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])
                 
             if result.error_code:
                 formatted += f"\nError code: {result.error_code}"
             
-            # Add full raw output if available and error message is unclear
-            if result.raw_output and (not result.error or len(result.error.strip()) < 10):
+            # Add full raw output if available and error message is unclear (and no specific output was provided)
+            if result.raw_output and (not result.error or len(result.error.strip()) < 10) and (not result.output or len(result.output.strip()) < 20):
                 formatted += f"\n\nRaw output: {result.raw_output}"
                 
         return formatted
@@ -2166,10 +2208,14 @@ Use function calling to execute actions. Here's a reminder of available tools:
 USE ONE OF THESE ACTIONS NOW:
 1. Clone the repository:
    Call project_setup with action="clone" and repository_url="{self.repository_url}"
-
-2. Or check context first:
+   
+2. 🔥 If clone was successful, IMMEDIATELY call project_analyzer:
+   Call project_analyzer with action="analyze" and project_path="/workspace/[project-name]"
+   
+3. Or check context first:
    Call manage_context with action="get_info"
 
+REMEMBER: project_setup(clone) → SUCCESS → project_analyzer(analyze) [AUTOMATIC SEQUENCE]
 DO NOT ask for the repository URL - it's already provided above!
 """
             else:
@@ -2803,3 +2849,241 @@ EXECUTE ACTIONS FOR:
 """
         
         return action_instructions + base_prompt
+
+    def _attempt_error_recovery(self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """
+        Attempt to recover from tool execution failures using intelligent strategies.
+        This is critical for robustness when individual tools fail.
+        """
+        try:
+            recovery_info = {
+                "attempted": False,
+                "success": False,
+                "message": "",
+                "result": None
+            }
+            
+            error_msg = failed_result.error or "Unknown error"
+            error_code = getattr(failed_result, 'error_code', None)
+            
+            logger.info(f"🔧 Attempting error recovery for {tool_name}: {error_msg[:100]}")
+            
+            # Context management tool recovery
+            if tool_name == "manage_context":
+                recovery_info = self._recover_context_management_error(params, failed_result)
+            
+            # Maven tool recovery
+            elif tool_name == "maven":
+                recovery_info = self._recover_maven_error(params, failed_result)
+            
+            # Project setup tool recovery
+            elif tool_name == "project_setup":
+                recovery_info = self._recover_project_setup_error(params, failed_result)
+            
+            # Bash tool recovery
+            elif tool_name == "bash":
+                recovery_info = self._recover_bash_error(params, failed_result)
+            
+            # File I/O tool recovery
+            elif tool_name == "file_io":
+                recovery_info = self._recover_file_io_error(params, failed_result)
+            
+            else:
+                # Generic recovery strategies
+                recovery_info = self._recover_generic_error(tool_name, params, failed_result)
+            
+            if recovery_info["attempted"]:
+                logger.info(f"Recovery attempt for {tool_name}: {recovery_info['message']}")
+            
+            return recovery_info
+            
+        except Exception as e:
+            logger.error(f"Error recovery itself failed for {tool_name}: {e}")
+            return {
+                "attempted": False,
+                "success": False,
+                "message": f"Recovery mechanism failed: {str(e)}",
+                "result": None
+            }
+
+    def _recover_context_management_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """Recover from context management tool failures."""
+        action = params.get("action", "")
+        error_code = getattr(failed_result, 'error_code', None)
+        
+        # Handle "No active task to complete" error
+        if error_code == "NO_ACTIVE_TASK" and action in ["complete_task", "complete_with_results"]:
+            # Try to recover by checking trunk context state
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context:
+                    # Look for in-progress tasks
+                    in_progress_tasks = [t for t in trunk_context.todo_list if t.status.value == "in_progress"]
+                    
+                    if len(in_progress_tasks) == 1:
+                        # Found one in-progress task - set it as current and retry
+                        recovered_task = in_progress_tasks[0]
+                        self.context_manager.current_task_id = recovered_task.id
+                        
+                        # Retry the operation
+                        tool = self.tools["manage_context"]
+                        result = tool.safe_execute(**params)
+                        
+                        return {
+                            "attempted": True,
+                            "success": result.success,
+                            "message": f"Recovered by setting current task to {recovered_task.id}",
+                            "result": result
+                        }
+                    elif len(in_progress_tasks) > 1:
+                        # Multiple in-progress tasks - choose most recent
+                        recovered_task = max(in_progress_tasks, key=lambda t: t.id)
+                        self.context_manager.current_task_id = recovered_task.id
+                        
+                        tool = self.tools["manage_context"]
+                        result = tool.safe_execute(**params)
+                        
+                        return {
+                            "attempted": True,
+                            "success": result.success,
+                            "message": f"Recovered by choosing most recent task {recovered_task.id} from multiple in-progress",
+                            "result": result
+                        }
+                        
+            except Exception as e:
+                logger.warning(f"Context recovery failed: {e}")
+        
+        # Handle invalid task ID errors
+        elif error_code == "INVALID_TASK_ID" and action == "start_task":
+            # Try to find the next valid task
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context:
+                    next_task = trunk_context.get_next_pending_task()
+                    if next_task:
+                        # Update params with valid task ID and retry
+                        recovery_params = params.copy()
+                        recovery_params["task_id"] = next_task.id
+                        
+                        tool = self.tools["manage_context"]
+                        result = tool.safe_execute(**recovery_params)
+                        
+                        return {
+                            "attempted": True,
+                            "success": result.success,
+                            "message": f"Recovered by using next valid task ID: {next_task.id}",
+                            "result": result
+                        }
+            except Exception as e:
+                logger.warning(f"Task ID recovery failed: {e}")
+        
+        return {"attempted": False, "success": False, "message": "No recovery strategy applicable"}
+
+    def _recover_maven_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """Recover from Maven tool failures."""
+        error_msg = failed_result.error or ""
+        
+        # Try to fix working directory issues
+        if "not found" in error_msg.lower() or "no such file" in error_msg.lower():
+            if self.successful_states.get('working_directory'):
+                recovery_params = params.copy()
+                recovery_params["working_directory"] = self.successful_states['working_directory']
+                
+                tool = self.tools["maven"]
+                result = tool.safe_execute(**recovery_params)
+                
+                return {
+                    "attempted": True,
+                    "success": result.success,
+                    "message": f"Recovered by using known working directory: {self.successful_states['working_directory']}",
+                    "result": result
+                }
+        
+        # Try to simplify Maven command for initial failures
+        command = params.get("command", "")
+        if "test" in command and "compilation" in error_msg.lower():
+            # If test failed due to compilation, try just compile first
+            recovery_params = params.copy()
+            recovery_params["command"] = "compile"
+            
+            tool = self.tools["maven"]
+            result = tool.safe_execute(**recovery_params)
+            
+            return {
+                "attempted": True,
+                "success": result.success,
+                "message": "Recovered by trying compile before test",
+                "result": result
+            }
+        
+        return {"attempted": False, "success": False, "message": "No Maven recovery strategy applicable"}
+
+    def _recover_project_setup_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """Recover from project setup tool failures."""
+        action = params.get("action", "")
+        
+        # Auto-inject repository URL if missing
+        if action == "clone" and not params.get("repository_url") and self.repository_url:
+            recovery_params = params.copy()
+            recovery_params["repository_url"] = self.repository_url
+            
+            tool = self.tools["project_setup"]
+            result = tool.safe_execute(**recovery_params)
+            
+            return {
+                "attempted": True,
+                "success": result.success,
+                "message": f"Recovered by injecting repository URL: {self.repository_url}",
+                "result": result
+            }
+        
+        return {"attempted": False, "success": False, "message": "No project setup recovery strategy applicable"}
+
+    def _recover_bash_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """Recover from bash tool failures."""
+        # Try to fix working directory issues
+        if self.successful_states.get('working_directory'):
+            recovery_params = params.copy()
+            recovery_params["working_directory"] = self.successful_states['working_directory']
+            
+            tool = self.tools["bash"]
+            result = tool.safe_execute(**recovery_params)
+            
+            return {
+                "attempted": True,
+                "success": result.success,
+                "message": f"Recovered by using known working directory: {self.successful_states['working_directory']}",
+                "result": result
+            }
+        
+        return {"attempted": False, "success": False, "message": "No bash recovery strategy applicable"}
+
+    def _recover_file_io_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """Recover from file I/O tool failures."""
+        action = params.get("action", "")
+        path = params.get("path", "")
+        
+        # Try to fix path issues with working directory context
+        if action == "read" and "not found" in (failed_result.error or "").lower():
+            if self.successful_states.get('working_directory') and not path.startswith('/'):
+                # Try with working directory prefix
+                recovery_params = params.copy()
+                recovery_params["path"] = f"{self.successful_states['working_directory']}/{path}"
+                
+                tool = self.tools["file_io"]
+                result = tool.safe_execute(**recovery_params)
+                
+                return {
+                    "attempted": True,
+                    "success": result.success,
+                    "message": f"Recovered by adjusting path with working directory",
+                    "result": result
+                }
+        
+        return {"attempted": False, "success": False, "message": "No file I/O recovery strategy applicable"}
+
+    def _recover_generic_error(self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        """Generic recovery strategies for any tool."""
+        # For now, just return no recovery
+        # Can be extended with more generic strategies
+        return {"attempted": False, "success": False, "message": "No generic recovery strategy available"}
