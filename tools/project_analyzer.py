@@ -564,144 +564,121 @@ class ProjectAnalyzerTool(BaseTool):
         return frameworks
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
-        """根据分析结果生成智能执行计划"""
+        """
+        Generate intelligent execution plan based on THREE CORE STEPS:
+        1. Clone repository (assumed already done by project_setup)
+        2. Build project (compile/package)  
+        3. Test project (run tests)
+        4. Generate report
+        """
         plan = []
 
         project_type = analysis.get("project_type", "unknown")
         build_system = analysis.get("build_system", "unknown")
         java_version = analysis.get("java_version")
         documentation = analysis.get("documentation", {})
-        existing_files = analysis.get("existing_files", [])
 
-        logger.info(f"Generating execution plan for {project_type} project with {build_system} build system")
+        logger.info(f"Generating three-step execution plan for {project_type} project with {build_system}")
 
         # Handle unknown projects with fallback strategies
         if project_type == "unknown" or build_system == "unknown":
             logger.warning("Project type or build system unknown, generating fallback plan")
-            return self._generate_fallback_execution_plan(analysis)
+            return self._generate_three_step_fallback_plan(analysis)
 
-        # 基础环境准备任务
+        # STEP 1: Environment setup (if needed)
         if java_version:
             plan.append({
-                "id": "setup_java_environment",
-                "description": f"Verify and setup Java {java_version} environment",
+                "id": "setup_environment",
+                "description": f"Verify Java {java_version} environment and install dependencies",
                 "priority": "high",
-                "type": "environment"
+                "type": "environment",
+                "core_step": "preparation"
             })
 
-        # 依赖安装任务
+        # STEP 2: BUILD - Compile/package the project
         if project_type == "Java" and build_system == "Maven":
             plan.append({
-                "id": "install_dependencies",
-                "description": "Install Maven dependencies and verify build environment",
-                "priority": "high", 
-                "type": "dependencies"
+                "id": "build_project",
+                "description": "Compile project using Maven",
+                "priority": "critical",
+                "type": "build", 
+                "core_step": "build"
             })
         elif project_type == "Java" and build_system == "Gradle":
             plan.append({
-                "id": "install_dependencies",
-                "description": "Install Gradle dependencies and verify build environment",
-                "priority": "high",
-                "type": "dependencies"
+                "id": "build_project", 
+                "description": "Compile project using Gradle",
+                "priority": "critical",
+                "type": "build",
+                "core_step": "build"
             })
         elif project_type == "Node.js":
             plan.append({
-                "id": "install_dependencies",
-                "description": "Install Node.js dependencies using npm/yarn",
-                "priority": "high",
-                "type": "dependencies"
+                "id": "build_project",
+                "description": "Build project using npm/yarn",
+                "priority": "critical", 
+                "type": "build",
+                "core_step": "build"
             })
         elif project_type == "Python":
             plan.append({
-                "id": "install_dependencies",
-                "description": "Install Python dependencies using pip/poetry",
-                "priority": "high",
-                "type": "dependencies"
+                "id": "build_project",
+                "description": "Setup and validate Python project",
+                "priority": "critical",
+                "type": "build", 
+                "core_step": "build"
+            })
+        else:
+            # Generic build step
+            plan.append({
+                "id": "build_project",
+                "description": f"Build {project_type} project using {build_system}",
+                "priority": "critical",
+                "type": "build",
+                "core_step": "build"
             })
 
-        # 构建任务
-        build_commands = documentation.get("build_commands", [])
-        if build_commands:
-            plan.append({
-                "id": "build_project",
-                "description": f"Build project using documented commands: {', '.join(build_commands[:2])}",
-                "priority": "high",
-                "type": "build"
-            })
-        elif project_type == "Java" and build_system == "Maven":
-            plan.append({
-                "id": "build_project", 
-                "description": "Compile project using Maven",
-                "priority": "high",
-                "type": "build"
-            })
-        elif project_type == "Java" and build_system == "Gradle":
-            plan.append({
-                "id": "build_project",
-                "description": "Compile project using Gradle",
-                "priority": "high",
-                "type": "build"
-            })
-        elif project_type == "Node.js":
-            plan.append({
-                "id": "build_project",
-                "description": "Build project using npm/yarn build scripts",
-                "priority": "high",
-                "type": "build"
-            })
-
-        # 测试任务
+        # STEP 3: TEST - Run project tests
         test_framework = analysis.get("test_framework", "unknown")
         test_commands = documentation.get("test_commands", [])
+        
         if test_commands:
-            plan.append({
-                "id": "run_tests",
-                "description": f"Run tests using documented commands: {', '.join(test_commands[:2])}",
-                "priority": "high",
-                "type": "test"
-            })
+            test_desc = f"Run tests using documented commands: {', '.join(test_commands[:2])}"
         elif project_type == "Java" and build_system == "Maven":
-            test_desc = "Execute project tests using Maven"
+            test_desc = "Run tests using Maven"
             if test_framework != "unknown":
-                test_desc += f" (detected: {test_framework})"
-            plan.append({
-                "id": "run_tests",
-                "description": test_desc,
-                "priority": "high",
-                "type": "test"
-            })
+                test_desc += f" ({test_framework})"
         elif project_type == "Java" and build_system == "Gradle":
-            test_desc = "Execute project tests using Gradle"
+            test_desc = "Run tests using Gradle"
             if test_framework != "unknown":
-                test_desc += f" (detected: {test_framework})"
-            plan.append({
-                "id": "run_tests",
-                "description": test_desc,
-                "priority": "high",
-                "type": "test"
-            })
+                test_desc += f" ({test_framework})"
         elif project_type == "Node.js":
-            plan.append({
-                "id": "run_tests",
-                "description": "Execute project tests using npm/yarn test scripts",
-                "priority": "high",
-                "type": "test"
-            })
+            test_desc = "Execute tests using npm/yarn test"
+        elif project_type == "Python":
+            test_desc = "Run Python tests (pytest/unittest)"
+        else:
+            test_desc = f"Execute {project_type} project tests"
 
-        # 确保至少有基本的任务
-        if not plan:
-            logger.warning("No specific tasks generated, adding basic setup tasks")
-            plan = self._generate_basic_setup_plan(analysis)
+        plan.append({
+            "id": "run_tests",
+            "description": test_desc,
+            "priority": "critical",
+            "type": "test",
+            "core_step": "test"
+        })
 
-        # 最终报告任务（确保始终存在）
+        # STEP 4: REPORT - Generate completion report
         plan.append({
             "id": "generate_completion_report",
             "description": "Generate comprehensive setup completion report",
             "priority": "high",
-            "type": "report"
+            "type": "report",
+            "core_step": "report"
         })
 
-        logger.info(f"Generated {len(plan)} tasks in execution plan")
+        logger.info(f"Generated {len(plan)} tasks in three-step execution plan")
+        logger.info(f"Core steps: {[task.get('core_step') for task in plan]}")
+        
         return plan
 
     def _generate_fallback_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -1075,43 +1052,61 @@ Project Analyzer Tool Usage Examples:
 4. Legacy parameter support (automatically mapped):
    project_analyzer(action="analyze", directory="/workspace/project")
 
+🎯 THREE-STEP EXECUTION STRATEGY:
+✅ STEP 1: Clone repository (handled by project_setup tool)
+✅ STEP 2: Build project (compile/package - CRITICAL)
+✅ STEP 3: Test project (run tests - CRITICAL) 
+✅ STEP 4: Generate report
+
+SUCCESS CRITERIA:
+- SUCCESS: All three core steps (clone + build + test) succeed
+- FAILED: Clone or build fails
+- PARTIAL: Clone + build succeed, but tests fail
+
 ENHANCED FEATURES:
 ✅ Smart path discovery - automatically finds project in subdirectories
-✅ Robust error handling - validates project structure before analysis  
+✅ Three-step plan generation - creates clear clone → build → test → report workflow
+✅ Multi-platform support - Maven, Gradle, npm, Python, Rust, Go
 ✅ Parameter compatibility - supports both 'project_path' and 'directory'
 ✅ Intelligent fallback plans - generates meaningful tasks even for unknown projects
 ✅ Context safety - preserves existing tasks if analysis fails
-✅ Plan validation - ensures generated plans are actionable
+✅ Plan validation - ensures generated plans follow three-step pattern
 
 WORKFLOW:
 1. First clone the repository using project_setup tool
-2. Then use project_analyzer to understand the project and generate intelligent plan
-3. Execute the dynamically generated tasks
+2. Then use project_analyzer to understand the project and generate three-step plan
+3. Execute the generated tasks: build → test → report
+4. Report tool will evaluate success based on all three core steps
 
 WHAT IT ANALYZES:
 - Project type (Java, Node.js, Python, Rust, Go, etc.)
 - Build system (Maven, Gradle, npm, pip, Cargo, etc.)
 - Java version requirements from README and config files
-- Maven dependencies from pom.xml
-- Gradle dependencies from build.gradle/build.gradle.kts (supports both Groovy and Kotlin DSL)
-- Test frameworks (JUnit, TestNG, Spock, Jest, pytest) for various project types
-- Gradle plugins and Maven profiles
-- Documentation and setup instructions
+- Maven/Gradle dependencies and build configuration
+- Test frameworks (JUnit, TestNG, Spock, Jest, pytest)
+- Documentation and build/test commands
 - Source code structure and organization
+
+GENERATED PLAN FORMAT:
+Each task includes a 'core_step' field indicating its role:
+- core_step: "preparation" - Environment setup
+- core_step: "build" - Project compilation/packaging  
+- core_step: "test" - Test execution
+- core_step: "report" - Final status report
 
 ROBUST ERROR HANDLING:
 - Validates project path and discovers actual project location
 - Handles parameter name variations (project_path vs directory)
-- Generates fallback plans for unknown project types
+- Generates three-step fallback plans for unknown project types
 - Preserves existing context if analysis fails
 - Provides detailed diagnostic information
 
 OUTPUT:
 - Comprehensive project analysis with path validation
-- Dynamically generated task list optimized for the specific project
+- Three-step execution plan: build → test → report
 - Plan quality assessment and validation
 - Safe context updates with rollback protection
-- Detailed diagnostic information for troubleshooting
+- Clear core step identification for each task
 """ 
 
     def _validate_and_discover_project_path(self, initial_path: str) -> Optional[str]:
@@ -1210,3 +1205,115 @@ OUTPUT:
             return False
         
         return True 
+
+    def _generate_three_step_fallback_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Generate three-step fallback plan for unknown project types."""
+        plan = []
+        existing_files = analysis.get("existing_files", [])
+        project_path = analysis.get("project_path", "/workspace")
+
+        logger.info("Generating three-step fallback execution plan for unknown project type")
+
+        # STEP 1: Environment/Dependencies
+        if "pom.xml" in existing_files:
+            plan.append({
+                "id": "setup_environment",
+                "description": "Install Maven dependencies and verify build environment",
+                "priority": "high",
+                "type": "environment",
+                "core_step": "preparation"
+            })
+            plan.append({
+                "id": "build_project",
+                "description": "Compile project using Maven", 
+                "priority": "critical",
+                "type": "build",
+                "core_step": "build"
+            })
+            plan.append({
+                "id": "run_tests",
+                "description": "Execute Maven project tests",
+                "priority": "critical", 
+                "type": "test",
+                "core_step": "test"
+            })
+        elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
+            plan.append({
+                "id": "setup_environment",
+                "description": "Install Gradle dependencies and verify build environment",
+                "priority": "high",
+                "type": "environment",
+                "core_step": "preparation" 
+            })
+            plan.append({
+                "id": "build_project",
+                "description": "Compile project using Gradle",
+                "priority": "critical",
+                "type": "build",
+                "core_step": "build"
+            })
+            plan.append({
+                "id": "run_tests", 
+                "description": "Execute Gradle project tests",
+                "priority": "critical",
+                "type": "test",
+                "core_step": "test"
+            })
+        elif "package.json" in existing_files:
+            plan.append({
+                "id": "setup_environment",
+                "description": "Install Node.js dependencies using npm/yarn",
+                "priority": "high",
+                "type": "environment",
+                "core_step": "preparation"
+            })
+            plan.append({
+                "id": "build_project",
+                "description": "Build Node.js project",
+                "priority": "critical",
+                "type": "build", 
+                "core_step": "build"
+            })
+            plan.append({
+                "id": "run_tests",
+                "description": "Execute Node.js project tests",
+                "priority": "critical",
+                "type": "test",
+                "core_step": "test"
+            })
+        else:
+            # Completely unknown project  
+            plan.extend([
+                {
+                    "id": "explore_project",
+                    "description": f"Manually explore and identify project structure at {project_path}",
+                    "priority": "high",
+                    "type": "exploration",
+                    "core_step": "preparation"
+                },
+                {
+                    "id": "attempt_build",
+                    "description": "Attempt to build project using identified tools",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build"
+                },
+                {
+                    "id": "attempt_tests",
+                    "description": "Attempt to run project tests",
+                    "priority": "critical", 
+                    "type": "test",
+                    "core_step": "test"
+                }
+            ])
+
+        # STEP 4: Always add report
+        plan.append({
+            "id": "generate_completion_report",
+            "description": "Generate comprehensive setup completion report",
+            "priority": "high",
+            "type": "report",
+            "core_step": "report"
+        })
+
+        return plan 

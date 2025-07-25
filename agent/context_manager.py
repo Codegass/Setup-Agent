@@ -269,31 +269,50 @@ class ContextManager:
         self.trunk_context_file: Optional[str] = None  # Trunk context file path
 
     def _ensure_contexts_dir_in_container(self):
-        """Ensure the contexts directory exists in the container."""
+        """
+        Ensure the contexts directory exists in the container.
+        
+        CRITICAL FIX: Don't assume /workspace exists when creating contexts directory.
+        Use workdir=None to avoid OCI runtime exec failed errors.
+        """
         if not self.orchestrator:
             return
 
         # Create the contexts directory in the container
         contexts_path = str(self.contexts_dir)
         
-        # Create directory with proper permissions
+        # CRITICAL: First ensure the parent directory (/workspace) exists
+        parent_dir = str(self.contexts_dir.parent)  # Should be /workspace
+        
+        logger.info(f"🔧 Ensuring parent directory exists: {parent_dir}")
+        parent_create_cmd = f"mkdir -p {parent_dir} && chmod 755 {parent_dir}"
+        parent_result = self.orchestrator.execute_command(parent_create_cmd, workdir=None)
+        
+        if not (parent_result.get("success") or parent_result.get("exit_code") == 0):
+            logger.error(f"Failed to create parent directory {parent_dir}: {parent_result.get('output', '')}")
+            raise RuntimeError(f"Cannot create parent directory in container: {parent_dir}")
+        else:
+            logger.info(f"✅ Parent directory created/verified: {parent_dir}")
+        
+        # Now create the contexts directory - use workdir=None to avoid dependency on /workspace
+        logger.info(f"🔧 Creating contexts directory: {contexts_path}")
         create_cmd = f"mkdir -p {contexts_path} && chmod 755 {contexts_path}"
-        result = self.orchestrator.execute_command(create_cmd)
+        result = self.orchestrator.execute_command(create_cmd, workdir=None)
 
         if result.get("success") or result.get("exit_code") == 0:
-            logger.info(f"Created contexts directory in container: {contexts_path}")
+            logger.info(f"✅ Created contexts directory in container: {contexts_path}")
             
-            # Verify the directory exists and is writable
+            # Verify the directory exists and is writable - also use workdir=None
             test_cmd = f"test -d {contexts_path} && test -w {contexts_path}"
-            test_result = self.orchestrator.execute_command(test_cmd)
+            test_result = self.orchestrator.execute_command(test_cmd, workdir=None)
             
             if not (test_result.get("success") or test_result.get("exit_code") == 0):
-                # Try to fix permissions
+                # Try to fix permissions - use workdir=None
                 chmod_cmd = f"chmod 755 {contexts_path}"
-                self.orchestrator.execute_command(chmod_cmd)
-                logger.warning(f"Fixed permissions for contexts directory: {contexts_path}")
+                self.orchestrator.execute_command(chmod_cmd, workdir=None)
+                logger.warning(f"🔧 Fixed permissions for contexts directory: {contexts_path}")
         else:
-            logger.error(f"Failed to create contexts directory: {result.get('output', '')}")
+            logger.error(f"❌ Failed to create contexts directory: {result.get('output', '')}")
             raise RuntimeError(f"Cannot create contexts directory in container: {contexts_path}")
 
     def create_trunk_context(self, goal: str, project_url: str, project_name: str, tasks: List[str] = None) -> TrunkContext:

@@ -3,7 +3,8 @@
 import os
 import subprocess
 import time
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import docker
@@ -352,6 +353,342 @@ class DockerOrchestrator:
                 "output": str(e)
             }
 
+    def execute_command_with_monitoring(
+        self,
+        command: str,
+        workdir: str = None,
+        silent_timeout: int = 600,  # 10 minutes no output
+        absolute_timeout: int = 2400,  # 40 minutes total
+        use_timeout_wrapper: bool = True,
+        enable_cpu_monitoring: bool = True,
+        optimize_for_maven: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Enhanced execute_command with comprehensive timeout and monitoring capabilities.
+        
+        Args:
+            command: Command to execute
+            workdir: Working directory
+            silent_timeout: Seconds without output before timeout (default: 10 min)
+            absolute_timeout: Maximum execution time (default: 30 min)
+            use_timeout_wrapper: Whether to wrap command with GNU timeout
+            enable_cpu_monitoring: Whether to monitor CPU usage for hang detection
+            optimize_for_maven: Whether to apply Maven-specific optimizations
+        """
+        
+        # Get the container object
+        container = self.client.containers.get(self.container_name)
+        
+        # Apply Maven optimizations if requested
+        if optimize_for_maven and ('mvn ' in command or command.startswith('mvn')):
+            command = self._optimize_maven_command(command, absolute_timeout)
+            logger.info(f"🔧 Applied Maven optimizations to command")
+        
+        # Wrap with GNU timeout if requested
+        if use_timeout_wrapper:
+            # Use timeout with preserve-status to get the actual exit code
+            wrapped_cmd = f"timeout --preserve-status {absolute_timeout} bash -c '{command}'"
+            logger.info(f"🕐 Wrapped command with {absolute_timeout}s absolute timeout")
+        else:
+            wrapped_cmd = command
+        
+        # Build the final command with environment loading
+        final_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {wrapped_cmd}"
+        exec_command = ["/bin/bash", "-c", final_command]
+        
+        logger.info(f"Executing command with monitoring: {command}")
+        if workdir:
+            logger.info(f"Working directory: {workdir}")
+        logger.info(f"⏱️ Timeouts: Silent={silent_timeout}s, Absolute={absolute_timeout}s")
+        
+        # Monitoring state
+        monitoring_state = {
+            'last_output_time': time.time(),
+            'start_time': time.time(),
+            'total_output': '',
+            'process_terminated': False,
+            'termination_reason': None,
+            'cpu_warnings': 0
+        }
+        
+        try:
+            # Start the command execution
+            exec_result = container.exec_run(
+                exec_command, 
+                workdir=workdir,
+                stream=True,  # Enable streaming to monitor output
+                demux=True    # Separate stdout/stderr
+            )
+            
+            # Start CPU monitoring thread if enabled
+            cpu_monitor_thread = None
+            if enable_cpu_monitoring:
+                cpu_monitor_thread = threading.Thread(
+                    target=self._monitor_cpu_usage,
+                    args=(monitoring_state, silent_timeout // 2),  # Check every half of silent timeout
+                    daemon=True
+                )
+                cpu_monitor_thread.start()
+            
+            # Monitor the execution with timeouts
+            result = self._monitor_execution_with_timeouts(
+                exec_result, 
+                monitoring_state, 
+                silent_timeout, 
+                absolute_timeout
+            )
+            
+            # Clean up monitoring thread
+            monitoring_state['process_terminated'] = True
+            if cpu_monitor_thread:
+                cpu_monitor_thread.join(timeout=1)  # Give it 1 second to finish
+            
+            return result
+            
+        except Exception as e:
+            monitoring_state['process_terminated'] = True
+            logger.error(f"Failed to execute command '{command}': {e}")
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": f"Execution failed: {str(e)}",
+                "termination_reason": "exception",
+                "monitoring_info": monitoring_state
+            }
+
+    def _optimize_maven_command(self, command: str, timeout_seconds: int) -> str:
+        """Apply Maven-specific optimizations to reduce timeout risks."""
+        
+        optimizations = []
+        
+        # Add batch mode and quiet flags if not present
+        if '-B' not in command:
+            optimizations.append('-B')  # Batch mode (non-interactive)
+        
+        if '-q' not in command and '-X' not in command:  # Don't add quiet if debug mode
+            optimizations.append('-q')  # Quiet mode (reduce output)
+        
+        # Add Maven-specific timeout settings
+        maven_timeout_props = [
+            f'-Dmaven.execution.timeout={timeout_seconds}000',  # Maven timeout in milliseconds
+            '-Dmaven.artifact.threads=4',  # Parallel downloads
+            '-Dmaven.resolver.transport=wagon',  # Use wagon transport for better reliability
+        ]
+        
+        # Insert optimizations after 'mvn' but before other arguments
+        parts = command.split(' ', 1)
+        if len(parts) == 2:
+            maven_cmd, remaining_args = parts
+            optimized_command = f"{maven_cmd} {' '.join(optimizations)} {' '.join(maven_timeout_props)} {remaining_args}"
+        else:
+            optimized_command = f"{command} {' '.join(optimizations)} {' '.join(maven_timeout_props)}"
+        
+        logger.info(f"🔧 Maven optimizations applied: {', '.join(optimizations + maven_timeout_props)}")
+        return optimized_command
+
+    def _monitor_execution_with_timeouts(
+        self, 
+        exec_result, 
+        monitoring_state: dict, 
+        silent_timeout: int, 
+        absolute_timeout: int
+    ) -> Dict[str, Any]:
+        """Monitor command execution with dual timeout mechanism."""
+        
+        output_buffer = []
+        last_chunk_time = time.time()
+        
+        try:
+            # Read output stream with timeout monitoring
+            for chunk in exec_result.output:
+                current_time = time.time()
+                
+                # Check absolute timeout
+                if current_time - monitoring_state['start_time'] > absolute_timeout:
+                    logger.error(f"⏰ ABSOLUTE TIMEOUT: Command exceeded {absolute_timeout}s limit")
+                    monitoring_state['termination_reason'] = 'absolute_timeout'
+                    self._terminate_container_processes()
+                    break
+                
+                # Check silent timeout
+                if current_time - last_chunk_time > silent_timeout:
+                    logger.warning(f"🔇 SILENT TIMEOUT: No output for {silent_timeout}s")
+                    monitoring_state['termination_reason'] = 'silent_timeout'
+                    self._terminate_container_processes()
+                    break
+                
+                # Process the chunk
+                if chunk[0]:  # stdout
+                    decoded_chunk = chunk[0].decode('utf-8')
+                    output_buffer.append(decoded_chunk)
+                    monitoring_state['total_output'] += decoded_chunk
+                    last_chunk_time = current_time
+                    monitoring_state['last_output_time'] = current_time
+                    
+                    # Log progress periodically
+                    if len(output_buffer) % 50 == 0:  # Every 50 chunks
+                        elapsed = current_time - monitoring_state['start_time']
+                        logger.info(f"📊 Progress: {len(output_buffer)} chunks, {elapsed:.1f}s elapsed")
+                
+                if chunk[1]:  # stderr
+                    decoded_chunk = chunk[1].decode('utf-8')
+                    output_buffer.append(f"STDERR: {decoded_chunk}")
+                    last_chunk_time = current_time
+                    monitoring_state['last_output_time'] = current_time
+            
+            # Get final execution result
+            exit_code = exec_result.exit_code
+            
+            # For streaming execution, exit_code might be None until stream is fully consumed
+            if exit_code is None:
+                # If we got output without errors, assume success
+                exit_code = 0
+            
+            # Combine all output
+            full_output = ''.join(output_buffer)
+            
+            # Apply truncation if needed
+            if len(full_output) > 10000:
+                full_output = self._truncate_output_smartly(full_output)
+            
+            success = exit_code == 0 and monitoring_state['termination_reason'] is None
+            
+            # Generate monitoring summary
+            monitoring_info = {
+                'execution_time': time.time() - monitoring_state['start_time'],
+                'termination_reason': monitoring_state['termination_reason'],
+                'cpu_warnings': monitoring_state['cpu_warnings'],
+                'output_chunks': len(output_buffer)
+            }
+            
+            if not success and monitoring_state['termination_reason']:
+                logger.error(f"❌ Command terminated due to: {monitoring_state['termination_reason']}")
+            
+            return {
+                "success": success,
+                "exit_code": exit_code or 0,
+                "output": full_output,
+                "termination_reason": monitoring_state['termination_reason'],
+                "monitoring_info": monitoring_info
+            }
+            
+        except Exception as e:
+            logger.error(f"Error during execution monitoring: {e}")
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": f"Monitoring error: {str(e)}",
+                "termination_reason": "monitoring_error",
+                "monitoring_info": monitoring_state
+            }
+
+    def _monitor_cpu_usage(self, monitoring_state: dict, check_interval: int):
+        """Monitor CPU usage to detect hung processes."""
+        
+        consecutive_low_cpu = 0
+        cpu_threshold = 1.0  # Consider CPU usage below 1% as potentially hung
+        
+        while not monitoring_state['process_terminated']:
+            try:
+                time.sleep(check_interval)
+                
+                if monitoring_state['process_terminated']:
+                    break
+                
+                # Get CPU stats
+                container = self.client.containers.get(self.container_name)
+                stats = container.stats(stream=False)
+                
+                # Calculate CPU percentage
+                cpu_percent = self._calculate_cpu_percentage(stats)
+                
+                current_time = time.time()
+                silent_duration = current_time - monitoring_state['last_output_time']
+                
+                # Check for potential hang: low CPU + no output for a while
+                if cpu_percent < cpu_threshold and silent_duration > check_interval:
+                    consecutive_low_cpu += 1
+                    monitoring_state['cpu_warnings'] += 1
+                    
+                    logger.warning(
+                        f"⚠️ CPU MONITOR: {cpu_percent:.2f}% CPU, "
+                        f"{silent_duration:.1f}s since last output "
+                        f"(warning #{consecutive_low_cpu})"
+                    )
+                    
+                    # Alert after 3 consecutive low CPU readings
+                    if consecutive_low_cpu >= 3:
+                        logger.error(
+                            f"🚨 HANG DETECTED: Consistently low CPU ({cpu_percent:.2f}%) "
+                            f"with {silent_duration:.1f}s silence"
+                        )
+                        # Don't auto-terminate here, let the silent timeout handle it
+                        
+                else:
+                    consecutive_low_cpu = 0  # Reset counter if CPU is normal
+                    
+            except Exception as e:
+                logger.warning(f"CPU monitoring error: {e}")
+                time.sleep(check_interval)
+
+    def _calculate_cpu_percentage(self, stats: dict) -> float:
+        """Calculate CPU percentage from Docker stats."""
+        try:
+            cpu_stats = stats['cpu_stats']
+            precpu_stats = stats['precpu_stats']
+            
+            cpu_delta = cpu_stats['cpu_usage']['total_usage'] - precpu_stats['cpu_usage']['total_usage']
+            system_delta = cpu_stats['system_cpu_usage'] - precpu_stats['system_cpu_usage']
+            
+            if system_delta > 0 and cpu_delta > 0:
+                cpu_percent = (cpu_delta / system_delta) * len(cpu_stats['cpu_usage']['percpu_usage']) * 100.0
+                return cpu_percent
+            
+        except (KeyError, ZeroDivisionError, TypeError):
+            pass
+        
+        return 0.0
+
+    def _terminate_container_processes(self):
+        """Gracefully terminate processes in the container."""
+        try:
+            container = self.client.containers.get(self.container_name)
+            
+            logger.info("🛑 Attempting graceful termination (SIGTERM)...")
+            # Send SIGTERM to all java/mvn processes
+            container.exec_run(["pkill", "-TERM", "java"], detach=True)
+            container.exec_run(["pkill", "-TERM", "mvn"], detach=True)
+            
+            # Wait 30 seconds for graceful shutdown
+            time.sleep(30)
+            
+            # Force kill if still running
+            logger.info("🔪 Force terminating remaining processes (SIGKILL)...")
+            container.exec_run(["pkill", "-KILL", "java"], detach=True)
+            container.exec_run(["pkill", "-KILL", "mvn"], detach=True)
+            
+        except Exception as e:
+            logger.error(f"Failed to terminate container processes: {e}")
+
+    def _truncate_output_smartly(self, output: str) -> str:
+        """Smart output truncation that preserves important information."""
+        lines = output.split('\n')
+        
+        if len(lines) <= 100:
+            return output
+        
+        # Keep more lines from the end (recent output) than the beginning
+        head_lines = 30
+        tail_lines = 50
+        
+        truncated = (
+            '\n'.join(lines[:head_lines]) +
+            f"\n... [TRUNCATED: {len(lines) - head_lines - tail_lines} lines omitted] ...\n" +
+            '\n'.join(lines[-tail_lines:])
+        )
+        
+        return truncated
+
     def get_container_info(self) -> Optional[Dict[str, Any]]:
         """Get container information."""
 
@@ -619,58 +956,139 @@ class DockerOrchestrator:
         return False
 
     def _setup_container_environment(self) -> bool:
-        """Setup the basic environment in the container."""
+        """
+        Setup the basic environment in the container.
+        
+        ★★★ CRITICAL FIX: Ensure /workspace directory always exists to prevent OCI runtime exec failed.
+        ★★ PRIORITY FIX: Install Git during environment initialization to prevent chain failures.
+        """
 
         try:
-            logger.info("Setting up container environment")
+            logger.info("Setting up container environment with robust workspace creation")
 
-            # Update package lists and install essential tools (including grep)
-            setup_commands = [
-                "apt-get update -qq",  # Quiet mode to reduce output
-                "apt-get install -y -qq curl wget git nano vim python3 python3-pip nodejs npm build-essential grep findutils",  # Added grep and findutils explicitly
+            # ★★★ STEP 1: CRITICAL - Ensure workspace directory exists and is permanent
+            workspace_commands = [
                 f"mkdir -p {self.config.workspace_path}",
                 f"chown -R root:root {self.config.workspace_path}",
-                "which grep && echo 'grep installed successfully' || echo 'ERROR: grep not found'",  # Verify grep installation
-            ]
-
-            for i, command in enumerate(setup_commands):
-                logger.info(f"Running setup step {i+1}/{len(setup_commands)}: {command.split()[0]}...")
-                result = self.execute_command(command)
-                
-                if not result["success"]:
-                    logger.warning(f"Setup command failed: {command}")
-                    logger.warning(f"Exit code: {result.get('exit_code', 'unknown')}")
-                    
-                    # For package installation failures, provide more context
-                    if "apt-get" in command:
-                        logger.error("Package installation failed - this may cause issues later")
-                        logger.info("Trying alternative approach...")
-                        # Don't fail completely, but log the issue
-                    # Continue with other commands even if one fails
-                else:
-                    logger.info(f"✅ Setup step {i+1} completed successfully")
-
-            # Verify essential tools are available
-            verification_commands = [
-                "grep --version | head -1",
-                "git --version",
-                "curl --version | head -1",
-                "python3 --version",
+                f"chmod 755 {self.config.workspace_path}",
+                f"touch {self.config.workspace_path}/.sag_workspace_marker",  # Marker to verify persistence
+                f"ls -la {self.config.workspace_path}",  # Verify creation
             ]
             
-            logger.info("Verifying essential tools...")
-            for cmd in verification_commands:
-                result = self.execute_command(cmd)
-                if result["success"]:
-                    tool_name = cmd.split()[0]
-                    logger.info(f"✅ {tool_name} is available")
+            logger.info("🔧 CRITICAL: Creating persistent workspace directory")
+            for i, command in enumerate(workspace_commands):
+                logger.info(f"Workspace setup {i+1}/{len(workspace_commands)}: {command}")
+                result = self.execute_command(command, workdir=None)  # Use no workdir for workspace creation
+                
+                if not result["success"]:
+                    logger.error(f"❌ CRITICAL: Workspace setup failed at step {i+1}: {command}")
+                    logger.error(f"Exit code: {result.get('exit_code', 'unknown')}")
+                    logger.error(f"Output: {result.get('output', 'no output')}")
+                    return False  # Fail fast on workspace creation failure
                 else:
-                    tool_name = cmd.split()[0]
-                    logger.warning(f"⚠️ {tool_name} verification failed")
+                    logger.info(f"✅ Workspace step {i+1} completed successfully")
 
-            logger.info("Container environment setup completed")
-            return True
+            # ★★ STEP 2: PRIORITY - Install Git and essential tools during initialization
+            logger.info("🔧 PRIORITY: Installing Git and essential tools")
+            
+            # Update package lists first
+            logger.info("📦 Updating package lists...")
+            update_result = self.execute_command("apt-get update -qq", workdir=None)
+            if not update_result["success"]:
+                logger.warning("⚠️ Package list update failed, continuing with cached lists")
+
+            # Install essential packages including Git - this prevents chain failure B
+            essential_packages = [
+                "curl", "wget", "git", "nano", "vim", 
+                "python3", "python3-pip", "nodejs", "npm", 
+                "build-essential", "grep", "findutils", "less"
+            ]
+            
+            install_command = f"apt-get install -y -qq {' '.join(essential_packages)}"
+            logger.info(f"📦 Installing essential packages: {' '.join(essential_packages)}")
+            
+            install_result = self.execute_command(install_command, workdir=None)
+            
+            if not install_result["success"]:
+                logger.error("❌ Essential package installation failed")
+                logger.error(f"Exit code: {install_result.get('exit_code', 'unknown')}")
+                logger.error(f"Output: {install_result.get('output', 'no output')}")
+                
+                # Try to install Git separately as it's critical for the workflow
+                logger.info("🔧 Attempting to install Git separately...")
+                git_result = self.execute_command("apt-get install -y git", workdir=None)
+                if not git_result["success"]:
+                    logger.error("❌ CRITICAL: Git installation failed - this will cause chain failure B")
+                    return False
+                else:
+                    logger.info("✅ Git installed successfully as fallback")
+            else:
+                logger.info("✅ All essential packages installed successfully")
+
+            # STEP 3: Verify critical tools are available and log versions
+            verification_commands = [
+                ("git --version", "Git"),
+                ("grep --version | head -1", "grep"), 
+                ("curl --version | head -1", "curl"),
+                ("python3 --version", "Python3"),
+                (f"test -d {self.config.workspace_path} && echo 'Workspace exists' || echo 'Workspace missing'", "Workspace"),
+                (f"test -f {self.config.workspace_path}/.sag_workspace_marker && echo 'Marker exists' || echo 'Marker missing'", "Workspace marker"),
+            ]
+            
+            logger.info("🔍 Verifying critical tools and workspace...")
+            verification_failed = False
+            
+            for cmd, tool_name in verification_commands:
+                result = self.execute_command(cmd, workdir=None)
+                if result["success"]:
+                    output_summary = result["output"][:100] + "..." if len(result["output"]) > 100 else result["output"]
+                    logger.info(f"✅ {tool_name}: {output_summary}")
+                else:
+                    logger.error(f"❌ {tool_name} verification failed")
+                    verification_failed = True
+                    
+                    # Special handling for critical failures
+                    if tool_name == "Git":
+                        logger.error("❌ CRITICAL: Git verification failed - this will cause project clone failures")
+                    elif tool_name == "Workspace":
+                        logger.error("❌ CRITICAL: Workspace verification failed - this will cause OCI runtime exec failures")
+
+            # STEP 4: Create environment script for persistent environment variables
+            env_script = f"""#!/bin/bash
+# SAG Environment Setup Script
+export WORKSPACE_PATH="{self.config.workspace_path}"
+export SAG_CONTAINER_INITIALIZED="true"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# Ensure workspace always exists
+if [ ! -d "$WORKSPACE_PATH" ]; then
+    echo "WARNING: Workspace missing, recreating..."
+    mkdir -p "$WORKSPACE_PATH"
+    chmod 755 "$WORKSPACE_PATH"
+    touch "$WORKSPACE_PATH/.sag_workspace_marker"
+fi
+
+cd "$WORKSPACE_PATH" 2>/dev/null || cd /root
+"""
+            
+            # Write environment script
+            script_result = self.execute_command(
+                f'echo \'{env_script}\' > /etc/profile.d/sag_env.sh && chmod +x /etc/profile.d/sag_env.sh',
+                workdir=None
+            )
+            
+            if script_result["success"]:
+                logger.info("✅ Environment script created successfully")
+            else:
+                logger.warning("⚠️ Failed to create environment script")
+
+            if verification_failed:
+                logger.error("❌ Environment setup completed with failures")
+                return False
+            else:
+                logger.info("✅ Container environment setup completed successfully with all verifications passing")
+                return True
 
         except Exception as e:
-            logger.error(f"Failed to setup container environment: {e}")
+            logger.error(f"❌ Failed to setup container environment: {e}")
             return False

@@ -59,12 +59,13 @@ class BashTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
 
-    def _extract_key_info(self, output: str, tool_name: str) -> str:
-        """Override to use bash-specific extraction with grep result optimization."""
-        if tool_name == "bash" or tool_name == self.name:
-            # Note: We can't access the original command here, so this is a fallback
-            return self._extract_bash_key_info(output, "")
-        return output
+    def _ensure_working_directory(self, requested_workdir: str) -> str:
+        """Smart working directory validation and setup."""
+        return self._validate_and_fix_working_directory(requested_workdir)
+
+    def _extract_key_info(self, output: str, command: str = "") -> str:
+        """Extract key information from command output."""
+        return self._extract_bash_key_info(output, command)
 
     def _extract_bash_key_info(self, output: str, command: str = "") -> str:
         """Extract key information from bash output with aggressive truncation for verbose commands."""
@@ -187,76 +188,315 @@ class BashTool(BaseTool):
         
         return output
 
-    def execute(self, command: str, working_directory: Optional[str] = None) -> ToolResult:
+    def execute(self, command: str, workdir: str = "/workspace") -> ToolResult:
         """
-        Execute a bash command in the container.
-
+        Execute a bash command in the Docker container with enhanced monitoring.
+        
         Args:
-            command: The command to execute.
-            working_directory: The directory to execute the command in.
+            command: The bash command to execute
+            workdir: Working directory (default: /workspace)
         """
-        if not command:
-            return ToolResult.error("Command cannot be empty.", error_code="EMPTY_COMMAND")
-            
-        logger.info(f"Executing bash command: {command}")
         
-        # Use the orchestrator to execute the command with the specified working directory
-        result = self.docker_orchestrator.execute_command(command, workdir=working_directory)
-        
-        if result["success"]:
-            # Apply our custom bash-specific extraction based on COMMAND, not output
-            extracted_output = self._extract_bash_key_info(result["output"], command)
-            return ToolResult(
-                success=True, 
-                output=extracted_output, 
-                metadata={"exit_code": result["exit_code"], "original_command": command}
-            )
-        else:
-            exit_code = result['exit_code']
-            output = result['output']
-            
-            # Provide more specific error messages based on exit code
-            if exit_code == 127:
-                error_message = "Command Not Found (exit code 127)"
-                suggestions = [
-                    "The command was not found in the system PATH.",
-                    "Check if the command is installed: which <command>",
-                    "For Java tools like 'mvn', ensure JAVA_HOME and M2_HOME are set.",
-                    "Try 'echo $PATH' to check the current PATH environment variable.",
-                    "Install the missing command or verify the spelling.",
-                ]
-            elif exit_code == 126:
-                error_message = "Permission Denied (exit code 126)"
-                suggestions = [
-                    "The command file exists but is not executable.",
-                    "Try 'chmod +x <command>' to make it executable.",
-                    "Check file permissions with 'ls -la <command>'.",
-                ]
-            elif exit_code == 2:
-                error_message = "File Not Found (exit code 2)"
-                suggestions = [
-                    "The specified file or directory does not exist.",
-                    "Check the path and filename for typos.",
-                    "Use 'ls -la' to verify the file exists.",
-                ]
-            else:
-                error_message = f"Command failed with exit code {exit_code}"
-                suggestions = [
-                    "Check the command syntax for errors.",
-                    "Verify that the command and its arguments are correct.",
-                    f"Ensure the working directory '{working_directory}' exists.",
-                    "Try running a simpler command like 'ls -la' to test connectivity."
-                ]
-            
-            if output:
-                error_message += f"\nOutput:\n{output}"
-
+        if not command or not command.strip():
             raise ToolError(
-                message=error_message,
-                suggestions=suggestions,
-                error_code="COMMAND_FAILED",
-                raw_output=output
+                message="Command cannot be empty",
+                suggestions=["Provide a valid bash command to execute"],
+                error_code="EMPTY_COMMAND"
             )
+        
+        if not self.docker_orchestrator:
+            raise ToolError(
+                message="Docker orchestrator not available",
+                suggestions=["Ensure Docker is running and container is available"],
+                error_code="NO_ORCHESTRATOR"
+            )
+        
+        # Smart working directory validation and setup
+        workdir = self._ensure_working_directory(workdir)
+        
+        # Detect if this is a long-running command that needs enhanced monitoring
+        is_long_running_command = self._is_long_running_command(command)
+        
+        try:
+            logger.info(f"Executing bash command: {command}")
+            logger.info(f"Working directory: {workdir}")
+            
+            if is_long_running_command:
+                # Use enhanced monitoring for long-running commands
+                logger.info("🔍 Using enhanced monitoring for long-running command")
+                result = self.docker_orchestrator.execute_command_with_monitoring(
+                    command=command,
+                    workdir=workdir,
+                    silent_timeout=600,  # 10 minutes no output
+                    absolute_timeout=1800,  # 30 minutes total
+                    use_timeout_wrapper=True,
+                    enable_cpu_monitoring=True,
+                    optimize_for_maven=('mvn' in command)
+                )
+            else:
+                # Use regular execution for normal commands
+                result = self.docker_orchestrator.execute_command(command, workdir=workdir)
+            
+            # Handle timeout terminations
+            if result.get('termination_reason'):
+                error_messages = {
+                    'absolute_timeout': f"Command exceeded maximum execution time (30 minutes)",
+                    'silent_timeout': f"Command was silent for too long (10 minutes)",
+                    'monitoring_error': f"Error occurred during command monitoring"
+                }
+                
+                termination_reason = result['termination_reason']
+                error_msg = error_messages.get(termination_reason, f"Command terminated: {termination_reason}")
+                
+                # Include monitoring info in suggestions
+                monitoring_info = result.get('monitoring_info', {})
+                suggestions = [
+                    f"Command was terminated due to: {termination_reason}",
+                    f"Execution time: {monitoring_info.get('execution_time', 0):.1f} seconds",
+                    "Consider breaking down the command into smaller steps",
+                    "Check if the command requires user interaction (not supported in containers)"
+                ]
+                
+                if monitoring_info.get('cpu_warnings', 0) > 0:
+                    suggestions.append(f"CPU warnings detected: {monitoring_info['cpu_warnings']} (possible hang)")
+                
+                return ToolResult(
+                    success=False,
+                    output=result.get('output', ''),
+                    error=error_msg,
+                    suggestions=suggestions,
+                    error_code=f"TIMEOUT_{termination_reason.upper()}",
+                    metadata={
+                        'termination_reason': termination_reason,
+                        'monitoring_info': monitoring_info
+                    }
+                )
+            
+            # Normal command completion
+            if result["success"]:
+                # Extract key information for different command types
+                extracted_output = self._extract_key_info(result["output"], command)
+                
+                return ToolResult(
+                    success=True,
+                    output=extracted_output,
+                    metadata={
+                        'exit_code': result.get('exit_code', 0),
+                        'monitoring_info': result.get('monitoring_info'),
+                        'workdir': workdir,
+                        'is_long_running': is_long_running_command
+                    }
+                )
+            else:
+                return ToolResult(
+                    success=False,
+                    output=result["output"],
+                    error=f"Command failed with exit code {result.get('exit_code', 'unknown')}",
+                    suggestions=[
+                        "Check the command syntax and parameters",
+                        "Verify that required files/directories exist",
+                        "Check container logs for more details",
+                        "Ensure proper permissions for the operation"
+                    ],
+                    error_code="COMMAND_FAILED",
+                    metadata={
+                        'exit_code': result.get('exit_code'),
+                        'monitoring_info': result.get('monitoring_info'),
+                        'workdir': workdir
+                    }
+                )
+        
+        except Exception as e:
+            raise ToolError(
+                message=f"Failed to execute bash command: {str(e)}",
+                suggestions=[
+                    "Check if Docker container is running",
+                    "Verify network connectivity",
+                    "Ensure sufficient disk space in container",
+                    "Check container logs for system errors"
+                ],
+                error_code="EXECUTION_ERROR"
+            )
+
+    def _is_long_running_command(self, command: str) -> bool:
+        """Detect if a command is likely to be long-running and needs enhanced monitoring."""
+        
+        long_running_patterns = [
+            'mvn clean install',
+            'mvn clean compile test',
+            'mvn package',
+            'mvn install',
+            'gradle build',
+            'gradle assemble',
+            'npm install',
+            'npm run build',
+            'docker build',
+            'apt-get update',
+            'apt-get install',
+            'wget',
+            'curl.*-o',  # downloads
+            'git clone',
+            'make',
+            'cmake --build'
+        ]
+        
+        command_lower = command.lower()
+        
+        # Check for explicit patterns
+        for pattern in long_running_patterns:
+            if pattern in command_lower:
+                return True
+        
+        # Check for commands that typically take time
+        time_consuming_commands = ['compile', 'build', 'test', 'install', 'download', 'clone']
+        for keyword in time_consuming_commands:
+            if keyword in command_lower:
+                return True
+        
+        return False
+
+    def _validate_and_fix_working_directory(self, requested_workdir: str) -> str:
+        """
+        Validate working directory exists and fix if needed.
+        
+        PRIORITY LOGIC:
+        1. FIRST: Try to ensure /workspace works (this is the standard)
+        2. SECOND: Try to repair /workspace if it's missing
+        3. LAST RESORT: Fall back to alternative directories only if /workspace is completely broken
+        
+        This ensures clone operations happen in the correct workspace location.
+        """
+        logger.debug(f"🔍 Validating working directory: {requested_workdir}")
+        
+        # PRIORITY 1: If requesting /workspace (or subdirs), try to ensure it works
+        if requested_workdir.startswith("/workspace"):
+            logger.info(f"🎯 PRIORITY: Ensuring /workspace is available for proper project setup")
+            
+            # First check if /workspace exists
+            workspace_check = self.docker_orchestrator.execute_command(
+                "test -d /workspace && echo 'EXISTS' || echo 'MISSING'", 
+                workdir=None
+            )
+            
+            if workspace_check["success"] and "EXISTS" in workspace_check["output"]:
+                logger.info(f"✅ /workspace exists and is accessible")
+                # Verify the specific subdirectory if needed
+                if requested_workdir != "/workspace":
+                    subdir_check = self.docker_orchestrator.execute_command(
+                        f"test -d {requested_workdir} && echo 'EXISTS' || echo 'MISSING'",
+                        workdir=None
+                    )
+                    if subdir_check["success"] and "EXISTS" in subdir_check["output"]:
+                        logger.debug(f"✅ Subdirectory {requested_workdir} exists")
+                        return requested_workdir
+                    else:
+                        # Try to create the subdirectory
+                        logger.info(f"🔧 Creating subdirectory: {requested_workdir}")
+                        create_subdir = self.docker_orchestrator.execute_command(
+                            f"mkdir -p {requested_workdir} && echo 'CREATED'",
+                            workdir="/workspace"  # Use /workspace as base since it exists
+                        )
+                        if create_subdir["success"] and "CREATED" in create_subdir["output"]:
+                            logger.info(f"✅ Created subdirectory: {requested_workdir}")
+                            return requested_workdir
+                        else:
+                            logger.warning(f"⚠️ Could not create {requested_workdir}, using /workspace")
+                            return "/workspace"
+                else:
+                    return "/workspace"
+            
+            # PRIORITY 2: /workspace is missing, try to repair it
+            logger.warning(f"⚠️ /workspace is missing - attempting repair")
+            repair_steps = [
+                ("mkdir -p /workspace", "Create /workspace directory"),
+                ("chmod 755 /workspace", "Set /workspace permissions"),
+                ("touch /workspace/.sag_workspace_marker", "Create workspace marker"),
+                ("chown root:root /workspace", "Set workspace ownership")
+            ]
+            
+            workspace_repaired = True
+            for repair_cmd, description in repair_steps:
+                logger.info(f"🔧 REPAIR: {description}")
+                repair_result = self.docker_orchestrator.execute_command(repair_cmd, workdir=None)
+                
+                if not repair_result["success"]:
+                    logger.error(f"❌ REPAIR FAILED: {description}")
+                    workspace_repaired = False
+                    break
+                else:
+                    logger.info(f"✅ REPAIR SUCCESS: {description}")
+            
+            if workspace_repaired:
+                # Verify repair worked
+                verify_result = self.docker_orchestrator.execute_command(
+                    "test -d /workspace && test -w /workspace && echo 'REPAIRED' || echo 'FAILED'",
+                    workdir=None
+                )
+                if verify_result["success"] and "REPAIRED" in verify_result["output"]:
+                    logger.info(f"✅ WORKSPACE REPAIRED: /workspace is now available")
+                    
+                    # Now try to create the requested subdirectory if needed
+                    if requested_workdir != "/workspace":
+                        create_result = self.docker_orchestrator.execute_command(
+                            f"mkdir -p {requested_workdir} && echo 'CREATED'",
+                            workdir="/workspace"
+                        )
+                        if create_result["success"]:
+                            logger.info(f"✅ Created requested directory after repair: {requested_workdir}")
+                            return requested_workdir
+                        else:
+                            logger.warning(f"⚠️ Could not create {requested_workdir} after repair, using /workspace")
+                            return "/workspace"
+                    else:
+                        return "/workspace"
+                else:
+                    logger.error(f"❌ WORKSPACE REPAIR VERIFICATION FAILED")
+                    workspace_repaired = False
+            
+            # PRIORITY 3: LAST RESORT - /workspace cannot be repaired
+            if not workspace_repaired:
+                logger.error(f"❌ CRITICAL: Cannot establish /workspace - falling back to alternative directories")
+                logger.error(f"❌ This may cause issues with project cloning and file operations")
+        
+        # For non-workspace directories or as last resort fallback
+        logger.info(f"🔍 Checking alternative directory: {requested_workdir}")
+        check_result = self.docker_orchestrator.execute_command(
+            f"test -d {requested_workdir} && echo 'EXISTS' || echo 'MISSING'", 
+            workdir=None
+        )
+        
+        if check_result["success"] and "EXISTS" in check_result["output"]:
+            logger.debug(f"✅ Alternative directory {requested_workdir} exists")
+            return requested_workdir
+        
+        # Try to create the alternative directory
+        logger.info(f"🔧 Attempting to create alternative directory: {requested_workdir}")
+        create_result = self.docker_orchestrator.execute_command(
+            f"mkdir -p {requested_workdir} && echo 'CREATED' || echo 'FAILED'",
+            workdir=None
+        )
+        
+        if create_result["success"] and "CREATED" in create_result["output"]:
+            logger.warning(f"⚠️ FALLBACK: Using alternative directory: {requested_workdir}")
+            return requested_workdir
+        
+        # Ultimate fallback to known good directories
+        fallback_dirs = ["/root", "/tmp", "/"]
+        
+        for fallback_dir in fallback_dirs:
+            logger.error(f"🆘 ULTIMATE FALLBACK: Trying {fallback_dir}")
+            fallback_check = self.docker_orchestrator.execute_command(
+                f"test -d {fallback_dir} && echo 'EXISTS' || echo 'MISSING'",
+                workdir=None
+            )
+            
+            if fallback_check["success"] and "EXISTS" in fallback_check["output"]:
+                logger.error(f"🆘 USING EMERGENCY FALLBACK: {fallback_dir} (MAJOR ISSUE - workspace unavailable)")
+                return fallback_dir
+        
+        # Last resort: no workdir (let Docker decide)
+        logger.error(f"❌ COMPLETE FAILURE: No working directory available - using container default")
+        return None
 
     def _enhance_grep_command(self, command: str) -> str:
         """Enhance grep commands with helpful default flags."""

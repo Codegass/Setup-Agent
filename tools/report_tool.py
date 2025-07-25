@@ -208,235 +208,293 @@ class ReportTool(BaseTool):
 
     def _reconcile_status(self, claimed_status: str, evidence_status: str, accomplishments: dict) -> str:
         """
-        Intelligently reconcile claimed status with evidence-based status.
-        CRITICAL FIX: Base success on actual build/test results, not action success rate.
+        Reconcile claimed status with evidence-based status.
+        New logic: Based on three core steps (clone, build, test)
         """
-        # CRITICAL CHANGE: For project setup, evidence-based assessment is AUTHORITATIVE
-        # We should never override technical evidence with action success rates
+        # Extract core step results
+        repository_cloned = accomplishments.get('repository_cloned', False)
+        build_success = accomplishments.get('build_success', False) 
+        test_success = accomplishments.get('test_success', False)
         
-        # If evidence shows failed, always use that (something core didn't work)
+        logger.info(f"🔍 Status reconciliation - Claimed: '{claimed_status}', Evidence: '{evidence_status}'")
+        logger.info(f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}")
+        
+        # Evidence-based status is authoritative for core technical failures
         if evidence_status == "failed":
-            logger.warning("🚨 Evidence shows project setup failed - technical issues detected")
+            if not repository_cloned:
+                logger.error("❌ Repository clone failed - cannot proceed")
+            elif not build_success:
+                logger.error("❌ Build failed - compilation issues prevent success")
             return "failed"
         
-        # CRITICAL: If evidence shows partial (e.g., build succeeded but tests failed)
-        # NEVER upgrade to success based on action count - technical results are definitive
+        # For partial status, check if user's assessment makes sense
         if evidence_status == "partial":
-            # For Maven projects, partial means either:
-            # 1. Compilation succeeded but tests failed (need to identify failed tests)
-            # 2. Project was cloned but build failed
-            # 3. Some components worked but critical ones didn't
-            
-            maven_compile_success = accomplishments.get('maven_compile_success', False)
-            maven_test_success = accomplishments.get('maven_test_success', False)
-            
-            if maven_compile_success and not maven_test_success:
-                logger.warning("🔨 Build succeeded but tests failed - this is PARTIAL success, not full success")
-                logger.warning("💡 Need to identify which tests failed and why")
-            elif not maven_compile_success:
-                logger.warning("🚨 Build compilation failed - cannot be considered success")
-                
-            # NEVER upgrade partial to success based on action success rate
-            logger.info(f"🎯 Evidence-based status '{evidence_status}' is definitive for technical assessments")
-            return "partial"
+            if repository_cloned and build_success and not test_success:
+                logger.info("✅ Partial status confirmed: clone + build succeeded, tests failed")
+                return "partial"
+            elif not build_success:
+                logger.warning("❌ Build failed but tests may not have run - status remains failed")
+                return "failed"
         
-        # If evidence shows success, trust it (all builds and tests passed)
+        # If evidence shows success, trust it
         if evidence_status == "success":
-            logger.info("✅ Evidence confirms genuine success - all builds and tests passed")
+            logger.info("✅ Success status confirmed by evidence")
             return "success"
         
-        # Fallback: if evidence is unclear, prefer the more conservative assessment
-        if claimed_status == "success" and evidence_status != "success":
-            logger.warning("🤔 Claimed success but evidence unclear - defaulting to partial")
-            return "partial"
-        
-        return evidence_status or claimed_status
+        # Default to evidence-based assessment
+        logger.info(f"🎯 Using evidence-based status: '{evidence_status}'")
+        return evidence_status
 
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
         """Verify the claimed status against actual execution history."""
-        if not self.execution_history_callback:
-            logger.warning("No execution history available for verification")
-            return claimed_status, {}
+        # Initialize accomplishments
+        actual_accomplishments = {
+            'repository_cloned': False,
+            'build_success': False,
+            'test_success': False,
+            'tools_successful': [],
+            'tools_failed': [],
+            'total_actions': 0,
+            'successful_actions': 0,
+            'detailed_results': {}  # Store detailed results for debugging
+        }
         
-        try:
-            # Get execution history from callback
-            history = self.execution_history_callback()
+        # Method 1: Check current session execution history
+        if self.execution_history_callback:
+            try:
+                # Get execution history from callback
+                history = self.execution_history_callback()
+                self._analyze_execution_steps(history, actual_accomplishments)
+            except Exception as e:
+                logger.warning(f"Failed to get execution history from callback: {e}")
+        
+        # Method 2: Check project context for completed tasks (more comprehensive)
+        if self.context_manager:
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context:
+                    self._analyze_completed_tasks(trunk_context, actual_accomplishments)
+                    logger.info(f"📊 Analyzed {len(trunk_context.todo_list)} tasks from project context")
+            except Exception as e:
+                logger.warning(f"Failed to get project context: {e}")
+        
+        # Determine actual status based on accomplishments
+        actual_status = self._determine_actual_status(actual_accomplishments)
+        
+        # Smart status reconciliation
+        if actual_status != claimed_status:
+            logger.warning(f"🔍 Status verification: Claimed '{claimed_status}' but evidence suggests '{actual_status}'")
+            logger.info(f"🔍 Actual accomplishments: {actual_accomplishments}")
             
-            # Analyze history for actual accomplishments
-            actual_accomplishments = {
-                'repository_cloned': False,
-                'project_detected': False,
-                'maven_compile_success': False,
-                'maven_test_success': False,
-                'environment_setup': True,  # Assume this is always true if we're running
-                'tools_successful': [],
-                'tools_failed': [],
-                'total_actions': 0,
-                'successful_actions': 0,
-                'test_details': {} # Initialize for detailed test analysis
-            }
+            # Reconcile the status
+            reconciled_status = self._reconcile_status(claimed_status, actual_status, actual_accomplishments)
+            logger.info(f"🤝 Status reconciled: Using '{reconciled_status}' as final status")
+            return reconciled_status, actual_accomplishments
+        
+        return actual_status, actual_accomplishments
+    
+    def _analyze_execution_steps(self, history: list, actual_accomplishments: dict):
+        """Analyze execution steps from current session history."""
+        for step in history:
+            # Handle ReActStep objects
+            if hasattr(step, 'step_type') and step.step_type == 'action' and hasattr(step, 'tool_result'):
+                tool_name = step.tool_name
+                tool_result = step.tool_result
+                tool_params = step.tool_params
+            # Handle dict format
+            elif isinstance(step, dict) and step.get('step_type') == 'action' and step.get('tool_result'):
+                tool_name = step.get('tool_name')
+                tool_result = step.get('tool_result')
+                tool_params = step.get('tool_params', {})
+            else:
+                continue
+                
+            actual_accomplishments['total_actions'] += 1
             
-            # Parse execution steps - handle both dict and object formats
-            for step in history:
-                # Handle ReActStep objects
-                if hasattr(step, 'step_type') and step.step_type == 'action' and hasattr(step, 'tool_result'):
-                    tool_name = step.tool_name
-                    tool_result = step.tool_result
-                    tool_params = step.tool_params
-                # Handle dict format
-                elif isinstance(step, dict) and step.get('step_type') == 'action' and step.get('tool_result'):
-                    tool_name = step.get('tool_name')
-                    tool_result = step.get('tool_result')
-                    tool_params = step.get('tool_params', {})
-                else:
-                    continue
-                    
-                actual_accomplishments['total_actions'] += 1
+            # Handle both object and dict format for tool_result
+            if hasattr(tool_result, 'success'):
+                # ToolResult object
+                success = tool_result.success
+                output = tool_result.output
+            elif isinstance(tool_result, dict):
+                # Dictionary format
+                success = tool_result.get('success', False)
+                output = tool_result.get('output', '')
+            else:
+                # Unknown format, assume failure
+                success = False
+                output = str(tool_result)
+            
+            if success:
+                actual_accomplishments['successful_actions'] += 1
+                actual_accomplishments['tools_successful'].append(tool_name)
                 
-                # Handle both object and dict format for tool_result
-                if hasattr(tool_result, 'success'):
-                    # ToolResult object
-                    success = tool_result.success
-                    output = tool_result.output
-                elif isinstance(tool_result, dict):
-                    # Dictionary format
-                    success = tool_result.get('success', False)
-                    output = tool_result.get('output', '')
-                else:
-                    # Unknown format, assume failure
-                    success = False
-                    output = str(tool_result)
+                # STEP 1: Check for repository clone
+                if tool_name == 'project_setup':
+                    if tool_params.get('action') == 'clone':
+                        actual_accomplishments['repository_cloned'] = True
+                        logger.info("✅ Repository clone detected as successful")
                 
-                if success:
-                    actual_accomplishments['successful_actions'] += 1
-                    actual_accomplishments['tools_successful'].append(tool_name)
+                # STEP 2: Check for build success (multiple build systems)
+                elif tool_name in ['maven', 'gradle', 'bash']:
+                    command = tool_params.get('command', '').lower()
                     
-                    # Check for specific accomplishments
-                    if tool_name == 'project_setup':
-                        if tool_params.get('action') == 'clone':
-                            actual_accomplishments['repository_cloned'] = True
-                        elif tool_params.get('action') == 'detect_project_type':
-                            actual_accomplishments['project_detected'] = True
+                    # Maven build detection - support multiple patterns
+                    if tool_name == 'maven':
+                        # Check for explicit build commands OR generic maven success
+                        is_build_command = any(cmd in command for cmd in ['compile', 'package', 'install']) or command == ''
+                        has_build_success = any(pattern in output for pattern in ['BUILD SUCCESS', 'Maven build completed successfully', 'build completed successfully'])
+                        
+                        if is_build_command and has_build_success:
+                            actual_accomplishments['build_success'] = True
+                            logger.info(f"✅ Maven build success detected: {command or 'default goal'}")
                     
-                    elif tool_name == 'maven':
-                        command = tool_params.get('command', '').lower()
+                    # Gradle build detection  
+                    elif tool_name == 'gradle' and any(cmd in command for cmd in ['build', 'compile', 'assemble']) and 'BUILD SUCCESSFUL' in output:
+                        actual_accomplishments['build_success'] = True
+                        logger.info(f"✅ Gradle build success detected: {command}")
+                    
+                    # Generic build via bash (npm, make, etc.)
+                    elif tool_name == 'bash':
+                        if any(build_cmd in command for build_cmd in ['npm run build', 'make', 'cargo build', 'go build']):
+                            # Check exit code or common success indicators
+                            if 'error' not in output.lower() and 'failed' not in output.lower():
+                                actual_accomplishments['build_success'] = True
+                                logger.info(f"✅ Build success detected via bash: {command}")
+                
+                # STEP 3: Check for test success (multiple test frameworks)
+                if tool_name in ['maven', 'gradle', 'bash']:
+                    command = tool_params.get('command', '').lower()
+                    
+                    # Maven test detection - enhanced patterns
+                    if tool_name == 'maven':
+                        # Check for test commands OR generic maven success with test results
+                        is_test_command = 'test' in command or command == ''
+                        has_test_success = any(pattern in output for pattern in ['BUILD SUCCESS', 'Maven build completed successfully', 'build completed successfully'])
+                        has_test_results = 'Tests run:' in output or 'tests run' in output.lower()
                         
-                        if 'compile' in command and 'BUILD SUCCESS' in output:
-                            actual_accomplishments['maven_compile_success'] = True
-                        
-                        if 'test' in command and 'BUILD SUCCESS' in output and 'Tests run:' in output:
-                            # Verify test results
+                        if is_test_command and has_test_success and has_test_results:
+                            # Parse test results - support multiple formats
                             import re
-                            test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
-                            if test_match:
-                                total_tests = int(test_match.group(1))
-                                failed_tests = int(test_match.group(2))
-                                test_errors = int(test_match.group(3))
-                                actual_accomplishments['test_details'] = {
-                                    'total_tests': total_tests,
-                                    'failed_tests': [],
-                                    'test_errors': []
-                                }
-                                if failed_tests > 0:
-                                    actual_accomplishments['test_details']['failed_tests'] = [f"Test {i+1}" for i in range(failed_tests)]
-                                if test_errors > 0:
-                                    actual_accomplishments['test_details']['test_errors'] = [f"Error {i+1}" for i in range(test_errors)]
-                                # CRITICAL FIX: Only mark as success if NO failures and NO errors
-                                actual_accomplishments['maven_test_success'] = (failed_tests == 0 and test_errors == 0)
-                else:
-                    actual_accomplishments['tools_failed'].append(tool_name)
-            
-            # Determine actual status based on accomplishments
-            actual_status = self._determine_actual_status(actual_accomplishments)
-            
-            # CRITICAL FIX: Smart status reconciliation instead of harsh override
-            # If agent claims success but evidence suggests otherwise, use smart reconciliation
-            if actual_status != claimed_status:
-                logger.warning(f"🔍 Status verification: Claimed '{claimed_status}' but evidence suggests '{actual_status}'")
-                logger.info(f"🔍 Actual accomplishments: {actual_accomplishments}")
+                            test_patterns = [
+                                r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)',  # Standard format
+                                r'Tests: (\d+) run, (\d+) failures, (\d+) errors'      # Alternative format
+                            ]
+                            
+                            for pattern in test_patterns:
+                                test_match = re.search(pattern, output)
+                                if test_match:
+                                    if len(test_match.groups()) == 3:
+                                        total_tests = int(test_match.group(1))
+                                        failures = int(test_match.group(2))
+                                        errors = int(test_match.group(3))
+                                    else:
+                                        # Handle different group arrangements
+                                        total_tests = int(test_match.group(1))
+                                        failures = int(test_match.group(2))
+                                        errors = int(test_match.group(3))
+                                    
+                                    if failures == 0 and errors == 0:
+                                        actual_accomplishments['test_success'] = True
+                                        logger.info(f"✅ Maven tests passed: {total_tests} tests, 0 failures")
+                                    else:
+                                        logger.warning(f"⚠️ Maven tests had issues: {failures} failures, {errors} errors")
+                                    break
+                    
+                    # Gradle test detection
+                    elif tool_name == 'gradle' and 'test' in command and 'BUILD SUCCESSFUL' in output:
+                        # Look for test results or assume success if build successful
+                        if 'failed' not in output.lower():
+                            actual_accomplishments['test_success'] = True
+                            logger.info(f"✅ Gradle tests passed")
+                    
+                    # Generic test via bash (npm test, pytest, etc.)
+                    elif tool_name == 'bash' and any(test_cmd in command for test_cmd in ['npm test', 'pytest', 'go test', 'cargo test']):
+                        if 'failed' not in output.lower() and 'error' not in output.lower():
+                            actual_accomplishments['test_success'] = True
+                            logger.info(f"✅ Tests passed via bash: {command}")
                 
-                # SMART RECONCILIATION: Consider agent's assessment and context
-                reconciled_status = self._reconcile_status(claimed_status, actual_status, actual_accomplishments)
-                logger.info(f"🤝 Status reconciled: Using '{reconciled_status}' as final status")
-                return reconciled_status, actual_accomplishments
-            
-            return actual_status, actual_accomplishments
-            
-        except Exception as e:
-            logger.error(f"Failed to verify execution history: {e}")
-            return claimed_status, {}
+                # Store detailed results for debugging
+                actual_accomplishments['detailed_results'][f"{tool_name}_{actual_accomplishments['total_actions']}"] = {
+                    'tool': tool_name,
+                    'command': tool_params.get('command', ''),
+                    'success': success,
+                    'output_snippet': output[:200] if output else ""
+                }
+                
+            else:
+                actual_accomplishments['tools_failed'].append(tool_name)
+    
+    def _analyze_completed_tasks(self, trunk_context, actual_accomplishments: dict):
+        """Analyze completed tasks from project context to determine core accomplishments."""
+        if not trunk_context or not trunk_context.todo_list:
+            return
+        
+        for task in trunk_context.todo_list:
+            if task.status.value == "completed":
+                task_desc = task.description.lower()
+                key_results = getattr(task, 'key_results', '') or ''
+                
+                # Check for repository clone
+                if any(keyword in task_desc for keyword in ['clone', 'repository', 'setup']):
+                    if any(indicator in key_results.lower() for indicator in ['repository path', 'cloned', 'commons-cli']):
+                        actual_accomplishments['repository_cloned'] = True
+                        logger.info(f"✅ Repository clone confirmed from task: {task.description[:50]}...")
+                
+                # Check for build success
+                if any(keyword in task_desc for keyword in ['compile', 'build', 'maven']):
+                    if any(indicator in key_results.lower() for indicator in ['artifacts:', 'target/', 'compiled', 'build']):
+                        actual_accomplishments['build_success'] = True
+                        logger.info(f"✅ Build success confirmed from task: {task.description[:50]}...")
+                
+                # Check for test success
+                if any(keyword in task_desc for keyword in ['test', 'run test']):
+                    test_indicators = [
+                        'tests passed', 'test reports', 'all tests', 'surefire-reports',
+                        'tests_passed=true', 'tests_passed": true', 'build success',
+                        'exit_code=0', 'mvn.*success', 'test.*success'
+                    ]
+                    if any(indicator in key_results.lower() for indicator in test_indicators):
+                        actual_accomplishments['test_success'] = True
+                        logger.info(f"✅ Test success confirmed from task: {task.description[:50]}...")
+                
+                # Count successful completion
+                actual_accomplishments['total_actions'] += 1
+                actual_accomplishments['successful_actions'] += 1
 
     def _determine_actual_status(self, accomplishments: dict) -> str:
         """
-        Determine the actual status based on verifiable accomplishments.
-        ENHANCED: Detailed analysis of build and test results with failure attribution.
+        Determine the actual status based on three core steps: clone, build, test.
+        Logic:
+        - All success = success
+        - Clone or build failed = failed  
+        - Only test failed = partial
         """
-        # CRITICAL: Maven project success requires BOTH compilation AND all tests passing
-        maven_compile_success = accomplishments.get('maven_compile_success', False)
-        maven_test_success = accomplishments.get('maven_test_success', False)
-        
-        # Analyze test results in detail
-        test_details = accomplishments.get('test_details', {})
-        failed_tests = test_details.get('failed_tests', [])
-        test_errors = test_details.get('test_errors', [])
-        total_tests = test_details.get('total_tests', 0)
-        
-        if maven_test_success and maven_compile_success:
-            logger.info("✅ Complete success: Compilation and all tests passed")
-            return "success"
-        elif maven_compile_success and not maven_test_success:
-            # Compilation succeeded but tests failed - this is PARTIAL success
-            if total_tests > 0:
-                failed_count = len(failed_tests) + len(test_errors)
-                logger.warning(f"🔨 Partial success: Build OK, but {failed_count}/{total_tests} tests failed")
-                
-                # Log specific test failures for debugging
-                if failed_tests:
-                    logger.warning(f"❌ Failed tests: {', '.join(failed_tests[:5])}")  # Show first 5
-                if test_errors:
-                    logger.warning(f"💥 Test errors: {', '.join(test_errors[:3])}")  # Show first 3
-            else:
-                logger.warning("🔨 Partial success: Build OK, but test execution had issues")
-            return "partial"
-        elif not maven_compile_success:
-            logger.warning("🚨 Build compilation failed - cannot proceed to testing")
-            
-            # Check what we DID accomplish
-            if accomplishments.get('project_detected'):
-                logger.info("📋 Project was detected and analyzed correctly")
-                return "partial"  # At least project setup worked
-            elif accomplishments.get('repository_cloned'):
-                logger.info("📥 Repository was cloned successfully")
-                return "partial"  # Basic setup worked
-            else:
-                logger.error("💥 Complete failure - even basic setup failed")
-                return "failed"
-        
-        # For non-Maven projects or unclear situations
+        # Extract the three core indicators
         repository_cloned = accomplishments.get('repository_cloned', False)
-        project_detected = accomplishments.get('project_detected', False)
-        environment_setup = accomplishments.get('environment_setup', False)
+        build_success = accomplishments.get('build_success', False) 
+        test_success = accomplishments.get('test_success', False)
         
-        if repository_cloned and project_detected and environment_setup:
-            logger.info("📋 Basic project setup completed successfully")
-            return "partial"  # Good foundation but no build/test validation
-        elif repository_cloned:
-            logger.warning("📥 Repository cloned but project analysis incomplete")
-            return "partial"
-        else:
-            # Last resort: check action success rate (only as fallback indicator)
-            total = accomplishments.get('total_actions', 0)
-            successful = accomplishments.get('successful_actions', 0)
-            if total > 0:
-                success_rate = successful / total
-                logger.warning(f"📊 Fallback assessment based on {success_rate:.1%} action success rate")
-                if success_rate >= 0.8:
-                    return "partial"  # High success rate suggests partial completion
-                else:
-                    return "failed"
-            
-            logger.error("💥 No clear indicators of success")
+        logger.info(f"🔍 Core status check - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}")
+        
+        # Step 1: Check if repository was cloned
+        if not repository_cloned:
+            logger.error("❌ Repository clone failed - this is a fundamental failure")
             return "failed"
+        
+        # Step 2: Check if build completed successfully  
+        if not build_success:
+            logger.error("❌ Build failed - cannot proceed without successful compilation")
+            return "failed"
+        
+        # Step 3: Check if tests passed
+        if not test_success:
+            logger.warning("⚠️ Tests failed - build succeeded but verification incomplete")
+            return "partial"
+        
+        # All three core steps succeeded
+        logger.info("✅ All core steps succeeded: clone + build + test")
+        return "success"
 
     def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None) -> str:
         """Generate console-formatted report."""
@@ -911,41 +969,3 @@ class ReportTool(BaseTool):
             },
             "required": ["action"],
         }
-
-    def get_usage_example(self) -> str:
-        """Get usage examples for the report tool."""
-        return """
-Report Tool Usage Examples:
-
-IMPORTANT: The summary and details should be based on your actual work and analysis, not generic text.
-
-1. Generate successful completion report:
-   report(action="generate", 
-          summary="Successfully cloned Apache Commons CLI repository, detected Maven project structure, compiled all modules with zero errors, and executed 127 tests with 100% pass rate. Environment is fully configured and ready for development.",
-          status="success",
-          details="Cloned repository from https://github.com/apache/commons-cli.git to /workspace/commons-cli. Detected Maven multi-module project with 3 modules. All dependencies resolved successfully. Build completed in 45 seconds. All 127 unit tests passed including integration tests.")
-
-2. Generate partial success report:
-   report(action="generate", 
-          summary="Repository cloned and project compiled successfully, but 3 test failures prevent complete validation. Core functionality appears working.",
-          status="partial", 
-          details="Maven compilation succeeded for all modules. However, 3 out of 127 tests failed due to timestamp-related assertions in DateUtilsTest. These appear to be flaky tests and don't affect core CLI parsing functionality.")
-
-3. Generate failure report:
-   report(action="generate", 
-          summary="Setup failed due to Maven dependency resolution errors. Unable to complete project build.",
-          status="failed", 
-          details="Repository cloning succeeded, but Maven build failed with 'Could not resolve dependency org.apache.commons:commons-parent:pom:52'. Network connectivity to Maven Central appears to be the issue.")
-
-CRITICAL GUIDELINES:
-- Always analyze the actual execution results and provide specific, factual details
-- Include concrete numbers (test counts, build times, error counts)
-- Mention specific file paths, URLs, and technical details discovered
-- Don't use generic phrases - base everything on what actually happened
-- The report content will be dynamically enhanced with task status and technical accomplishments
-
-Note: 
-- Using this tool marks the task as completed and stops the ReAct loop
-- Automatically generates both console output and a Markdown file in /workspace
-- Report includes dynamic sections based on trunk context and execution results
-""" 

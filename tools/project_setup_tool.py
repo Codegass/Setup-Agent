@@ -558,7 +558,37 @@ class ProjectSetupTool(BaseTool):
         documentation_links = []
         error_code = "CLONE_ERROR"
         
-        if "fatal: repository" in output and "not found" in output:
+        # CRITICAL FIX: Before treating as error, verify if clone actually succeeded
+        # Sometimes git clone outputs warnings but still succeeds
+        if "already exists" in output:
+            # Check if the target directory contains a valid git repository
+            verification_result = self._verify_clone_success(target_directory)
+            if verification_result["success"]:
+                logger.info(f"✅ Clone succeeded despite 'already exists' warning")
+                logger.info(f"✅ Verified git repository at: {target_directory}")
+                
+                # Return success with the verification info
+                return ToolResult(
+                    success=True,
+                    output=f"Repository cloned successfully to {target_directory}",
+                    metadata={
+                        "repository_url": repository_url,
+                        "target_directory": target_directory,
+                        "verification_details": verification_result["details"],
+                        "clone_warning": "Directory already existed but clone succeeded"
+                    }
+                )
+            else:
+                # Actually failed due to directory conflict
+                error_code = "DIRECTORY_EXISTS"
+                error_suggestions.extend([
+                    f"Directory '{target_directory}' already exists and contains conflicting content",
+                    "Use a different target directory name",
+                    "Remove the existing directory first: bash(command='rm -rf {target_directory}')",
+                    "Or use project_setup with a different target_directory parameter"
+                ])
+        
+        elif "fatal: repository" in output and "not found" in output:
             error_code = "REPOSITORY_NOT_FOUND"
             error_suggestions.extend([
                 "Verify the repository URL is correct",
@@ -574,15 +604,6 @@ class ProjectSetupTool(BaseTool):
                 "Verify DNS resolution is working",
                 "Try using HTTPS instead of SSH URLs",
                 "Check if firewall is blocking the connection"
-            ])
-        
-        elif "already exists" in output:
-            error_code = "DIRECTORY_EXISTS"
-            error_suggestions.extend([
-                f"Directory '{target_directory}' already exists",
-                "Use a different target directory name",
-                "Remove the existing directory first: bash(command='rm -rf {target_directory}')",
-                "Or use project_setup with a different target_directory parameter"
             ])
         
         elif "Permission denied" in output:
@@ -615,6 +636,111 @@ class ProjectSetupTool(BaseTool):
                 "command": command
             }
         )
+
+    def _verify_clone_success(self, target_directory: str) -> Dict[str, Any]:
+        """
+        Verify if a git clone operation actually succeeded by checking the target directory.
+        
+        Returns:
+            Dict with 'success' (bool) and 'details' (str) keys
+        """
+        try:
+            # CRITICAL FIX: Properly handle path construction for verification
+            # The target_directory might be:
+            # 1. Just the repo name (e.g., "commons-cli") - relative to working directory
+            # 2. An absolute path (e.g., "/workspace/commons-cli")
+            # 3. Incorrectly set to working directory itself (e.g., "/workspace")
+            
+            if target_directory.startswith('/'):
+                # Absolute path - use as is, but check if it's actually the working directory
+                if target_directory == "/workspace":
+                    # CRITICAL: If target_directory is just "/workspace", this is a bug!
+                    # The actual cloned repo should be in a subdirectory
+                    # Try to find the actual repository directory
+                    logger.warning(f"🐛 BUG DETECTED: target_directory is '{target_directory}' which is the working directory itself")
+                    
+                    # Look for git repositories in the workspace
+                    find_git_cmd = "find /workspace -maxdepth 1 -type d -name '.git' -exec dirname {} \\;"
+                    find_result = self.orchestrator.execute_command(find_git_cmd, workdir=None)
+                    
+                    if find_result.get("success") and find_result.get("output", "").strip():
+                        # Found git repositories, use the first one
+                        git_dirs = [d.strip() for d in find_result["output"].strip().split('\n') if d.strip()]
+                        if git_dirs:
+                            check_path = git_dirs[0]
+                            logger.info(f"🔧 AUTOFIX: Found git repository at {check_path}, using as check_path")
+                        else:
+                            check_path = target_directory
+                    else:
+                        # Fallback: Look for any subdirectories that might be the repo
+                        find_dirs_cmd = "find /workspace -maxdepth 1 -type d ! -name '.*' ! -name 'workspace' | grep -v '^/workspace$'"
+                        dirs_result = self.orchestrator.execute_command(find_dirs_cmd, workdir=None)
+                        
+                        if dirs_result.get("success") and dirs_result.get("output", "").strip():
+                            dirs = [d.strip() for d in dirs_result["output"].strip().split('\n') if d.strip()]
+                            if dirs:
+                                # Check if any of these directories contains .git
+                                for potential_repo in dirs:
+                                    git_test = self.orchestrator.execute_command(f"test -d '{potential_repo}/.git' && echo 'FOUND'", workdir=None)
+                                    if git_test.get("success") and "FOUND" in git_test.get("output", ""):
+                                        check_path = potential_repo
+                                        logger.info(f"🔧 AUTOFIX: Found git repository at {check_path}")
+                                        break
+                                else:
+                                    check_path = target_directory
+                            else:
+                                check_path = target_directory
+                        else:
+                            check_path = target_directory
+                else:
+                    check_path = target_directory
+            else:
+                # Relative path - assume it's relative to /workspace (the standard working directory)
+                check_path = f"/workspace/{target_directory}"
+            
+            logger.debug(f"🔍 Verifying clone success at path: {check_path}")
+            
+            # Check if directory exists and contains .git
+            git_check = self.orchestrator.execute_command(f"test -d '{check_path}/.git' && echo 'HAS_GIT' || echo 'NO_GIT'", workdir=None)
+            
+            if git_check.get("success") and "HAS_GIT" in git_check.get("output", ""):
+                # Further verify it's a valid git repository
+                verify_cmd = f"cd '{check_path}' && git status 2>/dev/null && echo 'VALID_REPO' || echo 'INVALID_REPO'"
+                verify_result = self.orchestrator.execute_command(verify_cmd, workdir=None)
+                
+                if verify_result.get("success") and "VALID_REPO" in verify_result.get("output", ""):
+                    # Get some details about the repository
+                    details_cmd = f"cd '{check_path}' && git remote -v | head -1"
+                    details_result = self.orchestrator.execute_command(details_cmd, workdir=None)
+                    
+                    logger.info(f"✅ VERIFICATION SUCCESS: Valid git repository at {check_path}")
+                    
+                    return {
+                        "success": True,
+                        "details": f"Valid git repository found at {check_path}. " + 
+                                 (details_result.get("output", "").strip() if details_result.get("success") else "")
+                    }
+                else:
+                    logger.warning(f"❌ VERIFICATION FAILED: Directory {check_path} exists but git status failed")
+                    logger.debug(f"Git status output: {verify_result.get('output', 'no output')}")
+                    return {
+                        "success": False,
+                        "details": f"Directory {check_path} exists but is not a valid git repository"
+                    }
+            else:
+                logger.warning(f"❌ VERIFICATION FAILED: No .git directory found at {check_path}")
+                logger.debug(f"Git check output: {git_check.get('output', 'no output')}")
+                return {
+                    "success": False,
+                    "details": f"Directory {check_path} does not exist or does not contain .git"
+                }
+                
+        except Exception as e:
+            logger.warning(f"Clone verification failed with exception: {e}")
+            return {
+                "success": False,
+                "details": f"Verification failed due to exception: {str(e)}"
+            }
     
     def _install_dependencies(self, working_directory: str) -> ToolResult:
         """Install dependencies based on detected project type."""

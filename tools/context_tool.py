@@ -774,77 +774,40 @@ class ContextTool(BaseTool):
 
     def _format_human_friendly_todo_list(self, todo_list: List[Dict[str, Any]]) -> str:
         """
-        Format TODO list in human-readable format with borders and checkboxes.
+        Format TODO list in clean checkbox style.
         Makes it easy to track project setup progress at a glance.
         """
         if not todo_list:
             return "\n📋 No tasks in TODO list\n"
         
-        # Calculate box width based on longest task description
-        max_width = max(len(task.get('description', '')) for task in todo_list)
-        box_width = min(max(max_width + 10, 60), 100)  # Between 60-100 chars
+        output = f"\n📋 PROJECT SETUP TODO LIST ({len(todo_list)} tasks):\n\n"
         
-        output = f"\n{'=' * box_width}\n"
-        output += f"📋 PROJECT SETUP TODO LIST ({len(todo_list)} tasks)\n"
-        output += f"{'=' * box_width}\n"
-        
-        for i, task in enumerate(todo_list, 1):
+        for task in todo_list:
             status = task.get('status', 'pending')
             description = task.get('description', 'No description')
-            task_id = task.get('id', f'task_{i}')
             
-            # Status checkbox
+            # Status checkbox - using simple Unicode checkboxes
             if status == 'completed':
-                checkbox = '✅ [x]'
-                status_icon = '✅'
+                checkbox = '☒'  # Checked box
             elif status == 'in_progress':
-                checkbox = '🔄 [~]'
-                status_icon = '🔄'
+                checkbox = '⬚'  # Square with progress
             elif status == 'failed':
-                checkbox = '❌ [!]'
-                status_icon = '❌'
+                checkbox = '☒'  # Checked (but failed)
             else:  # pending
-                checkbox = '⭕ [ ]'
-                status_icon = '⭕'
+                checkbox = '☐'  # Empty box
             
-            # Highlight CORE SETUP tasks
-            if any(keyword in description for keyword in ['🚨 CORE SETUP', 'build', 'test']):
-                priority_marker = ' 🚨'
-                if status == 'completed':
-                    priority_marker = ' 🎯✅'
-            else:
-                priority_marker = ''
+            # Clean task line
+            output += f"   {checkbox} {description}\n"
             
-            # Format task line
-            task_line = f"{checkbox} {task_id}: {description}{priority_marker}"
-            
-            # Truncate if too long, but preserve important parts
-            if len(task_line) > box_width - 4:
-                truncated_desc = description[:box_width - 20] + "..."
-                task_line = f"{checkbox} {task_id}: {truncated_desc}{priority_marker}"
-            
-            output += f"│ {task_line:<{box_width-4}} │\n"
-            
-            # Add additional info for in-progress/completed tasks
-            if status in ['in_progress', 'completed']:
-                started_at = task.get('started_at', '')
-                if started_at:
-                    time_info = f"   ⏰ Started: {started_at[:19] if len(started_at) > 19 else started_at}"
-                    output += f"│ {time_info:<{box_width-4}} │\n"
-                
-                if status == 'completed':
-                    completed_at = task.get('completed_at', '')
-                    key_results = task.get('key_results', '')
-                    if completed_at:
-                        time_info = f"   ✅ Completed: {completed_at[:19] if len(completed_at) > 19 else completed_at}"
-                        output += f"│ {time_info:<{box_width-4}} │\n"
-                    if key_results:
-                        # Show first 60 chars of key results
-                        results_preview = key_results[:60] + "..." if len(key_results) > 60 else key_results
-                        results_info = f"   🔑 Results: {results_preview}"
-                        output += f"│ {results_info:<{box_width-4}} │\n"
-        
-        output += f"{'=' * box_width}\n"
+            # Add key results for completed tasks on next line
+            if status == 'completed' and task.get('key_results'):
+                key_results = task.get('key_results', '')
+                # Show abbreviated results
+                if len(key_results) > 80:
+                    results_preview = key_results[:80] + "..."
+                else:
+                    results_preview = key_results
+                output += f"      └─ {results_preview}\n"
         
         # Summary statistics
         completed = sum(1 for task in todo_list if task.get('status') == 'completed')
@@ -852,23 +815,20 @@ class ContextTool(BaseTool):
         failed = sum(1 for task in todo_list if task.get('status') == 'failed')
         pending = len(todo_list) - completed - in_progress - failed
         
-        # Highlight CORE SETUP progress
-        core_tasks = [task for task in todo_list if '🚨 CORE SETUP' in task.get('description', '')]
-        core_completed = sum(1 for task in core_tasks if task.get('status') == 'completed')
-        
-        output += f"📊 Progress: {completed}/{len(todo_list)} completed"
+        output += f"\n📊 Progress: {completed}/{len(todo_list)} completed"
         if in_progress > 0:
-            output += f", {in_progress} in progress"
+            output += f", {in_progress} active"
         if failed > 0:
             output += f", {failed} failed"
         if pending > 0:
             output += f", {pending} pending"
         output += f"\n"
         
+        # Highlight CORE SETUP progress
+        core_tasks = [task for task in todo_list if '🚨 CORE SETUP' in task.get('description', '')]
         if core_tasks:
-            output += f"🚨 CORE SETUP: {core_completed}/{len(core_tasks)} build/test tasks completed\n"
-        
-        output += f"{'=' * box_width}\n"
+            core_completed = sum(1 for task in core_tasks if task.get('status') == 'completed')
+            output += f"🚨 CORE SETUP: {core_completed}/{len(core_tasks)} build/test tasks done\n"
         
         return output
 
@@ -880,19 +840,19 @@ Context Management Tool Usage Examples (Enhanced with Human-Friendly TODO List):
 1. Check current status with visual TODO list:
    manage_context(action="get_info")
    
-   This will show a beautifully formatted TODO list like:
-   ===============================================================
-   📋 PROJECT SETUP TODO LIST (5 tasks)
-   ===============================================================
-   │ ✅ [x] task_1: Clone repository and setup basic environment      │
-   │ 🔄 [~] task_2: CRITICAL: Analyze project structure... 🚨         │
-   │ ⭕ [ ] task_3: 🚨 CORE SETUP: Execute build tasks... 🚨          │
-   │ ⭕ [ ] task_4: 🚨 CORE SETUP: Execute test suite... 🚨           │
-   │ ⭕ [ ] task_5: Generate final completion report                   │
-   ===============================================================
-   📊 Progress: 1/5 completed, 1 in progress, 3 pending
-   🚨 CORE SETUP: 0/2 build/test tasks completed
-   ===============================================================
+   This will show a clean TODO list like:
+   
+   📋 PROJECT SETUP TODO LIST (5 tasks):
+   
+      ☒ Clone repository and setup basic environment
+         └─ Repository cloned successfully to /workspace/project-name
+      ⬚ Analyze project structure and generate intelligent plan
+      ☐ Execute Maven build and compile project
+      ☐ Run project test suite
+      ☐ Generate final completion report
+   
+   📊 Progress: 1/5 completed, 1 active, 3 pending
+   🚨 CORE SETUP: 0/2 build/test tasks done
 
 2. Start new task (with TODO status update):
    manage_context(action="start_task", task_id="task_2")
@@ -1318,7 +1278,7 @@ IMPORTANT:
 
     def _get_compact_todo_status_update(self, action_message: str) -> str:
         """
-        Helper to get a compact update of the current TODO list status.
+        Helper to get a simple TODO list status update showing all tasks.
         This is useful for showing the state after a task start/completion.
         """
         try:
@@ -1326,43 +1286,26 @@ IMPORTANT:
             if not trunk_context:
                 return "\n📋 Unable to load TODO list status\n"
 
-            # Count task statuses
-            completed = len([t for t in trunk_context.todo_list if t.status.value == 'completed'])
-            in_progress = len([t for t in trunk_context.todo_list if t.status.value == 'in_progress'])
-            pending = len([t for t in trunk_context.todo_list if t.status.value == 'pending'])
-            failed = len([t for t in trunk_context.todo_list if t.status.value == 'failed'])
-            total = len(trunk_context.todo_list)
-
-            # Count CORE SETUP tasks
-            core_tasks = [t for t in trunk_context.todo_list if '🚨 CORE SETUP' in t.description]
-            core_completed = len([t for t in core_tasks if t.status.value == 'completed'])
-
-            output = f"\n╭─── 📋 TODO LIST UPDATE: {action_message} ───╮\n"
-            output += f"│ Progress: {completed}/{total} completed"
-            if in_progress > 0:
-                output += f", {in_progress} active"
-            if pending > 0:
-                output += f", {pending} pending"
-            if failed > 0:
-                output += f", {failed} failed"
-            output += f" │\n"
+            output = f"\n📋 TODO LIST UPDATE: {action_message}\n"
             
-            if core_tasks:
-                output += f"│ 🚨 CORE SETUP: {core_completed}/{len(core_tasks)} build/test tasks done │\n"
-
-            # Show current task status
-            current_task = self.context_manager.current_task_id
-            if current_task:
-                output += f"│ 🔄 Current: {current_task} │\n"
-
-            # Show next task
-            next_task = trunk_context.get_next_pending_task()
-            if next_task:
-                output += f"│ ⏭️ Next: {next_task.id} │\n"
-            elif completed == total:
-                output += f"│ ✅ All tasks completed! │\n"
-
-            output += f"╰────────────────────────────────────────────╯\n"
+            # Show complete TODO list with simple checkboxes
+            for task in trunk_context.todo_list:
+                status = task.status.value
+                description = task.description
+                
+                # Simple checkbox - only ☒ for completed, ☐ for everything else
+                if status == 'completed':
+                    checkbox = '☒'
+                else:
+                    checkbox = '☐'
+                
+                output += f"     {checkbox} {description}\n"
+            
+            # Summary statistics
+            completed = len([t for t in trunk_context.todo_list if t.status.value == 'completed'])
+            total = len(trunk_context.todo_list)
+            
+            output += f"\nProgress: {completed}/{total} completed\n"
             
             return output
             

@@ -492,7 +492,53 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                     
                     if verified_status:
                         logger.info(f"🔍 Using verified status from report tool: {verified_status}")
-                        return verified_status == 'success'
+                        
+                        # CRITICAL FIX: Accept both 'success' and 'partial' as successful completion
+                        # 'partial' often means all core tasks completed but with minor issues/warnings
+                        if verified_status == 'success':
+                            return True
+                        elif verified_status == 'partial':
+                            # For 'partial' status, check if there are actual failures or just warnings
+                            # Look at the report output to assess the severity
+                            output = step.tool_result.output or ""
+                            
+                            # Check for evidence of major failures
+                            major_failures = [
+                                "❌ Repository clone failed",
+                                "❌ Build failed", 
+                                "❌ Compilation failed",
+                                "Status: FAILED",
+                                "BUILD FAILURE",
+                                "compilation error"
+                            ]
+                            
+                            has_major_failures = any(failure in output for failure in major_failures)
+                            
+                            # Check for evidence of successful completion
+                            success_indicators = [
+                                "✅ All tasks completed successfully",
+                                "tests_run=",
+                                "failures=0",
+                                "errors=0",
+                                "BUILD SUCCESS",
+                                "✅ Clone repository",
+                                "✅ Compile project",
+                                "✅ Run tests"
+                            ]
+                            
+                            has_success_indicators = any(indicator in output for indicator in success_indicators)
+                            
+                            if not has_major_failures and has_success_indicators:
+                                logger.info("🔍 Partial status assessment: No major failures + success indicators = treating as SUCCESS")
+                                return True
+                            else:
+                                logger.warning(f"🔍 Partial status assessment: Major failures detected or insufficient success evidence = treating as FAILURE")
+                                logger.debug(f"Major failures found: {has_major_failures}")
+                                logger.debug(f"Success indicators found: {has_success_indicators}")
+                                return False
+                        else:
+                            # Status is 'failed' or unknown
+                            return False
                     else:
                         # Fallback to checking report output for status indicators
                         output = step.tool_result.output or ""
@@ -502,6 +548,26 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                         elif "Status: SUCCESS" in output:
                             logger.info("🔍 Report shows SUCCESS status - treating as success")
                             return True
+                        elif "Status: PARTIAL" in output:
+                            logger.info("🔍 Report shows PARTIAL status - applying enhanced assessment")
+                            # Apply the same enhanced assessment as above
+                            major_failures = [
+                                "❌ Repository clone failed",
+                                "❌ Build failed", 
+                                "❌ Compilation failed",
+                                "BUILD FAILURE"
+                            ]
+                            success_indicators = [
+                                "✅ All tasks completed successfully",
+                                "tests_run=",
+                                "failures=0",
+                                "BUILD SUCCESS"
+                            ]
+                            
+                            has_major_failures = any(failure in output for failure in major_failures)
+                            has_success_indicators = any(indicator in output for indicator in success_indicators)
+                            
+                            return not has_major_failures and has_success_indicators
         
         # If no report was found, fall back to ReAct engine result
         logger.warning("🔍 No report tool result found, using ReAct engine result")

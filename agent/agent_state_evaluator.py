@@ -9,6 +9,14 @@ from loguru import logger
 from .context_manager import ContextManager
 
 
+class StepType(str, Enum):
+    """Types of steps in the ReAct loop (local definition to avoid circular import)."""
+    THOUGHT = "thought"
+    ACTION = "action"
+    OBSERVATION = "observation"
+    SYSTEM_GUIDANCE = "system_guidance"
+
+
 class AgentStatus(str, Enum):
     """Agent operational status."""
     PROCEEDING = "proceeding"  # Normal operation
@@ -214,7 +222,7 @@ class AgentStateEvaluator:
         # Look at recent observations
         recent_observations = []
         for step in reversed(steps[-5:]):  # Last 5 steps
-            if hasattr(step, 'step_type') and step.step_type.value == "observation":
+            if hasattr(step, 'step_type') and step.step_type == StepType.OBSERVATION:
                 recent_observations.append(step.content)
                 
         if not recent_observations:
@@ -262,9 +270,9 @@ class AgentStateEvaluator:
         consecutive_thoughts = 0
         for step in reversed(steps[-10:]):  # Look at last 10 steps
             if hasattr(step, 'step_type'):
-                if step.step_type.value == "thought":
+                if step.step_type == StepType.THOUGHT:
                     consecutive_thoughts += 1
-                elif step.step_type.value == "action":
+                elif step.step_type == StepType.ACTION:
                     break
                     
         if consecutive_thoughts >= 3:
@@ -321,7 +329,7 @@ class AgentStateEvaluator:
             recent_success = False
             for step in reversed(steps[-10:]):
                 if (hasattr(step, 'step_type') and 
-                    step.step_type.value == "observation" and 
+                    step.step_type == StepType.OBSERVATION and 
                     "BUILD SUCCESS" in step.content and 
                     "Tests run:" in step.content):
                     recent_success = True
@@ -354,7 +362,7 @@ class AgentStateEvaluator:
         """Check if the overall task is complete."""
         # Check for successful report generation
         for step in reversed(steps[-5:]):
-            if hasattr(step, 'step_type') and step.step_type.value == "action":
+            if hasattr(step, 'step_type') and step.step_type == StepType.ACTION:
                 if (hasattr(step, 'tool_name') and step.tool_name == "report" and
                     hasattr(step, 'tool_result') and step.tool_result and 
                     step.tool_result.success):
