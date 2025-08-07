@@ -1483,13 +1483,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 'execute': 'command',
                 'bash_command': 'command',
                 'shell_command': 'command',
-                'dir': 'working_directory',
-                'cwd': 'working_directory',
-                'working_dir': 'working_directory',
-                'workdir': 'working_directory',
-                'work_dir': 'working_directory',
-                'directory': 'working_directory',
-                'path': 'working_directory',  # Sometimes confused
+                'dir': 'workdir',
+                'cwd': 'workdir',
+                'working_dir': 'workdir',
+                'working_directory': 'workdir',  # Map working_directory to workdir for bash
+                'work_dir': 'workdir',
+                'directory': 'workdir',
+                'path': 'workdir',  # Path should also map to workdir for bash
             },
             'file_io': {
                 'file': 'path',
@@ -1638,7 +1638,8 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             elif tool_name == "maven" and params.get("working_directory"):
                 # Remember successful Maven working directory
                 if "BUILD SUCCESS" in (result.output or ""):
-                    maven_workdir = params['working_directory']
+                    # Check for either workdir or working_directory parameter
+                    maven_workdir = params.get('workdir') or params.get('working_directory', '/workspace')
                     self.successful_states['working_directory'] = maven_workdir
                     self.successful_states['maven_success'] = True
                     
@@ -2095,14 +2096,14 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         recent_tool_count = len(tool_executions)
         recent_failures = sum(1 for exec_info in tool_executions if not exec_info["success"])
         
-        # More lenient thresholds to avoid blocking legitimate operations
+        # Stricter thresholds to catch failures earlier and prevent stuck states
         # Block if: 
-        # 1. Exact same call attempted 3+ times, OR
-        # 2. Same tool failed 5+ times recently, OR  
-        # 3. Same tool called 8+ times in recent executions
-        return (exact_match_count >= 3 or 
-                recent_failures >= 5 or 
-                recent_tool_count >= 8)
+        # 1. Exact same call attempted 2+ times (reduced from 3), OR
+        # 2. Same tool failed 3+ times recently (reduced from 5), OR  
+        # 3. Same tool called 5+ times in recent executions (reduced from 8)
+        return (exact_match_count >= 2 or 
+                recent_failures >= 3 or 
+                recent_tool_count >= 5)
 
     def _track_tool_execution(self, tool_signature: str, success: bool):
         """Track tool execution to detect repetitive patterns."""

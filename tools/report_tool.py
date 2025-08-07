@@ -96,12 +96,15 @@ class ReportTool(BaseTool):
         # Get project information if available
         project_info = self._get_project_info()
         
+        # Collect execution metrics
+        execution_metrics = self._collect_execution_metrics()
+        
         # Verify execution history and adjust status/summary if needed
         verified_status, actual_accomplishments = self._verify_execution_history(status, summary)
         
-        # Generate both console and markdown versions with verified information
-        console_report = self._generate_console_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments)
-        markdown_report = self._generate_markdown_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments)
+        # Generate both console and markdown versions with verified information and metrics
+        console_report = self._generate_console_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments, execution_metrics)
+        markdown_report = self._generate_markdown_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments, execution_metrics)
         
         # Save markdown report to workspace
         self._save_markdown_report(markdown_report, timestamp)
@@ -245,6 +248,175 @@ class ReportTool(BaseTool):
         logger.info(f"🎯 Using evidence-based status: '{evidence_status}'")
         return evidence_status
 
+    def _collect_execution_metrics(self) -> dict:
+        """Collect comprehensive execution metrics from the session."""
+        metrics = {
+            'total_runtime': 0,
+            'start_time': None,
+            'end_time': None,
+            'total_iterations': 0,
+            'max_iterations': 0,
+            'iteration_utilization': 0,
+            'total_thoughts': 0,
+            'total_actions': 0,
+            'total_observations': 0,
+            'successful_actions': 0,
+            'failed_actions': 0,
+            'success_rate': 0,
+            'tools_used': {},
+            'tool_failures': {},
+            'thinking_model_calls': 0,
+            'action_model_calls': 0,
+            'phases': {
+                'clone': {'status': False, 'duration': 0},
+                'analyze': {'status': False, 'duration': 0},
+                'build': {'status': False, 'duration': 0},
+                'test': {'status': False, 'duration': 0}
+            },
+            'error_types': {},
+            'repetitive_failures': 0
+        }
+        
+        # Get execution history if available
+        if self.execution_history_callback:
+            try:
+                history = self.execution_history_callback()
+                
+                if history and len(history) > 0:
+                    # Calculate timing
+                    first_step = history[0]
+                    last_step = history[-1]
+                    
+                    # Get timestamps (handle both object and dict formats)
+                    if hasattr(first_step, 'timestamp'):
+                        metrics['start_time'] = first_step.timestamp
+                    elif isinstance(first_step, dict):
+                        metrics['start_time'] = first_step.get('timestamp')
+                    
+                    if hasattr(last_step, 'timestamp'):
+                        metrics['end_time'] = last_step.timestamp
+                    elif isinstance(last_step, dict):
+                        metrics['end_time'] = last_step.get('timestamp')
+                    
+                    # Calculate runtime if we have timestamps
+                    if metrics['start_time'] and metrics['end_time']:
+                        from datetime import datetime
+                        try:
+                            start = datetime.fromisoformat(metrics['start_time'].replace('Z', '+00:00'))
+                            end = datetime.fromisoformat(metrics['end_time'].replace('Z', '+00:00'))
+                            metrics['total_runtime'] = (end - start).total_seconds() / 60  # in minutes
+                        except:
+                            pass
+                    
+                    # Count step types
+                    for step in history:
+                        # Handle both object and dict formats
+                        if hasattr(step, 'step_type'):
+                            step_type = step.step_type
+                            tool_name = step.tool_name
+                            tool_result = step.tool_result
+                            model_used = step.model_used
+                        elif isinstance(step, dict):
+                            step_type = step.get('step_type')
+                            tool_name = step.get('tool_name')
+                            tool_result = step.get('tool_result')
+                            model_used = step.get('model_used')
+                        else:
+                            continue
+                        
+                        # Count by type
+                        if step_type == 'thought':
+                            metrics['total_thoughts'] += 1
+                            # Check which model was actually used
+                            if model_used:
+                                if any(thinking_model in str(model_used).lower() for thinking_model in ['o1', 'o4', 'thinking', 'claude-3-opus']):
+                                    metrics['thinking_model_calls'] += 1
+                                else:
+                                    metrics['action_model_calls'] += 1
+                            else:
+                                # Default to action model if not specified
+                                metrics['action_model_calls'] += 1
+                        elif step_type == 'action':
+                            metrics['total_actions'] += 1
+                            # Check which model was actually used for the action
+                            if model_used:
+                                if any(thinking_model in str(model_used).lower() for thinking_model in ['o1', 'o4', 'thinking', 'claude-3-opus']):
+                                    metrics['thinking_model_calls'] += 1
+                                else:
+                                    metrics['action_model_calls'] += 1
+                            else:
+                                # Default to action model for actions
+                                metrics['action_model_calls'] += 1
+                            
+                            # Track tool usage
+                            if tool_name:
+                                metrics['tools_used'][tool_name] = metrics['tools_used'].get(tool_name, 0) + 1
+                                
+                                # Check success/failure
+                                success = False
+                                if hasattr(tool_result, 'success'):
+                                    success = tool_result.success
+                                elif isinstance(tool_result, dict):
+                                    success = tool_result.get('success', False)
+                                
+                                if success:
+                                    metrics['successful_actions'] += 1
+                                else:
+                                    metrics['failed_actions'] += 1
+                                    metrics['tool_failures'][tool_name] = metrics['tool_failures'].get(tool_name, 0) + 1
+                                    
+                                    # Track error types
+                                    error_code = None
+                                    if hasattr(tool_result, 'error_code'):
+                                        error_code = tool_result.error_code
+                                    elif isinstance(tool_result, dict):
+                                        error_code = tool_result.get('error_code')
+                                    
+                                    if error_code:
+                                        metrics['error_types'][error_code] = metrics['error_types'].get(error_code, 0) + 1
+                                        if error_code == 'REPETITIVE_EXECUTION':
+                                            metrics['repetitive_failures'] += 1
+                                
+                                # Track phase completion
+                                if tool_name == 'project_setup' and success:
+                                    metrics['phases']['clone']['status'] = True
+                                elif tool_name == 'project_analyzer' and success:
+                                    metrics['phases']['analyze']['status'] = True
+                                elif tool_name in ['maven', 'gradle'] and success:
+                                    # Check if it's build or test
+                                    if hasattr(step, 'tool_params'):
+                                        params = step.tool_params
+                                    elif isinstance(step, dict):
+                                        params = step.get('tool_params', {})
+                                    else:
+                                        params = {}
+                                    
+                                    command = params.get('command', '').lower()
+                                    if 'test' in command:
+                                        metrics['phases']['test']['status'] = True
+                                    elif any(build_cmd in command for build_cmd in ['compile', 'build', 'package']):
+                                        metrics['phases']['build']['status'] = True
+                        
+                        elif step_type == 'observation':
+                            metrics['total_observations'] += 1
+                    
+                    # Calculate success rate
+                    if metrics['total_actions'] > 0:
+                        metrics['success_rate'] = (metrics['successful_actions'] / metrics['total_actions']) * 100
+                    
+                    # Get iteration count from context manager if available
+                    if self.context_manager:
+                        try:
+                            # This would need to be added to context manager
+                            metrics['total_iterations'] = len(history) // 3  # Rough estimate: thought + action + observation
+                        except:
+                            pass
+                            
+            except Exception as e:
+                logger.warning(f"Failed to collect execution metrics: {e}")
+        
+        return metrics
+    
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
         """Verify the claimed status against actual execution history."""
         # Initialize accomplishments
@@ -496,7 +668,7 @@ class ReportTool(BaseTool):
         logger.info("✅ All core steps succeeded: clone + build + test")
         return "success"
 
-    def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None) -> str:
+    def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None, execution_metrics: dict = None) -> str:
         """Generate console-formatted report."""
         
         report_lines = [
@@ -620,8 +792,61 @@ class ReportTool(BaseTool):
                         "   • ❌ Test execution (failed)",
                     ])
         
-        # Add execution statistics if available
-        if actual_accomplishments:
+        # Add comprehensive execution metrics
+        if execution_metrics:
+            report_lines.extend([
+                "",
+                "📊 EXECUTION METRICS:",
+            ])
+            
+            # Runtime metrics
+            if execution_metrics.get('total_runtime'):
+                report_lines.append(f"   • Total runtime: {execution_metrics['total_runtime']:.1f} minutes")
+            
+            # Iteration metrics
+            if execution_metrics.get('total_iterations'):
+                report_lines.append(f"   • Iterations used: {execution_metrics['total_iterations']}")
+            
+            # Step breakdown
+            report_lines.extend([
+                f"   • Total thoughts: {execution_metrics.get('total_thoughts', 0)}",
+                f"   • Total actions: {execution_metrics.get('total_actions', 0)}",
+                f"   • Total observations: {execution_metrics.get('total_observations', 0)}",
+            ])
+            
+            # Success metrics
+            successful = execution_metrics.get('successful_actions', 0)
+            failed = execution_metrics.get('failed_actions', 0)
+            success_rate = execution_metrics.get('success_rate', 0)
+            report_lines.extend([
+                f"   • Successful actions: {successful}",
+                f"   • Failed actions: {failed}",
+                f"   • Success rate: {success_rate:.1f}%",
+            ])
+            
+            # Model usage
+            report_lines.extend([
+                f"   • Thinking model calls: {execution_metrics.get('thinking_model_calls', 0)}",
+                f"   • Action model calls: {execution_metrics.get('action_model_calls', 0)}",
+            ])
+            
+            # Tool usage
+            if execution_metrics.get('tools_used'):
+                top_tools = sorted(execution_metrics['tools_used'].items(), key=lambda x: x[1], reverse=True)[:5]
+                tools_str = ", ".join([f"{tool}({count})" for tool, count in top_tools])
+                report_lines.append(f"   • Most used tools: {tools_str}")
+            
+            # Error patterns
+            if execution_metrics.get('repetitive_failures', 0) > 0:
+                report_lines.append(f"   • ⚠️ Repetitive failures: {execution_metrics['repetitive_failures']}")
+            
+            if execution_metrics.get('error_types'):
+                top_errors = sorted(execution_metrics['error_types'].items(), key=lambda x: x[1], reverse=True)[:3]
+                for error_type, count in top_errors:
+                    report_lines.append(f"   • Error type '{error_type}': {count} occurrences")
+        
+        # Add legacy execution statistics if no metrics available but accomplishments exist
+        elif actual_accomplishments:
             total = actual_accomplishments.get('total_actions', 0)
             successful = actual_accomplishments.get('successful_actions', 0)
             if total > 0:
@@ -710,7 +935,7 @@ class ReportTool(BaseTool):
             
         return info
     
-    def _generate_markdown_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None) -> str:
+    def _generate_markdown_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None, execution_metrics: dict = None) -> str:
         """Generate markdown-formatted report based on actual project context and execution results."""
         
         report_lines = [
@@ -759,6 +984,11 @@ class ReportTool(BaseTool):
         tech_section = self._generate_technical_accomplishments_section(actual_accomplishments)
         if tech_section:
             report_lines.extend(tech_section)
+        
+        # Generate execution metrics section
+        metrics_section = self._generate_metrics_section(execution_metrics)
+        if metrics_section:
+            report_lines.extend(metrics_section)
         
         # Generate next steps based on actual status and context
         next_steps_section = self._generate_next_steps_section(status, actual_accomplishments)
@@ -860,6 +1090,96 @@ class ReportTool(BaseTool):
         section_lines.append("")
         return section_lines
 
+    def _generate_metrics_section(self, execution_metrics: dict = None) -> list:
+        """Generate execution metrics section for the markdown report."""
+        if not execution_metrics:
+            return []
+        
+        section_lines = [
+            "## 📈 Execution Metrics",
+            "",
+        ]
+        
+        # Runtime and iterations
+        if execution_metrics.get('total_runtime'):
+            section_lines.append(f"**Total Runtime:** {execution_metrics['total_runtime']:.1f} minutes")
+        if execution_metrics.get('total_iterations'):
+            section_lines.append(f"**Iterations Used:** {execution_metrics['total_iterations']}")
+        
+        section_lines.append("")
+        
+        # Step breakdown table
+        section_lines.extend([
+            "### Step Breakdown",
+            "",
+            "| Step Type | Count |",
+            "|-----------|-------|",
+            f"| Thoughts | {execution_metrics.get('total_thoughts', 0)} |",
+            f"| Actions | {execution_metrics.get('total_actions', 0)} |",
+            f"| Observations | {execution_metrics.get('total_observations', 0)} |",
+            "",
+        ])
+        
+        # Success metrics
+        section_lines.extend([
+            "### Performance Metrics",
+            "",
+            f"- **Successful Actions:** {execution_metrics.get('successful_actions', 0)}",
+            f"- **Failed Actions:** {execution_metrics.get('failed_actions', 0)}",
+            f"- **Success Rate:** {execution_metrics.get('success_rate', 0):.1f}%",
+            f"- **Thinking Model Calls:** {execution_metrics.get('thinking_model_calls', 0)}",
+            f"- **Action Model Calls:** {execution_metrics.get('action_model_calls', 0)}",
+            "",
+        ])
+        
+        # Tool usage
+        if execution_metrics.get('tools_used'):
+            section_lines.extend([
+                "### Tool Usage",
+                "",
+                "| Tool | Calls |",
+                "|------|-------|",
+            ])
+            for tool, count in sorted(execution_metrics['tools_used'].items(), key=lambda x: x[1], reverse=True):
+                section_lines.append(f"| {tool} | {count} |")
+            section_lines.append("")
+        
+        # Error analysis
+        if execution_metrics.get('error_types') or execution_metrics.get('repetitive_failures'):
+            section_lines.extend([
+                "### Error Analysis",
+                "",
+            ])
+            
+            if execution_metrics.get('repetitive_failures', 0) > 0:
+                section_lines.append(f"- ⚠️ **Repetitive Failures:** {execution_metrics['repetitive_failures']}")
+            
+            if execution_metrics.get('error_types'):
+                section_lines.extend([
+                    "",
+                    "**Error Types:**",
+                    "",
+                ])
+                for error_type, count in sorted(execution_metrics['error_types'].items(), key=lambda x: x[1], reverse=True):
+                    section_lines.append(f"- `{error_type}`: {count} occurrences")
+            
+            section_lines.append("")
+        
+        # Phase completion
+        if execution_metrics.get('phases'):
+            section_lines.extend([
+                "### Phase Completion",
+                "",
+                "| Phase | Status |",
+                "|-------|--------|",
+            ])
+            for phase, info in execution_metrics['phases'].items():
+                status_icon = "✅" if info.get('status') else "❌"
+                section_lines.append(f"| {phase.capitalize()} | {status_icon} |")
+            section_lines.append("")
+        
+        return section_lines
+    
     def _generate_next_steps_section(self, status: str, actual_accomplishments: dict = None) -> list:
         """Generate next steps section based on actual status and context."""
         section_lines = []

@@ -58,6 +58,11 @@ class MavenTool(BaseTool):
             if not install_result.success:
                 return install_result
         
+        # Validate that pom.xml exists in the working directory
+        pom_validation = self._validate_pom_exists(working_directory, pom_file)
+        if not pom_validation["exists"]:
+            return self._handle_missing_pom(pom_validation, working_directory)
+        
         # If pom_file is specified, extract directory and use it as working_directory
         if pom_file and pom_file.endswith("pom.xml"):
             import os
@@ -212,6 +217,69 @@ class MavenTool(BaseTool):
             logger.warning(f"Failed to setup Java environment: {e}")
             return None
 
+    def _validate_pom_exists(self, working_directory: str, pom_file: str = None) -> dict:
+        """Validate that pom.xml exists and is accessible."""
+        if not self.orchestrator:
+            return {"exists": False, "error": "No orchestrator available"}
+        
+        # Check for pom.xml in working directory
+        pom_path = pom_file if pom_file else f"{working_directory}/pom.xml"
+        check_cmd = f"test -f {pom_path} && echo 'EXISTS' || echo 'NOT_FOUND'"
+        
+        try:
+            result = self.orchestrator.execute_command(check_cmd)
+            exists = "EXISTS" in result.get("output", "")
+            
+            if not exists:
+                # Try to find pom.xml in subdirectories
+                find_cmd = f"find {working_directory} -name pom.xml -type f 2>/dev/null | head -5"
+                find_result = self.orchestrator.execute_command(find_cmd)
+                found_poms = [p.strip() for p in find_result.get("output", "").split("\n") if p.strip()]
+                
+                return {
+                    "exists": False,
+                    "searched_path": pom_path,
+                    "found_alternatives": found_poms,
+                    "working_directory": working_directory
+                }
+            
+            return {"exists": True, "path": pom_path}
+            
+        except Exception as e:
+            return {"exists": False, "error": str(e)}
+    
+    def _handle_missing_pom(self, validation_result: dict, working_directory: str) -> ToolResult:
+        """Handle the case when pom.xml is not found."""
+        suggestions = [
+            f"Ensure you're in the correct project directory",
+            f"Current directory: {working_directory}",
+            "Change to the project root directory containing pom.xml"
+        ]
+        
+        # If we found alternative pom.xml files, suggest them
+        if validation_result.get("found_alternatives"):
+            suggestions.append("Found pom.xml in these locations:")
+            for pom_path in validation_result["found_alternatives"][:3]:
+                pom_dir = pom_path.replace("/pom.xml", "")
+                suggestions.append(f"  - Try: maven(working_directory='{pom_dir}')")
+        else:
+            suggestions.extend([
+                "Use bash tool to navigate: bash(command='ls -la', workdir='/workspace')",
+                "Find pom.xml: bash(command='find /workspace -name pom.xml')"
+            ])
+        
+        return ToolResult(
+            success=False,
+            output="",
+            error=f"No pom.xml found at {validation_result.get('searched_path', working_directory)}",
+            error_code="NO_POM_XML",
+            suggestions=suggestions,
+            metadata={
+                "validation_result": validation_result,
+                "working_directory": working_directory
+            }
+        )
+    
     def _is_maven_installed(self) -> bool:
         """Check if Maven is installed."""
         try:
@@ -354,6 +422,7 @@ class MavenTool(BaseTool):
         return output
     
     def _handle_maven_error(self, output: str, exit_code: int, command: str, analysis: Dict[str, Any]) -> ToolResult:
+        """Enhanced error handling with specific suggestions based on error type."""
         """Handle Maven build errors with detailed analysis."""
         
         error_suggestions = []
@@ -404,9 +473,53 @@ class MavenTool(BaseTool):
             error_suggestions.extend([
                 "Ensure you're in a directory containing a pom.xml file",
                 "Change to the correct project directory",
-                "Create a new Maven project with 'mvn archetype:generate'"
+                "Use bash to find pom.xml: bash(command='find /workspace -name pom.xml')",
+                "List current directory: bash(command='ls -la', workdir='/workspace')"
             ])
             documentation_links.append("https://maven.apache.org/guides/getting-started/maven-in-five-minutes.html")
+        
+        # Check for Java version issues
+        if "Unsupported major.minor version" in output or "java.lang.UnsupportedClassVersionError" in output:
+            error_code = "JAVA_VERSION_ERROR"
+            # Extract required Java version if possible
+            version_match = re.search(r'version (\d+\.\d+)', output)
+            java_version = version_match.group(1) if version_match else "appropriate"
+            error_suggestions.extend([
+                "Java version mismatch detected",
+                f"Install Java {java_version}: bash(command='apt-get install -y openjdk-{java_version.split('.')[0]}-jdk')",
+                "Check current Java version: bash(command='java -version')",
+                "Set JAVA_HOME: bash(command='export JAVA_HOME=/usr/lib/jvm/java-{version}-openjdk-amd64')"
+            ])
+        
+        # Check for missing compiler
+        if "No compiler is provided" in output or "Unable to locate the Javac Compiler" in output:
+            error_code = "NO_JAVA_COMPILER"
+            error_suggestions.extend([
+                "Java Development Kit (JDK) not found, only JRE is installed",
+                "Install JDK: bash(command='apt-get update && apt-get install -y default-jdk')",
+                "Or install specific version: bash(command='apt-get install -y openjdk-11-jdk')",
+                "Verify javac installation: bash(command='javac -version')"
+            ])
+        
+        # Check for memory issues
+        if "java.lang.OutOfMemoryError" in output or "GC overhead limit exceeded" in output:
+            error_code = "OUT_OF_MEMORY"
+            error_suggestions.extend([
+                "Increase JVM memory allocation",
+                "Try: maven(command='compile', properties='maven.compiler.fork=true,maven.compiler.meminitial=256m,maven.compiler.maxmem=1024m')",
+                "Or set MAVEN_OPTS: bash(command='export MAVEN_OPTS=\"-Xmx2048m -XX:MaxPermSize=512m\"')",
+                "Consider building modules separately if project is large"
+            ])
+        
+        # Check for network/proxy issues
+        if "Connection timed out" in output or "Could not transfer artifact" in output or "Connection refused" in output:
+            error_code = "NETWORK_ERROR"
+            error_suggestions.extend([
+                "Network connectivity issue detected",
+                "Check Maven repository accessibility: bash(command='curl -I https://repo.maven.apache.org/maven2/')",
+                "Try with offline mode if dependencies are cached: maven(command='compile', properties='offline=true')",
+                "Configure proxy if behind firewall (update ~/.m2/settings.xml)"
+            ])
         
         # Default suggestions if no specific error type identified
         if not error_suggestions:
@@ -442,7 +555,10 @@ class MavenTool(BaseTool):
                 "command": command,
                 "exit_code": exit_code,
                 "analysis": analysis,
-                "key_errors_extracted": True
+                "key_errors_extracted": True,
+                "error_type": error_code,
+                "recovery_actions": self._generate_recovery_actions(error_code, analysis),
+                "diagnostic_commands": self._get_diagnostic_commands(error_code)
             }
         )
     
@@ -542,6 +658,82 @@ class MavenTool(BaseTool):
             result += "No error information could be extracted. Use raw_output=true for full Maven output."
         
         return result
+    
+    def _generate_recovery_actions(self, error_code: str, analysis: Dict[str, Any]) -> list:
+        """Generate specific recovery actions based on error type."""
+        recovery_actions = []
+        
+        if error_code == "COMPILATION_ERROR":
+            recovery_actions.extend([
+                {"action": "view_errors", "command": "maven(command='compile', raw_output=true)"},
+                {"action": "check_syntax", "description": "Review Java syntax in source files"},
+                {"action": "verify_imports", "description": "Check all import statements are correct"}
+            ])
+        elif error_code == "DEPENDENCY_ERROR":
+            recovery_actions.extend([
+                {"action": "resolve_deps", "command": "maven(command='dependency:resolve')"},
+                {"action": "show_tree", "command": "maven(command='dependency:tree')"},
+                {"action": "force_update", "command": "maven(command='clean', properties='U=true')"}
+            ])
+        elif error_code == "TEST_FAILURE":
+            test_info = analysis.get("tests_run", {})
+            recovery_actions.extend([
+                {"action": "skip_tests", "command": "maven(command='package', properties='skipTests=true')"},
+                {"action": "run_specific_test", "description": "Run individual test class to isolate issue"},
+                {"action": "view_test_reports", "command": "bash(command='find /workspace/target/surefire-reports -name *.txt | head -5 | xargs cat')"}
+            ])
+        elif error_code == "NO_POM_XML":
+            recovery_actions.extend([
+                {"action": "find_pom", "command": "bash(command='find /workspace -name pom.xml -type f')"},
+                {"action": "list_dirs", "command": "bash(command='ls -la /workspace')"},
+                {"action": "check_structure", "command": "bash(command='tree -L 2 /workspace 2>/dev/null || find /workspace -maxdepth 2 -type d')"}
+            ])
+        elif error_code == "JAVA_VERSION_ERROR":
+            recovery_actions.extend([
+                {"action": "check_version", "command": "bash(command='java -version && javac -version')"},
+                {"action": "list_java", "command": "bash(command='update-alternatives --list java 2>/dev/null || ls /usr/lib/jvm/')"},
+                {"action": "install_java", "command": "bash(command='apt-get update && apt-get install -y openjdk-11-jdk')"}
+            ])
+        elif error_code == "OUT_OF_MEMORY":
+            recovery_actions.extend([
+                {"action": "increase_memory", "command": "bash(command='export MAVEN_OPTS=\"-Xmx2048m\"')"},
+                {"action": "build_modules", "description": "Build project modules separately"},
+                {"action": "clean_target", "command": "maven(command='clean')"}
+            ])
+        
+        return recovery_actions
+    
+    def _get_diagnostic_commands(self, error_code: str) -> list:
+        """Get diagnostic commands to help debug the specific error."""
+        diagnostics = []
+        
+        if error_code == "COMPILATION_ERROR":
+            diagnostics.extend([
+                "maven(command='compile', properties='maven.compiler.verbose=true')",
+                "bash(command='find /workspace/src -name *.java | head -5 | xargs head -20')"
+            ])
+        elif error_code == "DEPENDENCY_ERROR":
+            diagnostics.extend([
+                "maven(command='dependency:analyze')",
+                "bash(command='cat /workspace/pom.xml | grep -A 5 -B 5 dependency')"
+            ])
+        elif error_code == "TEST_FAILURE":
+            diagnostics.extend([
+                "maven(command='test', properties='maven.surefire.debug=true')",
+                "bash(command='ls -la /workspace/target/surefire-reports/')"
+            ])
+        elif error_code == "JAVA_VERSION_ERROR":
+            diagnostics.extend([
+                "bash(command='echo $JAVA_HOME')",
+                "bash(command='which java && which javac')"
+            ])
+        elif error_code == "NETWORK_ERROR":
+            diagnostics.extend([
+                "bash(command='ping -c 3 repo.maven.apache.org 2>/dev/null || echo Network unreachable')",
+                "bash(command='cat ~/.m2/settings.xml 2>/dev/null || echo No settings.xml')"
+            ])
+        
+        return diagnostics
 
     def get_usage_example(self) -> str:
         """Get usage examples for Maven tool."""

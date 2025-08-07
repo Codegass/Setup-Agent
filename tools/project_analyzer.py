@@ -258,7 +258,7 @@ class ProjectAnalyzerTool(BaseTool):
                     documentation["java_version_requirement"] = match.group(1)
                     break
 
-            # 提取构建命令
+            # 提取构建命令 - 清理markdown格式
             build_patterns = [
                 r"mvn.*?compile",
                 r"mvn.*?install",
@@ -271,9 +271,13 @@ class ProjectAnalyzerTool(BaseTool):
 
             for pattern in build_patterns:
                 matches = re.findall(pattern, readme_content, re.IGNORECASE)
-                documentation["build_commands"].extend(matches)
+                # 清理提取的命令
+                for match in matches:
+                    clean_cmd = self._clean_markdown_command(match)
+                    if clean_cmd and clean_cmd not in documentation["build_commands"]:
+                        documentation["build_commands"].append(clean_cmd)
 
-            # 提取测试命令
+            # 提取测试命令 - 清理markdown格式
             test_patterns = [
                 r"mvn.*?test",
                 r"gradle.*?test",
@@ -284,9 +288,40 @@ class ProjectAnalyzerTool(BaseTool):
 
             for pattern in test_patterns:
                 matches = re.findall(pattern, readme_content, re.IGNORECASE)
-                documentation["test_commands"].extend(matches)
+                # 清理提取的命令
+                for match in matches:
+                    clean_cmd = self._clean_markdown_command(match)
+                    if clean_cmd and clean_cmd not in documentation["test_commands"]:
+                        documentation["test_commands"].append(clean_cmd)
 
         return documentation
+    
+    def _clean_markdown_command(self, command: str) -> str:
+        """清理从markdown中提取的命令，移除格式化字符"""
+        if not command:
+            return ""
+        
+        clean_cmd = command.strip()
+        
+        # 移除markdown代码块标记
+        clean_cmd = re.sub(r'^```[a-z]*\s*', '', clean_cmd)  # 移除开始的```bash等
+        clean_cmd = re.sub(r'\s*```$', '', clean_cmd)        # 移除结束的```
+        
+        # 移除反引号
+        clean_cmd = re.sub(r'^`+|`+$', '', clean_cmd)        # 移除首尾反引号
+        
+        # 移除shell提示符
+        clean_cmd = re.sub(r'^[>$#]\s*', '', clean_cmd)      # 移除常见的shell提示符
+        
+        # 移除多余的空白字符
+        clean_cmd = ' '.join(clean_cmd.split())
+        
+        # 如果命令被截断或包含省略号，标记为需要验证
+        if '...' in clean_cmd or clean_cmd.endswith('.'):
+            # 移除省略号
+            clean_cmd = clean_cmd.replace('...', '').rstrip('.')
+        
+        return clean_cmd.strip()
 
     def _analyze_build_configuration(self, project_path: str, project_type: str) -> Dict[str, Any]:
         """分析构建配置文件"""

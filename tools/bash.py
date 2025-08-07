@@ -222,13 +222,15 @@ class BashTool(BaseTool):
             logger.info(f"Working directory: {workdir}")
             
             if is_long_running_command:
-                # Use enhanced monitoring for long-running commands
-                logger.info("🔍 Using enhanced monitoring for long-running command")
+                # Get dynamic timeouts based on command type
+                silent_timeout, absolute_timeout = self._get_command_timeout(command)
+                logger.info(f"🔍 Using enhanced monitoring for long-running command (silent: {silent_timeout}s, total: {absolute_timeout}s)")
+                
                 result = self.docker_orchestrator.execute_command_with_monitoring(
                     command=command,
                     workdir=workdir,
-                    silent_timeout=600,  # 10 minutes no output
-                    absolute_timeout=1800,  # 30 minutes total
+                    silent_timeout=silent_timeout,
+                    absolute_timeout=absolute_timeout,
                     use_timeout_wrapper=True,
                     enable_cpu_monitoring=True,
                     optimize_for_maven=('mvn' in command)
@@ -239,11 +241,20 @@ class BashTool(BaseTool):
             
             # Handle timeout terminations
             if result.get('termination_reason'):
-                error_messages = {
-                    'absolute_timeout': f"Command exceeded maximum execution time (30 minutes)",
-                    'silent_timeout': f"Command was silent for too long (10 minutes)",
-                    'monitoring_error': f"Error occurred during command monitoring"
-                }
+                # Get the timeouts that were used
+                if is_long_running_command:
+                    silent_timeout, absolute_timeout = self._get_command_timeout(command)
+                    error_messages = {
+                        'absolute_timeout': f"Command exceeded maximum execution time ({absolute_timeout/60:.0f} minutes)",
+                        'silent_timeout': f"Command was silent for too long ({silent_timeout/60:.0f} minutes)",
+                        'monitoring_error': f"Error occurred during command monitoring"
+                    }
+                else:
+                    error_messages = {
+                        'absolute_timeout': f"Command exceeded maximum execution time",
+                        'silent_timeout': f"Command was silent for too long",
+                        'monitoring_error': f"Error occurred during command monitoring"
+                    }
                 
                 termination_reason = result['termination_reason']
                 error_msg = error_messages.get(termination_reason, f"Command terminated: {termination_reason}")
@@ -277,32 +288,39 @@ class BashTool(BaseTool):
                 # Extract key information for different command types
                 extracted_output = self._extract_key_info(result["output"], command)
                 
+                # Analyze output for completion signals
+                completion_signals = self._detect_completion_signals(result["output"], command)
+                
                 return ToolResult(
                     success=True,
                     output=extracted_output,
+                    raw_output=result["output"],
                     metadata={
                         'exit_code': result.get('exit_code', 0),
                         'monitoring_info': result.get('monitoring_info'),
                         'workdir': workdir,
-                        'is_long_running': is_long_running_command
+                        'is_long_running': is_long_running_command,
+                        'completion_signals': completion_signals,
+                        'command_type': self._get_command_type(command),
+                        'extracted_values': self._extract_values(result["output"], command)
                     }
                 )
             else:
+                # Analyze error for specific failure patterns
+                error_analysis = self._analyze_error_output(result["output"], command)
+                
                 return ToolResult(
                     success=False,
                     output=result["output"],
                     error=f"Command failed with exit code {result.get('exit_code', 'unknown')}",
-                    suggestions=[
-                        "Check the command syntax and parameters",
-                        "Verify that required files/directories exist",
-                        "Check container logs for more details",
-                        "Ensure proper permissions for the operation"
-                    ],
-                    error_code="COMMAND_FAILED",
+                    suggestions=self._generate_error_suggestions(error_analysis, command, result.get('exit_code')),
+                    error_code=error_analysis.get('error_code', 'COMMAND_FAILED'),
                     metadata={
                         'exit_code': result.get('exit_code'),
                         'monitoring_info': result.get('monitoring_info'),
-                        'workdir': workdir
+                        'workdir': workdir,
+                        'error_analysis': error_analysis,
+                        'recovery_commands': self._get_recovery_commands(error_analysis)
                     }
                 )
         
@@ -354,6 +372,324 @@ class BashTool(BaseTool):
                 return True
         
         return False
+    
+    def _detect_completion_signals(self, output: str, command: str) -> dict:
+        """Detect completion signals in command output."""
+        signals = {
+            'build_success': False,
+            'tests_passed': False,
+            'installation_complete': False,
+            'file_created': False,
+            'service_started': False,
+            'package_installed': False
+        }
+        
+        output_lower = output.lower()
+        
+        # Build success indicators
+        if any(pattern in output_lower for pattern in ['build successful', 'build success', 'successfully built']):
+            signals['build_success'] = True
+        
+        # Test success indicators
+        if 'tests passed' in output_lower or 'all tests passed' in output_lower:
+            signals['tests_passed'] = True
+        elif 'tests run:' in output and 'failures: 0' in output and 'errors: 0' in output:
+            signals['tests_passed'] = True
+        
+        # Installation indicators
+        if 'successfully installed' in output_lower or 'installation complete' in output_lower:
+            signals['installation_complete'] = True
+        
+        # Package manager indicators
+        if 'packages can be updated' in output_lower or 'newly installed' in output_lower:
+            signals['package_installed'] = True
+        
+        # Service indicators
+        if 'active (running)' in output or 'started successfully' in output_lower:
+            signals['service_started'] = True
+        
+        # File creation indicators
+        if re.search(r'created|written|saved|generated', output_lower):
+            signals['file_created'] = True
+        
+        return signals
+    
+    def _get_command_type(self, command: str) -> str:
+        """Categorize the command type for better context."""
+        command_lower = command.lower()
+        
+        if any(tool in command_lower for tool in ['mvn', 'gradle', 'ant']):
+            return 'build_tool'
+        elif any(pkg in command_lower for pkg in ['apt', 'yum', 'dnf', 'pip', 'npm', 'yarn']):
+            return 'package_manager'
+        elif any(git in command_lower for git in ['git ', 'git-']):
+            return 'version_control'
+        elif any(test in command_lower for test in ['test', 'pytest', 'jest', 'mocha']):
+            return 'testing'
+        elif any(file_op in command_lower for file_op in ['ls', 'find', 'grep', 'cat', 'head', 'tail']):
+            return 'file_operation'
+        elif any(sys in command_lower for sys in ['ps', 'top', 'df', 'du', 'free']):
+            return 'system_info'
+        elif 'cd ' in command_lower or 'pwd' in command_lower:
+            return 'navigation'
+        elif any(net in command_lower for net in ['curl', 'wget', 'ping', 'netstat']):
+            return 'network'
+        else:
+            return 'general'
+    
+    def _extract_values(self, output: str, command: str) -> dict:
+        """Extract specific values from output based on command type."""
+        values = {}
+        
+        # Extract file paths
+        file_paths = re.findall(r'/[\w/.-]+', output)
+        if file_paths:
+            values['file_paths'] = list(set(file_paths))[:10]  # Limit to 10 unique paths
+        
+        # Extract URLs
+        urls = re.findall(r'https?://[^\s]+', output)
+        if urls:
+            values['urls'] = list(set(urls))[:5]
+        
+        # Extract version numbers
+        versions = re.findall(r'\b\d+\.\d+(?:\.\d+)?\b', output)
+        if versions:
+            values['versions'] = list(set(versions))[:5]
+        
+        # Extract IP addresses
+        ips = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', output)
+        if ips:
+            values['ip_addresses'] = list(set(ips))[:5]
+        
+        # Extract numbers (counts, sizes, etc.)
+        if 'ls' in command or 'find' in command or 'grep -c' in command:
+            lines = output.strip().split('\n')
+            if lines and lines[0]:
+                values['count'] = len(lines)
+        
+        # Extract process IDs
+        pids = re.findall(r'\bPID[:\s]+(\d+)', output)
+        if pids:
+            values['pids'] = pids[:5]
+        
+        return values
+    
+    def _analyze_error_output(self, output: str, command: str) -> dict:
+        """Analyze error output to determine specific failure type."""
+        analysis = {
+            'error_type': 'general',
+            'error_code': 'COMMAND_FAILED',
+            'key_errors': []
+        }
+        
+        output_lower = output.lower()
+        
+        # Permission errors
+        if 'permission denied' in output_lower or 'access denied' in output_lower:
+            analysis['error_type'] = 'permission'
+            analysis['error_code'] = 'PERMISSION_DENIED'
+        
+        # File/directory not found
+        elif 'no such file or directory' in output_lower or 'cannot find' in output_lower:
+            analysis['error_type'] = 'not_found'
+            analysis['error_code'] = 'FILE_NOT_FOUND'
+        
+        # Command not found
+        elif 'command not found' in output_lower or 'not found' in output_lower:
+            analysis['error_type'] = 'command_not_found'
+            analysis['error_code'] = 'COMMAND_NOT_FOUND'
+        
+        # Network errors
+        elif any(net_err in output_lower for net_err in ['connection refused', 'connection timeout', 'unreachable']):
+            analysis['error_type'] = 'network'
+            analysis['error_code'] = 'NETWORK_ERROR'
+        
+        # Disk space errors
+        elif 'no space left' in output_lower or 'disk full' in output_lower:
+            analysis['error_type'] = 'disk_space'
+            analysis['error_code'] = 'DISK_FULL'
+        
+        # Package manager errors
+        elif 'unable to locate package' in output_lower or 'no matching packages' in output_lower:
+            analysis['error_type'] = 'package_not_found'
+            analysis['error_code'] = 'PACKAGE_NOT_FOUND'
+        
+        # Extract key error lines
+        error_lines = [line for line in output.split('\n') if 'error' in line.lower() or 'fail' in line.lower()]
+        analysis['key_errors'] = error_lines[:5]  # Limit to 5 lines
+        
+        return analysis
+    
+    def _generate_error_suggestions(self, error_analysis: dict, command: str, exit_code: int) -> list:
+        """Generate specific suggestions based on error analysis."""
+        suggestions = []
+        error_type = error_analysis.get('error_type', 'general')
+        
+        if error_type == 'permission':
+            suggestions.extend([
+                "Try running with sudo if appropriate",
+                "Check file/directory permissions with 'ls -la'",
+                "Ensure the user has necessary permissions",
+                "Verify ownership with 'ls -l' command"
+            ])
+        elif error_type == 'not_found':
+            suggestions.extend([
+                "Verify the file/directory path is correct",
+                "Use 'ls' or 'find' to locate the resource",
+                "Check if you're in the correct working directory",
+                "Use absolute paths instead of relative paths"
+            ])
+        elif error_type == 'command_not_found':
+            cmd_name = command.split()[0] if command else 'command'
+            suggestions.extend([
+                f"Install {cmd_name} using the package manager",
+                f"Check if {cmd_name} is in PATH with 'which {cmd_name}'",
+                "Verify the command name is spelled correctly",
+                "Use the full path to the executable"
+            ])
+        elif error_type == 'network':
+            suggestions.extend([
+                "Check network connectivity",
+                "Verify the target host is reachable",
+                "Check firewall/proxy settings",
+                "Try again after a brief delay"
+            ])
+        elif error_type == 'disk_space':
+            suggestions.extend([
+                "Check disk space with 'df -h'",
+                "Clean up unnecessary files",
+                "Remove old logs or temporary files",
+                "Increase container disk allocation if needed"
+            ])
+        elif error_type == 'package_not_found':
+            suggestions.extend([
+                "Update package lists with 'apt-get update' or equivalent",
+                "Check the package name spelling",
+                "Search for the package with 'apt-cache search' or equivalent",
+                "Add required repositories if package is from external source"
+            ])
+        else:
+            # Generic suggestions
+            suggestions.extend([
+                "Check the command syntax and parameters",
+                "Verify that required files/directories exist",
+                f"Command exited with code {exit_code}",
+                "Review the error output for specific issues"
+            ])
+        
+        return suggestions
+    
+    def _get_recovery_commands(self, error_analysis: dict) -> list:
+        """Get recovery commands based on error type."""
+        recovery_commands = []
+        error_type = error_analysis.get('error_type', 'general')
+        
+        if error_type == 'permission':
+            recovery_commands.extend([
+                "ls -la",  # Check permissions
+                "whoami",  # Check current user
+                "id"       # Check user groups
+            ])
+        elif error_type == 'not_found':
+            recovery_commands.extend([
+                "pwd",     # Check current directory
+                "ls -la",  # List files
+                "find . -name '*' -type f | head -20"  # Search for files
+            ])
+        elif error_type == 'command_not_found':
+            recovery_commands.extend([
+                "echo $PATH",  # Check PATH
+                "which <command>",  # Check if command exists
+                "apt-get update && apt-cache search <command>"  # Search for package
+            ])
+        elif error_type == 'network':
+            recovery_commands.extend([
+                "ping -c 3 google.com",  # Check internet
+                "cat /etc/resolv.conf",  # Check DNS
+                "ip addr show"           # Check network interfaces
+            ])
+        elif error_type == 'disk_space':
+            recovery_commands.extend([
+                "df -h",     # Check disk space
+                "du -sh /*", # Check directory sizes
+                "find /tmp -type f -mtime +7 -delete"  # Clean old tmp files
+            ])
+        
+        return recovery_commands
+    
+    def _get_command_timeout(self, command: str) -> tuple[int, int]:
+        """
+        Get appropriate timeouts based on command type.
+        Returns (silent_timeout, absolute_timeout) in seconds.
+        """
+        command_lower = command.lower()
+        
+        # Maven/Gradle builds - need very long timeouts
+        if any(tool in command_lower for tool in ['mvn', 'gradle', './gradlew']):
+            # Check for specific Maven/Gradle operations
+            if any(op in command_lower for op in ['clean install', 'clean test', 'build']):
+                # Full builds with tests can take very long
+                return (900, 3600)  # 15 min silent, 60 min total
+            elif 'compile' in command_lower:
+                # Compilation only is faster
+                return (600, 1800)  # 10 min silent, 30 min total
+            elif 'test' in command_lower:
+                # Tests can be long running
+                return (900, 2400)  # 15 min silent, 40 min total
+            else:
+                # Default for Maven/Gradle
+                return (600, 1800)  # 10 min silent, 30 min total
+        
+        # NPM/Node operations
+        elif 'npm' in command_lower or 'yarn' in command_lower:
+            if 'install' in command_lower:
+                return (300, 900)  # 5 min silent, 15 min total
+            elif 'build' in command_lower or 'test' in command_lower:
+                return (300, 1200)  # 5 min silent, 20 min total
+            else:
+                return (180, 600)  # 3 min silent, 10 min total
+        
+        # Python operations
+        elif 'pip' in command_lower or 'pytest' in command_lower:
+            if 'install' in command_lower:
+                return (180, 600)  # 3 min silent, 10 min total
+            elif 'test' in command_lower:
+                return (300, 900)  # 5 min silent, 15 min total
+            else:
+                return (120, 300)  # 2 min silent, 5 min total
+        
+        # Git operations
+        elif 'git' in command_lower:
+            if 'clone' in command_lower:
+                # Large repos can take time
+                return (300, 1200)  # 5 min silent, 20 min total
+            else:
+                return (60, 180)  # 1 min silent, 3 min total
+        
+        # Docker operations
+        elif 'docker' in command_lower:
+            if 'build' in command_lower:
+                return (600, 1800)  # 10 min silent, 30 min total
+            elif 'pull' in command_lower:
+                return (300, 900)  # 5 min silent, 15 min total
+            else:
+                return (60, 300)  # 1 min silent, 5 min total
+        
+        # Package installation
+        elif any(pkg in command_lower for pkg in ['apt-get install', 'apt install', 'yum install']):
+            return (300, 900)  # 5 min silent, 15 min total
+        
+        # Make/CMake operations
+        elif 'make' in command_lower or 'cmake' in command_lower:
+            return (300, 1200)  # 5 min silent, 20 min total
+        
+        # Default for unknown long-running commands
+        elif self._is_long_running_command(command):
+            return (300, 900)  # 5 min silent, 15 min total
+        
+        # Default for regular commands
+        else:
+            return (60, 300)  # 1 min silent, 5 min total
 
     def _validate_and_fix_working_directory(self, requested_workdir: str) -> str:
         """

@@ -172,7 +172,7 @@ class AgentStateEvaluator:
                 else:
                     break
                     
-            if consecutive_failures >= 3:
+            if consecutive_failures >= 2:  # Reduced from 3 to catch issues earlier
                 guidance = (
                     f"🔁 REPETITIVE EXECUTION DETECTED: Tool '{last_tool}' has failed {consecutive_failures} times consecutively.\n\n"
                     f"This indicates the current approach is not working. Consider:\n"
