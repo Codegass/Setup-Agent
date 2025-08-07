@@ -64,10 +64,10 @@ class BaseTool(ABC):
         self.description = description
         self._parameter_schema: Dict[str, Any] = {}
         
-        # Output truncation settings
-        self.max_output_length = 3000  # Maximum total output length
-        self.head_length = 1200       # Length of beginning portion
-        self.tail_length = 800        # Length of ending portion
+        # Output truncation settings - increased for build tools
+        self.max_output_length = 10000  # Maximum total output length (increased from 3000)
+        self.head_length = 4000       # Length of beginning portion (increased from 1200)
+        self.tail_length = 3000        # Length of ending portion (increased from 800)
         
         self._generate_parameter_schema()
 
@@ -197,11 +197,12 @@ class BaseTool(ABC):
             elif "building jar:" in line_lower:
                 compilation_info = "📦 JAR artifact created"
             
-            # Error patterns - collect specific errors
+            # Error patterns - collect specific errors (increased limit)
             elif any(error_pattern in line_lower for error_pattern in [
-                "error:", "[error]", "exception:", "failed to", "cannot find", "package does not exist"
+                "error:", "[error]", "exception:", "failed to", "cannot find", "package does not exist",
+                "compilation failure", "cannot resolve", "symbol not found", "method does not exist"
             ]):
-                if len(error_summary) < 5:  # Limit to first 5 errors
+                if len(error_summary) < 15:  # Increased limit to capture more errors
                     error_summary.append(f"🚨 {line.strip()}")
         
         # Build the summary
@@ -218,9 +219,9 @@ class BaseTool(ABC):
         
         if error_summary:
             summary_parts.append("Key Errors:")
-            summary_parts.extend(error_summary[:3])  # Show max 3 errors
-            if len(error_summary) > 3:
-                summary_parts.append(f"... and {len(error_summary) - 3} more errors")
+            summary_parts.extend(error_summary[:10])  # Show more errors for better debugging
+            if len(error_summary) > 10:
+                summary_parts.append(f"... and {len(error_summary) - 10} more errors")
         
         # If we found key info, return it; otherwise return truncated original
         if summary_parts:

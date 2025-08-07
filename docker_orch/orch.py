@@ -197,18 +197,36 @@ class DockerOrchestrator:
 
     def connect_to_container(self, shell: str = "/bin/bash") -> None:
         """Connect to the container interactively."""
+        import subprocess
+        import sys
 
         if not self.is_container_running():
             raise RuntimeError(f"Container {self.container_name} is not running")
 
-        # Use docker exec to connect interactively
-        cmd = ["docker", "exec", "-it", self.container_name, shell]
+        # Check if we're in an interactive terminal
+        is_tty = sys.stdin.isatty()
+        
+        if is_tty:
+            # Use docker exec with -it for interactive terminal
+            cmd = ["docker", "exec", "-it", self.container_name, shell]
+        else:
+            # Use docker exec without -it for non-interactive (piped input)
+            cmd = ["docker", "exec", "-i", self.container_name, shell]
 
         logger.info(f"Connecting to container with command: {' '.join(cmd)}")
+        logger.info(f"TTY mode: {is_tty}")
 
         try:
-            # Replace current process with docker exec
-            os.execvp("docker", cmd)
+            # Use subprocess.call for better compatibility
+            # This preserves the current process and handles TTY correctly
+            result = subprocess.call(cmd)
+            if result != 0:
+                logger.error(f"Docker exec returned non-zero exit code: {result}")
+                raise RuntimeError(f"Failed to connect to container (exit code: {result})")
+        except KeyboardInterrupt:
+            # Handle Ctrl+C gracefully
+            logger.info("Container connection interrupted by user")
+            return
         except Exception as e:
             logger.error(f"Failed to connect to container: {e}")
             raise
