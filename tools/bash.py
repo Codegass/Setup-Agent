@@ -624,21 +624,24 @@ class BashTool(BaseTool):
         """
         command_lower = command.lower()
         
-        # Maven/Gradle builds - need very long timeouts
+        # Maven/Gradle builds - need very long timeouts, especially for first runs
         if any(tool in command_lower for tool in ['mvn', 'gradle', './gradlew']):
             # Check for specific Maven/Gradle operations
             if any(op in command_lower for op in ['clean install', 'clean test', 'build']):
-                # Full builds with tests can take very long
-                return (900, 3600)  # 15 min silent, 60 min total
+                # Full builds with tests can take very long, especially with dependency downloads
+                return (1800, 7200)  # 30 min silent, 120 min total
             elif 'compile' in command_lower:
-                # Compilation only is faster
-                return (600, 1800)  # 10 min silent, 30 min total
+                # Compilation with dependency downloads
+                return (1200, 3600)  # 20 min silent, 60 min total
+            elif 'package' in command_lower:
+                # Packaging can involve downloads
+                return (1200, 3600)  # 20 min silent, 60 min total
             elif 'test' in command_lower:
                 # Tests can be long running
-                return (900, 2400)  # 15 min silent, 40 min total
+                return (1200, 3600)  # 20 min silent, 60 min total
             else:
-                # Default for Maven/Gradle
-                return (600, 1800)  # 10 min silent, 30 min total
+                # Default for Maven/Gradle (includes dependency resolution)
+                return (900, 2400)  # 15 min silent, 40 min total
         
         # NPM/Node operations
         elif 'npm' in command_lower or 'yarn' in command_lower:

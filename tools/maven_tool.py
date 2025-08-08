@@ -76,10 +76,28 @@ class MavenTool(BaseTool):
         
         # Execute the command
         try:
-            result = self.orchestrator.execute_command(
-                maven_cmd,
-                workdir=working_directory
-            )
+            # Use extended timeout for Maven commands which often download dependencies
+            # Check if this is a potentially long-running command
+            is_long_running = any(cmd in maven_cmd for cmd in [
+                'clean', 'compile', 'test', 'package', 'install', 'deploy', 'verify', 'site'
+            ])
+            
+            if is_long_running and hasattr(self.orchestrator, 'execute_command_with_monitoring'):
+                # Use monitoring version with extended timeouts for build commands
+                logger.info(f"Executing Maven command with extended timeout: {maven_cmd}")
+                result = self.orchestrator.execute_command_with_monitoring(
+                    maven_cmd,
+                    workdir=working_directory,
+                    silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
+                    absolute_timeout=3600,  # 60 minutes total
+                    optimize_for_maven=True
+                )
+            else:
+                # Use regular version for quick commands like help, version, etc.
+                result = self.orchestrator.execute_command(
+                    maven_cmd,
+                    workdir=working_directory
+                )
             
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
@@ -478,17 +496,51 @@ class MavenTool(BaseTool):
             ])
             documentation_links.append("https://maven.apache.org/guides/getting-started/maven-in-five-minutes.html")
         
-        # Check for Java version issues
-        if "Unsupported major.minor version" in output or "java.lang.UnsupportedClassVersionError" in output:
+        # Check for Java version issues (including Maven Enforcer plugin)
+        if ("Unsupported major.minor version" in output or 
+            "java.lang.UnsupportedClassVersionError" in output or
+            "RequireJavaVersion" in output or
+            "Detected JDK" in output and "not in the allowed range" in output):
             error_code = "JAVA_VERSION_ERROR"
-            # Extract required Java version if possible
+            
+            # Try to extract required Java version from different error patterns
+            java_version = None
+            
+            # Pattern 1: Maven Enforcer plugin - "not in the allowed range [17,)"
+            enforcer_match = re.search(r'allowed range \[(\d+),', output)
+            if enforcer_match:
+                java_version = enforcer_match.group(1)
+            
+            # Pattern 2: Traditional version error - "version 55.0" maps to Java versions
             version_match = re.search(r'version (\d+\.\d+)', output)
-            java_version = version_match.group(1) if version_match else "appropriate"
+            if not java_version and version_match:
+                class_version = float(version_match.group(1))
+                # Map class file version to Java version
+                version_map = {52.0: "8", 53.0: "9", 54.0: "10", 55.0: "11", 
+                              56.0: "12", 57.0: "13", 58.0: "14", 59.0: "15",
+                              60.0: "16", 61.0: "17", 62.0: "18", 63.0: "19", 
+                              64.0: "20", 65.0: "21"}
+                java_version = version_map.get(class_version, str(int(class_version - 44)))
+            
+            # Pattern 3: Extract current vs required from enforcer message
+            current_match = re.search(r'version (\d+(?:\.\d+)*) which is not', output)
+            if current_match and not java_version:
+                # If we see current version is too low, suggest next LTS
+                current = int(current_match.group(1).split('.')[0])
+                if current < 17:
+                    java_version = "17"  # Suggest Java 17 LTS
+                elif current < 21:
+                    java_version = "21"  # Suggest Java 21 LTS
+            
+            if not java_version:
+                java_version = "17"  # Default to Java 17 LTS if can't determine
+            
             error_suggestions.extend([
-                "Java version mismatch detected",
-                f"Install Java {java_version}: bash(command='apt-get install -y openjdk-{java_version.split('.')[0]}-jdk')",
-                "Check current Java version: bash(command='java -version')",
-                "Set JAVA_HOME: bash(command='export JAVA_HOME=/usr/lib/jvm/java-{version}-openjdk-amd64')"
+                f"Java version mismatch detected - Java {java_version} or higher is required",
+                f"Install Java {java_version}: bash(command='apt-get update && apt-get install -y openjdk-{java_version}-jdk')",
+                f"Set JAVA_HOME: bash(command='export JAVA_HOME=/usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)')",
+                f"Update alternatives: bash(command='update-alternatives --set java /usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
+                "Verify installation: bash(command='java -version && javac -version')"
             ])
         
         # Check for missing compiler
@@ -689,10 +741,24 @@ class MavenTool(BaseTool):
                 {"action": "check_structure", "command": "bash(command='tree -L 2 /workspace 2>/dev/null || find /workspace -maxdepth 2 -type d')"}
             ])
         elif error_code == "JAVA_VERSION_ERROR":
+            # Extract Java version from error analysis if available
+            required_version = "17"  # Default to Java 17 LTS
+            if "error_suggestions" in locals():
+                for suggestion in error_suggestions:
+                    if "Java" in suggestion and "required" in suggestion:
+                        import re
+                        ver_match = re.search(r'Java (\d+)', suggestion)
+                        if ver_match:
+                            required_version = ver_match.group(1)
+                            break
+            
             recovery_actions.extend([
-                {"action": "check_version", "command": "bash(command='java -version && javac -version')"},
-                {"action": "list_java", "command": "bash(command='update-alternatives --list java 2>/dev/null || ls /usr/lib/jvm/')"},
-                {"action": "install_java", "command": "bash(command='apt-get update && apt-get install -y openjdk-11-jdk')"}
+                {"action": "check_current", "command": "bash(command='java -version 2>&1 && echo \"---\" && javac -version 2>&1')"},
+                {"action": "list_available", "command": "bash(command='apt-cache search openjdk | grep -E \"openjdk-[0-9]+-jdk\" | sort -V')"},
+                {"action": "install_required", "command": f"bash(command='apt-get update && apt-get install -y openjdk-{required_version}-jdk')"},
+                {"action": "set_java_home", "command": f"bash(command='export JAVA_HOME=/usr/lib/jvm/java-{required_version}-openjdk-$(dpkg --print-architecture) && echo $JAVA_HOME')"},
+                {"action": "update_alternatives", "command": f"bash(command='update-alternatives --set java /usr/lib/jvm/java-{required_version}-openjdk-$(dpkg --print-architecture)/bin/java')"},
+                {"action": "verify_install", "command": "bash(command='java -version && mvn -version')"}
             ])
         elif error_code == "OUT_OF_MEMORY":
             recovery_actions.extend([

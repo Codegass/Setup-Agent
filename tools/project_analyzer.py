@@ -353,27 +353,93 @@ class ProjectAnalyzerTool(BaseTool):
         return config
 
     def _analyze_maven_configuration(self, project_path: str, config: Dict[str, Any]):
-        """分析Maven配置（pom.xml）"""
+        """分析Maven配置（pom.xml）- 包括多模块项目和父POM"""
+        # First, read the main pom.xml
         result = self.docker_orchestrator.execute_command(f"cat {project_path}/pom.xml")
-        if result.get("success"):
-            pom_content = result.get("output", "")
+        if not result.get("success"):
+            return
             
-            # 提取 Java 版本
+        main_pom_content = result.get("output", "")
+        
+        # Check if this is a multi-module project and look for parent POMs
+        all_pom_contents = [main_pom_content]
+        pom_locations = [f"{project_path}/pom.xml"]
+        
+        # Check for parent module reference (e.g., tika-parent)
+        parent_match = re.search(r"<parent>.*?<artifactId>([^<]+)</artifactId>.*?</parent>", main_pom_content, re.DOTALL)
+        if parent_match:
+            parent_artifact = parent_match.group(1)
+            # Try to find the parent POM in common locations
+            potential_parent_paths = [
+                f"{project_path}/{parent_artifact}/pom.xml",
+                f"{project_path}/../{parent_artifact}/pom.xml",
+                f"{project_path}/parent/pom.xml"
+            ]
+            
+            for parent_path in potential_parent_paths:
+                # First check if parent POM exists
+                check_result = self.docker_orchestrator.execute_command(f"test -f {parent_path} && echo 'exists' 2>/dev/null")
+                if check_result.get("success") and "exists" in check_result.get("output", ""):
+                    # Extract just the properties section to avoid truncation
+                    props_result = self.docker_orchestrator.execute_command(
+                        f"sed -n '/<properties>/,/<\\/properties>/p' {parent_path} 2>/dev/null | head -200"
+                    )
+                    if props_result.get("success") and props_result.get("output"):
+                        # Get a minimal version of parent POM with just properties
+                        minimal_parent = f"<project>{props_result.get('output', '')}</project>"
+                        all_pom_contents.append(minimal_parent)
+                        pom_locations.append(parent_path)
+                        logger.info(f"Found parent POM at: {parent_path}")
+                    break
+        
+        # Analyze all POM contents for Java version
+        java_version = None
+        java_version_source = None
+        java_version_enforced = False
+        
+        for idx, pom_content in enumerate(all_pom_contents):
+            if java_version:
+                break  # Already found
+                
+            # 1. First check Maven Enforcer plugin for RequireJavaVersion
+            enforcer_pattern = r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            enforcer_match = re.search(enforcer_pattern, pom_content, re.DOTALL | re.IGNORECASE)
+            if enforcer_match:
+                java_version = enforcer_match.group(1).strip()
+                java_version_source = "maven-enforcer"
+                java_version_enforced = True
+                logger.info(f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}")
+                break
+            
+            # 2. Check standard properties
             java_version_patterns = [
-                r"<java\.version>([^<]+)</java\.version>",
+                r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
+                r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
                 r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
-                r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>"
+                r"<java\.version>([^<]+)</java\.version>"
             ]
             
             for pattern in java_version_patterns:
                 match = re.search(pattern, pom_content)
                 if match:
-                    config["java_version"] = match.group(1).strip()
+                    java_version = match.group(1).strip()
+                    java_version_source = "maven-compiler"
+                    logger.info(f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}")
                     break
+        
+        if java_version:
+            # Normalize version (e.g., "1.8" -> "8")
+            if java_version.startswith("1."):
+                java_version = java_version[2:]
+            config["java_version"] = java_version
+            config["java_version_source"] = java_version_source
+            config["java_version_enforced"] = java_version_enforced
+        else:
+            logger.warning(f"No Java version found in Maven configuration for {project_path}")
 
-            # 提取依赖信息
-            dependency_matches = re.findall(r"<groupId>([^<]+)</groupId>.*?<artifactId>([^<]+)</artifactId>", pom_content, re.DOTALL)
-            config["dependencies"] = [f"{group}:{artifact}" for group, artifact in dependency_matches[:10]]  # 限制输出
+        # Extract dependencies from main POM only
+        dependency_matches = re.findall(r"<groupId>([^<]+)</groupId>.*?<artifactId>([^<]+)</artifactId>", main_pom_content, re.DOTALL)
+        config["dependencies"] = [f"{group}:{artifact}" for group, artifact in dependency_matches[:10]]  # 限制输出
 
     def _analyze_gradle_configuration(self, project_path: str, config: Dict[str, Any]):
         """分析Gradle配置（build.gradle 或 build.gradle.kts）"""
@@ -622,13 +688,32 @@ class ProjectAnalyzerTool(BaseTool):
 
         # STEP 1: Environment setup (if needed)
         if java_version:
-            plan.append({
-                "id": "setup_environment",
-                "description": f"Verify Java {java_version} environment and install dependencies",
-                "priority": "high",
-                "type": "environment",
-                "core_step": "preparation"
-            })
+            # Check if Java version is enforced (stricter requirement)
+            is_enforced = analysis.get("java_version_enforced", False)
+            version_source = analysis.get("java_version_source", "unknown")
+            
+            if is_enforced:
+                plan.append({
+                    "id": "setup_java_environment",
+                    "description": f"Install and configure Java {java_version} (Required by Maven Enforcer)",
+                    "priority": "critical",
+                    "type": "environment",
+                    "core_step": "preparation",
+                    "commands": [
+                        f"bash(command='java -version 2>&1 | grep \"version\" || echo \"Java not found\"')",
+                        f"bash(command='apt-get update && apt-get install -y openjdk-{java_version}-jdk')",
+                        f"bash(command='update-alternatives --set java /usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
+                        f"bash(command='export JAVA_HOME=/usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture) && java -version')"
+                    ]
+                })
+            else:
+                plan.append({
+                    "id": "setup_environment",
+                    "description": f"Verify Java {java_version} environment and install dependencies",
+                    "priority": "high",
+                    "type": "environment",
+                    "core_step": "preparation"
+                })
 
         # STEP 2: BUILD - Compile/package the project
         if project_type == "Java" and build_system == "Maven":

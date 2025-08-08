@@ -319,10 +319,17 @@ class DockerOrchestrator:
             logger.info(f"Working directory: {workdir}")
 
         try:
-            # Execute the command
-            result = container.exec_run(exec_command, workdir=workdir)
+            # Execute the command with stderr capture
+            # Note: When demux=False (default), stderr is merged into stdout which is what we want
+            # This ensures error messages are captured
+            result = container.exec_run(
+                exec_command, 
+                workdir=workdir,
+                stderr=True,  # Explicitly capture stderr
+                stdout=True   # Explicitly capture stdout
+            )
 
-            # Decode output
+            # Decode output (includes both stdout and stderr)
             output = result.output.decode("utf-8").strip()
             exit_code = result.exit_code
 

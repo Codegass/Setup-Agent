@@ -19,20 +19,21 @@ class SystemTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
 
-    def execute(self, action: str, packages: Optional[List[str]] = None) -> ToolResult:
+    def execute(self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None) -> ToolResult:
         """Execute system management operations."""
         
-        if action not in ["install", "update", "detect_missing", "install_missing"]:
+        if action not in ["install", "update", "detect_missing", "install_missing", "install_java"]:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', or 'install_missing'",
+                error=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', or 'install_java'",
                 error_code="INVALID_ACTION",
                 suggestions=[
                     "Use 'install' to install specific packages",
                     "Use 'update' to update package lists",
                     "Use 'detect_missing' to check for missing dependencies",
-                    "Use 'install_missing' to automatically install missing dependencies"
+                    "Use 'install_missing' to automatically install missing dependencies",
+                    "Use 'install_java' to install and configure a specific Java version"
                 ]
             )
 
@@ -60,6 +61,20 @@ class SystemTool(BaseTool):
                     return self._smart_install_commands(packages)
                 else:
                     return self._install_missing_dependencies()
+            
+            elif action == "install_java":
+                if not java_version:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="Java version is required for 'install_java' action",
+                        error_code="MISSING_VERSION",
+                        suggestions=[
+                            "Provide Java version to install (e.g., '17', '21')",
+                            "Example: system(action='install_java', java_version='17')"
+                        ]
+                    )
+                return self._install_and_configure_java(java_version)
                 
         except Exception as e:
             error_msg = f"System operation failed: {str(e)}"
@@ -253,6 +268,126 @@ class SystemTool(BaseTool):
                 }
             )
 
+    def _install_and_configure_java(self, java_version: str) -> ToolResult:
+        """Install and configure a specific Java version."""
+        logger.info(f"Installing and configuring Java {java_version}")
+        
+        # Step 1: Check current Java version
+        current_java = self.docker_orchestrator.execute_command("java -version 2>&1 | head -1")
+        logger.info(f"Current Java: {current_java.get('output', 'Not installed')}")
+        
+        # Step 2: Update package lists
+        update_result = self._update_packages()
+        if not update_result.success:
+            logger.warning("Failed to update package lists, continuing anyway")
+        
+        # Step 3: Install OpenJDK
+        java_package = f"openjdk-{java_version}-jdk"
+        install_cmd = f"apt-get install -y {java_package}"
+        logger.info(f"Installing {java_package}")
+        
+        install_result = self.docker_orchestrator.execute_command(install_cmd)
+        
+        if install_result["exit_code"] != 0:
+            # Try alternative package names
+            alt_packages = [
+                f"openjdk-{java_version}-jdk-headless",
+                f"java-{java_version}-openjdk",
+                f"java-{java_version}-openjdk-devel"
+            ]
+            
+            for alt_package in alt_packages:
+                logger.info(f"Trying alternative package: {alt_package}")
+                alt_result = self.docker_orchestrator.execute_command(f"apt-get install -y {alt_package}")
+                if alt_result["exit_code"] == 0:
+                    install_result = alt_result
+                    java_package = alt_package
+                    break
+            else:
+                return ToolResult(
+                    success=False,
+                    output=install_result["output"],
+                    error=f"Failed to install Java {java_version}",
+                    error_code="JAVA_INSTALL_FAILED",
+                    suggestions=[
+                        f"Java {java_version} may not be available in the package repository",
+                        "Try a different version (e.g., 11, 17, 21)",
+                        "Check available versions: apt-cache search openjdk | grep jdk"
+                    ]
+                )
+        
+        # Step 4: Get architecture for Java home path
+        arch_result = self.docker_orchestrator.execute_command("dpkg --print-architecture")
+        arch = arch_result.get("output", "amd64").strip()
+        
+        # Step 5: Set JAVA_HOME and update alternatives
+        java_home = f"/usr/lib/jvm/java-{java_version}-openjdk-{arch}"
+        java_bin = f"{java_home}/bin/java"
+        javac_bin = f"{java_home}/bin/javac"
+        
+        # Check if the Java installation exists
+        check_java = self.docker_orchestrator.execute_command(f"test -f {java_bin} && echo 'exists'")
+        if "exists" not in check_java.get("output", ""):
+            # Try to find the actual Java installation
+            find_java = self.docker_orchestrator.execute_command(
+                f"find /usr/lib/jvm -name 'java-{java_version}-openjdk*' -type d | head -1"
+            )
+            if find_java.get("output"):
+                java_home = find_java["output"].strip()
+                java_bin = f"{java_home}/bin/java"
+                javac_bin = f"{java_home}/bin/javac"
+        
+        # Step 6: Configure environment
+        config_commands = [
+            # Set JAVA_HOME in profile
+            f"echo 'export JAVA_HOME={java_home}' >> /etc/profile",
+            f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /etc/profile",
+            # Set JAVA_HOME in bashrc
+            f"echo 'export JAVA_HOME={java_home}' >> /root/.bashrc",
+            f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /root/.bashrc",
+            # Update alternatives
+            f"update-alternatives --install /usr/bin/java java {java_bin} 100",
+            f"update-alternatives --install /usr/bin/javac javac {javac_bin} 100",
+            f"update-alternatives --set java {java_bin}",
+            f"update-alternatives --set javac {javac_bin}"
+        ]
+        
+        for cmd in config_commands:
+            result = self.docker_orchestrator.execute_command(cmd)
+            if result["exit_code"] != 0:
+                logger.warning(f"Failed to execute: {cmd}")
+        
+        # Step 7: Verify installation
+        verify_result = self.docker_orchestrator.execute_command(
+            f"export JAVA_HOME={java_home} && java -version 2>&1 && echo '---' && javac -version 2>&1"
+        )
+        
+        if verify_result["exit_code"] == 0:
+            return ToolResult(
+                success=True,
+                output=f"Successfully installed and configured Java {java_version}\n\n"
+                      f"JAVA_HOME: {java_home}\n"
+                      f"Verification:\n{verify_result['output']}",
+                metadata={
+                    "java_version": java_version,
+                    "java_home": java_home,
+                    "package": java_package,
+                    "architecture": arch
+                }
+            )
+        else:
+            return ToolResult(
+                success=False,
+                output=verify_result["output"],
+                error=f"Java {java_version} installed but verification failed",
+                error_code="JAVA_CONFIG_FAILED",
+                suggestions=[
+                    "Java was installed but configuration may be incomplete",
+                    f"Try manually setting: export JAVA_HOME={java_home}",
+                    "Restart the shell or container to apply changes"
+                ]
+            )
+    
     def _smart_install_commands(self, commands: List[str]) -> ToolResult:
         """
         Intelligently install packages that provide the specified commands.
