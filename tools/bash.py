@@ -1,12 +1,25 @@
 """Bash tool for executing shell commands with specialized grep functionality."""
 
+import re
 import shlex
 import subprocess
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
 
 from loguru import logger
 
 from .base import BaseTool, ToolResult, ToolError
+
+
+@dataclass
+class BashToolConfig:
+    """Configuration for the BashTool."""
+    allowed_commands: List[str] = field(default_factory=list)
+    blocked_commands: List[str] = field(default_factory=list)
+    enable_background_processes: bool = True
+    block_interactive_commands: bool = True
+    audit_command_execution: bool = True
+    add_sag_cli_marker: bool = True
 
 
 class BashTool(BaseTool):
@@ -50,18 +63,91 @@ class BashTool(BaseTool):
     Use bash for: file operations, package installation, git operations, system tasks, and ESPECIALLY grep-based code investigation.
     """
 
-    def __init__(self, docker_orchestrator=None):
+    def __init__(self, docker_orchestrator=None, config: Optional[BashToolConfig] = None):
         super().__init__(
             name="bash",
             description="Execute shell commands in the container. SPECIALIZES in grep-based code investigation. "
             "grep is your PRIMARY tool for understanding codebases, finding patterns, and investigating issues. "
-            "Use for file operations, package installation, git operations, and comprehensive code analysis.",
+            "Use for file operations, package installation, git operations, and comprehensive code analysis. "
+            "Supports background processes with & and command validation.",
         )
         self.docker_orchestrator = docker_orchestrator
+        self.config = config or BashToolConfig()
+        self.background_processes: Dict[str, List[int]] = {}  # Track background PIDs per container
 
     def _ensure_working_directory(self, requested_workdir: str) -> str:
         """Smart working directory validation and setup."""
         return self._validate_and_fix_working_directory(requested_workdir)
+    
+    def _validate_command(self, command: str) -> tuple[bool, str]:
+        """Validate command against allowlist/blocklist.
+        
+        Returns:
+            (is_valid, error_message)
+        """
+        # Split command chains (&&, ||, ;) and validate each part
+        command_parts = re.split(r'\s*(?:&&|\|\||;)\s*', command)
+        
+        for part in command_parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            # Extract the base command (first word)
+            base_cmd = shlex.split(part)[0] if part else ""
+            
+            # Check blocklist first (takes precedence)
+            for blocked in self.config.blocked_commands:
+                if base_cmd.startswith(blocked) or part.startswith(blocked):
+                    return False, f"Command '{base_cmd}' is blocked by security policy"
+            
+            # If allowlist is configured, check if command is allowed
+            if self.config.allowed_commands:
+                allowed = False
+                for allowed_cmd in self.config.allowed_commands:
+                    if base_cmd.startswith(allowed_cmd) or allowed_cmd == "*":
+                        allowed = True
+                        break
+                if not allowed:
+                    return False, f"Command '{base_cmd}' is not in the allowlist"
+        
+        # Check for dangerous patterns (process substitution)
+        if '<(' in command or '>(' in command:
+            return False, "Process substitution is not allowed for security reasons"
+        
+        return True, ""
+    
+    def _is_background_command(self, command: str) -> bool:
+        """Check if command should run in background."""
+        # Check if command ends with & (not &&)
+        command = command.strip()
+        return command.endswith('&') and not command.endswith('&&')
+    
+    def _detect_interactive_command(self, command: str) -> tuple[bool, str]:
+        """Detect if command requires interactive input.
+        
+        Returns:
+            (is_interactive, suggestion)
+        """
+        interactive_patterns = [
+            (r'\bnpm init\b(?!.*-y)', 'Use "npm init -y" for non-interactive mode'),
+            (r'\bgit rebase -i\b', 'Interactive rebase not supported in containers'),
+            (r'\bgit add -i\b', 'Interactive add not supported, use specific file paths'),
+            (r'\bvim?\b|\bnano\b|\bemacs\b', 'Text editors not supported, use file manipulation tools'),
+            (r'\bsudo -S\b', 'Password input not supported, configure sudoers if needed'),
+            (r'\bpasswd\b', 'Password changes not supported in container'),
+            (r'\bssh\b.*@', 'SSH with password not supported, use key-based auth'),
+            (r'\btop\b|\bhtop\b', 'Interactive monitoring not supported, use one-shot commands'),
+        ]
+        
+        for pattern, suggestion in interactive_patterns:
+            if re.search(pattern, command, re.IGNORECASE):
+                if self.config.block_interactive_commands:
+                    return True, suggestion
+                else:
+                    logger.warning(f"Potentially interactive command detected: {suggestion}")
+        
+        return False, ""
 
     def _extract_key_info(self, output: str, command: str = "") -> str:
         """Extract key information from command output."""
@@ -188,13 +274,15 @@ class BashTool(BaseTool):
         
         return output
 
-    def execute(self, command: str, working_directory: str = "/workspace") -> ToolResult:
+    def execute(self, command: str, working_directory: str = "/workspace", 
+                environment: Optional[Dict[str, str]] = None) -> ToolResult:
         """
         Execute a bash command in the Docker container with enhanced monitoring.
         
         Args:
             command: The bash command to execute
             working_directory: Working directory (default: /workspace)
+            environment: Additional environment variables to set
         """
         
         if not command or not command.strip():
@@ -211,15 +299,55 @@ class BashTool(BaseTool):
                 error_code="NO_ORCHESTRATOR"
             )
         
+        # Validate command against security policies
+        is_valid, error_msg = self._validate_command(command)
+        if not is_valid:
+            raise ToolError(
+                message=f"Command validation failed: {error_msg}",
+                suggestions=[
+                    "Check if the command is allowed by security policy",
+                    "Use alternative commands that are permitted",
+                    "Contact administrator to update security policy if needed"
+                ],
+                error_code="COMMAND_BLOCKED"
+            )
+        
+        # Check for interactive commands
+        is_interactive, suggestion = self._detect_interactive_command(command)
+        if is_interactive and self.config.block_interactive_commands:
+            raise ToolError(
+                message="Interactive command detected",
+                suggestions=[suggestion, "Use non-interactive alternatives"],
+                error_code="INTERACTIVE_COMMAND"
+            )
+        
         # Smart working directory validation and setup
         workdir = self._ensure_working_directory(working_directory)
         
+        # Check if this is a background command
+        is_background = self._is_background_command(command)
+        if is_background and self.config.enable_background_processes:
+            # Remove the trailing & for processing
+            command = command.rstrip().rstrip('&').rstrip()
+            logger.info(f"🚀 Detected background command: {command}")
+        
+        # Prepare environment variables
+        env_vars = environment or {}
+        if self.config.add_sag_cli_marker:
+            env_vars['SAG_CLI'] = '1'
+        
         # Detect if this is a long-running command that needs enhanced monitoring
-        is_long_running_command = self._is_long_running_command(command)
+        is_long_running_command = self._is_long_running_command(command) and not is_background
         
         try:
             logger.info(f"Executing bash command: {command}")
             logger.info(f"Working directory: {workdir}")
+            if env_vars:
+                logger.info(f"Environment variables: {list(env_vars.keys())}")
+            
+            # Handle background execution
+            if is_background and self.config.enable_background_processes:
+                return self._execute_background_command(command, workdir, env_vars)
             
             if is_long_running_command:
                 # Get dynamic timeouts based on command type
@@ -234,10 +362,16 @@ class BashTool(BaseTool):
                     use_timeout_wrapper=True,
                     enable_cpu_monitoring=True,
                     optimize_for_maven=('mvn' in command)
+                    # Note: env vars handled in wrapped command for monitoring
                 )
             else:
                 # Use regular execution for normal commands
-                result = self.docker_orchestrator.execute_command(command, workdir=workdir)
+                result = self.docker_orchestrator.execute_command(
+                    command, 
+                    workdir=workdir,
+                    capture_stderr=True,
+                    environment=env_vars
+                )
             
             # Handle timeout terminations
             if result.get('termination_reason'):
@@ -291,23 +425,36 @@ class BashTool(BaseTool):
                 # Analyze output for completion signals
                 completion_signals = self._detect_completion_signals(result["output"], command)
                 
+                # Separate stdout and stderr if available
+                stdout = result.get('stdout', result["output"])
+                stderr = result.get('stderr', '')
+                
                 return ToolResult(
                     success=True,
                     output=extracted_output,
                     raw_output=result["output"],
                     metadata={
+                        'stdout': stdout,
+                        'stderr': stderr,
                         'exit_code': result.get('exit_code', 0),
+                        'signal': result.get('signal'),
+                        'execution_directory': workdir,
+                        'environment_vars': env_vars,
                         'monitoring_info': result.get('monitoring_info'),
-                        'workdir': workdir,
                         'is_long_running': is_long_running_command,
                         'completion_signals': completion_signals,
                         'command_type': self._get_command_type(command),
-                        'extracted_values': self._extract_values(result["output"], command)
+                        'extracted_values': self._extract_values(result["output"], command),
+                        'background_pids': []
                     }
                 )
             else:
                 # Analyze error for specific failure patterns
                 error_analysis = self._analyze_error_output(result["output"], command)
+                
+                # Separate stdout and stderr if available
+                stdout = result.get('stdout', result["output"])
+                stderr = result.get('stderr', '')
                 
                 return ToolResult(
                     success=False,
@@ -316,11 +463,16 @@ class BashTool(BaseTool):
                     suggestions=self._generate_error_suggestions(error_analysis, command, result.get('exit_code')),
                     error_code=error_analysis.get('error_code', 'COMMAND_FAILED'),
                     metadata={
+                        'stdout': stdout,
+                        'stderr': stderr,
                         'exit_code': result.get('exit_code'),
+                        'signal': result.get('signal'),
+                        'execution_directory': workdir,
+                        'environment_vars': env_vars,
                         'monitoring_info': result.get('monitoring_info'),
-                        'workdir': workdir,
                         'error_analysis': error_analysis,
-                        'recovery_commands': self._get_recovery_commands(error_analysis)
+                        'recovery_commands': self._get_recovery_commands(error_analysis),
+                        'background_pids': []
                     }
                 )
         
@@ -335,6 +487,112 @@ class BashTool(BaseTool):
                 ],
                 error_code="EXECUTION_ERROR"
             )
+    
+    def _execute_background_command(self, command: str, workdir: str, env_vars: Dict[str, str]) -> ToolResult:
+        """Execute a command in the background and return immediately with PID."""
+        try:
+            # Build command that starts process in background and returns PID
+            # Use nohup to prevent SIGHUP when shell exits
+            pid_command = f"nohup {command} > /tmp/sag_bg_$$.out 2>&1 & echo $!"
+            
+            # Add environment variables to the command
+            if env_vars:
+                env_prefix = ' '.join(f'{k}={shlex.quote(v)}' for k, v in env_vars.items())
+                pid_command = f"{env_prefix} {pid_command}"
+            
+            # Execute command to get PID
+            result = self.docker_orchestrator.execute_command(pid_command, workdir=workdir)
+            
+            if result["success"] and result["output"].strip().isdigit():
+                pid = int(result["output"].strip())
+                
+                # Track the background process
+                container_name = self.docker_orchestrator.container_name
+                if container_name not in self.background_processes:
+                    self.background_processes[container_name] = []
+                self.background_processes[container_name].append(pid)
+                
+                logger.info(f"🚀 Started background process with PID {pid}")
+                
+                return ToolResult(
+                    success=True,
+                    output=f"Background process started with PID: {pid}",
+                    metadata={
+                        'background_pids': [pid],
+                        'execution_directory': workdir,
+                        'environment_vars': env_vars,
+                        'command_type': 'background',
+                        'output_file': f'/tmp/sag_bg_{pid}.out',
+                        'stdout': '',
+                        'stderr': '',
+                        'exit_code': None,
+                        'signal': None
+                    }
+                )
+            else:
+                return ToolResult(
+                    success=False,
+                    output=result.get('output', ''),
+                    error="Failed to start background process",
+                    suggestions=[
+                        "Check command syntax",
+                        "Verify the command can run in the container",
+                        "Check container logs for errors"
+                    ],
+                    error_code="BACKGROUND_START_FAILED",
+                    metadata={'background_pids': []}
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to execute background command: {e}")
+            raise ToolError(
+                message=f"Failed to execute background command: {str(e)}",
+                suggestions=[
+                    "Check if background processes are enabled",
+                    "Verify container supports nohup",
+                    "Check command syntax"
+                ],
+                error_code="BACKGROUND_EXECUTION_ERROR"
+            )
+    
+    def get_background_processes(self, container_name: Optional[str] = None) -> Dict[str, List[int]]:
+        """Get list of background processes for a container or all containers."""
+        if container_name:
+            return {container_name: self.background_processes.get(container_name, [])}
+        return self.background_processes.copy()
+    
+    def check_background_process(self, pid: int, container_name: Optional[str] = None) -> Dict[str, Any]:
+        """Check status of a background process."""
+        if not container_name and self.docker_orchestrator:
+            container_name = self.docker_orchestrator.container_name
+        
+        if not container_name:
+            return {'exists': False, 'error': 'No container specified'}
+        
+        try:
+            # Check if process is still running
+            check_cmd = f"ps -p {pid} > /dev/null 2>&1 && echo 'RUNNING' || echo 'STOPPED'"
+            result = self.docker_orchestrator.execute_command(check_cmd, workdir=None)
+            
+            is_running = result["success"] and "RUNNING" in result["output"]
+            
+            # Try to get output file if it exists
+            output = ""
+            output_file = f"/tmp/sag_bg_{pid}.out"
+            output_cmd = f"test -f {output_file} && tail -n 50 {output_file} || echo 'No output file'"
+            output_result = self.docker_orchestrator.execute_command(output_cmd, workdir=None)
+            if output_result["success"]:
+                output = output_result["output"]
+            
+            return {
+                'pid': pid,
+                'running': is_running,
+                'output': output,
+                'container': container_name
+            }
+            
+        except Exception as e:
+            return {'exists': False, 'error': str(e)}
 
     def _is_long_running_command(self, command: str) -> bool:
         """Detect if a command is likely to be long-running and needs enhanced monitoring."""

@@ -58,7 +58,7 @@ class SetupAgent:
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
         from tools.context_tool import ContextTool
-        from tools.bash import BashTool
+        from tools.bash import BashTool, BashToolConfig
         from tools.file_io import FileIOTool
         from tools.web_search import WebSearchTool
         from tools.maven_tool import MavenTool
@@ -68,8 +68,16 @@ class SetupAgent:
         from tools.report_tool import ReportTool
         from tools.project_analyzer import ProjectAnalyzerTool
         
+        # Configure bash tool with enhanced features
+        bash_config = BashToolConfig(
+            enable_background_processes=True,
+            block_interactive_commands=True,
+            audit_command_execution=False,  # Can be enabled for debugging
+            add_sag_cli_marker=True
+        )
+        
         tools = [
-            BashTool(self.orchestrator),
+            BashTool(self.orchestrator, config=bash_config),
             FileIOTool(self.orchestrator),  # 传递DockerOrchestrator
             WebSearchTool(),
             ContextTool(self.context_manager),

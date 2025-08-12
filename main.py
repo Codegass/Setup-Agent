@@ -164,9 +164,9 @@ def project(ctx, repo_url, name, goal):
         if success:
             console.print(f"[bold green]✅ Project '{name}' setup completed![/bold green]")
             console.print(f"\n[dim]Next steps:[/dim]")
-            console.print(f'  sag run {docker_name} --task "run the application"')
-            console.print(f'  sag run {docker_name} --task "add tests"')
-            console.print(f"  docker exec -it {docker_name} /bin/bash")
+            console.print(f'  uv run sag run {docker_name} --task "run the application"')
+            console.print(f'  uv run sag run {docker_name} --task "add tests"')
+            console.print(f"  uv run sag shell {docker_name}")
         else:
             console.print(f"[bold red]❌ Project setup failed![/bold red]")
             console.print(f"[dim]Check logs for details. You can retry with:[/dim]")
