@@ -291,7 +291,15 @@ class ProjectAnalyzerTool(BaseTool):
                 # 清理提取的命令
                 for match in matches:
                     clean_cmd = self._clean_markdown_command(match)
+                    # Filter out invalid test commands
                     if clean_cmd and clean_cmd not in documentation["test_commands"]:
+                        # Skip commands with -Dtest without a value (invalid Maven syntax)
+                        if '-Dtest' in clean_cmd and not re.search(r'-Dtest=\S+', clean_cmd):
+                            # Fix the command by removing invalid -Dtest
+                            clean_cmd = clean_cmd.replace('-Dtest', '').strip()
+                            # If it becomes just 'mvn clean install', change to 'mvn clean test'
+                            if clean_cmd == 'mvn clean install -Dossindex.skip':
+                                clean_cmd = 'mvn clean test -Dossindex.skip'
                         documentation["test_commands"].append(clean_cmd)
 
         return documentation

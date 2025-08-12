@@ -62,6 +62,7 @@ class SetupAgent:
         from tools.file_io import FileIOTool
         from tools.web_search import WebSearchTool
         from tools.maven_tool import MavenTool
+        from tools.gradle_tool import GradleTool
         from tools.project_setup_tool import ProjectSetupTool
         from tools.system_tool import SystemTool
         from tools.report_tool import ReportTool
@@ -73,6 +74,7 @@ class SetupAgent:
             WebSearchTool(),
             ContextTool(self.context_manager),
             MavenTool(self.orchestrator),
+            GradleTool(self.orchestrator),  # 添加Gradle工具
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
             ProjectAnalyzerTool(self.orchestrator, self.context_manager),  # 🆕 添加项目分析工具

@@ -503,9 +503,11 @@ class ReportTool(BaseTool):
                 
                 # STEP 1: Check for repository clone
                 if tool_name == 'project_setup':
-                    if tool_params.get('action') == 'clone':
+                    # project_setup tool success means repository was cloned
+                    # Check output for confirmation
+                    if 'Repository cloned' in output or 'successfully cloned' in output or 'Directory:' in output:
                         actual_accomplishments['repository_cloned'] = True
-                        logger.info("✅ Repository clone detected as successful")
+                        logger.info("✅ Repository clone detected as successful via project_setup")
                 
                 # STEP 2: Check for build success (multiple build systems)
                 elif tool_name in ['maven', 'gradle', 'bash']:
@@ -609,13 +611,16 @@ class ReportTool(BaseTool):
                 
                 # Check for repository clone
                 if any(keyword in task_desc for keyword in ['clone', 'repository', 'setup']):
-                    if any(indicator in key_results.lower() for indicator in ['repository path', 'cloned', 'commons-cli']):
+                    # More flexible detection for repository clone
+                    clone_indicators = ['repo_dir=', 'repository', 'cloned', '/workspace/', 'project_type=', 'directory']
+                    if any(indicator in key_results.lower() for indicator in clone_indicators):
                         actual_accomplishments['repository_cloned'] = True
                         logger.info(f"✅ Repository clone confirmed from task: {task.description[:50]}...")
                 
                 # Check for build success
                 if any(keyword in task_desc for keyword in ['compile', 'build', 'maven']):
-                    if any(indicator in key_results.lower() for indicator in ['artifacts:', 'target/', 'compiled', 'build']):
+                    build_indicators = ['compile_success=true', 'build_success=true', 'output_directory', 'target/', 'compiled', 'build']
+                    if any(indicator in key_results.lower() for indicator in build_indicators):
                         actual_accomplishments['build_success'] = True
                         logger.info(f"✅ Build success confirmed from task: {task.description[:50]}...")
                 
@@ -623,8 +628,8 @@ class ReportTool(BaseTool):
                 if any(keyword in task_desc for keyword in ['test', 'run test']):
                     test_indicators = [
                         'tests passed', 'test reports', 'all tests', 'surefire-reports',
-                        'tests_passed=true', 'tests_passed": true', 'build success',
-                        'exit_code=0', 'mvn.*success', 'test.*success'
+                        'tests_passed=true', 'tests_passed": true', 'build_success=true',
+                        'test_command=', 'exit_code=0', 'mvn.*success', 'test.*success'
                     ]
                     if any(indicator in key_results.lower() for indicator in test_indicators):
                         actual_accomplishments['test_success'] = True
@@ -909,8 +914,32 @@ class ReportTool(BaseTool):
         
         try:
             if self.docker_orchestrator:
-                # Check for common project files
-                result = self.docker_orchestrator.execute_command("ls -la /workspace")
+                # First try to get project info from trunk context
+                trunk_context = self.context_manager.load_trunk_context() if self.context_manager else None
+                
+                # Try to detect actual project directory from completed tasks
+                project_dir = "/workspace"
+                if trunk_context and 'todo_list' in trunk_context:
+                    for task in trunk_context['todo_list']:
+                        if task.get('status') == 'completed' and task.get('key_results'):
+                            key_results = task.get('key_results', '')
+                            # Look for project directory in key results
+                            if 'repo_dir=' in key_results:
+                                # Extract repo_dir value
+                                import re
+                                match = re.search(r'repo_dir=([^;,\s]+)', key_results)
+                                if match:
+                                    project_dir = match.group(1)
+                                    break
+                            elif '/workspace/' in key_results:
+                                # Try to extract project path
+                                match = re.search(r'/workspace/[\w-]+', key_results)
+                                if match:
+                                    project_dir = match.group(0)
+                                    break
+                
+                # Check for common project files in the actual project directory
+                result = self.docker_orchestrator.execute_command(f"ls -la {project_dir}")
                 if result.get("success"):
                     output = result.get("output", "")
                     
@@ -918,6 +947,9 @@ class ReportTool(BaseTool):
                     if "pom.xml" in output:
                         info["type"] = "Maven Java Project"
                         info["build_system"] = "Maven"
+                    elif "build.gradle" in output:
+                        info["type"] = "Gradle Java Project"
+                        info["build_system"] = "Gradle"
                     elif "package.json" in output:
                         info["type"] = "Node.js Project"
                         info["build_system"] = "npm/yarn"
@@ -928,7 +960,7 @@ class ReportTool(BaseTool):
                         info["type"] = "Generic Project"
                         info["build_system"] = "Unknown"
                     
-                    info["directory"] = "/workspace"
+                    info["directory"] = project_dir
                 
         except Exception as e:
             logger.warning(f"Could not gather project info: {e}")

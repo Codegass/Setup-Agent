@@ -588,6 +588,48 @@ class ContextTool(BaseTool):
                 error_code="MISSING_KEY_RESULTS"
             )
         
+        # CRITICAL: Check if this is a report generation task that needs report tool first
+        current_task_id = self.context_manager.current_task_id
+        if current_task_id:
+            # Get current task description from trunk context
+            trunk_context = self.context_manager.load_trunk_context()
+            if trunk_context and 'todo_list' in trunk_context:
+                for task in trunk_context['todo_list']:
+                    if task.get('id') == current_task_id:
+                        task_desc = task.get('description', '').lower()
+                        # If this is a report generation task
+                        if 'report' in task_desc and ('generate' in task_desc or 'completion' in task_desc or 'final' in task_desc):
+                            # Check if they mention using report tool in summary/key_results
+                            summary_lower = summary.lower() if summary else ''
+                            key_results_lower = key_results.lower() if key_results else ''
+                            
+                            # If neither mentions report generation, they probably forgot to use report tool
+                            if not any(word in summary_lower + key_results_lower for word in ['report generated', 'report created', 'setup-report', 'report tool', 'markdown report']):
+                                raise ToolError(
+                                    message="⚠️ WAIT! Report generation task requires using the 'report' tool first!",
+                                    suggestions=[
+                                        "📋 This is a report generation task - you must generate the report before completing it.",
+                                        "",
+                                        "STEP 1: Generate the report:",
+                                        "report(",
+                                        "    summary='Successfully set up and tested project',",
+                                        "    status='success',",
+                                        "    details='All build and test tasks completed successfully'",
+                                        ")",
+                                        "",
+                                        "STEP 2: After report is generated, then complete the task:",
+                                        "manage_context(",
+                                        "    action='complete_with_results',",
+                                        "    summary='Generated comprehensive setup report',",
+                                        "    key_results='Report created at /workspace/setup-report-*.md'",
+                                        ")",
+                                        "",
+                                        "The report tool creates a markdown file with all project details."
+                                    ],
+                                    error_code="REPORT_GENERATION_REQUIRED"
+                                )
+                        break
+        
         # ENHANCED: State recovery mechanism for robustness (same as _complete_task)
         if not self.context_manager.current_task_id:
             # Try to recover state before failing
