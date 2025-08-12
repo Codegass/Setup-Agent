@@ -188,13 +188,13 @@ class BashTool(BaseTool):
         
         return output
 
-    def execute(self, command: str, workdir: str = "/workspace") -> ToolResult:
+    def execute(self, command: str, working_directory: str = "/workspace") -> ToolResult:
         """
         Execute a bash command in the Docker container with enhanced monitoring.
         
         Args:
             command: The bash command to execute
-            workdir: Working directory (default: /workspace)
+            working_directory: Working directory (default: /workspace)
         """
         
         if not command or not command.strip():
@@ -212,7 +212,7 @@ class BashTool(BaseTool):
             )
         
         # Smart working directory validation and setup
-        workdir = self._ensure_working_directory(workdir)
+        workdir = self._ensure_working_directory(working_directory)
         
         # Detect if this is a long-running command that needs enhanced monitoring
         is_long_running_command = self._is_long_running_command(command)
@@ -946,8 +946,8 @@ GREP INVESTIGATION EXAMPLES:
 {self.name}(command="grep -rn 'def process_data' . --include='*.py'")  # Find function definitions
 {self.name}(command="grep -rni 'error|exception' . --include='*.py' -C 2")  # Find error handling with context
 {self.name}(command="grep -rn 'import pandas' .")  # Find specific imports
-{self.name}(command="ls -la")  # Standard file operations
-{self.name}(command="git status")  # Git operations
+{self.name}(command="ls -la", working_directory="/workspace")  # Standard file operations
+{self.name}(command="git status", working_directory="/workspace/project")  # Git operations
 
 💡 For comprehensive grep patterns, use: get_grep_examples()
         """

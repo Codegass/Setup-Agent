@@ -282,7 +282,7 @@ class MavenTool(BaseTool):
                 suggestions.append(f"  - Try: maven(working_directory='{pom_dir}')")
         else:
             suggestions.extend([
-                "Use bash tool to navigate: bash(command='ls -la', workdir='/workspace')",
+                "Use bash tool to navigate: bash(command='ls -la', working_directory='/workspace')",
                 "Find pom.xml: bash(command='find /workspace -name pom.xml')"
             ])
         
@@ -492,7 +492,7 @@ class MavenTool(BaseTool):
                 "Ensure you're in a directory containing a pom.xml file",
                 "Change to the correct project directory",
                 "Use bash to find pom.xml: bash(command='find /workspace -name pom.xml')",
-                "List current directory: bash(command='ls -la', workdir='/workspace')"
+                "List current directory: bash(command='ls -la', working_directory='/workspace')"
             ])
             documentation_links.append("https://maven.apache.org/guides/getting-started/maven-in-five-minutes.html")
         

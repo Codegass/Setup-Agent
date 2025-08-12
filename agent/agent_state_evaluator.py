@@ -121,7 +121,12 @@ class AgentStateEvaluator:
         if repetition_analysis.needs_guidance:
             return repetition_analysis
             
-        # 2. Check if task completion opportunity was missed
+        # 2. Check if working outside task context (ghost state prevention)
+        ghost_state_analysis = self._check_ghost_state(steps)
+        if ghost_state_analysis.needs_guidance:
+            return ghost_state_analysis
+            
+        # 3. Check if task completion opportunity was missed
         if self.context_manager.current_task_id:
             completion_analysis = self._check_task_completion_opportunity(steps)
             if completion_analysis.needs_guidance:
@@ -151,6 +156,80 @@ class AgentStateEvaluator:
             )
         
         # Default: Everything is proceeding normally
+        return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
+    
+    def _check_ghost_state(self, steps: List[Any]) -> AgentStateAnalysis:
+        """
+        Check if agent is working outside of task context (ghost state).
+        This happens when agent completes a task but then continues working without starting the next task.
+        """
+        # Only check if not in a task context
+        if self.context_manager.current_task_id:
+            return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
+        
+        # Check if recently completed a task (within last 5 steps)
+        recent_completion = False
+        for step in steps[-5:] if len(steps) > 5 else steps:
+            if (hasattr(step, 'tool_name') and step.tool_name == 'manage_context' and
+                hasattr(step, 'output') and 'task completed' in str(step.output).lower()):
+                recent_completion = True
+                break
+        
+        # If just completed a task, remind to check for next task
+        if recent_completion:
+            trunk_context = self.context_manager.load_trunk_context()
+            if trunk_context and 'todo_list' in trunk_context:
+                pending_tasks = [t for t in trunk_context['todo_list'] if t.get('status') == 'pending']
+                if pending_tasks:
+                    next_task = pending_tasks[0]
+                    return AgentStateAnalysis(
+                        status=AgentStatus.STUCK,
+                        needs_guidance=True,
+                        guidance=(
+                            f"✅ TASK COMPLETED - NOW CHECK FOR NEXT TASK!\n\n"
+                            f"You just completed a task. Follow the workflow:\n"
+                            f"1. IMMEDIATELY: manage_context(action='get_info')\n"
+                            f"2. Then: manage_context(action='start_task', task_id='{next_task['id']}')\n\n"
+                            f"Next pending task: {next_task['description']}\n\n"
+                            f"DON'T skip ahead - follow the workflow!"
+                        ),
+                        priority=9
+                    )
+        
+        # Look for recent work-related tool usage outside of task context
+        recent_steps = steps[-10:] if len(steps) > 10 else steps
+        
+        work_tools = ['maven', 'bash', 'file_io', 'project_analyzer', 'project_setup']
+        work_actions_found = []
+        
+        for step in recent_steps:
+            if hasattr(step, 'tool_name') and step.tool_name in work_tools:
+                work_actions_found.append(step.tool_name)
+        
+        # If doing actual work outside task context, this is a ghost state
+        if work_actions_found:
+            # Check if there are pending tasks
+            trunk_context = self.context_manager.load_trunk_context()
+            if trunk_context and 'todo_list' in trunk_context:
+                pending_tasks = [t for t in trunk_context['todo_list'] if t.get('status') == 'pending']
+                if pending_tasks:
+                    next_task = pending_tasks[0]
+                    return AgentStateAnalysis(
+                        status=AgentStatus.STUCK,
+                        needs_guidance=True,
+                        guidance=(
+                            f"🚨 GHOST STATE DETECTED: Working outside task context!\n\n"
+                            f"You are executing {', '.join(set(work_actions_found))} without an active task.\n"
+                            f"This creates a 'ghost state' where work is done but not tracked.\n\n"
+                            f"IMMEDIATE ACTION REQUIRED:\n"
+                            f"1. First: manage_context(action='get_info') to see current state\n"
+                            f"2. Then: manage_context(action='start_task', task_id='{next_task['id']}')\n"
+                            f"3. Only then continue with your {work_actions_found[-1]} work\n\n"
+                            f"Next pending task: {next_task['description']}"
+                        ),
+                        priority=10  # Highest priority
+                    )
+        
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
     
     def _check_repetitive_execution(self, recent_tool_executions: List[Dict]) -> AgentStateAnalysis:
