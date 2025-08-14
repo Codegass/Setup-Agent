@@ -288,13 +288,16 @@ class DockerOrchestrator:
             # 如果不是有效JSON，返回原内容
             return json_content
 
-    def execute_command(self, command: str, workdir: Optional[str] = None) -> Dict[str, Any]:
+    def execute_command(self, command: str, workdir: Optional[str] = None,
+                       capture_stderr: bool = True, environment: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Execute a command in the container.
 
         Args:
             command: The command to execute.
             workdir: The working directory to execute the command in.
+            capture_stderr: Whether to capture stderr separately.
+            environment: Additional environment variables.
 
         Returns:
             A dictionary with the result of the command execution.
@@ -319,12 +322,35 @@ class DockerOrchestrator:
             logger.info(f"Working directory: {workdir}")
 
         try:
-            # Execute the command
-            result = container.exec_run(exec_command, workdir=workdir)
+            # Prepare environment
+            exec_env = environment if environment else {}
+            
+            # Execute the command with stderr capture
+            # Use demux to separate stdout and stderr when requested
+            result = container.exec_run(
+                exec_command, 
+                workdir=workdir,
+                stderr=True,  # Explicitly capture stderr
+                stdout=True,  # Explicitly capture stdout
+                demux=capture_stderr,  # Separate stdout/stderr when True
+                environment=exec_env
+            )
 
-            # Decode output
-            output = result.output.decode("utf-8").strip()
-            exit_code = result.exit_code
+            # Handle output based on whether demux was used
+            if capture_stderr and isinstance(result.output, tuple):
+                # demux=True returns (stdout, stderr)
+                stdout, stderr = result.output
+                stdout_str = stdout.decode('utf-8', errors='replace').strip() if stdout else ""
+                stderr_str = stderr.decode('utf-8', errors='replace').strip() if stderr else ""
+                # Combine for backward compatibility
+                output = (stdout_str + "\n" + stderr_str).strip() if stderr_str else stdout_str
+                exit_code = result.exit_code
+            else:
+                # demux=False returns combined output
+                output = result.output.decode("utf-8", errors='replace').strip() if result.output else ""
+                stdout_str = output
+                stderr_str = ""
+                exit_code = result.exit_code
 
             logger.debug(f"Command finished with exit code: {exit_code}")
             
@@ -361,7 +387,10 @@ class DockerOrchestrator:
             return {
                 "success": exit_code == 0,
                 "exit_code": exit_code,
-                "output": output
+                "output": output,
+                "stdout": stdout_str,
+                "stderr": stderr_str,
+                "signal": None  # Docker doesn't directly provide signal info
             }
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
