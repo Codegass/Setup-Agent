@@ -2169,8 +2169,8 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         )
         self.steps.append(obs_step)
 
-        # Log full observation content without truncation
-        self.agent_logger.info(f"👁️ OBSERVATION: {observation}")
+        # FIXED: Only log once to prevent duplicate output in logs
+        # Use logger.info for main logging, agent_logger for internal tracking only
         logger.info(f"👁️ OBSERVATION: {observation}")
         
         # DEPRECATED: Task completion detection now handled by state_evaluator
