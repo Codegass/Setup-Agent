@@ -7,6 +7,7 @@ from enum import Enum
 from loguru import logger
 
 from .context_manager import ContextManager
+from .physical_validator import PhysicalValidator
 
 
 class StepType(str, Enum):
@@ -52,8 +53,9 @@ class AgentStateEvaluator:
     This replaces scattered _check_* methods in ReActEngine.
     """
     
-    def __init__(self, context_manager: ContextManager):
+    def __init__(self, context_manager: ContextManager, physical_validator: PhysicalValidator = None):
         self.context_manager = context_manager
+        self.physical_validator = physical_validator
         
         # Completion signal patterns
         self.completion_signals = {
@@ -469,4 +471,45 @@ class AgentStateEvaluator:
         if "test" in task_lower:
             relevant_signals.extend(self.completion_signals['tests_passed'])
             
-        return relevant_signals 
+        return relevant_signals
+    
+    def validate_build_state_physically(self, project_name: str = None) -> Dict[str, Any]:
+        """
+        Use physical validator to get ground truth about build state.
+        
+        Args:
+            project_name: Name of the project to validate
+            
+        Returns:
+            Physical validation results
+        """
+        if not self.physical_validator:
+            return {"available": False, "reason": "No physical validator configured"}
+        
+        try:
+            # Get physical evidence
+            validation = self.physical_validator.validate_build_artifacts(project_name)
+            
+            # Create summary for agent guidance
+            summary = {
+                "available": True,
+                "build_artifacts_exist": validation.get("valid", False),
+                "class_files": validation.get("class_files", 0),
+                "jar_files": validation.get("jar_files", 0),
+                "missing_compilations": len(validation.get("missing_classes", [])),
+                "evidence": validation.get("evidence", [])
+            }
+            
+            # Add interpretation
+            if summary["build_artifacts_exist"]:
+                summary["interpretation"] = "BUILD VERIFIED: Physical artifacts confirm successful compilation"
+            elif summary["class_files"] > 0 and summary["missing_compilations"] > 0:
+                summary["interpretation"] = "PARTIAL BUILD: Some files compiled but others failed"
+            else:
+                summary["interpretation"] = "BUILD FAILED: No compilation artifacts found"
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Physical validation failed: {e}")
+            return {"available": False, "reason": str(e)} 

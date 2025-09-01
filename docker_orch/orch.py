@@ -384,13 +384,36 @@ class DockerOrchestrator:
                 debug_output = output[:500] + "..." if len(output) > 500 else output
                 logger.debug(f"Command output (truncated for logs):\n{debug_output}")
 
+            # Enhanced success detection for build tools
+            # Check for explicit failure markers in addition to exit code
+            build_failed = False
+            if "mvn" in command or "maven" in command.lower():
+                # Maven-specific failure detection
+                if "BUILD FAILURE" in output or "[ERROR] BUILD FAILURE" in output:
+                    build_failed = True
+                    logger.warning("Maven BUILD FAILURE detected despite exit code")
+            elif "gradle" in command:
+                # Gradle-specific failure detection
+                if "BUILD FAILED" in output or "FAILURE: Build failed" in output:
+                    build_failed = True
+                    logger.warning("Gradle BUILD FAILED detected despite exit code")
+            elif "npm" in command:
+                # NPM-specific failure detection
+                if "npm ERR!" in output or "ERR!" in stderr_str:
+                    build_failed = True
+                    logger.warning("NPM error detected despite exit code")
+            
+            # Determine final success status
+            success = (exit_code == 0) and not build_failed
+            
             return {
-                "success": exit_code == 0,
+                "success": success,
                 "exit_code": exit_code,
                 "output": output,
                 "stdout": stdout_str,
                 "stderr": stderr_str,
-                "signal": None  # Docker doesn't directly provide signal info
+                "signal": None,  # Docker doesn't directly provide signal info
+                "build_failed": build_failed  # Additional flag for build failures
             }
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
@@ -427,9 +450,22 @@ class DockerOrchestrator:
         container = self.client.containers.get(self.container_name)
         
         # Apply Maven optimizations if requested
-        if optimize_for_maven and ('mvn ' in command or command.startswith('mvn')):
+        # Only optimize if the command actually starts with mvn, not if it's part of a compound command
+        if optimize_for_maven and (command.startswith('mvn ') or command == 'mvn'):
             command = self._optimize_maven_command(command, absolute_timeout)
             logger.info(f"🔧 Applied Maven optimizations to command")
+        elif optimize_for_maven and '&&' in command and 'mvn' in command:
+            # For compound commands, only optimize the mvn part
+            parts = command.split('&&')
+            optimized_parts = []
+            for part in parts:
+                part = part.strip()
+                if part.startswith('mvn ') or part == 'mvn':
+                    optimized_parts.append(self._optimize_maven_command(part, absolute_timeout))
+                else:
+                    optimized_parts.append(part)
+            command = ' && '.join(optimized_parts)
+            logger.info(f"🔧 Applied Maven optimizations to mvn parts of compound command")
         
         # Wrap with GNU timeout if requested
         if use_timeout_wrapper:

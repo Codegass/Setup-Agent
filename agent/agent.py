@@ -483,13 +483,112 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 
         return verified_success
 
+    def _verify_build_artifacts(self, project_name: str) -> bool:
+        """Verify build artifacts exist as ultimate success indicator."""
+        logger.info(f"Verifying build artifacts for project: {project_name}")
+        
+        if not self.orchestrator:
+            return False
+        
+        # Check for different build system artifacts
+        artifact_checks = [
+            # Maven artifacts
+            (f"find /workspace/{project_name} -name '*.jar' -path '*/target/*' 2>/dev/null | head -5", 
+             lambda output: bool(output.strip()) and len(output.strip().split('\n')) > 0),
+            # Gradle artifacts
+            (f"find /workspace/{project_name} -name '*.jar' -path '*/build/*' 2>/dev/null | head -5",
+             lambda output: bool(output.strip()) and len(output.strip().split('\n')) > 0),
+            # NPM/Node artifacts
+            (f"test -d /workspace/{project_name}/node_modules && test -f /workspace/{project_name}/package-lock.json && echo SUCCESS",
+             lambda output: 'SUCCESS' in output),
+            # Python artifacts
+            (f"test -d /workspace/{project_name}/venv || test -d /workspace/{project_name}/.venv && echo SUCCESS",
+             lambda output: 'SUCCESS' in output),
+            # Generic compiled output
+            (f"find /workspace/{project_name} -name '*.class' -o -name '*.o' -o -name '*.so' 2>/dev/null | head -5",
+             lambda output: bool(output.strip()))
+        ]
+        
+        for check_cmd, validator in artifact_checks:
+            result = self.orchestrator.execute_command(check_cmd)
+            if result.get('exit_code') == 0 and validator(result.get('output', '')):
+                logger.info(f"✅ Build artifacts found with command: {check_cmd[:50]}...")
+                return True
+        
+        logger.info("❌ No build artifacts found")
+        return False
+    
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
-        """Get the verified final status by checking report tool results."""
-        # If ReAct engine failed outright, it's definitely a failure
+        """Get the verified final status with multi-level verification."""
+        
+        # CRITICAL FIX: Check for explicit FAILED status first
+        # Don't let artifact presence override explicit failure
+        if hasattr(self.context_manager, 'get_current_context'):
+            context = self.context_manager.get_current_context()
+            if context:
+                # Check for explicit failure markers in context
+                context_str = str(context)
+                if any(marker in context_str for marker in ['status": "FAILED"', 'BUILD FAILED', 'BUILD FAILURE', 'compilation_errors']):
+                    logger.warning("❌ Explicit FAILED status detected in context - not overriding")
+                    return False
+        
+        # Priority 1: Check physical build artifacts (but don't override FAILED)
+        project_name = getattr(self.orchestrator, 'project_name', None) or getattr(self, 'project_name', None)
+        if not project_name and hasattr(self.context_manager, 'project_name'):
+            project_name = self.context_manager.project_name
+        
+        if project_name:
+            build_artifacts_exist = self._verify_build_artifacts(project_name)
+            # FIXED: Only mark as success if no failure detected
+            if build_artifacts_exist and react_engine_success:
+                logger.info("✅ Build artifacts verified and no failures detected - marking as SUCCESS")
+                return True
+            elif not build_artifacts_exist:
+                logger.warning("❌ No build artifacts found - cannot mark as SUCCESS")
+                return False
+        
+        # Priority 2: Check context for task completion
+        if hasattr(self.context_manager, 'get_current_context'):
+            context = self.context_manager.get_current_context()
+            if context and 'todo_list' in context:
+                tasks = context['todo_list']
+                completed_tasks = [t for t in tasks if t.get('status') == 'completed']
+                total_tasks = len(tasks)
+                completed_count = len(completed_tasks)
+                
+                # Check if all core tasks completed
+                if completed_count == total_tasks:
+                    logger.info(f"✅ All {total_tasks} tasks completed - marking as SUCCESS")
+                    return True
+                
+                # Allow success if only reporting/documentation is incomplete
+                if completed_count >= total_tasks - 1:
+                    incomplete_tasks = [t for t in tasks if t.get('status') != 'completed']
+                    # Check if only non-critical tasks are incomplete
+                    non_critical_keywords = ['report', 'document', 'summary', 'cleanup', 'optimize']
+                    all_non_critical = all(
+                        any(keyword in t.get('description', '').lower() for keyword in non_critical_keywords)
+                        for t in incomplete_tasks
+                    )
+                    
+                    if all_non_critical:
+                        logger.info(f"✅ {completed_count}/{total_tasks} tasks completed (only reporting incomplete) - marking as SUCCESS")
+                        return True
+                
+                # 80% rule for substantial completion
+                if completed_count >= total_tasks * 0.8:
+                    logger.info(f"⚠️ {completed_count}/{total_tasks} tasks completed (80% threshold) - checking for critical failures")
+                    
+                    # Check for BUILD SUCCESS in context
+                    if 'BUILD SUCCESS' in str(context):
+                        logger.info("✅ BUILD SUCCESS found in context - marking as SUCCESS")
+                        return True
+        
+        # Priority 3: Fall back to original ReAct engine success if no other evidence
         if not react_engine_success:
             return False
         
-        # Check if a report was generated and what its verified status was
+        # Priority 4: Check if a report was generated and what its verified status was
         if hasattr(self, 'react_engine') and self.react_engine and self.react_engine.steps:
             for step in reversed(self.react_engine.steps):
                 if (hasattr(step, 'step_type') and step.step_type == 'action' and 
