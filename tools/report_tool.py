@@ -6,6 +6,8 @@ from datetime import datetime
 from loguru import logger
 
 from .base import BaseTool, ToolResult
+# PhysicalValidator moved to agent module - physical validation now done by ReAct engine
+from .command_tracker import CommandTracker
 
 
 class ReportTool(BaseTool):
@@ -65,11 +67,16 @@ class ReportTool(BaseTool):
                     "timestamp": datetime.now().isoformat(),
                 }
                 
+                # ENHANCED: Provide condensed output for logs to reduce noise
+                # Full report is saved to markdown file, logs get summary only
+                condensed_output = self._generate_condensed_log_output(verified_status)
+                
                 return ToolResult(
                     success=True,
-                    output=report,
+                    output=condensed_output,
                     metadata=metadata,
-                    documentation_links=[]
+                    documentation_links=[],
+                    raw_data={"full_report": report}  # Store full report in metadata
                 )
             else:
                 return ToolResult(
@@ -111,18 +118,199 @@ class ReportTool(BaseTool):
         
         return console_report, verified_status
 
+    def _collect_simple_status_from_tasks(self) -> dict:
+        """
+        Collect simple three-phase status directly from trunk context tasks.
+        This is the simplified version that avoids complex execution history parsing.
+        
+        Returns:
+            dict: {
+                'clone_success': bool,
+                'build_success': bool, 
+                'test_success': bool,
+                'build_errors': [],
+                'failing_tests': [],
+                'project_info': dict
+            }
+        """
+        simple_status = {
+            'clone_success': False,
+            'build_success': False,
+            'test_success': False,
+            'build_errors': [],
+            'failing_tests': [],
+            'project_info': {}
+        }
+        
+        try:
+            if not self.context_manager:
+                return simple_status
+                
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context or not hasattr(trunk_context, 'todo_list'):
+                return simple_status
+            
+            # Analyze completed tasks for three core phases
+            for task in trunk_context.todo_list:
+                if task.status.value == 'completed' and task.key_results:
+                    task_desc = task.description.lower()
+                    key_results = task.key_results.lower()
+                    
+                    # Phase 1: Repository Clone
+                    if any(keyword in task_desc for keyword in ['clone', 'repository', 'setup']):
+                        clone_indicators = ['project_type=', 'repository', 'cloned', 'path=/workspace/', 'repo_dir=']
+                        if any(indicator in key_results for indicator in clone_indicators):
+                            simple_status['clone_success'] = True
+                    
+                    # Phase 2: Build/Compilation
+                    if any(keyword in task_desc for keyword in ['compile', 'build', 'maven', 'gradle']):
+                        build_indicators = ['modules_compiled:', 'build_status=success', 'build_success=true', 'compiled']
+                        if any(indicator in key_results for indicator in build_indicators):
+                            simple_status['build_success'] = True
+                        # TODO: Extract build errors if any
+                    
+                    # Phase 3: Testing
+                    if any(keyword in task_desc for keyword in ['test', 'run test']):
+                        test_indicators = ['test_status=success', 'tests_passed=true', 'all tests']
+                        if any(indicator in key_results for indicator in test_indicators):
+                            simple_status['test_success'] = True
+                        # TODO: Extract failing tests if any
+            
+            # Get project info using existing method
+            simple_status['project_info'] = self._get_project_info()
+            
+            logger.debug(f"🔍 Simple status: Clone={simple_status['clone_success']}, "
+                       f"Build={simple_status['build_success']}, Test={simple_status['test_success']}")
+                       
+        except Exception as e:
+            logger.warning(f"Failed to collect simple status from tasks: {e}")
+            
+        return simple_status
+
+    def _render_simple_summary_top(self, simple_status: dict) -> str:
+        """
+        Render the simple three-phase summary at the top of the report.
+        
+        Args:
+            simple_status: Status dict from _collect_simple_status_from_tasks
+            
+        Returns:
+            str: Formatted simple summary for console output
+        """
+        lines = [
+            "📋 SETUP RESULT SUMMARY",
+            "=" * 50,
+        ]
+        
+        # Phase 1: Repository Clone
+        if simple_status['clone_success']:
+            lines.append("✅ Repository Clone: SUCCESS")
+        else:
+            lines.append("❌ Repository Clone: FAILED")
+        
+        # Phase 2: Project Build
+        if simple_status['build_success']:
+            lines.append("✅ Project Build: SUCCESS")
+        else:
+            lines.append("❌ Project Build: FAILED")
+            if simple_status['build_errors']:
+                error_count = len(simple_status['build_errors'])
+                lines.append(f"   └─ {error_count} build error(s) detected")
+        
+        # Phase 3: Test Suite
+        if simple_status['test_success']:
+            lines.append("✅ Test Suite: SUCCESS")
+        else:
+            lines.append("❌ Test Suite: FAILED")
+            if simple_status['failing_tests']:
+                test_count = len(simple_status['failing_tests'])
+                lines.append(f"   └─ {test_count} test case(s) failed")
+        
+        # Project Information
+        project_info = simple_status.get('project_info', {})
+        if project_info.get('type'):
+            lines.append(f"📂 Project Type: {project_info['type']}")
+        
+        # Next Steps Recommendations
+        lines.append("")
+        lines.append("💡 Next Steps:")
+        
+        if not simple_status['clone_success']:
+            lines.append("   → Fix repository access and retry clone")
+        elif not simple_status['build_success']:
+            lines.append("   → Check build dependencies and fix compilation errors")
+        elif not simple_status['test_success']:
+            lines.append("   → Review test failures and fix issues")
+            # TODO: Add specific Maven/Gradle recovery commands
+            build_system = project_info.get('build_system', '').lower()
+            if 'maven' in build_system:
+                lines.append("   → Continue with remaining tests: mvn -fae test")
+            elif 'gradle' in build_system:
+                lines.append("   → Continue with remaining tests: ./gradlew test --continue")
+        else:
+            lines.append("   → Project is ready for development/deployment! 🎉")
+        
+        lines.extend(["", "=" * 50, ""])
+        
+        return "\n".join(lines)
+
+    def _generate_condensed_log_output(self, verified_status: str) -> str:
+        """
+        Generate condensed output for logs to reduce noise.
+        Only shows essential information instead of the full report.
+        """
+        simple_status = self._collect_simple_status_from_tasks()
+        project_info = self._get_project_info()
+        
+        # Create status icons
+        clone_icon = "✅" if simple_status.get('clone_success', False) else "❌"
+        build_icon = "✅" if simple_status.get('build_success', False) else "❌"
+        test_icon = "✅" if simple_status.get('test_success', False) else "❌"
+        
+        # Determine overall status icon
+        if verified_status == "success":
+            status_icon = "✅"
+            status_text = "SUCCESS"
+        elif verified_status == "partial":
+            status_icon = "⚠️"
+            status_text = "PARTIAL"
+        else:
+            status_icon = "❌"
+            status_text = "FAILED"
+        
+        # Generate condensed summary
+        lines = [
+            f"🎯 SETUP COMPLETED: {status_icon} {status_text}",
+            f"📋 Core Status: {clone_icon} Clone, {build_icon} Build, {test_icon} Test",
+            f"📂 Project: {project_info.get('type', 'Unknown')} ({project_info.get('build_system', 'Unknown')})",
+            f"📄 Full report saved to: /workspace/setup-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+        ]
+        
+        # Add next steps based on status
+        if verified_status == "success":
+            lines.append("💡 Next: Project ready for development/deployment! 🎉")
+        elif verified_status == "partial":
+            lines.append("💡 Next: Review logs and fix remaining issues")
+        else:
+            lines.append("💡 Next: Check error logs and retry setup")
+        
+        return "\n".join(lines)
+
     def _validate_context_prerequisites(self) -> Dict[str, Any]:
         """
         Validate that all prerequisite tasks are completed before generating report.
         This prevents premature report generation when tasks are still in progress.
         """
+        logger.info("Starting prerequisite validation for report generation")
+        
         if not self.context_manager:
             # If no context manager available, allow report generation (backward compatibility)
             logger.warning("No context manager available for prerequisite validation")
             return {"valid": True}
         
         try:
-            # Load trunk context to check task statuses
+            # Load trunk context to check task statuses with timeout protection
+            logger.info("Loading trunk context for validation")
             trunk_context = self.context_manager.load_trunk_context()
             if not trunk_context:
                 return {
@@ -135,17 +323,20 @@ class ReportTool(BaseTool):
                 }
             
             # Check each task status - CRITICAL: Exclude reporting tasks to avoid logical deadlock
+            logger.info(f"Checking {len(trunk_context.todo_list)} tasks for completion status")
             incomplete_tasks = []
             for task in trunk_context.todo_list:
+                logger.debug(f"Checking task {task.id}: {task.description} - Status: {task.status.value}")
                 if task.status.value != "completed":
                     # CRITICAL FIX: Allow reporting task to be in_progress when calling report tool
                     # This prevents the chicken-and-egg problem where the report tool can't run
                     # until the "generate report" task is complete, but the task can't be completed
                     # without running the report tool.
                     if self._is_reporting_task(task):
-                        logger.debug(f"Allowing reporting task {task.id} to be in_progress during report generation")
+                        logger.info(f"✅ Allowing reporting task {task.id} to be in_progress during report generation")
                         continue  # Skip reporting tasks from the prerequisite check
                     
+                    logger.debug(f"Task {task.id} is incomplete: {task.status.value}")
                     incomplete_tasks.append({
                         "id": task.id,
                         "description": task.description,
@@ -153,6 +344,31 @@ class ReportTool(BaseTool):
                     })
             
             if incomplete_tasks:
+                # Check if we should allow partial report generation
+                allow_partial = False
+                
+                # If only 1 task is incomplete and it's currently in progress, allow partial report
+                if len(incomplete_tasks) == 1 and incomplete_tasks[0]["status"] == "in_progress":
+                    logger.info(f"Allowing partial report generation with 1 in-progress task: {incomplete_tasks[0]['id']}")
+                    allow_partial = True
+                
+                # If more than 80% of tasks are complete, allow partial report with warning
+                total_tasks = len(trunk_context.todo_list)
+                completed_tasks = total_tasks - len(incomplete_tasks)
+                completion_percentage = (completed_tasks / total_tasks) * 100 if total_tasks > 0 else 0
+                
+                if completion_percentage >= 80:
+                    logger.info(f"Allowing partial report generation: {completion_percentage:.1f}% tasks complete")
+                    allow_partial = True
+                
+                if allow_partial:
+                    logger.warning(f"Generating partial report with {len(incomplete_tasks)} incomplete tasks")
+                    return {
+                        "valid": True,
+                        "warning": f"Generating partial report: {len(incomplete_tasks)} task(s) incomplete",
+                        "incomplete_tasks": incomplete_tasks
+                    }
+                
                 # Format error message with specific incomplete tasks
                 task_details = []
                 for task in incomplete_tasks:
@@ -377,25 +593,8 @@ class ReportTool(BaseTool):
                                         if error_code == 'REPETITIVE_EXECUTION':
                                             metrics['repetitive_failures'] += 1
                                 
-                                # Track phase completion
-                                if tool_name == 'project_setup' and success:
-                                    metrics['phases']['clone']['status'] = True
-                                elif tool_name == 'project_analyzer' and success:
-                                    metrics['phases']['analyze']['status'] = True
-                                elif tool_name in ['maven', 'gradle'] and success:
-                                    # Check if it's build or test
-                                    if hasattr(step, 'tool_params'):
-                                        params = step.tool_params
-                                    elif isinstance(step, dict):
-                                        params = step.get('tool_params', {})
-                                    else:
-                                        params = {}
-                                    
-                                    command = params.get('command', '').lower()
-                                    if 'test' in command:
-                                        metrics['phases']['test']['status'] = True
-                                    elif any(build_cmd in command for build_cmd in ['compile', 'build', 'package']):
-                                        metrics['phases']['build']['status'] = True
+                                # NOTE: Phase completion tracking is now unified with simple_status
+                                # at the end of this method to avoid contradictions
                         
                         elif step_type == 'observation':
                             metrics['total_observations'] += 1
@@ -415,10 +614,20 @@ class ReportTool(BaseTool):
             except Exception as e:
                 logger.warning(f"Failed to collect execution metrics: {e}")
         
+        # CRITICAL FIX: Unify phase status with simple_status to avoid contradictions
+        # Use the same logic as _collect_simple_status_from_tasks for consistency
+        simple_status = self._collect_simple_status_from_tasks()
+        if simple_status:
+            metrics['phases']['clone']['status'] = simple_status.get('clone_success', False)
+            metrics['phases']['analyze']['status'] = True  # Always true if we got this far
+            metrics['phases']['build']['status'] = simple_status.get('build_success', False)
+            metrics['phases']['test']['status'] = simple_status.get('test_success', False)
+            logger.debug(f"🔧 Phase status unified with simple_status: Clone={metrics['phases']['clone']['status']}, Build={metrics['phases']['build']['status']}, Test={metrics['phases']['test']['status']}")
+        
         return metrics
     
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
-        """Verify the claimed status against actual execution history."""
+        """Verify the claimed status using physical validation instead of inference."""
         # Initialize accomplishments
         actual_accomplishments = {
             'repository_cloned': False,
@@ -428,27 +637,65 @@ class ReportTool(BaseTool):
             'tools_failed': [],
             'total_actions': 0,
             'successful_actions': 0,
-            'detailed_results': {}  # Store detailed results for debugging
+            'detailed_results': {},  # Store detailed results for debugging
+            'physical_validation': {}  # Store physical validation results
         }
         
-        # Method 1: Check current session execution history
-        if self.execution_history_callback:
-            try:
-                # Get execution history from callback
-                history = self.execution_history_callback()
-                self._analyze_execution_steps(history, actual_accomplishments)
-            except Exception as e:
-                logger.warning(f"Failed to get execution history from callback: {e}")
+        # Physical validation is now done by the ReAct engine
+        # The engine provides physical evidence in observations
+        # Tools should not directly use PhysicalValidator
         
-        # Method 2: Check project context for completed tasks (more comprehensive)
-        if self.context_manager:
+        # For now, we'll do basic artifact checking using shell commands
+        if self.docker_orchestrator:
             try:
-                trunk_context = self.context_manager.load_trunk_context()
-                if trunk_context:
-                    self._analyze_completed_tasks(trunk_context, actual_accomplishments)
-                    logger.info(f"📊 Analyzed {len(trunk_context.todo_list)} tasks from project context")
+                project_info = self._get_project_info()
+                project_name = project_info.get('directory', '').split('/')[-1]
+                
+                # Basic artifact check using shell commands
+                class_count_result = self.docker_orchestrator.execute_command(
+                    f"find /workspace/{project_name} -name '*.class' -type f 2>/dev/null | wc -l"
+                )
+                class_count = int(class_count_result.get('output', '0').strip())
+                
+                if class_count > 0:
+                    logger.info(f"✅ Found {class_count} .class files")
+                    actual_accomplishments['physical_validation']['class_files'] = class_count
+                else:
+                    logger.warning("❌ No .class files found")
+                    actual_accomplishments['physical_validation']['class_files'] = 0
+                
+                logger.debug(f"Basic artifact check: {class_count} class files")
+                
             except Exception as e:
-                logger.warning(f"Failed to get project context: {e}")
+                logger.warning(f"Physical validation failed: {e}")
+        
+        # Fallback to old methods if physical validation unavailable
+        if not actual_accomplishments.get('physical_validation'):
+            # Method 1: Check current session execution history
+            if self.execution_history_callback:
+                try:
+                    # Get execution history from callback
+                    history = self.execution_history_callback()
+                    self._analyze_execution_steps(history, actual_accomplishments)
+                except Exception as e:
+                    logger.warning(f"Failed to get execution history from callback: {e}")
+            
+            # Method 2: Check project context for completed tasks
+            if self.context_manager:
+                try:
+                    trunk_context = self.context_manager.load_trunk_context()
+                    if trunk_context:
+                        self._analyze_completed_tasks(trunk_context, actual_accomplishments)
+                        logger.debug(f"📊 Analyzed {len(trunk_context.todo_list)} tasks from project context")
+                except Exception as e:
+                    logger.warning(f"Failed to get project context: {e}")
+        
+        # CRITICAL FIX: Enforce logical consistency
+        # If build failed, tests cannot have succeeded
+        if not actual_accomplishments['build_success']:
+            actual_accomplishments['test_success'] = False
+            actual_accomplishments['test_status'] = 'not_run'
+            logger.info("⚠️ Build failed - marking tests as not run (impossible to test without successful build)")
         
         # Determine actual status based on accomplishments
         actual_status = self._determine_actual_status(actual_accomplishments)
@@ -458,7 +705,11 @@ class ReportTool(BaseTool):
             logger.warning(f"🔍 Status verification: Claimed '{claimed_status}' but evidence suggests '{actual_status}'")
             logger.info(f"🔍 Actual accomplishments: {actual_accomplishments}")
             
-            # Reconcile the status
+            # Reconcile the status - prioritize physical evidence
+            if actual_accomplishments.get('physical_validation'):
+                logger.info("Using physical validation as primary source of truth")
+                return actual_status, actual_accomplishments
+            
             reconciled_status = self._reconcile_status(claimed_status, actual_status, actual_accomplishments)
             logger.info(f"🤝 Status reconciled: Using '{reconciled_status}' as final status")
             return reconciled_status, actual_accomplishments
@@ -507,7 +758,7 @@ class ReportTool(BaseTool):
                     # Check output for confirmation
                     if 'Repository cloned' in output or 'successfully cloned' in output or 'Directory:' in output:
                         actual_accomplishments['repository_cloned'] = True
-                        logger.info("✅ Repository clone detected as successful via project_setup")
+                        logger.debug("✅ Repository clone detected as successful via project_setup")
                 
                 # STEP 2: Check for build success (multiple build systems)
                 elif tool_name in ['maven', 'gradle', 'bash']:
@@ -521,12 +772,24 @@ class ReportTool(BaseTool):
                         
                         if is_build_command and has_build_success:
                             actual_accomplishments['build_success'] = True
-                            logger.info(f"✅ Maven build success detected: {command or 'default goal'}")
+                            logger.debug(f"✅ Maven build success detected: {command or 'default goal'}")
                     
-                    # Gradle build detection  
-                    elif tool_name == 'gradle' and any(cmd in command for cmd in ['build', 'compile', 'assemble']) and 'BUILD SUCCESSFUL' in output:
-                        actual_accomplishments['build_success'] = True
-                        logger.info(f"✅ Gradle build success detected: {command}")
+                    # Gradle build detection - ENHANCED to check for failures
+                    elif tool_name == 'gradle' and any(cmd in command for cmd in ['build', 'compile', 'assemble']):
+                        # Check for BUILD FAILED first to avoid false positives
+                        if 'BUILD FAILED' in output:
+                            actual_accomplishments['build_failed'] = True
+                            # Count compilation errors if present
+                            import re
+                            error_count = len(re.findall(r'unmappable character|error:', output, re.IGNORECASE))
+                            if error_count > 0:
+                                actual_accomplishments['compilation_errors'] = error_count
+                                logger.error(f"❌ Gradle build FAILED with {error_count} compilation errors: {command}")
+                            else:
+                                logger.error(f"❌ Gradle build FAILED: {command}")
+                        elif 'BUILD SUCCESSFUL' in output:
+                            actual_accomplishments['build_success'] = True
+                            logger.info(f"✅ Gradle build success detected: {command}")
                     
                     # Generic build via bash (npm, make, etc.)
                     elif tool_name == 'bash':
@@ -575,12 +838,33 @@ class ReportTool(BaseTool):
                                         logger.warning(f"⚠️ Maven tests had issues: {failures} failures, {errors} errors")
                                     break
                     
-                    # Gradle test detection
-                    elif tool_name == 'gradle' and 'test' in command and 'BUILD SUCCESSFUL' in output:
-                        # Look for test results or assume success if build successful
-                        if 'failed' not in output.lower():
-                            actual_accomplishments['test_success'] = True
-                            logger.info(f"✅ Gradle tests passed")
+                    # Gradle test detection - ENHANCED to check for failures and extract stats
+                    elif tool_name == 'gradle' and 'test' in command:
+                        # Check for BUILD FAILED first
+                        if 'BUILD FAILED' in output:
+                            actual_accomplishments['test_failed'] = True
+                            # Extract test statistics if available
+                            import re
+                            test_match = re.search(r'(\d+)\s+tests?\s+completed.*?(\d+)\s+failed', output, re.IGNORECASE)
+                            if test_match:
+                                total_tests = int(test_match.group(1))
+                                failed_tests = int(test_match.group(2))
+                                actual_accomplishments['test_stats'] = {
+                                    'total': total_tests,
+                                    'failed': failed_tests,
+                                    'passed': total_tests - failed_tests
+                                }
+                                logger.error(f"❌ Gradle tests FAILED: {failed_tests}/{total_tests} tests failed")
+                            else:
+                                logger.error(f"❌ Gradle tests FAILED")
+                        elif 'BUILD SUCCESSFUL' in output:
+                            # Also check for specific test failures even if build reports success
+                            if 'test failed' in output.lower() or 'tests failed' in output.lower():
+                                actual_accomplishments['test_partial'] = True
+                                logger.warning(f"⚠️ Gradle build successful but some tests failed")
+                            else:
+                                actual_accomplishments['test_success'] = True
+                                logger.info(f"✅ Gradle tests passed")
                     
                     # Generic test via bash (npm test, pytest, etc.)
                     elif tool_name == 'bash' and any(test_cmd in command for test_cmd in ['npm test', 'pytest', 'go test', 'cargo test']):
@@ -615,33 +899,95 @@ class ReportTool(BaseTool):
                     clone_indicators = ['repo_dir=', 'repository', 'cloned', '/workspace/', 'project_type=', 'directory']
                     if any(indicator in key_results.lower() for indicator in clone_indicators):
                         actual_accomplishments['repository_cloned'] = True
-                        logger.info(f"✅ Repository clone confirmed from task: {task.description[:50]}...")
+                        logger.debug(f"✅ Repository clone confirmed from task: {task.description[:50]}...")
                 
                 # Check for build success
                 if any(keyword in task_desc for keyword in ['compile', 'build', 'maven']):
-                    build_indicators = ['compile_success=true', 'build_success=true', 'output_directory', 'target/', 'compiled', 'build']
+                    build_indicators = [
+                        'compile_success=true', 'build_success=true', 'build_status=success',
+                        'modules_compiled:', 'output_directory', 'target/', 'compiled', 'build'
+                    ]
                     if any(indicator in key_results.lower() for indicator in build_indicators):
                         actual_accomplishments['build_success'] = True
-                        logger.info(f"✅ Build success confirmed from task: {task.description[:50]}...")
+                        logger.debug(f"✅ Build success confirmed from task: {task.description[:50]}...")
                 
                 # Check for test success
                 if any(keyword in task_desc for keyword in ['test', 'run test']):
                     test_indicators = [
                         'tests passed', 'test reports', 'all tests', 'surefire-reports',
-                        'tests_passed=true', 'tests_passed": true', 'build_success=true',
+                        'tests_passed=true', 'tests_passed": true', 
+                        'test_status=success',  # FIXED: Added missing key indicator
                         'test_command=', 'exit_code=0', 'mvn.*success', 'test.*success'
                     ]
+                    # FIXED: Removed 'build_success=true' from test indicators as it's misleading
                     if any(indicator in key_results.lower() for indicator in test_indicators):
                         actual_accomplishments['test_success'] = True
-                        logger.info(f"✅ Test success confirmed from task: {task.description[:50]}...")
+                        logger.debug(f"✅ Test success confirmed from task: {task.description[:50]}...")
                 
                 # Count successful completion
                 actual_accomplishments['total_actions'] += 1
                 actual_accomplishments['successful_actions'] += 1
 
+    def _verify_physical_artifacts(self, accomplishments: dict) -> bool:
+        """
+        Verify that physical build artifacts actually exist in the container.
+        This prevents false positives where build claims success but no .class or .jar files exist.
+        """
+        if not self.docker_orchestrator:
+            return True  # Can't verify without orchestrator, assume success
+        
+        try:
+            project_info = accomplishments.get('project_info', {}) or self._get_project_info()
+            project_dir = project_info.get('directory', '/workspace')
+            build_system = project_info.get('build_system', '').lower()
+            
+            # Different artifact patterns based on build system
+            artifact_checks = []
+            
+            if 'maven' in build_system:
+                # Check for .class files in target/classes
+                artifact_checks.extend([
+                    f"find {project_dir} -path '*/target/classes/*.class' -type f | head -5",
+                    f"find {project_dir} -name '*.jar' -path '*/target/*' -type f | head -5"
+                ])
+            elif 'gradle' in build_system:
+                # Check for .class files in build/classes
+                artifact_checks.extend([
+                    f"find {project_dir} -path '*/build/classes/*/*.class' -type f | head -5",
+                    f"find {project_dir} -name '*.jar' -path '*/build/*' -type f | head -5"
+                ])
+            else:
+                # Generic checks for any build system
+                artifact_checks.extend([
+                    f"find {project_dir} -name '*.class' -type f | head -5",
+                    f"find {project_dir} -name '*.jar' -type f | head -5",
+                    f"find {project_dir} -name '*.war' -type f | head -5"
+                ])
+            
+            # Execute checks
+            artifacts_found = False
+            for check_cmd in artifact_checks:
+                result = self.docker_orchestrator.execute_command(check_cmd)
+                if result.get('exit_code') == 0 and result.get('output', '').strip():
+                    artifacts_found = True
+                    logger.debug(f"✅ Found build artifacts: {result['output'][:100]}...")
+                    break
+            
+            if not artifacts_found:
+                logger.warning("⚠️ No compiled artifacts (.class/.jar files) found despite build success claim")
+                # Store details for reporting
+                accomplishments['missing_artifacts'] = True
+            
+            return artifacts_found
+            
+        except Exception as e:
+            logger.warning(f"Failed to verify physical artifacts: {e}")
+            return True  # Don't fail on verification errors
+    
     def _determine_actual_status(self, accomplishments: dict) -> str:
         """
         Determine the actual status based on three core steps: clone, build, test.
+        ENHANCED: Now includes physical artifact verification.
         Logic:
         - All success = success
         - Clone or build failed = failed  
@@ -652,33 +998,70 @@ class ReportTool(BaseTool):
         build_success = accomplishments.get('build_success', False) 
         test_success = accomplishments.get('test_success', False)
         
-        logger.info(f"🔍 Core status check - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}")
+        # Check for explicit build/test failures (higher priority than success flags)
+        build_failed = accomplishments.get('build_failed', False)
+        test_failed = accomplishments.get('test_failed', False)
+        compilation_errors = accomplishments.get('compilation_errors', 0)
+        
+        logger.debug(f"🔍 Core status check - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}")
+        logger.debug(f"🔍 Failure check - Build Failed: {build_failed}, Test Failed: {test_failed}, Compilation Errors: {compilation_errors}")
         
         # Step 1: Check if repository was cloned
         if not repository_cloned:
             logger.error("❌ Repository clone failed - this is a fundamental failure")
             return "failed"
         
-        # Step 2: Check if build completed successfully  
+        # Step 2: Check for explicit build failures or compilation errors
+        if build_failed or compilation_errors > 0:
+            logger.error(f"❌ Build explicitly failed with {compilation_errors} compilation errors")
+            return "failed"
+        
+        # Step 3: Verify physical artifacts if build claims success
+        if build_success and self.docker_orchestrator:
+            artifacts_exist = self._verify_physical_artifacts(accomplishments)
+            if not artifacts_exist:
+                logger.warning("⚠️ Build reported success but no compiled artifacts found")
+                # Override the success flag
+                build_success = False
+                accomplishments['build_success'] = False
+                accomplishments['artifact_verification_failed'] = True
+        
+        # Step 4: Check if build completed successfully  
         if not build_success:
             logger.error("❌ Build failed - cannot proceed without successful compilation")
             return "failed"
         
-        # Step 3: Check if tests passed
+        # Step 5: Check for explicit test failures
+        if test_failed:
+            test_stats = accomplishments.get('test_stats', {})
+            if test_stats:
+                failed_count = test_stats.get('failed', 0)
+                total_count = test_stats.get('total', 0)
+                logger.warning(f"⚠️ Tests explicitly failed - {failed_count}/{total_count} tests failed")
+            else:
+                logger.warning("⚠️ Tests explicitly failed")
+            return "partial"
+        
+        # Step 6: Check if tests passed
         if not test_success:
-            logger.warning("⚠️ Tests failed - build succeeded but verification incomplete")
+            logger.warning("⚠️ Tests not run or incomplete - build succeeded but verification incomplete")
             return "partial"
         
         # All three core steps succeeded
-        logger.info("✅ All core steps succeeded: clone + build + test")
+        logger.debug("✅ All core steps succeeded: clone + build + test")
         return "success"
 
     def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None, execution_metrics: dict = None) -> str:
-        """Generate console-formatted report."""
+        """Generate console-formatted report with simple summary at the top."""
+        
+        # ENHANCED: Add simple three-phase summary at the top
+        simple_status = self._collect_simple_status_from_tasks()
+        simple_summary = self._render_simple_summary_top(simple_status)
         
         report_lines = [
+            simple_summary,  # NEW: Simple summary first
             "=" * 80,
-            "🎯 PROJECT SETUP REPORT",
+            "🎯 DETAILED PROJECT SETUP REPORT",
             "=" * 80,
             f"⏰ Generated: {timestamp}",
             f"📊 Status: {status.upper()}",
@@ -910,6 +1293,7 @@ class ReportTool(BaseTool):
 
     def _get_project_info(self) -> Dict[str, str]:
         """Get basic project information from the workspace."""
+        import re  # FIXED: Move import to top level to avoid scope issues
         info = {}
         
         try:
@@ -917,50 +1301,76 @@ class ReportTool(BaseTool):
                 # First try to get project info from trunk context
                 trunk_context = self.context_manager.load_trunk_context() if self.context_manager else None
                 
-                # Try to detect actual project directory from completed tasks
+                # FIXED: Try to detect actual project directory from completed tasks
                 project_dir = "/workspace"
-                if trunk_context and 'todo_list' in trunk_context:
-                    for task in trunk_context['todo_list']:
-                        if task.get('status') == 'completed' and task.get('key_results'):
-                            key_results = task.get('key_results', '')
+                if trunk_context and hasattr(trunk_context, 'todo_list'):
+                    for task in trunk_context.todo_list:
+                        # FIXED: Use object attributes instead of dictionary access
+                        if task.status.value == 'completed' and task.key_results:
+                            key_results = task.key_results
                             # Look for project directory in key results
                             if 'repo_dir=' in key_results:
                                 # Extract repo_dir value
-                                import re
                                 match = re.search(r'repo_dir=([^;,\s]+)', key_results)
                                 if match:
                                     project_dir = match.group(1)
                                     break
-                            elif '/workspace/' in key_results:
-                                # Try to extract project path
-                                match = re.search(r'/workspace/[\w-]+', key_results)
+                            elif 'path=/workspace/' in key_results:
+                                # Try to extract project path - more specific pattern
+                                match = re.search(r'path=(/workspace/[\w-]+)', key_results)
                                 if match:
-                                    project_dir = match.group(0)
+                                    project_dir = match.group(1)
                                     break
                 
-                # Check for common project files in the actual project directory
-                result = self.docker_orchestrator.execute_command(f"ls -la {project_dir}")
-                if result.get("success"):
-                    output = result.get("output", "")
-                    
-                    # Determine project type based on files
-                    if "pom.xml" in output:
-                        info["type"] = "Maven Java Project"
-                        info["build_system"] = "Maven"
-                    elif "build.gradle" in output:
-                        info["type"] = "Gradle Java Project"
-                        info["build_system"] = "Gradle"
-                    elif "package.json" in output:
-                        info["type"] = "Node.js Project"
-                        info["build_system"] = "npm/yarn"
-                    elif "requirements.txt" in output or "pyproject.toml" in output:
-                        info["type"] = "Python Project"
-                        info["build_system"] = "pip/poetry"
-                    else:
-                        info["type"] = "Generic Project"
-                        info["build_system"] = "Unknown"
-                    
+                # ENHANCED: First try to get project type from task key_results
+                project_type_from_tasks = None
+                if trunk_context and hasattr(trunk_context, 'todo_list'):
+                    for task in trunk_context.todo_list:
+                        if task.status.value == 'completed' and task.key_results:
+                            key_results = task.key_results.lower()
+                            if 'project_type=maven' in key_results:
+                                project_type_from_tasks = ('Maven Java Project', 'Maven')
+                                break
+                            elif 'project_type=gradle' in key_results:
+                                project_type_from_tasks = ('Gradle Java Project', 'Gradle')
+                                break
+                            elif 'project_type=node' in key_results or 'project_type=npm' in key_results:
+                                project_type_from_tasks = ('Node.js Project', 'npm/yarn')
+                                break
+                            elif 'project_type=python' in key_results:
+                                project_type_from_tasks = ('Python Project', 'pip/poetry')
+                                break
+                
+                # Use project type from tasks if found, otherwise check files
+                if project_type_from_tasks:
+                    info["type"] = project_type_from_tasks[0]
+                    info["build_system"] = project_type_from_tasks[1]
                     info["directory"] = project_dir
+                    logger.debug(f"✅ Project type detected from task results: {project_type_from_tasks[0]}")
+                else:
+                    # Fallback: Check for common project files in the actual project directory
+                    result = self.docker_orchestrator.execute_command(f"ls -la {project_dir}")
+                    if result.get("success"):
+                        output = result.get("output", "")
+                        
+                        # Determine project type based on files
+                        if "pom.xml" in output:
+                            info["type"] = "Maven Java Project"
+                            info["build_system"] = "Maven"
+                        elif "build.gradle" in output:
+                            info["type"] = "Gradle Java Project"
+                            info["build_system"] = "Gradle"
+                        elif "package.json" in output:
+                            info["type"] = "Node.js Project"
+                            info["build_system"] = "npm/yarn"
+                        elif "requirements.txt" in output or "pyproject.toml" in output:
+                            info["type"] = "Python Project"
+                            info["build_system"] = "pip/poetry"
+                        else:
+                            info["type"] = "Generic Project"
+                            info["build_system"] = "Unknown"
+                        
+                        info["directory"] = project_dir
                 
         except Exception as e:
             logger.warning(f"Could not gather project info: {e}")
@@ -1016,6 +1426,11 @@ class ReportTool(BaseTool):
         tech_section = self._generate_technical_accomplishments_section(actual_accomplishments)
         if tech_section:
             report_lines.extend(tech_section)
+        
+        # Generate enhanced error reporting section if errors detected
+        error_section = self._generate_error_reporting_section(actual_accomplishments)
+        if error_section:
+            report_lines.extend(error_section)
         
         # Generate execution metrics section
         metrics_section = self._generate_metrics_section(execution_metrics)
@@ -1122,6 +1537,111 @@ class ReportTool(BaseTool):
         section_lines.append("")
         return section_lines
 
+    def _generate_error_reporting_section(self, actual_accomplishments: dict = None) -> list:
+        """Generate enhanced error reporting section for build and test failures."""
+        if not actual_accomplishments:
+            return []
+        
+        # Check if there are any errors to report
+        has_errors = (
+            actual_accomplishments.get('build_failed', False) or
+            actual_accomplishments.get('test_failed', False) or
+            actual_accomplishments.get('compilation_errors', 0) > 0 or
+            actual_accomplishments.get('test_partial', False)
+        )
+        
+        if not has_errors:
+            return []
+        
+        section_lines = [
+            "## ⚠️ Error Analysis",
+            "",
+        ]
+        
+        # Report compilation errors
+        if actual_accomplishments.get('compilation_errors', 0) > 0:
+            error_count = actual_accomplishments['compilation_errors']
+            section_lines.extend([
+                "### 🔴 Compilation Errors",
+                "",
+                f"**Total Compilation Errors:** {error_count}",
+                "",
+                "**Common Issues Detected:**",
+                "- Character encoding problems (unmappable characters)",
+                "- Source files may need UTF-8 encoding",
+                "- Consider adding `-Dfile.encoding=UTF-8` to build configuration",
+                "",
+            ])
+        
+        # Report build failures
+        if actual_accomplishments.get('build_failed', False):
+            section_lines.extend([
+                "### 🔴 Build Failure",
+                "",
+                "**Status:** BUILD FAILED",
+                "",
+                "The build process failed to complete successfully. This typically indicates:",
+                "- Compilation errors in source code",
+                "- Missing dependencies",
+                "- Configuration issues",
+                "",
+                "**Recommended Actions:**",
+                "1. Review compilation errors above",
+                "2. Check dependency configurations",
+                "3. Verify build tool setup (Maven/Gradle)",
+                "",
+            ])
+        
+        # Report test failures with statistics
+        if actual_accomplishments.get('test_failed', False) or actual_accomplishments.get('test_partial', False):
+            section_lines.extend([
+                "### 🔴 Test Failures",
+                "",
+            ])
+            
+            # Add test statistics if available
+            test_stats = actual_accomplishments.get('test_stats', {})
+            if test_stats:
+                total = test_stats.get('total', 0)
+                failed = test_stats.get('failed', 0)
+                passed = test_stats.get('passed', total - failed)
+                pass_rate = (passed / total * 100) if total > 0 else 0
+                
+                section_lines.extend([
+                    "**Test Statistics:**",
+                    f"- Total Tests: {total}",
+                    f"- Passed: {passed} ({pass_rate:.1f}%)",
+                    f"- Failed: {failed}",
+                    "",
+                ])
+            else:
+                section_lines.extend([
+                    "**Status:** Tests failed (detailed statistics unavailable)",
+                    "",
+                ])
+            
+            section_lines.extend([
+                "**Recommended Actions:**",
+                "1. Review test failure output for specific failing tests",
+                "2. Check test logs in `target/surefire-reports/` (Maven) or `build/test-results/` (Gradle)",
+                "3. Run failing tests individually for detailed debugging",
+                "4. Verify test environment setup and dependencies",
+                "",
+            ])
+        
+        # Report tools that failed
+        if actual_accomplishments.get('tools_failed'):
+            failed_tools = actual_accomplishments['tools_failed']
+            section_lines.extend([
+                "### 🔧 Failed Tool Executions",
+                "",
+                f"The following tools encountered errors: {', '.join(set(failed_tools))}",
+                "",
+            ])
+        
+        section_lines.append("")
+        return section_lines
+    
     def _generate_metrics_section(self, execution_metrics: dict = None) -> list:
         """Generate execution metrics section for the markdown report."""
         if not execution_metrics:

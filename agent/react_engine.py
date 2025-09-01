@@ -11,11 +11,12 @@ from loguru import logger
 from pydantic import BaseModel
 
 from config import create_agent_logger, create_verbose_logger, get_config
-from tools import BaseTool, ToolResult
 
 from tools.base import BaseTool, ToolResult
 from .context_manager import BranchContext, ContextManager, TrunkContext, BranchContextHistory
 from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
+from .output_storage import OutputStorageManager
+from .physical_validator import PhysicalValidator
 
 
 class StepType(str, Enum):
@@ -86,10 +87,26 @@ class ReActEngine:
         self._cached_trunk_context = None
         self._trunk_context_cache_timestamp = None
         
-        # Initialize the centralized state evaluator
+        # Initialize the centralized state evaluator (will be updated with physical validator after initialization)
         self.state_evaluator = AgentStateEvaluator(self.context_manager)
+        
+        # Initialize output storage manager
+        from pathlib import Path
+        contexts_dir = Path(self.context_manager.contexts_dir) if hasattr(self.context_manager, 'contexts_dir') else Path("/workspace/.setup_agent/contexts")
+        # Pass orchestrator to OutputStorageManager for container file operations
+        orchestrator = self.context_manager.orchestrator if hasattr(self.context_manager, 'orchestrator') else None
+        self.output_storage = OutputStorageManager(contexts_dir, orchestrator=orchestrator)
+        
+        # Initialize physical validator for fact-based validation
+        self.physical_validator = PhysicalValidator(
+            docker_orchestrator=orchestrator,
+            project_path="/workspace"
+        )
+        
+        # Update state evaluator with physical validator
+        self.state_evaluator.physical_validator = self.physical_validator
 
-        logger.info("ReAct Engine initialized with dual model support")
+        logger.info("ReAct Engine initialized with dual model support and physical validation")
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
         if repository_url:
@@ -1098,18 +1115,61 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 # Validate and fix parameters
                 validated_params = self._validate_and_fix_parameters(step.tool_name, step.tool_params or {})
 
-                # Check for repetitive tool execution
+                # Check for repetitive tool execution with ENHANCED graduated response
                 tool_signature = f"{step.tool_name}:{str(sorted(validated_params.items()))}"
-                if self._is_repetitive_execution(tool_signature):
-                    logger.warning(f"Detected repetitive execution of {step.tool_name}, adding guidance and triggering thinking model")
-                    
-                    # Force a switch to thinking model in next iteration
-                    self._force_thinking_next = True
-                    
-                    # Provide detailed guidance
+                repetition_level = self._get_repetition_level(tool_signature)
+                
+                if repetition_level > 0:
                     recent_executions = [e for e in self.recent_tool_executions 
                                        if e["signature"].startswith(step.tool_name + ':')]
                     failure_count = sum(1 for e in recent_executions if not e["success"])
+                    
+                    # Level 1: Warning (3 repetitions)
+                    if repetition_level == 1:
+                        logger.warning(f"Repetition level 1: {step.tool_name} called {len(recent_executions)} times")
+                        # Continue execution but with warning
+                        
+                    # Level 2: Guidance (4 repetitions)
+                    elif repetition_level == 2:
+                        logger.warning(f"Repetition level 2: {step.tool_name} needs alternative approach")
+                        self._force_thinking_next = True
+                        guidance_msg = (f"Tool {step.tool_name} has been executed {len(recent_executions)} times with {failure_count} failures. "
+                                      f"Consider alternative approaches: ")
+                        guidance_msg += self._generate_alternative_suggestions(step.tool_name, validated_params, recent_executions)
+                        
+                    # Level 3: Force break (5+ repetitions)
+                    else:  # repetition_level >= 3
+                        logger.error(f"BREAKING INFINITE LOOP: {step.tool_name} called {len(recent_executions)} times")
+                        
+                        # Check for specific patterns and apply targeted fixes
+                        if "update-alternatives" in str(recent_executions) or "java" in step.tool_name.lower():
+                            logger.info("Detected Java configuration loop - attempting auto-fix")
+                            return self._auto_fix_java_configuration()
+                        
+                        # Force progression to next task
+                        logger.info("Forcing progression to next task to break loop")
+                        result = ToolResult(
+                            success=False,
+                            output=f"🛑 INFINITE LOOP BROKEN: {step.tool_name} was called {len(recent_executions)} times without progress.\n"
+                                  f"Failures: {failure_count}/{len(recent_executions)}\n"
+                                  f"Moving to next task to prevent resource waste.",
+                            error="Infinite loop detected and broken",
+                            error_code="INFINITE_LOOP_BROKEN",
+                            suggestions=[
+                                "Task has been marked as incomplete",
+                                "Proceeding with next task",
+                                "Review logs for root cause analysis"
+                            ]
+                        )
+                        
+                        # Update tool execution history
+                        self._update_tool_execution_history(tool_signature, False)
+                        
+                        # Force context manager to move to next task
+                        if hasattr(self.context_manager, 'force_next_task'):
+                            self.context_manager.force_next_task()
+                        
+                        return result
                     
                     guidance_msg = (f"Tool {step.tool_name} has been executed repeatedly with {failure_count} failures. "
                                   f"This suggests the current approach is not working. ")
@@ -1147,18 +1207,34 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         guidance_msg += ("Consider examining the error messages, changing parameters, "
                                        "or using a different tool to achieve the same goal.")
                     
-                    result = ToolResult(
-                        success=False,
-                        output="",
-                        error=guidance_msg,
-                        error_code="REPETITIVE_EXECUTION",
-                        suggestions=[
+                    # Still execute the tool but with warning
+                    # This ensures agent can see actual errors instead of empty output
+                    try:
+                        actual_result = tool.execute(**validated_params)
+                        # Prepend warning to actual output
+                        warning_prefix = f"⚠️ REPETITIVE EXECUTION WARNING: {step.tool_name} has been called {len(recent_executions)} times\n\n"
+                        result = ToolResult(
+                            success=actual_result.success,
+                            output=warning_prefix + actual_result.output,
+                            raw_output=actual_result.raw_output if hasattr(actual_result, 'raw_output') else actual_result.output,
+                            error=actual_result.error if hasattr(actual_result, 'error') else None,
+                            error_code="REPETITIVE_EXECUTION_WITH_OUTPUT",
+                            metadata=actual_result.metadata if hasattr(actual_result, 'metadata') else {}
+                        )
+                    except Exception as e:
+                        # If execution fails, at least show the error
+                        result = ToolResult(
+                            success=False,
+                            output=f"⚠️ Repetitive execution detected. Tool execution failed: {str(e)}",
+                            error=guidance_msg,
+                            error_code="REPETITIVE_EXECUTION",
+                            suggestions=[
                             "Use thinking model to analyze the root cause of repeated failures",
                             "Try a different approach or tool to achieve the same goal",
                             "Examine the full error output using raw_output=true if available",
                             "Use file_io or bash tools to investigate the environment manually"
-                        ]
-                    )
+                            ]
+                        )
                 else:
                     # Log tool execution in verbose mode
                     if self.config.verbose:
@@ -1208,13 +1284,39 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 if self.context_manager.current_task_id:
                     # Add action result to branch history using new context management system
                     try:
+                        output_to_store = result.output if result.output else ""
+                        from datetime import datetime
+                        timestamp = datetime.now().isoformat()
+                        
+                        # Store full output and get reference if output is large
+                        if len(output_to_store) > 800:
+                            # Store the full output
+                            ref_id = self.output_storage.store_output(
+                                task_id=self.context_manager.current_task_id,
+                                tool_name=step.tool_name,
+                                output=output_to_store,
+                                timestamp=timestamp,
+                                metadata={
+                                    "success": result.success,
+                                    "iteration": self.current_iteration
+                                }
+                            )
+                            
+                            # Get truncated version with reference
+                            output_to_store = self.output_storage.get_truncation_with_reference(
+                                output=output_to_store,
+                                ref_id=ref_id,
+                                max_length=800,
+                                tool_name=step.tool_name
+                            )
+                        
                         self.context_manager.add_to_branch_history(
                             self.context_manager.current_task_id,
                             {
                                 "type": "action",
                                 "tool_name": step.tool_name,
                                 "success": result.success,
-                                "output": result.output[:500] if result.output else ""  # Truncate long outputs
+                                "output": output_to_store
                             }
                         )
                     except Exception as e:
@@ -2113,6 +2215,104 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
 
 
+    def _get_repetition_level(self, tool_signature: str) -> int:
+        """
+        Get the level of repetition for graduated response.
+        Returns:
+            0: No repetition concern
+            1: Warning level (3 repetitions)
+            2: Guidance level (4 repetitions)
+            3: Force break level (5+ repetitions)
+        """
+        # Count exact matches
+        exact_match_count = sum(1 for exec_info in self.recent_tool_executions 
+                               if exec_info["signature"] == tool_signature)
+        
+        # Extract tool name
+        tool_name = tool_signature.split(':')[0]
+        
+        # Special handling for manage_context
+        if tool_name == "manage_context":
+            if "start_task" in tool_signature or "get_info" in tool_signature:
+                return 0  # Never block these
+            if "complete_with_results" in tool_signature:
+                if exact_match_count >= 6:
+                    return 3
+                elif exact_match_count >= 5:
+                    return 2
+                elif exact_match_count >= 4:
+                    return 1
+                return 0
+        
+        # Count tool executions
+        tool_executions = [exec_info for exec_info in self.recent_tool_executions 
+                          if exec_info["signature"].startswith(tool_name + ':')]
+        tool_count = len(tool_executions)
+        
+        # Determine level based on counts
+        if exact_match_count >= 5 or tool_count >= 8:
+            return 3  # Force break
+        elif exact_match_count >= 4 or tool_count >= 6:
+            return 2  # Guidance
+        elif exact_match_count >= 3 or tool_count >= 5:
+            return 1  # Warning
+        
+        return 0  # No concern
+    
+    def _generate_alternative_suggestions(self, tool_name: str, params: Dict, recent_executions: List) -> str:
+        """Generate context-aware alternative suggestions."""
+        suggestions = []
+        
+        if tool_name == "bash":
+            # Check for common bash issues
+            if any("update-alternatives" in str(e) for e in recent_executions):
+                suggestions.append("Use system tool's install_java action instead of manual update-alternatives")
+            if any("java" in str(e) for e in recent_executions):
+                suggestions.append("Try: system(action='verify_java') to check current Java version")
+            suggestions.append("Use file_io tool to examine files before executing commands")
+            
+        elif tool_name == "maven":
+            suggestions.append("Try: bash(command='mvn --version') to verify Maven installation")
+            suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
+            suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
+            
+        elif tool_name == "system":
+            if params.get("action") == "install_java":
+                suggestions.append("Java might already be installed - verify with: system(action='verify_java')")
+                suggestions.append("Check available Java versions: bash(command='ls /usr/lib/jvm/')")
+                
+        return "\n• ".join(suggestions) if suggestions else "Try a different tool or approach"
+    
+    def _auto_fix_java_configuration(self) -> ToolResult:
+        """Automatically fix Java configuration issues."""
+        logger.info("Attempting automatic Java configuration fix")
+        
+        # Use the system tool which now has proper architecture detection
+        if "system" in self.tools:
+            # First verify what Java is needed
+            verify_result = self.tools["system"].execute(action="verify_java")
+            
+            # Check if Java 17 is needed (common for Tika)
+            if "17" in str(self.context_manager.get_current_context()):
+                logger.info("Detected Java 17 requirement, using system tool for proper installation")
+                install_result = self.tools["system"].execute(action="install_java", java_version="17")
+                
+                if install_result.success:
+                    return ToolResult(
+                        success=True,
+                        output="✅ Auto-fixed Java configuration using enhanced system tool\n" + install_result.output,
+                        metadata={"auto_fixed": True, "java_version": "17"}
+                    )
+        
+        # Fallback response
+        return ToolResult(
+            success=False,
+            output="Could not auto-fix Java configuration. Skipping to next task.",
+            error="Auto-fix failed",
+            error_code="AUTO_FIX_FAILED",
+            suggestions=["Manual intervention may be required", "Check Java installation logs"]
+        )
+    
     def _is_repetitive_execution(self, tool_signature: str) -> bool:
         """Check if this tool execution is repetitive."""
         # Count recent executions of the same tool with same parameters
@@ -2163,14 +2363,21 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             self.recent_tool_executions.pop(0)
 
     def _add_observation_step(self, observation: str):
-        """Add an observation step."""
+        """Add an observation step, enriched with physical validation state."""
+        # Get physical validation state if relevant
+        physical_state = self._get_physical_validation_state(observation)
+        
+        # Enrich observation with physical state if available
+        if physical_state:
+            observation = self._enrich_observation_with_physical_state(observation, physical_state)
+        
         obs_step = ReActStep(
             step_type=StepType.OBSERVATION, content=observation, timestamp=self._get_timestamp()
         )
         self.steps.append(obs_step)
 
-        # Log full observation content without truncation
-        self.agent_logger.info(f"👁️ OBSERVATION: {observation}")
+        # FIXED: Only log once to prevent duplicate output in logs
+        # Use logger.info for main logging, agent_logger for internal tracking only
         logger.info(f"👁️ OBSERVATION: {observation}")
         
         # DEPRECATED: Task completion detection now handled by state_evaluator
@@ -2676,6 +2883,86 @@ Use function calling to execute these tools!"""
         verbose_logger.info(
             f"🔧 TOOL EXECUTION: {json.dumps(execution_entry, indent=2, default=str)}"
         )
+
+    def _get_physical_validation_state(self, observation: str) -> Optional[Dict[str, any]]:
+        """
+        Get physical validation state for build/test related observations.
+        
+        Args:
+            observation: The observation text
+            
+        Returns:
+            Physical validation state dict or None
+        """
+        # Only validate for build/test related observations
+        obs_lower = observation.lower()
+        if not any(keyword in obs_lower for keyword in ['build', 'compile', 'test', 'maven', 'gradle', 'success', 'fail']):
+            return None
+        
+        try:
+            # Get project name from context or use default
+            project_name = None
+            if hasattr(self.context_manager, 'project_name'):
+                project_name = self.context_manager.project_name
+            
+            # Run physical validation
+            validation_result = self.physical_validator.validate_build_artifacts(project_name)
+            
+            # Check if we need to replay commands
+            if 'build success' in obs_lower or 'build fail' in obs_lower:
+                # Try to get the last build command from command tracker if available
+                if hasattr(self, 'command_tracker') and self.command_tracker:
+                    last_build = self.command_tracker.get_last_build_command()
+                    if last_build:
+                        replay_result = self.physical_validator.replay_last_build_command(
+                            last_build['command'],
+                            last_build.get('working_dir')
+                        )
+                        validation_result['build_replay'] = replay_result
+            
+            return validation_result
+            
+        except Exception as e:
+            logger.warning(f"Physical validation failed: {e}")
+            return None
+    
+    def _enrich_observation_with_physical_state(self, observation: str, physical_state: Dict[str, any]) -> str:
+        """
+        Enrich observation with physical validation facts.
+        
+        Args:
+            observation: Original observation text
+            physical_state: Physical validation state dict
+            
+        Returns:
+            Enriched observation text
+        """
+        # Build physical evidence summary
+        evidence_lines = []
+        
+        if physical_state.get('class_files', 0) > 0:
+            evidence_lines.append(f"[PHYSICAL EVIDENCE: {physical_state['class_files']} .class files exist]")
+        else:
+            evidence_lines.append("[PHYSICAL EVIDENCE: No .class files found - compilation may have failed]")
+        
+        if physical_state.get('jar_files', 0) > 0:
+            evidence_lines.append(f"[PHYSICAL EVIDENCE: {physical_state['jar_files']} JAR files exist]")
+        
+        if physical_state.get('missing_classes'):
+            count = len(physical_state['missing_classes'])
+            evidence_lines.append(f"[PHYSICAL EVIDENCE: {count} Java files have no corresponding .class files]")
+        
+        if 'build_replay' in physical_state:
+            if physical_state['build_replay']:
+                evidence_lines.append("[PHYSICAL EVIDENCE: Build command replay succeeded]")
+            else:
+                evidence_lines.append("[PHYSICAL EVIDENCE: Build command replay failed]")
+        
+        # Add evidence to observation
+        if evidence_lines:
+            return observation + "\n" + "\n".join(evidence_lines)
+        
+        return observation
 
     def _log_tool_result_verbose(self, tool_name: str, result):
         """Log detailed tool result information in verbose mode."""
@@ -3230,6 +3517,69 @@ EXECUTE ACTIONS FOR:
     def _recover_maven_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
         """Recover from Maven tool failures."""
         error_msg = failed_result.error or ""
+        error_code = getattr(failed_result, 'error_code', None)
+        
+        # Check for Java version mismatch (highest priority)
+        if error_code == "JAVA_VERSION_MISMATCH":
+            # Extract required Java version from metadata
+            metadata = getattr(failed_result, 'metadata', {})
+            analysis = metadata.get('analysis', {})
+            java_error = analysis.get('java_version_error', {})
+            
+            if java_error and java_error.get('required'):
+                required_version = java_error['required']
+                current_version = java_error.get('current', 'unknown')
+                
+                logger.info(f"🔧 Attempting Java version recovery: Installing Java {required_version} (current: {current_version})")
+                
+                # First, verify the current Java version
+                if "system" in self.tools:
+                    verify_result = self.tools["system"].safe_execute(
+                        action="verify_java",
+                        java_version=required_version
+                    )
+                    
+                    # If verification shows we already have the right version, just retry Maven
+                    if verify_result.success:
+                        logger.info(f"Java {required_version} is already installed, retrying Maven command")
+                        tool = self.tools["maven"]
+                        result = tool.safe_execute(**params)
+                        return {
+                            "attempted": True,
+                            "success": result.success,
+                            "message": f"Java {required_version} was already installed, retried Maven command",
+                            "result": result
+                        }
+                    
+                    # Install the required Java version
+                    install_result = self.tools["system"].safe_execute(
+                        action="install_java",
+                        java_version=required_version
+                    )
+                    
+                    if install_result.success:
+                        logger.info(f"✅ Successfully installed Java {required_version}, retrying Maven command")
+                        
+                        # Retry the original Maven command
+                        tool = self.tools["maven"]
+                        result = tool.safe_execute(**params)
+                        
+                        return {
+                            "attempted": True,
+                            "success": result.success,
+                            "message": f"Recovered by installing Java {required_version} and retrying",
+                            "result": result
+                        }
+                    else:
+                        logger.warning(f"Failed to install Java {required_version}: {install_result.error}")
+                        return {
+                            "attempted": True,
+                            "success": False,
+                            "message": f"Attempted to install Java {required_version} but failed",
+                            "result": install_result
+                        }
+                else:
+                    logger.warning("System tool not available for Java installation")
         
         # Try to fix working directory issues
         if "not found" in error_msg.lower() or "no such file" in error_msg.lower():

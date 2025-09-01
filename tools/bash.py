@@ -737,13 +737,74 @@ class BashTool(BaseTool):
         analysis = {
             'error_type': 'general',
             'error_code': 'COMMAND_FAILED',
-            'key_errors': []
+            'key_errors': [],
+            'compilation_errors': [],
+            'test_failures': [],
+            'error_count': 0,
+            'test_stats': {}
         }
         
         output_lower = output.lower()
+        lines = output.split('\n')
+        
+        # Java Compilation errors (HIGH PRIORITY - check first)
+        if 'unmappable character for encoding' in output_lower or 'compilation failed' in output_lower:
+            analysis['error_type'] = 'compilation_error'
+            analysis['error_code'] = 'COMPILATION_FAILED'
+            # Count compilation errors
+            for line in lines:
+                if 'unmappable character' in line.lower() or 'error:' in line:
+                    analysis['compilation_errors'].append(line.strip())
+                    if 'error:' in line:
+                        analysis['error_count'] += 1
+            # Limit stored errors to prevent bloat
+            analysis['compilation_errors'] = analysis['compilation_errors'][:20]
+        
+        # Build failures (Maven/Gradle)
+        elif 'build failed' in output_lower or 'build failure' in output_lower:
+            analysis['error_type'] = 'build_failed'
+            analysis['error_code'] = 'BUILD_FAILED'
+            # Look for specific build error patterns
+            for line in lines:
+                if 'BUILD FAILED' in line or 'BUILD FAILURE' in line:
+                    analysis['key_errors'].append(line.strip())
+                elif 'compilation error' in line.lower():
+                    analysis['compilation_errors'].append(line.strip())
+                    analysis['error_count'] += 1
+        
+        # Test failures
+        elif 'tests failed' in output_lower or 'test failures' in output_lower or 'failures: ' in output_lower:
+            analysis['error_type'] = 'test_failed'
+            analysis['error_code'] = 'TEST_FAILED'
+            # Extract test statistics
+            for line in lines:
+                # JUnit pattern: "Tests run: X, Failures: Y, Errors: Z, Skipped: W"
+                if 'tests run:' in line.lower():
+                    import re
+                    stats_match = re.search(r'tests?\s+run:\s*(\d+).*?failures?:\s*(\d+).*?errors?:\s*(\d+)', line, re.IGNORECASE)
+                    if stats_match:
+                        analysis['test_stats'] = {
+                            'total': int(stats_match.group(1)),
+                            'failures': int(stats_match.group(2)),
+                            'errors': int(stats_match.group(3))
+                        }
+                # Gradle pattern: "X tests completed, Y failed"
+                elif 'tests completed' in line.lower():
+                    stats_match = re.search(r'(\d+)\s+tests?\s+completed.*?(\d+)\s+failed', line, re.IGNORECASE)
+                    if stats_match:
+                        analysis['test_stats'] = {
+                            'total': int(stats_match.group(1)),
+                            'failures': int(stats_match.group(2)),
+                            'errors': 0
+                        }
+                # Capture failed test names
+                if 'FAILED' in line and ('Test' in line or 'test' in line):
+                    analysis['test_failures'].append(line.strip())
+            # Limit test failures stored
+            analysis['test_failures'] = analysis['test_failures'][:15]
         
         # Permission errors
-        if 'permission denied' in output_lower or 'access denied' in output_lower:
+        elif 'permission denied' in output_lower or 'access denied' in output_lower:
             analysis['error_type'] = 'permission'
             analysis['error_code'] = 'PERMISSION_DENIED'
         
@@ -772,9 +833,10 @@ class BashTool(BaseTool):
             analysis['error_type'] = 'package_not_found'
             analysis['error_code'] = 'PACKAGE_NOT_FOUND'
         
-        # Extract key error lines
-        error_lines = [line for line in output.split('\n') if 'error' in line.lower() or 'fail' in line.lower()]
-        analysis['key_errors'] = error_lines[:5]  # Limit to 5 lines
+        # Extract general error lines if not already captured
+        if not analysis['key_errors'] and not analysis['compilation_errors']:
+            error_lines = [line for line in lines if 'error' in line.lower() or 'fail' in line.lower()]
+            analysis['key_errors'] = error_lines[:10]  # Increased limit for better diagnostics
         
         return analysis
     
@@ -783,7 +845,45 @@ class BashTool(BaseTool):
         suggestions = []
         error_type = error_analysis.get('error_type', 'general')
         
-        if error_type == 'permission':
+        if error_type == 'compilation_error':
+            compilation_errors = error_analysis.get('compilation_errors', [])
+            error_count = error_analysis.get('error_count', 0)
+            suggestions.extend([
+                f"Compilation failed with {error_count} errors",
+                "Check source code for syntax errors",
+                "Verify character encoding (use UTF-8 for source files)",
+                "Check Java/compiler version compatibility",
+                "Review the first few errors as they often cascade"
+            ])
+            # Add specific encoding fix if detected
+            if any('unmappable character' in err.lower() for err in compilation_errors):
+                suggestions.insert(0, "Fix encoding: Add -Dfile.encoding=UTF-8 to MAVEN_OPTS or gradle.properties")
+        
+        elif error_type == 'build_failed':
+            suggestions.extend([
+                "Build failed - check compilation errors above",
+                "Verify all dependencies are available",
+                "Check if build tool (Maven/Gradle) is properly configured",
+                "Try running with -X (Maven) or --debug (Gradle) for detailed output",
+                "Clean and rebuild: 'mvn clean' or 'gradle clean'"
+            ])
+        
+        elif error_type == 'test_failed':
+            test_stats = error_analysis.get('test_stats', {})
+            if test_stats:
+                total = test_stats.get('total', 0)
+                failures = test_stats.get('failures', 0)
+                errors = test_stats.get('errors', 0)
+                suggestions.append(f"Tests failed: {failures} failures, {errors} errors out of {total} tests")
+            suggestions.extend([
+                "Review test failure details in the output above",
+                "Check test logs for detailed error messages",
+                "Run tests individually to isolate failures",
+                "Verify test environment and dependencies",
+                "Use -DskipTests to skip tests temporarily (not recommended for production)"
+            ])
+        
+        elif error_type == 'permission':
             suggestions.extend([
                 "Try running with sudo if appropriate",
                 "Check file/directory permissions with 'ls -la'",

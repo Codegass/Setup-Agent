@@ -10,9 +10,11 @@ from .gradle_tool import GradleTool
 from .project_setup_tool import ProjectSetupTool
 from .system_tool import SystemTool
 from .report_tool import ReportTool
+from .output_search_tool import OutputSearchTool
 
 __all__ = [
     "BaseTool", "ToolResult", "ToolError",
     "BashTool", "FileIOTool", "WebSearchTool", "ContextTool", 
-    "MavenTool", "GradleTool", "ProjectSetupTool", "SystemTool", "ReportTool"
+    "MavenTool", "GradleTool", "ProjectSetupTool", "SystemTool", "ReportTool",
+    "OutputSearchTool"
 ]

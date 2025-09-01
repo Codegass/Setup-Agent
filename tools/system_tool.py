@@ -22,18 +22,19 @@ class SystemTool(BaseTool):
     def execute(self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None) -> ToolResult:
         """Execute system management operations."""
         
-        if action not in ["install", "update", "detect_missing", "install_missing", "install_java"]:
+        if action not in ["install", "update", "detect_missing", "install_missing", "install_java", "verify_java"]:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', or 'install_java'",
+                error=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', 'install_java', or 'verify_java'",
                 error_code="INVALID_ACTION",
                 suggestions=[
                     "Use 'install' to install specific packages",
                     "Use 'update' to update package lists",
                     "Use 'detect_missing' to check for missing dependencies",
                     "Use 'install_missing' to automatically install missing dependencies",
-                    "Use 'install_java' to install and configure a specific Java version"
+                    "Use 'install_java' to install and configure a specific Java version",
+                    "Use 'verify_java' to check the current Java version"
                 ]
             )
 
@@ -75,6 +76,48 @@ class SystemTool(BaseTool):
                         ]
                     )
                 return self._install_and_configure_java(java_version)
+            
+            elif action == "verify_java":
+                if not java_version:
+                    # Just check what Java version is installed
+                    java_check = self.docker_orchestrator.execute_command("java -version 2>&1")
+                    return ToolResult(
+                        success=True,
+                        output=java_check.get("output", "Java not installed"),
+                        metadata={"exit_code": java_check.get("exit_code", -1)}
+                    )
+                else:
+                    # Verify against a specific version
+                    verification = self._verify_java_version(java_version)
+                    if verification["matches"]:
+                        return ToolResult(
+                            success=True,
+                            output=f"✅ Java {java_version} is installed and active",
+                            metadata=verification
+                        )
+                    elif verification["installed"]:
+                        return ToolResult(
+                            success=False,
+                            output=f"❌ Java version mismatch: Required {java_version}, but found {verification['current_version']}",
+                            error=f"Java version mismatch",
+                            error_code="JAVA_VERSION_MISMATCH",
+                            suggestions=[
+                                f"Install Java {java_version}: system(action='install_java', java_version='{java_version}')",
+                                f"Current version is {verification['current_version']}"
+                            ],
+                            metadata=verification
+                        )
+                    else:
+                        return ToolResult(
+                            success=False,
+                            output="Java is not installed",
+                            error="Java not found",
+                            error_code="JAVA_NOT_INSTALLED",
+                            suggestions=[
+                                f"Install Java {java_version}: system(action='install_java', java_version='{java_version}')"
+                            ],
+                            metadata=verification
+                        )
                 
         except Exception as e:
             error_msg = f"System operation failed: {str(e)}"
@@ -268,13 +311,80 @@ class SystemTool(BaseTool):
                 }
             )
 
+    def _verify_java_version(self, required_version: str) -> Dict[str, Any]:
+        """
+        Verify the current Java version against the required version.
+        
+        Returns:
+            Dict with keys:
+            - installed: bool (whether Java is installed)
+            - current_version: str (current Java version, e.g., "11", "17")
+            - required_version: str (required Java version)
+            - matches: bool (whether current matches required)
+            - raw_output: str (raw java -version output)
+        """
+        import re
+        
+        result = {
+            "installed": False,
+            "current_version": None,
+            "required_version": required_version,
+            "matches": False,
+            "raw_output": ""
+        }
+        
+        # Execute java -version command
+        java_check = self.docker_orchestrator.execute_command("java -version 2>&1")
+        result["raw_output"] = java_check.get("output", "")
+        
+        if java_check.get("exit_code") != 0 or "command not found" in result["raw_output"]:
+            logger.info("Java is not installed")
+            return result
+        
+        # Parse Java version from output
+        # Patterns for different Java version formats:
+        # OpenJDK: "openjdk version "17.0.8" 2023-07-18"
+        # Oracle: "java version "1.8.0_361""
+        # OpenJDK 11+: "openjdk version "11.0.20" 2023-07-18"
+        version_patterns = [
+            r'version "(\d+)\.[\d\._]+"',  # Java 9+ format (e.g., "17.0.8")
+            r'version "1\.(\d+)\.[\d_]+"',  # Java 8 and earlier (e.g., "1.8.0_361")
+            r'version "(\d+)"',  # Simple version format
+        ]
+        
+        for pattern in version_patterns:
+            match = re.search(pattern, result["raw_output"])
+            if match:
+                version = match.group(1)
+                result["installed"] = True
+                result["current_version"] = version
+                result["matches"] = (version == required_version)
+                logger.info(f"Detected Java version: {version} (required: {required_version})")
+                break
+        
+        if result["installed"] and not result["current_version"]:
+            # Java is installed but we couldn't parse the version
+            logger.warning(f"Could not parse Java version from: {result['raw_output']}")
+            result["current_version"] = "unknown"
+        
+        return result
+
     def _install_and_configure_java(self, java_version: str) -> ToolResult:
         """Install and configure a specific Java version."""
         logger.info(f"Installing and configuring Java {java_version}")
         
-        # Step 1: Check current Java version
-        current_java = self.docker_orchestrator.execute_command("java -version 2>&1 | head -1")
-        logger.info(f"Current Java: {current_java.get('output', 'Not installed')}")
+        # Step 1: Check current Java version using the new verification method
+        version_check = self._verify_java_version(java_version)
+        logger.info(f"Current Java status: {version_check}")
+        
+        # If the correct version is already installed, just configure it
+        if version_check["matches"]:
+            logger.info(f"Java {java_version} is already installed and active")
+            return ToolResult(
+                success=True,
+                output=f"Java {java_version} is already installed and configured\n\n{version_check['raw_output']}",
+                metadata=version_check
+            )
         
         # Step 2: Update package lists
         update_result = self._update_packages()
@@ -316,28 +426,99 @@ class SystemTool(BaseTool):
                     ]
                 )
         
-        # Step 4: Get architecture for Java home path
+        # Step 4: Get architecture for Java home path - ENHANCED VERSION
         arch_result = self.docker_orchestrator.execute_command("dpkg --print-architecture")
-        arch = arch_result.get("output", "amd64").strip()
+        arch = arch_result.get("output", "").strip()
         
-        # Step 5: Set JAVA_HOME and update alternatives
+        # Don't fallback to amd64 - detect properly
+        if not arch:
+            # Try alternative detection methods
+            uname_result = self.docker_orchestrator.execute_command("uname -m")
+            machine = uname_result.get("output", "").strip()
+            
+            # Map machine architecture to dpkg architecture
+            arch_mapping = {
+                "x86_64": "amd64",
+                "aarch64": "arm64",
+                "armv7l": "armhf",
+                "ppc64le": "ppc64el",
+                "s390x": "s390x"
+            }
+            arch = arch_mapping.get(machine, "")
+            
+            if not arch:
+                logger.warning(f"Could not detect architecture, machine type: {machine}")
+                # Last resort: scan what's actually installed
+                scan_result = self.docker_orchestrator.execute_command(
+                    f"ls -d /usr/lib/jvm/java-{java_version}-openjdk-* 2>/dev/null | head -1"
+                )
+                if scan_result.get("output"):
+                    installed_path = scan_result["output"].strip()
+                    # Extract architecture from path
+                    import re
+                    match = re.search(r'openjdk-([^/]+)$', installed_path)
+                    if match:
+                        arch = match.group(1)
+                        logger.info(f"Detected architecture from installed path: {arch}")
+        
+        logger.info(f"Detected system architecture: {arch}")
+        
+        # Step 5: Set JAVA_HOME and update alternatives with better verification
         java_home = f"/usr/lib/jvm/java-{java_version}-openjdk-{arch}"
         java_bin = f"{java_home}/bin/java"
         javac_bin = f"{java_home}/bin/javac"
         
-        # Check if the Java installation exists
+        # Enhanced verification: Check if the Java installation exists
         check_java = self.docker_orchestrator.execute_command(f"test -f {java_bin} && echo 'exists'")
         if "exists" not in check_java.get("output", ""):
-            # Try to find the actual Java installation
-            find_java = self.docker_orchestrator.execute_command(
-                f"find /usr/lib/jvm -name 'java-{java_version}-openjdk*' -type d | head -1"
-            )
-            if find_java.get("output"):
-                java_home = find_java["output"].strip()
-                java_bin = f"{java_home}/bin/java"
-                javac_bin = f"{java_home}/bin/javac"
+            logger.info(f"Java binary not found at {java_bin}, searching for actual installation")
+            
+            # Try to find the actual Java installation with more specific search
+            find_cmds = [
+                # First try: exact version match
+                f"find /usr/lib/jvm -name 'java-{java_version}-openjdk*' -type d | head -1",
+                # Second try: look for any java installation of this version
+                f"ls -d /usr/lib/jvm/*{java_version}* 2>/dev/null | grep -v '.jinfo' | head -1",
+                # Third try: check default-java symlink
+                f"readlink -f /usr/lib/jvm/default-java | grep -q {java_version} && readlink -f /usr/lib/jvm/default-java"
+            ]
+            
+            for find_cmd in find_cmds:
+                find_java = self.docker_orchestrator.execute_command(find_cmd)
+                if find_java.get("output") and find_java["output"].strip():
+                    java_home = find_java["output"].strip()
+                    java_bin = f"{java_home}/bin/java"
+                    javac_bin = f"{java_home}/bin/javac"
+                    
+                    # Verify the binaries actually exist
+                    verify_result = self.docker_orchestrator.execute_command(
+                        f"test -f {java_bin} && test -f {javac_bin} && echo 'verified'"
+                    )
+                    if "verified" in verify_result.get("output", ""):
+                        logger.info(f"Found Java installation at: {java_home}")
+                        break
+            else:
+                # Could not find Java installation
+                return ToolResult(
+                    success=False,
+                    output=f"Java {java_version} was installed but cannot find the binaries",
+                    error="Java binaries not found",
+                    error_code="JAVA_BINARIES_NOT_FOUND",
+                    suggestions=[
+                        "Check installation with: ls -la /usr/lib/jvm/",
+                        f"Try reinstalling: apt-get install --reinstall openjdk-{java_version}-jdk",
+                        "Check available Java versions: update-alternatives --list java"
+                    ]
+                )
         
-        # Step 6: Configure environment
+        # Step 6: Configure environment with better error handling
+        # First, check if alternatives are already registered
+        java_alternatives = self.docker_orchestrator.execute_command("update-alternatives --list java 2>/dev/null")
+        javac_alternatives = self.docker_orchestrator.execute_command("update-alternatives --list javac 2>/dev/null")
+        
+        java_registered = java_bin in java_alternatives.get("output", "")
+        javac_registered = javac_bin in javac_alternatives.get("output", "")
+        
         config_commands = [
             # Set JAVA_HOME in profile
             f"echo 'export JAVA_HOME={java_home}' >> /etc/profile",
@@ -345,17 +526,44 @@ class SystemTool(BaseTool):
             # Set JAVA_HOME in bashrc
             f"echo 'export JAVA_HOME={java_home}' >> /root/.bashrc",
             f"echo 'export PATH=$JAVA_HOME/bin:$PATH' >> /root/.bashrc",
-            # Update alternatives
-            f"update-alternatives --install /usr/bin/java java {java_bin} 100",
-            f"update-alternatives --install /usr/bin/javac javac {javac_bin} 100",
-            f"update-alternatives --set java {java_bin}",
-            f"update-alternatives --set javac {javac_bin}"
         ]
         
+        # Only install alternatives if not already registered
+        if not java_registered:
+            config_commands.append(f"update-alternatives --install /usr/bin/java java {java_bin} 100")
+        else:
+            logger.info(f"Java alternative already registered: {java_bin}")
+            
+        if not javac_registered:
+            config_commands.append(f"update-alternatives --install /usr/bin/javac javac {javac_bin} 100")
+        else:
+            logger.info(f"Javac alternative already registered: {javac_bin}")
+        
+        # Always try to set the alternatives (this is safe even if already set)
+        config_commands.extend([
+            f"update-alternatives --set java {java_bin}",
+            f"update-alternatives --set javac {javac_bin}"
+        ])
+        
+        # Execute configuration commands with better error handling
         for cmd in config_commands:
             result = self.docker_orchestrator.execute_command(cmd)
             if result["exit_code"] != 0:
-                logger.warning(f"Failed to execute: {cmd}")
+                # Check if it's an alternatives error
+                if "update-alternatives" in cmd and "not registered" in result.get("output", ""):
+                    logger.warning(f"Alternatives not registered properly, attempting to fix: {cmd}")
+                    # Try to force install the alternative
+                    if "--set" in cmd:
+                        # Replace --set with --install then --set
+                        install_cmd = cmd.replace("--set", "--install /usr/bin/java") + " 100"
+                        self.docker_orchestrator.execute_command(install_cmd)
+                        # Retry the set command
+                        result = self.docker_orchestrator.execute_command(cmd)
+                        if result["exit_code"] == 0:
+                            logger.info(f"Fixed alternatives registration for: {cmd}")
+                            continue
+                
+                logger.warning(f"Failed to execute: {cmd} - {result.get('output', '')[:100]}")
         
         # Step 7: Verify installation
         verify_result = self.docker_orchestrator.execute_command(

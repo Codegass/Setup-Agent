@@ -7,12 +7,14 @@ from typing import Dict, Any, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolResult, ToolError
+from .build_utils import BuildAnalyzer
+from .command_tracker import CommandTracker
 
 
 class MavenTool(BaseTool):
     """Maven build tool with enhanced error handling and raw output access."""
     
-    def __init__(self, orchestrator):
+    def __init__(self, orchestrator, command_tracker: CommandTracker = None):
         super().__init__(
             name="maven",
             description="Execute Maven commands with comprehensive error analysis and raw output access. "
@@ -20,6 +22,7 @@ class MavenTool(BaseTool):
                        "Automatically installs Maven if not present."
         )
         self.orchestrator = orchestrator
+        self.command_tracker = command_tracker
     
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use Maven-specific extraction."""
@@ -102,9 +105,33 @@ class MavenTool(BaseTool):
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
             
+            # Track command for fact-based validation
+            if self.command_tracker:
+                # Determine if this is a build or test command
+                is_test_command = any(test_word in command.lower() for test_word in ["test", "verify"])
+                is_build_command = any(build_word in command.lower() for build_word in ["compile", "package", "install"])
+                
+                if is_test_command:
+                    self.command_tracker.track_test_command(
+                        command=maven_cmd,
+                        tool="maven",
+                        working_dir=working_directory,
+                        exit_code=result["exit_code"],
+                        output=result["output"]
+                    )
+                elif is_build_command:
+                    self.command_tracker.track_build_command(
+                        command=maven_cmd,
+                        tool="maven",
+                        working_dir=working_directory,
+                        exit_code=result["exit_code"],
+                        output=result["output"]
+                    )
+                logger.debug(f"Tracked Maven command: {maven_cmd[:100]}...")
+            
             if raw_output:
                 return ToolResult(
-                    success=result["exit_code"] == 0,
+                    success=analysis["build_success"],  # Use analyzed build success, not exit code
                     output=result["output"],
                     raw_output=result["output"],
                     metadata={
@@ -114,7 +141,34 @@ class MavenTool(BaseTool):
                     }
                 )
             
-            if result["exit_code"] == 0:
+            # Use analysis result to determine success, not just exit code
+            if analysis["build_success"]:
+                # Validate build artifacts for compile/package/install commands
+                validation_result = None
+                if any(goal in command for goal in ["compile", "package", "install"]) and working_directory:
+                    try:
+                        validation_result = BuildAnalyzer.validate_build_artifacts(working_directory, "maven")
+                        logger.debug(f"Build validation: {validation_result}")
+                        
+                        # Add validation info to analysis
+                        analysis["artifacts_validated"] = validation_result.get("artifacts_exist", False)
+                        analysis["found_artifacts"] = validation_result.get("found_artifacts", [])
+                        
+                        # If artifacts don't exist despite "success", it's actually a failure
+                        if not validation_result.get("artifacts_exist") and "compile" in command:
+                            logger.warning("Build claimed success but no artifacts found!")
+                            analysis["build_success"] = False
+                            analysis["validation_error"] = "Build artifacts not found despite BUILD SUCCESS marker"
+                            analysis["missing_artifacts"] = validation_result.get("missing_artifacts", [])
+                            return self._handle_maven_error(
+                                result["output"], 
+                                result["exit_code"], 
+                                maven_cmd, 
+                                analysis
+                            )
+                    except Exception as e:
+                        logger.warning(f"Could not validate build artifacts: {e}")
+                
                 return ToolResult(
                     success=True,
                     output=self._format_success_output(analysis),
@@ -122,10 +176,12 @@ class MavenTool(BaseTool):
                     metadata={
                         "command": maven_cmd,
                         "exit_code": result["exit_code"],
-                        "analysis": analysis
+                        "analysis": analysis,
+                        "validation": validation_result
                     }
                 )
             else:
+                # Build failed - use error handler even if exit code was 0
                 return self._handle_maven_error(result["output"], result["exit_code"], maven_cmd, analysis)
                 
         except Exception as e:
@@ -152,14 +208,27 @@ class MavenTool(BaseTool):
         
         # Add properties
         if properties:
-            for prop in properties.split(","):
-                cmd_parts.append(f"-D{prop.strip()}")
+            # Handle both string and list types for properties
+            if isinstance(properties, list):
+                for prop in properties:
+                    # If it starts with -, add it directly (like -B)
+                    if prop.startswith("-"):
+                        cmd_parts.append(prop)
+                    else:
+                        cmd_parts.append(f"-D{prop.strip()}")
+            else:
+                for prop in properties.split(","):
+                    cmd_parts.append(f"-D{prop.strip()}")
         
         # Add pom file if specified
         if pom_file:
             cmd_parts.extend(["-f", pom_file])
         
         # Add command and goals
+        # Handle both string and list types for command
+        if isinstance(command, list):
+            command = " ".join(command)
+        
         if goals:
             cmd_parts.append(f"{command} {goals}")
         else:
@@ -356,18 +425,76 @@ class MavenTool(BaseTool):
     
     def _analyze_maven_output(self, output: str, exit_code: int) -> Dict[str, Any]:
         """Analyze Maven output for key information."""
+        # CRITICAL: Check for BUILD SUCCESS/FAILURE in output, not just exit code
+        # Maven can return 0 even when build fails in some scenarios
+        has_build_success = "BUILD SUCCESS" in output or "[INFO] BUILD SUCCESS" in output
+        has_build_failure = "BUILD FAILURE" in output or "[ERROR] BUILD FAILURE" in output
+        
+        # Determine actual build success
+        if has_build_failure:
+            build_success = False
+        elif has_build_success:
+            build_success = True
+        else:
+            # Fallback to exit code if no explicit markers found
+            build_success = exit_code == 0
+            
         analysis = {
-            "build_success": exit_code == 0,
+            "build_success": build_success,
+            "has_build_success_marker": has_build_success,
+            "has_build_failure_marker": has_build_failure,
+            "exit_code": exit_code,
             "phases_executed": [],
             "tests_run": None,
             "compilation_errors": [],
             "dependency_issues": [],
             "warnings": [],
             "build_time": None,
-            "artifacts_created": []
+            "artifacts_created": [],
+            "java_version_error": None,  # Added for Maven Enforcer detection
+            "enforcer_error": None  # Store the full enforcer error message
         }
         
         lines = output.split('\n')
+        
+        # Check for Maven Enforcer Java version errors
+        import re
+        enforcer_pattern = r"Detected JDK Version: ([\d\.]+).*is not in the allowed range \[([\d\.]+),\)"
+        for i, line in enumerate(lines):
+            match = re.search(enforcer_pattern, line)
+            if match:
+                current_version = match.group(1)
+                required_version = match.group(2)
+                
+                # Normalize versions (1.8 -> 8)
+                if current_version.startswith("1."):
+                    current_version = current_version[2:]
+                if required_version.startswith("1."):
+                    required_version = required_version[2:]
+                
+                analysis["java_version_error"] = {
+                    "current": current_version,
+                    "required": required_version,
+                    "error_type": "maven_enforcer"
+                }
+                analysis["enforcer_error"] = line
+                logger.info(f"Detected Maven Enforcer Java version error: Current {current_version}, Required {required_version}")
+                break
+        
+        # Also check for simpler Java version error messages
+        if not analysis["java_version_error"]:
+            for line in lines:
+                if "Java" in line and "required" in line.lower():
+                    # Try to extract version numbers
+                    version_match = re.search(r"Java (\d+).*required", line, re.IGNORECASE)
+                    if version_match:
+                        analysis["java_version_error"] = {
+                            "current": "unknown",
+                            "required": version_match.group(1),
+                            "error_type": "generic"
+                        }
+                        logger.info(f"Detected generic Java version requirement: {version_match.group(1)}")
+                        break
         
         for line in lines:
             line = line.strip()
@@ -448,6 +575,35 @@ class MavenTool(BaseTool):
         error_code = "MAVEN_BUILD_ERROR"
         
         # Analyze specific error types
+        if analysis.get("java_version_error"):
+            # Java version mismatch detected
+            java_error = analysis["java_version_error"]
+            error_code = "JAVA_VERSION_MISMATCH"
+            current = java_error.get("current", "unknown")
+            required = java_error.get("required", "unknown")
+            
+            error_suggestions.extend([
+                f"Java version mismatch: Current version is {current}, but {required} is required",
+                f"Install Java {required} using: system(action='install_java', java_version='{required}')",
+                f"Or manually: bash(command='apt-get update && apt-get install -y openjdk-{required}-jdk')",
+                f"After installation, retry the Maven command"
+            ])
+            
+            if java_error.get("error_type") == "maven_enforcer":
+                error_suggestions.insert(1, "This requirement is enforced by Maven Enforcer plugin")
+                documentation_links.append("https://maven.apache.org/enforcer/maven-enforcer-plugin/")
+        
+        if analysis.get("validation_error"):
+            error_code = "BUILD_VALIDATION_ERROR"
+            error_suggestions.extend([
+                "Build claims success but artifacts are missing",
+                "Check if the build actually completed",
+                "Look for hidden errors in build output with raw_output=true",
+                "Try running 'maven clean compile' to force a full rebuild",
+                f"Expected artifacts: {', '.join(analysis.get('missing_artifacts', []))}"
+            ])
+            documentation_links.append("https://maven.apache.org/guides/getting-started/compile.html")
+        
         if analysis["compilation_errors"]:
             error_code = "COMPILATION_ERROR"
             error_suggestions.extend([
