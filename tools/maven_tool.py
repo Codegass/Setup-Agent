@@ -1,13 +1,11 @@
 """Maven tool with comprehensive error handling and raw output access."""
 
-import json
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from loguru import logger
 
 from .base import BaseTool, ToolResult, ToolError
-from .build_utils import BuildAnalyzer
 from .command_tracker import CommandTracker
 
 
@@ -143,11 +141,12 @@ class MavenTool(BaseTool):
             
             # Use analysis result to determine success, not just exit code
             if analysis["build_success"]:
-                # Validate build artifacts for compile/package/install commands
+                # Validate build artifacts for compile/package/install commands using container-based validation
                 validation_result = None
                 if any(goal in command for goal in ["compile", "package", "install"]) and working_directory:
                     try:
-                        validation_result = BuildAnalyzer.validate_build_artifacts(working_directory, "maven")
+                        # Use container-based artifact validation instead of host Path.exists()
+                        validation_result = self._validate_build_artifacts_in_container(working_directory, command)
                         logger.debug(f"Build validation: {validation_result}")
                         
                         # Add validation info to analysis
@@ -318,16 +317,32 @@ class MavenTool(BaseTool):
             exists = "EXISTS" in result.get("output", "")
             
             if not exists:
-                # Try to find pom.xml in subdirectories
-                find_cmd = f"find {working_directory} -name pom.xml -type f 2>/dev/null | head -5"
+                # Try to find pom.xml in subdirectories and parent directories
+                find_cmd = f"find {working_directory} -name pom.xml -type f 2>/dev/null | head -10"
                 find_result = self.orchestrator.execute_command(find_cmd)
                 found_poms = [p.strip() for p in find_result.get("output", "").split("\n") if p.strip()]
+                
+                # For multi-module projects like Struts, prioritize root pom.xml
+                root_pom = None
+                for pom in found_poms:
+                    # Check if this is likely a root pom.xml (contains <modules> or is shortest path)
+                    if pom.count('/') < 4:  # Likely root level
+                        check_modules_cmd = f"grep -q '<modules>' {pom} 2>/dev/null && echo 'HAS_MODULES' || echo 'NO_MODULES'"
+                        modules_result = self.orchestrator.execute_command(check_modules_cmd)
+                        if "HAS_MODULES" in modules_result.get("output", ""):
+                            root_pom = pom
+                            break
+                
+                # If we found a root pom, suggest it first
+                if root_pom:
+                    found_poms = [root_pom] + [p for p in found_poms if p != root_pom]
                 
                 return {
                     "exists": False,
                     "searched_path": pom_path,
                     "found_alternatives": found_poms,
-                    "working_directory": working_directory
+                    "working_directory": working_directory,
+                    "suggested_root": root_pom
                 }
             
             return {"exists": True, "path": pom_path}
@@ -346,9 +361,19 @@ class MavenTool(BaseTool):
         # If we found alternative pom.xml files, suggest them
         if validation_result.get("found_alternatives"):
             suggestions.append("Found pom.xml in these locations:")
+            
+            # Highlight root pom.xml if found
+            suggested_root = validation_result.get("suggested_root")
+            if suggested_root:
+                root_dir = suggested_root.replace("/pom.xml", "")
+                suggestions.append(f"  - 🎯 ROOT POM (recommended): maven(working_directory='{root_dir}')")
+                suggestions.append(f"    This appears to be a multi-module Maven project root")
+            
+            # Show other alternatives
             for pom_path in validation_result["found_alternatives"][:3]:
-                pom_dir = pom_path.replace("/pom.xml", "")
-                suggestions.append(f"  - Try: maven(working_directory='{pom_dir}')")
+                if pom_path != suggested_root:  # Don't duplicate the root pom
+                    pom_dir = pom_path.replace("/pom.xml", "")
+                    suggestions.append(f"  - Alternative: maven(working_directory='{pom_dir}')")
         else:
             suggestions.extend([
                 "Use bash tool to navigate: bash(command='ls -la', working_directory='/workspace')",
@@ -899,14 +924,10 @@ class MavenTool(BaseTool):
         elif error_code == "JAVA_VERSION_ERROR":
             # Extract Java version from error analysis if available
             required_version = "17"  # Default to Java 17 LTS
-            if "error_suggestions" in locals():
-                for suggestion in error_suggestions:
-                    if "Java" in suggestion and "required" in suggestion:
-                        import re
-                        ver_match = re.search(r'Java (\d+)', suggestion)
-                        if ver_match:
-                            required_version = ver_match.group(1)
-                            break
+            if analysis and analysis.get("java_version_error"):
+                java_error = analysis["java_version_error"]
+                if java_error.get("required"):
+                    required_version = str(java_error["required"])
             
             recovery_actions.extend([
                 {"action": "check_current", "command": "bash(command='java -version 2>&1 && echo \"---\" && javac -version 2>&1')"},
@@ -956,6 +977,81 @@ class MavenTool(BaseTool):
             ])
         
         return diagnostics
+
+    def _validate_build_artifacts_in_container(self, working_directory: str, command: str) -> Dict[str, Any]:
+        """
+        Validate build artifacts exist in container using find commands.
+        This replaces BuildAnalyzer.validate_build_artifacts to avoid host Path.exists() issues.
+        
+        Args:
+            working_directory: Maven working directory
+            command: Maven command executed
+            
+        Returns:
+            Dictionary with validation results
+        """
+        validation = {
+            "artifacts_exist": False,
+            "missing_artifacts": [],
+            "found_artifacts": [],
+            "validation_performed": True
+        }
+        
+        if not self.orchestrator:
+            validation["validation_performed"] = False
+            return validation
+        
+        try:
+            # Check for .class files in target/classes (primary indicator for compile)
+            class_check_cmd = f"find {working_directory} -path '*/target/classes/*.class' -type f -print -quit"
+            class_result = self.orchestrator.execute_command(class_check_cmd)
+            
+            if class_result.get("exit_code") == 0 and class_result.get("output", "").strip():
+                validation["found_artifacts"].append("target/classes/*.class")
+                validation["artifacts_exist"] = True
+                logger.debug(f"✅ Found .class files in {working_directory}/target/classes")
+            else:
+                validation["missing_artifacts"].append("target/classes/*.class")
+                logger.debug(f"❌ No .class files found in {working_directory}/target/classes")
+            
+            # Check for JAR files in target/ (for package/install commands)
+            if any(goal in command for goal in ["package", "install"]):
+                jar_check_cmd = f"find {working_directory} -path '*/target/*.jar' -type f -print -quit"
+                jar_result = self.orchestrator.execute_command(jar_check_cmd)
+                
+                if jar_result.get("exit_code") == 0 and jar_result.get("output", "").strip():
+                    validation["found_artifacts"].append("target/*.jar")
+                    validation["artifacts_exist"] = True
+                    logger.debug(f"✅ Found .jar files in {working_directory}/target")
+                else:
+                    validation["missing_artifacts"].append("target/*.jar")
+                    logger.debug(f"❌ No .jar files found in {working_directory}/target")
+            
+            # For multi-module projects, check if any module has artifacts
+            if not validation["artifacts_exist"]:
+                # Check for any target/classes directories in subdirectories
+                multi_check_cmd = f"find {working_directory} -path '*/target/classes' -type d -print -quit"
+                multi_result = self.orchestrator.execute_command(multi_check_cmd)
+                
+                if multi_result.get("exit_code") == 0 and multi_result.get("output", "").strip():
+                    # Found target/classes dirs, now check for actual .class files
+                    multi_class_cmd = f"find {working_directory} -path '*/target/classes/*.class' -type f -print -quit"
+                    multi_class_result = self.orchestrator.execute_command(multi_class_cmd)
+                    
+                    if multi_class_result.get("exit_code") == 0 and multi_class_result.get("output", "").strip():
+                        validation["found_artifacts"].append("multi-module target/classes/*.class")
+                        validation["artifacts_exist"] = True
+                        logger.debug(f"✅ Found .class files in multi-module project")
+            
+            logger.debug(f"Container artifact validation: {validation['artifacts_exist']} "
+                        f"(found: {len(validation['found_artifacts'])}, missing: {len(validation['missing_artifacts'])})")
+            
+        except Exception as e:
+            logger.error(f"Container artifact validation failed: {e}")
+            validation["validation_performed"] = False
+            validation["error"] = str(e)
+        
+        return validation
 
     def get_usage_example(self) -> str:
         """Get usage examples for Maven tool."""

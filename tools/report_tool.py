@@ -345,6 +345,20 @@ class ReportTool(BaseTool):
             f"📄 Full report saved to: /workspace/{report_filename}"
         ]
         
+        # Add physical evidence for failed/partial status
+        if verified_status in ["failed", "partial"] and actual_accomplishments:
+            physical_validation = actual_accomplishments.get('physical_validation', {})
+            if physical_validation:
+                class_files = physical_validation.get('class_files', 0)
+                jar_files = physical_validation.get('jar_files', 0)
+                lines.append(f"[PHYSICAL EVIDENCE: {class_files} .class files, {jar_files} .jar files found]")
+            elif not actual_accomplishments.get('build_success', True):
+                lines.append("[PHYSICAL EVIDENCE: No .class files found - compilation may have failed]")
+        
+        # Show warning if no PhysicalValidator was injected
+        if not actual_accomplishments and not self.physical_validator:
+            lines.append("[⚠️ WARNING: No physical validator - using task-based inference only]")
+        
         # Add next steps based on status
         if verified_status == "success":
             lines.append("💡 Next: Project ready for development/deployment! 🎉")

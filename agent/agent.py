@@ -67,6 +67,7 @@ class SetupAgent:
         from tools.system_tool import SystemTool
         from tools.report_tool import ReportTool
         from tools.project_analyzer import ProjectAnalyzerTool
+        from agent.physical_validator import PhysicalValidator
         
         # Configure bash tool with enhanced features
         bash_config = BashToolConfig(
@@ -74,6 +75,12 @@ class SetupAgent:
             block_interactive_commands=True,
             audit_command_execution=False,  # Can be enabled for debugging
             add_sag_cli_marker=True
+        )
+        
+        # Create PhysicalValidator for accurate build/test status validation
+        physical_validator = PhysicalValidator(
+            docker_orchestrator=self.orchestrator,
+            project_path=self.config.workspace_path
         )
         
         tools = [
@@ -86,7 +93,12 @@ class SetupAgent:
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
             ProjectAnalyzerTool(self.orchestrator, self.context_manager),  # 🆕 添加项目分析工具
-            ReportTool(self.orchestrator, execution_history_callback=self._get_execution_history, context_manager=self.context_manager)
+            ReportTool(
+                self.orchestrator, 
+                execution_history_callback=self._get_execution_history, 
+                context_manager=self.context_manager,
+                physical_validator=physical_validator  # 🆕 注入物理校验器统一真值来源
+            )
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
