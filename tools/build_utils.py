@@ -180,13 +180,14 @@ class BuildAnalyzer:
         return patterns
     
     @staticmethod
-    def validate_build_artifacts(project_path: str, build_tool: str) -> Dict[str, Any]:
+    def validate_build_artifacts(project_path: str, build_tool: str, orchestrator=None) -> Dict[str, Any]:
         """
         Validate that expected build artifacts exist after a build.
         
         Args:
             project_path: Root path of the project
             build_tool: The build tool used (maven, gradle, npm, etc.)
+            orchestrator: Optional Docker orchestrator for container-based validation
             
         Returns:
             Dictionary with validation results
@@ -198,6 +199,11 @@ class BuildAnalyzer:
             "validation_performed": True
         }
         
+        # Use container-based validation if orchestrator is provided
+        if orchestrator:
+            return BuildAnalyzer._validate_artifacts_in_container(project_path, build_tool, orchestrator)
+        
+        # Fallback to host-based validation (may not work in container environments)
         project_path = Path(project_path)
         
         # Define expected artifacts for each build tool
@@ -259,6 +265,66 @@ class BuildAnalyzer:
             logger.debug(f"Build artifacts found for {build_tool}: {validation['found_artifacts']}")
         else:
             logger.warning(f"No build artifacts found for {build_tool}. Expected: {validation['missing_artifacts']}")
+        
+        return validation
+    
+    @staticmethod
+    def _validate_artifacts_in_container(project_path: str, build_tool: str, orchestrator) -> Dict[str, Any]:
+        """
+        Container-based artifact validation using find commands.
+        
+        Args:
+            project_path: Root path of the project in container
+            build_tool: The build tool used
+            orchestrator: Docker orchestrator for command execution
+            
+        Returns:
+            Dictionary with validation results
+        """
+        validation = {
+            "artifacts_exist": False,
+            "missing_artifacts": [],
+            "found_artifacts": [],
+            "validation_performed": True
+        }
+        
+        try:
+            if build_tool == "maven":
+                # Check for Maven artifacts
+                checks = [
+                    (f"find {project_path} -path '*/target/classes/*.class' -type f -print -quit", "target/classes/*.class"),
+                    (f"find {project_path} -path '*/target/*.jar' -type f -print -quit", "target/*.jar")
+                ]
+            elif build_tool == "gradle":
+                # Check for Gradle artifacts
+                checks = [
+                    (f"find {project_path} -path '*/build/classes/*/*.class' -type f -print -quit", "build/classes/*.class"),
+                    (f"find {project_path} -path '*/build/libs/*.jar' -type f -print -quit", "build/libs/*.jar")
+                ]
+            elif build_tool == "npm":
+                # Check for Node.js artifacts
+                checks = [
+                    (f"test -d {project_path}/node_modules && echo 'EXISTS'", "node_modules/"),
+                    (f"test -d {project_path}/dist && echo 'EXISTS'", "dist/")
+                ]
+            else:
+                # Generic checks
+                checks = [
+                    (f"find {project_path} -name '*.class' -type f -print -quit", "*.class"),
+                    (f"find {project_path} -name '*.jar' -type f -print -quit", "*.jar")
+                ]
+            
+            for check_cmd, artifact_name in checks:
+                result = orchestrator.execute_command(check_cmd)
+                if result.get("exit_code") == 0 and result.get("output", "").strip():
+                    validation["found_artifacts"].append(artifact_name)
+                    validation["artifacts_exist"] = True
+                else:
+                    validation["missing_artifacts"].append(artifact_name)
+            
+        except Exception as e:
+            validation["validation_performed"] = False
+            validation["error"] = str(e)
         
         return validation
     
