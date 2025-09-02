@@ -1730,6 +1730,14 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
     def _update_successful_states(self, tool_name: str, params: Dict[str, Any], result: ToolResult):
         """Update successful states based on tool execution results."""
         try:
+            # CRITICAL FIX: Reset context switch counter when context actually switches
+            if tool_name == "manage_context" and result.success:
+                action = params.get("action", "")
+                if action in ["start_task", "complete_with_results", "complete_task", "switch_to_trunk"]:
+                    # Reset the counter when we switch contexts
+                    self.steps_since_context_switch = 0
+                    logger.info(f"✅ Reset steps_since_context_switch counter after {action}")
+            
             if tool_name == "bash":
                 # CRITICAL FIX: Get actual working directory from tool result metadata
                 # This handles cases where bash tool had to fall back to alternative directories
