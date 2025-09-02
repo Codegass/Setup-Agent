@@ -65,6 +65,24 @@ class GradleTool(BaseTool):
         if command and not tasks:
             tasks = command
         
+        # Deterministic working directory fallback (only when safe)
+        try:
+            if working_directory in (None, "/workspace") and self.orchestrator:
+                project_name = getattr(self.orchestrator, 'project_name', None)
+                if project_name:
+                    probe_dir = f"/workspace/{project_name}"
+                    # Recognize Gradle project by standard files
+                    probe_cmd = (
+                        f"test -f {probe_dir}/build.gradle -o -f {probe_dir}/build.gradle.kts -o -f {probe_dir}/settings.gradle -o -f {probe_dir}/settings.gradle.kts && echo EXISTS || echo MISSING"
+                    )
+                    probe_res = self.orchestrator.execute_command(probe_cmd)
+                    if probe_res.get('exit_code') == 0 and 'EXISTS' in (probe_res.get('output') or ''):
+                        if working_directory != probe_dir:
+                            logger.info(f"🔧 Auto-selected project directory for Gradle: {probe_dir}")
+                            working_directory = probe_dir
+        except Exception as _e:
+            logger.debug(f"Gradle working directory fallback skipped: {_e}")
+
         # Check for Gradle wrapper or system Gradle
         gradle_executable = self._determine_gradle_executable(working_directory, use_wrapper)
         if not gradle_executable:

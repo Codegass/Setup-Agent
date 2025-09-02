@@ -53,6 +53,40 @@ class MavenTool(BaseTool):
             timeout: Command timeout in seconds
         """
         
+        # Deterministic working directory fallback (do not override user intent unless certain)
+        try:
+            if working_directory in (None, "/workspace") and self.orchestrator:
+                project_name = getattr(self.orchestrator, 'project_name', None)
+                # 1) Prefer /workspace/<project_name> if it has pom.xml
+                if project_name:
+                    probe_dir = f"/workspace/{project_name}"
+                    probe_cmd = f"test -f {probe_dir}/pom.xml && echo EXISTS || echo MISSING"
+                    probe_res = self.orchestrator.execute_command(probe_cmd)
+                    if probe_res.get("exit_code") == 0 and 'EXISTS' in (probe_res.get('output') or ''):
+                        if working_directory != probe_dir:
+                            logger.info(f"🔧 Auto-selected project directory for Maven: {probe_dir}")
+                            working_directory = probe_dir
+                # 2) If still /workspace, detect single candidate pom up to depth 2
+                if working_directory == "/workspace":
+                    find_cmd = "find /workspace -maxdepth 2 -type f -name pom.xml 2>/dev/null | head -3"
+                    find_res = self.orchestrator.execute_command(find_cmd)
+                    if find_res.get("exit_code") == 0:
+                        candidates = [p.strip() for p in (find_res.get('output') or '').split('\n') if p.strip()]
+                        if len(candidates) == 1:
+                            import os
+                            cand_dir = os.path.dirname(candidates[0])
+                            logger.info(f"🔧 Auto-selected Maven directory by single pom.xml candidate: {cand_dir}")
+                            working_directory = cand_dir
+                        elif len(candidates) > 1 and project_name:
+                            preferred = f"/workspace/{project_name}/pom.xml"
+                            if preferred in candidates:
+                                import os
+                                cand_dir = os.path.dirname(preferred)
+                                logger.info(f"🔧 Auto-selected Maven directory by preferred project: {cand_dir}")
+                                working_directory = cand_dir
+        except Exception as _e:
+            logger.debug(f"Working directory fallback skipped: {_e}")
+
         # Check if Maven is installed, install if not
         if not self._is_maven_installed():
             install_result = self._install_maven()

@@ -324,11 +324,24 @@ class BashTool(BaseTool):
         # Smart working directory validation and setup
         workdir = self._ensure_working_directory(working_directory)
         
-        # CRITICAL FIX: For Maven/Gradle commands, ensure we're in the right directory
-        if workdir and workdir != "/workspace" and ('mvn' in command or 'gradle' in command):
-            # Prepend cd to ensure we're in the right directory for build tools
-            command = f"cd {workdir} && {command}"
-            logger.info(f"🔧 Prepended cd for build tool command to ensure correct directory: {workdir}")
+        # Deterministic, minimal fallback for build tools
+        # Only when user did not specify a subdir (workdir is /workspace or None),
+        # and /workspace/<project> exists, prepend cd. Do not override explicit workdir.
+        if ('mvn' in command or 'gradle' in command) and self.docker_orchestrator:
+            try:
+                if not workdir or workdir == "/workspace":
+                    project_name = getattr(self.docker_orchestrator, 'project_name', None)
+                    if project_name:
+                        candidate = f"/workspace/{project_name}"
+                        chk = self.docker_orchestrator.execute_command(
+                            f"test -d {candidate} && echo EXISTS || echo MISSING",
+                            workdir=None
+                        )
+                        if chk.get('exit_code') == 0 and 'EXISTS' in (chk.get('output') or ''):
+                            command = f"cd {candidate} && {command}"
+                            logger.info(f"🔧 Prepended cd to project root for build tool: {candidate}")
+            except Exception as _e:
+                logger.debug(f"Bash build-tool workdir fallback skipped: {_e}")
         
         # Check if this is a background command
         is_background = self._is_background_command(command)
