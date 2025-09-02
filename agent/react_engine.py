@@ -3040,7 +3040,11 @@ Use function calling to execute these tools!"""
         
         # ENHANCED: Preserve dynamic project state information
         if self.successful_states.get('working_directory'):
-            critical_info.append(f"📁 Working Directory: {self.successful_states['working_directory']}")
+            workdir = self.successful_states['working_directory']
+            critical_info.append(f"📁 Working Directory: {workdir}")
+            # Add explicit reminder for Maven/Gradle projects
+            if workdir != "/workspace" and self.successful_states.get('project_type') in ['maven', 'gradle']:
+                critical_info.append(f"⚠️ IMPORTANT: All Maven/Gradle commands must run in: {workdir}")
         
         # Preserve project structure awareness
         if self.successful_states.get('project_name'):

@@ -324,6 +324,12 @@ class BashTool(BaseTool):
         # Smart working directory validation and setup
         workdir = self._ensure_working_directory(working_directory)
         
+        # CRITICAL FIX: For Maven/Gradle commands, ensure we're in the right directory
+        if workdir and workdir != "/workspace" and ('mvn' in command or 'gradle' in command):
+            # Prepend cd to ensure we're in the right directory for build tools
+            command = f"cd {workdir} && {command}"
+            logger.info(f"🔧 Prepended cd for build tool command to ensure correct directory: {workdir}")
+        
         # Check if this is a background command
         is_background = self._is_background_command(command)
         if is_background and self.config.enable_background_processes:

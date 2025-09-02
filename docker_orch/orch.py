@@ -314,7 +314,11 @@ class DockerOrchestrator:
 
         # Build the command to be executed in the container with proper environment loading
         # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
-        wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        # CRITICAL FIX: Explicitly cd to working directory before executing command
+        if workdir and workdir != "/workspace":
+            wrapped_command = f"cd {workdir} && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        else:
+            wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
         exec_command = ["/bin/bash", "-c", wrapped_command]
         
         logger.info(f"Executing command in container: {command}")
@@ -476,7 +480,11 @@ class DockerOrchestrator:
             wrapped_cmd = command
         
         # Build the final command with environment loading
-        final_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {wrapped_cmd}"
+        # CRITICAL FIX: Explicitly cd to working directory before executing command
+        if workdir and workdir != "/workspace":
+            final_command = f"cd {workdir} && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {wrapped_cmd}"
+        else:
+            final_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {wrapped_cmd}"
         exec_command = ["/bin/bash", "-c", final_command]
         
         logger.info(f"Executing command with monitoring: {command}")
