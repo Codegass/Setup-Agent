@@ -6,14 +6,25 @@ from datetime import datetime
 from loguru import logger
 
 from .base import BaseTool, ToolResult
-# PhysicalValidator moved to agent module - physical validation now done by ReAct engine
-from .command_tracker import CommandTracker
 
 
 class ReportTool(BaseTool):
-    """Tool for generating comprehensive project setup reports and marking task completion."""
+    """
+    Tool for generating comprehensive project setup reports and marking task completion.
+    
+    Enhanced Features (v2024.09):
+    - Physical evidence-based validation via PhysicalValidator integration
+    - Consistent report filename generation for log display and file saving  
+    - Safe markdown file writing using here-doc with base64 fallback
+    - Unified execution metrics with phase status driven by physical validation
+    - Comprehensive error analysis and next-steps recommendations
+    
+    The ReportTool now prioritizes physical evidence over log inference for accurate
+    status determination, eliminating false positives and providing detailed
+    validation evidence in the generated reports.
+    """
 
-    def __init__(self, docker_orchestrator=None, execution_history_callback=None, context_manager=None):
+    def __init__(self, docker_orchestrator=None, execution_history_callback=None, context_manager=None, physical_validator=None):
         super().__init__(
             name="report",
             description="Generate comprehensive project setup report and mark task as complete. "
@@ -23,6 +34,7 @@ class ReportTool(BaseTool):
         self.docker_orchestrator = docker_orchestrator
         self.execution_history_callback = execution_history_callback
         self.context_manager = context_manager
+        self.physical_validator = physical_validator
 
     def execute(
         self,
@@ -56,7 +68,7 @@ class ReportTool(BaseTool):
                         error_code="PREREQUISITE_TASKS_INCOMPLETE"
                     )
                 
-                report, verified_status = self._generate_comprehensive_report(summary, status, details)
+                report, verified_status, report_filename, actual_accomplishments = self._generate_comprehensive_report(summary, status, details)
                 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -69,7 +81,7 @@ class ReportTool(BaseTool):
                 
                 # ENHANCED: Provide condensed output for logs to reduce noise
                 # Full report is saved to markdown file, logs get summary only
-                condensed_output = self._generate_condensed_log_output(verified_status)
+                condensed_output = self._generate_condensed_log_output(verified_status, report_filename, actual_accomplishments)
                 
                 return ToolResult(
                     success=True,
@@ -99,6 +111,8 @@ class ReportTool(BaseTool):
         """Generate a comprehensive project setup report."""
         
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Generate consistent report filename for both display and saving
+        report_filename = f"setup-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
         
         # Get project information if available
         project_info = self._get_project_info()
@@ -109,14 +123,52 @@ class ReportTool(BaseTool):
         # Verify execution history and adjust status/summary if needed
         verified_status, actual_accomplishments = self._verify_execution_history(status, summary)
         
+        # CRITICAL: Update phase status based on physical validation results
+        if actual_accomplishments:
+            # Update phase status with detailed validation results
+            clone_success = actual_accomplishments.get('repository_cloned', False)
+            build_success = actual_accomplishments.get('build_success', False) 
+            test_success = actual_accomplishments.get('test_success', False)
+            
+            execution_metrics['phases']['clone']['status'] = clone_success
+            execution_metrics['phases']['analyze']['status'] = clone_success  # Can only analyze if cloned
+            execution_metrics['phases']['build']['status'] = build_success
+            execution_metrics['phases']['test']['status'] = test_success
+            
+            # Add validation evidence to phases
+            if 'physical_validation' in actual_accomplishments:
+                physical_data = actual_accomplishments['physical_validation']
+                execution_metrics['phases']['build']['evidence'] = {
+                    'class_files': physical_data.get('class_files', 0),
+                    'jar_files': physical_data.get('jar_files', 0),
+                    'recent_compilation': physical_data.get('recent_compilation', False),
+                    'missing_classes': physical_data.get('missing_classes', 0)
+                }
+                
+                if 'test_analysis' in physical_data:
+                    test_data = physical_data['test_analysis']
+                    execution_metrics['phases']['test']['evidence'] = {
+                        'total_tests': test_data.get('total_tests', 0),
+                        'passed_tests': test_data.get('passed_tests', 0),
+                        'failed_tests': test_data.get('failed_tests', 0),
+                        'error_tests': test_data.get('error_tests', 0),
+                        'report_files_count': test_data.get('report_files_count', 0)
+                    }
+            
+            # Estimate phase durations based on execution history if available
+            self._estimate_phase_durations(execution_metrics, actual_accomplishments)
+            
+            logger.info(f"📊 Phase status updated from physical validation: Clone={clone_success}, "
+                       f"Build={build_success}, Test={test_success}")
+        
         # Generate both console and markdown versions with verified information and metrics
         console_report = self._generate_console_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments, execution_metrics)
         markdown_report = self._generate_markdown_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments, execution_metrics)
         
-        # Save markdown report to workspace
-        self._save_markdown_report(markdown_report, timestamp)
+        # Save markdown report to workspace with consistent filename
+        self._save_markdown_report(markdown_report, timestamp, report_filename)
         
-        return console_report, verified_status
+        return console_report, verified_status, report_filename, actual_accomplishments
 
     def _collect_simple_status_from_tasks(self) -> dict:
         """
@@ -254,18 +306,25 @@ class ReportTool(BaseTool):
         
         return "\n".join(lines)
 
-    def _generate_condensed_log_output(self, verified_status: str) -> str:
+    def _generate_condensed_log_output(self, verified_status: str, report_filename: str, actual_accomplishments: dict = None) -> str:
         """
         Generate condensed output for logs to reduce noise.
         Only shows essential information instead of the full report.
         """
-        simple_status = self._collect_simple_status_from_tasks()
         project_info = self._get_project_info()
         
-        # Create status icons
-        clone_icon = "✅" if simple_status.get('clone_success', False) else "❌"
-        build_icon = "✅" if simple_status.get('build_success', False) else "❌"
-        test_icon = "✅" if simple_status.get('test_success', False) else "❌"
+        # Create status icons based on actual accomplishments if available, otherwise fallback to task analysis
+        if actual_accomplishments:
+            # Use physical validation results for accurate status icons
+            clone_icon = "✅" if actual_accomplishments.get('repository_cloned', False) else "❌"
+            build_icon = "✅" if actual_accomplishments.get('build_success', False) else "❌"
+            test_icon = "✅" if actual_accomplishments.get('test_success', False) else "❌"
+        else:
+            # Fallback to simple task-based status
+            simple_status = self._collect_simple_status_from_tasks()
+            clone_icon = "✅" if simple_status.get('clone_success', False) else "❌"
+            build_icon = "✅" if simple_status.get('build_success', False) else "❌"
+            test_icon = "✅" if simple_status.get('test_success', False) else "❌"
         
         # Determine overall status icon
         if verified_status == "success":
@@ -278,12 +337,12 @@ class ReportTool(BaseTool):
             status_icon = "❌"
             status_text = "FAILED"
         
-        # Generate condensed summary
+        # Generate condensed summary with consistent filename
         lines = [
             f"🎯 SETUP COMPLETED: {status_icon} {status_text}",
             f"📋 Core Status: {clone_icon} Clone, {build_icon} Build, {test_icon} Test",
             f"📂 Project: {project_info.get('type', 'Unknown')} ({project_info.get('build_system', 'Unknown')})",
-            f"📄 Full report saved to: /workspace/setup-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+            f"📄 Full report saved to: /workspace/{report_filename}"
         ]
         
         # Add next steps based on status
@@ -412,6 +471,83 @@ class ReportTool(BaseTool):
             # In case of error, allow report generation but log the issue
             return {"valid": True}
 
+    def _estimate_phase_durations(self, execution_metrics: dict, actual_accomplishments: dict):
+        """
+        Estimate phase durations based on execution history and accomplishments.
+        
+        Args:
+            execution_metrics: Execution metrics dictionary to update
+            actual_accomplishments: Physical validation results
+        """
+        try:
+            if not self.execution_history_callback:
+                return
+            
+            history = self.execution_history_callback()
+            if not history or len(history) == 0:
+                return
+            
+            # Group actions by likely phase
+            clone_actions = []
+            build_actions = []
+            test_actions = []
+            
+            for step in history:
+                # Handle both object and dict formats
+                if hasattr(step, 'step_type') and step.step_type == 'action':
+                    tool_name = step.tool_name
+                    tool_params = step.tool_params
+                    timestamp = step.timestamp
+                elif isinstance(step, dict) and step.get('step_type') == 'action':
+                    tool_name = step.get('tool_name')
+                    tool_params = step.get('tool_params', {})
+                    timestamp = step.get('timestamp')
+                else:
+                    continue
+                
+                if not timestamp:
+                    continue
+                
+                # Categorize actions by phase
+                if tool_name == 'project_setup':
+                    clone_actions.append(timestamp)
+                elif tool_name in ['maven', 'gradle', 'bash']:
+                    command = tool_params.get('command', '').lower()
+                    if any(build_cmd in command for build_cmd in ['compile', 'package', 'build', 'install']):
+                        build_actions.append(timestamp)
+                    elif 'test' in command:
+                        test_actions.append(timestamp)
+            
+            # Calculate phase durations
+            from datetime import datetime
+            
+            def calculate_duration(action_timestamps):
+                if len(action_timestamps) < 2:
+                    return 0
+                try:
+                    start_time = datetime.fromisoformat(action_timestamps[0].replace('Z', '+00:00'))
+                    end_time = datetime.fromisoformat(action_timestamps[-1].replace('Z', '+00:00'))
+                    return (end_time - start_time).total_seconds()
+                except:
+                    return 0
+            
+            if clone_actions:
+                execution_metrics['phases']['clone']['duration'] = calculate_duration(clone_actions)
+                execution_metrics['phases']['analyze']['duration'] = execution_metrics['phases']['clone']['duration']
+            
+            if build_actions:
+                execution_metrics['phases']['build']['duration'] = calculate_duration(build_actions)
+            
+            if test_actions:
+                execution_metrics['phases']['test']['duration'] = calculate_duration(test_actions)
+            
+            logger.debug(f"Phase durations estimated: Clone={execution_metrics['phases']['clone']['duration']}s, "
+                        f"Build={execution_metrics['phases']['build']['duration']}s, "
+                        f"Test={execution_metrics['phases']['test']['duration']}s")
+                        
+        except Exception as e:
+            logger.warning(f"Failed to estimate phase durations: {e}")
+    
     def _is_reporting_task(self, task) -> bool:
         """
         Determine if a task is related to report generation.
@@ -614,15 +750,14 @@ class ReportTool(BaseTool):
             except Exception as e:
                 logger.warning(f"Failed to collect execution metrics: {e}")
         
-        # CRITICAL FIX: Unify phase status with simple_status to avoid contradictions
-        # Use the same logic as _collect_simple_status_from_tasks for consistency
-        simple_status = self._collect_simple_status_from_tasks()
-        if simple_status:
-            metrics['phases']['clone']['status'] = simple_status.get('clone_success', False)
-            metrics['phases']['analyze']['status'] = True  # Always true if we got this far
-            metrics['phases']['build']['status'] = simple_status.get('build_success', False)
-            metrics['phases']['test']['status'] = simple_status.get('test_success', False)
-            logger.debug(f"🔧 Phase status unified with simple_status: Clone={metrics['phases']['clone']['status']}, Build={metrics['phases']['build']['status']}, Test={metrics['phases']['test']['status']}")
+        # CRITICAL FIX: Phase status should come from physical validation, not inference
+        # This will be updated later with actual physical validation results
+        # For now, set defaults that will be overridden
+        metrics['phases']['clone']['status'] = False
+        metrics['phases']['analyze']['status'] = False
+        metrics['phases']['build']['status'] = False
+        metrics['phases']['test']['status'] = False
+        logger.debug("Phase status will be determined by physical validation")
         
         return metrics
     
@@ -641,33 +776,105 @@ class ReportTool(BaseTool):
             'physical_validation': {}  # Store physical validation results
         }
         
-        # Physical validation is now done by the ReAct engine
-        # The engine provides physical evidence in observations
-        # Tools should not directly use PhysicalValidator
-        
-        # For now, we'll do basic artifact checking using shell commands
-        if self.docker_orchestrator:
+        # CRITICAL: Use physical evidence to determine true status
+        # Check actual files instead of inferring from logs or task descriptions
+        if self.physical_validator and self.docker_orchestrator:
             try:
                 project_info = self._get_project_info()
-                project_name = project_info.get('directory', '').split('/')[-1]
+                project_dir = project_info.get('directory', '/workspace')
                 
-                # Basic artifact check using shell commands
-                class_count_result = self.docker_orchestrator.execute_command(
-                    f"find /workspace/{project_name} -name '*.class' -type f 2>/dev/null | wc -l"
-                )
-                class_count = int(class_count_result.get('output', '0').strip())
+                # Use PhysicalValidator for comprehensive validation
+                validation_result = self.physical_validator.validate_build_artifacts()
+                test_analysis = self.physical_validator.parse_test_reports(project_dir)
                 
-                if class_count > 0:
-                    logger.info(f"✅ Found {class_count} .class files")
-                    actual_accomplishments['physical_validation']['class_files'] = class_count
+                # Extract results from PhysicalValidator
+                # Repository is cloned if PhysicalValidator found any artifacts (more reliable than source file count)
+                actual_accomplishments['repository_cloned'] = validation_result.get('class_files', 0) > 0 or validation_result.get('jar_files', 0) > 0 or len(validation_result.get('missing_classes', [])) > 0
+                actual_accomplishments['build_success'] = validation_result.get('valid', False)
+                
+                if test_analysis.get('valid'):
+                    actual_accomplishments['test_success'] = test_analysis['test_success']
+                    # Initialize physical_validation if not exists
+                    if 'physical_validation' not in actual_accomplishments:
+                        actual_accomplishments['physical_validation'] = {}
+                    actual_accomplishments['physical_validation']['test_analysis'] = {
+                        'total_tests': test_analysis['total_tests'],
+                        'passed_tests': test_analysis['passed_tests'],
+                        'failed_tests': test_analysis['failed_tests'],
+                        'error_tests': test_analysis['error_tests'],
+                        'skipped_tests': test_analysis['skipped_tests'],
+                        'report_files_count': len(test_analysis['report_files'])
+                    }
+                    
+                    if test_analysis['test_success']:
+                        logger.info(f"✅ PHYSICAL: Tests passed - {test_analysis['passed_tests']}/{test_analysis['total_tests']} tests successful")
+                    else:
+                        logger.warning(f"❌ PHYSICAL: Tests failed - {test_analysis['failed_tests']} failures, {test_analysis['error_tests']} errors out of {test_analysis['total_tests']} total")
                 else:
-                    logger.warning("❌ No .class files found")
-                    actual_accomplishments['physical_validation']['class_files'] = 0
+                    actual_accomplishments['test_success'] = False
+                    logger.info("⚠️ PHYSICAL: No test reports found or parsing failed")
                 
-                logger.debug(f"Basic artifact check: {class_count} class files")
+                # Store validation results - initialize if not exists
+                if 'physical_validation' not in actual_accomplishments:
+                    actual_accomplishments['physical_validation'] = {}
+                actual_accomplishments['physical_validation'].update({
+                    'class_files': validation_result.get('class_files', 0),
+                    'jar_files': validation_result.get('jar_files', 0),
+                    'recent_compilation': validation_result.get('recent_compilation', False),
+                    'missing_classes': len(validation_result.get('missing_classes', []))
+                })
+                
+                # CRITICAL: ENFORCE LOGICAL CONSISTENCY
+                if not actual_accomplishments['repository_cloned']:
+                    if actual_accomplishments['build_success'] or actual_accomplishments['test_success']:
+                        logger.error("🚨 IMPOSSIBLE STATE: Build/test without repository!")
+                    actual_accomplishments['build_success'] = False
+                    actual_accomplishments['test_success'] = False
+                    logger.info("⚠️ CONSISTENCY: No clone → no build/test")
+                elif not actual_accomplishments['build_success']:
+                    if actual_accomplishments['test_success']:
+                        logger.error("🚨 IMPOSSIBLE STATE: Test without build!")
+                    actual_accomplishments['test_success'] = False
+                    logger.info("⚠️ CONSISTENCY: No build → no test")
+                
+                logger.info(f"📊 PHYSICAL TRUTH: Clone={actual_accomplishments['repository_cloned']}, "
+                           f"Build={actual_accomplishments['build_success']}, "
+                           f"Test={actual_accomplishments['test_success']}")
                 
             except Exception as e:
-                logger.warning(f"Physical validation failed: {e}")
+                logger.warning(f"Physical validation error: {e}")
+        elif self.docker_orchestrator:
+            # Fallback to simplified physical checks if no PhysicalValidator injected
+            try:
+                project_info = self._get_project_info()
+                project_dir = project_info.get('directory', '/workspace')
+                
+                # Simplified repository check
+                source_count = self.docker_orchestrator.execute_command(
+                    f"find {project_dir} -type f \\( -name '*.java' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.cpp' -o -name '*.c' \\) 2>/dev/null | head -100 | wc -l"
+                )
+                source_files = int(source_count.get('output', '0').strip())
+                actual_accomplishments['repository_cloned'] = source_files > 0
+                
+                # Simplified build check
+                class_count_result = self.docker_orchestrator.execute_command(
+                    f"find {project_dir} -name '*.class' -type f 2>/dev/null | wc -l"
+                )
+                class_count = int(class_count_result.get('output', '0').strip())
+                actual_accomplishments['build_success'] = class_count > 0
+                
+                # Simplified test check - conservative approach
+                test_reports = self.docker_orchestrator.execute_command(
+                    f"find {project_dir} -type f \\( -path '*/surefire-reports/*.xml' -o -path '*/test-results/*.xml' \\) 2>/dev/null | wc -l"
+                )
+                test_report_count = int(test_reports.get('output', '0').strip())
+                actual_accomplishments['test_success'] = False  # Conservative without parsing
+                
+                logger.info(f"📊 FALLBACK PHYSICAL CHECK: Clone={actual_accomplishments['repository_cloned']}, "
+                           f"Build={actual_accomplishments['build_success']}, Test={actual_accomplishments['test_success']}")
+                
+            except Exception as e:
+                logger.warning(f"Fallback physical validation error: {e}")
         
         # Fallback to old methods if physical validation unavailable
         if not actual_accomplishments.get('physical_validation'):
@@ -1785,31 +1992,64 @@ class ReportTool(BaseTool):
         
         return section_lines
     
-    def _save_markdown_report(self, markdown_content: str, timestamp: str):
-        """Save markdown report to workspace."""
+    def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
+        """Save markdown report to workspace using here-doc for safe handling."""
         
         try:
             if self.docker_orchestrator:
-                # Generate filename with timestamp
-                filename = f"setup-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
-                filepath = f"/workspace/{filename}"
+                # Use provided consistent filename
+                filepath = f"/workspace/{report_filename}"
                 
-                # Escape content for shell command
-                escaped_content = markdown_content.replace("'", "'\"'\"'").replace("\n", "\\n")
+                # Use here-doc for safe content writing (no escaping needed)
+                # Generate a unique delimiter to avoid conflicts with content
+                delimiter = f"EOF_{hash(markdown_content) % 10000}"
                 
-                # Write the markdown file
-                command = f"echo -e '{escaped_content}' > {filepath}"
+                # Create here-doc command
+                command = f"cat > {filepath} << '{delimiter}'\n{markdown_content}\n{delimiter}"
+                
                 result = self.docker_orchestrator.execute_command(command)
                 
-                if result.get("success"):
+                # Check result using exit_code as primary indicator
+                if result.get("exit_code") == 0:
                     logger.info(f"✅ Markdown report saved to: {filepath}")
                 else:
-                    logger.warning(f"⚠️ Failed to save markdown report: {result.get('output', 'Unknown error')}")
+                    # Fallback to old method if here-doc fails
+                    logger.warning(f"⚠️ Here-doc failed, trying fallback method")
+                    self._save_markdown_report_fallback(markdown_content, filepath)
             else:
                 logger.warning("⚠️ Docker orchestrator not available, skipping markdown file creation")
                 
         except Exception as e:
             logger.error(f"❌ Error saving markdown report: {e}")
+            # Try fallback method on any exception
+            if self.docker_orchestrator:
+                try:
+                    self._save_markdown_report_fallback(markdown_content, f"/workspace/{report_filename}")
+                except Exception as fallback_error:
+                    logger.error(f"❌ Fallback method also failed: {fallback_error}")
+    
+    def _save_markdown_report_fallback(self, markdown_content: str, filepath: str):
+        """
+        Fallback method for saving markdown report using base64 encoding.
+        This method is more reliable for content with special characters.
+        """
+        try:
+            import base64
+            
+            # Encode content to base64 to avoid shell escaping issues
+            encoded_content = base64.b64encode(markdown_content.encode('utf-8')).decode('ascii')
+            
+            # Write using base64 decode
+            command = f"echo '{encoded_content}' | base64 -d > {filepath}"
+            result = self.docker_orchestrator.execute_command(command)
+            
+            if result.get("exit_code") == 0:
+                logger.info(f"✅ Markdown report saved via fallback to: {filepath}")
+            else:
+                logger.error(f"❌ Fallback method failed: {result.get('output', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.error(f"❌ Base64 fallback failed: {e}")
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
         """Get the parameters schema for this tool."""
