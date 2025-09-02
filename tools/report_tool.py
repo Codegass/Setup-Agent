@@ -797,13 +797,37 @@ class ReportTool(BaseTool):
                 project_info = self._get_project_info()
                 project_dir = project_info.get('directory', '/workspace')
                 
-                # Use PhysicalValidator for comprehensive validation
-                validation_result = self.physical_validator.validate_build_artifacts()
+                # Derive project_name for validator (expects name, not full path)
+                project_name_for_validator = None
+                try:
+                    if project_dir.startswith('/workspace/'):
+                        tail = project_dir[len('/workspace/'):].strip('/')
+                        # Only use single-segment project name (avoid nested paths)
+                        if tail and '/' not in tail:
+                            project_name_for_validator = tail
+                except Exception:
+                    project_name_for_validator = None
+                
+                # Use PhysicalValidator for comprehensive validation (scoped to project when known)
+                validation_result = self.physical_validator.validate_build_artifacts(project_name=project_name_for_validator)
                 test_analysis = self.physical_validator.parse_test_reports(project_dir)
                 
                 # Extract results from PhysicalValidator
-                # Repository is cloned if PhysicalValidator found any artifacts (more reliable than source file count)
-                actual_accomplishments['repository_cloned'] = validation_result.get('class_files', 0) > 0 or validation_result.get('jar_files', 0) > 0 or len(validation_result.get('missing_classes', [])) > 0
+                # Repository is cloned if artifacts detected OR the project directory exists under /workspace
+                actual_accomplishments['repository_cloned'] = (
+                    validation_result.get('class_files', 0) > 0 or
+                    validation_result.get('jar_files', 0) > 0 or
+                    len(validation_result.get('missing_classes', [])) > 0
+                )
+                # Strengthen with directory existence check
+                try:
+                    dir_check = self.docker_orchestrator.execute_command(
+                        f"test -d {project_dir} && echo EXISTS || echo MISSING"
+                    )
+                    if 'EXISTS' in (dir_check.get('output') or ''):
+                        actual_accomplishments['repository_cloned'] = True
+                except Exception as _e:
+                    logger.debug(f"Directory existence check failed: {_e}")
                 actual_accomplishments['build_success'] = validation_result.get('valid', False)
                 
                 if test_analysis.get('valid'):
@@ -1532,16 +1556,44 @@ class ReportTool(BaseTool):
                             # Look for project directory in key results
                             if 'repo_dir=' in key_results:
                                 # Extract repo_dir value
-                                match = re.search(r'repo_dir=([^;,\s]+)', key_results)
+                                match = re.search(r'repo_dir=([^;,.\s]+)', key_results)
                                 if match:
                                     project_dir = match.group(1)
                                     break
                             elif 'path=/workspace/' in key_results:
                                 # Try to extract project path - more specific pattern
-                                match = re.search(r'path=(/workspace/[\w-]+)', key_results)
+                                match = re.search(r'path=(/workspace/[\w.-]+)', key_results)
                                 if match:
                                     project_dir = match.group(1)
                                     break
+                            elif 'Directory=' in key_results or 'directory=' in key_results:
+                                # Handle 'Directory=/workspace/<name>' style
+                                match = re.search(r'[Dd]irectory=([^;,.\s]+)', key_results)
+                                if match and match.group(1).startswith('/workspace/'):
+                                    project_dir = match.group(1)
+                                    break
+                            elif 'clone_location' in key_results:
+                                # Handle dict-like key results: {'clone_location': '/workspace/<name>', ...}
+                                match = re.search(r"clone_location['\"]?\s*[:=]\s*['\"](/workspace/[^'\"\s]+)['\"]", key_results)
+                                if match:
+                                    project_dir = match.group(1)
+                                    break
+
+                # Fallback: if still /workspace, try to probe a likely project directory
+                if project_dir == "/workspace":
+                    try:
+                        probe_cmd = (
+                            "(find /workspace -maxdepth 2 -type f -name pom.xml -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -maxdepth 2 -type f -name build.gradle -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -maxdepth 2 -type f -name package.json -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -mindepth 1 -maxdepth 1 -type d ! -name '.setup_agent' -printf '%p\\n' 2>/dev/null | head -1)"
+                        )
+                        result = self.docker_orchestrator.execute_command(probe_cmd)
+                        candidate = result.get('output', '').strip().split('\n')[0]
+                        if candidate and candidate.startswith('/workspace/'):
+                            project_dir = candidate
+                    except Exception:
+                        pass
                 
                 # ENHANCED: First try to get project type from task key_results
                 project_type_from_tasks = None
