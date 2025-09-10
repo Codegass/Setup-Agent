@@ -3,10 +3,12 @@
 import json
 import re
 from typing import Dict, Any, Optional, List
+from pathlib import Path
 
 from loguru import logger
 
 from .base import BaseTool, ToolResult, ToolError
+from agent.output_storage import OutputStorageManager
 
 
 class GradleTool(BaseTool):
@@ -20,6 +22,7 @@ class GradleTool(BaseTool):
                        "Automatically uses gradlew wrapper if present, installs Gradle if needed."
         )
         self.orchestrator = orchestrator
+        self.output_storage = None  # Will be initialized when needed
     
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use Gradle-specific extraction."""
@@ -137,6 +140,22 @@ class GradleTool(BaseTool):
             # Analyze the output
             analysis = self._analyze_gradle_output(result["output"], result["exit_code"])
             
+            # Store full output if large
+            full_output = result["output"]
+            ref_id = None
+            if len(full_output) > 800:
+                if not self.output_storage:
+                    contexts_dir = Path("/workspace/.setup_agent/contexts")
+                    self.output_storage = OutputStorageManager(contexts_dir, self.orchestrator)
+                
+                ref_id = self.output_storage.store_output(
+                    task_id=f"gradle_{working_directory.replace('/', '_')}",
+                    tool_name="gradle",
+                    output=full_output,
+                    metadata={"command": gradle_cmd, "exit_code": result["exit_code"]}
+                )
+                logger.debug(f"Stored Gradle output with ref_id: {ref_id}")
+            
             if raw_output:
                 return ToolResult(
                     success=result["exit_code"] == 0,
@@ -152,12 +171,13 @@ class GradleTool(BaseTool):
             if result["exit_code"] == 0:
                 return ToolResult(
                     success=True,
-                    output=self._format_success_output(analysis),
+                    output=self._format_success_output_enhanced(analysis, ref_id),
                     raw_output=result["output"],
                     metadata={
                         "command": gradle_cmd,
                         "exit_code": result["exit_code"],
-                        "analysis": analysis
+                        "analysis": analysis,
+                        "output_ref_id": ref_id
                     }
                 )
             else:
@@ -449,6 +469,66 @@ class GradleTool(BaseTool):
         
         if analysis.get("deprecated_features"):
             output += f"⚠️ Deprecated features detected: {len(analysis['deprecated_features'])} warnings\n"
+        
+        return output
+    
+    def _format_success_output_enhanced(self, analysis: Dict[str, Any], ref_id: Optional[str] = None) -> str:
+        """Format with essential validation data always visible."""
+        output = "✅ Gradle build completed\n\n"
+        
+        # ALWAYS show what tasks executed (critical for validation)
+        output += "📍 Tasks executed: "
+        if analysis.get("tasks_executed"):
+            tasks = analysis["tasks_executed"]
+            output += ", ".join(tasks[:5])
+            if len(tasks) > 5:
+                output += f" (+{len(tasks)-5} more)"
+        else:
+            output += "⚠️ NONE DETECTED (possible parsing issue)"
+        
+        # ALWAYS show test execution status if test task ran
+        test_tasks = ["test", "check", "Test", "Check"]
+        tasks_executed = analysis.get("tasks_executed", [])
+        if any(any(test_task in task for test_task in test_tasks) for task in tasks_executed):
+            output += "\n📊 Test Execution: "
+            if analysis.get("test_results"):
+                results = analysis["test_results"]
+                total = results.get('total', 0)
+                failed = results.get('failed', 0)
+                output += f"{total} tests run"
+                if failed > 0:
+                    output += f", {failed} failed ❌"
+                else:
+                    output += " ✅"
+            else:
+                output += "⚠️ Test task ran but no results captured (check build/reports/tests/)"
+        
+        # Show compilation status if compile tasks ran
+        compile_tasks = ["compileJava", "compileKotlin", "compile"]
+        if any(any(compile_task in task for compile_task in compile_tasks) for task in tasks_executed):
+            if analysis.get("compilation_errors"):
+                output += f"\n❌ Compilation: {len(analysis['compilation_errors'])} errors"
+            else:
+                output += "\n✅ Compilation: successful"
+        
+        # Show build status
+        if analysis.get("build_successful"):
+            output += "\n✅ Build: SUCCESS"
+        else:
+            output += "\n❌ Build: FAILED"
+        
+        # Reference to full output
+        if ref_id:
+            output += f"\n\n📄 Full output reference: {ref_id}"
+            output += f"\n💡 Use: output_search(action='retrieve', ref_id='{ref_id}') for complete log"
+        
+        # Cache and performance info
+        if analysis.get("cache_hits", 0) > 0:
+            output += f"\n🚀 Performance: {analysis['cache_hits']} tasks cached"
+        
+        # Warnings summary
+        if analysis.get("deprecated_features"):
+            output += f"\n⚠️ {len(analysis['deprecated_features'])} deprecation warnings (see full output)"
         
         return output
     

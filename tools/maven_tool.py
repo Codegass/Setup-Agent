@@ -1,12 +1,14 @@
 """Maven tool with comprehensive error handling and raw output access."""
 
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from pathlib import Path
 
 from loguru import logger
 
 from .base import BaseTool, ToolResult, ToolError
 from .command_tracker import CommandTracker
+from agent.output_storage import OutputStorageManager
 
 
 class MavenTool(BaseTool):
@@ -21,6 +23,7 @@ class MavenTool(BaseTool):
         )
         self.orchestrator = orchestrator
         self.command_tracker = command_tracker
+        self.output_storage = None  # Will be initialized when needed
     
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """Override to use Maven-specific extraction."""
@@ -137,6 +140,22 @@ class MavenTool(BaseTool):
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
             
+            # Store full output if large
+            full_output = result["output"]
+            ref_id = None
+            if len(full_output) > 800:
+                if not self.output_storage:
+                    contexts_dir = Path("/workspace/.setup_agent/contexts")
+                    self.output_storage = OutputStorageManager(contexts_dir, self.orchestrator)
+                
+                ref_id = self.output_storage.store_output(
+                    task_id=f"maven_{working_directory.replace('/', '_')}",
+                    tool_name="maven",
+                    output=full_output,
+                    metadata={"command": maven_cmd, "exit_code": result["exit_code"]}
+                )
+                logger.debug(f"Stored Maven output with ref_id: {ref_id}")
+            
             # Track command for fact-based validation
             if self.command_tracker:
                 # Determine if this is a build or test command
@@ -204,13 +223,14 @@ class MavenTool(BaseTool):
                 
                 return ToolResult(
                     success=True,
-                    output=self._format_success_output(analysis),
+                    output=self._format_success_output_enhanced(analysis, ref_id),
                     raw_output=result["output"],
                     metadata={
                         "command": maven_cmd,
                         "exit_code": result["exit_code"],
                         "analysis": analysis,
-                        "validation": validation_result
+                        "validation": validation_result,
+                        "output_ref_id": ref_id
                     }
                 )
             else:
@@ -622,6 +642,57 @@ class MavenTool(BaseTool):
         
         if analysis["warnings"]:
             output += f"\n⚠️ Warnings ({len(analysis['warnings'])}): Use raw_output=true to see details\n"
+        
+        return output
+    
+    def _format_success_output_enhanced(self, analysis: Dict[str, Any], ref_id: Optional[str] = None) -> str:
+        """Format with essential validation data always visible."""
+        output = "✅ Maven build completed\n\n"
+        
+        # ALWAYS show what phases executed (critical for validation)
+        output += "📍 Phases executed: "
+        if analysis["phases_executed"]:
+            phases = list(set(analysis["phases_executed"]))  # Remove duplicates
+            output += ", ".join(phases[:5])
+            if len(phases) > 5:
+                output += f" (+{len(phases)-5} more)"
+        else:
+            output += "⚠️ NONE DETECTED (possible parsing issue)"
+        
+        # ALWAYS show test execution status if test/verify phase ran
+        test_phases = ["test", "verify", "surefire", "failsafe"]
+        phases_lower = [p.lower() for p in analysis.get("phases_executed", [])]
+        if any(phase in phases_lower for phase in test_phases):
+            output += "\n📊 Test Execution: "
+            if analysis["tests_run"]:
+                tests = analysis["tests_run"]
+                output += f"{tests['total']} tests run, {tests['failures']} failures, {tests['errors']} errors"
+                if tests['failures'] > 0 or tests['errors'] > 0:
+                    output += " ❌"
+                else:
+                    output += " ✅"
+            else:
+                output += "⚠️ Test phase ran but no results captured (check target/surefire-reports/)"
+        
+        # Show artifacts if created
+        if analysis["artifacts_created"]:
+            output += f"\n📦 Artifacts: {len(analysis['artifacts_created'])} created"
+        
+        # Show compilation status for compile phase
+        if "compile" in phases_lower:
+            if analysis.get("compilation_errors"):
+                output += f"\n❌ Compilation: {len(analysis['compilation_errors'])} errors"
+            else:
+                output += "\n✅ Compilation: successful"
+        
+        # Reference to full output
+        if ref_id:
+            output += f"\n\n📄 Full output reference: {ref_id}"
+            output += f"\n💡 Use: output_search(action='retrieve', ref_id='{ref_id}') for complete log"
+        
+        # Warnings summary
+        if analysis["warnings"]:
+            output += f"\n⚠️ {len(analysis['warnings'])} warnings (see full output for details)"
         
         return output
     

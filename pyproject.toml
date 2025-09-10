@@ -42,6 +42,7 @@ dev = [
     "isort>=6.0.1",
     "mypy>=1.16.1",
     "pytest>=8.4.1",
+    "pytest-cov>=6.3.0",
 ]
 
 [tool.black]

@@ -67,6 +67,7 @@ class SetupAgent:
         from tools.system_tool import SystemTool
         from tools.report_tool import ReportTool
         from tools.project_analyzer import ProjectAnalyzerTool
+        from tools.output_search_tool import OutputSearchTool
         from agent.physical_validator import PhysicalValidator
         
         # Configure bash tool with enhanced features
@@ -93,6 +94,7 @@ class SetupAgent:
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
             ProjectAnalyzerTool(self.orchestrator, self.context_manager),  # 🆕 添加项目分析工具
+            OutputSearchTool(contexts_dir=self.context_manager.contexts_dir),  # 🆕 添加输出搜索工具
             ReportTool(
                 self.orchestrator, 
                 execution_history_callback=self._get_execution_history, 
@@ -140,14 +142,14 @@ class SetupAgent:
             self.react_engine.set_repository_url(project_url)
 
             # Step 2: Initialize trunk context with intelligent planning approach
-            # 🆕 ENHANCED PLANNING: Split complex task into clear, executable steps
+            # Here we provide the initial steps. Split complex task into clear, executable steps
             # This ensures each critical step is executed independently and cannot be skipped
             # 🎯 CORE FOCUS: Build and Test success are the PRIMARY objectives of setup
             initial_tasks = [
                 "Clone repository and setup basic environment (use project_setup tool)",
                 "CRITICAL: Analyze project structure using project_analyzer tool and generate intelligent execution plan",
-                "🚨 CORE SETUP: Execute build tasks and ensure compilation success (use maven/gradle tools)",
-                "🚨 CORE SETUP: Execute test suite and ensure all tests pass (use maven/gradle tools)", 
+                "CORE SETUP: Execute build tasks and ensure compilation success (use maven/gradle tools)",
+                "CORE SETUP: Execute test suite and ensure all tests pass (use maven/gradle tools)",
                 "Generate final completion report with build and test results (use report tool)"
             ]
             
@@ -496,203 +498,109 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
         return verified_success
 
     def _verify_build_artifacts(self, project_name: str) -> bool:
-        """Verify build artifacts exist as ultimate success indicator."""
+        """
+        @deprecated - This method will be removed in future versions.
+        Use PhysicalValidator directly for more accurate verification.
+        
+        This is now a wrapper that delegates to PhysicalValidator for
+        fact-based build artifact verification.
+        """
         logger.info(f"Verifying build artifacts for project: {project_name}")
         
         if not self.orchestrator:
+            logger.error("No orchestrator available for verification")
             return False
         
-        # Check for different build system artifacts
-        artifact_checks = [
-            # Maven artifacts
-            (f"find /workspace/{project_name} -name '*.jar' -path '*/target/*' 2>/dev/null | head -5", 
-             lambda output: bool(output.strip()) and len(output.strip().split('\n')) > 0),
-            # Gradle artifacts
-            (f"find /workspace/{project_name} -name '*.jar' -path '*/build/*' 2>/dev/null | head -5",
-             lambda output: bool(output.strip()) and len(output.strip().split('\n')) > 0),
-            # NPM/Node artifacts
-            (f"test -d /workspace/{project_name}/node_modules && test -f /workspace/{project_name}/package-lock.json && echo SUCCESS",
-             lambda output: 'SUCCESS' in output),
-            # Python artifacts
-            (f"test -d /workspace/{project_name}/venv || test -d /workspace/{project_name}/.venv && echo SUCCESS",
-             lambda output: 'SUCCESS' in output),
-            # Generic compiled output
-            (f"find /workspace/{project_name} -name '*.class' -o -name '*.o' -o -name '*.so' 2>/dev/null | head -5",
-             lambda output: bool(output.strip()))
-        ]
+        # Initialize PhysicalValidator if not already done
+        if not hasattr(self, 'physical_validator') or self.physical_validator is None:
+            from agent.physical_validator import PhysicalValidator
+            self.physical_validator = PhysicalValidator(
+                docker_orchestrator=self.orchestrator,
+                project_path="/workspace"
+            )
+            logger.info("Initialized PhysicalValidator for artifact verification")
         
-        for check_cmd, validator in artifact_checks:
-            result = self.orchestrator.execute_command(check_cmd)
-            if result.get('exit_code') == 0 and validator(result.get('output', '')):
-                logger.info(f"✅ Build artifacts found with command: {check_cmd[:50]}...")
+        try:
+            # Use the new validate_build_status method with hierarchical validation
+            validation_result = self.physical_validator.validate_build_status(project_name)
+            
+            # Check the boolean success result
+            if validation_result.get('success', False):
+                reason = validation_result.get('reason', 'Unknown')
+                evidence = validation_result.get('evidence', {})
+                logger.info(f"✅ Physical validation successful: {reason}")
+                logger.debug(f"Evidence details: {evidence}")
                 return True
-        
-        logger.info("❌ No build artifacts found")
-        return False
+            else:
+                reason = validation_result.get('reason', 'Unknown')
+                evidence = validation_result.get('evidence', {})
+                logger.warning(f"❌ Physical validation failed: {reason}")
+                logger.debug(f"Evidence details: {evidence}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Physical validation error: {e}")
+            return False
     
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
-        """Get the verified final status with multi-level verification."""
+        """Get the verified final status using separate build and test validation."""
         
-        # CRITICAL FIX: Check for explicit FAILED status first
-        # Don't let artifact presence override explicit failure
-        if hasattr(self.context_manager, 'get_current_context'):
-            context = self.context_manager.get_current_context()
-            if context:
-                # Check for explicit failure markers in context
-                context_str = str(context)
-                if any(marker in context_str for marker in ['status": "FAILED"', 'BUILD FAILED', 'BUILD FAILURE', 'compilation_errors']):
-                    logger.warning("❌ Explicit FAILED status detected in context - not overriding")
-                    return False
-        
-        # Priority 1: Check physical build artifacts (but don't override FAILED)
         project_name = getattr(self.orchestrator, 'project_name', None) or getattr(self, 'project_name', None)
         if not project_name and hasattr(self.context_manager, 'project_name'):
             project_name = self.context_manager.project_name
         
-        if project_name:
-            build_artifacts_exist = self._verify_build_artifacts(project_name)
-            # FIXED: Only mark as success if no failure detected
-            if build_artifacts_exist and react_engine_success:
-                logger.info("✅ Build artifacts verified and no failures detected - marking as SUCCESS")
-                return True
-            elif not build_artifacts_exist:
-                logger.warning("❌ No build artifacts found - cannot mark as SUCCESS")
-                return False
-        
-        # Priority 2: Check context for task completion
-        if hasattr(self.context_manager, 'get_current_context'):
-            context = self.context_manager.get_current_context()
-            if context and 'todo_list' in context:
-                tasks = context['todo_list']
-                completed_tasks = [t for t in tasks if t.get('status') == 'completed']
-                total_tasks = len(tasks)
-                completed_count = len(completed_tasks)
-                
-                # Check if all core tasks completed
-                if completed_count == total_tasks:
-                    logger.info(f"✅ All {total_tasks} tasks completed - marking as SUCCESS")
-                    return True
-                
-                # Allow success if only reporting/documentation is incomplete
-                if completed_count >= total_tasks - 1:
-                    incomplete_tasks = [t for t in tasks if t.get('status') != 'completed']
-                    # Check if only non-critical tasks are incomplete
-                    non_critical_keywords = ['report', 'document', 'summary', 'cleanup', 'optimize']
-                    all_non_critical = all(
-                        any(keyword in t.get('description', '').lower() for keyword in non_critical_keywords)
-                        for t in incomplete_tasks
-                    )
-                    
-                    if all_non_critical:
-                        logger.info(f"✅ {completed_count}/{total_tasks} tasks completed (only reporting incomplete) - marking as SUCCESS")
-                        return True
-                
-                # 80% rule for substantial completion
-                if completed_count >= total_tasks * 0.8:
-                    logger.info(f"⚠️ {completed_count}/{total_tasks} tasks completed (80% threshold) - checking for critical failures")
-                    
-                    # Check for BUILD SUCCESS in context
-                    if 'BUILD SUCCESS' in str(context):
-                        logger.info("✅ BUILD SUCCESS found in context - marking as SUCCESS")
-                        return True
-        
-        # Priority 3: Fall back to original ReAct engine success if no other evidence
-        if not react_engine_success:
+        if not project_name:
+            logger.warning("🔍 No project name available for verification")
             return False
         
-        # Priority 4: Check if a report was generated and what its verified status was
-        if hasattr(self, 'react_engine') and self.react_engine and self.react_engine.steps:
-            for step in reversed(self.react_engine.steps):
-                if (hasattr(step, 'step_type') and step.step_type == 'action' and 
-                    hasattr(step, 'tool_name') and step.tool_name == 'report' and
-                    hasattr(step, 'tool_result') and step.tool_result and step.tool_result.success):
-                    
-                    # Check the metadata for the verified status
-                    metadata = step.tool_result.metadata or {}
-                    verified_status = metadata.get('verified_status')
-                    
-                    if verified_status:
-                        logger.info(f"🔍 Using verified status from report tool: {verified_status}")
-                        
-                        # CRITICAL FIX: Accept both 'success' and 'partial' as successful completion
-                        # 'partial' often means all core tasks completed but with minor issues/warnings
-                        if verified_status == 'success':
-                            return True
-                        elif verified_status == 'partial':
-                            # For 'partial' status, check if there are actual failures or just warnings
-                            # Look at the report output to assess the severity
-                            output = step.tool_result.output or ""
-                            
-                            # Check for evidence of major failures
-                            major_failures = [
-                                "❌ Repository clone failed",
-                                "❌ Build failed", 
-                                "❌ Compilation failed",
-                                "Status: FAILED",
-                                "BUILD FAILURE",
-                                "compilation error"
-                            ]
-                            
-                            has_major_failures = any(failure in output for failure in major_failures)
-                            
-                            # Check for evidence of successful completion
-                            success_indicators = [
-                                "✅ All tasks completed successfully",
-                                "tests_run=",
-                                "failures=0",
-                                "errors=0",
-                                "BUILD SUCCESS",
-                                "✅ Clone repository",
-                                "✅ Compile project",
-                                "✅ Run tests"
-                            ]
-                            
-                            has_success_indicators = any(indicator in output for indicator in success_indicators)
-                            
-                            if not has_major_failures and has_success_indicators:
-                                logger.info("🔍 Partial status assessment: No major failures + success indicators = treating as SUCCESS")
-                                return True
-                            else:
-                                logger.warning(f"🔍 Partial status assessment: Major failures detected or insufficient success evidence = treating as FAILURE")
-                                logger.debug(f"Major failures found: {has_major_failures}")
-                                logger.debug(f"Success indicators found: {has_success_indicators}")
-                                return False
-                        else:
-                            # Status is 'failed' or unknown
-                            return False
-                    else:
-                        # Fallback to checking report output for status indicators
-                        output = step.tool_result.output or ""
-                        if "Status: FAILED" in output:
-                            logger.info("🔍 Report shows FAILED status - treating as failure")
-                            return False
-                        elif "Status: SUCCESS" in output:
-                            logger.info("🔍 Report shows SUCCESS status - treating as success")
-                            return True
-                        elif "Status: PARTIAL" in output:
-                            logger.info("🔍 Report shows PARTIAL status - applying enhanced assessment")
-                            # Apply the same enhanced assessment as above
-                            major_failures = [
-                                "❌ Repository clone failed",
-                                "❌ Build failed", 
-                                "❌ Compilation failed",
-                                "BUILD FAILURE"
-                            ]
-                            success_indicators = [
-                                "✅ All tasks completed successfully",
-                                "tests_run=",
-                                "failures=0",
-                                "BUILD SUCCESS"
-                            ]
-                            
-                            has_major_failures = any(failure in output for failure in major_failures)
-                            has_success_indicators = any(indicator in output for indicator in success_indicators)
-                            
-                            return not has_major_failures and has_success_indicators
+        # Initialize PhysicalValidator if not already done
+        if not hasattr(self, 'physical_validator') or self.physical_validator is None:
+            from agent.physical_validator import PhysicalValidator
+            self.physical_validator = PhysicalValidator(
+                docker_orchestrator=self.orchestrator,
+                project_path="/workspace"
+            )
+            logger.info("Initialized PhysicalValidator for status verification")
         
-        # If no report was found, fall back to ReAct engine result
-        logger.warning("🔍 No report tool result found, using ReAct engine result")
-        return react_engine_success
+        # Get BUILD status (primary concern)
+        build_status = self.physical_validator.validate_build_status(project_name)
+        
+        # Get TEST status (secondary, informational)
+        test_status = self.physical_validator.validate_test_status(project_name)
+        
+        # Log comprehensive status
+        if build_status['success']:
+            logger.info(f"✅ Build validation: SUCCESS - {build_status['reason']}")
+            
+            # Report test status for information
+            if test_status['has_test_reports']:
+                if test_status['pass_rate'] == 100.0:
+                    logger.info(f"✅ Test validation: ALL PASSED - {test_status['total_tests']} tests (100% pass rate)")
+                elif test_status['pass_rate'] > 0:
+                    logger.info(f"⚠️ Test validation: PARTIAL - {test_status['passed_tests']}/{test_status['total_tests']} tests passed ({test_status['pass_rate']:.1f}% pass rate)")
+                else:
+                    logger.warning(f"❌ Test validation: ALL FAILED - 0/{test_status['total_tests']} tests passed (0% pass rate)")
+                
+                # Log test exclusions if detected
+                if test_status['test_exclusions']:
+                    logger.warning(f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}")
+                    
+                # Log execution coverage
+                if test_status['execution_coverage'] < 100:
+                    logger.info(f"📊 Test execution coverage: {test_status['execution_coverage']:.1f}%")
+            else:
+                logger.info("⚠️ Test validation: No test reports found")
+            
+            # Build success is the primary goal - return True
+            return True
+        else:
+            logger.error(f"❌ Build validation: FAILED - {build_status['reason']}")
+            
+            # Even if tests would pass, build failure means overall failure
+            if test_status['has_test_reports']:
+                logger.info(f"📊 Test status (informational): {test_status['passed_tests']}/{test_status['total_tests']} tests, {test_status['pass_rate']:.1f}% pass rate")
+            
+            return False
 
     def _provide_setup_summary(self, success: bool):
         """Provide a summary of the setup process."""
