@@ -50,7 +50,9 @@ class ReportTool(BaseTool):
         Args:
             action: Action to perform ('generate' for final report)
             summary: Brief summary of what was accomplished
-            status: Overall status ('success', 'partial', 'failed')
+            status: Overall status ('success' or 'fail') - REQUIRED
+                   - 'success': Build validation passed AND test pass rate > 80%
+                   - 'fail': Build failed OR test report not found OR test pass rate <= 80%
             details: Additional details about the setup process
         """
         
@@ -64,12 +66,24 @@ class ReportTool(BaseTool):
                     f"✅ Valid parameters:\n"
                     f"  - action (optional): 'generate' (default: 'generate')\n"
                     f"  - summary (optional): Brief summary of accomplishments\n"
-                    f"  - status (optional): 'success', 'partial', or 'failed' (default: 'success')\n"
+                    f"  - status (required): 'success' or 'fail'\n"
+                    f"     • 'success': Build passed AND test pass rate > 80%\n"
+                    f"     • 'fail': Build failed OR tests not found OR pass rate <= 80%\n"
                     f"  - details (optional): Additional details about the setup\n\n"
                     f"Example: report(action='generate')\n"
-                    f"Example: report(action='generate', summary='Project built successfully', status='success')"
+                    f"Example: report(action='generate', summary='Project built successfully', status='success')\n"
+                    f"Example: report(action='generate', summary='Project built successfully', status='success', details='All build and test tasks completed successfully')"
                 ),
                 error=f"Invalid parameters: {invalid_params}"
+            )
+
+        if not status:
+            return ToolResult(
+                success=False,
+                output="❌ Missing required parameter: 'status'. Must be either 'success' or 'fail'\n"
+                      "• 'success': Build passed AND test pass rate > 80%\n"
+                      "• 'fail': Build failed OR tests not found OR pass rate <= 80%",
+                error="Missing required parameter: status"
             )
         
         logger.info(f"Generating project report with status: {status}")
@@ -349,9 +363,9 @@ class ReportTool(BaseTool):
         if verified_status == "success":
             status_icon = "✅"
             status_text = "SUCCESS"
-        elif verified_status == "partial":
-            status_icon = "⚠️"
-            status_text = "PARTIAL"
+        elif verified_status == "fail":
+            status_icon = "❌"
+            status_text = "FAIL"
         else:
             status_icon = "❌"
             status_text = "FAILED"
@@ -364,8 +378,8 @@ class ReportTool(BaseTool):
             f"📄 Full report saved to: /workspace/{report_filename}"
         ]
         
-        # Add physical evidence for failed/partial status
-        if verified_status in ["failed", "partial"] and actual_accomplishments:
+        # Add physical evidence for failed status
+        if verified_status in ["failed", "fail"] and actual_accomplishments:
             physical_validation = actual_accomplishments.get('physical_validation', {})
             if physical_validation:
                 class_files = physical_validation.get('class_files', 0)
@@ -381,8 +395,8 @@ class ReportTool(BaseTool):
         # Add next steps based on status
         if verified_status == "success":
             lines.append("💡 Next: Project ready for development/deployment! 🎉")
-        elif verified_status == "partial":
-            lines.append("💡 Next: Review logs and fix remaining issues")
+        elif verified_status == "fail":
+            lines.append("💡 Next: Review logs and fix build/test failures")
         else:
             lines.append("💡 Next: Check error logs and retry setup")
         
@@ -390,8 +404,14 @@ class ReportTool(BaseTool):
 
     def _validate_context_prerequisites(self) -> Dict[str, Any]:
         """
-        Validate that all prerequisite tasks are completed before generating report.
-        This prevents premature report generation when tasks are still in progress.
+        Check context availability for report generation.
+        
+        IMPORTANT: TODO list completion is NOT a prerequisite for report generation.
+        The final status (success/fail) is determined solely by:
+        - Build validation: Must pass
+        - Test pass rate: Must be > 80%
+        
+        TODO list is tracked for visibility but does not affect the final status.
         """
         logger.info("Starting prerequisite validation for report generation")
         
@@ -435,68 +455,23 @@ class ReportTool(BaseTool):
                         "status": task.status.value
                     })
             
+            # Log TODO status but don't block report generation
+            # Status is determined by build/test results, not TODO completion
             if incomplete_tasks:
-                # Check if we should allow partial report generation
-                allow_partial = False
-                
-                # If only 1 task is incomplete and it's currently in progress, allow partial report
-                if len(incomplete_tasks) == 1 and incomplete_tasks[0]["status"] == "in_progress":
-                    logger.info(f"Allowing partial report generation with 1 in-progress task: {incomplete_tasks[0]['id']}")
-                    allow_partial = True
-                
-                # If more than 80% of tasks are complete, allow partial report with warning
                 total_tasks = len(trunk_context.todo_list)
                 completed_tasks = total_tasks - len(incomplete_tasks)
                 completion_percentage = (completed_tasks / total_tasks) * 100 if total_tasks > 0 else 0
                 
-                if completion_percentage >= 80:
-                    logger.info(f"Allowing partial report generation: {completion_percentage:.1f}% tasks complete")
-                    allow_partial = True
+                logger.info(f"📊 TODO List Status: {completed_tasks}/{total_tasks} tasks complete ({completion_percentage:.1f}%)")
+                logger.info(f"📝 {len(incomplete_tasks)} tasks remain incomplete (not blocking report)")
                 
-                if allow_partial:
-                    logger.warning(f"Generating partial report with {len(incomplete_tasks)} incomplete tasks")
-                    return {
-                        "valid": True,
-                        "warning": f"Generating partial report: {len(incomplete_tasks)} task(s) incomplete",
-                        "incomplete_tasks": incomplete_tasks
-                    }
-                
-                # Format error message with specific incomplete tasks
-                task_details = []
+                # Log incomplete tasks for visibility
                 for task in incomplete_tasks:
-                    task_details.append(f"  • {task['id']}: {task['description']} (status: {task['status']})")
-                
-                error_msg = (
-                    f"Cannot generate report because {len(incomplete_tasks)} task(s) are not yet complete:\n" +
-                    "\n".join(task_details) +
-                    "\n\nAll tasks must be completed before generating the final report."
-                )
-                
-                suggestions = [
-                    f"Complete the incomplete task(s) first",
-                    "Use manage_context to check and complete pending tasks",
-                    "If a task is currently in progress, use complete_task() to finish it"
-                ]
-                
-                # Add specific suggestion for current task if in progress
-                current_task = self.context_manager.current_task_id
-                if current_task:
-                    current_task_desc = None
-                    for task in incomplete_tasks:
-                        if task["id"] == current_task:
-                            current_task_desc = task["description"]
-                            break
-                    if current_task_desc:
-                        suggestions.insert(0, f"You are currently working on {current_task}: {current_task_desc}. Complete this task first.")
-                
-                return {
-                    "valid": False,
-                    "error": error_msg,
-                    "suggestions": suggestions
-                }
+                    logger.debug(f"  • Incomplete: {task['id']}: {task['description']} (status: {task['status']})")
+            else:
+                logger.info("✅ All TODO tasks completed")
             
-            # All tasks are completed
-            logger.info("✅ All prerequisite tasks completed, allowing report generation")
+            # Always allow report generation - status based on build/test results only
             return {"valid": True}
             
         except Exception as e:
@@ -597,41 +572,51 @@ class ReportTool(BaseTool):
     def _reconcile_status(self, claimed_status: str, evidence_status: str, accomplishments: dict) -> str:
         """
         Reconcile claimed status with evidence-based status.
-        New logic: Based on three core steps (clone, build, test)
+        Binary logic: success (build passed AND test >80%) or fail
         """
         # Extract core step results
         repository_cloned = accomplishments.get('repository_cloned', False)
-        build_success = accomplishments.get('build_success', False) 
-        test_success = accomplishments.get('test_success', False)
+        build_success = accomplishments.get('build_success', False)
+        
+        # Calculate test pass rate if available
+        test_pass_rate = 0.0
+        if 'physical_validation' in accomplishments and 'test_analysis' in accomplishments['physical_validation']:
+            test_data = accomplishments['physical_validation']['test_analysis']
+            # Use PhysicalValidator's method if available
+            if self.physical_validator:
+                test_pass_rate = self.physical_validator.calculate_test_pass_rate(test_data)
+            else:
+                total_tests = test_data.get('total_tests', 0)
+                passed_tests = test_data.get('passed_tests', 0)
+                if total_tests > 0:
+                    test_pass_rate = (passed_tests / total_tests) * 100
+        elif accomplishments.get('test_success', False):
+            # If tests marked as success without detailed data, assume high pass rate
+            test_pass_rate = 100.0
         
         logger.info(f"🔍 Status reconciliation - Claimed: '{claimed_status}', Evidence: '{evidence_status}'")
-        logger.info(f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}")
+        logger.info(f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test pass rate: {test_pass_rate:.1f}%")
         
-        # Evidence-based status is authoritative for core technical failures
-        if evidence_status == "failed":
-            if not repository_cloned:
-                logger.error("❌ Repository clone failed - cannot proceed")
-            elif not build_success:
-                logger.error("❌ Build failed - compilation issues prevent success")
-            return "failed"
+        # Update evidence_status to use binary logic
+        if evidence_status in ["failed", "partial"]:
+            evidence_status = "fail"
         
-        # For partial status, check if user's assessment makes sense
-        if evidence_status == "partial":
-            if repository_cloned and build_success and not test_success:
-                logger.info("✅ Partial status confirmed: clone + build succeeded, tests failed")
-                return "partial"
-            elif not build_success:
-                logger.warning("❌ Build failed but tests may not have run - status remains failed")
-                return "failed"
+        # Evidence-based status is authoritative
+        if not repository_cloned:
+            logger.error("❌ Repository clone failed - cannot proceed")
+            return "fail"
         
-        # If evidence shows success, trust it
-        if evidence_status == "success":
-            logger.info("✅ Success status confirmed by evidence")
+        if not build_success:
+            logger.error("❌ Build failed - compilation issues prevent success")
+            return "fail"
+        
+        # Check test pass rate
+        if test_pass_rate > 80:
+            logger.info(f"✅ Success confirmed: Build passed, Test pass rate {test_pass_rate:.1f}% > 80%")
             return "success"
-        
-        # Default to evidence-based assessment
-        logger.info(f"🎯 Using evidence-based status: '{evidence_status}'")
-        return evidence_status
+        else:
+            logger.warning(f"❌ Fail: Test pass rate {test_pass_rate:.1f}% <= 80%")
+            return "fail"
 
     def _collect_execution_metrics(self) -> dict:
         """Collect comprehensive execution metrics from the session."""
@@ -829,7 +814,18 @@ class ReportTool(BaseTool):
                 
                 # Use PhysicalValidator for comprehensive validation (scoped to project when known)
                 validation_result = self.physical_validator.validate_build_artifacts(project_name=project_name_for_validator)
-                test_analysis = self.physical_validator.parse_test_reports(project_dir)
+                
+                # Use enhanced test parsing with metrics for better accuracy
+                test_analysis = self.physical_validator.parse_test_reports_with_metrics(project_dir)
+                
+                # Also get test validation status for additional insights
+                test_status = self.physical_validator.validate_test_status(project_name_for_validator)
+                
+                # Log test status insights
+                if test_status.get('pass_rate', 0) <= 80 and test_status.get('has_test_reports'):
+                    logger.warning(f"⚠️ Test pass rate is {test_status['pass_rate']:.1f}% (below 80% threshold)")
+                if test_status.get('test_exclusions'):
+                    logger.warning(f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}")
                 
                 # Extract results from PhysicalValidator
                 # Repository is cloned if artifacts detected OR the project directory exists under /workspace
@@ -860,8 +856,14 @@ class ReportTool(BaseTool):
                         'failed_tests': test_analysis['failed_tests'],
                         'error_tests': test_analysis['error_tests'],
                         'skipped_tests': test_analysis['skipped_tests'],
-                        'report_files_count': len(test_analysis['report_files'])
+                        'report_files_count': len(test_analysis['report_files']),
+                        'test_exclusions': test_analysis.get('test_exclusions', []),
+                        'execution_coverage': test_analysis.get('execution_coverage', 100.0)
                     }
+                    
+                    # Log if tests were excluded
+                    if test_analysis.get('test_exclusions'):
+                        logger.warning(f"⚠️ Test exclusions detected: {', '.join(test_analysis['test_exclusions'])}")
                     
                     if test_analysis['test_success']:
                         logger.info(f"✅ PHYSICAL: Tests passed - {test_analysis['passed_tests']}/{test_analysis['total_tests']} tests successful")
@@ -1124,7 +1126,7 @@ class ReportTool(BaseTool):
                         elif 'BUILD SUCCESSFUL' in output:
                             # Also check for specific test failures even if build reports success
                             if 'test failed' in output.lower() or 'tests failed' in output.lower():
-                                actual_accomplishments['test_partial'] = True
+                                actual_accomplishments['test_failed'] = True
                                 logger.warning(f"⚠️ Gradle build successful but some tests failed")
                             else:
                                 actual_accomplishments['test_success'] = True
@@ -1250,12 +1252,10 @@ class ReportTool(BaseTool):
     
     def _determine_actual_status(self, accomplishments: dict) -> str:
         """
-        Determine the actual status based on three core steps: clone, build, test.
-        ENHANCED: Now includes physical artifact verification.
-        Logic:
-        - All success = success
-        - Clone or build failed = failed  
-        - Only test failed = partial
+        Determine the actual status based on build and test results.
+        Binary status logic (no partial):
+        - SUCCESS: Build passed AND test pass rate > 80%
+        - FAIL: Build failed OR test report not found OR test pass rate <= 80%
         """
         # Extract the three core indicators
         repository_cloned = accomplishments.get('repository_cloned', False)
@@ -1273,12 +1273,12 @@ class ReportTool(BaseTool):
         # Step 1: Check if repository was cloned
         if not repository_cloned:
             logger.error("❌ Repository clone failed - this is a fundamental failure")
-            return "failed"
+            return "fail"
         
         # Step 2: Check for explicit build failures or compilation errors
         if build_failed or compilation_errors > 0:
             logger.error(f"❌ Build explicitly failed with {compilation_errors} compilation errors")
-            return "failed"
+            return "fail"
         
         # Step 3: Verify physical artifacts if build claims success
         if build_success and self.docker_orchestrator:
@@ -1293,27 +1293,49 @@ class ReportTool(BaseTool):
         # Step 4: Check if build completed successfully  
         if not build_success:
             logger.error("❌ Build failed - cannot proceed without successful compilation")
-            return "failed"
+            return "fail"
         
-        # Step 5: Check for explicit test failures
-        if test_failed:
-            test_stats = accomplishments.get('test_stats', {})
-            if test_stats:
-                failed_count = test_stats.get('failed', 0)
-                total_count = test_stats.get('total', 0)
-                logger.warning(f"⚠️ Tests explicitly failed - {failed_count}/{total_count} tests failed")
+        # Step 5: Calculate test pass rate for final determination
+        test_pass_rate = 0.0
+        
+        # Check if we have physical validation test data
+        if 'physical_validation' in accomplishments and 'test_analysis' in accomplishments['physical_validation']:
+            test_data = accomplishments['physical_validation']['test_analysis']
+            
+            # Use PhysicalValidator's method if available for consistency
+            if self.physical_validator:
+                test_pass_rate = self.physical_validator.calculate_test_pass_rate(test_data)
             else:
-                logger.warning("⚠️ Tests explicitly failed")
-            return "partial"
+                # Fallback to manual calculation
+                total_tests = test_data.get('total_tests', 0)
+                passed_tests = test_data.get('passed_tests', 0)
+                if total_tests > 0:
+                    test_pass_rate = (passed_tests / total_tests) * 100
+            
+            if test_pass_rate == 0 and test_data.get('total_tests', 0) == 0:
+                logger.warning("⚠️ No test reports found - treating as 0% pass rate")
+                return "fail"
+            else:
+                logger.info(f"📊 Test pass rate: {test_pass_rate:.1f}% ({test_data.get('passed_tests', 0)}/{test_data.get('total_tests', 0)})")
+        elif test_success:
+            # If we don't have detailed test data but tests marked as success, check for test_failed flag
+            if test_failed:
+                logger.warning("❌ Tests marked as failed")
+                return "fail"
+            # Assume high pass rate if tests succeeded without detailed data
+            test_pass_rate = 100.0
+            logger.info("✅ Tests marked as successful (assuming 100% pass rate)")
+        else:
+            logger.warning("⚠️ No test execution detected - treating as 0% pass rate")
+            return "fail"
         
-        # Step 6: Check if tests passed
-        if not test_success:
-            logger.warning("⚠️ Tests not run or incomplete - build succeeded but verification incomplete")
-            return "partial"
-        
-        # All three core steps succeeded
-        logger.debug("✅ All core steps succeeded: clone + build + test")
-        return "success"
+        # Final determination based on pass rate threshold
+        if test_pass_rate > 80:
+            logger.info(f"✅ SUCCESS: Build passed ✓, Test pass rate {test_pass_rate:.1f}% > 80% ✓")
+            return "success"
+        else:
+            logger.warning(f"❌ FAIL: Test pass rate {test_pass_rate:.1f}% <= 80%")
+            return "fail"
 
     def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None, execution_metrics: dict = None) -> str:
         """Generate console-formatted report with simple summary at the top."""
@@ -1839,7 +1861,7 @@ class ReportTool(BaseTool):
             actual_accomplishments.get('build_failed', False) or
             actual_accomplishments.get('test_failed', False) or
             actual_accomplishments.get('compilation_errors', 0) > 0 or
-            actual_accomplishments.get('test_partial', False)
+            actual_accomplishments.get('test_failed', False)
         )
         
         if not has_errors:
@@ -1885,7 +1907,7 @@ class ReportTool(BaseTool):
             ])
         
         # Report test failures with statistics
-        if actual_accomplishments.get('test_failed', False) or actual_accomplishments.get('test_partial', False):
+        if actual_accomplishments.get('test_failed', False):
             section_lines.extend([
                 "### 🔴 Test Failures",
                 "",

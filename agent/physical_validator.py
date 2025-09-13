@@ -645,37 +645,55 @@ class PhysicalValidator:
         }
         
         try:
-            # Find all test report XML files
-            find_cmd = f"find {project_dir} -type f \\( -path '*/surefire-reports/*.xml' -o -path '*/test-results/*.xml' \\) 2>/dev/null"
-            result = self.docker_orchestrator.execute_command(find_cmd)
-            
-            if result.get("exit_code") != 0:
-                test_result["error"] = "Failed to find test reports"
-                return test_result
-            
-            report_files = [f.strip() for f in result.get("output", "").split("\n") if f.strip()]
+            # Step 1: Discover report directories first to avoid massive single-command outputs
+            # Include Maven Surefire, Maven Failsafe, and Gradle test-results
+            dirs_cmd = (
+                f"find {project_dir} -type d "
+                f"\\( -name 'surefire-reports' -o -name 'failsafe-reports' -o -path '*/build/test-results/*' \\) 2>/dev/null"
+            )
+            dirs_result = self.docker_orchestrator.execute_command(dirs_cmd)
+            report_dirs = []
+            if dirs_result.get("exit_code") == 0 and dirs_result.get("output"):
+                report_dirs = [d.strip() for d in dirs_result.get("output", "").split("\n") if d.strip()]
+
+            # Step 2: For each directory, list XML files in small batches to avoid truncation
+            report_files: List[str] = []
+            for report_dir in report_dirs:
+                # Limit depth to keep per-command output small; Gradle may have nested per-class dirs
+                list_cmd = f"find '{report_dir}' -maxdepth 2 -type f -name '*.xml' 2>/dev/null"
+                list_result = self.docker_orchestrator.execute_command(list_cmd)
+                if list_result.get("exit_code") == 0 and list_result.get("output"):
+                    files = [f.strip() for f in list_result.get("output", "").split("\n") if f.strip()]
+                    # Filter obviously irrelevant XMLs if any (keep flexible)
+                    report_files.extend(files)
+
+            # Fallback: If directory discovery failed to find anything, do a global file search (may be heavy)
+            if not report_files:
+                fallback_cmd = (
+                    f"find {project_dir} -type f \\( -path '*/surefire-reports/*.xml' -o -path '*/failsafe-reports/*.xml' -o -path '*/test-results/*.xml' \\) 2>/dev/null"
+                )
+                fallback_res = self.docker_orchestrator.execute_command(fallback_cmd)
+                if fallback_res.get("exit_code") == 0 and fallback_res.get("output"):
+                    report_files = [f.strip() for f in fallback_res.get("output", "").split("\n") if f.strip()]
+
             test_result["report_files"] = report_files
-            
+
             if not report_files:
                 test_result["error"] = "No test report files found"
                 return test_result
-            
-            # Parse all XML files (removed 20 file limit for complete analysis)
+
+            # Step 3: Parse all XML files
             for report_file in report_files:
                 try:
-                    # Read the XML content
-                    cat_cmd = f"cat '{report_file}'"
-                    xml_result = self.docker_orchestrator.execute_command(cat_cmd)
-                    
+                    xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
                     if xml_result.get("exit_code") != 0:
                         test_result["parsing_errors"].append(f"Failed to read {report_file}")
                         continue
-                    
+
                     xml_content = xml_result.get("output", "")
                     if not xml_content.strip():
                         continue
-                    
-                    # Parse XML based on format
+
                     stats = self._parse_single_test_xml(xml_content, report_file)
                     if stats:
                         test_result["total_tests"] += stats.get("total", 0)
@@ -684,25 +702,27 @@ class PhysicalValidator:
                         test_result["error_tests"] += stats.get("errors", 0)
                         test_result["skipped_tests"] += stats.get("skipped", 0)
                     else:
-                        # XML parsing failed - record the error
-                        test_result["parsing_errors"].append(f"Failed to parse XML structure in {report_file}")
-                    
+                        test_result["parsing_errors"].append(
+                            f"Failed to parse XML structure in {report_file}"
+                        )
                 except Exception as e:
                     test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
                     logger.warning(f"Failed to parse test report {report_file}: {e}")
-            
+
             # Determine test success: only if no failures and no errors
             test_result["test_success"] = (
-                test_result["failed_tests"] == 0 and 
-                test_result["error_tests"] == 0 and
-                test_result["total_tests"] > 0
+                test_result["failed_tests"] == 0
+                and test_result["error_tests"] == 0
+                and test_result["total_tests"] > 0
             )
             test_result["valid"] = True
-            
-            logger.info(f"📊 Test report analysis: {test_result['total_tests']} total, "
-                       f"{test_result['passed_tests']} passed, {test_result['failed_tests']} failed, "
-                       f"{test_result['error_tests']} errors, {test_result['skipped_tests']} skipped")
-            
+
+            logger.info(
+                f"📊 Test report analysis: {test_result['total_tests']} total, "
+                f"{test_result['passed_tests']} passed, {test_result['failed_tests']} failed, "
+                f"{test_result['error_tests']} errors, {test_result['skipped_tests']} skipped"
+            )
+
         except Exception as e:
             test_result["error"] = f"Failed to parse test reports: {str(e)}"
             logger.error(f"Test report parsing failed: {e}")
@@ -1013,39 +1033,73 @@ class PhysicalValidator:
         exclusions = []
         
         try:
-            # Check Maven surefire configuration for exclusions
-            pom_cmd = f"grep -E 'excludes|exclude|Dtest=!' {project_dir}/pom.xml 2>/dev/null || true"
-            pom_result = self._execute_command_with_logging(pom_cmd, "checking Maven test exclusions")
-            if pom_result['success'] and pom_result.get('output'):
-                # Extract exclusion patterns
-                import re
-                # Look for -Dtest=!Pattern or <exclude> tags
-                maven_excludes = re.findall(r'-Dtest=!([^\s]+)', pom_result['output'])
-                exclusions.extend(maven_excludes)
-                
-                xml_excludes = re.findall(r'<exclude>([^<]+)</exclude>', pom_result['output'])
-                exclusions.extend(xml_excludes)
-            
-            # Check Gradle for test exclusions
-            gradle_files = ['build.gradle', 'build.gradle.kts']
-            for gradle_file in gradle_files:
-                gradle_cmd = f"grep -E 'exclude|excludeTestsMatching' {project_dir}/{gradle_file} 2>/dev/null || true"
-                gradle_result = self._execute_command_with_logging(gradle_cmd, f"checking Gradle test exclusions")
-                if gradle_result['success'] and gradle_result.get('output'):
-                    # Extract Gradle exclusion patterns
-                    import re
-                    gradle_excludes = re.findall(r"exclude[^'\"]*['\"]([^'\"]+)['\"]", gradle_result['output'])
-                    exclusions.extend(gradle_excludes)
-            
+            # Maven: scan all pom.xml files but only extract excludes inside surefire/failsafe plugin blocks
+            poms_cmd = f"find {project_dir} -type f -name 'pom.xml' 2>/dev/null"
+            poms_result = self._execute_command_with_logging(poms_cmd, "discovering Maven POMs for exclusions")
+            pom_files = [p.strip() for p in (poms_result.get('output') or '').split('\n') if p.strip()] if poms_result['success'] else []
+
+            plugin_pattern = re.compile(
+                r"<plugin>[\s\S]*?<artifactId>\s*maven-(surefire|failsafe)-plugin\s*</artifactId>[\s\S]*?</plugin>",
+                re.IGNORECASE
+            )
+            exclude_tag_pattern = re.compile(r"<exclude>\s*([^<]+?)\s*</exclude>", re.IGNORECASE)
+            skip_flag_pattern = re.compile(r"<skipTests>\s*true\s*</skipTests>", re.IGNORECASE)
+
+            for pom in pom_files:
+                cat_res = self._execute_command_with_logging(f"cat '{pom}' 2>/dev/null || true", f"reading {pom}")
+                if not cat_res['success'] or not cat_res.get('output'):
+                    continue
+                content = cat_res['output']
+                for plugin_block in plugin_pattern.findall(content) or []:
+                    # The regex returns only the group; re-find full blocks to extract excludes
+                    for block_match in re.finditer(
+                        r"<plugin>[\s\S]*?<artifactId>\s*maven-(?:surefire|failsafe)-plugin\s*</artifactId>[\s\S]*?</plugin>",
+                        content,
+                        re.IGNORECASE,
+                    ):
+                        block = block_match.group(0)
+                        exclusions.extend(exclude_tag_pattern.findall(block))
+                        if skip_flag_pattern.search(block):
+                            exclusions.append("ALL_TESTS_SKIPPED")
+
+            # Gradle: inspect test{} blocks only
+            gradle_cmd = f"find {project_dir} -type f \\(-name 'build.gradle' -o -name 'build.gradle.kts'\\) 2>/dev/null"
+            gradle_files_res = self._execute_command_with_logging(gradle_cmd, "discovering Gradle build files for exclusions")
+            gradle_files = [g.strip() for g in (gradle_files_res.get('output') or '').split('\n') if g.strip()] if gradle_files_res['success'] else []
+
+            for gf in gradle_files:
+                gcat = self._execute_command_with_logging(f"cat '{gf}' 2>/dev/null || true", f"reading {gf}")
+                if not gcat['success'] or not gcat.get('output'):
+                    continue
+                gcontent = gcat['output']
+                # Capture test { ... } blocks
+                for test_block_match in re.finditer(r"test\s*\{([\s\S]*?)\}", gcontent, re.IGNORECASE):
+                    block = test_block_match.group(1)
+                    # Direct exclude 'exclude "pattern"' or 'exclude 'pattern''
+                    exclusions.extend(re.findall(r"exclude\s*['\"]([^'\"]+)['\"]", block))
+                    # excludeTestsMatching inside filter {}
+                    for filter_block in re.findall(r"filter\s*\{([\s\S]*?)\}", block, re.IGNORECASE):
+                        exclusions.extend(re.findall(r"excludeTestsMatching\s*['\"]([^'\"]+)['\"]", filter_block))
+                # useJUnitPlatform { excludeTags 'slow' }
+                for ujp_block in re.finditer(r"useJUnitPlatform\s*\{([\s\S]*?)\}", gcontent, re.IGNORECASE):
+                    tags = re.findall(r"excludeTags\s*['\"]([^'\"]+)['\"]", ujp_block.group(1))
+                    exclusions.extend([f"EXCLUDE_TAG:{t}" for t in tags])
+
             # Check for skip flags in recent commands (from command history if available)
-            history_cmd = f"grep -E 'DskipTests|-x test|--exclude-task test' {project_dir}/.setup_agent/command_history.txt 2>/dev/null || true"
+            history_cmd = (
+                f"grep -E 'DskipTests|-x test|--exclude-task test|Dtest=' {project_dir}/.setup_agent/command_history.txt 2>/dev/null || true"
+            )
             history_result = self._execute_command_with_logging(history_cmd, "checking command history for test skips")
             if history_result['success'] and history_result.get('output'):
-                if '-DskipTests' in history_result['output'] or 'skipTests=true' in history_result['output']:
+                hist = history_result['output']
+                if '-DskipTests' in hist or 'skipTests=true' in hist:
                     exclusions.append("ALL_TESTS_SKIPPED")
-                if '-x test' in history_result['output'] or '--exclude-task test' in history_result['output']:
+                if '-x test' in hist or '--exclude-task test' in hist:
                     exclusions.append("GRADLE_TESTS_EXCLUDED")
-            
+                # Extract -Dtest=!Pattern and -Dtest=Pattern
+                exclusions.extend(re.findall(r"-Dtest=!([^\s]+)", hist))
+                exclusions.extend([f"INCLUDE_TEST:{m}" for m in re.findall(r"-Dtest=([^!\s][^\s]*)", hist)])
+
         except Exception as e:
             logger.warning(f"Failed to detect test exclusions: {e}")
         
@@ -1060,28 +1114,57 @@ class PhysicalValidator:
             Estimated number of expected tests
         """
         try:
-            # Count test source files
-            test_file_patterns = [
-                f"find {project_dir} -path '*/src/test/java/*.java' -name '*Test.java' -o -name '*Tests.java' 2>/dev/null | wc -l",
-                f"find {project_dir} -path '*/src/test/kotlin/*.kt' -name '*Test.kt' -o -name '*Tests.kt' 2>/dev/null | wc -l",
-                f"find {project_dir} -path '*/test/*.js' -name '*.test.js' -o -name '*.spec.js' 2>/dev/null | wc -l",
-                f"find {project_dir} -path '*/test_*.py' -o -path '*/tests/*.py' 2>/dev/null | wc -l"
-            ]
-            
             total_test_files = 0
-            for pattern_cmd in test_file_patterns:
-                result = self._execute_command_with_logging(pattern_cmd, "counting test files")
-                if result['success'] and result.get('output'):
-                    try:
-                        count = int(result['output'].strip())
-                        total_test_files += count
-                    except ValueError:
-                        pass
-            
-            # Rough estimate: assume average of 3 test methods per test file
-            # This is a heuristic and may vary significantly
+
+            # Java (unit and IT)
+            java_cmd = (
+                f"find {project_dir} -type f \\( -name '*Test.java' -o -name '*Tests.java' -o -name '*IT.java' -o -name '*ITCase.java' \\) 2>/dev/null "
+                f"| grep -E '/src/(test|it)/java/' | wc -l"
+            )
+            java_res = self._execute_command_with_logging(java_cmd, "counting Java test files")
+            if java_res['success'] and java_res.get('output'):
+                try:
+                    total_test_files += int(java_res['output'].strip() or 0)
+                except ValueError:
+                    pass
+
+            # Kotlin (unit and IT)
+            kt_cmd = (
+                f"find {project_dir} -type f \\( -name '*Test.kt' -o -name '*Tests.kt' -o -name '*IT.kt' \\) 2>/dev/null "
+                f"| grep -E '/src/(test|it)/kotlin/' | wc -l"
+            )
+            kt_res = self._execute_command_with_logging(kt_cmd, "counting Kotlin test files")
+            if kt_res['success'] and kt_res.get('output'):
+                try:
+                    total_test_files += int(kt_res['output'].strip() or 0)
+                except ValueError:
+                    pass
+
+            # JavaScript
+            js_cmd = (
+                f"find {project_dir} -type f \\(-name '*.test.js' -o -name '*.spec.js'\\) 2>/dev/null | wc -l"
+            )
+            js_res = self._execute_command_with_logging(js_cmd, "counting JS test files")
+            if js_res['success'] and js_res.get('output'):
+                try:
+                    total_test_files += int(js_res['output'].strip() or 0)
+                except ValueError:
+                    pass
+
+            # Python
+            py_cmd = (
+                f"find {project_dir} -type f 2>/dev/null | grep -E '/tests/.*\\.py$|/test_.*\\.py$' | wc -l"
+            )
+            py_res = self._execute_command_with_logging(py_cmd, "counting Python test files")
+            if py_res['success'] and py_res.get('output'):
+                try:
+                    total_test_files += int(py_res['output'].strip() or 0)
+                except ValueError:
+                    pass
+
+            # Heuristic: assume ~3 test methods per test file
             return total_test_files * 3
-            
+
         except Exception as e:
             logger.warning(f"Failed to estimate expected tests: {e}")
             return 0

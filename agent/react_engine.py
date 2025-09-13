@@ -4,7 +4,6 @@ import json
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
-from typing_extensions import deprecated
 
 import litellm
 from loguru import logger
@@ -356,7 +355,11 @@ class ReActEngine:
                 # Step count is now automatically managed by branch history updates
                 # No manual step increment needed in new design
 
-                self.steps_since_context_switch += 1
+                # FIX: Only increment counter when actual work (ACTION steps) was done
+                # Don't count pure thinking steps toward context switch threshold
+                if parsed_steps and any(step.step_type == StepType.ACTION for step in parsed_steps):
+                    self.steps_since_context_switch += 1
+                    logger.debug(f"Incremented steps_since_context_switch to {self.steps_since_context_switch} after ACTION step")
 
             logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
             return False
@@ -1262,7 +1265,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         # PERFORMANCE: Invalidate trunk cache if context state changed
                         if step.tool_name == "manage_context":
                             action = validated_params.get("action", "")
-                            if action in ["start_task", "complete_task", "complete_with_results"]:
+                            # FIX: Include ALL context-changing actions for cache invalidation
+                            cache_invalidating_actions = [
+                                "start_task", "complete_task", "complete_with_results",
+                                "add_context", "compact_context", "create_branch", 
+                                "switch_to_trunk", "switch_to_branch"
+                            ]
+                            if action in cache_invalidating_actions:
                                 self._invalidate_trunk_cache()
                                 logger.debug(f"Trunk cache invalidated after {action}")
 
@@ -1511,6 +1520,14 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         """Convert parameter to expected type."""
         try:
             if expected_type == 'string':
+                # Handle list to string conversion properly
+                if isinstance(value, list):
+                    # If list has one element, return just that element
+                    if len(value) == 1:
+                        return str(value[0])
+                    # If multiple elements, join with spaces (common for command-line args)
+                    else:
+                        return ' '.join(str(v) for v in value)
                 return str(value)
             elif expected_type == 'integer':
                 if isinstance(value, str):
@@ -1523,6 +1540,16 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             elif expected_type == 'boolean':
                 if isinstance(value, str):
                     return value.lower() in ['true', '1', 'yes', 'on']
+                elif isinstance(value, list):
+                    # Handle list to boolean conversion properly
+                    if len(value) == 0:
+                        return False  # Empty list = False
+                    elif len(value) == 1:
+                        # Single element - convert that element recursively
+                        return self._convert_parameter_type(value[0], 'boolean', param_name)
+                    else:
+                        # Multiple elements - true if any are true
+                        return any(self._convert_parameter_type(v, 'boolean', param_name) for v in value)
                 return bool(value)
             elif expected_type == 'array':
                 if isinstance(value, str):
@@ -1550,6 +1577,9 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                             return {"description": value}
                         else:
                             return {"value": value}  # Fallback: preserve in generic wrapper
+                # Don't wrap lists of dicts unnecessarily
+                if isinstance(value, list) and all(isinstance(item, dict) for item in value if value):
+                    return value  # Return list of dicts as-is
                 return value if isinstance(value, dict) else {"value": value}
         except Exception as e:
             logger.warning(f"Failed to convert parameter '{param_name}' to {expected_type}: {e}")
@@ -1648,7 +1678,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 'output': 'target_directory',
             },
             'maven': {
-                'goals': 'command',
+                # Don't map 'goals' - it's a separate parameter from 'command'
                 'options': 'properties',
                 'dir': 'working_directory',
                 'project_dir': 'working_directory',
@@ -1733,12 +1763,21 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         """Update successful states based on tool execution results."""
         try:
             # CRITICAL FIX: Reset context switch counter when context actually switches
-            if tool_name == "manage_context" and result.success:
+            # Reset on BOTH successful AND failed attempts to prevent accumulation
+            if tool_name == "manage_context":
                 action = params.get("action", "")
-                if action in ["start_task", "complete_with_results", "complete_task", "switch_to_trunk"]:
-                    # Reset the counter when we switch contexts
+                # Include all context-changing actions
+                context_changing_actions = [
+                    "start_task", "complete_with_results", "complete_task", 
+                    "switch_to_trunk", "create_branch", "switch_to_branch"
+                ]
+                if action in context_changing_actions:
+                    # Reset the counter regardless of success/failure
                     self.steps_since_context_switch = 0
-                    logger.info(f"✅ Reset steps_since_context_switch counter after {action}")
+                    if result.success:
+                        logger.info(f"✅ Reset steps_since_context_switch counter after successful {action}")
+                    else:
+                        logger.info(f"⚠️ Reset steps_since_context_switch counter after failed {action} attempt")
             
             if tool_name == "bash":
                 # CRITICAL FIX: Get actual working directory from tool result metadata
@@ -2554,50 +2593,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 return True
         return False
     
-    @deprecated("This is no longer used")
-    def _add_strong_completion_guidance(self, reason: str):
-        """Add strong guidance to push agent toward completion."""
-        guidance = (f"🚨 URGENT COMPLETION NOTICE: {reason}. "
-                   f"You MUST now call the report tool to generate a completion summary. "
-                   f"Example: report(action='generate', "
-                   f"summary='Maven project successfully built and tested'). "
-                   f"This will complete the task and stop further iterations.")
-        
-        guidance_step = ReActStep(
-            step_type=StepType.SYSTEM_GUIDANCE,
-            content=guidance,
-            timestamp=self._get_timestamp(),
-        )
-        self.steps.append(guidance_step)
-        
-        self.agent_logger.info(f"🚨 URGENT COMPLETION: {guidance}")
-        logger.info(f"🚨 URGENT COMPLETION: Strong completion guidance added - {reason}")
 
-    @deprecated("This is no longer used")
-    def _check_context_switching_guidance(self):
-        """Check if we should provide context switching guidance."""
-        if self.steps_since_context_switch >= self.context_switch_threshold:
-            # Check if we're in a branch context and haven't switched recently
-            if self.context_manager.current_task_id:
-                guidance = (
-                    f"SYSTEM GUIDANCE: You have been working on the current task for "
-                    f"{self.steps_since_context_switch} steps. Consider if the sub-task "
-                    f"is complete and if you should return to the trunk context with a summary "
-                    f"using the manage_context tool."
-                )
-
-                guidance_step = ReActStep(
-                    step_type=StepType.SYSTEM_GUIDANCE,
-                    content=guidance,
-                    timestamp=self._get_timestamp(),
-                )
-                self.steps.append(guidance_step)
-
-                self.agent_logger.info(f"🔔 SYSTEM GUIDANCE: {guidance}")
-                logger.info(f"🔔 SYSTEM GUIDANCE: Context switch suggestion")
-
-                # Reset counter
-                self.steps_since_context_switch = 0
 
     def _build_next_prompt(self) -> str:
         """Build the prompt for the next iteration."""
@@ -2709,73 +2705,7 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
 
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    @deprecated("This is no longer used")
-    def _needs_action_guidance(self) -> bool:
-        """Check if the model needs explicit action guidance."""
-        # Count recent thoughts without actions
-        recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
-        thoughts_count = 0
-        actions_count = 0
-        
-        for step in reversed(recent_steps):
-            if step.step_type == StepType.THOUGHT:
-                thoughts_count += 1
-                # Check if the thought mentions needing repository URL
-                if any(phrase in step.content.lower() for phrase in [
-                    "need the repository url",
-                    "need access to",
-                    "please share",
-                    "could you",
-                    "waiting for",
-                    "require the url"
-                ]):
-                    return True
-            elif step.step_type == StepType.ACTION:
-                actions_count += 1
-                
-        # Need guidance if too many thoughts without actions
-        return thoughts_count >= 3 and actions_count == 0
 
-    @deprecated("This is no longer used")
-    def _add_action_guidance(self):
-        """Add explicit action guidance to help the model."""
-        if self.repository_url:
-            guidance = f"""SYSTEM GUIDANCE: You seem to be stuck. The repository URL is: {self.repository_url}
-
-Take ACTION NOW using function calling. Here's exactly what to do:
-
-Option 1: Clone the repository immediately:
-- Use project_setup tool with action="clone" and repository_url="{self.repository_url}"
-
-Option 2: Check context first:
-- Use manage_context tool with action="get_info"
-
-Option 3: If already cloned, navigate to the project:
-- Use bash tool with command="cd /workspace && ls -la"
-
-STOP asking for the repository URL - it's already provided above!"""
-        else:
-            guidance = """SYSTEM GUIDANCE: You need to take action. Use the available tools:
-
-1. manage_context - Check your current context
-2. bash - Execute shell commands
-3. file_io - Read and write files
-4. web_search - Search for information
-5. maven - Run Maven commands
-6. project_setup - Clone and setup projects
-7. system - Install packages
-
-Use function calling to execute these tools!"""
-
-        guidance_step = ReActStep(
-            step_type=StepType.SYSTEM_GUIDANCE,
-            content=guidance,
-            timestamp=self._get_timestamp(),
-        )
-        self.steps.append(guidance_step)
-        
-        self.agent_logger.info(f"🔔 SYSTEM GUIDANCE: Added explicit action guidance")
-        logger.info(f"🔔 SYSTEM GUIDANCE: Model needs explicit action guidance")
 
     def _log_llm_request(
         self, model: str, prompt: str, temperature: float, max_tokens: int, is_thinking: bool
@@ -3155,71 +3085,6 @@ Use function calling to execute these tools!"""
                 return critical_memory + "\n" + prompt
         return prompt
 
-    @deprecated("This is no longer used")
-    def _check_task_completion_opportunity(self, observation: str):
-        """
-        Check if the observation indicates a task completion opportunity.
-        Reminds Agent to use complete_with_results to avoid state/action separation.
-        """
-        if not self.context_manager.current_task_id:
-            return  # Not in a task context
-            
-        # Define completion signals for different types of work
-        completion_signals = {
-            'repository_cloned': [
-                'successfully cloned',
-                'cloning into',
-                'clone completed',
-                'repository cloned'
-            ],
-            'project_detected': [
-                'found pom.xml',
-                'maven project detected',
-                'package.json found',
-                'project type:'
-            ],
-            'build_success': [
-                'BUILD SUCCESS',
-                'Tests run:',
-                'compilation successful',
-                'all tests passed'
-            ],
-            'environment_setup': [
-                'environment configured',
-                'dependencies installed',
-                'setup completed'
-            ]
-        }
-        
-        observation_lower = observation.lower()
-        detected_signals = []
-        
-        for signal_type, patterns in completion_signals.items():
-            for pattern in patterns:
-                if pattern.lower() in observation_lower:
-                    detected_signals.append(signal_type)
-                    break
-        
-        if detected_signals:
-            # Add a system guidance to remind about state updates
-            guidance_content = (
-                f"🚨 TASK COMPLETION DETECTED: {', '.join(detected_signals)}\n"
-                f"CRITICAL REMINDER: If this completes your current task ({self.context_manager.current_task_id}), "
-                f"you MUST immediately call:\n"
-                f"manage_context(action='complete_with_results', summary='...', key_results='...')\n"
-                f"Do NOT continue to other tasks without updating the official task status!\n"
-                f"This prevents 'ghost states' where work is done but not recorded."
-            )
-            
-            guidance_step = ReActStep(
-                step_type=StepType.SYSTEM_GUIDANCE,
-                content=guidance_content,
-                timestamp=self._get_timestamp()
-            )
-            self.steps.append(guidance_step)
-            
-            logger.info(f"🚨 Task completion opportunity detected: {detected_signals}")
-            self.agent_logger.info(f"🚨 TASK COMPLETION GUIDANCE: {guidance_content}")
 
     def _get_cached_trunk_context(self):
         """
@@ -3679,7 +3544,18 @@ EXECUTE ACTIONS FOR:
                 for recovery_cmd, description in recovery_steps:
                     logger.info(f"🔧 RECOVERY STEP: {description}")
                     # Use the orchestrator directly to avoid recursion
-                    recovery_result = self.docker_orchestrator.execute_command(recovery_cmd, workdir=None)
+                    # Fix: Use context_manager.orchestrator instead of non-existent self.docker_orchestrator
+                    if hasattr(self.context_manager, 'orchestrator') and self.context_manager.orchestrator:
+                        recovery_result = self.context_manager.orchestrator.execute_command(recovery_cmd, workdir=None)
+                    else:
+                        # Fallback to bash tool if orchestrator not available
+                        logger.warning("No orchestrator available, using bash tool for recovery")
+                        bash_tool = self.tools.get("bash")
+                        if bash_tool:
+                            bash_result = bash_tool.execute(command=recovery_cmd, working_directory="/")
+                            recovery_result = {"success": bash_result.success, "output": bash_result.output}
+                        else:
+                            recovery_result = {"success": False, "output": "No recovery mechanism available"}
                     
                     if not recovery_result["success"]:
                         logger.warning(f"⚠️ Recovery step failed: {description}")
