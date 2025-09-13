@@ -208,7 +208,8 @@ class ProjectSetupTool(BaseTool):
         target_directory: Optional[str] = None,
         branch: Optional[str] = None,
         auto_install_deps: bool = True,
-        working_directory: str = "/workspace"
+        working_directory: str = "/workspace",
+        **kwargs
     ) -> ToolResult:
         """
         Execute project setup actions.

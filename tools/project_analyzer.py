@@ -26,8 +26,8 @@ class ProjectAnalyzerTool(BaseTool):
         self,
         action: str = "analyze",
         project_path: str = "/workspace",
-        directory: str = None,  # Support legacy parameter name
-        update_context: bool = True
+        update_context: bool = True,
+        **kwargs
     ) -> ToolResult:
         """
         Analyze project and generate execution plan.
@@ -35,14 +35,25 @@ class ProjectAnalyzerTool(BaseTool):
         Args:
             action: Action to perform ('analyze' for full analysis)
             project_path: Path to the project directory in container
-            directory: Legacy parameter name (mapped to project_path)
             update_context: Whether to update the trunk context with new tasks
         """
         
-        # Handle legacy parameter name 'directory'
-        if directory is not None:
-            project_path = directory
-            logger.info(f"⚠️ Using legacy parameter 'directory', mapped to project_path: {project_path}")
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for project_analyzer tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - action (optional): 'analyze' (default: 'analyze')\n"
+                    f"  - project_path (optional): Path to project directory (default: '/workspace')\n"
+                    f"  - update_context (optional): Update trunk context (default: True)\n\n"
+                    f"Example: project_analyzer(action='analyze', project_path='/workspace/myproject')\n"
+                    f"Example: project_analyzer()"  # Uses all defaults
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
         
         logger.info(f"Starting project analysis at: {project_path}")
 

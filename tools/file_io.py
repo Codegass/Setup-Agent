@@ -23,7 +23,8 @@ class FileIOTool(BaseTool):
         path: str,
         content: Optional[str] = None,
         start_line: int = 0,
-        end_line: Optional[int] = None
+        end_line: Optional[int] = None,
+        **kwargs
     ) -> ToolResult:
         """
         Execute a file operation.
@@ -35,6 +36,50 @@ class FileIOTool(BaseTool):
             start_line: The starting line number for reading (for 'read' action).
             end_line: The ending line number for reading (for 'read' action).
         """
+        
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for file_io tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - action (required): 'read', 'write', or 'list'\n"
+                    f"  - path (required): File or directory path\n"
+                    f"  - content (optional): Content to write (for 'write' action)\n"
+                    f"  - start_line (optional): Starting line for reading (default: 0)\n"
+                    f"  - end_line (optional): Ending line for reading (default: None)\n\n"
+                    f"Example: file_io(action='read', path='/workspace/file.txt')\n"
+                    f"Example: file_io(action='write', path='/workspace/file.txt', content='Hello World')"
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
+        
+        # Check for required parameters
+        if not action:
+            return ToolResult(
+                success=False,
+                output=(
+                    "❌ Missing required parameter: 'action'\n\n"
+                    "The file_io tool requires an 'action' parameter.\n"
+                    "Valid actions: 'read', 'write', 'list'\n"
+                    "Example: file_io(action='read', path='/workspace/file.txt')"
+                ),
+                error="Missing required parameter: action"
+            )
+        
+        if not path:
+            return ToolResult(
+                success=False,
+                output=(
+                    "❌ Missing required parameter: 'path'\n\n"
+                    "The file_io tool requires a 'path' parameter.\n"
+                    "Example: file_io(action='read', path='/workspace/file.txt')"
+                ),
+                error="Missing required parameter: path"
+            )
+        
         if action == "read":
             return self._read(path, start_line, end_line)
         elif action == "write":

@@ -27,7 +27,8 @@ class ContextTool(BaseTool):
         entry: Optional[Dict[str, Any]] = None,
         summary: Optional[str] = None,
         new_context: Optional[List[Dict[str, Any]]] = None,
-        key_results: Optional[str] = None
+        key_results: Optional[str] = None,
+        **kwargs
     ) -> ToolResult:
         """
         Execute context management actions.
@@ -40,6 +41,39 @@ class ContextTool(BaseTool):
             new_context: Compacted context history (required for 'compact_context')
             key_results: Key results to record (required for 'complete_with_results')
         """
+        
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for context tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - action (required): 'get_info', 'start_task', 'add_context', 'get_full_context', etc.\n"
+                    f"  - task_id (optional): Task ID for task-specific actions\n"
+                    f"  - entry (optional): Context entry for 'add_context'\n"
+                    f"  - summary (optional): Summary for completion actions\n"
+                    f"  - new_context (optional): New context for 'compact_context'\n"
+                    f"  - key_results (optional): Key results for 'complete_with_results'\n\n"
+                    f"Example: context(action='get_info')\n"
+                    f"Example: context(action='start_task', task_id='task_1')"
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
+        
+        # Check for required parameters
+        if not action:
+            return ToolResult(
+                success=False,
+                output=(
+                    "❌ Missing required parameter: 'action'\n\n"
+                    "The context tool requires an 'action' parameter.\n"
+                    "Valid actions: 'get_info', 'start_task', 'add_context', 'get_full_context', etc.\n"
+                    "Example: context(action='get_info')"
+                ),
+                error="Missing required parameter: action"
+            )
         
         valid_actions = ["get_info", "start_task", "create_branch", "add_context", "get_full_context", "compact_context", "complete_task", "complete_with_results", "switch_to_trunk"]
         

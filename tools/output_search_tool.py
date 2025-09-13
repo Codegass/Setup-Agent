@@ -54,6 +54,27 @@ class OutputSearchTool(BaseTool):
         Returns:
             ToolResult with search results or retrieved output
         """
+        
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for output_search tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - action (optional): 'search', 'retrieve', or 'list' (default: 'search')\n"
+                    f"  - ref_id (optional): Reference ID for 'retrieve' action\n"
+                    f"  - pattern (optional): Search pattern for 'search' action\n"
+                    f"  - task_id (optional): Filter by task ID\n"
+                    f"  - tool_name (optional): Filter by tool name\n"
+                    f"  - limit (optional): Maximum results (default: 10)\n\n"
+                    f"Example: output_search(action='search', pattern='error')\n"
+                    f"Example: output_search(action='retrieve', ref_id='abc123')"
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
+        
         try:
             if action == "retrieve":
                 return self._retrieve_output(ref_id)

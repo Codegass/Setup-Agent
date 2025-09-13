@@ -20,8 +20,37 @@ class WebSearchTool(BaseTool):
             "installation instructions, or any other information needed for setup.",
         )
 
-    def execute(self, query: str, max_results: int = 5) -> ToolResult:
+    def execute(self, query: str, max_results: int = 5, **kwargs) -> ToolResult:
         """Execute a web search."""
+        
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for web_search tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - query (required): Search query string\n"
+                    f"  - max_results (optional): Maximum number of results (default: 5)\n\n"
+                    f"Example: web_search(query='Python programming tutorials')\n"
+                    f"Example: web_search(query='Docker best practices', max_results=10)"
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
+        
+        # Check for required parameters
+        if not query:
+            return ToolResult(
+                success=False,
+                output=(
+                    "❌ Missing required parameter: 'query'\n\n"
+                    "The web_search tool requires a 'query' parameter.\n"
+                    "Example: web_search(query='Python programming tutorials')"
+                ),
+                error="Missing required parameter: query"
+            )
+        
         if not query.strip():
             return ToolResult(success=False, output="", error="Empty search query provided")
 

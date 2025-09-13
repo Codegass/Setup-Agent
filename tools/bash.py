@@ -274,8 +274,8 @@ class BashTool(BaseTool):
         
         return output
 
-    def execute(self, command: str, working_directory: str = "/workspace", 
-                environment: Optional[Dict[str, str]] = None) -> ToolResult:
+    def execute(self, command: str = None, working_directory: str = "/workspace", 
+                environment: Optional[Dict[str, str]] = None, **kwargs) -> ToolResult:
         """
         Execute a bash command in the Docker container with enhanced monitoring.
         
@@ -285,11 +285,36 @@ class BashTool(BaseTool):
             environment: Additional environment variables to set
         """
         
+        # Check for unexpected parameters and provide clear error feedback
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for bash tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - command (required): The bash command to execute\n"
+                    f"  - working_directory (optional): Working directory (default: /workspace)\n"
+                    f"  - environment (optional): Additional environment variables\n\n"
+                    f"Example: bash(command='mvn clean test', working_directory='/workspace/project')\n"
+                    f"Example: bash(command='ls -la')"
+                ),
+                error=f"Invalid parameters: {invalid_params}",
+                raw_output=""
+            )
+        
+        # Check for required parameter
         if not command or not command.strip():
-            raise ToolError(
-                message="Command cannot be empty",
-                suggestions=["Provide a valid bash command to execute"],
-                error_code="EMPTY_COMMAND"
+            return ToolResult(
+                success=False,
+                output=(
+                    "❌ Missing required parameter: 'command'\n\n"
+                    "The bash tool requires a 'command' parameter.\n"
+                    "Example: bash(command='ls -la')\n"
+                    "Example: bash(command='mvn clean test')"
+                ),
+                error="Missing required parameter: command",
+                raw_output=""
             )
         
         if not self.docker_orchestrator:

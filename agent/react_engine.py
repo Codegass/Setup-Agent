@@ -1380,9 +1380,11 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         # Remove clearly invalid parameters
                         params_to_remove.append(param)
                 
-                for param in params_to_remove:
-                    logger.warning(f"🔧 Removing invalid parameter: {param}={validated_params[param]}")
-                    del validated_params[param]
+                # DISABLED: Auto-removal of invalid parameters to enable proper error feedback
+                # Let tools handle their own parameter validation and provide clear error messages
+                # for param in params_to_remove:
+                #     logger.warning(f"🔧 Removing invalid parameter: {param}={validated_params[param]}")
+                #     del validated_params[param]
             
             # Log parameter fixes if any were made
             if validated_params != params:

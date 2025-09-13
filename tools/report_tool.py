@@ -41,7 +41,8 @@ class ReportTool(BaseTool):
         action: str = "generate",
         summary: Optional[str] = None,
         status: str = "success",
-        details: Optional[str] = None
+        details: Optional[str] = None,
+        **kwargs
     ) -> ToolResult:
         """
         Generate project setup report and mark completion.
@@ -52,6 +53,24 @@ class ReportTool(BaseTool):
             status: Overall status ('success', 'partial', 'failed')
             details: Additional details about the setup process
         """
+        
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for report tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - action (optional): 'generate' (default: 'generate')\n"
+                    f"  - summary (optional): Brief summary of accomplishments\n"
+                    f"  - status (optional): 'success', 'partial', or 'failed' (default: 'success')\n"
+                    f"  - details (optional): Additional details about the setup\n\n"
+                    f"Example: report(action='generate')\n"
+                    f"Example: report(action='generate', summary='Project built successfully', status='success')"
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
         
         logger.info(f"Generating project report with status: {status}")
 

@@ -1,4 +1,5 @@
 {
     "editor.fontFamily": "'Monaspace Krypton',Menlo, Monaco, 'Courier New', monospace",
-    "workbench.colorTheme": "Dobri Next -A04- Cobalt"
+    "workbench.colorTheme": "Dobri Next -A04- Cobalt",
+    "python.languageServer": "None"
 }

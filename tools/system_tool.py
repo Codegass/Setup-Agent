@@ -19,8 +19,38 @@ class SystemTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
 
-    def execute(self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None) -> ToolResult:
+    def execute(self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None, **kwargs) -> ToolResult:
         """Execute system management operations."""
+        
+        # Check for unexpected parameters
+        if kwargs:
+            invalid_params = list(kwargs.keys())
+            return ToolResult(
+                success=False,
+                output=(
+                    f"❌ Invalid parameters for system tool: {invalid_params}\n\n"
+                    f"✅ Valid parameters:\n"
+                    f"  - action (required): 'install', 'verify_java', 'install_java'\n"
+                    f"  - packages (optional): List of packages to install\n"
+                    f"  - java_version (optional): Java version for 'install_java' action\n\n"
+                    f"Example: system(action='install', packages=['curl', 'git'])\n"
+                    f"Example: system(action='install_java', java_version='17')"
+                ),
+                error=f"Invalid parameters: {invalid_params}"
+            )
+        
+        # Check for required parameters
+        if not action:
+            return ToolResult(
+                success=False,
+                output=(
+                    "❌ Missing required parameter: 'action'\n\n"
+                    "The system tool requires an 'action' parameter.\n"
+                    "Valid actions: 'install', 'verify_java', 'install_java'\n"
+                    "Example: system(action='install', packages=['curl', 'git'])"
+                ),
+                error="Missing required parameter: action"
+            )
         
         if action not in ["install", "update", "detect_missing", "install_missing", "install_java", "verify_java"]:
             return ToolResult(
