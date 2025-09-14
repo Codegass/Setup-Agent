@@ -456,6 +456,18 @@ class ProjectAnalyzerTool(BaseTool):
         else:
             logger.warning(f"No Java version found in Maven configuration for {project_path}")
 
+        # Check for multi-module project
+        modules_match = re.search(r"<modules>(.*?)</modules>", main_pom_content, re.DOTALL)
+        if modules_match:
+            module_content = modules_match.group(1)
+            modules = re.findall(r"<module>([^<]+)</module>", module_content)
+            config["maven_modules"] = modules
+            config["is_multi_module"] = True
+            logger.info(f"Found multi-module Maven project with {len(modules)} modules: {modules}")
+        else:
+            config["maven_modules"] = []
+            config["is_multi_module"] = False
+
         # Extract dependencies from main POM only
         dependency_matches = re.findall(r"<groupId>([^<]+)</groupId>.*?<artifactId>([^<]+)</artifactId>", main_pom_content, re.DOTALL)
         config["dependencies"] = [f"{group}:{artifact}" for group, artifact in dependency_matches[:10]]  # 限制输出
@@ -784,7 +796,14 @@ class ProjectAnalyzerTool(BaseTool):
         if test_commands:
             test_desc = f"Run tests using documented commands: {', '.join(test_commands[:2])}"
         elif project_type == "Java" and build_system == "Maven":
-            test_desc = "Run tests using Maven"
+            # Check if this is a multi-module project
+            is_multi_module = analysis.get("is_multi_module", False)
+            if is_multi_module:
+                test_desc = "Run tests for all modules using Maven (multi-module project)"
+                # Add specific command recommendation
+                test_commands = ["maven(command='test', fail_at_end=True)"]
+            else:
+                test_desc = "Run tests using Maven"
             if test_framework != "unknown":
                 test_desc += f" ({test_framework})"
         elif project_type == "Java" and build_system == "Gradle":
@@ -798,13 +817,23 @@ class ProjectAnalyzerTool(BaseTool):
         else:
             test_desc = f"Execute {project_type} project tests"
 
-        plan.append({
+        test_step = {
             "id": "run_tests",
             "description": test_desc,
             "priority": "critical",
             "type": "test",
             "core_step": "test"
-        })
+        }
+
+        # Add specific commands for multi-module Maven projects
+        if project_type == "Java" and build_system == "Maven" and analysis.get("is_multi_module", False):
+            test_step["commands"] = [
+                "maven(command='test', fail_at_end=True)",
+                "# This ensures all modules are tested even if some have failures"
+            ]
+            test_step["notes"] = "Multi-module project: use fail_at_end=True to test all modules"
+
+        plan.append(test_step)
 
         # STEP 4: REPORT - Generate completion report
         plan.append({

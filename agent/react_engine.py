@@ -850,7 +850,84 @@ EXAMPLE FLOW:
 3. 📋 Your generic tasks get replaced with smart tasks like "Setup Maven Java 17 environment", "Build with Maven", etc.
 4. Execute the intelligent plan
 
-Use these tools as needed to complete your tasks."""
+Use these tools as needed to complete your tasks.
+
+## Handling Maven POM Parsing Errors
+
+When encountering Maven POM parsing errors during test execution, follow this decision tree:
+
+### 1. Identify POM Parsing Errors
+Look for these specific error patterns:
+- [FATAL] Non-parseable POM /path/to/pom.xml: Unrecognised tag: 'tagname' (position: START_TAG seen ...@line:column)
+- [ERROR] The build could not read 1 project
+
+### 2. Attempt Automatic Recovery (for POM errors ONLY)
+For POM parsing errors, try these fixes in order:
+1. Analyze the error location: bash(command='sed -n "LINE-5,LINE+5p" pom.xml')
+2. Common XML fixes:
+   - Orphaned tags outside dependency blocks: Remove or move inside proper parent
+   - Missing closing tags: Add the appropriate closing tag
+   - Misplaced tags: Move to correct location within parent element
+3. Verify fix: bash(command='xmllint --noout pom.xml')
+4. Test the fix: maven(command='validate', working_directory='/path/to/module')
+
+### 3. When Recovery Fails
+If automatic fix attempts fail after 2 tries:
+- Use maven(command='test', properties='pl=!module-name') to exclude ONLY the unparseable module
+- Document the issue in the context for the report
+- Continue testing other modules to maximize test coverage
+
+### 4. Important Distinctions
+DO NOT skip modules for: Test failures, compilation errors, missing dependencies, timeouts
+ONLY skip modules for: Unfixable POM parsing errors after attempted recovery
+
+### 5. Validation Requirements
+Before marking any test task as complete:
+- Check for test reports: bash(command='find . -name "TEST-*.xml" -o -path "*/surefire-reports"')
+- If no reports exist, the tests didn't run - investigate why
+- Document the number of tests run vs skipped in task results
+
+## Handling Multi-Module Maven Test Execution
+
+When running tests in multi-module Maven projects:
+
+### 1. DEFAULT BEHAVIOR WARNING
+Maven stops at the first module with test failures by default. This means:
+- If module A has test failures, modules B, C, D won't be tested
+- You'll miss potentially thousands of tests
+- Physical validation will show incomplete test coverage
+
+### 2. COMPREHENSIVE TESTING STRATEGIES
+For multi-module projects, use these approaches:
+
+**Option 1 - Fail at End (RECOMMENDED):**
+```
+maven(command="test", fail_at_end=True)
+```
+- Runs tests for ALL modules
+- Reports failures at the end
+- Build fails if any module has test failures
+- Best for getting complete test coverage
+
+**Option 2 - Ignore Test Failures:**
+```
+maven(command="test", ignore_test_failures=True)
+```
+- Continues build even if tests fail
+- Useful for getting a full picture of all failures
+- Build succeeds even with test failures
+
+### 3. DETECTION AND RESPONSE
+When you detect a multi-module project (contains <modules> in pom.xml):
+1. Always use fail_at_end=True for initial test run
+2. Check physical validation for modules without test reports
+3. If some modules lack reports, investigate why (compilation failures, etc.)
+
+### 4. VALIDATION
+After running tests in multi-module projects:
+- Verify ALL modules have surefire-reports directories
+- Check total test count matches expected (hundreds/thousands, not just dozens)
+- Report any modules that didn't run tests"""
 
         prompt += f"""
 

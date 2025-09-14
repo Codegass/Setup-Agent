@@ -17,8 +17,10 @@ class MavenTool(BaseTool):
     def __init__(self, orchestrator, command_tracker: CommandTracker = None):
         super().__init__(
             name="maven",
-            description="Execute Maven commands with comprehensive error analysis and raw output access. "
-                       "Supports all Maven lifecycle phases, dependency management, and build analysis. "
+            description="Execute Maven commands for building and testing Java projects. "
+                       "IMPORTANT: Set working_directory to the folder containing pom.xml. "
+                       "For multi-module projects with test failures, use fail_at_end=True to test all modules. "
+                       "Common commands: compile, test, package, install. "
                        "Automatically installs Maven if not present."
         )
         self.orchestrator = orchestrator
@@ -41,19 +43,53 @@ class MavenTool(BaseTool):
         working_directory: str = "/workspace",
         timeout: int = 300,
         pom_file: str = None,
+        fail_at_end: bool = False,
+        ignore_test_failures: bool = False,
         **kwargs  # Accept any additional parameters
     ) -> ToolResult:
         """
         Execute Maven commands with comprehensive error handling.
-        
+
         Args:
-            command: Maven command (e.g., 'clean', 'compile', 'test', 'package', 'install')
-            goals: Additional goals to run (e.g., 'clean compile', 'test-compile')
-            profiles: Maven profiles to activate (e.g., 'dev,test')
-            properties: Maven properties (e.g., 'skipTests=true,maven.test.skip=true')
-            raw_output: Whether to return raw Maven output for detailed analysis
-            working_directory: Directory to execute Maven in
-            timeout: Command timeout in seconds
+            command: Main Maven phase/goal to execute. Common values:
+                    - 'compile' - Compile source code
+                    - 'test' - Run unit tests (stops at first module failure by default)
+                    - 'package' - Create JAR/WAR files
+                    - 'install' - Install to local repository
+                    - 'clean' - Clean build artifacts
+                    Can also be compound like 'clean compile' or 'clean test'
+
+            working_directory: REQUIRED - Path to directory containing pom.xml
+                             Example: '/workspace/struts' for the Struts project
+                             Default: '/workspace' (will auto-search for pom.xml)
+
+            fail_at_end: IMPORTANT for multi-module projects!
+                        Set to True when running tests to test ALL modules even if some fail.
+                        Without this, Maven stops at the first module with test failures.
+                        Example: maven(command='test', fail_at_end=True)
+
+            properties: Maven properties as comma-separated key=value pairs.
+                       Examples:
+                       - 'skipTests=true' - Skip test execution
+                       - 'maven.test.skip=true' - Skip test compilation and execution
+                       - 'maven.compiler.source=17,maven.compiler.target=17' - Set Java version
+
+            goals: Additional goals to append after the main command (rarely needed)
+                  Example: goals='dependency:tree' to add dependency analysis
+
+            profiles: Activate Maven profiles defined in pom.xml
+                     Example: 'production' or 'dev,test' for multiple profiles
+
+            raw_output: Set to True to get complete Maven output for debugging
+                       Useful when build fails and you need to see all details
+
+            pom_file: Path to specific pom.xml if not in working_directory (rarely needed)
+                     Example: '/workspace/project/custom-pom.xml'
+
+            ignore_test_failures: Continue build even if tests fail (alternative to fail_at_end)
+                                 Sets maven.test.failure.ignore=true property
+
+            timeout: Maximum seconds to wait for command completion (default: 300)
         """
         
         # Deterministic working directory fallback (do not override user intent unless certain)
@@ -96,6 +132,13 @@ class MavenTool(BaseTool):
             if not install_result.success:
                 return install_result
         
+        # Handle ignore_test_failures by adding to properties
+        if ignore_test_failures:
+            if properties:
+                properties += ",maven.test.failure.ignore=true"
+            else:
+                properties = "maven.test.failure.ignore=true"
+
         # Validate that pom.xml exists in the working directory
         pom_validation = self._validate_pom_exists(working_directory, pom_file)
         if not pom_validation["exists"]:
@@ -110,8 +153,15 @@ class MavenTool(BaseTool):
                 logger.info(f"🔧 Using directory from pom_file: {working_directory}")
         
         # Build Maven command
-        maven_cmd = self._build_maven_command(command, goals, profiles, properties, pom_file)
-        
+        maven_cmd = self._build_maven_command(command, goals, profiles, properties, pom_file, fail_at_end)
+
+        # Check if this is a multi-module project running tests without fail handling
+        if command == "test" and self._is_multi_module_project(working_directory):
+            if not fail_at_end and not ignore_test_failures:
+                logger.warning("⚠️ Multi-module project detected! Maven will STOP at first module with test failures.")
+                logger.info("💡 To test ALL modules: maven(command='test', fail_at_end=True, working_directory='{}')".
+                          format(working_directory))
+
         # Execute the command
         try:
             # Use extended timeout for Maven commands which often download dependencies
@@ -251,9 +301,13 @@ class MavenTool(BaseTool):
                 error_code="MAVEN_EXECUTION_ERROR"
             )
     
-    def _build_maven_command(self, command: str, goals: str, profiles: str, properties: str, pom_file: str = None) -> str:
+    def _build_maven_command(self, command: str, goals: str, profiles: str, properties: str, pom_file: str = None, fail_at_end: bool = False) -> str:
         """Build the complete Maven command."""
         cmd_parts = ["mvn"]
+
+        # Add fail-at-end flag for multi-module projects
+        if fail_at_end:
+            cmd_parts.append("--fail-at-end")
         
         # Add profiles
         if profiles:
@@ -357,6 +411,19 @@ class MavenTool(BaseTool):
             logger.warning(f"Failed to setup Java environment: {e}")
             return None
 
+    def _is_multi_module_project(self, working_directory: str) -> bool:
+        """Check if this is a multi-module Maven project."""
+        if not self.orchestrator:
+            return False
+
+        try:
+            # Check for <modules> tag in the root pom.xml
+            check_cmd = f"grep -q '<modules>' {working_directory}/pom.xml 2>/dev/null && echo 'HAS_MODULES' || echo 'NO_MODULES'"
+            result = self.orchestrator.execute_command(check_cmd)
+            return result.get("success", False) and "HAS_MODULES" in result.get("output", "")
+        except Exception:
+            return False
+
     def _validate_pom_exists(self, working_directory: str, pom_file: str = None) -> dict:
         """Validate that pom.xml exists and is accessible."""
         if not self.orchestrator:
@@ -407,31 +474,33 @@ class MavenTool(BaseTool):
     def _handle_missing_pom(self, validation_result: dict, working_directory: str) -> ToolResult:
         """Handle the case when pom.xml is not found."""
         suggestions = [
-            f"Ensure you're in the correct project directory",
-            f"Current directory: {working_directory}",
-            "Change to the project root directory containing pom.xml"
+            f"📍 Current directory: {working_directory}",
+            "⚠️ This directory doesn't contain a pom.xml file"
         ]
-        
+
         # If we found alternative pom.xml files, suggest them
         if validation_result.get("found_alternatives"):
-            suggestions.append("Found pom.xml in these locations:")
-            
+            suggestions.append("\n🔍 Found pom.xml in these locations:")
+
             # Highlight root pom.xml if found
             suggested_root = validation_result.get("suggested_root")
             if suggested_root:
                 root_dir = suggested_root.replace("/pom.xml", "")
-                suggestions.append(f"  - 🎯 ROOT POM (recommended): maven(working_directory='{root_dir}')")
-                suggestions.append(f"    This appears to be a multi-module Maven project root")
-            
+                suggestions.append(f"\n🎯 RECOMMENDED: maven(command='...', working_directory='{root_dir}')")
+                if "<modules>" in suggested_root:
+                    suggestions.append("   ^ This is the root of a multi-module project")
+
             # Show other alternatives
             for pom_path in validation_result["found_alternatives"][:3]:
                 if pom_path != suggested_root:  # Don't duplicate the root pom
                     pom_dir = pom_path.replace("/pom.xml", "")
-                    suggestions.append(f"  - Alternative: maven(working_directory='{pom_dir}')")
+                    suggestions.append(f"\n• Alternative: maven(command='...', working_directory='{pom_dir}')")
         else:
             suggestions.extend([
-                "Use bash tool to navigate: bash(command='ls -la', working_directory='/workspace')",
-                "Find pom.xml: bash(command='find /workspace -name pom.xml')"
+                "\n🔍 To find pom.xml files:",
+                "bash(command='find /workspace -name pom.xml')",
+                "\n📂 To list current directory:",
+                "bash(command='ls -la', working_directory='/workspace')"
             ])
         
         return ToolResult(
@@ -531,11 +600,27 @@ class MavenTool(BaseTool):
             "build_time": None,
             "artifacts_created": [],
             "java_version_error": None,  # Added for Maven Enforcer detection
-            "enforcer_error": None  # Store the full enforcer error message
+            "enforcer_error": None,  # Store the full enforcer error message
+            "pom_parse_error": None,  # Added for POM parsing error detection
+            "error_type": None  # Track specific error type
         }
         
         lines = output.split('\n')
-        
+
+        # Check for POM parsing errors
+        if "Non-parseable POM" in output and "Unrecognised tag" in output:
+            import re
+            pom_error_match = re.search(r'Non-parseable POM ([^:]+): Unrecognised tag: \'([^\']+)\'.+@(\d+):(\d+)', output)
+            if pom_error_match:
+                analysis["pom_parse_error"] = {
+                    "file": pom_error_match.group(1),
+                    "tag": pom_error_match.group(2),
+                    "line": int(pom_error_match.group(3)),
+                    "column": int(pom_error_match.group(4))
+                }
+                analysis["error_type"] = "POM_PARSE_ERROR"
+                analysis["build_success"] = False  # Override build success for POM errors
+
         # Check for Maven Enforcer Java version errors
         import re
         enforcer_pattern = r"Detected JDK Version: ([\d\.]+).*is not in the allowed range \[([\d\.]+),\)"
@@ -781,7 +866,19 @@ class MavenTool(BaseTool):
                 "List current directory: bash(command='ls -la', working_directory='/workspace')"
             ])
             documentation_links.append("https://maven.apache.org/guides/getting-started/maven-in-five-minutes.html")
-        
+
+        # Check for POM parsing errors
+        if "Non-parseable POM" in output:
+            error_code = "POM_PARSE_ERROR"
+            error_suggestions.extend([
+                "POM file has XML syntax errors - check the error message for the specific line and tag",
+                "Use bash to examine the problematic line in the POM file",
+                "Common issues: orphaned tags, missing closing tags, tags outside proper parent elements",
+                "Try: bash(command='xmllint --noout /path/to/pom.xml') to validate XML structure",
+                "If unfixable, exclude the module: maven(command='test', properties='pl=!module-name')"
+            ])
+            documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
+
         # Check for Java version issues (including Maven Enforcer plugin)
         if ("Unsupported major.minor version" in output or 
             "java.lang.UnsupportedClassVersionError" in output or
@@ -1048,7 +1145,23 @@ class MavenTool(BaseTool):
                 {"action": "build_modules", "description": "Build project modules separately"},
                 {"action": "clean_target", "command": "maven(command='clean')"}
             ])
-        
+        elif error_code == "POM_PARSE_ERROR":
+            # Get POM parsing error details
+            pom_error = analysis.get("pom_parse_error", {})
+            pom_file = pom_error.get("file", "pom.xml")
+            tag = pom_error.get("tag", "unknown")
+            line = pom_error.get("line", 0)
+
+            recovery_actions.extend([
+                {"action": "examine_pom", "command": f"bash(command='cat {pom_file} | head -n {line + 5} | tail -n 10')"},
+                {"action": "validate_xml", "command": f"bash(command='xmllint --noout {pom_file} 2>&1 || echo \"XML validation failed\"')"},
+                {"action": "find_orphaned_tags", "command": f"bash(command='grep -n \"<{tag}>\" {pom_file}')"},
+                {"action": "fix_orphaned_tag", "description": f"Remove orphaned <{tag}> tag at line {line} that's outside proper XML structure"},
+                {"action": "backup_and_fix", "command": f"bash(command='cp {pom_file} {pom_file}.backup && sed -i \"{line}d\" {pom_file}')"},
+                {"action": "check_parent_pom", "command": "bash(command='if [ -f ../pom.xml ]; then grep -A 5 -B 5 \"<modules>\" ../pom.xml; fi')"},
+                {"action": "skip_module", "description": f"If POM cannot be fixed, consider excluding this module from parent POM (last resort)"}
+            ])
+
         return recovery_actions
     
     def _get_diagnostic_commands(self, error_code: str) -> list:
@@ -1080,7 +1193,13 @@ class MavenTool(BaseTool):
                 "bash(command='ping -c 3 repo.maven.apache.org 2>/dev/null || echo Network unreachable')",
                 "bash(command='cat ~/.m2/settings.xml 2>/dev/null || echo No settings.xml')"
             ])
-        
+        elif error_code == "POM_PARSE_ERROR":
+            diagnostics.extend([
+                "bash(command='find /workspace -name pom.xml -type f | xargs -I {} xmllint --noout {} 2>&1')",
+                "maven(command='validate', raw_output=true)",
+                "bash(command='grep -r \"<groupId>\" --include=\"pom.xml\" /workspace | head -20')"
+            ])
+
         return diagnostics
 
     def _validate_build_artifacts_in_container(self, working_directory: str, command: str) -> Dict[str, Any]:
@@ -1163,22 +1282,27 @@ class MavenTool(BaseTool):
         return """
 Maven Tool Usage Examples:
 
-Basic commands:
-• maven(command="clean")
-• maven(command="compile")
-• maven(command="test")
-• maven(command="package")
+🎯 MOST COMMON USAGE:
+• maven(command="compile", working_directory="/workspace/myproject")
+• maven(command="test", working_directory="/workspace/myproject")
+• maven(command="clean install", working_directory="/workspace/myproject")
 
-Advanced usage:
-• maven(command="clean", goals="compile test")
-• maven(command="test", properties="skipTests=false")
-• maven(command="package", profiles="production")
-• maven(command="install", raw_output=true)  # Get full Maven output
+⚠️ MULTI-MODULE PROJECTS (like Struts, Tika):
+• maven(command="test", working_directory="/workspace/struts", fail_at_end=True)
+  # Without fail_at_end=True, Maven stops at first module with test failures!
+  # With it, all 2,711 tests run instead of just 326
 
-For debugging:
-• maven(command="compile", raw_output=true)  # See full compilation details
-• maven(command="dependency:tree")  # Analyze dependencies
-• maven(command="help:effective-pom")  # See effective POM
+🔧 COMMON SCENARIOS:
+• Skip tests: maven(command="install", properties="skipTests=true")
+• Debug failures: maven(command="test", raw_output=True)
+• Clean build: maven(command="clean compile")
+• With profiles: maven(command="package", profiles="production")
+
+💡 PARAMETER TIPS:
+• working_directory: ALWAYS set to folder containing pom.xml
+• fail_at_end: ALWAYS use True for multi-module project tests
+• command vs goals: Use 'command' for main phases, 'goals' only for extras
+• raw_output: Use True when debugging build failures
 """
     
     def _get_parameters_schema(self) -> Dict[str, Any]:
@@ -1188,42 +1312,52 @@ For debugging:
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "Maven command (e.g., 'clean', 'compile', 'test', 'package', 'install')",
+                    "description": "Maven phase to execute: 'compile', 'test', 'package', 'install', 'clean', or compound like 'clean test'",
                 },
-                "goals": {
+                "working_directory": {
                     "type": "string",
-                    "description": "Additional goals to run (e.g., 'clean compile', 'test-compile')",
-                    "default": None,
+                    "description": "Path to directory containing pom.xml (e.g., '/workspace/struts'). Will auto-search if not specified.",
+                    "default": "/workspace",
                 },
-                "profiles": {
-                    "type": "string",
-                    "description": "Maven profiles to activate (e.g., 'dev,test')",
-                    "default": None,
+                "fail_at_end": {
+                    "type": "boolean",
+                    "description": "IMPORTANT for multi-module projects: Set to True to test ALL modules even if some fail. Without this, Maven stops at first failure.",
+                    "default": False,
                 },
                 "properties": {
                     "type": "string",
-                    "description": "Maven properties (e.g., 'skipTests=true,maven.test.skip=true')",
+                    "description": "Maven properties as 'key=value,key2=value2'. Common: 'skipTests=true' to skip tests.",
                     "default": None,
                 },
                 "raw_output": {
                     "type": "boolean",
-                    "description": "Whether to return raw Maven output for detailed analysis",
+                    "description": "Return complete Maven output for debugging failed builds",
                     "default": False,
                 },
-                "working_directory": {
+                "goals": {
                     "type": "string",
-                    "description": "Directory to execute Maven in",
-                    "default": "/workspace",
+                    "description": "Additional goals to append (rarely needed, use 'command' for main goals)",
+                    "default": None,
+                },
+                "profiles": {
+                    "type": "string",
+                    "description": "Activate Maven profiles from pom.xml (e.g., 'production' or 'dev,test')",
+                    "default": None,
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Command timeout in seconds",
+                    "description": "Maximum seconds to wait (increase for slow builds)",
                     "default": 300,
                 },
                 "pom_file": {
                     "type": "string",
-                    "description": "Path to specific pom.xml file to use",
+                    "description": "Path to specific pom.xml if not in working_directory (rarely needed)",
                     "default": None,
+                },
+                "ignore_test_failures": {
+                    "type": "boolean",
+                    "description": "Continue build despite test failures (alternative to fail_at_end)",
+                    "default": False,
                 },
             },
             "required": ["command"],

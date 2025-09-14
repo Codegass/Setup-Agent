@@ -238,7 +238,7 @@ class DockerOrchestrator:
         # 如果command包含.json文件路径
         if '.json' in command and ('cat' in command or 'head' in command or 'tail' in command):
             return True
-        
+
         # 如果输出内容看起来像JSON结构
         stripped = output.strip()
         if stripped.startswith('{') and stripped.endswith('}'):
@@ -248,8 +248,116 @@ class DockerOrchestrator:
                 return True
             except json.JSONDecodeError:
                 pass
-        
+
         return False
+
+    def _is_xml_content(self, output: str, command: str) -> bool:
+        """
+        Detect if content is XML/POM file to avoid destructive truncation
+        """
+        # Check if command is reading a POM or XML file
+        if ('.xml' in command or 'pom.xml' in command) and ('cat' in command or 'head' in command or 'tail' in command):
+            return True
+
+        # Check if output looks like XML
+        stripped = output.strip()
+        if stripped.startswith('<?xml') or stripped.startswith('<project'):
+            return True
+
+        return False
+
+    def _smart_xml_truncate(self, xml_content: str, max_lines: int = 150) -> str:
+        """
+        Smart truncation for XML/POM files that preserves error-prone sections
+        """
+        lines = xml_content.split('\n')
+
+        if len(lines) <= max_lines:
+            return xml_content
+
+        # For POM files, try to preserve important sections
+        important_sections = []
+        error_prone_sections = []
+
+        # Look for potential problem areas in the XML
+        # First, find complete properties sections
+        properties_sections = []
+        i = 0
+        while i < len(lines):
+            if '<properties>' in lines[i]:
+                start_idx = i
+                # Find the matching closing tag
+                for j in range(i + 1, min(i + 50, len(lines))):  # Look up to 50 lines ahead
+                    if '</properties>' in lines[j]:
+                        # Include a few lines before and after for context
+                        properties_sections.append((max(0, start_idx - 2), min(len(lines), j + 3)))
+                        i = j
+                        break
+            i += 1
+
+        # Now look for other important tags
+        for i, line in enumerate(lines):
+            # Check for orphaned tags or malformed XML patterns
+            stripped = line.strip()
+            # Common problematic patterns
+            if any(tag in stripped for tag in ['<groupId>', '<artifactId>', '<version>', '<dependency>', '</dependency>']):
+                # Get context around these tags (5 lines before and after)
+                start = max(0, i - 5)
+                end = min(len(lines), i + 6)
+                error_prone_sections.append((start, end))
+
+        # Combine properties sections with other error-prone sections
+        # Keep properties sections separate for now to prevent merging
+
+        # Merge overlapping sections (but not properties sections)
+        if error_prone_sections or properties_sections:
+            merged = []
+
+            # First merge non-properties sections
+            if error_prone_sections:
+                error_prone_sections.sort()
+                current_start, current_end = error_prone_sections[0]
+
+                for start, end in error_prone_sections[1:]:
+                    if start <= current_end:
+                        current_end = max(current_end, end)
+                    else:
+                        merged.append((current_start, current_end))
+                        current_start, current_end = start, end
+                merged.append((current_start, current_end))
+
+            # Add all properties sections without merging (they're critical for Java version detection)
+            merged.extend(properties_sections)
+
+            # Sort the final list
+            merged.sort()
+
+            # Build truncated output preserving error-prone sections
+            result = []
+            result.extend(lines[:30])  # First 30 lines (header, organization info)
+            result.append(f"\n... [SMART XML TRUNCATION: Preserving error-prone sections including properties] ...\n")
+
+            for start, end in merged:
+                # Skip sections that are already included in the first 30 or last 20 lines
+                if end <= 30 or start >= len(lines) - 20:
+                    continue
+                # Include the section, adjusting for overlap with already included lines
+                actual_start = max(start, 30)  # Don't duplicate lines already in first 30
+                actual_end = min(end, len(lines) - 20)  # Don't duplicate lines in last 20
+                if actual_start < actual_end:
+                    result.append(f"... [Lines {actual_start+1}-{actual_end}] ...")
+                    result.extend(lines[actual_start:actual_end])
+
+            result.append(f"\n... [End of error-prone sections] ...\n")
+            result.extend(lines[-20:])  # Last 20 lines
+
+            logger.info(f"🔧 Applied XML-aware truncation: {len(lines)} lines → {len(result)} lines (preserved error-prone sections)")
+            return '\n'.join(result)
+        else:
+            # Fallback to standard truncation if no error-prone sections found
+            truncated = '\n'.join(lines[:50]) + f"\n... [XML TRUNCATED: {len(lines)} total lines] ...\n" + '\n'.join(lines[-50:])
+            logger.info(f"🔧 Applied XML truncation: {len(lines)} lines → 100 lines")
+            return truncated
 
     def _smart_json_truncate(self, json_content: str, max_entries: int = 10) -> str:
         """
@@ -259,7 +367,7 @@ class DockerOrchestrator:
         try:
             import json
             data = json.loads(json_content)
-            
+
             # 如果是branch context history，可以安全截断history数组
             if isinstance(data, dict) and 'history' in data and isinstance(data['history'], list):
                 history = data['history']
@@ -267,7 +375,7 @@ class DockerOrchestrator:
                     # 保留前5个和后5个history条目，中间标记截断
                     truncated_count = len(history) - max_entries
                     data['history'] = (
-                        history[:5] + 
+                        history[:5] +
                         [{"type": "truncated", "message": f"[SMART TRUNCATION: {truncated_count} entries omitted to prevent context pollution]", "timestamp": "system"}] +
                         history[-5:]
                     )
@@ -358,7 +466,7 @@ class DockerOrchestrator:
 
             logger.debug(f"Command finished with exit code: {exit_code}")
             
-            # IMPROVED: JSON-aware truncation logic
+            # IMPROVED: Content-aware truncation logic
             original_length = len(output)
             if original_length > 10000:  # ~100 lines threshold
                 lines = output.split('\n')
@@ -368,8 +476,13 @@ class DockerOrchestrator:
                         # For JSON files, apply smart truncation that preserves validity
                         output = self._smart_json_truncate(output, max_entries=10)
                         logger.info(f"🔧 Applied JSON-aware truncation to preserve file integrity")
+                    # Check if this is XML/POM content that needs special handling
+                    elif self._is_xml_content(output, command):
+                        # For XML/POM files, apply smart truncation that preserves error-prone sections
+                        output = self._smart_xml_truncate(output, max_lines=150)
+                        logger.info(f"🔧 Applied XML-aware truncation to preserve error-prone sections")
                     else:
-                        # Apply normal truncation for non-JSON content
+                        # Apply normal truncation for non-JSON/XML content
                         truncated = '\n'.join(lines[:25]) + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n" + '\n'.join(lines[-25:])
                         logger.warning(f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution")
                         output = truncated
@@ -549,15 +662,61 @@ class DockerOrchestrator:
 
     def _optimize_maven_command(self, command: str, timeout_seconds: int) -> str:
         """Apply Maven-specific optimizations to reduce timeout risks."""
-        
+        import re
+
         optimizations = []
-        
+
         # Add batch mode and quiet flags if not present
         if '-B' not in command:
             optimizations.append('-B')  # Batch mode (non-interactive)
-        
-        if '-q' not in command and '-X' not in command:  # Don't add quiet if debug mode
-            optimizations.append('-q')  # Quiet mode (reduce output)
+
+        # CRITICAL: Don't add -q for commands that run tests as it suppresses test output and reports
+        # This was causing test reports to not be generated (issue found 2025-09-13)
+
+        # Check if tests are explicitly skipped
+        skip_patterns = [
+            r'-DskipTests(?:=true)?(?:\s|$)',
+            r'-Dmaven\.test\.skip(?:=true)?(?:\s|$)',
+            r'-DskipITs?(?:=true)?(?:\s|$)',
+            r'-DskipUTs?(?:=true)?(?:\s|$)'
+        ]
+        tests_explicitly_skipped = any(re.search(pattern, command) for pattern in skip_patterns)
+
+        # Check if tests are explicitly enabled (overrides skip)
+        tests_explicitly_enabled = re.search(r'-DskipTests=false', command) is not None
+
+        # Lifecycle phases that run tests (unless explicitly skipped)
+        # Note: test-compile and test-jar don't actually run tests
+        test_lifecycle_phases = [
+            'test', 'verify', 'integration-test',
+            'package', 'install', 'deploy'
+        ]
+
+        # Plugin goals that run tests
+        test_plugin_goals = [
+            'surefire:test',
+            'failsafe:integration-test',
+            'failsafe:verify'
+        ]
+
+        # Build regex pattern for precise matching
+        # Maven goals are typically separated by spaces or are at the start/end of the command
+        # We need to ensure we don't match "test" in "test-compile" or "contest"
+        lifecycle_pattern = r'(?:^|\s)(' + '|'.join(re.escape(phase) for phase in test_lifecycle_phases) + r')(?:\s|$)'
+        plugin_pattern = r'(?:^|\s)(' + '|'.join(re.escape(goal) for goal in test_plugin_goals) + r')(?:\s|$)'
+
+        # Determine if this command will run tests
+        contains_test_phase = re.search(lifecycle_pattern, command) is not None
+        contains_test_plugin = re.search(plugin_pattern, command) is not None
+
+        # A command runs tests if:
+        # 1. It contains a test-running phase/plugin AND
+        # 2. Tests are not explicitly skipped OR tests are explicitly enabled
+        will_run_tests = (contains_test_phase or contains_test_plugin) and (not tests_explicitly_skipped or tests_explicitly_enabled)
+
+        # Don't add -q if tests will run or if debug mode is on
+        if '-q' not in command and '-X' not in command and not will_run_tests:
+            optimizations.append('-q')  # Quiet mode (reduce output - but NOT for tests!)
         
         # Add Maven-specific timeout settings
         maven_timeout_props = [
@@ -574,6 +733,20 @@ class DockerOrchestrator:
         else:
             optimized_command = f"{command} {' '.join(optimizations)} {' '.join(maven_timeout_props)}"
         
+        # Log optimization details, especially for test commands
+        if will_run_tests:
+            details = []
+            if contains_test_phase:
+                match = re.search(lifecycle_pattern, command)
+                details.append(f"lifecycle phase: {match.group(1)}")
+            if contains_test_plugin:
+                match = re.search(plugin_pattern, command)
+                details.append(f"plugin goal: {match.group(1)}")
+            if tests_explicitly_enabled:
+                details.append("tests explicitly enabled with -DskipTests=false")
+            logger.info(f"🧪 Maven TEST command detected ({', '.join(details)}) - preserving output for test reports")
+        elif tests_explicitly_skipped:
+            logger.info("⏭️ Tests explicitly skipped - applying quiet mode for faster execution")
         logger.info(f"🔧 Maven optimizations applied: {', '.join(optimizations + maven_timeout_props)}")
         return optimized_command
 
