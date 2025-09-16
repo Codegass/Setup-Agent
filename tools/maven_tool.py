@@ -1,7 +1,7 @@
 """Maven tool with comprehensive error handling and raw output access."""
 
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 
 from loguru import logger
@@ -156,11 +156,20 @@ class MavenTool(BaseTool):
         maven_cmd = self._build_maven_command(command, goals, profiles, properties, pom_file, fail_at_end)
 
         # Check if this is a multi-module project running tests without fail handling
-        if command == "test" and self._is_multi_module_project(working_directory):
+        is_multi_module = self._is_multi_module_project(working_directory)
+        if command == "test" and is_multi_module:
+            modules_info = self._get_module_info(working_directory)
             if not fail_at_end and not ignore_test_failures:
                 logger.warning("⚠️ Multi-module project detected! Maven will STOP at first module with test failures.")
-                logger.info("💡 To test ALL modules: maven(command='test', fail_at_end=True, working_directory='{}')".
-                          format(working_directory))
+                logger.warning(f"📦 Found {modules_info.get('module_count', 'multiple')} modules: {', '.join(modules_info.get('modules', [])[:5])}")
+                logger.info("💡 RECOMMENDED: maven(command='test', fail_at_end=True) to test ALL modules")
+                logger.info(f"💡 Current approach will only test modules until first failure!")
+                # Add a warning to the result that will be seen by the agent
+                self._multi_module_warning = (
+                    f"WARNING: Multi-module project with {modules_info.get('module_count', 'multiple')} modules. "
+                    f"Without fail_at_end=True, only partial modules will be tested. "
+                    f"Use maven(command='test', fail_at_end=True) to test all modules."
+                )
 
         # Execute the command
         try:
@@ -169,7 +178,7 @@ class MavenTool(BaseTool):
             is_long_running = any(cmd in maven_cmd for cmd in [
                 'clean', 'compile', 'test', 'package', 'install', 'deploy', 'verify', 'site'
             ])
-            
+
             if is_long_running and hasattr(self.orchestrator, 'execute_command_with_monitoring'):
                 # Use monitoring version with extended timeouts for build commands
                 logger.info(f"Executing Maven command with extended timeout: {maven_cmd}")
@@ -424,6 +433,25 @@ class MavenTool(BaseTool):
         except Exception:
             return False
 
+    def _get_module_info(self, working_directory: str) -> dict:
+        """Get information about modules in a multi-module project."""
+        if not self.orchestrator:
+            return {"modules": [], "module_count": 0}
+
+        try:
+            # Extract module names from pom.xml
+            extract_cmd = f"grep -A 100 '<modules>' {working_directory}/pom.xml 2>/dev/null | grep '<module>' | sed 's/.*<module>\\(.*\\)<\\/module>.*/\\1/' | head -20"
+            result = self.orchestrator.execute_command(extract_cmd)
+
+            if result.get("success", False) and result.get("output"):
+                modules = [m.strip() for m in result["output"].split("\n") if m.strip()]
+                return {"modules": modules, "module_count": len(modules)}
+
+            return {"modules": [], "module_count": 0}
+        except Exception as e:
+            logger.debug(f"Failed to get module info: {e}")
+            return {"modules": [], "module_count": 0}
+
     def _validate_pom_exists(self, working_directory: str, pom_file: str = None) -> dict:
         """Validate that pom.xml exists and is accessible."""
         if not self.orchestrator:
@@ -602,10 +630,17 @@ class MavenTool(BaseTool):
             "java_version_error": None,  # Added for Maven Enforcer detection
             "enforcer_error": None,  # Store the full enforcer error message
             "pom_parse_error": None,  # Added for POM parsing error detection
-            "error_type": None  # Track specific error type
+            "error_type": None,  # Track specific error type
+            "failed_modules": [],
+            "failed_tests": [],
+            "surefire_reports": []
         }
-        
+
         lines = output.split('\n')
+
+        if "Missing argument for option" in output:
+            analysis["error_type"] = "CLI_USAGE_ERROR"
+            analysis["build_success"] = False
 
         # Check for POM parsing errors
         if "Non-parseable POM" in output and "Unrecognised tag" in output:
@@ -660,9 +695,12 @@ class MavenTool(BaseTool):
                         logger.info(f"Detected generic Java version requirement: {version_match.group(1)}")
                         break
         
+        failed_modules: List[Dict[str, Any]] = []
+        failed_tests: List[str] = []
+        collecting_failed_tests = False
         for line in lines:
             line = line.strip()
-            
+
             # Extract executed phases
             if "--- maven-" in line and "plugin:" in line:
                 phase_match = re.search(r'--- maven-(\w+)-plugin:', line)
@@ -687,23 +725,71 @@ class MavenTool(BaseTool):
             # Extract dependency issues
             if "Could not resolve dependencies" in line or "Dependency resolution failed" in line:
                 analysis["dependency_issues"].append(line)
-            
+
             # Extract warnings
             if "[WARNING]" in line:
                 analysis["warnings"].append(line)
-            
+
             # Extract build time
             if "Total time:" in line:
                 time_match = re.search(r'Total time: (.+)', line)
                 if time_match:
                     analysis["build_time"] = time_match.group(1).strip()
-            
+
             # Extract created artifacts
             if "Building jar:" in line:
                 artifact_match = re.search(r'Building jar: (.+)', line)
                 if artifact_match:
                     analysis["artifacts_created"].append(artifact_match.group(1).strip())
-        
+
+            module_match = re.search(
+                r"The project ([^:]+):([^:]+):([^ ]+) \(([^)]+)\) has (\d+) error",
+                line
+            )
+            if module_match:
+                failed_modules.append(
+                    {
+                        "group_id": module_match.group(1),
+                        "artifact_id": module_match.group(2),
+                        "version": module_match.group(3),
+                        "pom_path": module_match.group(4),
+                        "error_count": int(module_match.group(5))
+                    }
+                )
+
+            if any(marker in line for marker in ["Tests in error:", "Tests in failure:", "Failed tests:"]):
+                collecting_failed_tests = True
+                continue
+
+            if collecting_failed_tests:
+                if not line:
+                    collecting_failed_tests = False
+                    continue
+                cleaned = re.sub(r'^\[ERROR\]\s*', '', line).strip()
+                if cleaned:
+                    failed_tests.append(cleaned)
+
+            report_match = re.search(r"refer to (.+?surefire-reports)", line)
+            if report_match:
+                analysis["surefire_reports"].append(report_match.group(1))
+
+        if failed_modules:
+            analysis["failed_modules"] = failed_modules
+            if not analysis["error_type"]:
+                analysis["error_type"] = "MODULE_FAILURE"
+
+        if failed_tests:
+            # remove duplicates while preserving order
+            seen = set()
+            unique_tests = []
+            for test in failed_tests:
+                if test not in seen:
+                    seen.add(test)
+                    unique_tests.append(test)
+            analysis["failed_tests"] = unique_tests
+            if not analysis["error_type"]:
+                analysis["error_type"] = "TEST_FAILURE"
+
         return analysis
     
     def _format_success_output(self, analysis: Dict[str, Any]) -> str:
@@ -733,7 +819,13 @@ class MavenTool(BaseTool):
     def _format_success_output_enhanced(self, analysis: Dict[str, Any], ref_id: Optional[str] = None) -> str:
         """Format with essential validation data always visible."""
         output = "✅ Maven build completed\n\n"
-        
+
+        # Add multi-module warning if applicable
+        if hasattr(self, '_multi_module_warning'):
+            output = f"⚠️ {self._multi_module_warning}\n\n" + output
+            # Clear the warning after use
+            delattr(self, '_multi_module_warning')
+
         # ALWAYS show what phases executed (critical for validation)
         output += "📍 Phases executed: "
         if analysis["phases_executed"]:
@@ -838,7 +930,45 @@ class MavenTool(BaseTool):
                 "Check if Maven repositories are accessible"
             ])
             documentation_links.append("https://maven.apache.org/guides/introduction/introduction-to-dependency-mechanism.html")
-        
+
+        if analysis.get("failed_modules"):
+            for module_info in analysis["failed_modules"][:3]:
+                artifact_id = module_info.get("artifact_id")
+                pom_path = module_info.get("pom_path")
+                module_hint = pom_path or artifact_id
+                if artifact_id:
+                    error_suggestions.append(
+                        f"Temporarily exclude module '{artifact_id}' ({module_hint}) and rerun: "
+                        f"maven(command='{command}', fail_at_end=True, properties=['-pl !{artifact_id}','-am'])"
+                    )
+                elif pom_path:
+                    module_name = Path(pom_path).parent.name
+                    error_suggestions.append(
+                        f"Temporarily exclude module '{module_name}' ({module_hint}) and rerun: "
+                        f"maven(command='{command}', fail_at_end=True, properties=['-pl !{module_name}','-am'])"
+                    )
+            error_suggestions.append(
+                "Excluding the failing module lets the remaining reactor modules finish so you still capture their results."
+            )
+
+        if analysis.get("failed_tests"):
+            for failed_test in analysis["failed_tests"][:5]:
+                display_name = failed_test.split('(')[0].strip() or failed_test
+                display_name = display_name.split(':')[0].strip()
+                error_suggestions.append(
+                    f"Skip failing test '{display_name}' on the next run: "
+                    f"maven(command='{command}', fail_at_end=True, properties='test=!{display_name}')"
+                )
+            error_suggestions.append(
+                "Combine multiple exclusions with commas inside the test property, e.g. properties='test=!TestOne,!TestTwo'."
+            )
+
+        if analysis.get("surefire_reports"):
+            for report_path in analysis["surefire_reports"][:3]:
+                error_suggestions.append(
+                    f"Review Surefire report output at {report_path} for full failure context."
+                )
+
         if analysis["tests_run"] and (analysis["tests_run"]["failures"] > 0 or analysis["tests_run"]["errors"] > 0):
             error_code = "TEST_FAILURE"
             error_suggestions.extend([

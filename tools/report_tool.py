@@ -858,7 +858,7 @@ class ReportTool(BaseTool):
                         'skipped_tests': test_analysis['skipped_tests'],
                         'report_files_count': len(test_analysis['report_files']),
                         'test_exclusions': test_analysis.get('test_exclusions', []),
-                        'execution_coverage': test_analysis.get('execution_coverage', 100.0)
+                        'modules_without_tests': test_analysis.get('modules_without_tests', [])
                     }
                     
                     # Log if tests were excluded

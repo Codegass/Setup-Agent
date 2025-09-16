@@ -584,10 +584,11 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                 # Log test exclusions if detected
                 if test_status['test_exclusions']:
                     logger.warning(f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}")
-                    
-                # Log execution coverage
-                if test_status['execution_coverage'] < 100:
-                    logger.info(f"📊 Test execution coverage: {test_status['execution_coverage']:.1f}%")
+
+                # Log module coverage if some modules weren't tested
+                if test_status.get('modules_without_tests'):
+                    module_count = len(test_status['modules_without_tests'])
+                    logger.info(f"📊 {module_count} modules not tested: {', '.join(test_status['modules_without_tests'][:3])}")
             else:
                 logger.info("⚠️ Test validation: No test reports found")
             

@@ -1071,7 +1071,6 @@ class PhysicalValidator:
                 - skipped_tests: int
                 - pass_rate: float (0-100)
                 - test_exclusions: List[str] (detected excluded tests)
-                - execution_coverage: float (percentage of tests actually executed)
                 - status: str (SUCCESS/WARNING/PARTIAL/FAILED)
                 - reason: str (explanation of the status)
         """
@@ -1108,7 +1107,6 @@ class PhysicalValidator:
             'skipped_tests': test_metrics.get('skipped_tests', 0),
             'pass_rate': pass_rate,
             'test_exclusions': test_metrics.get('test_exclusions', []),
-            'execution_coverage': test_metrics.get('execution_coverage', 100.0),
             'modules_without_tests': test_metrics.get('modules_without_tests', []),
             'status': status,
             'reason': reason,
@@ -1120,8 +1118,11 @@ class PhysicalValidator:
         if result['test_exclusions']:
             logger.warning(f"Detected test exclusions: {', '.join(result['test_exclusions'])}")
         if result['modules_without_tests']:
-            logger.warning(f"⚠️ Modules without test reports: {', '.join(result['modules_without_tests'])}")
-            logger.info("💡 Consider using maven(command='test', fail_at_end=True) to test all modules")
+            untested_count = len(result['modules_without_tests'])
+            logger.warning(f"⚠️ MISSING TEST REPORTS: {untested_count} modules have no test results: {', '.join(result['modules_without_tests'])}")
+            logger.warning(f"📊 Found {result['total_tests']} tests executed, but some modules were skipped")
+            logger.info("💡 RECOMMENDED: Use maven(command='test', fail_at_end=True) at project root to test ALL modules")
+            logger.info("💡 Alternative: Run bash(command='cd /workspace/PROJECT && mvn test --fail-at-end')")
 
         return result
     
@@ -1137,20 +1138,17 @@ class PhysicalValidator:
             Dictionary with enhanced test statistics including:
                 - All fields from parse_test_reports
                 - test_exclusions: List of detected excluded tests
-                - execution_coverage: Percentage of tests actually executed
+                - modules_without_tests: List of modules that lack test reports
         """
         # Start with the base test report parsing
         base_result = self.parse_test_reports(project_dir)
         
         # Add enhanced metrics
         base_result['test_exclusions'] = self._detect_test_exclusions(project_dir)
-        
-        # Calculate execution coverage if we can detect expected tests
-        expected_tests = self._estimate_expected_tests(project_dir)
-        if expected_tests > 0 and base_result.get('total_tests', 0) > 0:
-            base_result['execution_coverage'] = (base_result['total_tests'] / expected_tests) * 100
-        else:
-            base_result['execution_coverage'] = 100.0  # Default to 100% if we can't determine
+
+        # We don't calculate coverage - that's about test quality, not our concern
+        # SAG only cares that tests were executed, not how comprehensive they are
+        # The actual test count from reports is the only truth we need
         
         return base_result
     
@@ -1254,68 +1252,6 @@ class PhysicalValidator:
         # Remove duplicates and return
         return list(set(exclusions))
     
-    def _estimate_expected_tests(self, project_dir: str) -> int:
-        """
-        Estimate the expected number of tests based on test source files.
-        
-        Returns:
-            Estimated number of expected tests
-        """
-        try:
-            total_test_files = 0
-
-            # Java (unit and IT)
-            java_cmd = (
-                f"find {project_dir} -type f \\( -name '*Test.java' -o -name '*Tests.java' -o -name '*IT.java' -o -name '*ITCase.java' \\) 2>/dev/null "
-                f"| grep -E '/src/(test|it)/java/' | wc -l"
-            )
-            java_res = self._execute_command_with_logging(java_cmd, "counting Java test files")
-            if java_res['success'] and java_res.get('output'):
-                try:
-                    total_test_files += int(java_res['output'].strip() or 0)
-                except ValueError:
-                    pass
-
-            # Kotlin (unit and IT)
-            kt_cmd = (
-                f"find {project_dir} -type f \\( -name '*Test.kt' -o -name '*Tests.kt' -o -name '*IT.kt' \\) 2>/dev/null "
-                f"| grep -E '/src/(test|it)/kotlin/' | wc -l"
-            )
-            kt_res = self._execute_command_with_logging(kt_cmd, "counting Kotlin test files")
-            if kt_res['success'] and kt_res.get('output'):
-                try:
-                    total_test_files += int(kt_res['output'].strip() or 0)
-                except ValueError:
-                    pass
-
-            # JavaScript
-            js_cmd = (
-                f"find {project_dir} -type f \\(-name '*.test.js' -o -name '*.spec.js'\\) 2>/dev/null | wc -l"
-            )
-            js_res = self._execute_command_with_logging(js_cmd, "counting JS test files")
-            if js_res['success'] and js_res.get('output'):
-                try:
-                    total_test_files += int(js_res['output'].strip() or 0)
-                except ValueError:
-                    pass
-
-            # Python
-            py_cmd = (
-                f"find {project_dir} -type f 2>/dev/null | grep -E '/tests/.*\\.py$|/test_.*\\.py$' | wc -l"
-            )
-            py_res = self._execute_command_with_logging(py_cmd, "counting Python test files")
-            if py_res['success'] and py_res.get('output'):
-                try:
-                    total_test_files += int(py_res['output'].strip() or 0)
-                except ValueError:
-                    pass
-
-            # Heuristic: assume ~3 test methods per test file
-            return total_test_files * 3
-
-        except Exception as e:
-            logger.warning(f"Failed to estimate expected tests: {e}")
-            return 0
     
     def _detect_build_system(self, project_dir: str) -> str:
         """

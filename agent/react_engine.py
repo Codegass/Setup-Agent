@@ -802,6 +802,7 @@ AVAILABLE TOOLS:
 
 AVAILABLE TOOLS:
 - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
+  • ⚠️ For Maven projects: DO NOT use bash to run 'mvn' commands - use maven tool instead!
 - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
 - web_search: Search the web for information
 - manage_context: Manage task workflow and context (NOT context or complete_with_results)
@@ -812,7 +813,10 @@ AVAILABLE TOOLS:
   • get_info: Check current context and available tasks
   • CRITICAL: complete_with_results is an ACTION, not a separate tool!
   • Example: manage_context(action="complete_with_results", summary="Task completed successfully", key_results="Built project, all tests pass")
-- maven: Execute Maven commands (NOT mvn)
+- maven: 🔥 PREFERRED for Maven projects - Execute Maven commands (NOT mvn)
+  • ✅ USE THIS for: compile, test, package, install, clean, verify
+  • ✅ Multi-module support: maven(command='test', fail_at_end=True) tests ALL modules
+  • ❌ DO NOT use bash(command='mvn ...') - use maven tool instead!
 - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
 - project_analyzer: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
   • 🔥 TRIGGER: Automatically call this tool after ANY project_setup clone success
@@ -3319,8 +3323,10 @@ CRITICAL: If the thinking model recommended a specific tool and action, execute 
 
 AVAILABLE TOOLS AND THEIR PURPOSE:
 - project_setup: Clone repositories and detect project types
-- bash: Execute shell commands for system operations
-- maven: Run Maven build commands
+- bash: Execute shell commands for system operations (NOT for mvn commands!)
+- maven: 🔥 PREFERRED for Maven - Run Maven build commands
+  • ✅ USE for multi-module projects: maven(command='test', fail_at_end=True)
+  • ❌ DO NOT use bash for mvn commands!
 - file_io: Read and write files
 - manage_context: Manage task workflow and completion
 
