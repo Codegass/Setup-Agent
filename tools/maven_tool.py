@@ -1,12 +1,14 @@
 """Maven tool with comprehensive error handling and raw output access."""
 
+import json
 import re
-from typing import Dict, Any, Optional, List
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from .base import BaseTool, ToolResult, ToolError
+from .base import BaseTool, ToolError, ToolResult
 from .command_tracker import CommandTracker
 from agent.output_storage import OutputStorageManager
 
@@ -250,9 +252,11 @@ class MavenTool(BaseTool):
                         "analysis": analysis
                     }
                 )
-            
+
             # Use analysis result to determine success, not just exit code
             if analysis["build_success"]:
+                if any(goal in command.lower() for goal in ["test", "verify"]):
+                    self._record_test_summary(working_directory, analysis, result["exit_code"], maven_cmd)
                 # Validate build artifacts for compile/package/install commands using container-based validation
                 validation_result = None
                 if any(goal in command for goal in ["compile", "package", "install"]) and working_directory:
@@ -293,6 +297,8 @@ class MavenTool(BaseTool):
                     }
                 )
             else:
+                if any(goal in command.lower() for goal in ["test", "verify"]):
+                    self._record_test_summary(working_directory, analysis, result["exit_code"], maven_cmd)
                 # Build failed - use error handler even if exit code was 0
                 return self._handle_maven_error(result["output"], result["exit_code"], maven_cmd, analysis)
                 
@@ -633,13 +639,19 @@ class MavenTool(BaseTool):
             "error_type": None,  # Track specific error type
             "failed_modules": [],
             "failed_tests": [],
-            "surefire_reports": []
+            "surefire_reports": [],
+            "skipped_modules": [],
+            "reactor_summary": []
         }
 
         lines = output.split('\n')
 
         if "Missing argument for option" in output:
             analysis["error_type"] = "CLI_USAGE_ERROR"
+            analysis["build_success"] = False
+
+        if "MissingProjectException" in output:
+            analysis["error_type"] = analysis.get("error_type") or "MISSING_PROJECT"
             analysis["build_success"] = False
 
         # Check for POM parsing errors
@@ -698,6 +710,7 @@ class MavenTool(BaseTool):
         failed_modules: List[Dict[str, Any]] = []
         failed_tests: List[str] = []
         collecting_failed_tests = False
+        last_summary_module: Optional[str] = None
         for line in lines:
             line = line.strip()
 
@@ -757,6 +770,23 @@ class MavenTool(BaseTool):
                     }
                 )
 
+            summary_match = re.search(r"\[INFO\]\s+([^\.\[]+?)\s+\.+\s+(SUCCESS|FAILURE|SKIPPED)", line)
+            if summary_match:
+                module_label = summary_match.group(1).strip()
+                status = summary_match.group(2).upper()
+                analysis["reactor_summary"].append(
+                    {
+                        "module": module_label,
+                        "status": status,
+                        "raw": line
+                    }
+                )
+                last_summary_module = module_label
+                if status == "SKIPPED":
+                    analysis["skipped_modules"].append(module_label)
+                elif status == "FAILURE" and not analysis.get("error_type"):
+                    analysis["error_type"] = "MODULE_FAILURE"
+
             if any(marker in line for marker in ["Tests in error:", "Tests in failure:", "Failed tests:"]):
                 collecting_failed_tests = True
                 continue
@@ -772,6 +802,12 @@ class MavenTool(BaseTool):
             report_match = re.search(r"refer to (.+?surefire-reports)", line)
             if report_match:
                 analysis["surefire_reports"].append(report_match.group(1))
+
+            if "banned from the build" in line.lower():
+                if last_summary_module:
+                    analysis["skipped_modules"].append(last_summary_module)
+                if not analysis.get("error_type"):
+                    analysis["error_type"] = "MODULE_BANNED"
 
         if failed_modules:
             analysis["failed_modules"] = failed_modules
@@ -789,6 +825,16 @@ class MavenTool(BaseTool):
             analysis["failed_tests"] = unique_tests
             if not analysis["error_type"]:
                 analysis["error_type"] = "TEST_FAILURE"
+
+        if analysis["skipped_modules"]:
+            # ensure uniqueness while preserving order
+            seen_skip = set()
+            deduped = []
+            for module in analysis["skipped_modules"]:
+                if module and module not in seen_skip:
+                    seen_skip.add(module)
+                    deduped.append(module)
+            analysis["skipped_modules"] = deduped
 
         return analysis
     
@@ -1126,7 +1172,50 @@ class MavenTool(BaseTool):
                 "diagnostic_commands": self._get_diagnostic_commands(error_code)
             }
         )
-    
+
+    def _record_test_summary(self, working_directory: str, analysis: Dict[str, Any], exit_code: int, command: str) -> None:
+        """Write a concise test execution summary for downstream reporting."""
+        if not self.orchestrator:
+            return
+
+        tests = analysis.get("tests_run") or {}
+        failed_modules = []
+        for module_info in analysis.get("failed_modules", []):
+            artifact_id = module_info.get("artifact_id")
+            if artifact_id:
+                failed_modules.append(artifact_id)
+            else:
+                pom_path = module_info.get("pom_path")
+                if pom_path:
+                    failed_modules.append(Path(pom_path).parent.name)
+
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "working_directory": working_directory,
+            "command": command,
+            "exit_code": exit_code,
+            "tests_total": tests.get("total"),
+            "tests_failures": tests.get("failures"),
+            "tests_errors": tests.get("errors"),
+            "tests_skipped": tests.get("skipped"),
+            "failed_tests": analysis.get("failed_tests", []),
+            "failed_modules": failed_modules,
+            "skipped_modules": analysis.get("skipped_modules", []),
+            "reactor_summary": analysis.get("reactor_summary", [])
+        }
+
+        metrics_dir = "/workspace/.setup_agent/metrics"
+        summary_path = f"{metrics_dir}/test_summary.jsonl"
+
+        try:
+            self.orchestrator.execute_command(f"mkdir -p {metrics_dir}")
+            payload = json.dumps(entry, sort_keys=True)
+            append_cmd = f"cat >> {summary_path} <<'EOF'\n{payload}\nEOF"
+            self.orchestrator.execute_command(append_cmd)
+            logger.debug(f"Recorded test summary entry to {summary_path}")
+        except Exception as exc:  # pragma: no cover - best effort logging
+            logger.warning(f"Failed to record test summary: {exc}")
+
     def _extract_key_error_lines(self, output: str) -> str:
         """Extract key error lines from Maven output for immediate visibility."""
         if not output:

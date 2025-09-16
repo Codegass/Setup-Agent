@@ -3,7 +3,8 @@
 import json
 import re
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import litellm
 from loguru import logger
@@ -71,6 +72,8 @@ class ReActEngine:
             'cloned_repos': set(),      # Set of successfully cloned repo URLs
             'project_type': None,       # Detected project type
             'maven_success': False,     # Whether maven operations succeeded
+            'excluded_modules': set(),
+            'excluded_tests': set(),
         }
 
         # Agent logger for detailed traces
@@ -2140,6 +2143,11 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     logger.info(f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}")
                 else:
                     fixed_params["working_directory"] = "/workspace"
+
+            command_str = fixed_params.get("command", "")
+            if command_str and "mvn" in command_str and "--fail-at-end" not in command_str:
+                fixed_params["command"] = f"{command_str} --fail-at-end"
+                logger.info("🔧 Appended --fail-at-end to bash Maven command")
                 
         elif tool_name == "file_io":
             # Ensure file_io has an action
@@ -3480,7 +3488,35 @@ EXECUTE ACTIONS FOR:
         """Recover from Maven tool failures."""
         error_msg = failed_result.error or ""
         error_code = getattr(failed_result, 'error_code', None)
-        
+
+        def normalize_properties(raw_props: Any) -> List[str]:
+            if not raw_props:
+                return []
+            if isinstance(raw_props, list):
+                return [p for p in raw_props if p]
+            if isinstance(raw_props, str):
+                return [p.strip() for p in raw_props.split(',') if p.strip()]
+            return [str(raw_props)]
+
+        def ensure_flag(props: List[str], flag: str) -> List[str]:
+            if flag not in props:
+                props.append(flag)
+            return props
+
+        def set_property(props: List[str], prefix: str, value: str) -> List[str]:
+            updated = [p for p in props if not p.startswith(prefix)]
+            updated.append(f"{prefix}{value}")
+            return updated
+
+        def format_test_exclusion(name: str) -> str:
+            cleaned = (name or "").strip()
+            if not cleaned:
+                return cleaned
+            if '.' in cleaned and '#' not in cleaned:
+                cls, method = cleaned.rsplit('.', 1)
+                return f"{cls}#{method}"
+            return cleaned
+
         # Check for Java version mismatch (highest priority)
         if error_code == "JAVA_VERSION_MISMATCH":
             # Extract required Java version from metadata
@@ -3575,7 +3611,64 @@ EXECUTE ACTIONS FOR:
                 "message": "Recovered by trying compile before test",
                 "result": result
             }
-        
+
+        analysis = getattr(failed_result, 'metadata', {}).get('analysis', {})
+        if analysis:
+            failed_modules: List[str] = []
+            for module in analysis.get("failed_modules", []):
+                artifact = module.get("artifact_id")
+                if artifact:
+                    failed_modules.append(artifact)
+                else:
+                    pom_path = module.get("pom_path")
+                    if pom_path:
+                        failed_modules.append(Path(pom_path).parent.name)
+
+            failed_tests = [format_test_exclusion(test) for test in analysis.get("failed_tests", [])]
+
+            recovery_params = params.copy()
+            recovery_params["fail_at_end"] = True
+            new_exclusions = False
+
+            if failed_modules:
+                excluded_modules: Set[str] = self.successful_states.setdefault('excluded_modules', set())
+                for module_name in failed_modules:
+                    if module_name and module_name not in excluded_modules:
+                        excluded_modules.add(module_name)
+                        new_exclusions = True
+                if excluded_modules and new_exclusions:
+                    props = normalize_properties(recovery_params.get("properties"))
+                    props = [prop for prop in props if not prop.startswith("-pl")]
+                    module_clause = ','.join(f"!{name}" for name in sorted(excluded_modules))
+                    props.append(f"-pl {module_clause}")
+                    props = ensure_flag(props, "-am")
+                    recovery_params["properties"] = props
+
+            if failed_tests:
+                excluded_tests: Set[str] = self.successful_states.setdefault('excluded_tests', set())
+                added_test = False
+                for test_name in failed_tests:
+                    if test_name and test_name not in excluded_tests:
+                        excluded_tests.add(test_name)
+                        added_test = True
+                if excluded_tests and added_test:
+                    props = normalize_properties(recovery_params.get("properties"))
+                    test_clause = "!" + ",!".join(sorted(excluded_tests))
+                    props = set_property(props, "test=", test_clause)
+                    recovery_params["properties"] = props
+                    new_exclusions = True
+
+            if new_exclusions:
+                logger.info("🔧 Retrying Maven after excluding failing modules/tests")
+                tool = self.tools["maven"]
+                result = tool.safe_execute(**recovery_params)
+                return {
+                    "attempted": True,
+                    "success": result.success,
+                    "message": "Recovered by excluding failing modules/tests and rerunning Maven",
+                    "result": result
+                }
+
         return {"attempted": False, "success": False, "message": "No Maven recovery strategy applicable"}
 
     def _recover_project_setup_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
