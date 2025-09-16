@@ -422,10 +422,13 @@ class DockerOrchestrator:
 
         # Build the command to be executed in the container with proper environment loading
         # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
-        # CRITICAL FIX: Explicitly cd to working directory before executing command
-        if workdir and workdir != "/workspace":
-            wrapped_command = f"cd {workdir} && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        # CRITICAL FIX: Always cd to working directory when specified, including /workspace
+        # This ensures commands run in the correct directory consistently
+        if workdir:
+            # Always change to the specified working directory
+            wrapped_command = f"cd '{workdir}' && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
         else:
+            # No working directory specified, use default behavior
             wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
         exec_command = ["/bin/bash", "-c", wrapped_command]
         
@@ -584,20 +587,25 @@ class DockerOrchestrator:
             command = ' && '.join(optimized_parts)
             logger.info(f"🔧 Applied Maven optimizations to mvn parts of compound command")
         
+        # Build the command with proper working directory handling
+        # CRITICAL FIX: Always cd to working directory when specified, including /workspace
+        # This ensures Maven and other tools run in the correct directory
+        if workdir:
+            # Add cd command to ensure we're in the right directory
+            base_cmd = f"cd '{workdir}' && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        else:
+            # No working directory specified, use default
+            base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        
         # Wrap with GNU timeout if requested
         if use_timeout_wrapper:
             # Use timeout with preserve-status to get the actual exit code
-            wrapped_cmd = f"timeout --preserve-status {absolute_timeout} bash -c '{command}'"
+            # The entire command (including cd) needs to be wrapped
+            final_command = f"timeout --preserve-status {absolute_timeout} bash -c '{base_cmd}'"
             logger.info(f"🕐 Wrapped command with {absolute_timeout}s absolute timeout")
         else:
-            wrapped_cmd = command
+            final_command = base_cmd
         
-        # Build the final command with environment loading
-        # CRITICAL FIX: Explicitly cd to working directory before executing command
-        if workdir and workdir != "/workspace":
-            final_command = f"cd {workdir} && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {wrapped_cmd}"
-        else:
-            final_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {wrapped_cmd}"
         exec_command = ["/bin/bash", "-c", final_command]
         
         logger.info(f"Executing command with monitoring: {command}")
