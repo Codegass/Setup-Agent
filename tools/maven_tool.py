@@ -2,6 +2,7 @@
 
 import json
 import re
+import shlex
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,8 @@ class MavenTool(BaseTool):
         pom_file: str = None,
         fail_at_end: bool = False,
         ignore_test_failures: bool = False,
+        use_wrapper: bool = False,
+        extra_args: str = None,
         **kwargs  # Accept any additional parameters
     ) -> ToolResult:
         """
@@ -155,7 +158,16 @@ class MavenTool(BaseTool):
                 logger.info(f"🔧 Using directory from pom_file: {working_directory}")
         
         # Build Maven command
-        maven_cmd = self._build_maven_command(command, goals, profiles, properties, pom_file, fail_at_end)
+        maven_cmd = self._build_maven_command(
+            command,
+            goals,
+            profiles,
+            properties,
+            pom_file,
+            fail_at_end,
+            use_wrapper=use_wrapper,
+            extra_args=extra_args,
+        )
 
         # Check if this is a multi-module project running tests without fail handling
         is_multi_module = self._is_multi_module_project(working_directory)
@@ -316,14 +328,40 @@ class MavenTool(BaseTool):
                 error_code="MAVEN_EXECUTION_ERROR"
             )
     
-    def _build_maven_command(self, command: str, goals: str, profiles: str, properties: str, pom_file: str = None, fail_at_end: bool = False) -> str:
+    def _build_maven_command(
+        self,
+        command: str,
+        goals: str,
+        profiles: str,
+        properties: str,
+        pom_file: str = None,
+        fail_at_end: bool = False,
+        use_wrapper: bool = False,
+        extra_args: str = None,
+    ) -> str:
         """Build the complete Maven command."""
-        cmd_parts = ["mvn"]
+        cmd_parts = []
+
+        if use_wrapper:
+            wrapper_path = "./mvnw"
+            if self.orchestrator:
+                check = self.orchestrator.execute_command(
+                    f"test -f {wrapper_path} && echo EXISTS || echo MISSING"
+                )
+                if check.get("exit_code") == 0 and "EXISTS" in (check.get("output") or ""):
+                    cmd_parts.append(wrapper_path)
+                else:
+                    logger.warning("mvnw wrapper not found, falling back to system mvn")
+                    cmd_parts.append("mvn")
+            else:
+                cmd_parts.append(wrapper_path)
+        else:
+            cmd_parts.append("mvn")
 
         # Add fail-at-end flag for multi-module projects
         if fail_at_end:
             cmd_parts.append("--fail-at-end")
-        
+
         # Add profiles
         if profiles:
             cmd_parts.append(f"-P{profiles}")
@@ -350,12 +388,19 @@ class MavenTool(BaseTool):
         # Handle both string and list types for command
         if isinstance(command, list):
             command = " ".join(command)
-        
+
         if goals:
             cmd_parts.append(f"{command} {goals}")
         else:
             cmd_parts.append(command)
-        
+
+        # Extra args appended verbatim after main command
+        if extra_args:
+            if isinstance(extra_args, list):
+                cmd_parts.extend(extra_args)
+            else:
+                cmd_parts.extend(shlex.split(extra_args))
+
         return " ".join(cmd_parts)
     
     def _ensure_maven_in_path(self):
@@ -1577,6 +1622,17 @@ Maven Tool Usage Examples:
                     "type": "boolean",
                     "description": "Continue build despite test failures (alternative to fail_at_end)",
                     "default": False,
+                },
+                "use_wrapper": {
+                    "type": "boolean",
+                    "description": "Use ./mvnw wrapper if available (falls back to mvn)",
+                    "default": False,
+                },
+                "extra_args": {
+                    "type": ["string", "array"],
+                    "description": "Additional CLI arguments appended verbatim after the command",
+                    "items": {"type": "string"},
+                    "default": None,
                 },
             },
             "required": ["command"],

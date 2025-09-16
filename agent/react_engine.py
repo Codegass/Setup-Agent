@@ -1,6 +1,7 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
 import json
+import os
 import re
 from enum import Enum
 from pathlib import Path
@@ -3613,6 +3614,37 @@ EXECUTE ACTIONS FOR:
             }
 
         analysis = getattr(failed_result, 'metadata', {}).get('analysis', {})
+        if analysis and (analysis.get("error_type") == "MISSING_PROJECT" or "pom" in error_msg.lower() and "not" in error_msg.lower()):
+            orchestrator = getattr(self.context_manager, 'orchestrator', None)
+            if orchestrator:
+                try:
+                    locate_cmd = "find /workspace -maxdepth 4 -name pom.xml | head -20"
+                    locate_res = orchestrator.execute_command(locate_cmd)
+                    pom_candidates = (locate_res.get("output") or "").strip().splitlines()
+                    project_name = getattr(orchestrator, 'project_name', None)
+                    target_pom = None
+                    for candidate in pom_candidates:
+                        if project_name and f"/workspace/{project_name}" in candidate:
+                            target_pom = candidate
+                            break
+                    if not target_pom and pom_candidates:
+                        target_pom = pom_candidates[0]
+
+                    if target_pom:
+                        recovery_params = params.copy()
+                        recovery_params["pom_file"] = target_pom
+                        recovery_params["working_directory"] = os.path.dirname(target_pom)
+                        tool = self.tools["maven"]
+                        result = tool.safe_execute(**recovery_params)
+                        return {
+                            "attempted": True,
+                            "success": result.success,
+                            "message": f"Recovered by targeting detected pom: {target_pom}",
+                            "result": result
+                        }
+                except Exception as exc:
+                    logger.warning(f"Automatic pom.xml discovery failed during Maven recovery: {exc}")
+
         if analysis:
             failed_modules: List[str] = []
             for module in analysis.get("failed_modules", []):

@@ -365,6 +365,10 @@ class BashTool(BaseTool):
                         if chk.get('exit_code') == 0 and 'EXISTS' in (chk.get('output') or ''):
                             command = f"cd {candidate} && {command}"
                             logger.info(f"🔧 Prepended cd to project root for build tool: {candidate}")
+                # Add gentle guidance to prefer dedicated build tools for Maven/Gradle
+                logger.info(
+                    "⚠️ Consider using the maven tool for richer diagnostics, auto fail-at-end, and structured test data."
+                )
             except Exception as _e:
                 logger.debug(f"Bash build-tool workdir fallback skipped: {_e}")
         
