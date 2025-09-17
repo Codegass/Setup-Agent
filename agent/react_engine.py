@@ -3623,10 +3623,17 @@ EXECUTE ACTIONS FOR:
                     pom_candidates = (locate_res.get("output") or "").strip().splitlines()
                     project_name = getattr(orchestrator, 'project_name', None)
                     target_pom = None
-                    for candidate in pom_candidates:
-                        if project_name and f"/workspace/{project_name}" in candidate:
-                            target_pom = candidate
-                            break
+                    if project_name:
+                        root_candidate = f"/workspace/{project_name}/pom.xml"
+                        if root_candidate in pom_candidates:
+                            target_pom = root_candidate
+                    if not target_pom and project_name:
+                        # Prefer candidates directly under /workspace/<project_name>/
+                        scoped = [c for c in pom_candidates if c.startswith(f"/workspace/{project_name}/")]
+                        if scoped:
+                            # Sort by path depth to pick the shallowest (closest to root pom)
+                            scoped.sort(key=lambda p: p.count('/'))
+                            target_pom = scoped[0]
                     if not target_pom and pom_candidates:
                         target_pom = pom_candidates[0]
 
