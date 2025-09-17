@@ -442,9 +442,11 @@ class DockerOrchestrator:
             
             # Execute the command with stderr capture
             # Use demux to separate stdout and stderr when requested
+            # NOTE: We don't use Docker's workdir parameter here because we handle it 
+            # explicitly with cd in the bash command for better reliability
             result = container.exec_run(
                 exec_command, 
-                workdir=workdir,
+                workdir=None,  # Handled by cd command in bash
                 stderr=True,  # Explicitly capture stderr
                 stdout=True,  # Explicitly capture stdout
                 demux=capture_stderr,  # Separate stdout/stderr when True
@@ -592,7 +594,8 @@ class DockerOrchestrator:
         # This ensures Maven and other tools run in the correct directory
         if workdir:
             # Add cd command to ensure we're in the right directory
-            base_cmd = f"cd '{workdir}' && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            # Use escaped quotes to avoid shell escaping issues when wrapped with timeout
+            base_cmd = f"cd {workdir} && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
         else:
             # No working directory specified, use default
             base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
@@ -601,7 +604,9 @@ class DockerOrchestrator:
         if use_timeout_wrapper:
             # Use timeout with preserve-status to get the actual exit code
             # The entire command (including cd) needs to be wrapped
-            final_command = f"timeout --preserve-status {absolute_timeout} bash -c '{base_cmd}'"
+            # Use double quotes and escape them properly for nested shell execution
+            escaped_cmd = base_cmd.replace("'", "'\\''")
+            final_command = f"timeout --preserve-status {absolute_timeout} bash -c '{escaped_cmd}'"
             logger.info(f"🕐 Wrapped command with {absolute_timeout}s absolute timeout")
         else:
             final_command = base_cmd
@@ -625,9 +630,11 @@ class DockerOrchestrator:
         
         try:
             # Start the command execution
+            # NOTE: We don't use Docker's workdir parameter here because we handle it 
+            # explicitly with cd in the bash command for better compatibility with timeout wrapper
             exec_result = container.exec_run(
                 exec_command, 
-                workdir=workdir,
+                workdir=None,  # Handled by cd command in bash
                 stream=True,  # Enable streaming to monitor output
                 demux=True    # Separate stdout/stderr
             )
