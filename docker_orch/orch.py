@@ -422,11 +422,11 @@ class DockerOrchestrator:
 
         # Build the command to be executed in the container with proper environment loading
         # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
-        # CRITICAL FIX: Always cd to working directory when specified, including /workspace
-        # This ensures commands run in the correct directory consistently
+        # CRITICAL FIX: Source environment files BEFORE changing directory
+        # This prevents the source commands from resetting the working directory
         if workdir:
-            # Always change to the specified working directory
-            wrapped_command = f"cd '{workdir}' && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            # Source environment first, THEN change to the specified working directory
+            wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; cd '{workdir}' && {command}"
         else:
             # No working directory specified, use default behavior
             wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
@@ -590,12 +590,12 @@ class DockerOrchestrator:
             logger.info(f"🔧 Applied Maven optimizations to mvn parts of compound command")
         
         # Build the command with proper working directory handling
-        # CRITICAL FIX: Always cd to working directory when specified, including /workspace
-        # This ensures Maven and other tools run in the correct directory
+        # CRITICAL FIX: Source environment files BEFORE changing directory
+        # This prevents the source commands from resetting the working directory
         if workdir:
-            # Add cd command to ensure we're in the right directory
-            # Use escaped quotes to avoid shell escaping issues when wrapped with timeout
-            base_cmd = f"cd {workdir} && source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            # Source environment first, THEN change to the specified working directory
+            # No quotes needed for workdir since it's used after proper environment setup
+            base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; cd {workdir} && {command}"
         else:
             # No working directory specified, use default
             base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
