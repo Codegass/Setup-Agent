@@ -143,6 +143,18 @@ class MavenTool(BaseTool):
                 properties += ",maven.test.failure.ignore=true"
             else:
                 properties = "maven.test.failure.ignore=true"
+        
+        # CRITICAL FIX: Make fail_at_end work correctly for test commands
+        # Maven's --fail-at-end doesn't continue after test failures, only compilation failures
+        # For test commands with fail_at_end, automatically add maven.test.failure.ignore=true
+        if fail_at_end and command in ["test", "verify", "integration-test"]:
+            logger.info("📝 Enabling test failure ignore for fail_at_end with test command")
+            logger.info("   (Maven's --fail-at-end doesn't continue after test failures)")
+            if properties:
+                if "maven.test.failure.ignore" not in properties:
+                    properties += ",maven.test.failure.ignore=true"
+            else:
+                properties = "maven.test.failure.ignore=true"
 
         # Validate that pom.xml exists in the working directory
         pom_validation = self._validate_pom_exists(working_directory, pom_file)
