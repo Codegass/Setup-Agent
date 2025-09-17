@@ -1,11 +1,13 @@
 """Report tool for generating task summaries and marking completion."""
 
-from typing import Dict, Any, Optional
+import json
+from typing import Dict, Any, Iterable, List, Optional, Tuple
 from datetime import datetime
 
 from loguru import logger
 
 from .base import BaseTool, ToolResult
+from reporting import render_condensed_summary, truncate_list, format_percentage
 
 
 class ReportTool(BaseTool):
@@ -101,7 +103,13 @@ class ReportTool(BaseTool):
                         error_code="PREREQUISITE_TASKS_INCOMPLETE"
                     )
                 
-                report, verified_status, report_filename, actual_accomplishments = self._generate_comprehensive_report(summary, status, details)
+                (
+                    report,
+                    verified_status,
+                    report_filename,
+                    actual_accomplishments,
+                    report_snapshot,
+                ) = self._generate_comprehensive_report(summary, status, details)
                 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -110,18 +118,27 @@ class ReportTool(BaseTool):
                     "status": status,
                     "verified_status": verified_status,  # Include the verified status
                     "timestamp": datetime.now().isoformat(),
+                    "report_snapshot": report_snapshot,
                 }
-                
+
                 # ENHANCED: Provide condensed output for logs to reduce noise
                 # Full report is saved to markdown file, logs get summary only
-                condensed_output = self._generate_condensed_log_output(verified_status, report_filename, actual_accomplishments)
-                
+                condensed_output = self._generate_condensed_log_output(
+                    verified_status,
+                    report_filename,
+                    actual_accomplishments,
+                    report_snapshot,
+                )
+
                 return ToolResult(
                     success=True,
                     output=condensed_output,
                     metadata=metadata,
                     documentation_links=[],
-                    raw_data={"full_report": report}  # Store full report in metadata
+                    raw_data={
+                        "full_report": report,
+                        "report_snapshot": report_snapshot,
+                    }  # Store full report in metadata
                 )
             else:
                 return ToolResult(
@@ -140,7 +157,7 @@ class ReportTool(BaseTool):
                 suggestions=["Check if all required information is available"]
             )
 
-    def _generate_comprehensive_report(self, summary: str, status: str, details: str) -> tuple[str, str]:
+    def _generate_comprehensive_report(self, summary: str, status: str, details: str) -> Tuple[str, str, str, dict, dict]:
         """Generate a comprehensive project setup report."""
         
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -194,14 +211,40 @@ class ReportTool(BaseTool):
             logger.info(f"📊 Phase status updated from physical validation: Clone={clone_success}, "
                        f"Build={build_success}, Test={test_success}")
         
+        report_snapshot = self._build_report_snapshot(
+            verified_status,
+            report_filename,
+            project_info or {},
+            actual_accomplishments,
+            execution_metrics,
+        )
+
         # Generate both console and markdown versions with verified information and metrics
-        console_report = self._generate_console_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments, execution_metrics)
-        markdown_report = self._generate_markdown_report(summary, verified_status, details, timestamp, project_info, actual_accomplishments, execution_metrics)
+        console_report = self._generate_console_report(
+            summary,
+            verified_status,
+            details,
+            timestamp,
+            project_info,
+            actual_accomplishments,
+            execution_metrics,
+            report_snapshot,
+        )
+        markdown_report = self._generate_markdown_report(
+            summary,
+            verified_status,
+            details,
+            timestamp,
+            project_info,
+            actual_accomplishments,
+            execution_metrics,
+            report_snapshot,
+        )
         
         # Save markdown report to workspace with consistent filename
         self._save_markdown_report(markdown_report, timestamp, report_filename)
         
-        return console_report, verified_status, report_filename, actual_accomplishments
+        return console_report, verified_status, report_filename, actual_accomplishments, report_snapshot
 
     def _collect_simple_status_from_tasks(self) -> dict:
         """
@@ -339,68 +382,499 @@ class ReportTool(BaseTool):
         
         return "\n".join(lines)
 
-    def _generate_condensed_log_output(self, verified_status: str, report_filename: str, actual_accomplishments: dict = None) -> str:
-        """
-        Generate condensed output for logs to reduce noise.
-        Only shows essential information instead of the full report.
-        """
-        project_info = self._get_project_info()
-        
-        # Create status icons based on actual accomplishments if available, otherwise fallback to task analysis
-        if actual_accomplishments:
-            # Use physical validation results for accurate status icons
-            clone_icon = "✅" if actual_accomplishments.get('repository_cloned', False) else "❌"
-            build_icon = "✅" if actual_accomplishments.get('build_success', False) else "❌"
-            test_icon = "✅" if actual_accomplishments.get('test_success', False) else "❌"
+    def _load_test_history(self, max_lines: int = 40, max_bytes: int = 16384) -> Dict[str, Any]:
+        """Load and aggregate recent test history events from the metrics JSONL file."""
+        metrics_path = "/workspace/.setup_agent/metrics/test_summary.jsonl"
+        raw_lines: List[str] = []
+
+        if self.docker_orchestrator:
+            try:
+                cmd = f"if [ -f {metrics_path} ]; then tail -n {max_lines} {metrics_path}; fi"
+                result = self.docker_orchestrator.execute_command(cmd)
+                if result.get("exit_code") == 0 and result.get("output"):
+                    raw_lines = result["output"].splitlines()
+            except Exception as exc:
+                logger.debug(f"Failed to fetch test history via orchestrator: {exc}")
+
+        if not raw_lines:
+            try:
+                with open(metrics_path, "r", encoding="utf-8") as handle:
+                    raw_lines = handle.readlines()[-max_lines:]
+            except FileNotFoundError:
+                return {}
+            except Exception as exc:
+                logger.debug(f"Failed to read test history locally: {exc}")
+                return {}
+
+        history: Dict[str, Any] = {
+            'ignored_lines': 0,
+            'last_cmd': {},
+            'aggregate': {},
+            'per_module': {},
+            'exclusions': {'tests': [], 'modules': []},
+            'failed_tests': [],
+            'flags': {},
+        }
+
+        modules_seen: Dict[str, Dict[str, Any]] = {}
+        aggregate_entry: Dict[str, Any] = {}
+        skipped_modules: set[str] = set()
+        excluded_tests: set[str] = set()
+        excluded_modules: set[str] = set()
+        failed_tests: set[str] = set()
+        modules_expected: Optional[int] = None
+
+        def normalize_tests(source: Dict[str, Any]) -> Dict[str, Optional[float]]:
+            def cast(value: Optional[float]) -> Optional[int]:
+                if value is None:
+                    return None
+                try:
+                    value = float(value)
+                    if value.is_integer():
+                        return int(value)
+                    return int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            def pick(keys: Iterable[str]) -> Optional[float]:
+                for key in keys:
+                    if key in source and source[key] is not None:
+                        try:
+                            return float(source[key])
+                        except (TypeError, ValueError):
+                            return None
+                return None
+
+            total = pick(['total', 'tests_total', 'total_tests'])
+            failed = pick(['failed', 'failures', 'tests_failed', 'tests_failures']) or 0
+            errors = pick(['errors', 'error', 'tests_errors']) or 0
+            skipped = pick(['skipped', 'tests_skipped']) or 0
+            passed = pick(['passed', 'passes', 'tests_passed'])
+
+            if passed is None and total is not None:
+                try:
+                    passed = max(total - failed - errors, 0)
+                except TypeError:
+                    passed = None
+
+            pass_pct = None
+            if total and passed is not None:
+                try:
+                    pass_pct = (passed / total) * 100 if total else None
+                except ZeroDivisionError:
+                    pass_pct = None
+
+            return {
+                'total': cast(total),
+                'passed': cast(passed),
+                'failed': cast(failed),
+                'error': cast(errors),
+                'skipped': cast(skipped),
+                'pass_pct': pass_pct,
+            }
+
+        for raw_line in raw_lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if len(line) > max_bytes:
+                history['ignored_lines'] += 1
+                continue
+
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                history['ignored_lines'] += 1
+                continue
+
+            event_type = entry.get('event') or 'legacy_session'
+
+            if event_type == 'test_module_summary':
+                module_name = entry.get('module') or entry.get('module_name')
+                if not module_name:
+                    continue
+                counts = normalize_tests(entry.get('tests', entry))
+                modules_seen[module_name] = {
+                    'total': counts['total'],
+                    'passed': counts['passed'],
+                    'failed': counts['failed'],
+                    'error': counts['error'],
+                    'skipped': counts['skipped'],
+                    'pass_pct': counts['pass_pct'],
+                }
+
+                excluded = entry.get('exclusions', {})
+                if isinstance(excluded, dict):
+                    excluded_tests.update(excluded.get('tests', []) or [])
+                    excluded_modules.update(excluded.get('modules', []) or [])
+                skipped_modules.update(entry.get('skipped_modules', []) or [])
+                failed_tests.update(entry.get('failed_tests', []) or [])
+                continue
+
+            if event_type in {'test_session_end', 'legacy_session'}:
+                aggregate_entry = entry
+                counts = normalize_tests(entry.get('tests', entry))
+                aggregate_entry['_normalized_tests'] = counts
+
+                modules_expected = entry.get('modules_expected', modules_expected)
+                if entry.get('modules_seen'):
+                    try:
+                        seen = int(entry['modules_seen'])
+                        aggregate_entry['_modules_seen'] = seen
+                    except (TypeError, ValueError):
+                        pass
+
+                skipped_modules.update(entry.get('skipped_modules', []) or [])
+                failed_tests.update(entry.get('failed_tests', []) or [])
+
+                exclusions_field = entry.get('exclusions')
+                if isinstance(exclusions_field, dict):
+                    excluded_tests.update(exclusions_field.get('tests', []) or [])
+                    excluded_modules.update(exclusions_field.get('modules', []) or [])
+                else:
+                    excluded_tests.update(entry.get('excluded_tests', []) or [])
+                    excluded_modules.update(entry.get('excluded_modules', []) or [])
+
+                history['last_cmd'] = {
+                    'tool': entry.get('tool'),
+                    'workdir': entry.get('working_directory'),
+                    'exit_code': entry.get('exit_code'),
+                    'command': entry.get('command'),
+                    'fail_at_end': entry.get('fail_at_end')
+                }
+
+                # Infer fail_at_end from command if not explicit
+                if history['last_cmd'].get('fail_at_end') is None:
+                    command_str = entry.get('command') or ''
+                    history['last_cmd']['fail_at_end'] = '--fail-at-end' in command_str or ' -fae' in command_str
+
+        if not modules_seen and not aggregate_entry:
+            return {}
+
+        aggregate_counts = aggregate_entry.get('_normalized_tests', {}) if aggregate_entry else {}
+        aggregate: Dict[str, Any] = {
+            'modules_expected': modules_expected,
+            'skipped_modules': sorted(skipped_modules) if skipped_modules else [],
+            'tests': {
+                'total': aggregate_counts.get('total'),
+                'passed': aggregate_counts.get('passed'),
+                'failed': aggregate_counts.get('failed'),
+                'error': aggregate_counts.get('error'),
+                'skipped': aggregate_counts.get('skipped'),
+            },
+            'pass_pct': aggregate_counts.get('pass_pct'),
+        }
+
+        modules_seen_count = aggregate_entry.get('_modules_seen') if aggregate_entry else None
+        if modules_seen_count is None:
+            modules_seen_count = len(modules_seen)
+        aggregate['modules_seen'] = modules_seen_count
+
+        # Detect inconsistencies between per-module totals and aggregate
+        if aggregate_counts.get('total') is not None and modules_seen:
+            module_total = 0.0
+            for module_info in modules_seen.values():
+                if module_info.get('total') is not None:
+                    module_total += module_info['total']
+            try:
+                aggregate['inconsistent'] = abs(module_total - aggregate_counts['total']) > 0.5
+            except TypeError:
+                aggregate['inconsistent'] = True
+
+        history['aggregate'] = aggregate
+        history['per_module'] = modules_seen
+        history['exclusions']['tests'] = sorted(excluded_tests)
+        history['exclusions']['modules'] = sorted(excluded_modules)
+        history['failed_tests'] = sorted(failed_tests)
+        history['flags']['fail_at_end'] = history['last_cmd'].get('fail_at_end') if history['last_cmd'] else None
+
+        return history
+
+    def _build_report_snapshot(
+        self,
+        verified_status: str,
+        report_filename: str,
+        project_info: dict,
+        actual_accomplishments: dict,
+        execution_metrics: dict,
+    ) -> Dict[str, Any]:
+        """Create a normalized snapshot used for rendering condensed and markdown reports."""
+
+        actual_accomplishments = actual_accomplishments or {}
+        execution_metrics = execution_metrics or {}
+
+        test_history = execution_metrics.get('test_history', {}) or {}
+        aggregate = test_history.get('aggregate', {}) or {}
+        per_module = test_history.get('per_module', {}) or {}
+
+        def to_int(value):
+            if value is None:
+                return None
+            try:
+                value = float(value)
+                if value.is_integer():
+                    return int(value)
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        tests_counts = aggregate.get('tests', {}) or {}
+        tests_total = tests_counts.get('total')
+        tests_failed = tests_counts.get('failed')
+        tests_error = tests_counts.get('error')
+        tests_skipped = tests_counts.get('skipped')
+        tests_passed = tests_counts.get('passed')
+        pass_pct = aggregate.get('pass_pct')
+
+        physical_validation = actual_accomplishments.get('physical_validation', {}) or {}
+        test_analysis = physical_validation.get('test_analysis', {}) or {}
+
+        if tests_total is None:
+            tests_total = test_analysis.get('total_tests')
+        if tests_failed is None:
+            tests_failed = test_analysis.get('failed_tests')
+        if tests_error is None:
+            tests_error = test_analysis.get('error_tests')
+        if tests_skipped is None:
+            tests_skipped = test_analysis.get('skipped_tests')
+        if tests_passed is None:
+            tests_passed = test_analysis.get('passed_tests')
+
+        if pass_pct is None:
+            pass_pct = (
+                test_analysis.get('pass_rate')
+                or test_analysis.get('pass_pct')
+                or test_analysis.get('pass_percentage')
+            )
+
+        if pass_pct is None and tests_total and tests_passed is not None:
+            try:
+                pass_pct = (tests_passed / tests_total) * 100
+            except ZeroDivisionError:
+                pass_pct = None
+
+        modules_expected = aggregate.get('modules_expected')
+        modules_seen = aggregate.get('modules_seen')
+        skipped_modules = aggregate.get('skipped_modules', []) or []
+
+        exclusions = test_history.get('exclusions', {}) or {}
+        exclusions_tests = exclusions.get('tests', []) or []
+        exclusions_modules = exclusions.get('modules', []) or []
+
+        phases = {
+            'clone': actual_accomplishments.get('repository_cloned', False),
+            'build': actual_accomplishments.get('build_success', False),
+            'test': actual_accomplishments.get('test_success', False),
+        }
+
+        status = {
+            'overall': verified_status,
+            'tests_total': to_int(tests_total),
+            'tests_passed': to_int(tests_passed),
+            'tests_failed': to_int(tests_failed),
+            'tests_errors': to_int(tests_error),
+            'tests_skipped': to_int(tests_skipped),
+            'pass_pct': pass_pct,
+            'modules_expected': to_int(modules_expected),
+            'modules_seen': to_int(modules_seen),
+            'skipped_modules': skipped_modules,
+        }
+
+        if status['tests_passed'] is None and status['tests_total'] is not None and status['tests_failed'] is not None:
+            try:
+                status['tests_passed'] = max(status['tests_total'] - status['tests_failed'] - (status['tests_errors'] or 0), 0)
+            except TypeError:
+                status['tests_passed'] = None
+
+        tests_ok = None
+        if pass_pct is not None:
+            tests_ok = pass_pct >= 80
+        elif status['tests_total'] is not None:
+            tests_ok = actual_accomplishments.get('test_success', False)
+        status['tests_ok'] = tests_ok
+
+        physical_evidence = {
+            'class_files': physical_validation.get('class_files'),
+            'jar_files': physical_validation.get('jar_files'),
+            'tests_total': status['tests_total'],
+            'tests_pass_pct': pass_pct,
+        }
+
+        flags = {
+            'fail_at_end': test_history.get('flags', {}).get('fail_at_end'),
+            'excluded_tests': exclusions_tests,
+            'excluded_modules': exclusions_modules,
+        }
+
+        snapshot = {
+            'status': status,
+            'project': {
+                'type': project_info.get('type', 'Unknown'),
+                'build_system': project_info.get('build_system', 'Unknown'),
+            },
+            'phases': phases,
+            'report_path': f"/workspace/{report_filename}",
+            'physical_evidence': physical_evidence,
+            'test_history': test_history,
+            'per_module': per_module,
+            'flags': flags,
+            'last_command': test_history.get('last_cmd', {}),
+            'failed_tests': test_history.get('failed_tests', []),
+        }
+
+        attention = self._evaluate_attention_flags(snapshot)
+        snapshot['attention'] = {
+            'items': [f"{item['icon']} {item['message']}" for item in attention],
+            'raw': attention,
+            'ignored_lines': test_history.get('ignored_lines', 0),
+        }
+
+        return snapshot
+
+    def _evaluate_attention_flags(self, snapshot: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Evaluate needs-attention rules and return ordered severity entries."""
+
+        severity_order = {'BLOCKER': 0, 'WARNING': 1, 'INFO': 2}
+        severity_icons = {'BLOCKER': '🔴', 'WARNING': '🟠', 'INFO': '🔵'}
+        items: List[Dict[str, str]] = []
+
+        phases = snapshot.get('phases', {})
+        status = snapshot.get('status', {})
+        test_history = snapshot.get('test_history', {})
+        per_module = snapshot.get('per_module', {})
+        flags = snapshot.get('flags', {})
+
+        def add(severity: str, message: str):
+            items.append({'severity': severity, 'icon': severity_icons[severity], 'message': message})
+
+        # BLOCKER: build failure
+        if not phases.get('build', False):
+            add('BLOCKER', 'Build failed - compilation or packaging incomplete.')
+
+        # BLOCKER: tests flagged unsuccessful despite telemetry
+        if status.get('tests_total') and phases.get('test') is False:
+            pass_rate = format_percentage(status.get('pass_pct'))
+            add('BLOCKER', f'Tests reported failures (pass rate {pass_rate}).')
+
+        # BLOCKER: build succeeded but no test telemetry captured
+        if phases.get('build') and not status.get('tests_total'):
+            add('BLOCKER', 'No test reports detected despite successful build.')
+
+        # WARNING: pass rate below threshold (unless already blocker)
+        if status.get('pass_pct') is not None and status['pass_pct'] < 80:
+            pass_rate = format_percentage(status['pass_pct'])
+            add('WARNING', f'Test pass rate below threshold (80%): {pass_rate}.')
+
+        # WARNING: module coverage shortfall
+        if status.get('modules_expected') and status.get('modules_seen') is not None:
+            if status['modules_seen'] < status['modules_expected']:
+                add(
+                    'WARNING',
+                    f"Module coverage incomplete ({status['modules_seen']}/{status['modules_expected']} tested).",
+                )
+
+        # WARNING: skipped modules or exclusions present
+        skipped_modules = status.get('skipped_modules') or []
+        if skipped_modules:
+            skipped_str = truncate_list(skipped_modules)
+            add('WARNING', f'Skipped modules detected: {skipped_str}.')
+
+        exclusions_tests = flags.get('excluded_tests') or []
+        if exclusions_tests:
+            exclusion_str = truncate_list(exclusions_tests)
+            add('WARNING', f'Excluded tests patterns applied: {exclusion_str}.')
+
+        # INFO: fail_at_end flag
+        if flags.get('fail_at_end'):
+            add('INFO', 'fail_at_end enabled (test failures may be deferred).')
+
+        # INFO: modules with low pass percentage
+        low_modules = []
+        for module, data in per_module.items():
+            module_pass = data.get('pass_pct')
+            if module_pass is not None and module_pass < 80:
+                low_modules.append(f"{module} ({format_percentage(module_pass)})")
+
+        if low_modules:
+            low_modules.sort(key=lambda entry: entry)
+            add('INFO', f"Modules below 80% pass rate: {truncate_list(low_modules)}.")
+
+        # INFO: ignored telemetry lines
+        ignored_lines = test_history.get('ignored_lines', 0)
+        if ignored_lines:
+            add('INFO', f'Telemetry entries ignored during aggregation: {ignored_lines}.')
+
+        items.sort(key=lambda entry: severity_order[entry['severity']])
+        return items
+
+    def _generate_condensed_log_output(
+        self,
+        verified_status: str,
+        report_filename: str,
+        actual_accomplishments: dict = None,
+        report_snapshot: dict = None,
+    ) -> str:
+        """Generate condensed output for logs using the shared rendering utility."""
+        if report_snapshot:
+            snapshot = dict(report_snapshot)
+            snapshot['report_path'] = snapshot.get('report_path') or f"/workspace/{report_filename}"
         else:
-            # Fallback to simple task-based status
-            simple_status = self._collect_simple_status_from_tasks()
-            clone_icon = "✅" if simple_status.get('clone_success', False) else "❌"
-            build_icon = "✅" if simple_status.get('build_success', False) else "❌"
-            test_icon = "✅" if simple_status.get('test_success', False) else "❌"
-        
-        # Determine overall status icon
-        if verified_status == "success":
-            status_icon = "✅"
-            status_text = "SUCCESS"
-        elif verified_status == "fail":
-            status_icon = "❌"
-            status_text = "FAIL"
-        else:
-            status_icon = "❌"
-            status_text = "FAILED"
-        
-        # Generate condensed summary with consistent filename
-        lines = [
-            f"🎯 SETUP COMPLETED: {status_icon} {status_text}",
-            f"📋 Core Status: {clone_icon} Clone, {build_icon} Build, {test_icon} Test",
-            f"📂 Project: {project_info.get('type', 'Unknown')} ({project_info.get('build_system', 'Unknown')})",
-            f"📄 Full report saved to: /workspace/{report_filename}"
-        ]
-        
-        # Add physical evidence for failed status
-        if verified_status in ["failed", "fail"] and actual_accomplishments:
-            physical_validation = actual_accomplishments.get('physical_validation', {})
+            project_info = self._get_project_info()
+            if actual_accomplishments:
+                phases = {
+                    'clone': actual_accomplishments.get('repository_cloned', False),
+                    'build': actual_accomplishments.get('build_success', False),
+                    'test': actual_accomplishments.get('test_success', False),
+                }
+                physical_validation = actual_accomplishments.get('physical_validation', {})
+            else:
+                simple_status = self._collect_simple_status_from_tasks()
+                phases = {
+                    'clone': simple_status.get('clone_success', False),
+                    'build': simple_status.get('build_success', False),
+                    'test': simple_status.get('test_success', False),
+                }
+                physical_validation = {}
+
+            evidence = {}
             if physical_validation:
-                class_files = physical_validation.get('class_files', 0)
-                jar_files = physical_validation.get('jar_files', 0)
-                lines.append(f"[PHYSICAL EVIDENCE: {class_files} .class files, {jar_files} .jar files found]")
-            elif not actual_accomplishments.get('build_success', True):
-                lines.append("[PHYSICAL EVIDENCE: No .class files found - compilation may have failed]")
-        
-        # Show warning if no PhysicalValidator was injected
+                evidence['class_files'] = physical_validation.get('class_files')
+                evidence['jar_files'] = physical_validation.get('jar_files')
+                if 'test_analysis' in physical_validation:
+                    test_data = physical_validation['test_analysis']
+                    evidence['tests_total'] = test_data.get('total_tests')
+                    evidence['tests_pass_pct'] = test_data.get('pass_rate') or test_data.get('pass_pct')
+                    if evidence['tests_pass_pct'] is None:
+                        total = test_data.get('total_tests')
+                        passed = test_data.get('passed_tests')
+                        if total:
+                            evidence['tests_pass_pct'] = (passed / total) * 100 if passed is not None else None
+
+            snapshot = {
+                'status': {'overall': verified_status},
+                'project': {
+                    'type': project_info.get('type', 'Unknown'),
+                    'build_system': project_info.get('build_system', 'Unknown'),
+                },
+                'phases': phases,
+                'report_path': f"/workspace/{report_filename}",
+                'physical_evidence': evidence,
+                'attention': {'items': []},
+            }
+
+        condensed_lines = render_condensed_summary(snapshot).split('\n')
+
         if not actual_accomplishments and not self.physical_validator:
-            lines.append("[⚠️ WARNING: No physical validator - using task-based inference only]")
-        
-        # Add next steps based on status
+            condensed_lines.append("[⚠️ WARNING: No physical validator - using task-based inference only]")
+
         if verified_status == "success":
-            lines.append("💡 Next: Project ready for development/deployment! 🎉")
+            condensed_lines.append("💡 Next: Project ready for development/deployment! 🎉")
         elif verified_status == "fail":
-            lines.append("💡 Next: Review logs and fix build/test failures")
+            condensed_lines.append("💡 Next: Review logs and fix build/test failures")
         else:
-            lines.append("💡 Next: Check error logs and retry setup")
-        
-        return "\n".join(lines)
+            condensed_lines.append("💡 Next: Check error logs and retry setup")
+
+        return "\n".join(condensed_lines)
 
     def _validate_context_prerequisites(self) -> Dict[str, Any]:
         """
@@ -776,7 +1250,11 @@ class ReportTool(BaseTool):
         metrics['phases']['build']['status'] = False
         metrics['phases']['test']['status'] = False
         logger.debug("Phase status will be determined by physical validation")
-        
+
+        test_history = self._load_test_history()
+        if test_history:
+            metrics['test_history'] = test_history
+
         return metrics
     
     def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
@@ -1337,7 +1815,17 @@ class ReportTool(BaseTool):
             logger.warning(f"❌ FAIL: Test pass rate {test_pass_rate:.1f}% <= 80%")
             return "fail"
 
-    def _generate_console_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None, execution_metrics: dict = None) -> str:
+    def _generate_console_report(
+        self,
+        summary: str,
+        status: str,
+        details: str,
+        timestamp: str,
+        project_info: dict,
+        actual_accomplishments: dict = None,
+        execution_metrics: dict = None,
+        report_snapshot: dict = None,
+    ) -> str:
         """Generate console-formatted report with simple summary at the top."""
         
         # ENHANCED: Add simple three-phase summary at the top
@@ -1691,7 +2179,17 @@ class ReportTool(BaseTool):
             
         return info
     
-    def _generate_markdown_report(self, summary: str, status: str, details: str, timestamp: str, project_info: dict, actual_accomplishments: dict = None, execution_metrics: dict = None) -> str:
+    def _generate_markdown_report(
+        self,
+        summary: str,
+        status: str,
+        details: str,
+        timestamp: str,
+        project_info: dict,
+        actual_accomplishments: dict = None,
+        execution_metrics: dict = None,
+        report_snapshot: dict = None,
+    ) -> str:
         """Generate markdown-formatted report based on actual project context and execution results."""
         
         report_lines = [
@@ -1701,7 +2199,22 @@ class ReportTool(BaseTool):
             f"**Status:** {status.upper()}",
             "",
         ]
-        
+
+        if report_snapshot:
+            report_lines.extend(self._render_conclusion_section(report_snapshot))
+
+            attention_section = self._render_attention_section(report_snapshot)
+            if attention_section:
+                report_lines.extend(attention_section)
+
+            coverage_section = self._render_test_coverage_section(report_snapshot)
+            if coverage_section:
+                report_lines.extend(coverage_section)
+
+            execution_detail_section = self._render_execution_details_section(report_snapshot)
+            if execution_detail_section:
+                report_lines.extend(execution_detail_section)
+
         # Add project information from actual context
         if project_info:
             report_lines.extend([
@@ -1712,7 +2225,7 @@ class ReportTool(BaseTool):
                 f"- **Build System:** {project_info.get('build_system', 'Unknown')}",
                 "",
             ])
-        
+
         # Add agent's summary - this should be provided by the agent based on actual work done
         if summary:
             report_lines.extend([
@@ -1730,7 +2243,7 @@ class ReportTool(BaseTool):
         # Add execution details - this should be filled by agent analysis
         if details:
             report_lines.extend([
-                "## 📝 Execution Details",
+                "## 📝 Additional Details",
                 "",
                 details,
                 "",
@@ -1763,8 +2276,193 @@ class ReportTool(BaseTool):
             "",
             f"*This report was automatically generated by Setup-Agent at {timestamp}*",
         ])
-        
+
         return "\n".join(report_lines)
+
+    def _render_conclusion_section(self, snapshot: Dict[str, Any]) -> List[str]:
+        status = snapshot.get('status', {})
+        phases = snapshot.get('phases', {})
+        evidence = snapshot.get('physical_evidence', {})
+
+        build_icon = '✅' if phases.get('build') else '❌'
+        class_files = evidence.get('class_files')
+        jar_files = evidence.get('jar_files')
+        build_details = []
+        if class_files is not None:
+            build_details.append(f"{class_files} .class files")
+        if jar_files is not None:
+            build_details.append(f"{jar_files} .jar files")
+        build_suffix = (
+            f"Artifacts: {', '.join(build_details)}"
+            if build_details
+            else "No build artifacts detected"
+        )
+
+        tests_total = status.get('tests_total')
+        tests_passed = status.get('tests_passed')
+        tests_failed = status.get('tests_failed')
+        tests_errors = status.get('tests_errors')
+        tests_skipped = status.get('tests_skipped')
+        pass_pct = status.get('pass_pct')
+
+        if tests_total:
+            test_icon = '✅' if status.get('tests_ok', False) else '❌'
+            test_summary = (
+                f"{tests_passed or 0}/{tests_total} passed"
+                f", {tests_failed or 0} failed, {tests_errors or 0} errors"
+            )
+            if tests_skipped:
+                test_summary += f", {tests_skipped} skipped"
+            test_summary += f" (pass rate {format_percentage(pass_pct)})"
+        else:
+            test_icon = '⚠️'
+            test_summary = "No test telemetry captured"
+
+        modules_expected = status.get('modules_expected')
+        modules_seen = status.get('modules_seen')
+        if modules_expected:
+            coverage_line = f"{modules_seen or 0}/{modules_expected} modules executed"
+        elif modules_seen is not None:
+            coverage_line = f"Modules observed: {modules_seen}"
+        else:
+            coverage_line = None
+
+        lines = [
+            "## ✅ Conclusion",
+            "",
+            f"- **Build:** {build_icon} {build_suffix}",
+            f"- **Tests:** {test_icon} {test_summary}",
+        ]
+
+        if coverage_line:
+            lines.append(f"- **Module Coverage:** {coverage_line}")
+
+        lines.append("")
+        return lines
+
+    def _render_attention_section(self, snapshot: Dict[str, Any]) -> List[str]:
+        attention_raw = snapshot.get('attention', {}).get('raw', [])
+        if not attention_raw:
+            return [
+                "## 🚨 Needs Attention",
+                "",
+                "- ✅ No outstanding blocking issues detected.",
+                "",
+            ]
+
+        lines = ["## 🚨 Needs Attention", ""]
+        for item in attention_raw[:5]:
+            lines.append(f"- {item['icon']} {item['message']}")
+
+        remaining = len(attention_raw) - 5
+        if remaining > 0:
+            lines.append(f"- ... (+{remaining} more)")
+        lines.append("")
+        return lines
+
+    def _render_test_coverage_section(self, snapshot: Dict[str, Any]) -> List[str]:
+        status = snapshot.get('status', {})
+        per_module = snapshot.get('per_module', {}) or {}
+        flags = snapshot.get('flags', {})
+
+        lines = ["## 🧪 Test Coverage", ""]
+
+        if status.get('tests_total'):
+            lines.append(
+                f"- **Total Tests:** {status['tests_total']} (pass rate {format_percentage(status.get('pass_pct'))})"
+            )
+            lines.append(
+                f"- **Failures/Errors:** {status.get('tests_failed', 0)} failed, "
+                f"{status.get('tests_errors', 0)} errors"
+            )
+        else:
+            lines.append("- ⚠️ No aggregated test results available.")
+
+        if status.get('modules_expected'):
+            lines.append(
+                f"- **Module Coverage:** {status.get('modules_seen', 0)}/"
+                f"{status['modules_expected']} modules executed"
+            )
+
+        skipped_modules = status.get('skipped_modules') or []
+        if skipped_modules:
+            lines.append(f"- **Skipped Modules:** {truncate_list(skipped_modules)}")
+
+        exclusions_tests = flags.get('excluded_tests') or []
+        if exclusions_tests:
+            lines.append(f"- **Excluded Tests:** {truncate_list(exclusions_tests)}")
+
+        lines.append("")
+
+        if per_module:
+            lines.extend([
+                "| Module | Pass % | Pass/Fail/Error/Skip |",
+                "|--------|-------:|---------------------|",
+            ])
+
+            sorted_modules = sorted(
+                per_module.items(),
+                key=lambda item: (item[1].get('pass_pct') if item[1].get('pass_pct') is not None else 101.0,
+                                  item[0])
+            )
+
+            max_rows = 6
+            for idx, (module, data) in enumerate(sorted_modules):
+                if idx >= max_rows:
+                    break
+                pass_pct = format_percentage(data.get('pass_pct'))
+                summary = (
+                    f"{data.get('passed', 0)}/{data.get('failed', 0)}/"
+                    f"{data.get('error', 0)}/{data.get('skipped', 0)}"
+                )
+                lines.append(f"| {module} | {pass_pct} | {summary} |")
+
+            if len(sorted_modules) > max_rows:
+                lines.append(f"| ... | ... | +{len(sorted_modules) - max_rows} more modules |")
+
+            lines.append("")
+
+        return lines
+
+    def _render_execution_details_section(self, snapshot: Dict[str, Any]) -> List[str]:
+        history = snapshot.get('test_history', {}) or {}
+        last_cmd = snapshot.get('last_command', {}) or {}
+        flags = snapshot.get('flags', {}) or {}
+        failed_tests = snapshot.get('failed_tests', []) or []
+
+        lines = ["## 🧰 Execution Details", ""]
+
+        if last_cmd:
+            command = last_cmd.get('command') or '<unknown>'
+            exit_code = last_cmd.get('exit_code')
+            tool = last_cmd.get('tool') or 'maven'
+            workdir = last_cmd.get('workdir') or 'N/A'
+            lines.append(f"- **Tool:** {tool}")
+            lines.append(f"- **Working Directory:** {workdir}")
+            lines.append(f"- **Command:** `{command}`")
+            if exit_code is not None:
+                lines.append(f"- **Exit Code:** {exit_code}")
+
+        if flags.get('fail_at_end'):
+            lines.append("- **Flag:** `fail_at_end=True`")
+
+        exclusions_tests = flags.get('excluded_tests') or []
+        if exclusions_tests:
+            lines.append(f"- **Excluded Tests:** {truncate_list(exclusions_tests)}")
+
+        exclusions_modules = flags.get('excluded_modules') or []
+        if exclusions_modules:
+            lines.append(f"- **Excluded Modules:** {truncate_list(exclusions_modules)}")
+
+        ignored_lines = history.get('ignored_lines', 0)
+        if ignored_lines:
+            lines.append(f"- **Telemetry:** {ignored_lines} lines ignored during aggregation")
+
+        if failed_tests:
+            lines.append(f"- **Failed Tests (latest):** {truncate_list(failed_tests)}")
+
+        lines.append("")
+        return lines
 
     def _generate_task_status_section(self, actual_accomplishments: dict = None) -> list:
         """Generate task completion status section based on trunk context."""
