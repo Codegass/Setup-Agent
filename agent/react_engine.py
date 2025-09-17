@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from config import create_agent_logger, create_verbose_logger, get_config
 
 from tools.base import BaseTool, ToolResult
+from reporting import render_condensed_summary
 from .context_manager import BranchContext, ContextManager, TrunkContext, BranchContextHistory
 from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
 from .output_storage import OutputStorageManager
@@ -75,6 +76,7 @@ class ReActEngine:
             'maven_success': False,     # Whether maven operations succeeded
             'excluded_modules': set(),
             'excluded_tests': set(),
+            'report_snapshot': None,
         }
 
         # Agent logger for detailed traces
@@ -1956,7 +1958,15 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 elif "gradle" in output.lower() or "build.gradle" in output.lower():
                     self.successful_states['project_type'] = 'gradle'
                     logger.debug("Detected Gradle project type")
-        
+
+            elif tool_name == "report":
+                snapshot = {}
+                if hasattr(result, 'metadata') and result.metadata:
+                    snapshot = result.metadata.get('report_snapshot') or {}
+                if snapshot:
+                    self.successful_states['report_snapshot'] = dict(snapshot)
+                    logger.debug("Stored report snapshot for completion guidance")
+
         except Exception as e:
             logger.warning(f"Failed to update successful states: {e}")
 
@@ -2626,10 +2636,23 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
     def _add_completion_guidance(self, reason: str):
         """Add guidance to help agent recognize task completion."""
-        guidance = (f"SYSTEM GUIDANCE: Task completion detected! {reason}. "
-                   f"You should now generate a completion report using the report tool "
-                   f"with a summary of what was accomplished, then the system will stop.")
-        
+        guidance_segments: List[str] = []
+
+        snapshot = self.successful_states.get('report_snapshot')
+        if snapshot:
+            try:
+                guidance_segments.append(render_condensed_summary(snapshot))
+            except Exception as exc:  # pragma: no cover - defensive logging
+                logger.debug(f"Failed to render report snapshot for completion guidance: {exc}")
+
+        guidance_segments.append(
+            f"SYSTEM GUIDANCE: Task completion detected! {reason}. "
+            f"You should now generate a completion report using the report tool "
+            f"with a summary of what was accomplished, then the system will stop."
+        )
+
+        guidance = "\n".join(guidance_segments)
+
         guidance_step = ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
             content=guidance,
