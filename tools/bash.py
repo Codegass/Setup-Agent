@@ -3,6 +3,8 @@
 import re
 import shlex
 import subprocess
+import json
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 
@@ -472,6 +474,12 @@ class BashTool(BaseTool):
                 
                 # Analyze output for completion signals
                 completion_signals = self._detect_completion_signals(result["output"], command)
+                
+                # Detect and record test telemetry if applicable
+                test_data = self._detect_test_output(command, result["output"])
+                if test_data:
+                    self._write_test_telemetry(command, workdir, result.get('exit_code', 0), test_data)
+                    logger.info(f"📊 Detected {test_data['tool']} test results: {test_data['tests']}")
                 
                 # Separate stdout and stderr if available
                 stdout = result.get('stdout', result["output"])
@@ -1345,6 +1353,128 @@ GREP INVESTIGATION EXAMPLES:
             },
             "required": ["command"],
         }
+
+    def _detect_test_output(self, command: str, output: str) -> Optional[Dict[str, Any]]:
+        """Detect and parse test output from various test runners."""
+        if not output:
+            return None
+            
+        # Check if this is a test command
+        test_indicators = ['pytest', 'jest', 'npm test', 'yarn test', 'go test', 'cargo test', 'phpunit', 'rspec']
+        is_test_command = any(indicator in command.lower() for indicator in test_indicators)
+        if not is_test_command:
+            return None
+            
+        test_data = {}
+        
+        # Pytest detection
+        if 'pytest' in command or '= test session starts =' in output:
+            # Pattern: "5 passed, 2 failed, 1 error in 10.5s"
+            match = re.search(r'(\d+) passed(?:, (\d+) failed)?(?:, (\d+) error)?(?:, (\d+) skipped)?', output)
+            if match:
+                passed = int(match.group(1) or 0)
+                failed = int(match.group(2) or 0)  
+                errors = int(match.group(3) or 0)
+                skipped = int(match.group(4) or 0)
+                test_data = {
+                    'tool': 'pytest',
+                    'tests': {
+                        'total': passed + failed + errors + skipped,
+                        'passed': passed,
+                        'failed': failed,
+                        'error': errors,
+                        'skipped': skipped
+                    }
+                }
+        
+        # Jest/npm test detection
+        elif 'jest' in command or 'npm test' in command or 'Tests:' in output:
+            # Pattern: "Tests:       5 passed, 2 failed, 7 total"
+            match = re.search(r'Tests:\s+(\d+) passed(?:, (\d+) failed)?(?:, (\d+) skipped)?, (\d+) total', output)
+            if match:
+                passed = int(match.group(1) or 0)
+                failed = int(match.group(2) or 0)
+                skipped = int(match.group(3) or 0)
+                total = int(match.group(4) or 0)
+                test_data = {
+                    'tool': 'jest',
+                    'tests': {
+                        'total': total,
+                        'passed': passed,
+                        'failed': failed,
+                        'error': 0,
+                        'skipped': skipped
+                    }
+                }
+        
+        # Go test detection
+        elif 'go test' in command:
+            # Pattern: "PASS" or "FAIL" at the end, "ok  \tpackage\t0.123s"
+            passed = len(re.findall(r'^PASS', output, re.MULTILINE))
+            failed = len(re.findall(r'^FAIL', output, re.MULTILINE))
+            if passed > 0 or failed > 0:
+                test_data = {
+                    'tool': 'go',
+                    'tests': {
+                        'total': passed + failed,
+                        'passed': passed,
+                        'failed': failed,
+                        'error': 0,
+                        'skipped': 0
+                    }
+                }
+        
+        # PHPUnit detection
+        elif 'phpunit' in command.lower():
+            # Pattern: "OK (5 tests, 10 assertions)" or "FAILURES! Tests: 5, Assertions: 10, Failures: 2."
+            match = re.search(r'(?:OK \((\d+) tests?|Tests: (\d+)).*?(?:Failures: (\d+))?(?:.*?Errors: (\d+))?', output)
+            if match:
+                total = int(match.group(1) or match.group(2) or 0)
+                failures = int(match.group(3) or 0)
+                errors = int(match.group(4) or 0)
+                test_data = {
+                    'tool': 'phpunit',
+                    'tests': {
+                        'total': total,
+                        'passed': total - failures - errors,
+                        'failed': failures,
+                        'error': errors,
+                        'skipped': 0
+                    }
+                }
+        
+        return test_data if test_data else None
+    
+    def _write_test_telemetry(self, command: str, working_directory: str, exit_code: int, test_data: Dict[str, Any]) -> None:
+        """Write test execution telemetry to JSONL file."""
+        if not self.docker_orchestrator or not test_data:
+            return
+            
+        try:
+            # Create telemetry entry following the schema
+            entry = {
+                "event": "test_session_end",
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "tool": test_data.get('tool', 'unknown'),
+                "command": command,
+                "working_directory": working_directory,
+                "exit_code": exit_code,
+                "tests": test_data.get('tests', {})
+            }
+            
+            # Write to telemetry file
+            metrics_dir = "/workspace/.setup_agent/metrics"
+            summary_path = f"{metrics_dir}/test_summary.jsonl"
+            
+            self.docker_orchestrator.execute_command(f"mkdir -p {metrics_dir}")
+            payload = json.dumps(entry, sort_keys=True)
+            append_cmd = f"cat >> {summary_path} <<'EOF'\n{payload}\nEOF"
+            self.docker_orchestrator.execute_command(append_cmd)
+            
+            logger.debug(f"Recorded test telemetry for {test_data.get('tool')} to {summary_path}")
+            
+        except Exception as exc:
+            logger.warning(f"Failed to write test telemetry: {exc}")
 
     def get_usage_example(self) -> str:
         """Get usage examples focused on grep investigations."""
