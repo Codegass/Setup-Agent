@@ -1311,12 +1311,15 @@ class PhysicalValidator:
         if class_result['success']:
             result['class_count'] = int(class_result['output'].strip() or 0)
         
-        # Check for Node modules
-        node_cmd = f"test -d {project_dir}/node_modules && find {project_dir}/node_modules -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l"
-        node_result = self._execute_command_with_logging(node_cmd, "checking Node modules")
-        if node_result['success']:
-            result['details']['node_modules'] = int(node_result['output'].strip() or 0)
-        
+        # Check for Node modules only if a Node.js project is detected
+        package_json_cmd = f"find {project_dir} -maxdepth 2 -name 'package.json' -type f 2>/dev/null | head -1"
+        package_json_result = self._execute_command_with_logging(package_json_cmd, "discovering package.json")
+        if package_json_result['success'] and package_json_result['output'].strip():
+            node_cmd = f"test -d {project_dir}/node_modules && find {project_dir}/node_modules -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l"
+            node_result = self._execute_command_with_logging(node_cmd, "checking Node modules")
+            if node_result['success']:
+                result['details']['node_modules'] = int(node_result['output'].strip() or 0)
+
         # Determine if artifacts exist
         result['count'] = result['jar_count'] + result['class_count'] + result['details'].get('node_modules', 0)
         result['exist'] = result['count'] > 0

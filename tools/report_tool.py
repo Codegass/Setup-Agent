@@ -667,6 +667,11 @@ class ReportTool(BaseTool):
             'test': actual_accomplishments.get('test_success', False),
         }
 
+        # Get tests_expected_total from actual_accomplishments if available
+        tests_expected_total = None
+        if actual_accomplishments:
+            tests_expected_total = actual_accomplishments.get('tests_expected_total')
+        
         status = {
             'overall': verified_status,
             'tests_total': to_int(tests_total),
@@ -678,6 +683,7 @@ class ReportTool(BaseTool):
             'modules_expected': to_int(modules_expected),
             'modules_seen': to_int(modules_seen),
             'skipped_modules': skipped_modules,
+            'tests_expected_total': to_int(tests_expected_total) if tests_expected_total else None,
         }
 
         if status['tests_passed'] is None and status['tests_total'] is not None and status['tests_failed'] is not None:
@@ -1635,6 +1641,16 @@ class ReportTool(BaseTool):
         for task in trunk_context.todo_list:
             if task.status.value == "completed":
                 task_desc = task.description.lower()
+                
+                # Check for project analyzer results with test estimation
+                if 'project_analyzer' in task_desc or 'analyze project' in task_desc:
+                    if task.key_results:
+                        # Try to extract tests_expected_total from key_results
+                        import re
+                        match = re.search(r'tests_expected_total[\s=:]+(\d+)', task.key_results)
+                        if match:
+                            actual_accomplishments['tests_expected_total'] = int(match.group(1))
+                            logger.info(f"Found tests_expected_total: {match.group(1)} from project analyzer")
                 key_results = getattr(task, 'key_results', '') or ''
                 
                 # Check for repository clone
@@ -2211,6 +2227,10 @@ class ReportTool(BaseTool):
             if coverage_section:
                 report_lines.extend(coverage_section)
 
+            current_situation_section = self._render_current_situation_section(report_snapshot)
+            if current_situation_section:
+                report_lines.extend(current_situation_section)
+
             execution_detail_section = self._render_execution_details_section(report_snapshot)
             if execution_detail_section:
                 report_lines.extend(execution_detail_section)
@@ -2419,6 +2439,100 @@ class ReportTool(BaseTool):
 
             if len(sorted_modules) > max_rows:
                 lines.append(f"| ... | ... | +{len(sorted_modules) - max_rows} more modules |")
+
+            lines.append("")
+
+        return lines
+
+    def _render_current_situation_section(self, snapshot: Dict[str, Any]) -> List[str]:
+        """
+        Render the Current Situation section that summarizes blockers, warnings,
+        and compares expected vs executed test counts.
+        """
+        lines = ["## 📊 Current Situation", ""]
+
+        status = snapshot.get('status', {})
+        phases = snapshot.get('phases', {})
+        attention_raw = snapshot.get('attention', {}).get('raw', [])
+
+        tests_expected = status.get('tests_expected_total')
+        tests_total = status.get('tests_total')
+        tests_failed = status.get('tests_failed', 0) or 0
+        tests_errors = status.get('tests_errors', 0) or 0
+        tests_skipped = status.get('tests_skipped', 0) or 0
+        pass_pct = status.get('pass_pct')
+
+        agent_narrative = snapshot.get('current_situation_narrative')
+        if agent_narrative:
+            lines.append(agent_narrative)
+            lines.append("")
+
+        summary_items: List[str] = []
+
+        phase_labels = [
+            ('clone', 'Repository clone'),
+            ('build', 'Build phase'),
+            ('test', 'Test execution'),
+        ]
+        for key, label in phase_labels:
+            state = phases.get(key)
+            if state is True:
+                summary_items.append(f"✅ {label} completed")
+            elif state is False:
+                summary_items.append(f"❌ {label} incomplete")
+
+        if tests_total is not None:
+            if tests_expected:
+                coverage_pct = (tests_total / tests_expected * 100) if tests_expected else 0
+                coverage_icon = "✅" if coverage_pct >= 90 else "⚠️" if coverage_pct >= 50 else "❌"
+                summary_items.append(
+                    f"{coverage_icon} Tests executed: {tests_total} of ~{tests_expected} ({format_percentage(coverage_pct)})"
+                )
+            else:
+                summary_items.append(f"🧪 Tests executed: {tests_total}")
+        else:
+            summary_items.append("⚠️ Tests not executed or no telemetry produced")
+
+        if (tests_failed + tests_errors) > 0:
+            summary_items.append(
+                f"❗ Failures detected: {tests_failed} failed, {tests_errors} errors, {tests_skipped} skipped"
+            )
+        elif tests_total:
+            summary_items.append("✅ All executed tests passed")
+
+        if attention_raw:
+            summary_items.append(f"{attention_raw[0]['icon']} {attention_raw[0]['message']}")
+
+        if summary_items:
+            lines.append("**Key Points**")
+            for item in summary_items:
+                lines.append(f"- {item}")
+            lines.append("")
+
+        if tests_expected is not None or tests_total is not None:
+            lines.extend([
+                "### Test Execution Summary",
+                "",
+                "| Metric | Value | Status |",
+                "|--------|-------|--------|",
+            ])
+
+            if tests_expected is not None:
+                lines.append(f"| Expected Tests | ~{tests_expected} | Estimated via @Test scan |")
+
+            if tests_total is not None:
+                status_icon = "✅" if status.get('tests_ok') else "⚠️" if (tests_failed + tests_errors) == 0 else "❌"
+                lines.append(f"| Executed Tests | {tests_total} | {status_icon} |")
+
+                if tests_expected is not None and tests_expected > 0:
+                    coverage_pct = (tests_total / tests_expected * 100)
+                    coverage_icon = "✅" if coverage_pct >= 80 else "⚠️" if coverage_pct >= 50 else "❌"
+                    lines.append(f"| Test Coverage | {format_percentage(coverage_pct)} | {coverage_icon} |")
+
+            if status.get('tests_passed') is not None:
+                pct_value = pass_pct if pass_pct is not None else 0
+                pass_icon = "✅" if pct_value >= 95 else "⚠️" if pct_value >= 80 else "❌"
+                lines.append(f"| Pass Rate | {format_percentage(pass_pct)} | {pass_icon} |")
 
             lines.append("")
 
