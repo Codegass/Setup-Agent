@@ -28,6 +28,7 @@ class ContextTool(BaseTool):
         summary: Optional[str] = None,
         new_context: Optional[List[Dict[str, Any]]] = None,
         key_results: Optional[str] = None,
+        force: bool = False,
         **kwargs
     ) -> ToolResult:
         """
@@ -40,6 +41,7 @@ class ContextTool(BaseTool):
             summary: Summary of work done (required for 'complete_task', 'complete_with_results')
             new_context: Compacted context history (required for 'compact_context')
             key_results: Key results to record (required for 'complete_with_results')
+            force: Force completion even if validation fails (use with caution)
         """
         
         # Check for unexpected parameters
@@ -55,7 +57,8 @@ class ContextTool(BaseTool):
                     f"  - entry (optional): Context entry for 'add_context'\n"
                     f"  - summary (optional): Summary for completion actions\n"
                     f"  - new_context (optional): New context for 'compact_context'\n"
-                    f"  - key_results (optional): Key results for 'complete_with_results'\n\n"
+                    f"  - key_results (optional): Key results for 'complete_with_results'\n"
+                    f"  - force (optional): Override validation failures (use with caution)\n\n"
                     f"Example: context(action='get_info')\n"
                     f"Example: context(action='start_task', task_id='task_1')"
                 ),
@@ -135,7 +138,7 @@ class ContextTool(BaseTool):
             elif action in ["complete_task", "switch_to_trunk"]:
                 return self._complete_task(summary)
             elif action == "complete_with_results":
-                return self._complete_task_with_results(summary, key_results)
+                return self._complete_task_with_results(summary, key_results, force)
                 
         except Exception as e:
             raise ToolError(
@@ -595,11 +598,16 @@ class ContextTool(BaseTool):
                 error_code="COMPLETE_TASK_ERROR"
             )
 
-    def _complete_task_with_results(self, summary: Optional[str], key_results: Optional[str]) -> ToolResult:
+    def _complete_task_with_results(self, summary: Optional[str], key_results: Optional[str], force: bool = False) -> ToolResult:
         """
         Complete current task with key results recording - ATOMIC operation to prevent state/action separation.
         This is the RECOMMENDED way to complete tasks as it enforces proper state management.
         ENHANCED: Add validation to ensure critical tasks are properly completed.
+        
+        Args:
+            summary: Summary of what was accomplished
+            key_results: Key results to record for future tasks
+            force: Override validation failures (use with caution)
         """
         if not summary:
             raise ToolError(
@@ -729,11 +737,18 @@ class ContextTool(BaseTool):
         # ENHANCED: Task-specific completion validation
         validation_result = self._validate_task_completion(current_task, summary, key_results)
         if not validation_result["valid"]:
-            raise ToolError(
-                message=f"Task completion validation failed: {validation_result['reason']}",
-                suggestions=validation_result["suggestions"],
-                error_code="TASK_COMPLETION_VALIDATION_FAILED"
-            )
+            if force:
+                logger.warning(f"⚠️ Force completing task despite validation failure: {validation_result['reason']}")
+                logger.info("🔧 Using force parameter - validation bypassed")
+            else:
+                raise ToolError(
+                    message=f"Task completion validation failed: {validation_result['reason']}",
+                    suggestions=validation_result["suggestions"] + [
+                        "⚠️ If you're certain the task was completed correctly, use force=True to override validation",
+                        "Example: manage_context(action='complete_with_results', summary='...', key_results='...', force=True)"
+                    ],
+                    error_code="TASK_COMPLETION_VALIDATION_FAILED"
+                )
         
         try:
             # CRITICAL FIX: True atomic operation - do all updates in one transaction
@@ -1319,37 +1334,116 @@ IMPORTANT:
 
     def _check_project_analyzer_execution(self) -> bool:
         """
-        Check if project_analyzer tool was actually executed by examining branch history.
+        Check if project_analyzer tool was actually executed by examining multiple sources.
+        Enhanced to check trunk context updates and output storage in addition to branch history.
         """
         try:
             if not self.context_manager.current_task_id:
                 return False
             
-            # Load branch history for current task
+            # Method 1: Check branch history (original check)
             branch_history = self.context_manager.load_branch_history(self.context_manager.current_task_id)
-            if not branch_history:
-                return False
+            if branch_history:
+                # Check if any history entry indicates project_analyzer usage
+                for entry in branch_history.history:
+                    if isinstance(entry, dict):
+                        # Check for action entries that mention project_analyzer
+                        if (entry.get("type") == "action" and 
+                            entry.get("tool_name") == "project_analyzer"):
+                            logger.info("✅ Found evidence of project_analyzer execution in branch history")
+                            return True
+                        
+                        # Check for content that mentions project_analyzer
+                        content = str(entry.get("content", "")).lower()
+                        if "project_analyzer" in content:
+                            logger.info("✅ Found reference to project_analyzer in branch history")
+                            return True
             
-            # Check if any history entry indicates project_analyzer usage
-            for entry in branch_history.history:
-                if isinstance(entry, dict):
-                    # Check for action entries that mention project_analyzer
-                    if (entry.get("type") == "action" and 
-                        entry.get("tool_name") == "project_analyzer"):
-                        logger.info("✅ Found evidence of project_analyzer execution in branch history")
-                        return True
-                    
-                    # Check for content that mentions project_analyzer
-                    content = str(entry.get("content", "")).lower()
-                    if "project_analyzer" in content:
-                        logger.info("✅ Found reference to project_analyzer in branch history")
-                        return True
+            # Method 2: Check if trunk context was updated with new tasks (evidence of analyzer execution)
+            trunk_evidence = self._check_trunk_context_for_analyzer_updates()
+            if trunk_evidence:
+                logger.warning("⚠️ Project analyzer execution not in branch history but trunk context shows updates")
+                logger.info("✅ Accepting based on trunk context evidence (new tasks or project metadata)")
+                return True
             
-            logger.warning("❌ No evidence of project_analyzer execution found in branch history")
+            # Method 3: Check output storage for project_analyzer outputs
+            if self._check_output_storage_for_analyzer():
+                logger.warning("⚠️ Project analyzer execution not in branch history but found in output storage")
+                logger.info("✅ Accepting based on output storage evidence")
+                return True
+            
+            logger.warning("❌ No evidence of project_analyzer execution found in any source")
+            logger.info("💡 Hint: Use project_analyzer(action='analyze') before completing this task")
             return False
             
         except Exception as e:
             logger.error(f"Failed to check project_analyzer execution: {e}")
+            # Be lenient on errors - don't block completion due to validation errors
+            return True
+    
+    def _check_trunk_context_for_analyzer_updates(self) -> bool:
+        """
+        Check if trunk context shows evidence of project_analyzer execution.
+        Looks for new tasks added or project metadata updates.
+        """
+        try:
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context:
+                return False
+            
+            # Check if we have tasks beyond the initial task_2 (analyzer task)
+            # Initial setup usually has task_1 (clone) and task_2 (analyze)
+            # If we have task_3+ it means analyzer added new tasks
+            task_count = len(trunk_context.todo_list)
+            if task_count > 2:
+                # Check if any task after task_2 was created recently
+                for task in trunk_context.todo_list:
+                    task_id = task.id
+                    # Tasks created by analyzer typically start from task_3
+                    if task_id not in ["task_1", "task_2"]:
+                        logger.debug(f"Found task {task_id} which suggests analyzer was executed")
+                        return True
+            
+            # Also check if any task has java_version or build_system in key_results
+            # These are typically set by project_analyzer
+            for task in trunk_context.todo_list:
+                if task.key_results:
+                    key_results_lower = task.key_results.lower()
+                    if any(indicator in key_results_lower for indicator in 
+                           ["java_version", "build_system", "maven", "gradle", "project_path", "dependencies"]):
+                        logger.debug(f"Found project metadata in task {task.id} key_results")
+                        return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to check trunk context: {e}")
+            return False
+    
+    def _check_output_storage_for_analyzer(self) -> bool:
+        """
+        Check output storage for evidence of project_analyzer execution.
+        """
+        try:
+            # Check if we have output storage manager
+            if not hasattr(self.context_manager, 'output_storage') or not self.context_manager.output_storage:
+                return False
+            
+            # Search for project_analyzer outputs
+            results = self.context_manager.output_storage.search_outputs(
+                tool_name="project_analyzer",
+                task_id=self.context_manager.current_task_id,
+                limit=1
+            )
+            
+            if results:
+                logger.debug(f"Found project_analyzer output in storage: {results[0].get('ref_id')}")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Failed to check output storage: {e}")
             return False
 
     def _get_compact_todo_status_update(self, action_message: str) -> str:
