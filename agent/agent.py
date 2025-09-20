@@ -147,7 +147,7 @@ class SetupAgent:
             # 🎯 CORE FOCUS: Build and Test success are the PRIMARY objectives of setup
             initial_tasks = [
                 "Clone repository and setup basic environment (use project_setup tool)",
-                "CRITICAL: Analyze project structure using project_analyzer tool and generate intelligent execution plan",
+                "CRITICAL: Run project_analyzer tool with action='analyze' to analyze project structure, count static tests, and generate intelligent execution plan (MUST use project_analyzer tool, do NOT manually read files)",
                 "CORE SETUP: Execute build tasks and ensure compilation success (use maven/gradle tools)",
                 "CORE SETUP: Execute test suite and ensure all tests pass (use maven/gradle tools)",
                 "Generate final completion report with build and test results (use report tool)"

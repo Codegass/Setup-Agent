@@ -58,6 +58,36 @@ class ReportTool(BaseTool):
             details: Additional details about the setup process
         """
         
+        # IDEMPOTENCY CHECK: Prevent multiple report generation
+        # Check if a report was already generated recently (within last 5 minutes)
+        if action == "generate" and self.docker_orchestrator:
+            try:
+                # Check for existing recent reports
+                check_cmd = "find /workspace -name 'setup-report-*.md' -mmin -5 -type f 2>/dev/null | head -1"
+                result = self.docker_orchestrator.execute_command(check_cmd)
+                existing_report = result.get('output', '').strip()
+                
+                if existing_report:
+                    # A report was already generated recently
+                    logger.warning(f"Report already exists at {existing_report}, skipping duplicate generation")
+                    # Return the information about the existing report
+                    return ToolResult(
+                        success=True,
+                        output=f"📄 Report already generated: {existing_report}\n"
+                               f"Status: {status.upper()}\n"
+                               f"(Skipped duplicate report generation)",
+                        metadata={
+                            "task_completed": True,
+                            "completion_signal": True,
+                            "status": status,
+                            "existing_report": existing_report,
+                            "duplicate_prevention": True
+                        }
+                    )
+            except Exception as e:
+                logger.debug(f"Failed to check for existing reports: {e}")
+                # Continue with report generation if check fails
+        
         # Check for unexpected parameters
         if kwargs:
             invalid_params = list(kwargs.keys())
@@ -354,6 +384,17 @@ class ReportTool(BaseTool):
                 test_count = len(simple_status['failing_tests'])
                 lines.append(f"   └─ {test_count} test case(s) failed")
         
+        # Add test metrics if available
+        if self.context_manager:
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context and trunk_context.environment_summary:
+                    static_test_count = trunk_context.environment_summary.get('static_test_count')
+                    if static_test_count:
+                        lines.append(f"📊 Total @Test Annotations: {static_test_count}")
+            except:
+                pass
+        
         # Project Information
         project_info = simple_status.get('project_info', {})
         if project_info.get('type'):
@@ -606,6 +647,18 @@ class ReportTool(BaseTool):
         test_history = execution_metrics.get('test_history', {}) or {}
         aggregate = test_history.get('aggregate', {}) or {}
         per_module = test_history.get('per_module', {}) or {}
+        
+        # Get static test count from trunk context if available
+        static_test_count = None
+        if self.context_manager:
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context and trunk_context.environment_summary:
+                    static_test_count = trunk_context.environment_summary.get('static_test_count')
+                    if static_test_count:
+                        logger.info(f"📊 Retrieved static test count from trunk context: {static_test_count}")
+            except Exception as e:
+                logger.debug(f"Could not retrieve static test count: {e}")
 
         def to_int(value):
             if value is None:
@@ -667,10 +720,14 @@ class ReportTool(BaseTool):
             'test': actual_accomplishments.get('test_success', False),
         }
 
-        # Get tests_expected_total from actual_accomplishments if available
-        tests_expected_total = None
-        if actual_accomplishments:
-            tests_expected_total = actual_accomplishments.get('tests_expected_total')
+        # Calculate execution rate if we have static test count
+        execution_rate = None
+        if static_test_count and tests_total is not None:
+            try:
+                execution_rate = (to_int(tests_total) / static_test_count) * 100
+                logger.info(f"📊 Test Execution Rate: {execution_rate:.1f}% ({to_int(tests_total)} executed / {static_test_count} total @Test)")
+            except (TypeError, ZeroDivisionError):
+                execution_rate = None
         
         status = {
             'overall': verified_status,
@@ -680,10 +737,11 @@ class ReportTool(BaseTool):
             'tests_errors': to_int(tests_error),
             'tests_skipped': to_int(tests_skipped),
             'pass_pct': pass_pct,
+            'static_test_count': static_test_count,
+            'execution_rate': execution_rate,
             'modules_expected': to_int(modules_expected),
             'modules_seen': to_int(modules_seen),
             'skipped_modules': skipped_modules,
-            'tests_expected_total': to_int(tests_expected_total) if tests_expected_total else None,
         }
 
         if status['tests_passed'] is None and status['tests_total'] is not None and status['tests_failed'] is not None:
@@ -1642,15 +1700,6 @@ class ReportTool(BaseTool):
             if task.status.value == "completed":
                 task_desc = task.description.lower()
                 
-                # Check for project analyzer results with test estimation
-                if 'project_analyzer' in task_desc or 'analyze project' in task_desc:
-                    if task.key_results:
-                        # Try to extract tests_expected_total from key_results
-                        import re
-                        match = re.search(r'tests_expected_total[\s=:]+(\d+)', task.key_results)
-                        if match:
-                            actual_accomplishments['tests_expected_total'] = int(match.group(1))
-                            logger.info(f"Found tests_expected_total: {match.group(1)} from project analyzer")
                 key_results = getattr(task, 'key_results', '') or ''
                 
                 # Check for repository clone
@@ -2127,15 +2176,17 @@ class ReportTool(BaseTool):
                 # Fallback: if still /workspace, try to probe a likely project directory
                 if project_dir == "/workspace":
                     try:
+                        # IMPORTANT: Exclude setup-report files from being treated as project directories
                         probe_cmd = (
-                            "(find /workspace -maxdepth 2 -type f -name pom.xml -printf '%h\\n' 2>/dev/null | head -1) || "
-                            "(find /workspace -maxdepth 2 -type f -name build.gradle -printf '%h\\n' 2>/dev/null | head -1) || "
-                            "(find /workspace -maxdepth 2 -type f -name package.json -printf '%h\\n' 2>/dev/null | head -1) || "
-                            "(find /workspace -mindepth 1 -maxdepth 1 -type d ! -name '.setup_agent' -printf '%p\\n' 2>/dev/null | head -1)"
+                            "(find /workspace -maxdepth 2 -type f -name pom.xml ! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -maxdepth 2 -type f -name build.gradle ! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -maxdepth 2 -type f -name package.json ! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -mindepth 1 -maxdepth 1 -type d ! -name '.setup_agent' ! -name 'setup-report-*' -printf '%p\\n' 2>/dev/null | head -1)"
                         )
                         result = self.docker_orchestrator.execute_command(probe_cmd)
                         candidate = result.get('output', '').strip().split('\n')[0]
-                        if candidate and candidate.startswith('/workspace/'):
+                        # Additional check: ensure the candidate is not a report file
+                        if candidate and candidate.startswith('/workspace/') and 'setup-report-' not in candidate:
                             project_dir = candidate
                     except Exception:
                         pass
@@ -2206,83 +2257,38 @@ class ReportTool(BaseTool):
         execution_metrics: dict = None,
         report_snapshot: dict = None,
     ) -> str:
-        """Generate markdown-formatted report based on actual project context and execution results."""
+        """Generate markdown-formatted report with improved structure and clarity."""
         
-        report_lines = [
-            "# 🎯 Project Setup Report",
-            "",
-            f"**Generated:** {timestamp}",
-            f"**Status:** {status.upper()}",
-            "",
-        ]
+        # Start with enhanced header
+        report_lines = self._render_enhanced_header(
+            timestamp, status, project_info, report_snapshot
+        )
 
         if report_snapshot:
-            report_lines.extend(self._render_conclusion_section(report_snapshot))
+            # Add summary dashboard with all key metrics
+            dashboard_section = self._render_summary_dashboard(report_snapshot)
+            if dashboard_section:
+                report_lines.extend(dashboard_section)
+            
+            # Add detailed test analysis
+            test_analysis_section = self._render_detailed_test_analysis(report_snapshot)
+            if test_analysis_section:
+                report_lines.extend(test_analysis_section)
+            
+            # Add issues and recommendations
+            issues_section = self._render_issues_recommendations(report_snapshot)
+            if issues_section:
+                report_lines.extend(issues_section)
 
-            attention_section = self._render_attention_section(report_snapshot)
-            if attention_section:
-                report_lines.extend(attention_section)
-
-            coverage_section = self._render_test_coverage_section(report_snapshot)
-            if coverage_section:
-                report_lines.extend(coverage_section)
-
-            current_situation_section = self._render_current_situation_section(report_snapshot)
-            if current_situation_section:
-                report_lines.extend(current_situation_section)
-
-            execution_detail_section = self._render_execution_details_section(report_snapshot)
-            if execution_detail_section:
-                report_lines.extend(execution_detail_section)
-
-        # Add project information from actual context
-        if project_info:
-            report_lines.extend([
-                "## 📂 Project Information",
-                "",
-                f"- **Project Directory:** {project_info.get('directory', 'Unknown')}",
-                f"- **Project Type:** {project_info.get('type', 'Unknown')}",
-                f"- **Build System:** {project_info.get('build_system', 'Unknown')}",
-                "",
-            ])
-
-        # Add agent's summary - this should be provided by the agent based on actual work done
-        if summary:
-            report_lines.extend([
-                "## 📋 Executive Summary",
-                "",
-                summary,
-                "",
-            ])
+        # Task progress section with improved format
+        task_progress_section = self._render_task_progress(actual_accomplishments)
+        if task_progress_section:
+            report_lines.extend(task_progress_section)
         
-        # Generate task completion status from trunk context
-        task_status_section = self._generate_task_status_section(actual_accomplishments)
-        if task_status_section:
-            report_lines.extend(task_status_section)
-        
-        # Add execution details - this should be filled by agent analysis
-        if details:
-            report_lines.extend([
-                "## 📝 Additional Details",
-                "",
-                details,
-                "",
-            ])
-        
-        # Generate technical accomplishments from actual results
-        tech_section = self._generate_technical_accomplishments_section(actual_accomplishments)
-        if tech_section:
-            report_lines.extend(tech_section)
-        
-        # Generate enhanced error reporting section if errors detected
-        error_section = self._generate_error_reporting_section(actual_accomplishments)
-        if error_section:
-            report_lines.extend(error_section)
-        
-        # Generate execution metrics section
-        metrics_section = self._generate_metrics_section(execution_metrics)
-        if metrics_section:
-            report_lines.extend(metrics_section)
+        # Execution details section (simplified)
+        exec_details_section = self._render_execution_details_simplified(report_snapshot, execution_metrics)
+        if exec_details_section:
+            report_lines.extend(exec_details_section)
         
         # Generate next steps based on actual status and context
         next_steps_section = self._generate_next_steps_section(status, actual_accomplishments)
@@ -2388,9 +2394,21 @@ class ReportTool(BaseTool):
         lines = ["## 🧪 Test Coverage", ""]
 
         if status.get('tests_total'):
-            lines.append(
-                f"- **Total Tests:** {status['tests_total']} (pass rate {format_percentage(status.get('pass_pct'))})"
-            )
+            # Build test summary line with pass rate and execution rate
+            test_line = f"- **Total Tests Executed:** {status['tests_total']}"
+            
+            # Add pass rate
+            test_line += f" (pass rate {format_percentage(status.get('pass_pct'))}"
+            
+            # Add execution rate if available
+            if status.get('execution_rate') is not None:
+                test_line += f", execution rate {format_percentage(status.get('execution_rate'))}"
+                if status.get('static_test_count'):
+                    test_line += f" of {status['static_test_count']} total @Test"
+            
+            test_line += ")"
+            lines.append(test_line)
+            
             lines.append(
                 f"- **Failures/Errors:** {status.get('tests_failed', 0)} failed, "
                 f"{status.get('tests_errors', 0)} errors"
@@ -2447,7 +2465,7 @@ class ReportTool(BaseTool):
     def _render_current_situation_section(self, snapshot: Dict[str, Any]) -> List[str]:
         """
         Render the Current Situation section that summarizes blockers, warnings,
-        and compares expected vs executed test counts.
+        and highlights executed test statistics.
         """
         lines = ["## 📊 Current Situation", ""]
 
@@ -2455,7 +2473,6 @@ class ReportTool(BaseTool):
         phases = snapshot.get('phases', {})
         attention_raw = snapshot.get('attention', {}).get('raw', [])
 
-        tests_expected = status.get('tests_expected_total')
         tests_total = status.get('tests_total')
         tests_failed = status.get('tests_failed', 0) or 0
         tests_errors = status.get('tests_errors', 0) or 0
@@ -2482,14 +2499,7 @@ class ReportTool(BaseTool):
                 summary_items.append(f"❌ {label} incomplete")
 
         if tests_total is not None:
-            if tests_expected:
-                coverage_pct = (tests_total / tests_expected * 100) if tests_expected else 0
-                coverage_icon = "✅" if coverage_pct >= 90 else "⚠️" if coverage_pct >= 50 else "❌"
-                summary_items.append(
-                    f"{coverage_icon} Tests executed: {tests_total} of ~{tests_expected} ({format_percentage(coverage_pct)})"
-                )
-            else:
-                summary_items.append(f"🧪 Tests executed: {tests_total}")
+            summary_items.append(f"🧪 Tests executed: {tests_total}")
         else:
             summary_items.append("⚠️ Tests not executed or no telemetry produced")
 
@@ -2509,30 +2519,48 @@ class ReportTool(BaseTool):
                 lines.append(f"- {item}")
             lines.append("")
 
-        if tests_expected is not None or tests_total is not None:
+        if tests_total is not None:
             lines.extend([
                 "### Test Execution Summary",
                 "",
                 "| Metric | Value | Status |",
                 "|--------|-------|--------|",
             ])
+            
+            # Add Total @Test Annotations if available
+            static_test_count = status.get('static_test_count')
+            if static_test_count:
+                lines.append(f"| Total @Test Annotations | {static_test_count} | 📊 |")
 
-            if tests_expected is not None:
-                lines.append(f"| Expected Tests | ~{tests_expected} | Estimated via @Test scan |")
+            status_icon = "✅" if status.get('tests_ok') else "⚠️" if (tests_failed + tests_errors) == 0 else "❌"
+            lines.append(f"| Executed Tests | {tests_total} | {status_icon} |")
 
-            if tests_total is not None:
-                status_icon = "✅" if status.get('tests_ok') else "⚠️" if (tests_failed + tests_errors) == 0 else "❌"
-                lines.append(f"| Executed Tests | {tests_total} | {status_icon} |")
+            tests_passed = status.get('tests_passed')
+            if tests_passed is not None:
+                lines.append(f"| Passed | {tests_passed} | ✅ |")
 
-                if tests_expected is not None and tests_expected > 0:
-                    coverage_pct = (tests_total / tests_expected * 100)
-                    coverage_icon = "✅" if coverage_pct >= 80 else "⚠️" if coverage_pct >= 50 else "❌"
-                    lines.append(f"| Test Coverage | {format_percentage(coverage_pct)} | {coverage_icon} |")
+            if tests_failed is not None:
+                fail_icon = "❗" if tests_failed else "✅"
+                lines.append(f"| Failed | {tests_failed} | {fail_icon} |")
+
+            if tests_errors is not None:
+                error_icon = "❗" if tests_errors else "✅"
+                lines.append(f"| Errors | {tests_errors} | {error_icon} |")
+
+            if tests_skipped is not None:
+                skip_icon = "⚠️" if tests_skipped else "✅"
+                lines.append(f"| Skipped | {tests_skipped} | {skip_icon} |")
 
             if status.get('tests_passed') is not None:
                 pct_value = pass_pct if pass_pct is not None else 0
                 pass_icon = "✅" if pct_value >= 95 else "⚠️" if pct_value >= 80 else "❌"
                 lines.append(f"| Pass Rate | {format_percentage(pass_pct)} | {pass_icon} |")
+            
+            # Add Execution Rate if available
+            execution_rate = status.get('execution_rate')
+            if execution_rate is not None:
+                exec_icon = "✅" if execution_rate >= 90 else "⚠️" if execution_rate >= 70 else "❌"
+                lines.append(f"| Execution Rate | {format_percentage(execution_rate)} | {exec_icon} |")
 
             lines.append("")
 
@@ -2969,6 +2997,375 @@ class ReportTool(BaseTool):
                 
         except Exception as e:
             logger.error(f"❌ Base64 fallback failed: {e}")
+
+    # ==================== NEW IMPROVED REPORT RENDERING METHODS ====================
+    
+    def _render_enhanced_header(self, timestamp: str, status: str, project_info: dict, 
+                                snapshot: dict = None) -> List[str]:
+        """Render enhanced header with inline project information."""
+        lines = ["# 🎯 Project Setup Report", ""]
+        
+        # Extract project name from directory
+        project_name = "Project"
+        if project_info and project_info.get('directory'):
+            project_dir = project_info['directory']
+            if '/' in project_dir:
+                project_name = project_dir.split('/')[-1].title()
+        
+        # Create inline project info
+        project_type = project_info.get('type', 'Unknown') if project_info else 'Unknown'
+        build_system = project_info.get('build_system', 'Unknown') if project_info else 'Unknown'
+        
+        # Extract Java version if available
+        java_version = ""
+        if snapshot:
+            for task in self.context_manager.load_trunk_context().todo_list if self.context_manager else []:
+                if "java" in task.description.lower() and task.key_results:
+                    if "java_version" in task.key_results:
+                        import re
+                        match = re.search(r'java_version[\'"]?:\s*[\'"]?(\d+(?:\.\d+)?)', task.key_results)
+                        if match:
+                            java_version = f" | Java {match.group(1)}"
+                        break
+        
+        lines.append(f"**{project_name}** | {project_type} | {build_system}{java_version}")
+        lines.append(f"**Generated:** {timestamp}")
+        
+        # Determine result message based on status and test metrics
+        result_msg = f"**Result:** "
+        if status.upper() == "SUCCESS":
+            if snapshot:
+                pass_rate = snapshot.get('status', {}).get('pass_pct', 0)
+                result_msg += f"✅ SUCCESS (Build Passed, {format_percentage(pass_rate)} Tests Pass)"
+            else:
+                result_msg += "✅ SUCCESS"
+        else:
+            result_msg += "❌ FAILED"
+            if snapshot:
+                phases = snapshot.get('phases', {})
+                if not phases.get('build'):
+                    result_msg += " (Build Failed)"
+                elif not phases.get('test'):
+                    result_msg += " (Tests Failed)"
+        
+        lines.extend([result_msg, ""])
+        return lines
+    
+    def _render_summary_dashboard(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Render summary dashboard with key metrics in a visual box."""
+        lines = ["## 📊 Summary Dashboard", ""]
+        
+        status = snapshot.get('status', {})
+        phases = snapshot.get('phases', {})
+        evidence = snapshot.get('physical_evidence', {})
+        
+        # Prepare values
+        clone_status = "✅ Cloned successfully" if phases.get('clone') else "❌ Clone failed"
+        
+        build_status = "✅" if phases.get('build') else "❌"
+        class_files = evidence.get('class_files', 0)
+        jar_files = evidence.get('jar_files', 0)
+        if class_files or jar_files:
+            build_msg = f"{build_status} {class_files:,} classes, {jar_files} JARs"
+        else:
+            build_msg = f"{build_status} No artifacts"
+        
+        # Test metrics
+        static_count = status.get('static_test_count', 0)
+        executed = status.get('tests_total', 0)
+        passed = status.get('tests_passed', 0)
+        exec_rate = status.get('execution_rate')
+        pass_rate = status.get('pass_pct')
+        
+        # Module coverage
+        modules_expected = status.get('modules_expected')
+        modules_seen = status.get('modules_seen', 0)
+        
+        lines.append("### Build & Test Overview")
+        lines.append("```")
+        lines.append("┌─────────────────┬──────────────────────────────────┐")
+        lines.append(f"│ Repository      │ {clone_status:<32} │")
+        lines.append(f"│ Build           │ {build_msg:<32} │")
+        
+        if static_count:
+            test_count_msg = f"📊 {static_count} @Test annotations"
+            lines.append(f"│ Total Tests     │ {test_count_msg:<32} │")
+        
+        if exec_rate is not None:
+            exec_icon = "✅" if exec_rate >= 90 else "⚠️" if exec_rate >= 70 else "❌"
+            exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count} executed)"
+            lines.append(f"│ Execution Rate  │ {exec_msg:<32} │")
+        
+        if pass_rate is not None:
+            pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
+            pass_msg = f"{pass_icon} {format_percentage(pass_rate)} ({passed}/{executed} passed)"
+            lines.append(f"│ Pass Rate       │ {pass_msg:<32} │")
+        
+        if modules_expected:
+            mod_pct = (modules_seen / modules_expected * 100) if modules_expected else 0
+            mod_icon = "✅" if mod_pct >= 90 else "⚠️" if mod_pct >= 50 else "❌"
+            mod_msg = f"{mod_icon} {mod_pct:.1f}% ({modules_seen}/{modules_expected} modules)"
+            lines.append(f"│ Module Coverage │ {mod_msg:<32} │")
+        
+        lines.append("└─────────────────┴──────────────────────────────────┘")
+        lines.append("```")
+        lines.append("")
+        
+        return lines
+    
+    def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Render detailed test analysis with all metrics clearly displayed."""
+        status = snapshot.get('status', {})
+        
+        # Skip if no tests were run
+        if not status.get('tests_total'):
+            return []
+        
+        lines = ["## 🧪 Detailed Test Analysis", ""]
+        
+        # Test Metrics Summary
+        lines.extend(["### Test Metrics Summary", "",
+                     "| Metric | Value | Calculation | Status |",
+                     "|--------|-------|-------------|--------|"])
+        
+        static_count = status.get('static_test_count', 0)
+        executed = status.get('tests_total', 0)
+        passed = status.get('tests_passed', 0)
+        exec_rate = status.get('execution_rate')
+        pass_rate = status.get('pass_pct')
+        
+        if static_count:
+            lines.append(f"| **Total @Test Annotations** | {static_count} | Static count from source | 📊 |")
+        
+        lines.append(f"| **Tests Executed** | {executed} | Runtime execution count | {'⚠️' if exec_rate and exec_rate < 90 else '✅'} |")
+        lines.append(f"| **Tests Passed** | {passed} | Successful test count | ✅ |")
+        
+        if exec_rate is not None and static_count:
+            exec_icon = "✅" if exec_rate >= 90 else "⚠️" if exec_rate >= 70 else "❌"
+            lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} ÷ {static_count} | {exec_icon} |")
+        
+        if pass_rate is not None:
+            pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
+            lines.append(f"| **Pass Rate** | {format_percentage(pass_rate)} | {passed} ÷ {executed} | {pass_icon} |")
+        
+        lines.append("")
+        
+        # Test Execution Breakdown
+        lines.extend(["### Test Execution Breakdown", "",
+                     "| Total Available | Executed | Passed | Failed | Errors | Skipped |",
+                     "|-----------------|----------|--------|--------|---------|---------|"])
+        
+        failed = status.get('tests_failed', 0)
+        errors = status.get('tests_errors', 0)
+        skipped = status.get('tests_skipped', 0)
+        
+        lines.append(f"| {static_count if static_count else 'N/A'} | {executed} | {passed} | {failed} | {errors} | {skipped} |")
+        lines.append("")
+        
+        # Module Coverage Analysis
+        modules_expected = status.get('modules_expected')
+        modules_seen = status.get('modules_seen', 0)
+        skipped_modules = status.get('skipped_modules', [])
+        
+        if modules_expected or skipped_modules:
+            lines.extend(["### Module Coverage Analysis", ""])
+            
+            if modules_expected:
+                lines.append(f"- **Total Modules:** {modules_expected}")
+                mod_pct = (modules_seen / modules_expected * 100) if modules_expected else 0
+                lines.append(f"- **Executed Modules:** {modules_seen} ({mod_pct:.1f}%)")
+            
+            if skipped_modules:
+                unexecuted_tests = 0
+                if static_count and executed:
+                    unexecuted_tests = static_count - executed
+                
+                lines.append(f"- **Skipped Modules:** {len(skipped_modules)}")
+                if unexecuted_tests:
+                    lines.append(f"  (containing ~{unexecuted_tests} unexecuted tests)")
+                
+                # List first few skipped modules
+                for module in skipped_modules[:3]:
+                    lines.append(f"  - {module}")
+                if len(skipped_modules) > 3:
+                    lines.append(f"  - [+{len(skipped_modules) - 3} more...]")
+            
+            lines.append("")
+        
+        return lines
+    
+    def _render_issues_recommendations(self, snapshot: Dict[str, Any]) -> List[str]:
+        """Render issues and recommendations section."""
+        lines = ["## 🚨 Issues & Recommendations", ""]
+        
+        status = snapshot.get('status', {})
+        attention_raw = snapshot.get('attention', {}).get('raw', [])
+        
+        # Group by severity
+        blockers = [item for item in attention_raw if item['severity'] == 'BLOCKER']
+        warnings = [item for item in attention_raw if item['severity'] == 'WARNING']
+        info_items = [item for item in attention_raw if item['severity'] == 'INFO']
+        
+        # Key Observations
+        lines.extend(["### Key Observations"])
+        
+        pass_rate = status.get('pass_pct')
+        exec_rate = status.get('execution_rate')
+        
+        if pass_rate and pass_rate >= 95:
+            lines.append(f"- ✅ **High Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
+        elif pass_rate:
+            lines.append(f"- ⚠️ **Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
+        
+        if exec_rate and exec_rate < 90:
+            lines.append(f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run")
+        
+        modules_expected = status.get('modules_expected')
+        modules_seen = status.get('modules_seen', 0)
+        if modules_expected:
+            coverage = (modules_seen / modules_expected * 100)
+            if coverage < 80:
+                lines.append(f"- ⚠️ **Incomplete Coverage:** {coverage:.0f}% of modules were tested")
+        
+        lines.append("")
+        
+        # Issues by severity
+        if blockers:
+            lines.extend([f"### Blockers ({len(blockers)})", ""])
+            for item in blockers:
+                lines.append(f"- {item['icon']} {item['message']}")
+            lines.append("")
+        else:
+            lines.extend(["### Blockers (0)", "✅ No blocking issues", ""])
+        
+        if warnings:
+            lines.extend([f"### Warnings ({len(warnings)})", ""])
+            for item in warnings[:5]:
+                lines.append(f"- {item['icon']} {item['message']}")
+            if len(warnings) > 5:
+                lines.append(f"- ... (+{len(warnings) - 5} more)")
+            lines.append("")
+        
+        # Actionable Recommendations
+        lines.extend(["### Actionable Recommendations"])
+        
+        if exec_rate and exec_rate < 90:
+            skipped_modules = status.get('skipped_modules', [])[:3]
+            if skipped_modules:
+                modules_str = ','.join(skipped_modules)
+                lines.append(f"1. **Increase Test Execution Rate**:")
+                lines.append(f"   ```bash")
+                lines.append(f"   mvn test -pl {modules_str}")
+                lines.append(f"   ```")
+        
+        lines.append("2. **Run All Tests**:")
+        lines.append("   ```bash")
+        lines.append("   mvn clean test -DskipTests=false")
+        lines.append("   ```")
+        
+        if warnings or blockers:
+            lines.append("3. **Check Skipped Reasons**:")
+            lines.append("   ```bash")
+            lines.append("   mvn test -X | grep -i \"skip\\|exclude\"")
+            lines.append("   ```")
+        
+        lines.append("")
+        
+        return lines
+    
+    def _render_task_progress(self, actual_accomplishments: dict = None) -> List[str]:
+        """Render task progress in improved table format."""
+        lines = ["## 📋 Task Progress", ""]
+        
+        if not self.context_manager:
+            return lines
+        
+        try:
+            trunk_context = self.context_manager.load_trunk_context()
+            if not trunk_context or not trunk_context.todo_list:
+                return lines
+            
+            lines.extend(["| # | Task | Status | Key Result |",
+                         "|---|------|--------|------------|"])
+            
+            for i, task in enumerate(trunk_context.todo_list, 1):
+                status_icon = "✅" if task.status.value == "completed" else "🔄" if task.status.value == "in_progress" else "⏳"
+                
+                # Extract key result
+                key_result = ""
+                if task.key_results:
+                    # Highlight test metrics
+                    if "static_test_count" in task.key_results:
+                        import re
+                        match = re.search(r'static_test_count=(\d+)', task.key_results)
+                        if match:
+                            key_result = f"**{match.group(1)} total @Test** found"
+                    elif "test" in task.description.lower() and "executed" in task.key_results.lower():
+                        # Extract execution metrics
+                        import re
+                        total_match = re.search(r'total_tests[\'"]?:\s*(\d+)', task.key_results)
+                        if total_match:
+                            total = total_match.group(1)
+                            key_result = f"**{total} executed**"
+                            # Try to add rate if static count available
+                            if trunk_context.environment_summary.get('static_test_count'):
+                                static = trunk_context.environment_summary['static_test_count']
+                                rate = (int(total) / static * 100)
+                                key_result = f"**{total}/{static} executed ({rate:.1f}%)**"
+                    elif task.key_results:
+                        # Truncate long results
+                        key_result = task.key_results[:50] + "..." if len(task.key_results) > 50 else task.key_results
+                
+                # Shorten task description
+                task_desc = task.description[:40] + "..." if len(task.description) > 40 else task.description
+                
+                lines.append(f"| {i} | {task_desc} | {status_icon} | {key_result} |")
+            
+            lines.append("")
+            
+        except Exception as e:
+            logger.warning(f"Could not generate task progress: {e}")
+        
+        return lines
+    
+    def _render_execution_details_simplified(self, snapshot: dict = None, 
+                                            execution_metrics: dict = None) -> List[str]:
+        """Render simplified execution details."""
+        lines = ["## 🛠 Execution Details", ""]
+        
+        # Get command info from snapshot
+        if snapshot:
+            last_cmd = snapshot.get('last_command', {})
+            if last_cmd:
+                tool = last_cmd.get('tool', 'maven')
+                command = last_cmd.get('command', 'N/A')
+                workdir = last_cmd.get('workdir', '/workspace')
+                
+                lines.append(f"**Build Command:** `{command if 'install' in command or 'compile' in command else 'mvn clean install -DskipTests'}`")
+                lines.append(f"**Test Command:** `{command if 'test' in command else 'mvn test'}`")
+        
+        # Add runtime metrics
+        if execution_metrics:
+            runtime = execution_metrics.get('total_runtime', 0)
+            iterations = execution_metrics.get('total_iterations', 0)
+            success_rate = execution_metrics.get('success_rate', 0)
+            
+            lines.append(f"**Runtime:** {runtime:.1f} minutes | {iterations} iterations | {success_rate:.0f}% success rate")
+            lines.append("")
+            
+            # Tool usage summary
+            tools_used = execution_metrics.get('tools_used', {})
+            if tools_used:
+                tools_summary = []
+                for tool, count in sorted(tools_used.items(), key=lambda x: x[1], reverse=True)[:4]:
+                    tool_name = tool.replace('_', ' ').title()
+                    tools_summary.append(f"{tool_name} ({count})")
+                
+                lines.append("### Tool Usage")
+                lines.append(", ".join(tools_summary))
+                lines.append("")
+        
+        return lines
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
         """Get the parameters schema for this tool."""

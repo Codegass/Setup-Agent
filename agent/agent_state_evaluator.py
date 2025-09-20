@@ -128,6 +128,11 @@ class AgentStateEvaluator:
         if ghost_state_analysis.needs_guidance:
             return ghost_state_analysis
             
+        # 2.5. Check if task_2 requires project_analyzer enforcement
+        task2_analysis = self._check_task2_project_analyzer_requirement(steps)
+        if task2_analysis.needs_guidance:
+            return task2_analysis
+            
         # 3. Check if task completion opportunity was missed
         if self.context_manager.current_task_id:
             completion_analysis = self._check_task_completion_opportunity(steps)
@@ -158,6 +163,53 @@ class AgentStateEvaluator:
             )
         
         # Default: Everything is proceeding normally
+        return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
+    
+    def _check_task2_project_analyzer_requirement(self, steps: List[Any]) -> AgentStateAnalysis:
+        """
+        Check if agent is working on task_2 but hasn't used project_analyzer tool.
+        Task_2 is critical for static test counting and must use project_analyzer.
+        """
+        # Check if current task is task_2
+        if self.context_manager.current_task_id != 'task_2':
+            return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
+        
+        # Check if project_analyzer has been used in this task
+        project_analyzer_used = False
+        for step in steps[-20:]:  # Check last 20 steps
+            if (hasattr(step, 'tool_name') and step.tool_name == 'project_analyzer' and
+                hasattr(step, 'tool_result') and step.tool_result.success):
+                project_analyzer_used = True
+                break
+        
+        # If working on task_2 but hasn't used project_analyzer yet
+        if not project_analyzer_used:
+            # Check if agent is trying to analyze manually (reading pom.xml, etc.)
+            manual_analysis_detected = False
+            for step in steps[-5:]:
+                if hasattr(step, 'tool_name') and step.tool_name in ['file_io', 'bash']:
+                    if hasattr(step, 'input') and 'pom.xml' in str(step.input).lower():
+                        manual_analysis_detected = True
+                        break
+            
+            if manual_analysis_detected:
+                return AgentStateAnalysis(
+                    status=AgentStatus.STUCK,
+                    needs_guidance=True,
+                    guidance=(
+                        "⚠️ CRITICAL: USE PROJECT_ANALYZER TOOL FOR TASK_2!\n\n"
+                        "You are attempting to manually analyze the project structure.\n"
+                        "Task_2 REQUIRES using the project_analyzer tool to:\n"
+                        "• Analyze project structure comprehensively\n"
+                        "• Count static test cases (Java @Test annotations)\n"
+                        "• Store static test count in trunk context\n"
+                        "• Generate intelligent execution plan\n\n"
+                        "IMMEDIATELY use: project_analyzer(action='analyze', project_path='/workspace/<project>')\n\n"
+                        "DO NOT manually read pom.xml or analyze files - the tool does this automatically!"
+                    ),
+                    priority=10  # Highest priority
+                )
+        
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
     
     def _check_ghost_state(self, steps: List[Any]) -> AgentStateAnalysis:

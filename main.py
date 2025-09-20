@@ -1,5 +1,6 @@
 """Main CLI interface for SAG (Setup-Agent)."""
 
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,73 @@ from config import Config, LogLevel, get_config, get_session_logger, set_config
 from docker_orch.orch import DockerOrchestrator
 
 console = Console()
+
+
+def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:
+    """Copy setup artifacts from Docker container to local session logs.
+    
+    Args:
+        orchestrator: Docker orchestrator for the project
+        project_name: Name of the project
+    """
+    try:
+        session_logger = get_session_logger()
+        if not session_logger:
+            logger.warning("No session logger available, skipping artifact save")
+            return
+            
+        # Get the session log directory
+        session_dir = session_logger.session_log_dir
+        if not session_dir.exists():
+            session_dir.mkdir(parents=True, exist_ok=True)
+            
+        logger.info(f"Saving artifacts to {session_dir}")
+        
+        # Check if .setup_agent folder exists in container
+        check_result = orchestrator.execute_command(
+            "test -d /workspace/.setup_agent && echo 'EXISTS' || echo 'NOT_FOUND'"
+        )
+        
+        if check_result.get("output", "").strip() == "EXISTS":
+            # Copy .setup_agent folder
+            copy_cmd = f"docker cp {orchestrator.container_name}:/workspace/.setup_agent {session_dir}/"
+            import subprocess
+            result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info("✅ Copied .setup_agent folder from container")
+            else:
+                logger.warning(f"Failed to copy .setup_agent folder: {result.stderr}")
+        else:
+            logger.info(".setup_agent folder not found in container, skipping")
+            
+        # Find and copy setup-report-*.md files
+        find_result = orchestrator.execute_command(
+            "find /workspace -maxdepth 1 -name 'setup-report-*.md' -type f 2>/dev/null | head -10"
+        )
+        
+        report_files = find_result.get("output", "").strip().split("\n")
+        report_files = [f for f in report_files if f.strip()]
+        
+        if report_files:
+            for report_file in report_files:
+                if report_file:
+                    # Extract filename from full path
+                    filename = report_file.split("/")[-1]
+                    copy_cmd = f"docker cp {orchestrator.container_name}:{report_file} {session_dir}/{filename}"
+                    result = subprocess.run(copy_cmd, shell=True, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        logger.info(f"✅ Copied {filename} from container")
+                    else:
+                        logger.warning(f"Failed to copy {filename}: {result.stderr}")
+        else:
+            logger.info("No setup report files found in container")
+            
+        console.print(f"[dim]Artifacts saved to: {session_dir}[/dim]")
+        
+    except Exception as e:
+        logger.error(f"Failed to save artifacts: {e}")
+        # Don't fail the main operation if artifact saving fails
+        console.print(f"[yellow]⚠️ Could not save artifacts: {e}[/yellow]")
 
 
 @click.group()
@@ -123,8 +191,9 @@ def list():
 @click.argument("repo_url")
 @click.option("--name", help="Override project name (default: extracted from URL)")
 @click.option("--goal", help="Custom setup goal (default: auto-generated)")
+@click.option("--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs")
 @click.pass_context
-def project(ctx, repo_url, name, goal):
+def project(ctx, repo_url, name, goal, record):
     """Initial setup for a new project from repository URL."""
 
     config = ctx.obj["config"]
@@ -145,6 +214,8 @@ def project(ctx, repo_url, name, goal):
         console.print(f"[dim]Project Name:[/dim] {name}")
         console.print(f"[dim]Docker Name:[/dim] {docker_name}")
         console.print(f"[dim]Goal:[/dim] {goal}")
+        if record:
+            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         # Check if project already exists
         orchestrator = DockerOrchestrator(project_name=name)
@@ -160,6 +231,10 @@ def project(ctx, repo_url, name, goal):
 
         # Run the setup
         success = agent.setup_project(project_url=repo_url, project_name=name, goal=goal)
+
+        # Save artifacts if recording is enabled
+        if record:
+            _save_setup_artifacts(orchestrator, name)
 
         if success:
             console.print(f"[bold green]✅ Project '{name}' setup completed![/bold green]")
@@ -182,8 +257,9 @@ def project(ctx, repo_url, name, goal):
 @click.argument("docker_name")
 @click.option("--task", required=True, help="Specific task or requirement for the agent")
 @click.option("--max-iterations", default=None, type=int, help="Maximum number of agent iterations")
+@click.option("--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs")
 @click.pass_context
-def run(ctx, docker_name, task, max_iterations):
+def run(ctx, docker_name, task, max_iterations, record):
     """Run a specific task on an existing SAG project."""
 
     config = ctx.obj["config"]
@@ -200,6 +276,8 @@ def run(ctx, docker_name, task, max_iterations):
         console.print(f"[bold green]🔧 Running task on project: {project_name}[/bold green]")
         console.print(f"[dim]Docker:[/dim] {docker_name}")
         console.print(f"[dim]Task:[/dim] {task}")
+        if record:
+            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         # Initialize orchestrator
         orchestrator = DockerOrchestrator(project_name=project_name)
@@ -216,6 +294,10 @@ def run(ctx, docker_name, task, max_iterations):
 
         # Run the task
         success = agent.run_task(project_name=project_name, task_description=task)
+
+        # Save artifacts if recording is enabled
+        if record:
+            _save_setup_artifacts(orchestrator, project_name)
 
         if success:
             console.print(f"[bold green]✅ Task completed successfully![/bold green]")
