@@ -153,7 +153,8 @@ class ProjectAnalyzerTool(BaseTool):
             "test_framework": "unknown",
             "documentation": {},
             "special_requirements": [],
-            "execution_plan": []
+            "execution_plan": [],
+            "static_test_count": None  # Add static test count field
         }
 
         # Step 1: 检测项目基本结构
@@ -172,17 +173,16 @@ class ProjectAnalyzerTool(BaseTool):
         test_config = self._analyze_test_configuration(project_path, analysis["project_type"])
         analysis.update(test_config)
 
-        # Step 5: 估算测试总数
-        tests_expected_total = self._estimate_total_test_cases(
-            project_path, 
-            analysis["project_type"], 
-            analysis.get("build_system", "unknown")
-        )
-        if tests_expected_total is not None:
-            analysis["tests_expected_total"] = tests_expected_total
-            logger.info(f"Estimated {tests_expected_total} total test cases for project")
+        # Step 4.5: Count static test cases for Java projects
+        if analysis["project_type"] == "Java":
+            static_count = self._count_java_test_annotations(project_path)
+            if static_count is not None:
+                analysis["static_test_count"] = static_count
+                logger.info(f"📊 Counted {static_count} @Test annotations in Java source files")
+            else:
+                logger.debug("Unable to count @Test annotations or no tests found")
 
-        # Step 6: 生成智能执行计划
+        # Step 5: 生成智能执行计划
         execution_plan = self._generate_execution_plan(analysis)
         analysis["execution_plan"] = execution_plan
 
@@ -673,235 +673,7 @@ class ProjectAnalyzerTool(BaseTool):
                 logger.info(f"Found Gradle test frameworks: {test_frameworks}")
 
     def _estimate_total_test_cases(self, project_path: str, project_type: str, build_system: str) -> Optional[int]:
-        """
-        Estimate the total number of test cases in the project.
-        Uses build tool signals first, then falls back to filesystem scanning.
-        
-        Returns:
-            Estimated number of test cases, or None if unable to estimate
-        """
-        if not self.docker_orchestrator:
-            return None
-            
-        logger.info(f"Estimating test cases for {project_type} project with {build_system}")
-        
-        # Prefer direct annotation counting for Java-based projects
-        if project_type and project_type.lower() == "java" or build_system in {"Maven", "Gradle"}:
-            annotation_total = self._count_java_test_annotations(project_path)
-            if annotation_total:
-                logger.info(f"Detected {annotation_total} test methods via @Test annotation scan")
-                return annotation_total
-
-        # Strategy 1: Maven - Static analysis of test files only
-        if build_system == "Maven":
-            # First, try to find all test directories in multi-module projects
-            # Look for any src/test/java directories recursively
-            test_dirs_result = self.docker_orchestrator.execute_command(
-                f"find {project_path} -type d -path '*/src/test/java' 2>/dev/null"
-            )
-            
-            test_file_count = 0
-            
-            if test_dirs_result.get("success") and test_dirs_result.get("output"):
-                # Count test files in all test directories found (handles multi-module projects)
-                # Use proper find syntax with parentheses for OR conditions
-                result = self.docker_orchestrator.execute_command(
-                    f"find {project_path} -path '*/src/test/java/*' \\( -name '*Test.java' -o -name '*Tests.java' -o -name 'Test*.java' -o -name '*TestCase.java' -o -name '*IT.java' \\) -type f 2>/dev/null | wc -l"
-                )
-                
-                # Also log which modules have tests for debugging
-                modules_with_tests = self.docker_orchestrator.execute_command(
-                    f"find {project_path} -type d -path '*/src/test/java' 2>/dev/null | wc -l"
-                )
-                if modules_with_tests.get("success"):
-                    module_count = int(modules_with_tests.get("output", "0").strip())
-                    if module_count > 0:
-                        logger.debug(f"Found {module_count} Maven modules with test directories")
-            else:
-                # Fallback: Look for test files in standard single-module Maven structure
-                result = self.docker_orchestrator.execute_command(
-                    f"find {project_path}/src/test -type f \\( -name '*Test.java' -o -name '*Tests.java' -o -name 'Test*.java' -o -name '*TestCase.java' -o -name '*IT.java' \\) 2>/dev/null | wc -l"
-                )
-            if result.get("success"):
-                try:
-                    file_count = int(result["output"].strip())
-                    if file_count > 0:
-                        # Count actual @Test annotations in all test files
-                        # This gives us the exact number of test methods, not an estimate
-                        
-                        # Count JUnit 4/5 @Test annotations
-                        test_count_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -path '*/src/test/java/*' \\( -name '*Test.java' -o -name '*Tests.java' -o -name 'Test*.java' -o -name '*TestCase.java' -o -name '*IT.java' \\) -type f -exec grep -h '@Test' {{}} \\; 2>/dev/null | wc -l"
-                        )
-                        
-                        if test_count_result.get("success"):
-                            try:
-                                test_count = int(test_count_result["output"].strip())
-                                if test_count > 0:
-                                    logger.info(f"Found {file_count} test files containing {test_count} @Test annotations")
-                                    return test_count
-                            except ValueError:
-                                pass
-                        
-                        # Fallback: If grep fails or no annotations found, try alternative patterns
-                        # TestNG uses @Test, JUnit 3 uses test* method names
-                        testng_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -path '*/src/test/java/*' -name '*.java' -type f -exec grep -h '@Test.*testng' {{}} \\; 2>/dev/null | wc -l"
-                        )
-                        junit3_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -path '*/src/test/java/*' -name '*.java' -type f -exec grep -h 'public.*void test' {{}} \\; 2>/dev/null | wc -l"
-                        )
-                        
-                        total_tests = 0
-                        if testng_result.get("success"):
-                            try:
-                                total_tests += int(testng_result["output"].strip())
-                            except ValueError:
-                                pass
-                        
-                        if junit3_result.get("success"):
-                            try:
-                                total_tests += int(junit3_result["output"].strip())
-                            except ValueError:
-                                pass
-                        
-                        if total_tests > 0:
-                            logger.info(f"Found {total_tests} test methods using alternative patterns")
-                            return total_tests
-                        
-                        # Last resort: If we found test files but couldn't count annotations
-                        # This might happen if files are not readable or use unusual patterns
-                        logger.warning(f"Found {file_count} test files but couldn't count test methods, using conservative estimate")
-                        return file_count * 3  # Conservative estimate if annotation counting fails
-                        
-                except ValueError:
-                    pass
-        
-        # Strategy 2: Gradle - Count actual test annotations
-        elif build_system == "Gradle":
-            # First find test files (Java, Kotlin, Groovy)
-            result = self.docker_orchestrator.execute_command(
-                f"find {project_path} -path '*/src/test/*' \\( -name '*.java' -o -name '*.kt' -o -name '*.groovy' \\) -type f 2>/dev/null | wc -l"
-            )
-            
-            if result.get("success"):
-                try:
-                    file_count = int(result["output"].strip())
-                    if file_count > 0:
-                        # Count @Test annotations for JUnit/TestNG
-                        test_count_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -path '*/src/test/*' \\( -name '*.java' -o -name '*.kt' -o -name '*.groovy' \\) -type f -exec grep -h '@Test' {{}} \\; 2>/dev/null | wc -l"
-                        )
-                        
-                        if test_count_result.get("success"):
-                            try:
-                                test_count = int(test_count_result["output"].strip())
-                                if test_count > 0:
-                                    logger.info(f"Found {file_count} test files containing {test_count} @Test annotations")
-                                    return test_count
-                            except ValueError:
-                                pass
-                        
-                        # For Spock tests (Groovy), look for def "test name"() patterns
-                        spock_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -path '*/src/test/*' -name '*.groovy' -type f -exec grep -h 'def \".*\"()' {{}} \\; 2>/dev/null | wc -l"
-                        )
-                        
-                        if spock_result.get("success"):
-                            try:
-                                spock_count = int(spock_result["output"].strip())
-                                if spock_count > 0:
-                                    logger.info(f"Found {spock_count} Spock test methods")
-                                    return spock_count
-                            except ValueError:
-                                pass
-                        
-                        # Fallback for Gradle
-                        logger.warning(f"Found {file_count} test files but couldn't count test methods")
-                        return file_count * 3  # Conservative estimate
-                        
-                except ValueError:
-                    pass
-        
-        # Strategy 3: Node.js projects - Count actual test definitions
-        elif project_type in ["Node.js", "JavaScript", "TypeScript"]:
-            patterns = [
-                "*.test.js", "*.spec.js", "*.test.ts", "*.spec.ts",
-                "*.test.jsx", "*.spec.jsx", "*.test.tsx", "*.spec.tsx"
-            ]
-            pattern_str = " -o ".join([f"-name '{p}'" for p in patterns])
-            result = self.docker_orchestrator.execute_command(
-                f"find {project_path} -type f \\( {pattern_str} \\) 2>/dev/null | grep -v node_modules | wc -l"
-            )
-            if result.get("success"):
-                try:
-                    file_count = int(result["output"].strip())
-                    if file_count > 0:
-                        # Count actual test definitions: it(), test(), describe().it, etc.
-                        test_count_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -type f \\( {pattern_str} \\) -not -path '*/node_modules/*' -exec grep -h -E '\\s+(it|test)\\s*\\(' {{}} \\; 2>/dev/null | wc -l"
-                        )
-                        
-                        if test_count_result.get("success"):
-                            try:
-                                test_count = int(test_count_result["output"].strip())
-                                if test_count > 0:
-                                    logger.info(f"Found {file_count} test files containing {test_count} test cases")
-                                    return test_count
-                            except ValueError:
-                                pass
-                        
-                        # Fallback if grep fails
-                        logger.warning(f"Found {file_count} test files but couldn't count test cases")
-                        return file_count * 5  # Conservative estimate
-                        
-                except ValueError:
-                    pass
-        
-        # Strategy 4: Python projects - Count test files and functions
-        elif project_type == "Python":
-            result = self.docker_orchestrator.execute_command(
-                f"find {project_path} -name 'test_*.py' -o -name '*_test.py' 2>/dev/null | wc -l"
-            )
-            if result.get("success"):
-                try:
-                    count = int(result["output"].strip())
-                    if count > 0:
-                        # Try to count actual test functions
-                        func_result = self.docker_orchestrator.execute_command(
-                            f"find {project_path} -name 'test_*.py' -o -name '*_test.py' | xargs grep -h 'def test_' 2>/dev/null | wc -l"
-                        )
-                        if func_result.get("success"):
-                            try:
-                                func_count = int(func_result["output"].strip())
-                                if func_count > 0:
-                                    logger.info(f"Found {func_count} test functions in {count} files")
-                                    return func_count
-                            except ValueError:
-                                pass
-                        # Fallback: estimate based on files
-                        estimated = count * 6
-                        logger.info(f"Found {count} test files, estimating {estimated} test cases")
-                        return estimated
-                except ValueError:
-                    pass
-        
-        # Generic fallback: Count any test-like files
-        result = self.docker_orchestrator.execute_command(
-            f"find {project_path} -type f -name '*test*' -o -name '*spec*' 2>/dev/null | grep -v -E '(node_modules|.git|target|build|dist)' | wc -l"
-        )
-        if result.get("success"):
-            try:
-                count = int(result["output"].strip())
-                if count > 0:
-                    # Conservative estimate for unknown projects
-                    estimated = count * 3
-                    logger.info(f"Found {count} test-like files, estimating {estimated} test cases")
-                    return estimated
-            except ValueError:
-                pass
-        
-        logger.warning("Unable to estimate test count for project")
+        """(Deprecated) Test estimation disabled."""
         return None
 
     def _count_java_test_annotations(self, project_path: str) -> Optional[int]:
@@ -914,9 +686,9 @@ class ProjectAnalyzerTool(BaseTool):
             "find . -path '*/src/test/*' -name '*.java' -print0 2>/dev/null | "
             "while IFS= read -r -d '' file; do "
             "count=$(grep -c '@Test' \"$file\" 2>/dev/null || echo 0); "
-            "count=${count##*:}; "
+            "count=${{count##*:}}; "
             "echo $count; "
-            "done | awk '{sum += $1} END {print sum+0}'"
+            "done | awk '{{sum += $1}} END {{print sum+0}}'"
         ).format(project=project_path)
 
         result = self.docker_orchestrator.execute_command(count_cmd)
@@ -1316,6 +1088,12 @@ class ProjectAnalyzerTool(BaseTool):
                     logger.debug(f"Adding task: {task_description} (type: {task_type})")
                     trunk_context.add_task(task_description)
 
+                # Store static test count in environment summary if available
+                static_test_count = analysis.get("static_test_count")
+                if static_test_count is not None:
+                    trunk_context.environment_summary["static_test_count"] = static_test_count
+                    logger.info(f"📊 Stored static test count in trunk context: {static_test_count} @Test annotations")
+
                 # 保存更新后的context
                 self.context_manager._save_trunk_context(trunk_context)
                 logger.info(f"✅ Successfully updated trunk context with {len(execution_plan)} new intelligent tasks")
@@ -1404,9 +1182,11 @@ class ProjectAnalyzerTool(BaseTool):
         test_framework = analysis.get('test_framework', 'unknown')
         if test_framework != 'unknown':
             output += f"🧪 Test Framework: {test_framework}\n"
-
-        if analysis.get('tests_expected_total'):
-            output += f"🧮 Estimated Tests: {analysis['tests_expected_total']}\n"
+        
+        # Static test count
+        static_test_count = analysis.get('static_test_count')
+        if static_test_count is not None:
+            output += f"📊 Static Test Count: {static_test_count} @Test annotations found\n"
 
         # 执行计划
         execution_plan = analysis.get('execution_plan', [])
