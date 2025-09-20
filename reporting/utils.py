@@ -105,10 +105,18 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
                 lines.append(f"🧾 Build artifacts: {', '.join(details)}")
         if evidence.get("tests_total") is not None:
             pass_pct = evidence.get("tests_pass_pct")
-            lines.append(
-                "🧪 Tests: "
-                f"{evidence['tests_total']} total (pass rate {format_percentage(pass_pct)})"
-            )
+            execution_rate = status.get("execution_rate")
+            test_line = f"🧪 Tests: {evidence['tests_total']} executed"
+            
+            # Add pass rate
+            test_line += f" (pass rate {format_percentage(pass_pct)}"
+            
+            # Add execution rate if available
+            if execution_rate is not None:
+                test_line += f", execution rate {format_percentage(execution_rate)}"
+            
+            test_line += ")"
+            lines.append(test_line)
 
     if attention.get("ignored_lines"):
         lines.append(f"ℹ️ Ignored telemetry lines: {attention['ignored_lines']}")
