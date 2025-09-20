@@ -109,7 +109,16 @@ class SetupAgent:
     def _get_execution_history(self):
         """Get execution history for report verification."""
         if hasattr(self, 'react_engine') and self.react_engine:
-            return self.react_engine.steps
+            try:
+                summary = self.react_engine.get_execution_summary()
+            except Exception:
+                summary = {}
+
+            return {
+                "steps": list(self.react_engine.steps),
+                "summary": summary,
+                "current_iteration": getattr(self.react_engine, "current_iteration", 0),
+            }
         return []
 
     def setup_project(
