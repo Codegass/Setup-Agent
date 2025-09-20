@@ -720,14 +720,30 @@ class ReportTool(BaseTool):
             'test': actual_accomplishments.get('test_success', False),
         }
 
-        # Calculate execution rate if we have static test count
+        # Calculate test metrics
+        # We distinguish between:
+        # 1. Coverage Rate: How many test methods were run (can be <100% if tests skipped)
+        # 2. Expansion Factor: How many times each test executes (>1 for parameterized tests)
         execution_rate = None
+        expansion_factor = None
+        
         if static_test_count and tests_total is not None:
             try:
+                # For backwards compatibility, still calculate execution_rate
+                # But now we understand it's really measuring test expansion
                 execution_rate = (to_int(tests_total) / static_test_count) * 100
-                logger.info(f"📊 Test Execution Rate: {execution_rate:.1f}% ({to_int(tests_total)} executed / {static_test_count} total @Test)")
+                
+                # Calculate expansion factor for better clarity
+                expansion_factor = to_int(tests_total) / static_test_count
+                
+                if execution_rate > 100:
+                    logger.info(f"📊 Test Methods: {static_test_count} | Executions: {to_int(tests_total)} | Expansion: {expansion_factor:.1f}x")
+                    logger.info(f"ℹ️ Expansion factor >1 indicates parameterized tests")
+                else:
+                    logger.info(f"📊 Test Coverage: {execution_rate:.1f}% ({to_int(tests_total)} of {static_test_count} methods executed)")
             except (TypeError, ZeroDivisionError):
                 execution_rate = None
+                expansion_factor = None
         
         status = {
             'overall': verified_status,
@@ -1029,8 +1045,13 @@ class ReportTool(BaseTool):
             if not self.execution_history_callback:
                 return
             
-            history = self.execution_history_callback()
-            if not history or len(history) == 0:
+            history_payload = self.execution_history_callback()
+            if isinstance(history_payload, dict):
+                history = history_payload.get('steps') or []
+            else:
+                history = history_payload or []
+
+            if not history:
                 return
             
             # Group actions by likely phase
@@ -1162,6 +1183,7 @@ class ReportTool(BaseTool):
             'total_runtime': 0,
             'start_time': None,
             'end_time': None,
+            'total_steps': 0,
             'total_iterations': 0,
             'max_iterations': 0,
             'iteration_utilization': 0,
@@ -1188,12 +1210,28 @@ class ReportTool(BaseTool):
         # Get execution history if available
         if self.execution_history_callback:
             try:
-                history = self.execution_history_callback()
-                
-                if history and len(history) > 0:
+                history_payload = self.execution_history_callback()
+
+                summary_snapshot = {}
+                history_steps: List[Any] = []
+
+                if isinstance(history_payload, dict):
+                    history_steps = list(history_payload.get('steps') or [])
+                    summary_snapshot = history_payload.get('summary') or {}
+
+                    # Prefer direct iteration count when provided (aligns with agent summary)
+                    if summary_snapshot.get('iterations') is not None:
+                        metrics['total_iterations'] = summary_snapshot['iterations']
+                    elif history_payload.get('current_iteration') is not None:
+                        metrics['total_iterations'] = history_payload['current_iteration']
+                else:
+                    history_steps = list(history_payload or [])
+                    summary_snapshot = {}
+
+                if history_steps:
                     # Calculate timing
-                    first_step = history[0]
-                    last_step = history[-1]
+                    first_step = history_steps[0]
+                    last_step = history_steps[-1]
                     
                     # Get timestamps (handle both object and dict formats)
                     if hasattr(first_step, 'timestamp'):
@@ -1217,7 +1255,7 @@ class ReportTool(BaseTool):
                             pass
                     
                     # Count step types
-                    for step in history:
+                    for step in history_steps:
                         # Handle both object and dict formats
                         if hasattr(step, 'step_type'):
                             step_type = step.step_type
@@ -1294,15 +1332,36 @@ class ReportTool(BaseTool):
                     # Calculate success rate
                     if metrics['total_actions'] > 0:
                         metrics['success_rate'] = (metrics['successful_actions'] / metrics['total_actions']) * 100
-                    
+
                     # Get iteration count from context manager if available
                     if self.context_manager:
                         try:
                             # This would need to be added to context manager
-                            metrics['total_iterations'] = len(history) // 3  # Rough estimate: thought + action + observation
+                            if not metrics['total_iterations']:
+                                metrics['total_iterations'] = len(history_steps) // 3  # Rough estimate
                         except:
                             pass
-                            
+                
+                # Override with authoritative summary data when available
+                if summary_snapshot:
+                    metrics['total_steps'] = summary_snapshot.get('total_steps', metrics['total_steps'])
+                    metrics['total_thoughts'] = summary_snapshot.get('thoughts', metrics['total_thoughts'])
+                    metrics['total_actions'] = summary_snapshot.get('actions', metrics['total_actions'])
+                    metrics['total_observations'] = summary_snapshot.get('observations', metrics['total_observations'])
+                    metrics['successful_actions'] = summary_snapshot.get('successful_actions', metrics['successful_actions'])
+                    metrics['failed_actions'] = summary_snapshot.get('failed_actions', metrics['failed_actions'])
+                    metrics['thinking_model_calls'] = summary_snapshot.get('thinking_model_calls', metrics['thinking_model_calls'])
+                    metrics['action_model_calls'] = summary_snapshot.get('action_model_calls', metrics['action_model_calls'])
+
+                    if summary_snapshot.get('actions'):
+                        try:
+                            metrics['success_rate'] = (
+                                summary_snapshot.get('successful_actions', 0)
+                                / summary_snapshot['actions']
+                            ) * 100
+                        except ZeroDivisionError:
+                            metrics['success_rate'] = 0
+
             except Exception as e:
                 logger.warning(f"Failed to collect execution metrics: {e}")
         
@@ -1354,12 +1413,28 @@ class ReportTool(BaseTool):
                 except Exception:
                     project_name_for_validator = None
                 
-                # Use PhysicalValidator for comprehensive validation (scoped to project when known)
-                validation_result = self.physical_validator.validate_build_artifacts(project_name=project_name_for_validator)
-                
+                # Ensure physical_validation container exists
+                if 'physical_validation' not in actual_accomplishments:
+                    actual_accomplishments['physical_validation'] = {}
+
+                # Primary build verdict must match agent-facing validation
+                build_status = self.physical_validator.validate_build_status(project_name_for_validator)
+                actual_accomplishments['build_success'] = build_status.get('success', False)
+                actual_accomplishments['physical_validation']['build_status'] = build_status
+                logger.info(
+                    f"🔍 Build status verification:"
+                    f" {'SUCCESS' if actual_accomplishments['build_success'] else 'FAILED'}"
+                    f" - {build_status.get('reason', 'no reason provided')}"
+                )
+
+                # Use artifact scan for counts/evidence without overriding build_success
+                validation_result = self.physical_validator.validate_build_artifacts(
+                    project_name=project_name_for_validator
+                )
+
                 # Use enhanced test parsing with metrics for better accuracy
                 test_analysis = self.physical_validator.parse_test_reports_with_metrics(project_dir)
-                
+
                 # Also get test validation status for additional insights
                 test_status = self.physical_validator.validate_test_status(project_name_for_validator)
                 
@@ -1372,9 +1447,10 @@ class ReportTool(BaseTool):
                 # Extract results from PhysicalValidator
                 # Repository is cloned if artifacts detected OR the project directory exists under /workspace
                 actual_accomplishments['repository_cloned'] = (
-                    validation_result.get('class_files', 0) > 0 or
-                    validation_result.get('jar_files', 0) > 0 or
-                    len(validation_result.get('missing_classes', [])) > 0
+                    validation_result.get('class_files', 0) > 0
+                    or validation_result.get('jar_files', 0) > 0
+                    or len(validation_result.get('missing_classes', [])) > 0
+                    or actual_accomplishments['build_success']
                 )
                 # Strengthen with directory existence check
                 try:
@@ -1385,13 +1461,9 @@ class ReportTool(BaseTool):
                         actual_accomplishments['repository_cloned'] = True
                 except Exception as _e:
                     logger.debug(f"Directory existence check failed: {_e}")
-                actual_accomplishments['build_success'] = validation_result.get('valid', False)
-                
+
                 if test_analysis.get('valid'):
                     actual_accomplishments['test_success'] = test_analysis['test_success']
-                    # Initialize physical_validation if not exists
-                    if 'physical_validation' not in actual_accomplishments:
-                        actual_accomplishments['physical_validation'] = {}
                     actual_accomplishments['physical_validation']['test_analysis'] = {
                         'total_tests': test_analysis['total_tests'],
                         'passed_tests': test_analysis['passed_tests'],
@@ -1416,8 +1488,6 @@ class ReportTool(BaseTool):
                     logger.info("⚠️ PHYSICAL: No test reports found or parsing failed")
                 
                 # Store validation results - initialize if not exists
-                if 'physical_validation' not in actual_accomplishments:
-                    actual_accomplishments['physical_validation'] = {}
                 actual_accomplishments['physical_validation'].update({
                     'class_files': validation_result.get('class_files', 0),
                     'jar_files': validation_result.get('jar_files', 0),
@@ -1438,9 +1508,11 @@ class ReportTool(BaseTool):
                     actual_accomplishments['test_success'] = False
                     logger.info("⚠️ CONSISTENCY: No build → no test")
                 
-                logger.info(f"📊 PHYSICAL TRUTH: Clone={actual_accomplishments['repository_cloned']}, "
-                           f"Build={actual_accomplishments['build_success']}, "
-                           f"Test={actual_accomplishments['test_success']}")
+                logger.info(
+                    f"📊 PHYSICAL TRUTH: Clone={actual_accomplishments['repository_cloned']}, "
+                    f"Build={actual_accomplishments['build_success']}, "
+                    f"Test={actual_accomplishments['test_success']}"
+                )
                 
             except Exception as e:
                 logger.warning(f"Physical validation error: {e}")
@@ -1483,7 +1555,11 @@ class ReportTool(BaseTool):
             if self.execution_history_callback:
                 try:
                     # Get execution history from callback
-                    history = self.execution_history_callback()
+                    history_payload = self.execution_history_callback()
+                    if isinstance(history_payload, dict):
+                        history = history_payload.get('steps') or []
+                    else:
+                        history = history_payload or []
                     self._analyze_execution_steps(history, actual_accomplishments)
                 except Exception as e:
                     logger.warning(f"Failed to get execution history from callback: {e}")
@@ -2559,7 +2635,11 @@ class ReportTool(BaseTool):
             # Add Execution Rate if available
             execution_rate = status.get('execution_rate')
             if execution_rate is not None:
-                exec_icon = "✅" if execution_rate >= 90 else "⚠️" if execution_rate >= 70 else "❌"
+                # Handle rates over 100% (indicates parameterized tests)
+                if execution_rate > 100:
+                    exec_icon = "🔄"  # Special icon for parameterized tests
+                else:
+                    exec_icon = "✅" if execution_rate >= 90 else "⚠️" if execution_rate >= 70 else "❌"
                 lines.append(f"| Execution Rate | {format_percentage(execution_rate)} | {exec_icon} |")
 
             lines.append("")
@@ -3092,8 +3172,12 @@ class ReportTool(BaseTool):
             lines.append(f"│ Total Tests     │ {test_count_msg:<32} │")
         
         if exec_rate is not None:
-            exec_icon = "✅" if exec_rate >= 90 else "⚠️" if exec_rate >= 70 else "❌"
-            exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count} executed)"
+            if exec_rate > 100:
+                exec_icon = "🔄"
+                exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count} - parameterized)"
+            else:
+                exec_icon = "✅" if exec_rate >= 90 else "⚠️" if exec_rate >= 70 else "❌"
+                exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count} executed)"
             lines.append(f"│ Execution Rate  │ {exec_msg:<32} │")
         
         if pass_rate is not None:
@@ -3135,14 +3219,28 @@ class ReportTool(BaseTool):
         pass_rate = status.get('pass_pct')
         
         if static_count:
-            lines.append(f"| **Total @Test Annotations** | {static_count} | Static count from source | 📊 |")
+            lines.append(f"| **Test Methods in Code** | {static_count} | @Test, @ParameterizedTest, etc. | 📊 |")
         
         lines.append(f"| **Tests Executed** | {executed} | Runtime execution count | {'⚠️' if exec_rate and exec_rate < 90 else '✅'} |")
         lines.append(f"| **Tests Passed** | {passed} | Successful test count | ✅ |")
         
         if exec_rate is not None and static_count:
-            exec_icon = "✅" if exec_rate >= 90 else "⚠️" if exec_rate >= 70 else "❌"
-            lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} ÷ {static_count} | {exec_icon} |")
+            if exec_rate > 100:
+                # This indicates parameterized tests  
+                expansion = executed / static_count if static_count else 1.0
+                exec_icon = "🔄"
+                lines.append(f"| **Test Coverage** | ~100% | All {static_count} methods likely run | ✅ |")
+                lines.append(f"| **Test Expansion** | {expansion:.1f}x | {executed} executions from {static_count} methods | {exec_icon} |")
+                lines.append(f"| | *Parameterized tests* | *execute with multiple parameters* | |")
+            else:
+                # This might indicate some tests were skipped
+                exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"  
+                actual_methods_run = int(exec_rate * static_count / 100)
+                lines.append(f"| **Test Coverage** | {format_percentage(exec_rate)} | {actual_methods_run} of {static_count} methods run | {exec_icon} |")
+                if exec_rate < 100:
+                    skipped_est = static_count - actual_methods_run
+                    if skipped_est > 0:
+                        lines.append(f"| | *~{skipped_est} methods* | *possibly not executed* | ⚠️ |")
         
         if pass_rate is not None:
             pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
@@ -3217,8 +3315,11 @@ class ReportTool(BaseTool):
         elif pass_rate:
             lines.append(f"- ⚠️ **Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
         
-        if exec_rate and exec_rate < 90:
-            lines.append(f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run")
+        if exec_rate:
+            if exec_rate > 100:
+                lines.append(f"- ℹ️ **Parameterized Tests Detected:** Execution rate {format_percentage(exec_rate)} indicates tests with multiple parameters")
+            elif exec_rate < 90:
+                lines.append(f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run")
         
         modules_expected = status.get('modules_expected')
         modules_seen = status.get('modules_seen', 0)

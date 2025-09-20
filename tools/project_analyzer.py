@@ -173,14 +173,27 @@ class ProjectAnalyzerTool(BaseTool):
         test_config = self._analyze_test_configuration(project_path, analysis["project_type"])
         analysis.update(test_config)
 
-        # Step 4.5: Count static test cases for Java projects
+        # Step 4.5: Count test methods for Java projects
+        # We always count test method declarations (not executions)
+        # This gives us a stable baseline for measuring test coverage
         if analysis["project_type"] == "Java":
-            static_count = self._count_java_test_annotations(project_path)
-            if static_count is not None:
-                analysis["static_test_count"] = static_count
-                logger.info(f"📊 Counted {static_count} @Test annotations in Java source files")
+            method_count = self._count_java_test_annotations(project_path)
+            if method_count is not None:
+                analysis["static_test_count"] = method_count
+                analysis["test_count_method"] = "method_declarations"
+                logger.info(f"📊 Counted {method_count} test method declarations in Java source files")
+                
+                # Also check if we have execution data for additional metrics
+                actual_executions = self._count_actual_test_executions(project_path)
+                if actual_executions is not None:
+                    analysis["actual_test_executions"] = actual_executions
+                    expansion_factor = actual_executions / method_count if method_count > 0 else 1.0
+                    analysis["test_expansion_factor"] = expansion_factor
+                    logger.info(f"📈 Found {actual_executions} actual test executions (expansion factor: {expansion_factor:.1f}x)")
+                    if expansion_factor > 1.5:
+                        logger.info(f"ℹ️ High expansion factor indicates extensive use of parameterized tests")
             else:
-                logger.debug("Unable to count @Test annotations or no tests found")
+                logger.debug("Unable to count test methods or no tests found")
 
         # Step 5: 生成智能执行计划
         execution_plan = self._generate_execution_plan(analysis)
@@ -677,15 +690,27 @@ class ProjectAnalyzerTool(BaseTool):
         return None
 
     def _count_java_test_annotations(self, project_path: str) -> Optional[int]:
-        """Count @Test annotations across Java test sources for a project."""
+        """Count all test annotations across Java test sources for a project.
+        
+        Includes:
+        - @Test (standard JUnit 4/5 tests)
+        - @ParameterizedTest (JUnit 5 - runs multiple times with different parameters)
+        - @RepeatedTest (JUnit 5 - runs multiple times)
+        - @TestFactory (JUnit 5 - generates tests dynamically)
+        - @TestTemplate (JUnit 5 - template for tests)
+        
+        Note: This counts test METHOD declarations, not test EXECUTIONS.
+        Parameterized tests will execute multiple times but are counted once here.
+        """
         if not self.docker_orchestrator:
             return None
 
+        # Count all JUnit test annotations
         count_cmd = (
             "cd {project} && "
             "find . -path '*/src/test/*' -name '*.java' -print0 2>/dev/null | "
             "while IFS= read -r -d '' file; do "
-            "count=$(grep -c '@Test' \"$file\" 2>/dev/null || echo 0); "
+            "count=$(grep -c '@Test\\|@ParameterizedTest\\|@RepeatedTest\\|@TestFactory\\|@TestTemplate' \"$file\" 2>/dev/null || echo 0); "
             "count=${{count##*:}}; "
             "echo $count; "
             "done | awk '{{sum += $1}} END {{print sum+0}}'"
@@ -701,10 +726,88 @@ class ProjectAnalyzerTool(BaseTool):
 
         try:
             total = int(float(output))
+            # Log the count for debugging
+            if total > 0:
+                logger.info(f"📊 Found {total} test method annotations (@Test, @ParameterizedTest, etc.)")
+                
+                # Also count just @Test for comparison
+                simple_count_cmd = (
+                    "cd {project} && "
+                    "find . -path '*/src/test/*' -name '*.java' -print0 2>/dev/null | "
+                    "while IFS= read -r -d '' file; do "
+                    "count=$(grep -c '@Test' \"$file\" 2>/dev/null || echo 0); "
+                    "count=${{count##*:}}; "
+                    "echo $count; "
+                    "done | awk '{{sum += $1}} END {{print sum+0}}'"
+                ).format(project=project_path)
+                
+                simple_result = self.docker_orchestrator.execute_command(simple_count_cmd)
+                if simple_result.get("success"):
+                    simple_output = (simple_result.get("output") or "").strip()
+                    try:
+                        simple_total = int(float(simple_output))
+                        if simple_total != total:
+                            logger.debug(f"  - @Test annotations: {simple_total}")
+                            logger.debug(f"  - Other test annotations: {total - simple_total} (e.g., @ParameterizedTest)")
+                            logger.info(f"ℹ️ Note: Parameterized tests execute multiple times but are counted once here")
+                    except ValueError:
+                        pass
+                
             return total if total > 0 else None
         except ValueError:
             logger.debug(f"Unable to parse test annotation count from output: {output}")
             return None
+    
+    def _count_actual_test_executions(self, project_path: str) -> Optional[int]:
+        """Count actual test executions (including parameterized test expansions).
+        
+        This method attempts to get the true count of test cases that will execute,
+        including all parameter variations of parameterized tests.
+        
+        Approaches:
+        1. Check existing surefire-reports XML files for test counts
+        2. Run tests with minimal overhead to generate reports
+        3. Fall back to annotation counting if execution counting fails
+        """
+        if not self.docker_orchestrator:
+            return None
+        
+        # First, try to get counts from existing test reports if available
+        xml_count_cmd = (
+            "if [ -d {project}/target/surefire-reports ]; then "
+            "grep -h 'tests=' {project}/target/surefire-reports/TEST-*.xml 2>/dev/null | "
+            "sed -n 's/.*tests=\"\\([0-9]*\\)\".*/\\1/p' | "
+            "awk '{{sum += $1}} END {{if (sum > 0) print sum; else print \"0\"}}'; "
+            "else echo '0'; fi"
+        ).format(project=project_path)
+        
+        result = self.docker_orchestrator.execute_command(xml_count_cmd)
+        if result.get("success"):
+            output = (result.get("output") or "").strip()
+            try:
+                count = int(output)
+                if count > 0:
+                    logger.info(f"📊 Found {count} actual test executions from surefire reports")
+                    return count
+            except ValueError:
+                pass
+        
+        # If no existing reports, try to run tests in list-only mode (if supported)
+        # Note: This is a lightweight operation that discovers tests without executing them
+        # However, JUnit 5's console launcher or Maven's test discovery might be needed
+        
+        # For now, we'll check if we can get a quick test count by running with failfast
+        # This is still not ideal as it runs tests, but we limit the time
+        discover_cmd = (
+            "cd {project} && timeout 30 mvn test -DskipTests=false -Dmaven.test.failure.ignore=true "
+            "-DtrimStackTrace=false 2>&1 | grep -E '^\\[INFO\\] Tests run: [0-9]+' | "
+            "tail -1 | sed 's/.*Tests run: \\([0-9]*\\).*/\\1/'"
+        ).format(project=project_path)
+        
+        # Actually, let's not run tests here - that's too expensive
+        # Instead, return None to indicate we couldn't get actual execution count
+        logger.debug("No existing test reports found, actual execution count unavailable")
+        return None
 
     def _parse_gradle_test_frameworks(self, gradle_content: str) -> List[str]:
         """从Gradle配置中解析测试框架"""
@@ -1185,8 +1288,14 @@ class ProjectAnalyzerTool(BaseTool):
         
         # Static test count
         static_test_count = analysis.get('static_test_count')
+        test_count_method = analysis.get('test_count_method', 'unknown')
         if static_test_count is not None:
-            output += f"📊 Static Test Count: {static_test_count} @Test annotations found\n"
+            if test_count_method == 'actual_executions':
+                output += f"📊 Test Count: {static_test_count} actual test executions (from test reports)\n"
+                output += f"   ℹ️ This includes all parameterized test expansions\n"
+            else:
+                output += f"📊 Test Count: {static_test_count} test method annotations found\n"
+                output += f"   ℹ️ Note: Parameterized tests will execute multiple times\n"
 
         # 执行计划
         execution_plan = analysis.get('execution_plan', [])
