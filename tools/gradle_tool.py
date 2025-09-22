@@ -44,11 +44,12 @@ class GradleTool(BaseTool):
         parallel: bool = False,  # Gradle-specific: parallel execution
         configure_on_demand: bool = False,  # Gradle-specific optimization
         build_cache: bool = True,  # Gradle-specific: use build cache
+        fail_at_end: bool = False,  # Continue execution after failures
         **kwargs  # Accept any additional parameters
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.
-        
+
         Args:
             tasks: Gradle tasks to run (e.g., 'clean build', 'test', 'assemble')
             command: Alias for tasks (for compatibility)
@@ -62,6 +63,9 @@ class GradleTool(BaseTool):
             parallel: Enable parallel execution
             configure_on_demand: Only configure relevant projects
             build_cache: Use Gradle build cache for faster builds
+            fail_at_end: IMPORTANT for multi-module projects! Set to True to continue after task failures.
+                        For test tasks, automatically adds test.ignoreFailures=true.
+                        Essential for running ALL tests in multi-module projects.
         """
         
         # Handle command as alias for tasks
@@ -98,17 +102,42 @@ class GradleTool(BaseTool):
         build_validation = self._validate_build_file_exists(working_directory, build_file)
         if not build_validation["exists"]:
             return self._handle_missing_build_file(build_validation, working_directory)
-        
+
+        # Check if this is a multi-module project running tests without fail handling
+        is_multi_module = self._is_multi_module_project(working_directory)
+        test_tasks = ["test", "check", "Test", "integrationTest", "functionalTest"]
+        is_test_task = tasks and any(task in tasks for task in test_tasks)
+
+        if is_test_task and is_multi_module:
+            modules_info = self._get_module_info(working_directory)
+            if not fail_at_end:
+                logger.warning("⚠️ Multi-module project detected! Gradle will STOP at first module with test failures.")
+                logger.warning(f"📦 Found {modules_info.get('module_count', 'multiple')} modules: {', '.join(modules_info.get('modules', [])[:5])}")
+                logger.info("💡 RECOMMENDED: gradle(tasks='test', fail_at_end=True) to test ALL modules")
+                logger.info(f"💡 Current approach will only test modules until first failure!")
+
+        # Handle fail_at_end for test tasks
+        if fail_at_end and is_test_task:
+            logger.info("📝 Enabling test failure ignore for fail_at_end with test tasks")
+            logger.info("   (Gradle's --continue will process all modules even with failures)")
+            # Add test.ignoreFailures property
+            if properties:
+                if "test.ignoreFailures" not in properties:
+                    properties += " -Dtest.ignoreFailures=true"
+            else:
+                properties = "-Dtest.ignoreFailures=true"
+
         # Build Gradle command
         gradle_cmd = self._build_gradle_command(
-            gradle_executable, 
-            tasks, 
-            properties, 
+            gradle_executable,
+            tasks,
+            properties,
             gradle_args,
             build_file,
             parallel,
             configure_on_demand,
-            build_cache
+            build_cache,
+            fail_at_end
         )
         
         # Execute the command
@@ -127,7 +156,7 @@ class GradleTool(BaseTool):
                     workdir=working_directory,
                     silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
                     absolute_timeout=3600,  # 60 minutes total
-                    optimize_for_gradle=True
+                    optimize_for_maven=True  # Use Maven optimization (works for both Maven and Gradle)
                 )
             else:
                 # Use regular version for quick commands like help, tasks, etc.
@@ -327,7 +356,7 @@ class GradleTool(BaseTool):
         )
     
     def _build_gradle_command(
-        self, 
+        self,
         executable: str,
         tasks: str,
         properties: str,
@@ -335,7 +364,8 @@ class GradleTool(BaseTool):
         build_file: str,
         parallel: bool,
         configure_on_demand: bool,
-        build_cache: bool
+        build_cache: bool,
+        fail_at_end: bool = False
     ) -> str:
         """Build the complete Gradle command."""
         cmd_parts = [executable]
@@ -343,7 +373,11 @@ class GradleTool(BaseTool):
         # Add build file if specified
         if build_file:
             cmd_parts.extend(["-b", build_file])
-        
+
+        # Add fail_at_end support (--continue flag)
+        if fail_at_end:
+            cmd_parts.append("--continue")
+
         # Add performance flags
         if parallel:
             cmd_parts.append("--parallel")
@@ -665,7 +699,54 @@ class GradleTool(BaseTool):
         
         # If no key patterns found, return the last 30 lines
         return '\n'.join(lines[-30:])
-    
+
+    def _is_multi_module_project(self, working_directory: str) -> bool:
+        """Check if this is a multi-module Gradle project."""
+        # Check for settings.gradle or settings.gradle.kts with include statements
+        check_cmd = (
+            "(test -f settings.gradle && grep -q 'include' settings.gradle) || "
+            "(test -f settings.gradle.kts && grep -q 'include' settings.gradle.kts)"
+        )
+        result = self.orchestrator.execute_command(check_cmd, workdir=working_directory)
+        return result.get("exit_code") == 0
+
+    def _get_module_info(self, working_directory: str) -> Dict[str, Any]:
+        """Get information about modules in a multi-module project."""
+        modules = []
+
+        # Try to extract module names from settings.gradle
+        extract_cmd = (
+            "if [ -f settings.gradle ]; then "
+            "grep \"include\" settings.gradle | sed \"s/.*'\\([^']*\\)'.*/\\1/g\" | tr '\\n' ' '; "
+            "elif [ -f settings.gradle.kts ]; then "
+            "grep \"include\" settings.gradle.kts | sed 's/.*\"\\([^\"]*\\)\".*/\\1/g' | tr '\\n' ' '; "
+            "fi"
+        )
+
+        result = self.orchestrator.execute_command(extract_cmd, workdir=working_directory)
+        if result.get("exit_code") == 0 and result.get("output"):
+            module_str = result["output"].strip()
+            if module_str:
+                # Split by space and clean up module names
+                modules = [m.strip().replace(':', '') for m in module_str.split() if m.strip()]
+
+        # If we couldn't extract from settings file, look for subdirectories with build.gradle
+        if not modules:
+            find_cmd = "find . -maxdepth 2 -name 'build.gradle' -o -name 'build.gradle.kts' | grep -v '^\\./build' | wc -l"
+            count_result = self.orchestrator.execute_command(find_cmd, workdir=working_directory)
+            if count_result.get("exit_code") == 0:
+                try:
+                    module_count = int(count_result["output"].strip())
+                    if module_count > 1:
+                        return {"module_count": module_count, "modules": ["(multiple modules detected)"]}
+                except ValueError:
+                    pass
+
+        return {
+            "module_count": len(modules) if modules else 0,
+            "modules": modules[:10] if modules else []  # Limit to first 10 modules
+        }
+
     def _get_parameters_schema(self) -> Dict[str, Any]:
         """Get parameters schema for function calling."""
         return {
@@ -711,6 +792,11 @@ class GradleTool(BaseTool):
                     "type": "boolean",
                     "description": "Use Gradle build cache",
                     "default": True
+                },
+                "fail_at_end": {
+                    "type": "boolean",
+                    "description": "IMPORTANT for multi-module projects: Continue after task failures. For test tasks, adds test.ignoreFailures=true to run ALL tests even if some fail.",
+                    "default": False
                 }
             },
             "required": []
