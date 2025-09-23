@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional, List
 from loguru import logger
 from pathlib import Path
 
-from tools.base import BaseTool, ToolResult
+from tools.base import BaseTool, ToolResult, ToolError
 from agent.output_storage import OutputStorageManager
 
 
@@ -37,12 +37,11 @@ class OutputSearchTool(BaseTool):
         pattern: Optional[str] = None,
         task_id: Optional[str] = None,
         tool_name: Optional[str] = None,
-        limit: int = 10,
-        **kwargs
+        limit: int = 10
     ) -> ToolResult:
         """
         Execute output search operations.
-        
+
         Args:
             action: The action to perform - "search", "retrieve", or "list"
             ref_id: Reference ID for retrieving specific output
@@ -50,30 +49,11 @@ class OutputSearchTool(BaseTool):
             task_id: Filter by task ID
             tool_name: Filter by tool name
             limit: Maximum number of search results
-            
+
         Returns:
             ToolResult with search results or retrieved output
         """
-        
-        # Check for unexpected parameters
-        if kwargs:
-            invalid_params = list(kwargs.keys())
-            return ToolResult(
-                success=False,
-                output=(
-                    f"❌ Invalid parameters for output_search tool: {invalid_params}\n\n"
-                    f"✅ Valid parameters:\n"
-                    f"  - action (optional): 'search', 'retrieve', or 'list' (default: 'search')\n"
-                    f"  - ref_id (optional): Reference ID for 'retrieve' action\n"
-                    f"  - pattern (optional): Search pattern for 'search' action\n"
-                    f"  - task_id (optional): Filter by task ID\n"
-                    f"  - tool_name (optional): Filter by tool name\n"
-                    f"  - limit (optional): Maximum results (default: 10)\n\n"
-                    f"Example: output_search(action='search', pattern='error')\n"
-                    f"Example: output_search(action='retrieve', ref_id='abc123')"
-                ),
-                error=f"Invalid parameters: {invalid_params}"
-            )
+        # The base class now handles parameter validation automatically
         
         try:
             if action == "retrieve":
@@ -83,23 +63,40 @@ class OutputSearchTool(BaseTool):
             elif action == "list":
                 return self._list_outputs(task_id, tool_name, limit)
             else:
-                return ToolResult(
-                    success=False,
-                    output=f"Unknown action: {action}. Use 'search', 'retrieve', or 'list'"
+                raise ToolError(
+                    message=f"Unknown action: {action}. Use 'search', 'retrieve', or 'list'",
+                    category="validation",
+                    error_code="INVALID_ACTION",
+                    suggestions=[
+                        "Use action='search' to search for patterns in outputs",
+                        "Use action='retrieve' to get a specific output by reference ID",
+                        "Use action='list' to list available outputs"
+                    ],
+                    details={"provided_action": action, "valid_actions": ["search", "retrieve", "list"]},
+                    retryable=True
                 )
+        except ToolError:
+            # Re-raise ToolErrors without wrapping them
+            raise
         except Exception as e:
             logger.error(f"Output search tool error: {e}")
-            return ToolResult(
-                success=False,
-                output=f"Error during output search: {str(e)}"
+            raise ToolError(
+                message=f"Error during output search: {str(e)}",
+                category="system",
+                error_code="SEARCH_ERROR",
+                details={"exception_type": type(e).__name__},
+                retryable=False
             )
     
     def _retrieve_output(self, ref_id: Optional[str]) -> ToolResult:
         """Retrieve a specific output by reference ID."""
         if not ref_id:
-            return ToolResult(
-                success=False,
-                output="Reference ID is required for retrieve action"
+            raise ToolError(
+                message="Reference ID is required for retrieve action",
+                category="validation",
+                error_code="MISSING_REF_ID",
+                suggestions=["Provide the 'ref_id' parameter to retrieve a specific output"],
+                retryable=True
             )
         
         output = self.storage_manager.retrieve_output(ref_id)
