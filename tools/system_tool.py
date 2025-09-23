@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from .base import BaseTool, ToolResult
+from .base import BaseTool, ToolResult, ToolError
 
 
 class SystemTool(BaseTool):
@@ -19,44 +19,14 @@ class SystemTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
 
-    def execute(self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None, **kwargs) -> ToolResult:
+    def execute(self, action: str, packages: Optional[List[str]] = None, java_version: Optional[str] = None) -> ToolResult:
         """Execute system management operations."""
-        
-        # Check for unexpected parameters
-        if kwargs:
-            invalid_params = list(kwargs.keys())
-            return ToolResult(
-                success=False,
-                output=(
-                    f"❌ Invalid parameters for system tool: {invalid_params}\n\n"
-                    f"✅ Valid parameters:\n"
-                    f"  - action (required): 'install', 'verify_java', 'install_java'\n"
-                    f"  - packages (optional): List of packages to install\n"
-                    f"  - java_version (optional): Java version for 'install_java' action\n\n"
-                    f"Example: system(action='install', packages=['curl', 'git'])\n"
-                    f"Example: system(action='install_java', java_version='17')"
-                ),
-                error=f"Invalid parameters: {invalid_params}"
-            )
-        
-        # Check for required parameters
-        if not action:
-            return ToolResult(
-                success=False,
-                output=(
-                    "❌ Missing required parameter: 'action'\n\n"
-                    "The system tool requires an 'action' parameter.\n"
-                    "Valid actions: 'install', 'verify_java', 'install_java'\n"
-                    "Example: system(action='install', packages=['curl', 'git'])"
-                ),
-                error="Missing required parameter: action"
-            )
-        
+        # The base class now handles parameter validation automatically
+
         if action not in ["install", "update", "detect_missing", "install_missing", "install_java", "verify_java"]:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', 'install_java', or 'verify_java'",
+            raise ToolError(
+                message=f"Invalid action '{action}'. Must be 'install', 'update', 'detect_missing', 'install_missing', 'install_java', or 'verify_java'",
+                category="validation",
                 error_code="INVALID_ACTION",
                 suggestions=[
                     "Use 'install' to install specific packages",
@@ -65,18 +35,20 @@ class SystemTool(BaseTool):
                     "Use 'install_missing' to automatically install missing dependencies",
                     "Use 'install_java' to install and configure a specific Java version",
                     "Use 'verify_java' to check the current Java version"
-                ]
+                ],
+                details={"provided_action": action, "valid_actions": ["install", "update", "detect_missing", "install_missing", "install_java", "verify_java"]},
+                retryable=True
             )
 
         try:
             if action == "install":
                 if not packages:
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error="Packages list is required for 'install' action",
+                    raise ToolError(
+                        message="Packages list is required for 'install' action",
+                        category="validation",
                         error_code="MISSING_PACKAGES",
-                        suggestions=["Provide a list of packages to install"]
+                        suggestions=["Provide a list of packages to install"],
+                        retryable=True
                     )
                 return self._install_packages(packages)
             
@@ -95,15 +67,15 @@ class SystemTool(BaseTool):
             
             elif action == "install_java":
                 if not java_version:
-                    return ToolResult(
-                        success=False,
-                        output="",
-                        error="Java version is required for 'install_java' action",
+                    raise ToolError(
+                        message="Java version is required for 'install_java' action",
+                        category="validation",
                         error_code="MISSING_VERSION",
                         suggestions=[
                             "Provide Java version to install (e.g., '17', '21')",
                             "Example: system(action='install_java', java_version='17')"
-                        ]
+                        ],
+                        retryable=True
                     )
                 return self._install_and_configure_java(java_version)
             
@@ -149,6 +121,9 @@ class SystemTool(BaseTool):
                             metadata=verification
                         )
                 
+        except ToolError:
+            # Re-raise ToolErrors without wrapping them
+            raise
         except Exception as e:
             error_msg = f"System operation failed: {str(e)}"
             logger.error(f"System tool error for action '{action}': {error_msg}")
@@ -823,14 +798,19 @@ class SystemTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["install", "update", "detect_missing", "install_missing"],
+                    "enum": ["install", "update", "detect_missing", "install_missing", "install_java", "verify_java"],
                     "description": "The system operation to perform"
                 },
                 "packages": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of packages to install (required for 'install' action)",
+                    "description": "List of packages to install (for 'install' or 'install_missing' actions)",
                     "default": []
+                },
+                "java_version": {
+                    "type": "string",
+                    "description": "Java version to install or verify (for 'install_java' or 'verify_java' actions)",
+                    "default": None
                 }
             },
             "required": ["action"]
