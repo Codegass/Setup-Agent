@@ -21,6 +21,7 @@ class ProjectAnalyzerTool(BaseTool):
         )
         self.docker_orchestrator = docker_orchestrator
         self.context_manager = context_manager
+        self._java_annotation_cache: Dict[str, Dict[str, int]] = {}
 
     def execute(
         self,
@@ -692,6 +693,72 @@ class ProjectAnalyzerTool(BaseTool):
         """(Deprecated) Test estimation disabled."""
         return None
 
+    def _get_java_test_annotation_counts(self, project_path: str) -> Optional[Dict[str, int]]:
+        """Collect counts for key JUnit annotations inside src/test/* Java sources."""
+        if not self.docker_orchestrator:
+            return None
+
+        if project_path in self._java_annotation_cache:
+            return self._java_annotation_cache[project_path]
+
+        command = f"""cd {project_path} && python3 - <<'PY'
+import json
+import re
+from collections import Counter
+from pathlib import Path
+
+ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
+
+
+def strip_comments(source: str) -> str:
+    source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+    source = re.sub(r'//.*', '', source)
+    return source
+
+
+counts = Counter()
+root = Path('src/test')
+if root.exists():
+    for java_file in root.rglob('*.java'):
+        try:
+            text = java_file.read_text(encoding='utf-8')
+        except Exception:
+            try:
+                text = java_file.read_text(encoding='latin-1')
+            except Exception:
+                continue
+        cleaned = strip_comments(text)
+        counts.update(ANNOTATION_PATTERN.findall(cleaned))
+
+result = {{
+    'Test': counts.get('Test', 0),
+    'ParameterizedTest': counts.get('ParameterizedTest', 0),
+    'RepeatedTest': counts.get('RepeatedTest', 0),
+    'TestFactory': counts.get('TestFactory', 0),
+    'TestTemplate': counts.get('TestTemplate', 0),
+    'DynamicTest': counts.get('DynamicTest', 0),
+    'Disabled': counts.get('Disabled', 0),
+}}
+print(json.dumps(result))
+PY"""
+
+        response = self.docker_orchestrator.execute_command(command)
+        if not response.get("success"):
+            return None
+
+        output = (response.get("output") or "").strip()
+        if not output:
+            return None
+
+        try:
+            counts = json.loads(output.splitlines()[-1])
+        except json.JSONDecodeError:
+            logger.debug("Unable to parse Java test annotation counts from output")
+            return None
+
+        self._java_annotation_cache[project_path] = counts
+        return counts
+
     def _count_java_test_with_expansions(self, project_path: str) -> Dict[str, Any]:
         """
         Count Java tests INCLUDING parameterized test expansions.
@@ -705,106 +772,53 @@ class ProjectAnalyzerTool(BaseTool):
         if not self.docker_orchestrator:
             return {'method_count': None, 'total_test_count': None}
 
-        # First get the basic method count
-        method_count = self._count_java_test_annotations(project_path)
-        if method_count is None:
+        counts = self._get_java_test_annotation_counts(project_path)
+        if counts is None:
             return {'method_count': None, 'total_test_count': None}
 
-        # Now count parameterized test expansions
-        # This command will find @ParameterizedTest methods and analyze their sources
-        expansion_cmd = f"""cd {project_path} && find . -path '*/src/test/*' -name '*.java' | while read file; do
-            # For each file, extract parameterized tests with their source annotations
-            awk '
-            BEGIN {{ in_param_test = 0; source_found = 0; test_count = 0 }}
-            /@ValueSource/ {{
-                # Count values in @ValueSource
-                gsub(/.*@ValueSource\\(/, "")
-                gsub(/\\).*/, "")
-                # Count comma-separated values
-                n = split($0, arr, ",")
-                test_count += n
-                source_found = 1
-            }}
-            /@CsvSource/ {{
-                # Count CSV rows in @CsvSource
-                gsub(/.*@CsvSource\\(\\{{/, "")
-                gsub(/\\}}\\).*/, "")
-                # Count quoted strings (each is a row)
-                n = gsub(/"[^"]*"/, "")
-                test_count += n
-                source_found = 1
-            }}
-            /@MethodSource/ {{
-                # For @MethodSource, we need to analyze the method
-                # Extract method name if specified
-                if (match($0, /@MethodSource\\("([^"]*)"\\)/, m)) {{
-                    # Method name specified, but we cant easily count without parsing
-                    # Use a default of 5 for now
-                    test_count += 5
-                }} else {{
-                    # No method name, defaults to same name as test method
-                    # Also use 5 as default
-                    test_count += 5
-                }}
-                source_found = 1
-            }}
-            /@EnumSource/ {{
-                # For @EnumSource, count enum values if possible
-                # Default to 5 for now
-                test_count += 5
-                source_found = 1
-            }}
-            /@ParameterizedTest/ {{
-                in_param_test = 1
-                if (!source_found) {{
-                    # No explicit source found, default to 3
-                    test_count += 3
-                }}
-                source_found = 0
-            }}
-            END {{ print test_count }}
-            ' "$file"
-        done | awk '{{sum += $1}} END {{print sum+0}}'"""
+        regular_tests = counts.get('Test', 0)
+        parameterized_methods = counts.get('ParameterizedTest', 0)
+        repeated_tests = counts.get('RepeatedTest', 0)
+        factory_methods = counts.get('TestFactory', 0)
+        template_methods = counts.get('TestTemplate', 0)
+        dynamic_tests = counts.get('DynamicTest', 0)
 
-        expansion_result = self.docker_orchestrator.execute_command(expansion_cmd)
-        parameterized_expansions = 0
-        if expansion_result.get("success"):
-            try:
-                parameterized_expansions = int(expansion_result.get("output", "0").strip())
-            except:
-                logger.warning("Could not parse parameterized test expansions")
+        method_count = (
+            regular_tests
+            + parameterized_methods
+            + repeated_tests
+            + factory_methods
+            + template_methods
+            + dynamic_tests
+        )
 
-        # Count regular @Test annotations (not parameterized)
-        regular_test_cmd = f"""cd {project_path} && find . -path '*/src/test/*' -name '*.java' -print0 2>/dev/null | while IFS= read -r -d '' file; do
-            # Count @Test but exclude @ParameterizedTest
-            grep -E '^[[:space:]]*@Test[[:space:]]*$|^[[:space:]]*@Test\\(' "$file" 2>/dev/null | wc -l
-        done | awk '{{sum += $1}} END {{print sum+0}}'"""
-
-        regular_result = self.docker_orchestrator.execute_command(regular_test_cmd)
-        regular_tests = 0
-        if regular_result.get("success"):
-            try:
-                regular_tests = int(regular_result.get("output", "0").strip())
-            except:
-                pass
-
-        # Total = regular tests + parameterized expansions
-        total_test_count = regular_tests + parameterized_expansions
+        total_test_count = method_count
 
         result = {
             'method_count': method_count,
             'total_test_count': total_test_count,
             'parameterized_info': {
                 'regular_tests': regular_tests,
-                'parameterized_expansions': parameterized_expansions
+                'parameterized_methods': parameterized_methods,
+                'parameterized_expansions': parameterized_methods,
+                'repeated_tests': repeated_tests,
+                'test_factory_methods': factory_methods,
+                'test_template_methods': template_methods,
+                'dynamic_tests': dynamic_tests,
             }
         }
 
-        logger.info(f"📊 Test count analysis:")
-        logger.info(f"   - Method annotations: {method_count}")
-        logger.info(f"   - Regular @Test: {regular_tests}")
-        logger.info(f"   - Parameterized expansions: {parameterized_expansions}")
-        logger.info(f"   - Total test cases: {total_test_count}")
+        logger.info("📊 Test count analysis:")
+        logger.info(f"   - Regular @Test methods: {regular_tests}")
+        logger.info(f"   - @ParameterizedTest methods: {parameterized_methods}")
+        if repeated_tests:
+            logger.info(f"   - @RepeatedTest methods: {repeated_tests}")
+        if factory_methods or template_methods or dynamic_tests:
+            logger.info(
+                "   - Additional test annotations (factory/template/dynamic): "
+                f"{factory_methods}/{template_methods}/{dynamic_tests}"
+            )
+        logger.info(f"   - Total annotated test methods: {method_count}")
 
         return result
 
@@ -824,58 +838,28 @@ class ProjectAnalyzerTool(BaseTool):
         if not self.docker_orchestrator:
             return None
 
-        # Count all JUnit test annotations
-        count_cmd = (
-            "cd {project} && "
-            "find . -path '*/src/test/*' -name '*.java' -print0 2>/dev/null | "
-            "while IFS= read -r -d '' file; do "
-            "count=$(grep -c '@Test\\|@ParameterizedTest\\|@RepeatedTest\\|@TestFactory\\|@TestTemplate' \"$file\" 2>/dev/null || echo 0); "
-            "count=${{count##*:}}; "
-            "echo $count; "
-            "done | awk '{{sum += $1}} END {{print sum+0}}'"
-        ).format(project=project_path)
-
-        result = self.docker_orchestrator.execute_command(count_cmd)
-        if not result.get("success"):
+        counts = self._get_java_test_annotation_counts(project_path)
+        if counts is None:
             return None
 
-        output = (result.get("output") or "").strip()
-        if not output:
-            return None
+        total = (
+            counts.get('Test', 0)
+            + counts.get('ParameterizedTest', 0)
+            + counts.get('RepeatedTest', 0)
+            + counts.get('TestFactory', 0)
+            + counts.get('TestTemplate', 0)
+            + counts.get('DynamicTest', 0)
+        )
 
-        try:
-            total = int(float(output))
-            # Log the count for debugging
-            if total > 0:
-                logger.info(f"📊 Found {total} test method annotations (@Test, @ParameterizedTest, etc.)")
-                
-                # Also count just @Test for comparison
-                simple_count_cmd = (
-                    "cd {project} && "
-                    "find . -path '*/src/test/*' -name '*.java' -print0 2>/dev/null | "
-                    "while IFS= read -r -d '' file; do "
-                    "count=$(grep -c '@Test' \"$file\" 2>/dev/null || echo 0); "
-                    "count=${{count##*:}}; "
-                    "echo $count; "
-                    "done | awk '{{sum += $1}} END {{print sum+0}}'"
-                ).format(project=project_path)
-                
-                simple_result = self.docker_orchestrator.execute_command(simple_count_cmd)
-                if simple_result.get("success"):
-                    simple_output = (simple_result.get("output") or "").strip()
-                    try:
-                        simple_total = int(float(simple_output))
-                        if simple_total != total:
-                            logger.debug(f"  - @Test annotations: {simple_total}")
-                            logger.debug(f"  - Other test annotations: {total - simple_total} (e.g., @ParameterizedTest)")
-                            logger.info(f"ℹ️ Note: Parameterized tests execute multiple times but are counted once here")
-                    except ValueError:
-                        pass
-                
-            return total if total > 0 else None
-        except ValueError:
-            logger.debug(f"Unable to parse test annotation count from output: {output}")
-            return None
+        if total > 0:
+            logger.info(
+                f"📊 Found {total} test method annotations (Test/Parameterized/Repeated/Factory/Template)."
+            )
+            param_methods = counts.get('ParameterizedTest', 0)
+            if param_methods:
+                logger.info(f"   - Includes {param_methods} parameterized test methods")
+
+        return total if total > 0 else None
     
     def _count_actual_test_executions(self, project_path: str) -> Optional[int]:
         """Count actual test executions (including parameterized test expansions).
