@@ -2830,8 +2830,14 @@ class ReportTool(BaseTool):
         try:
             from agent.error_logger import ErrorLogger
 
-            # Get error logger instance
-            workspace_path = self.orchestrator.workspace_path if self.orchestrator else "/workspace"
+            # Get error logger instance - ensure we use the correct workspace path
+            workspace_path = "/workspace"  # Default workspace path in container
+            if hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'workspace_path'):
+                # If orchestrator has a workspace path, use it
+                workspace_path = self.orchestrator.workspace_path
+            elif hasattr(self, 'docker_orchestrator') and self.docker_orchestrator and hasattr(self.docker_orchestrator, 'workspace_path'):
+                # Alternative attribute name for orchestrator
+                workspace_path = self.docker_orchestrator.workspace_path
             error_logger = ErrorLogger.get_instance(workspace_path=workspace_path)
 
             # Get error summary
@@ -3603,8 +3609,8 @@ class ReportTool(BaseTool):
                         # Truncate long results
                         key_result = task.key_results[:50] + "..." if len(task.key_results) > 50 else task.key_results
                 
-                # Shorten task description
-                task_desc = task.description[:40] + "..." if len(task.description) > 40 else task.description
+                # Use full task description or reasonable truncation
+                task_desc = task.description[:100] + "..." if len(task.description) > 100 else task.description
                 
                 lines.append(f"| {i} | {task_desc} | {status_icon} | {key_result} |")
             
@@ -3635,21 +3641,38 @@ class ReportTool(BaseTool):
         if execution_metrics:
             runtime = execution_metrics.get('total_runtime', 0)
             iterations = execution_metrics.get('total_iterations', 0)
+            total_thoughts = execution_metrics.get('total_thoughts', 0)
+            total_actions = execution_metrics.get('total_actions', 0)
+            successful_actions = execution_metrics.get('successful_actions', 0)
             success_rate = execution_metrics.get('success_rate', 0)
-            successful_actions = execution_metrics.get('successful_actions')
-            total_actions = execution_metrics.get('total_actions')
 
+            # Main metrics line with thoughts and actions
             if successful_actions is not None and total_actions:
                 lines.append(
                     f"**Runtime:** {runtime:.1f} minutes | {iterations} iterations | "
+                    f"{total_thoughts} thoughts | {total_actions} actions | "
                     f"success rate {successful_actions}/{total_actions} ({success_rate:.0f}%)"
                 )
             else:
                 lines.append(
                     f"**Runtime:** {runtime:.1f} minutes | {iterations} iterations | "
+                    f"{total_thoughts} thoughts | {total_actions} actions | "
                     f"{success_rate:.0f}% success rate"
                 )
             lines.append("")
+
+            # Add test metrics if available from snapshot
+            if snapshot:
+                status = snapshot.get('status', {})
+                static_test_count = status.get('static_test_count')
+                tests_total = status.get('tests_total')
+                if static_test_count:
+                    test_coverage_line = f"**Test Coverage:** {tests_total or 0}/{static_test_count} tests executed"
+                    if tests_total and static_test_count:
+                        execution_rate = (tests_total / static_test_count) * 100
+                        test_coverage_line += f" ({execution_rate:.1f}% execution rate)"
+                    lines.append(test_coverage_line)
+                    lines.append("")
 
             # Tool usage summary
             tools_used = execution_metrics.get('tools_used', {})

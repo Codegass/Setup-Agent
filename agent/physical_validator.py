@@ -635,10 +635,20 @@ class PhysicalValidator:
         test_result = {
             "valid": False,
             "total_tests": 0,
+            "raw_total_tests": 0,
+            "unique_tests": 0,
             "passed_tests": 0,
+            "raw_passed_tests": 0,
             "failed_tests": 0,
+            "raw_failed_tests": 0,
             "error_tests": 0,
+            "raw_error_tests": 0,
             "skipped_tests": 0,
+            "raw_skipped_tests": 0,
+            "unique_passed_tests": 0,
+            "unique_failed_tests": 0,
+            "unique_error_tests": 0,
+            "unique_skipped_tests": 0,
             "test_success": False,
             "report_files": [],
             "parsing_errors": []
@@ -683,6 +693,9 @@ class PhysicalValidator:
                 return test_result
 
             # Step 3: Parse all XML files
+            # Track deduplicated testcases by normalized identifier
+            unique_cases: Dict[str, str] = {}
+
             for report_file in report_files:
                 try:
                     xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
@@ -701,6 +714,22 @@ class PhysicalValidator:
                         test_result["failed_tests"] += stats.get("failed", 0)
                         test_result["error_tests"] += stats.get("errors", 0)
                         test_result["skipped_tests"] += stats.get("skipped", 0)
+
+                        for testcase in stats.get("testcases", []):
+                            normalized = self._normalize_testcase_identifier(
+                                testcase.get("classname"),
+                                testcase.get("name"),
+                                testcase.get("file")
+                            )
+                            status = testcase.get("status", "passed")
+                            if not normalized:
+                                continue
+                            if normalized not in unique_cases:
+                                unique_cases[normalized] = status
+                            else:
+                                unique_cases[normalized] = self._merge_testcase_status(
+                                    unique_cases[normalized], status
+                                )
                     else:
                         test_result["parsing_errors"].append(
                             f"Failed to parse XML structure in {report_file}"
@@ -708,6 +737,40 @@ class PhysicalValidator:
                 except Exception as e:
                     test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
                     logger.warning(f"Failed to parse test report {report_file}: {e}")
+
+            if unique_cases:
+                # Preserve raw metrics before overwriting with deduplicated counts
+                test_result["raw_total_tests"] = test_result["total_tests"]
+                test_result["raw_passed_tests"] = test_result["passed_tests"]
+                test_result["raw_failed_tests"] = test_result["failed_tests"]
+                test_result["raw_error_tests"] = test_result["error_tests"]
+                test_result["raw_skipped_tests"] = test_result["skipped_tests"]
+
+                test_result["unique_tests"] = len(unique_cases)
+                for status in unique_cases.values():
+                    if status == "passed":
+                        test_result["unique_passed_tests"] += 1
+                    elif status == "failed":
+                        test_result["unique_failed_tests"] += 1
+                    elif status == "error":
+                        test_result["unique_error_tests"] += 1
+                    elif status == "skipped":
+                        test_result["unique_skipped_tests"] += 1
+
+                # Switch primary metrics to deduplicated values for downstream reporting
+                if test_result["unique_tests"] > 0:
+                    test_result["total_tests"] = test_result["unique_tests"]
+                    test_result["passed_tests"] = test_result["unique_passed_tests"]
+                    test_result["failed_tests"] = test_result["unique_failed_tests"]
+                    test_result["error_tests"] = test_result["unique_error_tests"]
+                    test_result["skipped_tests"] = test_result["unique_skipped_tests"]
+
+                # Recalculate success flag using deduplicated metrics
+                test_result["test_success"] = (
+                    test_result["failed_tests"] == 0
+                    and test_result["error_tests"] == 0
+                    and test_result["total_tests"] > 0
+                )
 
             # Determine test success: only if no failures and no errors
             test_result["test_success"] = (
@@ -740,7 +803,7 @@ class PhysicalValidator:
         # Cache the result
         self._cache_result(cache_key, test_result)
         return test_result
-    
+
     def _parse_single_test_xml(self, xml_content: str, file_path: str) -> Optional[Dict[str, int]]:
         """
         Parse a single test XML file and extract statistics.
@@ -748,7 +811,8 @@ class PhysicalValidator:
         """
         try:
             root = ET.fromstring(xml_content)
-            
+            testcase_entries: List[Dict[str, str]] = []
+
             # Maven Surefire format: <testsuite tests="X" failures="Y" errors="Z" skipped="W">
             if root.tag == "testsuite":
                 total = int(root.get("tests", "0"))
@@ -756,57 +820,68 @@ class PhysicalValidator:
                 errors = int(root.get("errors", "0"))
                 skipped = int(root.get("skipped", "0"))
                 passed = total - failures - errors - skipped
-                
+
+                testcase_entries.extend(self._collect_testcases_from_suite(root, file_path))
+
                 return {
                     "total": total,
                     "passed": max(0, passed),  # Ensure non-negative
                     "failed": failures,
                     "errors": errors,
-                    "skipped": skipped
+                    "skipped": skipped,
+                    "testcases": testcase_entries
                 }
-            
+
             # Gradle format: <testsuites> containing multiple <testsuite>
             elif root.tag == "testsuites":
                 total_stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-                
+
                 for testsuite in root.findall("testsuite"):
                     suite_total = int(testsuite.get("tests", "0"))
                     suite_failures = int(testsuite.get("failures", "0"))
                     suite_errors = int(testsuite.get("errors", "0"))
                     suite_skipped = int(testsuite.get("skipped", "0"))
                     suite_passed = suite_total - suite_failures - suite_errors - suite_skipped
-                    
+
                     total_stats["total"] += suite_total
                     total_stats["passed"] += max(0, suite_passed)
                     total_stats["failed"] += suite_failures
                     total_stats["errors"] += suite_errors
                     total_stats["skipped"] += suite_skipped
-                
+
+                    testcase_entries.extend(self._collect_testcases_from_suite(testsuite, file_path))
+
+                total_stats["testcases"] = testcase_entries
                 return total_stats
-            
+
             # Try to find testsuite elements even if root is different
             testsuites = root.findall(".//testsuite")
             if testsuites:
                 total_stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-                
+
                 for testsuite in testsuites:
                     suite_total = int(testsuite.get("tests", "0"))
                     suite_failures = int(testsuite.get("failures", "0"))
                     suite_errors = int(testsuite.get("errors", "0"))
                     suite_skipped = int(testsuite.get("skipped", "0"))
                     suite_passed = suite_total - suite_failures - suite_errors - suite_skipped
-                    
+
                     total_stats["total"] += suite_total
                     total_stats["passed"] += max(0, suite_passed)
                     total_stats["failed"] += suite_failures
                     total_stats["errors"] += suite_errors
                     total_stats["skipped"] += suite_skipped
-                
-                return total_stats if total_stats["total"] > 0 else None
-            
+
+                    testcase_entries.extend(self._collect_testcases_from_suite(testsuite, file_path))
+
+                if total_stats["total"] > 0:
+                    total_stats["testcases"] = testcase_entries
+                    return total_stats
+                return None
+
             logger.warning(f"Unrecognized XML format in {file_path}, root tag: {root.tag}")
             return None
-            
+
         except ET.ParseError as e:
             logger.warning(f"XML parsing error in {file_path}: {e}")
             # Try fallback extraction instead of returning None
@@ -880,6 +955,66 @@ class PhysicalValidator:
             logger.warning(f"Failed to check modules without tests: {e}")
             return []
 
+    def _collect_testcases_from_suite(self, testsuite: ET.Element, file_path: str) -> List[Dict[str, str]]:
+        """Collect individual testcase entries from a testsuite element."""
+        cases: List[Dict[str, str]] = []
+        for testcase in testsuite.findall("testcase"):
+            name = (testcase.get("name") or "").strip()
+            classname = (testcase.get("classname") or "").strip()
+            file_attr = testcase.get("file") or testsuite.get("file") or file_path
+            status = self._determine_testcase_status(testcase)
+            cases.append(
+                {
+                    "name": name,
+                    "classname": classname,
+                    "file": file_attr,
+                    "status": status,
+                }
+            )
+        return cases
+
+    @staticmethod
+    def _determine_testcase_status(testcase: ET.Element) -> str:
+        """Determine the status of a testcase element."""
+        # JUnit 5 marks status via child elements
+        if testcase.find("error") is not None:
+            return "error"
+        if testcase.find("failure") is not None:
+            return "failed"
+        if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
+            return "skipped"
+        return "passed"
+
+    @staticmethod
+    def _merge_testcase_status(current: str, new: str) -> str:
+        """Merge testcase statuses, keeping the most severe outcome."""
+        severity = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
+        return new if severity.get(new, 0) > severity.get(current, 0) else current
+
+    @staticmethod
+    def _normalize_testcase_identifier(classname: Optional[str], name: Optional[str], file_path: Optional[str]) -> Optional[str]:
+        """Normalize testcase identifier for deduplication across parameterized runs."""
+        base_name = (name or "").strip()
+        if not base_name:
+            return None
+
+        # Strip parameter decorations like method(arg)[index]
+        for separator in ("(", "["):
+            idx = base_name.find(separator)
+            if idx != -1:
+                base_name = base_name[:idx]
+                break
+        base_name = base_name.strip()
+        if not base_name:
+            return None
+
+        class_name = (classname or "").strip()
+        if not class_name and file_path:
+            # Derive something stable from file path
+            class_name = file_path.replace("/", ".").rsplit(".", 1)[0]
+
+        return f"{class_name}::{base_name}" if class_name else base_name
+
     def _extract_test_stats_fallback(self, xml_content: str, file_path: str) -> Dict[str, int]:
         """
         Fallback regex extraction when XML parsing fails.
@@ -924,7 +1059,8 @@ class PhysicalValidator:
                         "passed": max(0, passed),
                         "failed": failures,
                         "errors": errors,
-                        "skipped": skipped
+                        "skipped": skipped,
+                        "testcases": []
                     }
 
             # If we can't extract from testsuite, try counting testcase tags as last resort
@@ -937,7 +1073,8 @@ class PhysicalValidator:
                     "passed": testcase_count,  # Assume passed unless we know otherwise
                     "failed": 0,
                     "errors": 0,
-                    "skipped": 0
+                    "skipped": 0,
+                    "testcases": []
                 }
 
         except Exception as e:
@@ -1155,18 +1292,22 @@ class PhysicalValidator:
     def calculate_test_pass_rate(self, test_metrics: Dict[str, any]) -> float:
         """
         Calculate test pass rate from test statistics.
-        
+
         Args:
             test_metrics: Dictionary containing test statistics
-            
+
         Returns:
             Pass rate as percentage (0-100)
         """
-        total = test_metrics.get('total_tests', 0)
+        total = test_metrics.get('total_tests', 0) or test_metrics.get('raw_total_tests', 0)
         if total == 0:
             return 0.0
-        
+
         passed = test_metrics.get('passed_tests', 0)
+        if passed == 0 and test_metrics.get('unique_passed_tests', 0) > 0:
+            passed = test_metrics.get('unique_passed_tests', 0)
+        if passed == 0 and test_metrics.get('raw_passed_tests', 0) > 0:
+            passed = test_metrics.get('raw_passed_tests', 0)
         return (passed / total) * 100
     
     def _detect_test_exclusions(self, project_dir: str) -> List[str]:
