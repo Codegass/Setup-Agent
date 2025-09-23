@@ -10,22 +10,53 @@ from pydantic import BaseModel
 
 
 class ToolError(Exception):
-    """Enhanced tool error with actionable guidance."""
+    """Enhanced tool error with actionable guidance and categorization."""
 
     def __init__(
         self,
         message: str,
+        category: str = "execution",  # "validation" | "execution" | "system"
         suggestions: Optional[List[str]] = None,
         documentation_links: Optional[List[str]] = None,
         error_code: Optional[str] = None,
         raw_output: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+        retryable: bool = False,
     ):
         super().__init__(message)
         self.message = message
+        self.category = category
         self.suggestions = suggestions or []
         self.documentation_links = documentation_links or []
         self.error_code = error_code
         self.raw_output = raw_output
+        self.details = details or {}
+        self.retryable = retryable
+
+    def to_result(self, duration: Optional[float] = None) -> "ToolResult":
+        """Convert ToolError to ToolResult with preserved metadata."""
+        metadata = {
+            "failure_category": self.category,
+            "retryable": self.retryable,
+        }
+
+        # Add optional metadata
+        if duration is not None:
+            metadata["duration_ms"] = duration * 1000  # Convert to milliseconds
+
+        if self.details:
+            metadata["error_details"] = self.details
+
+        return ToolResult(
+            success=False,
+            output="",
+            error=self.message,
+            error_code=self.error_code,
+            suggestions=self.suggestions,
+            documentation_links=self.documentation_links,
+            raw_output=self.raw_output,
+            metadata=metadata,
+        )
 
 
 class ToolResult(BaseModel):
@@ -301,18 +332,17 @@ class BaseTool(ABC):
         """Execute the tool with given parameters."""
         pass
 
-    def _validate_parameters(self, kwargs: Dict[str, Any]) -> Optional[ToolResult]:
-        """Validate parameters and return error result if invalid."""
+    def _validate_parameters(self, kwargs: Dict[str, Any]) -> None:
+        """Validate parameters and raise ToolError if invalid."""
         required_params = self._parameter_schema.get("required", [])
         provided_params = set(kwargs.keys())
 
         # Check for missing required parameters
         missing_params = [p for p in required_params if p not in provided_params]
         if missing_params:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Missing required parameters: {', '.join(missing_params)}",
+            raise ToolError(
+                message=f"Missing required parameters: {', '.join(missing_params)}",
+                category="validation",
                 error_code="MISSING_PARAMETERS",
                 suggestions=[
                     f"Provide the missing parameters: {', '.join(missing_params)}",
@@ -320,16 +350,17 @@ class BaseTool(ABC):
                     f"Example usage: {self.name}({', '.join(f'{p}=<value>' for p in required_params)})",
                 ],
                 documentation_links=[f"Tool documentation: {self.get_usage_example()}"],
+                details={"missing_parameters": missing_params},
+                retryable=True,
             )
 
         # Check for unexpected parameters
         expected_params = set(self._parameter_schema.get("properties", {}).keys())
         unexpected_params = provided_params - expected_params
         if unexpected_params:
-            return ToolResult(
-                success=False,
-                output="",
-                error=f"Unexpected parameters: {', '.join(unexpected_params)}",
+            raise ToolError(
+                message=f"Unexpected parameters: {', '.join(unexpected_params)}",
+                category="validation",
                 error_code="UNEXPECTED_PARAMETERS",
                 suggestions=[
                     f"Remove unexpected parameters: {', '.join(unexpected_params)}",
@@ -337,60 +368,76 @@ class BaseTool(ABC):
                     f"Check the parameter schema for correct parameter names",
                 ],
                 documentation_links=[f"Tool documentation: {self.get_usage_example()}"],
+                details={"unexpected_parameters": list(unexpected_params)},
+                retryable=True,
             )
-
-        return None
 
     def safe_execute(self, **kwargs) -> ToolResult:
         """Execute the tool with enhanced error handling and validation."""
+        import time
+        start_time = time.time()
+
         try:
             logger.info(f"Executing tool: {self.name}")
 
-            # Validate parameters first
-            validation_error = self._validate_parameters(kwargs)
-            if validation_error:
-                self._log_execution(kwargs, validation_error)
-                return validation_error
+            # Validate parameters - will raise ToolError if invalid
+            self._validate_parameters(kwargs)
 
             result = self.execute(**kwargs)
-            
+
             # Apply output truncation if needed
             if result.success and result.output:
                 original_length = len(result.output)
                 result.output = self._truncate_output(result.output, self.name)
-                
+
                 # Update metadata with truncation info
                 if len(result.output) < original_length:
                     result.metadata["output_truncated"] = True
                     result.metadata["original_length"] = original_length
                     result.metadata["truncated_length"] = len(result.output)
-            
+
+            # Add execution duration to successful results
+            duration = time.time() - start_time
+            result.metadata["duration_ms"] = duration * 1000
+
             self._log_execution(kwargs, result)
             return result
 
         except ToolError as e:
-            # Handle custom tool errors with enhanced information
-            result = ToolResult(
-                success=False,
-                output="",
-                error=e.message,
-                error_code=e.error_code,
-                suggestions=e.suggestions,
-                documentation_links=e.documentation_links,
-                raw_output=e.raw_output,
-            )
+            # Handle tool errors using to_result() method
+            duration = time.time() - start_time
+            result = e.to_result(duration=duration)
+
+            # Log to centralized error logger
+            try:
+                from agent.error_logger import ErrorLogger
+                error_logger = ErrorLogger.get_instance()
+                error_logger.log_tool_error(
+                    tool_name=self.name,
+                    error_message=e.message,
+                    category=e.category,
+                    error_code=e.error_code,
+                    suggestions=e.suggestions,
+                    retryable=e.retryable,
+                    details=e.details,
+                    context={"parameters": kwargs}
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log error to centralized logger: {log_error}")
+
             self._log_execution(kwargs, result)
             return result
 
         except Exception as e:
-            # Handle unexpected errors
+            # Handle unexpected errors with proper categorization
+            duration = time.time() - start_time
             error_msg = f"Tool {self.name} crashed: {str(e)}"
             logger.error(error_msg, exc_info=True)
 
-            result = ToolResult(
-                success=False,
-                output="",
-                error=error_msg,
+            # Create a system-level ToolError and convert it
+            system_error = ToolError(
+                message=error_msg,
+                category="system",
                 error_code="UNEXPECTED_ERROR",
                 suggestions=[
                     "Check the tool parameters for correctness",
@@ -398,7 +445,29 @@ class BaseTool(ABC):
                     "Try a simpler version of the command first",
                 ],
                 documentation_links=[f"Tool documentation: {self.get_usage_example()}"],
+                details={"exception_type": type(e).__name__, "exception_str": str(e)},
+                retryable=False,
             )
+
+            result = system_error.to_result(duration=duration)
+
+            # Log system error to centralized logger
+            try:
+                from agent.error_logger import ErrorLogger
+                error_logger = ErrorLogger.get_instance()
+                error_logger.log_tool_error(
+                    tool_name=self.name,
+                    error_message=system_error.message,
+                    category="system",
+                    error_code=system_error.error_code,
+                    suggestions=system_error.suggestions,
+                    retryable=system_error.retryable,
+                    details=system_error.details,
+                    context={"parameters": kwargs, "exception_type": type(e).__name__}
+                )
+            except Exception as log_error:
+                logger.warning(f"Failed to log system error to centralized logger: {log_error}")
+
             self._log_execution(kwargs, result)
             return result
 

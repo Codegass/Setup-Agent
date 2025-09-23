@@ -49,8 +49,7 @@ class MavenTool(BaseTool):
         fail_at_end: bool = False,
         ignore_test_failures: bool = False,
         use_wrapper: bool = False,
-        extra_args: str = None,
-        **kwargs  # Accept any additional parameters
+        extra_args: str = None
     ) -> ToolResult:
         """
         Execute Maven commands with comprehensive error handling.

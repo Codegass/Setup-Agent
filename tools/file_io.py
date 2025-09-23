@@ -23,8 +23,7 @@ class FileIOTool(BaseTool):
         path: str,
         content: Optional[str] = None,
         start_line: int = 0,
-        end_line: Optional[int] = None,
-        **kwargs
+        end_line: Optional[int] = None
     ) -> ToolResult:
         """
         Execute a file operation.
@@ -36,50 +35,9 @@ class FileIOTool(BaseTool):
             start_line: The starting line number for reading (for 'read' action).
             end_line: The ending line number for reading (for 'read' action).
         """
-        
-        # Check for unexpected parameters
-        if kwargs:
-            invalid_params = list(kwargs.keys())
-            return ToolResult(
-                success=False,
-                output=(
-                    f"❌ Invalid parameters for file_io tool: {invalid_params}\n\n"
-                    f"✅ Valid parameters:\n"
-                    f"  - action (required): 'read', 'write', or 'list'\n"
-                    f"  - path (required): File or directory path\n"
-                    f"  - content (optional): Content to write (for 'write' action)\n"
-                    f"  - start_line (optional): Starting line for reading (default: 0)\n"
-                    f"  - end_line (optional): Ending line for reading (default: None)\n\n"
-                    f"Example: file_io(action='read', path='/workspace/file.txt')\n"
-                    f"Example: file_io(action='write', path='/workspace/file.txt', content='Hello World')"
-                ),
-                error=f"Invalid parameters: {invalid_params}"
-            )
-        
-        # Check for required parameters
-        if not action:
-            return ToolResult(
-                success=False,
-                output=(
-                    "❌ Missing required parameter: 'action'\n\n"
-                    "The file_io tool requires an 'action' parameter.\n"
-                    "Valid actions: 'read', 'write', 'list'\n"
-                    "Example: file_io(action='read', path='/workspace/file.txt')"
-                ),
-                error="Missing required parameter: action"
-            )
-        
-        if not path:
-            return ToolResult(
-                success=False,
-                output=(
-                    "❌ Missing required parameter: 'path'\n\n"
-                    "The file_io tool requires a 'path' parameter.\n"
-                    "Example: file_io(action='read', path='/workspace/file.txt')"
-                ),
-                error="Missing required parameter: path"
-            )
-        
+        # The base class now handles parameter validation automatically
+        # via _validate_parameters() which checks the schema
+
         if action == "read":
             return self._read(path, start_line, end_line)
         elif action == "write":
@@ -88,21 +46,45 @@ class FileIOTool(BaseTool):
             return self._list(path)
         else:
             raise ToolError(
-                f"Invalid action '{action}'. Must be 'read', 'write', or 'list'.",
-                error_code="INVALID_ACTION"
+                message=f"Invalid action '{action}'. Must be 'read', 'write', or 'list'.",
+                category="validation",
+                error_code="INVALID_ACTION",
+                suggestions=[
+                    "Use action='read' to read a file",
+                    "Use action='write' to write content to a file",
+                    "Use action='list' to list directory contents"
+                ],
+                details={"provided_action": action, "valid_actions": ["read", "write", "list"]},
+                retryable=True
             )
 
     def _read(self, path: str, start_line: int, end_line: Optional[int]) -> ToolResult:
         """Read a file."""
         if not path:
-            raise ToolError("Path is required for reading.", error_code="MISSING_PATH")
+            raise ToolError(
+                message="Path is required for reading.",
+                category="validation",
+                error_code="MISSING_PATH",
+                retryable=True
+            )
             
         # Command to read the file content
         command = f"cat '{path}'"
         result = self.orchestrator.execute_command(command)
 
         if not result["success"]:
-            raise ToolError(f"Failed to read file: {result['output']}", error_code="READ_FAILED")
+            raise ToolError(
+                message=f"Failed to read file: {result['output']}",
+                category="execution",
+                error_code="READ_FAILED",
+                raw_output=result.get('output'),
+                suggestions=[
+                    "Check if the file exists",
+                    "Verify you have read permissions",
+                    "Ensure the path is correct"
+                ],
+                retryable=True
+            )
 
         file_content = result["output"]
         lines = file_content.splitlines()
@@ -129,7 +111,13 @@ class FileIOTool(BaseTool):
     def _write(self, path: str, content: Optional[str]) -> ToolResult:
         """Write content to a file."""
         if content is None:
-            raise ToolError("Content is required for writing.", error_code="MISSING_CONTENT")
+            raise ToolError(
+                message="Content is required for writing.",
+                category="validation",
+                error_code="MISSING_CONTENT",
+                suggestions=["Provide the 'content' parameter with the text to write"],
+                retryable=True
+            )
 
         import base64
         encoded_content = base64.b64encode(content.encode('utf-8')).decode('ascii')
@@ -147,19 +135,46 @@ with open('{path}', 'w') as f:
         result = self.orchestrator.execute_command(command)
 
         if not result["success"]:
-            raise ToolError(f"Failed to write to file: {result['output']}", error_code="WRITE_FAILED")
+            raise ToolError(
+                message=f"Failed to write to file: {result['output']}",
+                category="execution",
+                error_code="WRITE_FAILED",
+                raw_output=result.get('output'),
+                suggestions=[
+                    "Check if you have write permissions",
+                    "Ensure the directory exists",
+                    "Verify disk space is available"
+                ],
+                retryable=True
+            )
 
         return ToolResult(success=True, output=f"Successfully wrote {len(content)} characters to {path}")
 
     def _list(self, path: str) -> ToolResult:
         """List files in a directory."""
         if not path:
-            raise ToolError("Path is required for listing.", error_code="MISSING_PATH")
+            raise ToolError(
+                message="Path is required for listing.",
+                category="validation",
+                error_code="MISSING_PATH",
+                retryable=True
+            )
             
         command = f"ls -la '{path}'"
         result = self.orchestrator.execute_command(command)
 
         if not result["success"]:
-            raise ToolError(f"Failed to list directory: {result['output']}", error_code="LIST_FAILED")
+            raise ToolError(
+                message=f"Failed to list directory: {result['output']}",
+                category="execution",
+                error_code="LIST_FAILED",
+                raw_output=result.get('output'),
+                suggestions=[
+                    "Check if the directory exists",
+                    "Verify you have read permissions",
+                    "Ensure the path is a directory, not a file"
+                ],
+                retryable=True
+            )
 
         return ToolResult(success=True, output=result["output"])

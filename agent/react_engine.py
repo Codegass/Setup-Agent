@@ -1194,9 +1194,39 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     self._log_react_step_verbose(step)
 
                 if step.tool_name not in self.tools:
-                    error_msg = f"Unknown tool: {step.tool_name}"
-                    logger.error(error_msg)
-                    self._add_observation_step(error_msg)
+                    # Generate comprehensive feedback for unknown tool
+                    unknown_feedback = self._generate_unknown_tool_feedback(step.tool_name)
+                    logger.error(f"Unknown tool requested: {step.tool_name}")
+
+                    # Log unknown tool attempt to centralized error logger
+                    try:
+                        from agent.error_logger import ErrorLogger
+                        error_logger = ErrorLogger.get_instance()
+
+                        # Extract suggested tool from feedback
+                        suggested_tool = None
+                        if "Did you mean:" in unknown_feedback:
+                            # Parse suggested tool from feedback
+                            lines = unknown_feedback.split('\n')
+                            for line in lines:
+                                if "Did you mean:" in line:
+                                    suggested_tool = line.split("Did you mean:")[1].strip().rstrip('?')
+                                    break
+
+                        error_logger.log_unknown_tool(
+                            requested_tool=step.tool_name,
+                            suggested_tool=suggested_tool,
+                            feedback_provided=unknown_feedback,
+                            context={
+                                "step_content": step.content,
+                                "tool_params": step.tool_params,
+                                "available_tools": list(self.tools.keys())
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to log unknown tool to error logger: {e}")
+
+                    self._add_observation_step(unknown_feedback)
                     continue
 
                 # Execute the tool with parameter validation and self-healing
@@ -1300,7 +1330,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     # Still execute the tool but with warning
                     # This ensures agent can see actual errors instead of empty output
                     try:
-                        actual_result = tool.execute(**validated_params)
+                        actual_result = tool.safe_execute(**validated_params)
                         # Prepend warning to actual output
                         warning_prefix = f"⚠️ REPETITIVE EXECUTION WARNING: {step.tool_name} has been called {len(recent_executions)} times\n\n"
                         result = ToolResult(
@@ -2439,12 +2469,12 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         # Use the system tool which now has proper architecture detection
         if "system" in self.tools:
             # First verify what Java is needed
-            verify_result = self.tools["system"].execute(action="verify_java")
+            verify_result = self.tools["system"].safe_execute(action="verify_java")
             
             # Check if Java 17 is needed (common for Tika)
             if "17" in str(self.context_manager.get_current_context()):
                 logger.info("Detected Java 17 requirement, using system tool for proper installation")
-                install_result = self.tools["system"].execute(action="install_java", java_version="17")
+                install_result = self.tools["system"].safe_execute(action="install_java", java_version="17")
                 
                 if install_result.success:
                     return ToolResult(
@@ -2510,6 +2540,105 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         # Keep only recent executions to prevent memory bloat
         if len(self.recent_tool_executions) > self.max_recent_executions:
             self.recent_tool_executions.pop(0)
+
+    def _generate_unknown_tool_feedback(self, requested_tool: str) -> str:
+        """Generate comprehensive feedback for unknown tool requests."""
+        from difflib import get_close_matches
+
+        # Common tool name mappings
+        tool_mappings = {
+            'git': 'project_setup',
+            'git_clone': 'project_setup',
+            'clone': 'project_setup',
+            'setup': 'project_setup',
+            'mvn': 'maven',
+            'gradle_build': 'gradle',
+            'npm': 'bash',
+            'pip': 'bash',
+            'python': 'bash',
+            'ls': 'bash',
+            'cd': 'bash',
+            'cat': 'file_io',
+            'echo': 'bash',
+            'mkdir': 'bash',
+            'rm': 'bash',
+            'cp': 'bash',
+            'mv': 'bash',
+            'find': 'file_search',
+            'grep': 'file_search',
+            'test': 'bash',
+            'build': 'maven or gradle or bash',
+            'compile': 'maven or gradle',
+            'install': 'system or bash',
+            'package': 'maven or gradle',
+            'analyze': 'project_analyzer',
+            'review': 'code_review',
+            'report': 'report',
+            'context': 'manage_context',
+            'search': 'file_search or web_search',
+            'read': 'file_io',
+            'write': 'file_io',
+            'edit': 'file_io'
+        }
+
+        # Build feedback message
+        feedback_parts = [f"❌ Tool '{requested_tool}' does not exist."]
+
+        # Check for direct mapping
+        if requested_tool.lower() in tool_mappings:
+            suggested = tool_mappings[requested_tool.lower()]
+            feedback_parts.append(f"\n✅ Did you mean: {suggested}?")
+
+            # Add usage example for the suggested tool
+            if suggested == 'project_setup':
+                feedback_parts.append("\n📝 Usage: Use 'project_setup' with action='clone' and repo_url to clone repositories")
+            elif suggested == 'maven':
+                feedback_parts.append("\n📝 Usage: Use 'maven' with command='compile' or 'test' or 'package'")
+            elif suggested == 'bash':
+                feedback_parts.append(f"\n📝 Usage: Use 'bash' with command='{requested_tool} <args>' to run shell commands")
+            elif suggested == 'manage_context':
+                feedback_parts.append("\n📝 Usage: Use 'manage_context' with action='get_info' or 'create_branch'")
+        else:
+            # Find similar tool names
+            available_tools = list(self.tools.keys())
+            close_matches = get_close_matches(requested_tool, available_tools, n=3, cutoff=0.6)
+
+            if close_matches:
+                feedback_parts.append(f"\n✅ Did you mean one of these? {', '.join(close_matches)}")
+
+            # Always list available tools for reference
+            feedback_parts.append("\n\n📋 Available tools:")
+            tool_descriptions = {
+                'bash': 'Execute shell commands',
+                'file_io': 'Read, write, and manipulate files',
+                'file_search': 'Search for files and content',
+                'web_search': 'Search the web for information',
+                'project_setup': 'Clone repositories and install dependencies',
+                'project_analyzer': 'Analyze project structure and requirements',
+                'maven': 'Run Maven build commands',
+                'gradle': 'Run Gradle build commands',
+                'system': 'Install system packages and configure Java',
+                'manage_context': 'Manage task context and branching',
+                'report': 'Generate project reports',
+                'code_review': 'Review code quality and security',
+                'output_search': 'Search truncated outputs'
+            }
+
+            for tool in available_tools[:10]:  # Show first 10 tools
+                desc = tool_descriptions.get(tool, "Tool for specialized operations")
+                feedback_parts.append(f"  • {tool}: {desc}")
+
+            if len(available_tools) > 10:
+                feedback_parts.append(f"  ... and {len(available_tools) - 10} more tools")
+
+        # Add general guidance
+        feedback_parts.append("\n\n💡 Tips:")
+        feedback_parts.append("• For shell commands, use 'bash' tool with command parameter")
+        feedback_parts.append("• For file operations, use 'file_io' tool with action parameter")
+        feedback_parts.append("• For Java projects, use 'maven' or 'gradle' tools")
+        feedback_parts.append("• Check tool parameter requirements with action='help' where supported")
+
+        return '\n'.join(feedback_parts)
 
     def _add_observation_step(self, observation: str):
         """Add an observation step, enriched with physical validation state."""
@@ -3790,7 +3919,7 @@ EXECUTE ACTIONS FOR:
                         logger.warning("No orchestrator available, using bash tool for recovery")
                         bash_tool = self.tools.get("bash")
                         if bash_tool:
-                            bash_result = bash_tool.execute(command=recovery_cmd, working_directory="/")
+                            bash_result = bash_tool.safe_execute(command=recovery_cmd, working_directory="/")
                             recovery_result = {"success": bash_result.success, "output": bash_result.output}
                         else:
                             recovery_result = {"success": False, "output": "No recovery mechanism available"}

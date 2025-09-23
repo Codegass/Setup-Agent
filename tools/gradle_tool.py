@@ -44,8 +44,7 @@ class GradleTool(BaseTool):
         parallel: bool = False,  # Gradle-specific: parallel execution
         configure_on_demand: bool = False,  # Gradle-specific optimization
         build_cache: bool = True,  # Gradle-specific: use build cache
-        fail_at_end: bool = False,  # Continue execution after failures
-        **kwargs  # Accept any additional parameters
+        fail_at_end: bool = False  # Continue execution after failures
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.

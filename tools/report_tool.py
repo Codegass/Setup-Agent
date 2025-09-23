@@ -2414,7 +2414,12 @@ class ReportTool(BaseTool):
         exec_details_section = self._render_execution_details_simplified(report_snapshot, execution_metrics)
         if exec_details_section:
             report_lines.extend(exec_details_section)
-        
+
+        # Add error analysis section
+        error_section = self._generate_error_reporting_section(actual_accomplishments)
+        if error_section:
+            report_lines.extend(error_section)
+
         # Generate next steps based on actual status and context
         next_steps_section = self._generate_next_steps_section(status, actual_accomplishments)
         if next_steps_section:
@@ -2820,26 +2825,153 @@ class ReportTool(BaseTool):
         section_lines.append("")
         return section_lines
 
+    def _get_centralized_error_analysis(self) -> list:
+        """Get error analysis from centralized error logger."""
+        try:
+            from agent.error_logger import ErrorLogger
+
+            # Get error logger instance
+            workspace_path = self.orchestrator.workspace_path if self.orchestrator else "/workspace"
+            error_logger = ErrorLogger.get_instance(workspace_path=workspace_path)
+
+            # Get error summary
+            summary = error_logger.get_error_summary()
+
+            if summary['total_errors'] == 0:
+                return []
+
+            analysis_lines = [
+                "### 📊 Centralized Error Summary",
+                "",
+                f"**Total Errors Logged:** {summary['total_errors']}",
+                ""
+            ]
+
+            # Error type breakdown
+            if summary['error_counts_by_type']:
+                analysis_lines.extend([
+                    "**Error Types:**",
+                ])
+                for error_type, count in sorted(summary['error_counts_by_type'].items(),
+                                               key=lambda x: x[1], reverse=True):
+                    percentage = (count / summary['total_errors']) * 100
+                    emoji = {
+                        'tool_error': '🔧',
+                        'unknown_tool': '❓',
+                        'validation_error': '✅',
+                        'execution_error': '⚡',
+                        'system_error': '💥',
+                        'timeout_error': '⏰',
+                        'recovery_failed': '🔄'
+                    }.get(error_type, '⚠️')
+                    analysis_lines.append(f"- {emoji} **{error_type}**: {count} ({percentage:.1f}%)")
+                analysis_lines.append("")
+
+            # Tool error categories
+            if summary['tool_error_categories']:
+                analysis_lines.extend([
+                    "**Tool Error Categories:**",
+                ])
+                for category, count in sorted(summary['tool_error_categories'].items(),
+                                             key=lambda x: x[1], reverse=True):
+                    analysis_lines.append(f"- **{category}**: {count} errors")
+                analysis_lines.append("")
+
+            # Unknown tools attempted
+            if summary['unknown_tools_attempted']:
+                analysis_lines.extend([
+                    "**Unknown Tools Attempted:**",
+                ])
+                # Show up to 10 unique unknown tools
+                unique_tools = list(set(summary['unknown_tools_attempted']))[:10]
+                for tool in unique_tools:
+                    analysis_lines.append(f"- `{tool}`")
+                if len(summary['unknown_tools_attempted']) > 10:
+                    analysis_lines.append(f"- ... and {len(summary['unknown_tools_attempted']) - 10} more")
+                analysis_lines.append("")
+
+            # Recovery failure rate
+            if summary['recovery_failure_rate'] > 0:
+                analysis_lines.extend([
+                    f"**Recovery Failure Rate:** {summary['recovery_failure_rate']:.1f}%",
+                    ""
+                ])
+
+            # Get sample errors for detailed analysis
+            errors = error_logger.get_errors_for_analysis(limit=20)
+            if errors:
+                # Find most common error patterns
+                error_patterns = {}
+                for error in errors:
+                    if error.get('type') == 'tool_error':
+                        key = f"{error.get('tool_name', 'unknown')}_{error.get('category', 'unknown')}"
+                        if key not in error_patterns:
+                            error_patterns[key] = {
+                                'count': 0,
+                                'tool': error.get('tool_name', 'unknown'),
+                                'category': error.get('category', 'unknown'),
+                                'sample_message': error.get('error_message', 'No message'),
+                                'suggestions': error.get('suggestions', [])
+                            }
+                        error_patterns[key]['count'] += 1
+
+                if error_patterns:
+                    analysis_lines.extend([
+                        "**Common Error Patterns:**",
+                    ])
+                    # Show top 5 patterns
+                    top_patterns = sorted(error_patterns.items(),
+                                        key=lambda x: x[1]['count'], reverse=True)[:5]
+                    for pattern_key, pattern_data in top_patterns:
+                        analysis_lines.append(
+                            f"- **{pattern_data['tool']}** ({pattern_data['category']}): "
+                            f"{pattern_data['count']} occurrences"
+                        )
+                        if pattern_data['sample_message']:
+                            msg = pattern_data['sample_message'][:100]
+                            if len(pattern_data['sample_message']) > 100:
+                                msg += "..."
+                            analysis_lines.append(f"  - Sample: {msg}")
+                        if pattern_data['suggestions']:
+                            analysis_lines.append(f"  - Suggestion: {pattern_data['suggestions'][0]}")
+                    analysis_lines.append("")
+
+            return analysis_lines
+
+        except Exception as e:
+            logger.warning(f"Failed to get centralized error analysis: {e}")
+            return []
+
     def _generate_error_reporting_section(self, actual_accomplishments: dict = None) -> list:
         """Generate enhanced error reporting section for build and test failures."""
-        if not actual_accomplishments:
+        section_lines = []
+
+        # Get centralized error log analysis
+        error_analysis_lines = self._get_centralized_error_analysis()
+
+        # Check if there are any errors from accomplishments
+        has_accomplishment_errors = False
+        if actual_accomplishments:
+            has_accomplishment_errors = (
+                actual_accomplishments.get('build_failed', False) or
+                actual_accomplishments.get('test_failed', False) or
+                actual_accomplishments.get('compilation_errors', 0) > 0 or
+                actual_accomplishments.get('test_failed', False)
+            )
+
+        # Return empty if no errors at all
+        if not error_analysis_lines and not has_accomplishment_errors:
             return []
-        
-        # Check if there are any errors to report
-        has_errors = (
-            actual_accomplishments.get('build_failed', False) or
-            actual_accomplishments.get('test_failed', False) or
-            actual_accomplishments.get('compilation_errors', 0) > 0 or
-            actual_accomplishments.get('test_failed', False)
-        )
-        
-        if not has_errors:
-            return []
-        
+
         section_lines = [
             "## ⚠️ Error Analysis",
             "",
         ]
+
+        # Add centralized error analysis if available
+        if error_analysis_lines:
+            section_lines.extend(error_analysis_lines)
+            section_lines.append("")
         
         # Report compilation errors
         if actual_accomplishments.get('compilation_errors', 0) > 0:
