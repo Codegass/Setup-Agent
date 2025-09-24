@@ -761,20 +761,31 @@ PY"""
 
     def _count_java_test_with_expansions(self, project_path: str) -> Dict[str, Any]:
         """
-        Count Java tests INCLUDING parameterized test expansions.
+        Count Java test annotations and capture metadata about parameterized usage.
 
         Returns:
             Dict with:
             - 'method_count': Number of test method annotations
-            - 'total_test_count': Total test cases including parameterized expansions
+            - 'total_test_count': Total test cases based on annotations (deduplicated)
             - 'parameterized_info': Details about parameterized tests
         """
         if not self.docker_orchestrator:
             return {'method_count': None, 'total_test_count': None}
 
+        # Always calculate the raw annotation total first so we have a baseline
+        # even if the per-annotation breakdown command fails.
+        method_count = self._count_java_test_annotations(project_path)
+
         counts = self._get_java_test_annotation_counts(project_path)
-        if counts is None:
+        if counts is None and method_count is None:
             return {'method_count': None, 'total_test_count': None}
+
+        # When both approaches succeed use the scripted breakdown so we can
+        # populate the parameterized metadata, but prefer the streaming grep
+        # total as a guard against bugs in either implementation.
+        if counts is None:
+            counts = {'Test': 0, 'ParameterizedTest': 0, 'RepeatedTest': 0,
+                      'TestFactory': 0, 'TestTemplate': 0, 'DynamicTest': 0}
 
         regular_tests = counts.get('Test', 0)
         parameterized_methods = counts.get('ParameterizedTest', 0)
@@ -783,7 +794,7 @@ PY"""
         template_methods = counts.get('TestTemplate', 0)
         dynamic_tests = counts.get('DynamicTest', 0)
 
-        method_count = (
+        breakdown_total = (
             regular_tests
             + parameterized_methods
             + repeated_tests
@@ -791,6 +802,16 @@ PY"""
             + template_methods
             + dynamic_tests
         )
+
+        if method_count is None:
+            method_count = breakdown_total
+        elif breakdown_total and breakdown_total != method_count:
+            logger.debug(
+                "Mismatch between streaming annotation total ({}) and breakdown total ({})",
+                method_count,
+                breakdown_total,
+            )
+            method_count = max(method_count, breakdown_total)
 
         total_test_count = method_count
 
