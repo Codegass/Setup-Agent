@@ -707,6 +707,17 @@ import re
 from collections import Counter
 from pathlib import Path
 
+EXCLUDED_DIR_NAMES = {
+    '.git',
+    '.svn',
+    '.idea',
+    '.vscode',
+    'target',
+    'build',
+    'out',
+    'tmp',
+}
+
 ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
 
 
@@ -717,9 +728,26 @@ def strip_comments(source: str) -> str:
 
 
 counts = Counter()
-root = Path('src/test')
-if root.exists():
-    for java_file in root.rglob('*.java'):
+project_root = Path('.')
+
+def is_excluded(path: Path) -> bool:
+    return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
+
+test_dirs = []
+for candidate in project_root.rglob('src'):
+    if candidate.name != 'src':
+        continue
+    test_dir = candidate / 'test'
+    if not test_dir.is_dir():
+        continue
+    if is_excluded(test_dir):
+        continue
+    test_dirs.append(test_dir)
+
+for test_dir in test_dirs:
+    for java_file in test_dir.rglob('*.java'):
+        if is_excluded(java_file.parent):
+            continue
         try:
             text = java_file.read_text(encoding='utf-8')
         except Exception:
