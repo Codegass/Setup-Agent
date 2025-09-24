@@ -21,6 +21,10 @@ class Config(BaseModel):
     reasoning_effort: str = Field(default="medium")  # for o1 models and claude thinking
     thinking_budget_tokens: int = Field(default=10000)  # for claude thinking budget
 
+    # GPT-5 specific parameters
+    verbosity: str = Field(default="medium")  # for GPT-5 models
+    gpt5_reasoning_effort: str = Field(default="medium")  # for GPT-5 models
+
     action_model: str = Field(default="gpt-4o")
     action_provider: str = Field(default="openai")
     action_temperature: float = Field(default=0.3)
@@ -69,6 +73,9 @@ class Config(BaseModel):
             thinking_max_tokens=int(os.getenv("SAG_MAX_THINKING_TOKENS", "16000")),
             reasoning_effort=os.getenv("SAG_REASONING_EFFORT", "medium"),
             thinking_budget_tokens=int(os.getenv("SAG_THINKING_BUDGET_TOKENS", "10000")),
+            # GPT-5 specific parameters
+            verbosity=os.getenv("SAG_VERBOSITY", "medium"),
+            gpt5_reasoning_effort=os.getenv("SAG_GPT5_REASONING_EFFORT", "medium"),
             # Action model config
             action_model=os.getenv("SAG_ACTION_MODEL", "gpt-4o"),
             action_provider=os.getenv("SAG_ACTION_PROVIDER", "openai"),
@@ -119,6 +126,15 @@ class Config(BaseModel):
         else:
             return f"{provider}/{model}"
 
+    def is_gpt5_model(self, model_type: str = "action") -> bool:
+        """Check if the specified model is a GPT-5 variant."""
+        if model_type == "thinking":
+            model = self.thinking_model.lower()
+        else:
+            model = self.action_model.lower()
+
+        return "gpt5" in model or "gpt-5" in model
+
     def get_thinking_config(self) -> dict:
         """Get thinking configuration based on provider."""
         if self.thinking_provider == "anthropic":
@@ -129,6 +145,9 @@ class Config(BaseModel):
         elif self.thinking_provider == "openai" and "o1" in self.thinking_model:
             # For OpenAI o1 models, use reasoning_effort
             return {"reasoning_effort": self.reasoning_effort}
+        elif self.thinking_provider == "openai" and self.is_gpt5_model("thinking"):
+            # For OpenAI GPT-5 models, use verbosity and reasoning_effort
+            return {"verbosity": self.verbosity, "reasoning_effort": self.gpt5_reasoning_effort}
         else:
             # For other models, no special thinking config
             return {}

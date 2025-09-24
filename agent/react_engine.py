@@ -429,74 +429,97 @@ class ReActEngine:
         try:
             if use_thinking_model:
                 model = self.config.get_litellm_model_name("thinking")
-                temperature = self.config.thinking_temperature
-                max_tokens = self.config.thinking_max_tokens
 
-                # Special handling for O-series models (only support temperature=1)
-                if (
-                    "o4" in self.config.thinking_model.lower()
-                    or "o1" in self.config.thinking_model.lower()
-                ):
-                    temperature = 1.0
+                # Check if this is a GPT-5 model and adjust parameters accordingly
+                if self.config.is_gpt5_model("thinking"):
+                    # GPT-5 models use verbosity and reasoning_effort instead of temperature and max_tokens
+                    request_params = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
+                        "verbosity": self.config.verbosity,
+                        "reasoning_effort": self.config.gpt5_reasoning_effort,
+                    }
+                    logger.info(f"Using GPT-5 parameters for thinking model: verbosity={self.config.verbosity}, reasoning_effort={self.config.gpt5_reasoning_effort}")
+                else:
+                    # Traditional models use temperature and max_tokens
+                    temperature = self.config.thinking_temperature
+                    max_tokens = self.config.thinking_max_tokens
 
-                # CRITICAL: Create specialized prompt for thinking model
-                thinking_prompt = self._build_thinking_model_prompt(prompt)
+                    # Special handling for O-series models (only support temperature=1)
+                    if (
+                        "o4" in self.config.thinking_model.lower()
+                        or "o1" in self.config.thinking_model.lower()
+                    ):
+                        temperature = 1.0
+
+                    # Get thinking configuration based on provider
+                    thinking_config = self.config.get_thinking_config()
+
+                    request_params = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                        **thinking_config,
+                    }
 
                 # Log detailed request in verbose mode
                 if self.config.verbose:
-                    self._log_llm_request(
-                        model, thinking_prompt, temperature, max_tokens, use_thinking_model
-                    )
+                    logger.debug(f"Thinking model request params: {request_params}")
 
-                # Get thinking configuration based on provider
-                thinking_config = self.config.get_thinking_config()
-
-                # Special handling for different thinking models
-                if thinking_config:
-                    # For models with thinking capabilities (o1, claude)
-                    response = litellm.completion(
-                        model=model,
-                        messages=[{"role": "user", "content": thinking_prompt}],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        **thinking_config,
-                    )
-                else:
-                    # For regular models
-                    response = litellm.completion(
-                        model=model,
-                        messages=[{"role": "user", "content": thinking_prompt}],
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
+                # Make the API call with error handling for GPT-5 models
+                try:
+                    response = litellm.completion(**request_params)
+                except Exception as e:
+                    # If GPT-5 parameters fail, try falling back to traditional parameters
+                    if self.config.is_gpt5_model("thinking"):
+                        logger.warning(f"GPT-5 thinking model call failed: {e}")
+                        logger.info("Falling back to traditional parameters for thinking model")
+                        fallback_params = {
+                            "model": model,
+                            "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
+                            "temperature": self.config.thinking_temperature,
+                            "max_tokens": self.config.thinking_max_tokens,
+                        }
+                        response = litellm.completion(**fallback_params)
+                    else:
+                        raise
             else:
                 model = self.config.get_litellm_model_name("action")
-                temperature = self.config.action_temperature
-                max_tokens = self.config.action_max_tokens
 
-                # Special handling for O-series models (only support temperature=1)
-                if (
-                    "o4" in self.config.action_model.lower()
-                    or "o1" in self.config.action_model.lower()
-                ):
-                    temperature = 1.0
+                # Check if this is a GPT-5 model and adjust parameters accordingly
+                if self.config.is_gpt5_model("action"):
+                    # GPT-5 models use verbosity and reasoning_effort instead of temperature and max_tokens
+                    request_params = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
+                        "verbosity": self.config.verbosity,
+                        "reasoning_effort": self.config.gpt5_reasoning_effort,
+                    }
+                    logger.info(f"Using GPT-5 parameters for action model: verbosity={self.config.verbosity}, reasoning_effort={self.config.gpt5_reasoning_effort}")
+                else:
+                    # Traditional models use temperature and max_tokens
+                    temperature = self.config.action_temperature
+                    max_tokens = self.config.action_max_tokens
 
-                # CRITICAL: Create specialized prompt for action model
-                action_prompt = self._build_action_model_prompt(prompt)
+                    # Special handling for O-series models (only support temperature=1)
+                    if (
+                        "o4" in self.config.action_model.lower()
+                        or "o1" in self.config.action_model.lower()
+                    ):
+                        temperature = 1.0
+
+                    # Build parameters for the request
+                    request_params = {
+                        "model": model,
+                        "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
 
                 # Log detailed request in verbose mode
                 if self.config.verbose:
-                    self._log_llm_request(
-                        model, action_prompt, temperature, max_tokens, use_thinking_model
-                    )
-
-                # Build parameters for the request
-                request_params = {
-                    "model": model,
-                    "messages": [{"role": "user", "content": action_prompt}],
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                }
+                    logger.debug(f"Action model request params: {request_params}")
 
                 # Add function calling support if available
                 # For o4-mini and other supported models, use function calling for all steps
@@ -520,7 +543,32 @@ class ReActEngine:
                         if tools_schema and self.config.verbose:
                             logger.debug(f"First tool schema: {json.dumps(tools_schema[0], indent=2)}")
 
-                response = litellm.completion(**request_params)
+                # Make the API call with error handling for GPT-5 models
+                try:
+                    response = litellm.completion(**request_params)
+                except Exception as e:
+                    # If GPT-5 parameters fail, try falling back to traditional parameters
+                    if self.config.is_gpt5_model("action"):
+                        logger.warning(f"GPT-5 action model call failed: {e}")
+                        logger.info("Falling back to traditional parameters for action model")
+
+                        # Build fallback parameters with traditional settings
+                        fallback_params = {
+                            "model": model,
+                            "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
+                            "temperature": self.config.action_temperature,
+                            "max_tokens": self.config.action_max_tokens,
+                        }
+
+                        # Add function calling support to fallback if it was in the original request
+                        if "tools" in request_params:
+                            fallback_params["tools"] = request_params["tools"]
+                        if "tool_choice" in request_params:
+                            fallback_params["tool_choice"] = request_params["tool_choice"]
+
+                        response = litellm.completion(**fallback_params)
+                    else:
+                        raise
 
             # Debug logging for function calling response
             message = response.choices[0].message
