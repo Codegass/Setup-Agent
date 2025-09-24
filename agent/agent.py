@@ -1,6 +1,7 @@
 """Main Setup Agent that orchestrates project setup."""
 
 import re
+from datetime import datetime
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -40,6 +41,14 @@ class SetupAgent:
         """Initialize context manager, tools, and react engine after Docker is ready."""
         if self.context_manager is not None:
             return  # Already initialized
+
+        # Initialize ErrorLogger with container workspace path
+        from agent.error_logger import ErrorLogger
+        error_logger = ErrorLogger.get_instance(
+            workspace_path=self.config.workspace_path,
+            session_id=datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        self.agent_logger.info(f"ErrorLogger initialized with workspace: {self.config.workspace_path}")
 
         # Initialize context manager with container-based workspace
         self.context_manager = ContextManager(
