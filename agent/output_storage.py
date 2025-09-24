@@ -44,11 +44,23 @@ class OutputStorageManager:
             try:
                 self.storage_dir.mkdir(parents=True, exist_ok=True)
                 logger.debug(f"Output storage directory ensured locally: {self.storage_dir}")
+            except (OSError, PermissionError) as e:
+                # If we can't create the directory (e.g., /workspace doesn't exist), use temp dir
+                import tempfile
+                temp_dir = Path(tempfile.gettempdir()) / "sag_output_storage" / "contexts"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                self.storage_dir = temp_dir
+                logger.warning(f"Could not create storage dir at {storage_dir}, using {self.storage_dir}: {e}")
+                # Update file paths after changing storage_dir
+                self.storage_file = self.storage_dir / "full_outputs.jsonl"
+                self.index_file = self.storage_dir / "output_index.json"
             except Exception as e:
                 logger.error(f"Failed to create storage directory {self.storage_dir}: {e}")
-        
-        self.storage_file = self.storage_dir / "full_outputs.jsonl"
-        self.index_file = self.storage_dir / "output_index.json"
+
+        # Set file paths (may have been updated in exception handler)
+        if not hasattr(self, 'storage_file'):
+            self.storage_file = self.storage_dir / "full_outputs.jsonl"
+            self.index_file = self.storage_dir / "output_index.json"
         
         # Log initialization
         logger.info(f"OutputStorageManager initialized: storage_file={self.storage_file}, index_file={self.index_file}")

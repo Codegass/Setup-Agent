@@ -55,13 +55,21 @@ class ErrorLogger:
             
         self.workspace_path = Path(workspace_path)
         self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Create error log directory
+
+        # Create error log directory - handle cases where workspace is in container
         self.error_dir = self.workspace_path / ".setup_agent" / "errors"
-        self.error_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Error log file in JSONL format for easy parsing
-        self.error_log_file = self.error_dir / f"errors_{self.session_id}.jsonl"
+        try:
+            self.error_dir.mkdir(parents=True, exist_ok=True)
+            # Error log file in JSONL format for easy parsing
+            self.error_log_file = self.error_dir / f"errors_{self.session_id}.jsonl"
+        except (OSError, PermissionError) as e:
+            # Fallback to temp directory if workspace is not accessible (e.g., in container)
+            import tempfile
+            temp_dir = Path(tempfile.gettempdir()) / "sag_errors" / self.session_id
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            self.error_dir = temp_dir
+            self.error_log_file = self.error_dir / f"errors_{self.session_id}.jsonl"
+            logger.warning(f"Could not create error dir in {workspace_path}, using {self.error_dir}: {e}")
         
         # Summary statistics
         self.error_counts: Dict[str, int] = {}

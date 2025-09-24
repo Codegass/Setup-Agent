@@ -62,20 +62,27 @@ class ReportTool(BaseTool):
         # Check if a report was already generated recently (within last 5 minutes)
         if action == "generate" and self.docker_orchestrator:
             try:
-                # Check for existing recent reports
-                check_cmd = "find /workspace -name 'setup-report-*.md' -mmin -5 -type f 2>/dev/null | head -1"
+                # Check for ANY existing reports (broader check to prevent duplicates)
+                check_cmd = "find /workspace -maxdepth 1 -name '*report*.md' -type f 2>/dev/null | grep -E '(setup.*report|final.*report|report.*md)' | head -1"
                 result = self.docker_orchestrator.execute_command(check_cmd)
                 existing_report = result.get('output', '').strip()
-                
+
                 if existing_report:
-                    # A report was already generated recently
+                    # A report was already generated
                     logger.warning(f"Report already exists at {existing_report}, skipping duplicate generation")
+
+                    # Read and return the existing report content
+                    read_cmd = f"head -100 {existing_report}"
+                    read_result = self.docker_orchestrator.execute_command(read_cmd)
+                    existing_content = read_result.get('output', '') if read_result.get('success') else ""
+
                     # Return the information about the existing report
                     return ToolResult(
                         success=True,
                         output=f"📄 Report already generated: {existing_report}\n"
                                f"Status: {status.upper()}\n"
-                               f"(Skipped duplicate report generation)",
+                               f"(Using existing report to prevent duplicates)\n\n"
+                               f"{existing_content[:500]}...",
                         metadata={
                             "task_completed": True,
                             "completion_signal": True,
@@ -3208,9 +3215,17 @@ class ReportTool(BaseTool):
     
     def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
         """Save markdown report to workspace using here-doc for safe handling."""
-        
+
         try:
             if self.docker_orchestrator:
+                # Clean up any old report files first to prevent accumulation
+                try:
+                    cleanup_cmd = "rm -f /workspace/setup_report.md /workspace/final_report.md 2>/dev/null || true"
+                    self.docker_orchestrator.execute_command(cleanup_cmd)
+                    logger.debug("Cleaned up old report files")
+                except:
+                    pass  # Non-critical if cleanup fails
+
                 # Use provided consistent filename
                 filepath = f"/workspace/{report_filename}"
                 

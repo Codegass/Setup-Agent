@@ -132,7 +132,13 @@ class AgentStateEvaluator:
         task2_analysis = self._check_task2_project_analyzer_requirement(steps)
         if task2_analysis.needs_guidance:
             return task2_analysis
-            
+
+        # 2.6. Check if project analysis is missing (using physical validator)
+        if self.physical_validator:
+            analysis_check = self._check_project_analysis_status()
+            if analysis_check.needs_guidance:
+                return analysis_check
+
         # 3. Check if task completion opportunity was missed
         if self.context_manager.current_task_id:
             completion_analysis = self._check_task_completion_opportunity(steps)
@@ -165,6 +171,40 @@ class AgentStateEvaluator:
         # Default: Everything is proceeding normally
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
     
+    def _check_project_analysis_status(self) -> AgentStateAnalysis:
+        """
+        Check if project analysis has been performed using physical validator.
+        This provides enforcement across all tasks, not just task_2.
+        """
+        try:
+            # Use physical validator to check analysis status
+            validation = self.physical_validator.validate_project_analysis_status()
+
+            # If analysis is missing and we have a prompt to inject
+            if not validation.get('analyzed') and validation.get('missing_analysis_prompt'):
+                # Only enforce if we're past task_1 (repository should be cloned)
+                current_task = self.context_manager.current_task_id
+                if current_task and current_task != 'task_1':
+                    # Check priority based on current task
+                    priority = 5  # Default priority
+                    if current_task == 'task_2':
+                        priority = 10  # Highest priority during task_2
+                    elif current_task in ['task_4', 'task_5']:
+                        priority = 7  # High priority before tests/report
+
+                    return AgentStateAnalysis(
+                        status=AgentStatus.CONFUSED,
+                        needs_guidance=True,
+                        guidance_message=validation['missing_analysis_prompt'],
+                        guidance_priority=priority,
+                        metadata={'static_test_count': validation.get('static_test_count')}
+                    )
+
+        except Exception as e:
+            logger.debug(f"Could not check project analysis status: {e}")
+
+        return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
+
     def _check_task2_project_analyzer_requirement(self, steps: List[Any]) -> AgentStateAnalysis:
         """
         Check if agent is working on task_2 but hasn't used project_analyzer tool.
