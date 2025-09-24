@@ -19,6 +19,7 @@ from .context_manager import BranchContext, ContextManager, TrunkContext, Branch
 from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
+from .token_tracker import TokenTracker
 
 
 class StepType(str, Enum):
@@ -111,7 +112,10 @@ class ReActEngine:
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
-        logger.info("ReAct Engine initialized with dual model support and physical validation")
+        # Initialize token tracker for monitoring LLM usage
+        self.token_tracker = TokenTracker()
+
+        logger.info("ReAct Engine initialized with dual model support, physical validation, and token tracking")
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
         if repository_url:
@@ -309,6 +313,9 @@ class ReActEngine:
                 self.current_iteration += 1
                 self.agent_logger.info(f"ReAct iteration {self.current_iteration}/{max_iter}")
 
+                # Update token tracker with current iteration
+                self.token_tracker.set_iteration(self.current_iteration)
+
                 # Determine if this should be a thinking step or action step
                 is_thinking_step = self._should_use_thinking_model()
 
@@ -317,6 +324,8 @@ class ReActEngine:
 
                 if not response:
                     logger.error("Failed to get LLM response")
+                    # Export token usage before early return due to failed LLM response
+                    self._export_token_usage_csv()
                     return False
 
                 # Parse the response
@@ -345,6 +354,8 @@ class ReActEngine:
                 # Check for task completion
                 if state_analysis.is_task_complete:
                     self.agent_logger.info("Task completed successfully")
+                    # Export token usage before successful completion
+                    self._export_token_usage_csv()
                     return True
 
                 # DEPRECATED: Legacy checks now handled by state_evaluator
@@ -368,10 +379,14 @@ class ReActEngine:
                     logger.debug(f"Incremented steps_since_context_switch to {self.steps_since_context_switch} after ACTION step")
 
             logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
+            # Export token usage before max iterations completion
+            self._export_token_usage_csv()
             return False
 
         except Exception as e:
             logger.error(f"ReAct loop failed: {e}", exc_info=True)
+            # Export token usage before exception completion
+            self._export_token_usage_csv()
             return False
 
     def _should_use_thinking_model(self) -> bool:
@@ -432,14 +447,14 @@ class ReActEngine:
 
                 # Check if this is a GPT-5 model and adjust parameters accordingly
                 if self.config.is_gpt5_model("thinking"):
-                    # GPT-5 models use verbosity and reasoning_effort instead of temperature and max_tokens
+                    # GPT-5 models use reasoning_effort instead of temperature and max_tokens
                     request_params = {
                         "model": model,
                         "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
-                        "verbosity": self.config.verbosity,
                         "reasoning_effort": self.config.gpt5_reasoning_effort,
+                        "drop_params": True,  # Safely ignore unsupported parameters
                     }
-                    logger.info(f"Using GPT-5 parameters for thinking model: verbosity={self.config.verbosity}, reasoning_effort={self.config.gpt5_reasoning_effort}")
+                    logger.info(f"Using GPT-5 parameters for thinking model: reasoning_effort={self.config.gpt5_reasoning_effort}")
                 else:
                     # Traditional models use temperature and max_tokens
                     temperature = self.config.thinking_temperature
@@ -470,6 +485,8 @@ class ReActEngine:
                 # Make the API call with error handling for GPT-5 models
                 try:
                     response = litellm.completion(**request_params)
+                    # Track token usage for thinking model
+                    self.token_tracker.track_token_usage(response, model, "thought")
                 except Exception as e:
                     # If GPT-5 parameters fail, try falling back to traditional parameters
                     if self.config.is_gpt5_model("thinking"):
@@ -480,8 +497,11 @@ class ReActEngine:
                             "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
                             "temperature": self.config.thinking_temperature,
                             "max_tokens": self.config.thinking_max_tokens,
+                            "drop_params": True,  # Safely ignore unsupported parameters
                         }
                         response = litellm.completion(**fallback_params)
+                        # Track token usage for thinking model fallback
+                        self.token_tracker.track_token_usage(response, model, "thought")
                     else:
                         raise
             else:
@@ -489,14 +509,14 @@ class ReActEngine:
 
                 # Check if this is a GPT-5 model and adjust parameters accordingly
                 if self.config.is_gpt5_model("action"):
-                    # GPT-5 models use verbosity and reasoning_effort instead of temperature and max_tokens
+                    # GPT-5 models use reasoning_effort instead of temperature and max_tokens
                     request_params = {
                         "model": model,
                         "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
-                        "verbosity": self.config.verbosity,
                         "reasoning_effort": self.config.gpt5_reasoning_effort,
+                        "drop_params": True,  # Safely ignore unsupported parameters
                     }
-                    logger.info(f"Using GPT-5 parameters for action model: verbosity={self.config.verbosity}, reasoning_effort={self.config.gpt5_reasoning_effort}")
+                    logger.info(f"Using GPT-5 parameters for action model: reasoning_effort={self.config.gpt5_reasoning_effort}")
                 else:
                     # Traditional models use temperature and max_tokens
                     temperature = self.config.action_temperature
@@ -546,6 +566,8 @@ class ReActEngine:
                 # Make the API call with error handling for GPT-5 models
                 try:
                     response = litellm.completion(**request_params)
+                    # Track token usage for action model
+                    self.token_tracker.track_token_usage(response, model, "action")
                 except Exception as e:
                     # If GPT-5 parameters fail, try falling back to traditional parameters
                     if self.config.is_gpt5_model("action"):
@@ -558,6 +580,7 @@ class ReActEngine:
                             "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
                             "temperature": self.config.action_temperature,
                             "max_tokens": self.config.action_max_tokens,
+                            "drop_params": True,  # Safely ignore unsupported parameters
                         }
 
                         # Add function calling support to fallback if it was in the original request
@@ -567,6 +590,8 @@ class ReActEngine:
                             fallback_params["tool_choice"] = request_params["tool_choice"]
 
                         response = litellm.completion(**fallback_params)
+                        # Track token usage for action model fallback
+                        self.token_tracker.track_token_usage(response, model, "action")
                     else:
                         raise
 
@@ -1236,6 +1261,10 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             elif step.step_type == StepType.ACTION:
                 self.agent_logger.info(f"🔧 ACTION: {step.content}")
                 logger.info(f"🔧 ACTION: {step.content}")
+
+                # Update token tracker with actual tool name for the last action token record
+                if step.tool_name:
+                    self.token_tracker.update_last_tool_name(step.tool_name)
 
                 # Detailed logging in verbose mode
                 if self.config.verbose:
@@ -4060,3 +4089,35 @@ EXECUTE ACTIONS FOR:
         # For now, just return no recovery
         # Can be extended with more generic strategies
         return {"attempted": False, "success": False, "message": "No generic recovery strategy available"}
+
+    def _export_token_usage_csv(self):
+        """Export token usage to CSV file when ReAct loop completes."""
+        try:
+            # Get session logger for CSV path
+            from config.logger import get_session_logger
+            session_logger = get_session_logger()
+
+            if session_logger:
+                # Save to session directory
+                csv_path = session_logger.session_log_dir / "token_usage.csv"
+            else:
+                # Fallback to logs directory
+                from datetime import datetime
+                from pathlib import Path
+                logs_dir = Path("logs")
+                logs_dir.mkdir(exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                csv_path = logs_dir / f"token_usage_{timestamp}.csv"
+
+            # Export the CSV
+            success = self.token_tracker.export_to_csv(str(csv_path))
+
+            if success:
+                # Log summary stats
+                self.token_tracker.log_summary()
+                logger.info(f"📊 Token usage exported to: {csv_path}")
+            else:
+                logger.warning("Failed to export token usage CSV")
+
+        except Exception as e:
+            logger.warning(f"Failed to export token usage CSV: {e}")

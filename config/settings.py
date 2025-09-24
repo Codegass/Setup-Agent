@@ -133,6 +133,7 @@ class Config(BaseModel):
         else:
             model = self.action_model.lower()
 
+        # Only check for actual GPT-5 variants (not GPT-4.1)
         return "gpt5" in model or "gpt-5" in model
 
     def get_thinking_config(self) -> dict:
@@ -146,8 +147,8 @@ class Config(BaseModel):
             # For OpenAI o1 models, use reasoning_effort
             return {"reasoning_effort": self.reasoning_effort}
         elif self.thinking_provider == "openai" and self.is_gpt5_model("thinking"):
-            # For OpenAI GPT-5 models, use verbosity and reasoning_effort
-            return {"verbosity": self.verbosity, "reasoning_effort": self.gpt5_reasoning_effort}
+            # For OpenAI GPT-5 models, use reasoning_effort only
+            return {"reasoning_effort": self.gpt5_reasoning_effort}
         else:
             # For other models, no special thinking config
             return {}
