@@ -1283,7 +1283,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         )
                         
                         # Update tool execution history
-                        self._update_tool_execution_history(tool_signature, False)
+                        self._track_tool_execution(tool_signature, False)
                         
                         # Force context manager to move to next task
                         if hasattr(self.context_manager, 'force_next_task'):

@@ -692,9 +692,15 @@ class PhysicalValidator:
                 test_result["error"] = "No test report files found"
                 return test_result
 
+            logger.info(f"📊 Processing {len(report_files)} test report XML files...")
+
             # Step 3: Parse all XML files
             # Track deduplicated testcases by normalized identifier
             unique_cases: Dict[str, str] = {}
+
+            # Debug: track processing
+            files_with_testcases = 0
+            total_testcases_found = 0
 
             for report_file in report_files:
                 try:
@@ -715,7 +721,12 @@ class PhysicalValidator:
                         test_result["error_tests"] += stats.get("errors", 0)
                         test_result["skipped_tests"] += stats.get("skipped", 0)
 
-                        for testcase in stats.get("testcases", []):
+                        testcases_in_file = stats.get("testcases", [])
+                        if testcases_in_file:
+                            files_with_testcases += 1
+                            total_testcases_found += len(testcases_in_file)
+
+                        for testcase in testcases_in_file:
                             normalized = self._normalize_testcase_identifier(
                                 testcase.get("classname"),
                                 testcase.get("name"),
@@ -738,6 +749,9 @@ class PhysicalValidator:
                     test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
                     logger.warning(f"Failed to parse test report {report_file}: {e}")
 
+            logger.info(f"📊 Debug: Found {total_testcases_found} total testcases in {files_with_testcases} files")
+            logger.info(f"📊 Collected {len(unique_cases)} unique test cases from all XML files")
+
             if unique_cases:
                 # Preserve raw metrics before overwriting with deduplicated counts
                 test_result["raw_total_tests"] = test_result["total_tests"]
@@ -756,6 +770,12 @@ class PhysicalValidator:
                         test_result["unique_error_tests"] += 1
                     elif status == "skipped":
                         test_result["unique_skipped_tests"] += 1
+
+                # Log deduplication results
+                logger.info(f"📊 Test deduplication complete:")
+                logger.info(f"   Raw test count: {test_result['raw_total_tests']} (from XML files)")
+                logger.info(f"   Unique test count: {test_result['unique_tests']} (after deduplication)")
+                logger.info(f"   Deduplication ratio: {test_result['raw_total_tests'] / test_result['unique_tests']:.1f}x")
 
                 # Switch primary metrics to deduplicated values for downstream reporting
                 if test_result["unique_tests"] > 0:
@@ -890,6 +910,10 @@ class PhysicalValidator:
             logger.warning(f"Data extraction error in {file_path}: {e}")
             # Try fallback extraction for other errors too
             return self._extract_test_stats_fallback(xml_content, file_path)
+        except Exception as e:
+            logger.warning(f"Unexpected error parsing {file_path}: {e}")
+            # Always try fallback rather than losing data
+            return self._extract_test_stats_fallback(xml_content, file_path)
 
     def _check_modules_without_tests(self, project_dir: str, report_dirs: List[str]) -> List[str]:
         """
@@ -971,6 +995,9 @@ class PhysicalValidator:
                     "status": status,
                 }
             )
+        # Debug logging
+        if len(cases) > 0:
+            logger.debug(f"Collected {len(cases)} testcases from {file_path}")
         return cases
 
     @staticmethod
@@ -1037,6 +1064,38 @@ class PhysicalValidator:
             testsuite_pattern = r'<testsuite[^>]*?>'
             match = re.search(testsuite_pattern, xml_content, re.IGNORECASE)
 
+            testcase_entries = []
+
+            # Try to extract individual testcases with regex for deduplication
+            # Extract all testcase tags first
+            testcase_tags = re.findall(r'<testcase\s+[^>]*?/?>', xml_content, re.IGNORECASE | re.DOTALL)
+
+            for testcase_tag in testcase_tags:
+                # Extract name and classname from each tag (order-independent)
+                # Use word boundary \b to ensure we match the attribute name correctly
+                name_match = re.search(r'\bname=["\']([^"\']*)["\']', testcase_tag)
+                classname_match = re.search(r'\bclassname=["\']([^"\']*)["\']', testcase_tag)
+
+                # Both name and classname are important for deduplication
+                if name_match and classname_match:
+                    name = name_match.group(1)
+                    classname = classname_match.group(1)
+
+                    testcase_entries.append({
+                        "name": name,
+                        "classname": classname,
+                        "file": file_path,
+                        "status": "passed"  # Default to passed in fallback
+                    })
+                elif name_match:
+                    # If only name is found, still add it
+                    testcase_entries.append({
+                        "name": name_match.group(1),
+                        "classname": "",
+                        "file": file_path,
+                        "status": "passed"
+                    })
+
             if match:
                 testsuite_tag = match.group(0)
 
@@ -1053,18 +1112,18 @@ class PhysicalValidator:
                     skipped = int(skipped_match.group(1)) if skipped_match else 0
                     passed = total - failures - errors - skipped
 
-                    logger.info(f"Recovered stats from malformed XML {file_path}: {total} tests")
+                    logger.info(f"Recovered stats from malformed XML {file_path}: {total} tests, {len(testcase_entries)} testcases")
                     return {
                         "total": total,
                         "passed": max(0, passed),
                         "failed": failures,
                         "errors": errors,
                         "skipped": skipped,
-                        "testcases": []
+                        "testcases": testcase_entries
                     }
 
             # If we can't extract from testsuite, try counting testcase tags as last resort
-            testcase_count = len(re.findall(r'<testcase\s', xml_content))
+            testcase_count = len(testcase_entries)
             if testcase_count > 0:
                 logger.info(f"Counted {testcase_count} testcase tags in {file_path}")
                 # We can't determine pass/fail from just counting tags
@@ -1074,7 +1133,7 @@ class PhysicalValidator:
                     "failed": 0,
                     "errors": 0,
                     "skipped": 0,
-                    "testcases": []
+                    "testcases": testcase_entries
                 }
 
         except Exception as e:
@@ -1083,7 +1142,7 @@ class PhysicalValidator:
         # Return zeros instead of None to prevent losing the file entirely
         # This way we at least know a file existed even if we couldn't parse it
         logger.warning(f"Could not extract any test data from {file_path}, returning zeros")
-        return {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+        return {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0, "testcases": []}
 
     def validate_build_status(self, project_name: str) -> Dict[str, any]:
         """
@@ -1263,14 +1322,100 @@ class PhysicalValidator:
 
         return result
     
+    def validate_project_analysis_status(self, project_name: str = None) -> Dict[str, any]:
+        """
+        Validate whether project analysis has been performed.
+
+        Checks for presence of static test count and other analysis markers
+        in the trunk context to determine if project_analyzer was run.
+
+        Args:
+            project_name: Optional project name for context
+
+        Returns:
+            Dictionary with:
+                - analyzed: Boolean indicating if analysis was performed
+                - has_static_test_count: Boolean for test count presence
+                - static_test_count: The actual count if available
+                - missing_analysis_prompt: Suggested prompt to inject if not analyzed
+        """
+        result = {
+            "analyzed": False,
+            "has_static_test_count": False,
+            "static_test_count": None,
+            "missing_analysis_prompt": None,
+            "trunk_context_found": False
+        }
+
+        try:
+            # Try to find and load trunk context
+            trunk_file_cmd = f"ls {self.project_path}/.setup_agent/contexts/trunk_*.json 2>/dev/null | head -1"
+            trunk_file_result = self._execute_command_with_logging(trunk_file_cmd, "finding trunk context file")
+
+            if not trunk_file_result['success'] or not trunk_file_result.get('output'):
+                logger.warning("No trunk context file found - project analysis likely not performed")
+                result["missing_analysis_prompt"] = (
+                    "🚨 CRITICAL: Project analysis has NOT been performed yet! "
+                    "You MUST run project_analyzer(action='analyze') immediately to count static tests "
+                    "and generate an intelligent execution plan. This is REQUIRED for accurate reporting."
+                )
+                return result
+
+            trunk_file = trunk_file_result['output'].strip()
+            result["trunk_context_found"] = True
+
+            # Load and parse trunk context
+            load_cmd = f"cat {trunk_file}"
+            load_result = self._execute_command_with_logging(load_cmd, "loading trunk context")
+
+            if load_result['success'] and load_result.get('output'):
+                import json
+                try:
+                    trunk_data = json.loads(load_result['output'])
+                    env_summary = trunk_data.get('environment_summary', {})
+
+                    # Check for static test count
+                    static_test_count = env_summary.get('static_test_count')
+                    if static_test_count is not None:
+                        result["has_static_test_count"] = True
+                        result["static_test_count"] = static_test_count
+                        result["analyzed"] = True
+                        logger.info(f"✅ Project analysis found: {static_test_count} static tests detected")
+                    else:
+                        logger.warning("⚠️ Trunk context exists but no static_test_count found")
+                        result["missing_analysis_prompt"] = (
+                            "⚠️ WARNING: Project analysis appears incomplete. Static test count is missing! "
+                            "Please run project_analyzer(action='analyze', project_path='/workspace/{project}') "
+                            "to properly analyze the project and count all test methods. "
+                            "This is essential for accurate test coverage reporting."
+                        )
+
+                    # Check for other analysis markers
+                    if env_summary.get('project_type') or env_summary.get('build_system'):
+                        result["analyzed"] = True  # At least partial analysis was done
+
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse trunk context JSON: {e}")
+
+        except Exception as e:
+            logger.error(f"Error validating project analysis status: {e}")
+
+        if not result["analyzed"] and not result["missing_analysis_prompt"]:
+            result["missing_analysis_prompt"] = (
+                "📊 REMINDER: Run project_analyzer tool to get accurate static test counts "
+                "for better reporting. This helps track test coverage and execution rates."
+            )
+
+        return result
+
     def parse_test_reports_with_metrics(self, project_dir: str) -> Dict[str, any]:
         """
         Enhanced test report parsing with pass rate calculations and exclusion detection.
         Extends the existing parse_test_reports with additional metrics.
-        
+
         Args:
             project_dir: Project directory path
-            
+
         Returns:
             Dictionary with enhanced test statistics including:
                 - All fields from parse_test_reports
@@ -1279,14 +1424,14 @@ class PhysicalValidator:
         """
         # Start with the base test report parsing
         base_result = self.parse_test_reports(project_dir)
-        
+
         # Add enhanced metrics
         base_result['test_exclusions'] = self._detect_test_exclusions(project_dir)
 
         # We don't calculate coverage - that's about test quality, not our concern
         # SAG only cares that tests were executed, not how comprehensive they are
         # The actual test count from reports is the only truth we need
-        
+
         return base_result
     
     def calculate_test_pass_rate(self, test_metrics: Dict[str, any]) -> float:
