@@ -697,7 +697,7 @@ class ReportTool(BaseTool):
             try:
                 trunk_context = self.context_manager.load_trunk_context()
                 if trunk_context and trunk_context.environment_summary:
-                    # Get the accurate total test count (includes expansions)
+                    # Get the static test method count collected during analysis
                     static_test_count = trunk_context.environment_summary.get('static_test_count')
                     # Get the method count for comparison
                     method_count = trunk_context.environment_summary.get('method_count')
@@ -705,8 +705,8 @@ class ReportTool(BaseTool):
                     parameterized_info = trunk_context.environment_summary.get('parameterized_info', {})
 
                     if static_test_count:
-                        logger.info(f"📊 Retrieved test counts from trunk context:")
-                        logger.info(f"   - Total test cases: {static_test_count} (includes expansions)")
+                        logger.info("📊 Retrieved test counts from trunk context:")
+                        logger.info(f"   - Declared test methods: {static_test_count}")
                         if method_count and method_count != static_test_count:
                             logger.info(f"   - Method annotations: {method_count}")
             except Exception as e:
@@ -724,33 +724,65 @@ class ReportTool(BaseTool):
                 return None
 
         tests_counts = aggregate.get('tests', {}) or {}
-        tests_total = tests_counts.get('total')
-        tests_failed = tests_counts.get('failed')
-        tests_error = tests_counts.get('error')
-        tests_skipped = tests_counts.get('skipped')
-        tests_passed = tests_counts.get('passed')
-        pass_pct = aggregate.get('pass_pct')
+        aggregate_total = tests_counts.get('total')
+        aggregate_passed = tests_counts.get('passed')
+        aggregate_failed = tests_counts.get('failed')
+        aggregate_error = tests_counts.get('error')
+        aggregate_skipped = tests_counts.get('skipped')
+        aggregate_pass_pct = aggregate.get('pass_pct')
 
         physical_validation = actual_accomplishments.get('physical_validation', {}) or {}
         test_analysis = physical_validation.get('test_analysis', {}) or {}
 
+        tests_total = test_analysis.get('total_tests')
+        tests_failed = test_analysis.get('failed_tests')
+        tests_error = test_analysis.get('error_tests')
+        tests_skipped = test_analysis.get('skipped_tests')
+        tests_passed = test_analysis.get('passed_tests')
+        pass_pct = (
+            test_analysis.get('pass_rate')
+            or test_analysis.get('pass_pct')
+            or test_analysis.get('pass_percentage')
+        )
+
+        raw_total_tests = test_analysis.get('raw_total_tests')
+        raw_passed_tests = test_analysis.get('raw_passed_tests')
+        raw_failed_tests = test_analysis.get('raw_failed_tests')
+        raw_error_tests = test_analysis.get('raw_error_tests')
+        raw_skipped_tests = test_analysis.get('raw_skipped_tests')
+
         if tests_total is None:
-            tests_total = test_analysis.get('total_tests')
-        if tests_failed is None:
-            tests_failed = test_analysis.get('failed_tests')
-        if tests_error is None:
-            tests_error = test_analysis.get('error_tests')
-        if tests_skipped is None:
-            tests_skipped = test_analysis.get('skipped_tests')
+            tests_total = aggregate_total
+        else:
+            if raw_total_tests is None and aggregate_total is not None:
+                raw_total_tests = aggregate_total
+
         if tests_passed is None:
-            tests_passed = test_analysis.get('passed_tests')
+            tests_passed = aggregate_passed
+        else:
+            if raw_passed_tests is None and aggregate_passed is not None:
+                raw_passed_tests = aggregate_passed
+
+        if tests_failed is None:
+            tests_failed = aggregate_failed
+        else:
+            if raw_failed_tests is None and aggregate_failed is not None:
+                raw_failed_tests = aggregate_failed
+
+        if tests_error is None:
+            tests_error = aggregate_error
+        else:
+            if raw_error_tests is None and aggregate_error is not None:
+                raw_error_tests = aggregate_error
+
+        if tests_skipped is None:
+            tests_skipped = aggregate_skipped
+        else:
+            if raw_skipped_tests is None and aggregate_skipped is not None:
+                raw_skipped_tests = aggregate_skipped
 
         if pass_pct is None:
-            pass_pct = (
-                test_analysis.get('pass_rate')
-                or test_analysis.get('pass_pct')
-                or test_analysis.get('pass_percentage')
-            )
+            pass_pct = aggregate_pass_pct
 
         if pass_pct is None and tests_total and tests_passed is not None:
             try:
@@ -772,41 +804,51 @@ class ReportTool(BaseTool):
             'test': actual_accomplishments.get('test_success', False),
         }
 
-        # Calculate test metrics with accurate counting
-        # static_test_count is now the TRUE total (including parameterized expansions)
-        # So execution_rate should be close to 100% if all tests run
+        # Calculate test metrics with consistent counting
+        # static_test_count reflects the number of declared test methods
+        # execution_rate therefore measures method-level coverage
         execution_rate = None
         expansion_factor = None
 
-        if static_test_count and tests_total is not None:
-            try:
-                # Now this is a TRUE execution rate since static_test_count includes expansions
-                execution_rate = (to_int(tests_total) / static_test_count) * 100
+        executed_tests = to_int(tests_total)
+        raw_executed_tests = to_int(raw_total_tests)
 
-                # If we have method_count, calculate the expansion factor
-                if method_count:
-                    expansion_factor = static_test_count / method_count
-                    logger.info(f"📊 Test Analysis:")
-                    logger.info(f"   - Total test cases: {static_test_count} (includes expansions)")
-                    logger.info(f"   - Executed: {to_int(tests_total)}")
-                    logger.info(f"   - Execution rate: {execution_rate:.1f}%")
-                    if expansion_factor > 1.1:
-                        logger.info(f"   - Expansion factor: {expansion_factor:.1f}x (from {method_count} methods)")
-                else:
-                    logger.info(f"📊 Test Coverage: {execution_rate:.1f}% ({to_int(tests_total)} of {static_test_count} tests executed)")
+        if static_test_count and executed_tests is not None:
+            try:
+                execution_rate = (executed_tests / static_test_count) * 100
+                logger.info(f"📊 Test Coverage: {execution_rate:.1f}% ({executed_tests} of {static_test_count} tests executed)")
             except (TypeError, ZeroDivisionError):
                 execution_rate = None
+
+        if raw_executed_tests and executed_tests and raw_executed_tests > executed_tests:
+            try:
+                expansion_factor = raw_executed_tests / executed_tests
+                logger.info(f"📊 Parameterized expansion detected: {raw_executed_tests} raw runs vs {executed_tests} deduplicated")
+                logger.info(f"   - Average expansions per test: {expansion_factor:.2f}x")
+            except ZeroDivisionError:
                 expansion_factor = None
+        elif method_count and executed_tests is not None and method_count:
+            try:
+                # Provide coverage relative to declared methods when deduplicated counts are available
+                method_coverage = (executed_tests / method_count) * 100
+                logger.info(f"📊 Method coverage: {method_coverage:.1f}% ({executed_tests} of {method_count} methods)")
+            except ZeroDivisionError:
+                pass
         
         status = {
             'overall': verified_status,
             'tests_total': to_int(tests_total),
+            'tests_total_raw': to_int(raw_total_tests),
             'tests_passed': to_int(tests_passed),
+            'tests_passed_raw': to_int(raw_passed_tests),
             'tests_failed': to_int(tests_failed),
+            'tests_failed_raw': to_int(raw_failed_tests),
             'tests_errors': to_int(tests_error),
+            'tests_errors_raw': to_int(raw_error_tests),
             'tests_skipped': to_int(tests_skipped),
+            'tests_skipped_raw': to_int(raw_skipped_tests),
             'pass_pct': pass_pct,
-            'static_test_count': static_test_count,  # Now the TRUE total with expansions
+            'static_test_count': static_test_count,
             'method_count': method_count,  # Original method annotations
             'execution_rate': execution_rate,
             'expansion_factor': expansion_factor,
@@ -3353,13 +3395,14 @@ class ReportTool(BaseTool):
             build_msg = f"{build_status} No artifacts"
         
         # Test metrics - now with accurate counting
-        static_count = status.get('static_test_count', 0)  # TRUE total with expansions
-        method_count = status.get('method_count', 0)  # Original methods
+        static_count = status.get('static_test_count', 0)
+        method_count = status.get('method_count', 0)
         executed = status.get('tests_total', 0)
+        raw_executed = status.get('tests_total_raw', 0)
         passed = status.get('tests_passed', 0)
         exec_rate = status.get('execution_rate')
-        pass_rate = status.get('pass_pct')
         expansion_factor = status.get('expansion_factor')
+        pass_rate = status.get('pass_pct')
 
         # Module coverage
         modules_expected = status.get('modules_expected')
@@ -3372,16 +3415,15 @@ class ReportTool(BaseTool):
         lines.append(f"│ Build           │ {build_msg:<32} │")
 
         if static_count:
-            # Show accurate total test count
-            if method_count and expansion_factor and expansion_factor > 1.1:
-                # Show that we have parameterized tests
-                test_count_msg = f"📊 {static_count} tests ({method_count} methods)"
-            else:
-                test_count_msg = f"📊 {static_count} test cases"
+            test_count_msg = f"📊 {static_count} test methods"
             lines.append(f"│ Total Tests     │ {test_count_msg:<32} │")
 
+        if raw_executed and raw_executed > executed and expansion_factor:
+            raw_msg = f"🔄 {raw_executed} raw runs (~{expansion_factor:.1f}x)"
+            lines.append(f"│ Raw Executions  │ {raw_msg:<32} │")
+
         if exec_rate is not None and static_count:
-            # Now exec_rate is accurate since static_count is the TRUE total
+            # Execution rate now reflects coverage of static test methods
             exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
             exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count})"
             lines.append(f"│ Execution Rate  │ {exec_msg:<32} │")
@@ -3418,28 +3460,27 @@ class ReportTool(BaseTool):
                      "| Metric | Value | Calculation | Status |",
                      "|--------|-------|-------------|--------|"])
         
-        static_count = status.get('static_test_count', 0)  # TRUE total with expansions
-        method_count = status.get('method_count', 0)  # Original method annotations
+        static_count = status.get('static_test_count', 0)
+        method_count = status.get('method_count', 0)
         executed = status.get('tests_total', 0)
+        raw_executed = status.get('tests_total_raw', 0)
         passed = status.get('tests_passed', 0)
         exec_rate = status.get('execution_rate')
         pass_rate = status.get('pass_pct')
         expansion_factor = status.get('expansion_factor')
 
-        # Show the TRUE total test count
+        # Static test methods discovered during analysis
         if static_count:
-            lines.append(f"| **Total Test Cases** | {static_count} | Accurate count with parameterized expansions | 📊 |")
+            lines.append(f"| **Total Test Methods** | {static_count} | @Test-style annotations discovered | 📊 |")
 
-        # Show method count if different from total (indicating parameterization)
-        if method_count and method_count != static_count:
-            lines.append(f"| **Test Methods** | {method_count} | @Test, @ParameterizedTest annotations | 📝 |")
-            if expansion_factor and expansion_factor > 1:
-                lines.append(f"| **Expansion Factor** | {expansion_factor:.1f}x | Parameterized test multiplier | 🔄 |")
+        # Highlight raw executions when we detected parameterization at runtime
+        if raw_executed and raw_executed > executed and expansion_factor and expansion_factor > 1:
+            lines.append(f"| **Raw Test Executions** | {raw_executed} | Reported by test runner (~{expansion_factor:.1f}x) | 🔄 |")
 
-        lines.append(f"| **Tests Executed** | {executed} | Runtime execution count | {'✅' if exec_rate and exec_rate >= 95 else '⚠️' if exec_rate and exec_rate >= 80 else '❌' if exec_rate else '📊'} |")
+        lines.append(f"| **Tests Executed** | {executed} | Deduplicated runtime count | {'✅' if exec_rate and exec_rate >= 95 else '⚠️' if exec_rate and exec_rate >= 80 else '❌' if exec_rate else '📊'} |")
         lines.append(f"| **Tests Passed** | {passed} | Successful test count | ✅ |")
 
-        # Now the execution rate makes sense as static_count is the TRUE total
+        # Execution rate now measures coverage of declared test methods
         if exec_rate is not None and static_count:
             exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
             actual_tests_run = int(exec_rate * static_count / 100)
@@ -3516,6 +3557,7 @@ class ReportTool(BaseTool):
         
         pass_rate = status.get('pass_pct')
         exec_rate = status.get('execution_rate')
+        expansion_factor = status.get('expansion_factor')
         
         if pass_rate and pass_rate >= 95:
             lines.append(f"- ✅ **High Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
@@ -3523,10 +3565,11 @@ class ReportTool(BaseTool):
             lines.append(f"- ⚠️ **Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
         
         if exec_rate:
-            if exec_rate > 100:
-                lines.append(f"- ℹ️ **Parameterized Tests Detected:** Execution rate {format_percentage(exec_rate)} indicates tests with multiple parameters")
-            elif exec_rate < 90:
+            if exec_rate < 90:
                 lines.append(f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run")
+
+        if expansion_factor and expansion_factor > 1:
+            lines.append(f"- ℹ️ **Parameterized Tests Detected:** Runtime produced ~{expansion_factor:.1f}× more executions than unique tests")
         
         modules_expected = status.get('modules_expected')
         modules_seen = status.get('modules_seen', 0)
