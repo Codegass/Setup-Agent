@@ -46,7 +46,9 @@ class ReActStep(BaseModel):
 class ReActEngine:
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
-    def __init__(self, context_manager: ContextManager, tools: List[BaseTool], repository_url: str = None):
+    def __init__(
+        self, context_manager: ContextManager, tools: List[BaseTool], repository_url: str = None
+    ):
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
@@ -65,19 +67,19 @@ class ReActEngine:
         self.recent_tool_executions = []
         self.max_recent_executions = 10
         self._force_thinking_next = False
-        
+
         # CRITICAL: Flag to force thinking after successful tool execution
         self._force_thinking_after_success = False
-        
+
         # State memory for successful operations
         self.successful_states = {
-            'working_directory': None,  # Last successful working directory
-            'cloned_repos': set(),      # Set of successfully cloned repo URLs
-            'project_type': None,       # Detected project type
-            'maven_success': False,     # Whether maven operations succeeded
-            'excluded_modules': set(),
-            'excluded_tests': set(),
-            'report_snapshot': None,
+            "working_directory": None,  # Last successful working directory
+            "cloned_repos": set(),  # Set of successfully cloned repo URLs
+            "project_type": None,  # Detected project type
+            "maven_success": False,  # Whether maven operations succeeded
+            "excluded_modules": set(),
+            "excluded_tests": set(),
+            "report_snapshot": None,
         }
 
         # Agent logger for detailed traces
@@ -88,34 +90,44 @@ class ReActEngine:
 
         # Check function calling support
         self._check_function_calling_support()
-        
+
         # PERFORMANCE: Cache trunk context to avoid frequent file I/O
         self._cached_trunk_context = None
         self._trunk_context_cache_timestamp = None
-        
+
         # Initialize the centralized state evaluator (will be updated with physical validator after initialization)
         self.state_evaluator = AgentStateEvaluator(self.context_manager)
-        
+
         # Initialize output storage manager
         from pathlib import Path
-        contexts_dir = Path(self.context_manager.contexts_dir) if hasattr(self.context_manager, 'contexts_dir') else Path("/workspace/.setup_agent/contexts")
+
+        contexts_dir = (
+            Path(self.context_manager.contexts_dir)
+            if hasattr(self.context_manager, "contexts_dir")
+            else Path("/workspace/.setup_agent/contexts")
+        )
         # Pass orchestrator to OutputStorageManager for container file operations
-        orchestrator = self.context_manager.orchestrator if hasattr(self.context_manager, 'orchestrator') else None
+        orchestrator = (
+            self.context_manager.orchestrator
+            if hasattr(self.context_manager, "orchestrator")
+            else None
+        )
         self.output_storage = OutputStorageManager(contexts_dir, orchestrator=orchestrator)
-        
+
         # Initialize physical validator for fact-based validation
         self.physical_validator = PhysicalValidator(
-            docker_orchestrator=orchestrator,
-            project_path="/workspace"
+            docker_orchestrator=orchestrator, project_path="/workspace"
         )
-        
+
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
         # Initialize token tracker for monitoring LLM usage
         self.token_tracker = TokenTracker()
 
-        logger.info("ReAct Engine initialized with dual model support, physical validation, and token tracking")
+        logger.info(
+            "ReAct Engine initialized with dual model support, physical validation, and token tracking"
+        )
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
         if repository_url:
@@ -248,7 +260,7 @@ class ReActEngine:
                 if hasattr(message, "tool_calls") and message.tool_calls:
                     for tool_call in message.tool_calls:
                         function_name = tool_call.function.name
-                        
+
                         # Strip OpenAI namespace prefix if present
                         if function_name.startswith("functions."):
                             function_name = function_name[10:]  # Remove "functions." prefix
@@ -300,7 +312,7 @@ class ReActEngine:
         # Initialize with the initial prompt
         self.steps = []
         self.current_iteration = 0
-        
+
         # PERFORMANCE: Initialize trunk context cache at start
         self._invalidate_trunk_cache()  # Ensure fresh start
         self._get_cached_trunk_context()  # Load initial cache
@@ -338,19 +350,21 @@ class ReActEngine:
 
                 # Execute the steps
                 success = self._execute_steps(parsed_steps)
-                
+
                 # CENTRALIZED STATE EVALUATION: Replace all scattered checks
                 state_analysis = self.state_evaluator.evaluate(
                     steps=self.steps,
                     current_iteration=self.current_iteration,
                     recent_tool_executions=self.recent_tool_executions,
-                    steps_since_context_switch=self.steps_since_context_switch
+                    steps_since_context_switch=self.steps_since_context_switch,
                 )
-                
+
                 # Handle guidance based on state analysis
                 if state_analysis.needs_guidance:
-                    self._add_system_guidance(state_analysis.guidance_message, state_analysis.guidance_priority)
-                
+                    self._add_system_guidance(
+                        state_analysis.guidance_message, state_analysis.guidance_priority
+                    )
+
                 # Check for task completion
                 if state_analysis.is_task_complete:
                     self.agent_logger.info("Task completed successfully")
@@ -361,7 +375,7 @@ class ReActEngine:
                 # DEPRECATED: Legacy checks now handled by state_evaluator
                 # Check for context switching guidance
                 # self._check_context_switching_guidance()
-                
+
                 # Check if model needs explicit action guidance
                 # if self._needs_action_guidance():
                 #     self._add_action_guidance()
@@ -376,7 +390,9 @@ class ReActEngine:
                 # Don't count pure thinking steps toward context switch threshold
                 if parsed_steps and any(step.step_type == StepType.ACTION for step in parsed_steps):
                     self.steps_since_context_switch += 1
-                    logger.debug(f"Incremented steps_since_context_switch to {self.steps_since_context_switch} after ACTION step")
+                    logger.debug(
+                        f"Incremented steps_since_context_switch to {self.steps_since_context_switch} after ACTION step"
+                    )
 
             logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
             # Export token usage before max iterations completion
@@ -396,17 +412,17 @@ class ReActEngine:
             self._force_thinking_after_success = False  # Reset the flag
             logger.info("Using thinking model to analyze successful tool execution results")
             return True
-            
+
         # Check if thinking model was explicitly requested due to repetitive execution
         if self._force_thinking_next:
             self._force_thinking_next = False  # Reset the flag
             logger.info("Using thinking model due to repetitive execution detection")
             return True
-        
+
         # CRITICAL: ReAct Architecture Enforcement
         # Thinking model = ANALYSIS and PLANNING (after observations)
         # Action model = EXECUTION (after thinking)
-        
+
         # Always start with thinking model for initial analysis
         if len(self.steps) == 0:
             logger.info("Using thinking model for initial analysis")
@@ -414,12 +430,12 @@ class ReActEngine:
 
         # ENFORCE PROPER REACT SEQUENCE: OBSERVATION → THINKING → ACTION → OBSERVATION
         last_step = self.steps[-1] if self.steps else None
-        
+
         if last_step and last_step.step_type == StepType.OBSERVATION:
             # After observation, always analyze with thinking model
             logger.info("Using thinking model to analyze observation results")
             return True
-            
+
         if last_step and last_step.step_type == StepType.THOUGHT:
             # After thinking, switch to action model for execution
             logger.info("Switching to action model for tool execution after analysis")
@@ -428,7 +444,8 @@ class ReActEngine:
         # Use thinking model when we encounter errors (need analysis)
         recent_steps = self.steps[-3:] if len(self.steps) >= 3 else self.steps
         recent_errors = [
-            s for s in recent_steps
+            s
+            for s in recent_steps
             if s.step_type == StepType.ACTION and s.tool_result and not s.tool_result.success
         ]
 
@@ -450,11 +467,15 @@ class ReActEngine:
                     # GPT-5 models use reasoning_effort instead of temperature and max_tokens
                     request_params = {
                         "model": model,
-                        "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
+                        "messages": [
+                            {"role": "user", "content": self._build_thinking_model_prompt(prompt)}
+                        ],
                         "reasoning_effort": self.config.gpt5_reasoning_effort,
                         "drop_params": True,  # Safely ignore unsupported parameters
                     }
-                    logger.info(f"Using GPT-5 parameters for thinking model: reasoning_effort={self.config.gpt5_reasoning_effort}")
+                    logger.info(
+                        f"Using GPT-5 parameters for thinking model: reasoning_effort={self.config.gpt5_reasoning_effort}"
+                    )
                 else:
                     # Traditional models use temperature and max_tokens
                     temperature = self.config.thinking_temperature
@@ -472,7 +493,9 @@ class ReActEngine:
 
                     request_params = {
                         "model": model,
-                        "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
+                        "messages": [
+                            {"role": "user", "content": self._build_thinking_model_prompt(prompt)}
+                        ],
                         "temperature": temperature,
                         "max_tokens": max_tokens,
                         **thinking_config,
@@ -494,7 +517,12 @@ class ReActEngine:
                         logger.info("Falling back to traditional parameters for thinking model")
                         fallback_params = {
                             "model": model,
-                            "messages": [{"role": "user", "content": self._build_thinking_model_prompt(prompt)}],
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": self._build_thinking_model_prompt(prompt),
+                                }
+                            ],
                             "temperature": self.config.thinking_temperature,
                             "max_tokens": self.config.thinking_max_tokens,
                             "drop_params": True,  # Safely ignore unsupported parameters
@@ -512,11 +540,15 @@ class ReActEngine:
                     # GPT-5 models use reasoning_effort instead of temperature and max_tokens
                     request_params = {
                         "model": model,
-                        "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
+                        "messages": [
+                            {"role": "user", "content": self._build_action_model_prompt(prompt)}
+                        ],
                         "reasoning_effort": self.config.gpt5_reasoning_effort,
                         "drop_params": True,  # Safely ignore unsupported parameters
                     }
-                    logger.info(f"Using GPT-5 parameters for action model: reasoning_effort={self.config.gpt5_reasoning_effort}")
+                    logger.info(
+                        f"Using GPT-5 parameters for action model: reasoning_effort={self.config.gpt5_reasoning_effort}"
+                    )
                 else:
                     # Traditional models use temperature and max_tokens
                     temperature = self.config.action_temperature
@@ -532,7 +564,9 @@ class ReActEngine:
                     # Build parameters for the request
                     request_params = {
                         "model": model,
-                        "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
+                        "messages": [
+                            {"role": "user", "content": self._build_action_model_prompt(prompt)}
+                        ],
                         "temperature": temperature,
                         "max_tokens": max_tokens,
                     }
@@ -558,10 +592,12 @@ class ReActEngine:
                         logger.debug(
                             f"Using {model_type} function calling with {len(tools_schema)} tools"
                         )
-                        
+
                         # Log first tool schema for debugging
                         if tools_schema and self.config.verbose:
-                            logger.debug(f"First tool schema: {json.dumps(tools_schema[0], indent=2)}")
+                            logger.debug(
+                                f"First tool schema: {json.dumps(tools_schema[0], indent=2)}"
+                            )
 
                 # Make the API call with error handling for GPT-5 models
                 try:
@@ -577,7 +613,9 @@ class ReActEngine:
                         # Build fallback parameters with traditional settings
                         fallback_params = {
                             "model": model,
-                            "messages": [{"role": "user", "content": self._build_action_model_prompt(prompt)}],
+                            "messages": [
+                                {"role": "user", "content": self._build_action_model_prompt(prompt)}
+                            ],
                             "temperature": self.config.action_temperature,
                             "max_tokens": self.config.action_max_tokens,
                             "drop_params": True,  # Safely ignore unsupported parameters
@@ -599,9 +637,9 @@ class ReActEngine:
             message = response.choices[0].message
             logger.debug(f"Response message attributes: {dir(message)}")
             logger.debug(f"Has tool_calls: {hasattr(message, 'tool_calls')}")
-            if hasattr(message, 'tool_calls'):
+            if hasattr(message, "tool_calls"):
                 logger.debug(f"Tool calls value: {message.tool_calls}")
-            
+
             # Handle function calling response
             if (
                 hasattr(response.choices[0].message, "tool_calls")
@@ -618,7 +656,7 @@ class ReActEngine:
 
             content_str = content if content is not None else ""
             self.agent_logger.info(f"LLM Response from {model}: {len(content_str)} chars")
-            
+
             # Always log the full response content
             logger.info(f"Full LLM Response from {model}:")
             logger.info(content_str)
@@ -643,187 +681,208 @@ class ReActEngine:
         """Try to parse JSON function calls from content when function calling format is not used."""
         try:
             # Look for JSON patterns that might be function calls
-            lines = content.strip().split('\n')
+            lines = content.strip().split("\n")
             parsed_parts = []
             i = 0
-            
+
             while i < len(lines):
                 stripped = lines[i].strip()
-                
+
                 # Check if this line contains a JSON object with various formats
-                if stripped.startswith('{') and stripped.endswith('}'):
+                if stripped.startswith("{") and stripped.endswith("}"):
                     try:
                         json_obj = json.loads(stripped)
                         function_name = None
                         function_args = {}
-                        
+
                         # Format 1: {"tool": "tool_name", "action": "action_name", ...}
-                        if 'tool' in json_obj:
-                            function_name = json_obj['tool']
+                        if "tool" in json_obj:
+                            function_name = json_obj["tool"]
                             # Convert all other fields to arguments, with special handling for common patterns
-                            function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
-                            
+                            function_args = {k: v for k, v in json_obj.items() if k != "tool"}
+
                             # If there's only an action, it might be a parameter
-                            if len(function_args) == 1 and 'action' in function_args:
-                                function_args = {'action': function_args['action']}
-                        
+                            if len(function_args) == 1 and "action" in function_args:
+                                function_args = {"action": function_args["action"]}
+
                         # Format 2: Standard format: {"name": "tool_name", "arguments": {...}}
-                        elif 'name' in json_obj and 'arguments' in json_obj:
-                            function_name = json_obj['name']
-                            function_args = json_obj['arguments']
-                        
+                        elif "name" in json_obj and "arguments" in json_obj:
+                            function_name = json_obj["name"]
+                            function_args = json_obj["arguments"]
+
                         # Format 2.5: Model thinking format: {"thought": "...", "action": "tool_name", "action_args": {...}}
-                        elif 'action' in json_obj and 'action_args' in json_obj:
-                            function_name = json_obj['action']
-                            function_args = json_obj['action_args']
+                        elif "action" in json_obj and "action_args" in json_obj:
+                            function_name = json_obj["action"]
+                            function_args = json_obj["action_args"]
                             # Also include the thought as a separate line if present
-                            if 'thought' in json_obj:
+                            if "thought" in json_obj:
                                 parsed_parts.append(f"THOUGHT: {json_obj['thought']}")
-                        
+
                         # Format 2.6: Alternative args format: {"action": "tool_name", "args": {...}}
-                        elif 'action' in json_obj and 'args' in json_obj:
-                            function_name = json_obj['action']
-                            function_args = json_obj['args']
-                        
+                        elif "action" in json_obj and "args" in json_obj:
+                            function_name = json_obj["action"]
+                            function_args = json_obj["args"]
+
                         # Format 3: Single tool name format: {"manage_context": {...}}
                         elif len(json_obj) == 1:
                             tool_name = list(json_obj.keys())[0]
                             if tool_name in self.tools:
                                 function_name = tool_name
-                                function_args = json_obj[tool_name] if isinstance(json_obj[tool_name], dict) else {}
-                        
+                                function_args = (
+                                    json_obj[tool_name]
+                                    if isinstance(json_obj[tool_name], dict)
+                                    else {}
+                                )
+
                         # Format 4: Simple parameter object (assume it's for the last mentioned tool)
-                        elif not function_name and any(key in json_obj for key in ['action', 'command', 'path', 'query']):
+                        elif not function_name and any(
+                            key in json_obj for key in ["action", "command", "path", "query"]
+                        ):
                             # Try to infer tool based on parameters
-                            if 'action' in json_obj:
-                                if json_obj.get('action') in ['read', 'write', 'append']:
-                                    function_name = 'file_io'
-                                elif json_obj.get('action') in ['get_info', 'switch_to_trunk', 'create_branch']:
-                                    function_name = 'manage_context'
-                                elif json_obj.get('action') in ['clone', 'detect_project_type']:
-                                    function_name = 'project_setup'
+                            if "action" in json_obj:
+                                if json_obj.get("action") in ["read", "write", "append"]:
+                                    function_name = "file_io"
+                                elif json_obj.get("action") in [
+                                    "get_info",
+                                    "switch_to_trunk",
+                                    "create_branch",
+                                ]:
+                                    function_name = "manage_context"
+                                elif json_obj.get("action") in ["clone", "detect_project_type"]:
+                                    function_name = "project_setup"
                                 function_args = json_obj
-                            elif 'command' in json_obj:
+                            elif "command" in json_obj:
                                 # Check if it's a maven command or bash command
-                                command = json_obj.get('command', '').lower()
-                                if any(cmd in command for cmd in ['compile', 'test', 'package', 'clean', 'install']):
-                                    function_name = 'maven'
+                                command = json_obj.get("command", "").lower()
+                                if any(
+                                    cmd in command
+                                    for cmd in ["compile", "test", "package", "clean", "install"]
+                                ):
+                                    function_name = "maven"
                                 else:
-                                    function_name = 'bash'
+                                    function_name = "bash"
                                 function_args = json_obj
-                            elif 'query' in json_obj:
-                                function_name = 'web_search'
+                            elif "query" in json_obj:
+                                function_name = "web_search"
                                 function_args = json_obj
-                        
+
                         if function_name:
                             # Format as ReAct ACTION
                             parsed_parts.append(f"ACTION: {function_name}")
                             parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                            logger.debug(f"Parsed JSON function call: {function_name} with args: {function_args}")
+                            logger.debug(
+                                f"Parsed JSON function call: {function_name} with args: {function_args}"
+                            )
                             i += 1
                             continue
-                            
+
                     except json.JSONDecodeError:
                         # Not valid JSON, treat as regular content
                         pass
-                
+
                 # Check for "ACTION:" followed by JSON on the next line
-                if stripped == 'ACTION:' and i + 1 < len(lines):
+                if stripped == "ACTION:" and i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
-                    if next_line.startswith('{') and next_line.endswith('}'):
+                    if next_line.startswith("{") and next_line.endswith("}"):
                         try:
                             json_obj = json.loads(next_line)
                             function_name = None
                             function_args = {}
-                            
+
                             # Try different JSON formats (same logic as above)
-                            if 'name' in json_obj and 'arguments' in json_obj:
-                                function_name = json_obj['name']
-                                function_args = json_obj['arguments']
-                            elif 'tool' in json_obj:
-                                function_name = json_obj['tool']
-                                function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
-                            
+                            if "name" in json_obj and "arguments" in json_obj:
+                                function_name = json_obj["name"]
+                                function_args = json_obj["arguments"]
+                            elif "tool" in json_obj:
+                                function_name = json_obj["tool"]
+                                function_args = {k: v for k, v in json_obj.items() if k != "tool"}
+
                             if function_name:
                                 parsed_parts.append(f"ACTION: {function_name}")
                                 parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                                logger.debug(f"Parsed ACTION JSON: {function_name} with args: {function_args}")
+                                logger.debug(
+                                    f"Parsed ACTION JSON: {function_name} with args: {function_args}"
+                                )
                                 i += 2  # Skip both lines
                                 continue
                         except json.JSONDecodeError:
                             pass
-                
-                # Check for patterns like "ACTION: {json}" 
-                if stripped.startswith('ACTION:'):
+
+                # Check for patterns like "ACTION: {json}"
+                if stripped.startswith("ACTION:"):
                     action_part = stripped[7:].strip()
-                    if action_part.startswith('{') and action_part.endswith('}'):
+                    if action_part.startswith("{") and action_part.endswith("}"):
                         try:
                             json_obj = json.loads(action_part)
                             function_name = None
                             function_args = {}
-                            
+
                             # Try different JSON formats
-                            if 'name' in json_obj and 'arguments' in json_obj:
-                                function_name = json_obj['name']
-                                function_args = json_obj['arguments']
-                            elif 'tool' in json_obj:
-                                function_name = json_obj['tool']
-                                function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
-                            
+                            if "name" in json_obj and "arguments" in json_obj:
+                                function_name = json_obj["name"]
+                                function_args = json_obj["arguments"]
+                            elif "tool" in json_obj:
+                                function_name = json_obj["tool"]
+                                function_args = {k: v for k, v in json_obj.items() if k != "tool"}
+
                             if function_name:
                                 parsed_parts.append(f"ACTION: {function_name}")
                                 parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                                logger.debug(f"Parsed ACTION JSON: {function_name} with args: {function_args}")
+                                logger.debug(
+                                    f"Parsed ACTION JSON: {function_name} with args: {function_args}"
+                                )
                                 i += 1
                                 continue
                         except json.JSONDecodeError:
                             pass
-                
+
                 # Check for markdown code blocks with JSON
-                if stripped.startswith('```json') and i + 1 < len(lines):
+                if stripped.startswith("```json") and i + 1 < len(lines):
                     # Find the end of the code block
                     json_lines = []
                     j = i + 1
-                    while j < len(lines) and not lines[j].strip().startswith('```'):
+                    while j < len(lines) and not lines[j].strip().startswith("```"):
                         json_lines.append(lines[j])
                         j += 1
-                    
+
                     if json_lines:
                         try:
-                            json_content = '\n'.join(json_lines).strip()
+                            json_content = "\n".join(json_lines).strip()
                             json_obj = json.loads(json_content)
                             function_name = None
                             function_args = {}
-                            
+
                             # Try different JSON formats
-                            if 'name' in json_obj and 'arguments' in json_obj:
-                                function_name = json_obj['name']
-                                function_args = json_obj['arguments']
-                            elif 'tool' in json_obj:
-                                function_name = json_obj['tool']
-                                function_args = {k: v for k, v in json_obj.items() if k != 'tool'}
-                            
+                            if "name" in json_obj and "arguments" in json_obj:
+                                function_name = json_obj["name"]
+                                function_args = json_obj["arguments"]
+                            elif "tool" in json_obj:
+                                function_name = json_obj["tool"]
+                                function_args = {k: v for k, v in json_obj.items() if k != "tool"}
+
                             if function_name:
                                 parsed_parts.append(f"ACTION: {function_name}")
                                 parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                                logger.debug(f"Parsed JSON code block: {function_name} with args: {function_args}")
+                                logger.debug(
+                                    f"Parsed JSON code block: {function_name} with args: {function_args}"
+                                )
                                 i = j + 1  # Skip past the closing ```
                                 continue
                         except json.JSONDecodeError:
                             pass
-                
+
                 # Keep non-JSON lines as-is (thoughts, etc.)
-                if stripped and not stripped.startswith('```'):
+                if stripped and not stripped.startswith("```"):
                     parsed_parts.append(stripped)
-                
+
                 i += 1
-            
+
             if parsed_parts:
-                return '\n'.join(parsed_parts)
-                
+                return "\n".join(parsed_parts)
+
         except Exception as e:
             logger.warning(f"Failed to parse JSON function calls: {e}")
-            
+
         return None
 
     def _build_initial_system_prompt(self) -> str:
@@ -1110,14 +1169,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
 ⚠️ CRITICAL: NEVER try to complete_task without first doing start_task!"""
 
-        
         # Add repository URL reminder if available
         if self.repository_url:
             prompt += f"""
 
 📂 REPOSITORY INFO: The target repository is {self.repository_url}
 🔧 Use this URL when cloning: project_setup(action="clone", repository_url="{self.repository_url}")"""
-        
+
         prompt += """
 
 🔄 REMEMBER THE CONTINUOUS CYCLE: 
@@ -1141,7 +1199,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
         # Split response into sections
         sections = re.split(r"\n\n(?=THOUGHT:|ACTION:|OBSERVATION:)", response.strip())
-        
+
         logger.debug(f"Split response into {len(sections)} sections")
         for i, section in enumerate(sections):
             logger.debug(f"Section {i+1}: {section}")
@@ -1170,7 +1228,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     continue
 
                 tool_name = action_lines[0][7:].strip()
-                
+
                 # Check for invalid tool names
                 if not tool_name or tool_name.lower() in ["none", "null", ""]:
                     # Convert to a thought with guidance
@@ -1213,16 +1271,22 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             content = response.strip()
             logger.info(f"Parsing failed, treating entire response as thought")
             logger.info(f"Full response content: {content}")
-            
+
             # CRITICAL: Maintain ReAct structure - thinking should lead to action in next iteration
             # Add system guidance to ensure proper model role separation
             if was_thinking_model:
                 # Thinking model should not attempt actions - guide towards pure analysis
-                enhanced_content = content + "\n\n[SYSTEM: This was pure analysis. Next step should be action execution by action model.]"
+                enhanced_content = (
+                    content
+                    + "\n\n[SYSTEM: This was pure analysis. Next step should be action execution by action model.]"
+                )
             else:
                 # Action model failed to format properly - provide formatting guidance
-                enhanced_content = content + "\n\n[SYSTEM: Action model must use proper tool call format: ACTION: tool_name, PARAMETERS: {...}]"
-            
+                enhanced_content = (
+                    content
+                    + "\n\n[SYSTEM: Action model must use proper tool call format: ACTION: tool_name, PARAMETERS: {...}]"
+                )
+
             steps.append(
                 ReActStep(
                     step_type=StepType.THOUGHT,
@@ -1253,7 +1317,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     try:
                         self.context_manager.add_to_branch_history(
                             self.context_manager.current_task_id,
-                            {"type": "thought", "content": step.content}
+                            {"type": "thought", "content": step.content},
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log thought to branch history: {e}")
@@ -1278,16 +1342,19 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     # Log unknown tool attempt to centralized error logger
                     try:
                         from agent.error_logger import ErrorLogger
+
                         error_logger = ErrorLogger.get_instance()
 
                         # Extract suggested tool from feedback
                         suggested_tool = None
                         if "Did you mean:" in unknown_feedback:
                             # Parse suggested tool from feedback
-                            lines = unknown_feedback.split('\n')
+                            lines = unknown_feedback.split("\n")
                             for line in lines:
                                 if "Did you mean:" in line:
-                                    suggested_tool = line.split("Did you mean:")[1].strip().rstrip('?')
+                                    suggested_tool = (
+                                        line.split("Did you mean:")[1].strip().rstrip("?")
+                                    )
                                     break
 
                         error_logger.log_unknown_tool(
@@ -1297,8 +1364,8 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                             context={
                                 "step_content": step.content,
                                 "tool_params": step.tool_params,
-                                "available_tools": list(self.tools.keys())
-                            }
+                                "available_tools": list(self.tools.keys()),
+                            },
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log unknown tool to error logger: {e}")
@@ -1308,102 +1375,134 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
                 # Execute the tool with parameter validation and self-healing
                 tool = self.tools[step.tool_name]
-                
+
                 # Validate and fix parameters
-                validated_params = self._validate_and_fix_parameters(step.tool_name, step.tool_params or {})
+                validated_params = self._validate_and_fix_parameters(
+                    step.tool_name, step.tool_params or {}
+                )
 
                 # Check for repetitive tool execution with ENHANCED graduated response
                 tool_signature = f"{step.tool_name}:{str(sorted(validated_params.items()))}"
                 repetition_level = self._get_repetition_level(tool_signature)
-                
+
                 if repetition_level > 0:
-                    recent_executions = [e for e in self.recent_tool_executions 
-                                       if e["signature"].startswith(step.tool_name + ':')]
+                    recent_executions = [
+                        e
+                        for e in self.recent_tool_executions
+                        if e["signature"].startswith(step.tool_name + ":")
+                    ]
                     failure_count = sum(1 for e in recent_executions if not e["success"])
-                    
+
                     # Level 1: Warning (3 repetitions)
                     if repetition_level == 1:
-                        logger.warning(f"Repetition level 1: {step.tool_name} called {len(recent_executions)} times")
+                        logger.warning(
+                            f"Repetition level 1: {step.tool_name} called {len(recent_executions)} times"
+                        )
                         # Continue execution but with warning
-                        
+
                     # Level 2: Guidance (4 repetitions)
                     elif repetition_level == 2:
-                        logger.warning(f"Repetition level 2: {step.tool_name} needs alternative approach")
+                        logger.warning(
+                            f"Repetition level 2: {step.tool_name} needs alternative approach"
+                        )
                         self._force_thinking_next = True
-                        guidance_msg = (f"Tool {step.tool_name} has been executed {len(recent_executions)} times with {failure_count} failures. "
-                                      f"Consider alternative approaches: ")
-                        guidance_msg += self._generate_alternative_suggestions(step.tool_name, validated_params, recent_executions)
-                        
+                        guidance_msg = (
+                            f"Tool {step.tool_name} has been executed {len(recent_executions)} times with {failure_count} failures. "
+                            f"Consider alternative approaches: "
+                        )
+                        guidance_msg += self._generate_alternative_suggestions(
+                            step.tool_name, validated_params, recent_executions
+                        )
+
                     # Level 3: Force break (5+ repetitions)
                     else:  # repetition_level >= 3
-                        logger.error(f"BREAKING INFINITE LOOP: {step.tool_name} called {len(recent_executions)} times")
-                        
+                        logger.error(
+                            f"BREAKING INFINITE LOOP: {step.tool_name} called {len(recent_executions)} times"
+                        )
+
                         # Check for specific patterns and apply targeted fixes
-                        if "update-alternatives" in str(recent_executions) or "java" in step.tool_name.lower():
+                        if (
+                            "update-alternatives" in str(recent_executions)
+                            or "java" in step.tool_name.lower()
+                        ):
                             logger.info("Detected Java configuration loop - attempting auto-fix")
                             return self._auto_fix_java_configuration()
-                        
+
                         # Force progression to next task
                         logger.info("Forcing progression to next task to break loop")
                         result = ToolResult(
                             success=False,
                             output=f"🛑 INFINITE LOOP BROKEN: {step.tool_name} was called {len(recent_executions)} times without progress.\n"
-                                  f"Failures: {failure_count}/{len(recent_executions)}\n"
-                                  f"Moving to next task to prevent resource waste.",
+                            f"Failures: {failure_count}/{len(recent_executions)}\n"
+                            f"Moving to next task to prevent resource waste.",
                             error="Infinite loop detected and broken",
                             error_code="INFINITE_LOOP_BROKEN",
                             suggestions=[
                                 "Task has been marked as incomplete",
                                 "Proceeding with next task",
-                                "Review logs for root cause analysis"
-                            ]
+                                "Review logs for root cause analysis",
+                            ],
                         )
-                        
+
                         # Update tool execution history
                         self._track_tool_execution(tool_signature, False)
-                        
+
                         # Force context manager to move to next task
-                        if hasattr(self.context_manager, 'force_next_task'):
+                        if hasattr(self.context_manager, "force_next_task"):
                             self.context_manager.force_next_task()
-                        
+
                         return result
-                    
-                    guidance_msg = (f"Tool {step.tool_name} has been executed repeatedly with {failure_count} failures. "
-                                  f"This suggests the current approach is not working. ")
-                    
+
+                    guidance_msg = (
+                        f"Tool {step.tool_name} has been executed repeatedly with {failure_count} failures. "
+                        f"This suggests the current approach is not working. "
+                    )
+
                     if step.tool_name == "maven":
-                        guidance_msg += ("Consider checking the project structure, examining build errors in detail, "
-                                       "or switching to bash tool to investigate the issue manually.")
+                        guidance_msg += (
+                            "Consider checking the project structure, examining build errors in detail, "
+                            "or switching to bash tool to investigate the issue manually."
+                        )
                     elif step.tool_name == "bash":
-                        guidance_msg += ("Consider checking command syntax, working directory, or using file_io "
-                                       "to examine files before executing commands.")
+                        guidance_msg += (
+                            "Consider checking command syntax, working directory, or using file_io "
+                            "to examine files before executing commands."
+                        )
                     elif step.tool_name == "manage_context":
                         action = validated_params.get("action", "")
                         if action == "complete_with_results":
                             # Check if parameters are actually missing
                             has_summary = "summary" in validated_params
                             has_key_results = "key_results" in validated_params
-                            
+
                             if not has_summary or not has_key_results:
                                 missing = []
                                 if not has_summary:
                                     missing.append("summary")
                                 if not has_key_results:
                                     missing.append("key_results")
-                                guidance_msg += (f'Missing required parameters: {", ".join(missing)}. '
-                                               'The action "complete_with_results" requires both summary and key_results. '
-                                               'Example: manage_context(action="complete_with_results", '
-                                               'summary="Analyzed project structure", key_results="Project type: Maven, Build system: pom.xml found")')
+                                guidance_msg += (
+                                    f'Missing required parameters: {", ".join(missing)}. '
+                                    'The action "complete_with_results" requires both summary and key_results. '
+                                    'Example: manage_context(action="complete_with_results", '
+                                    'summary="Analyzed project structure", key_results="Project type: Maven, Build system: pom.xml found")'
+                                )
                             else:
-                                guidance_msg += ('Parameters appear correct but execution is failing. '
-                                               'Try simpler values or check if task is already completed.')
+                                guidance_msg += (
+                                    "Parameters appear correct but execution is failing. "
+                                    "Try simpler values or check if task is already completed."
+                                )
                         else:
-                            guidance_msg += ("Check that all required parameters are provided for the action. "
-                                           "Use manage_context(action=\"get_info\") to see current state.")
+                            guidance_msg += (
+                                "Check that all required parameters are provided for the action. "
+                                'Use manage_context(action="get_info") to see current state.'
+                            )
                     else:
-                        guidance_msg += ("Consider examining the error messages, changing parameters, "
-                                       "or using a different tool to achieve the same goal.")
-                    
+                        guidance_msg += (
+                            "Consider examining the error messages, changing parameters, "
+                            "or using a different tool to achieve the same goal."
+                        )
+
                     # Still execute the tool but with warning
                     # This ensures agent can see actual errors instead of empty output
                     try:
@@ -1413,10 +1512,16 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         result = ToolResult(
                             success=actual_result.success,
                             output=warning_prefix + actual_result.output,
-                            raw_output=actual_result.raw_output if hasattr(actual_result, 'raw_output') else actual_result.output,
-                            error=actual_result.error if hasattr(actual_result, 'error') else None,
+                            raw_output=(
+                                actual_result.raw_output
+                                if hasattr(actual_result, "raw_output")
+                                else actual_result.output
+                            ),
+                            error=actual_result.error if hasattr(actual_result, "error") else None,
                             error_code="REPETITIVE_EXECUTION_WITH_OUTPUT",
-                            metadata=actual_result.metadata if hasattr(actual_result, 'metadata') else {}
+                            metadata=(
+                                actual_result.metadata if hasattr(actual_result, "metadata") else {}
+                            ),
                         )
                     except Exception as e:
                         # If execution fails, at least show the error
@@ -1426,11 +1531,11 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                             error=guidance_msg,
                             error_code="REPETITIVE_EXECUTION",
                             suggestions=[
-                            "Use thinking model to analyze the root cause of repeated failures",
-                            "Try a different approach or tool to achieve the same goal",
-                            "Examine the full error output using raw_output=true if available",
-                            "Use file_io or bash tools to investigate the environment manually"
-                            ]
+                                "Use thinking model to analyze the root cause of repeated failures",
+                                "Try a different approach or tool to achieve the same goal",
+                                "Examine the full error output using raw_output=true if available",
+                                "Use file_io or bash tools to investigate the environment manually",
+                            ],
                         )
                 else:
                     # Log tool execution in verbose mode
@@ -1438,32 +1543,41 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         self._log_tool_execution_verbose(step.tool_name, validated_params)
 
                     result = tool.safe_execute(**validated_params)
-                    
+
                     # Track this execution
                     self._track_tool_execution(tool_signature, result.success)
-                    
+
                     # ENHANCED: Intelligent error recovery mechanism
                     if not result.success:
-                        recovery_result = self._attempt_error_recovery(step.tool_name, validated_params, result)
+                        recovery_result = self._attempt_error_recovery(
+                            step.tool_name, validated_params, result
+                        )
                         if recovery_result["attempted"]:
-                            logger.info(f"🔧 Error recovery attempted: {recovery_result['message']}")
+                            logger.info(
+                                f"🔧 Error recovery attempted: {recovery_result['message']}"
+                            )
                             if recovery_result["success"]:
                                 # Recovery succeeded, use the recovered result
                                 result = recovery_result["result"]
                                 logger.info(f"✅ Error recovery successful for {step.tool_name}")
-                    
+
                     # Update successful states for future reference
                     if result.success:
                         self._update_successful_states(step.tool_name, validated_params, result)
-                        
+
                         # PERFORMANCE: Invalidate trunk cache if context state changed
                         if step.tool_name == "manage_context":
                             action = validated_params.get("action", "")
                             # FIX: Include ALL context-changing actions for cache invalidation
                             cache_invalidating_actions = [
-                                "start_task", "complete_task", "complete_with_results",
-                                "add_context", "compact_context", "create_branch", 
-                                "switch_to_trunk", "switch_to_branch"
+                                "start_task",
+                                "complete_task",
+                                "complete_with_results",
+                                "add_context",
+                                "compact_context",
+                                "create_branch",
+                                "switch_to_trunk",
+                                "switch_to_branch",
                             ]
                             if action in cache_invalidating_actions:
                                 self._invalidate_trunk_cache()
@@ -1477,11 +1591,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
                 # Add observation step with improved formatting
                 self._add_observation_step(self._format_tool_result(step.tool_name, result))
-                
+
                 # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
                 if result.success:
                     self._force_thinking_after_success = True
-                    logger.debug(f"✅ Tool {step.tool_name} succeeded - forcing thinking on next iteration")
+                    logger.debug(
+                        f"✅ Tool {step.tool_name} succeeded - forcing thinking on next iteration"
+                    )
 
                 # Log to branch context if we're in one
                 if self.context_manager.current_task_id:
@@ -1489,8 +1605,9 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     try:
                         output_to_store = result.output if result.output else ""
                         from datetime import datetime
+
                         timestamp = datetime.now().isoformat()
-                        
+
                         # Store full output and get reference if output is large
                         if len(output_to_store) > 800:
                             # Store the full output
@@ -1501,219 +1618,232 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                                 timestamp=timestamp,
                                 metadata={
                                     "success": result.success,
-                                    "iteration": self.current_iteration
-                                }
+                                    "iteration": self.current_iteration,
+                                },
                             )
-                            
+
                             # Get truncated version with reference
                             output_to_store = self.output_storage.get_truncation_with_reference(
                                 output=output_to_store,
                                 ref_id=ref_id,
                                 max_length=800,
-                                tool_name=step.tool_name
+                                tool_name=step.tool_name,
                             )
-                        
+
                         self.context_manager.add_to_branch_history(
                             self.context_manager.current_task_id,
                             {
                                 "type": "action",
                                 "tool_name": step.tool_name,
                                 "success": result.success,
-                                "output": output_to_store
-                            }
+                                "output": output_to_store,
+                            },
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log action to branch history: {e}")
 
         return True
 
-    def _validate_and_fix_parameters(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _validate_and_fix_parameters(
+        self, tool_name: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Validate and fix tool parameters with self-healing capability."""
         if tool_name not in self.tools:
             logger.error(f"Unknown tool: {tool_name}")
             return params
-            
+
         tool = self.tools[tool_name]
-        
+
         # Handle completely empty parameters
         if not params:
             params = {}
-        
+
         # Get the tool's parameter schema
         try:
-            if hasattr(tool, 'get_parameter_schema'):
+            if hasattr(tool, "get_parameter_schema"):
                 schema = tool.get_parameter_schema()
-            elif hasattr(tool, '_get_parameters_schema'):
+            elif hasattr(tool, "_get_parameters_schema"):
                 schema = tool._get_parameters_schema()
             else:
                 # No schema available, apply basic fixes
                 return self._apply_basic_parameter_fixes(tool_name, params)
-                
+
             # Validate and fix parameters
             validated_params = self._fix_parameters_against_schema(params, schema, tool_name)
-            
+
             # Apply additional tool-specific fixes
             validated_params = self._apply_tool_specific_fixes(tool_name, validated_params)
-            
+
             # Check for unexpected parameters and provide warnings
-            expected_params = set(schema.get('properties', {}).keys())
+            expected_params = set(schema.get("properties", {}).keys())
             actual_params = set(validated_params.keys())
             unexpected_params = actual_params - expected_params
-            
+
             if unexpected_params:
                 logger.warning(f"🚨 Unexpected parameters for {tool_name}: {unexpected_params}")
                 logger.warning(f"Expected parameters: {expected_params}")
-                
+
                 # Only remove parameters that are clearly invalid, keep potentially useful ones
                 params_to_remove = []
                 for param in unexpected_params:
                     param_value = validated_params[param]
-                    
+
                     # Keep parameters that might be useful extensions
                     if tool_name == "maven" and param in ["pom_file", "maven_home", "java_home"]:
-                        logger.info(f"🔧 Keeping potentially useful Maven parameter: {param}={param_value}")
+                        logger.info(
+                            f"🔧 Keeping potentially useful Maven parameter: {param}={param_value}"
+                        )
                         continue
                     elif tool_name == "bash" and param in ["env", "environment"]:
-                        logger.info(f"🔧 Keeping potentially useful bash parameter: {param}={param_value}")
+                        logger.info(
+                            f"🔧 Keeping potentially useful bash parameter: {param}={param_value}"
+                        )
                         continue
                     elif tool_name == "system" and param in ["sudo", "force"]:
-                        logger.info(f"🔧 Keeping potentially useful system parameter: {param}={param_value}")
+                        logger.info(
+                            f"🔧 Keeping potentially useful system parameter: {param}={param_value}"
+                        )
                         continue
                     else:
                         # Remove clearly invalid parameters
                         params_to_remove.append(param)
-                
+
                 # DISABLED: Auto-removal of invalid parameters to enable proper error feedback
                 # Let tools handle their own parameter validation and provide clear error messages
                 # for param in params_to_remove:
                 #     logger.warning(f"🔧 Removing invalid parameter: {param}={validated_params[param]}")
                 #     del validated_params[param]
-            
+
             # Log parameter fixes if any were made
             if validated_params != params:
                 logger.info(f"🔧 Parameter self-healing applied for {tool_name}")
                 logger.debug(f"Original params: {params}")
                 logger.debug(f"Fixed params: {validated_params}")
-                
+
             return validated_params
-            
+
         except Exception as e:
             logger.warning(f"Failed to validate parameters for {tool_name}: {e}")
             return self._apply_basic_parameter_fixes(tool_name, params)
 
-    def _fix_parameters_against_schema(self, params: Dict[str, Any], schema: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
+    def _fix_parameters_against_schema(
+        self, params: Dict[str, Any], schema: Dict[str, Any], tool_name: str
+    ) -> Dict[str, Any]:
         """Fix parameters against a schema with intelligent defaults."""
         fixed_params = params.copy()
-        
+
         # Get schema properties
-        properties = schema.get('properties', {})
-        required = schema.get('required', [])
-        
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+
         # Fix missing required parameters
         for param_name in required:
             if param_name not in fixed_params or fixed_params[param_name] is None:
-                default_value = self._get_smart_default(param_name, properties.get(param_name, {}), tool_name)
+                default_value = self._get_smart_default(
+                    param_name, properties.get(param_name, {}), tool_name
+                )
                 if default_value is not None:
                     fixed_params[param_name] = default_value
-                    logger.info(f"🔧 Added missing required parameter '{param_name}' with default: {default_value}")
-        
+                    logger.info(
+                        f"🔧 Added missing required parameter '{param_name}' with default: {default_value}"
+                    )
+
         # Fix parameter types
         for param_name, param_value in fixed_params.items():
             if param_name in properties:
                 prop_schema = properties[param_name]
-                expected_type = prop_schema.get('type')
-                
+                expected_type = prop_schema.get("type")
+
                 # Try to convert to expected type
                 if expected_type and param_value is not None:
-                    converted_value = self._convert_parameter_type(param_value, expected_type, param_name)
+                    converted_value = self._convert_parameter_type(
+                        param_value, expected_type, param_name
+                    )
                     if converted_value != param_value:
                         fixed_params[param_name] = converted_value
-                        logger.info(f"🔧 Converted parameter '{param_name}' from {type(param_value).__name__} to {expected_type}")
-        
+                        logger.info(
+                            f"🔧 Converted parameter '{param_name}' from {type(param_value).__name__} to {expected_type}"
+                        )
+
         # Handle common parameter naming issues
         fixed_params = self._fix_parameter_names(fixed_params, properties, tool_name)
-        
+
         return fixed_params
 
-    def _get_smart_default(self, param_name: str, param_schema: Dict[str, Any], tool_name: str) -> Any:
+    def _get_smart_default(
+        self, param_name: str, param_schema: Dict[str, Any], tool_name: str
+    ) -> Any:
         """Get smart default values for common parameters."""
-        param_type = param_schema.get('type', 'string')
-        
+        param_type = param_schema.get("type", "string")
+
         # Check if there's a default in the schema
-        if 'default' in param_schema:
-            return param_schema['default']
-        
+        if "default" in param_schema:
+            return param_schema["default"]
+
         # Smart defaults based on parameter names and tool types
         smart_defaults = {
             # Command-related parameters
-            'command': 'help' if tool_name == 'bash' else None,
-            'cmd': 'help',
-            'timeout': 60,
-            
+            "command": "help" if tool_name == "bash" else None,
+            "cmd": "help",
+            "timeout": 60,
             # File-related parameters
-            'action': self._get_tool_specific_action_default(tool_name),
-            'path': '/workspace',
-            'file_path': '/workspace',
-            'directory': '/workspace',
-            'working_directory': '/workspace',
-            
+            "action": self._get_tool_specific_action_default(tool_name),
+            "path": "/workspace",
+            "file_path": "/workspace",
+            "directory": "/workspace",
+            "working_directory": "/workspace",
             # Web search parameters
-            'query': 'help' if tool_name == 'web_search' else None,
-            'max_results': 5,
-            
+            "query": "help" if tool_name == "web_search" else None,
+            "max_results": 5,
             # System parameters
-            'packages': [] if param_type == 'array' else None,
-            
+            "packages": [] if param_type == "array" else None,
             # Maven parameters
-            'goals': None,
-            'profiles': None,
-            'properties': None,
-            'raw_output': False,
-            
+            "goals": None,
+            "profiles": None,
+            "properties": None,
+            "raw_output": False,
             # Context management
-            'context_type': 'branch',
-            'summary': 'Task in progress',
-            
+            "context_type": "branch",
+            "summary": "Task in progress",
             # Project setup parameters - DO NOT provide defaults for URLs
             # These should come from the user's actual repository URL
-            'repository_url': None,
-            'url': None,
-            'repo_url': None,
-            
+            "repository_url": None,
+            "url": None,
+            "repo_url": None,
             # Generic defaults by type
-            'boolean': False,
-            'integer': 0,
-            'array': [],
-            'object': {}
+            "boolean": False,
+            "integer": 0,
+            "array": [],
+            "object": {},
         }
-        
+
         # Try parameter name first
         if param_name in smart_defaults:
             return smart_defaults[param_name]
-        
+
         # Try parameter type
         if param_type in smart_defaults:
             return smart_defaults[param_type]
-        
+
         return None
 
     def _get_tool_specific_action_default(self, tool_name: str) -> str:
         """Get tool-specific default action."""
         tool_action_defaults = {
-            'file_io': 'read',
-            'project_setup': 'clone',
-            'system': 'install_missing',
-            'manage_context': 'get_info',
-            'maven': 'compile',
-            'bash': None,
-            'web_search': None
+            "file_io": "read",
+            "project_setup": "clone",
+            "system": "install_missing",
+            "manage_context": "get_info",
+            "maven": "compile",
+            "bash": None,
+            "web_search": None,
         }
-        return tool_action_defaults.get(tool_name, 'list')
+        return tool_action_defaults.get(tool_name, "list")
 
     def _convert_parameter_type(self, value: Any, expected_type: str, param_name: str) -> Any:
         """Convert parameter to expected type."""
         try:
-            if expected_type == 'string':
+            if expected_type == "string":
                 # Handle list to string conversion properly
                 if isinstance(value, list):
                     # If list has one element, return just that element
@@ -1721,190 +1851,193 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         return str(value[0])
                     # If multiple elements, join with spaces (common for command-line args)
                     else:
-                        return ' '.join(str(v) for v in value)
+                        return " ".join(str(v) for v in value)
                 return str(value)
-            elif expected_type == 'integer':
+            elif expected_type == "integer":
                 if isinstance(value, str):
                     # Try to extract number from string
                     import re
-                    match = re.search(r'\d+', value)
+
+                    match = re.search(r"\d+", value)
                     if match:
                         return int(match.group())
                 return int(value)
-            elif expected_type == 'boolean':
+            elif expected_type == "boolean":
                 if isinstance(value, str):
-                    return value.lower() in ['true', '1', 'yes', 'on']
+                    return value.lower() in ["true", "1", "yes", "on"]
                 elif isinstance(value, list):
                     # Handle list to boolean conversion properly
                     if len(value) == 0:
                         return False  # Empty list = False
                     elif len(value) == 1:
                         # Single element - convert that element recursively
-                        return self._convert_parameter_type(value[0], 'boolean', param_name)
+                        return self._convert_parameter_type(value[0], "boolean", param_name)
                     else:
                         # Multiple elements - true if any are true
-                        return any(self._convert_parameter_type(v, 'boolean', param_name) for v in value)
+                        return any(
+                            self._convert_parameter_type(v, "boolean", param_name) for v in value
+                        )
                 return bool(value)
-            elif expected_type == 'array':
+            elif expected_type == "array":
                 if isinstance(value, str):
                     # Try to parse as JSON array or split by common delimiters
                     try:
                         import json
+
                         return json.loads(value)
                     except:
                         # Split by common delimiters
-                        return [item.strip() for item in value.split(',')]
+                        return [item.strip() for item in value.split(",")]
                 elif not isinstance(value, list):
                     return [value]
                 return value
-            elif expected_type == 'object':
+            elif expected_type == "object":
                 if isinstance(value, str):
                     try:
                         import json
+
                         return json.loads(value)
                     except:
                         # CRITICAL FIX: Don't lose the original string value!
                         # For manage_context entry parameter, wrap string in meaningful object
-                        if param_name == 'entry':
+                        if param_name == "entry":
                             return {"content": value}  # Preserve the original string as content
-                        elif 'description' in param_name.lower() or 'content' in param_name.lower():
+                        elif "description" in param_name.lower() or "content" in param_name.lower():
                             return {"description": value}
                         else:
                             return {"value": value}  # Fallback: preserve in generic wrapper
                 # Don't wrap lists of dicts unnecessarily
-                if isinstance(value, list) and all(isinstance(item, dict) for item in value if value):
+                if isinstance(value, list) and all(
+                    isinstance(item, dict) for item in value if value
+                ):
                     return value  # Return list of dicts as-is
                 return value if isinstance(value, dict) else {"value": value}
         except Exception as e:
             logger.warning(f"Failed to convert parameter '{param_name}' to {expected_type}: {e}")
             return value
-        
+
         return value
 
-    def _fix_parameter_names(self, params: Dict[str, Any], properties: Dict[str, Any], tool_name: str) -> Dict[str, Any]:
+    def _fix_parameter_names(
+        self, params: Dict[str, Any], properties: Dict[str, Any], tool_name: str
+    ) -> Dict[str, Any]:
         """Fix common parameter naming issues."""
         fixed_params = params.copy()
-        
+
         # Common parameter name mappings (removed conflicting mappings)
         name_mappings = {
             # Action variations (file_io, context tools)
-            'op': 'action',
-            'operation': 'action',
-            'method': 'action',
-            'type': 'action',
-            
+            "op": "action",
+            "operation": "action",
+            "method": "action",
+            "type": "action",
             # Query variations (web_search tool)
-            'search': 'query',
-            'q': 'query',
-            'term': 'query',
-            'search_term': 'query',
-            'keywords': 'query',
-            
+            "search": "query",
+            "q": "query",
+            "term": "query",
+            "search_term": "query",
+            "keywords": "query",
             # URL variations (project_setup tool)
-            'url': 'repository_url',
-            'repo_url': 'repository_url',
-            'git_url': 'repository_url',
-            'repository': 'repository_url',
-            'repo': 'repository_url',
-            'git_repo': 'repository_url',
-            
+            "url": "repository_url",
+            "repo_url": "repository_url",
+            "git_url": "repository_url",
+            "repository": "repository_url",
+            "repo": "repository_url",
+            "git_repo": "repository_url",
             # Target directory variations (project_setup tool)
-            'destination': 'target_directory',
-            'dest': 'target_directory',
-            'target_dir': 'target_directory',
-            'output_dir': 'target_directory',
-            'clone_dir': 'target_directory',
-            
+            "destination": "target_directory",
+            "dest": "target_directory",
+            "target_dir": "target_directory",
+            "output_dir": "target_directory",
+            "clone_dir": "target_directory",
             # Maven/build specific (non-conflicting)
-            'options': 'properties',
-            'opts': 'properties',
-            'maven_options': 'properties',
-            'build_options': 'properties',
-            
+            "options": "properties",
+            "opts": "properties",
+            "maven_options": "properties",
+            "build_options": "properties",
             # Context specific
-            'context_type': 'action',
-            'name': 'task_id',
-            'parameters': 'summary',
-            'task_name': 'task_id',
-            'id': 'task_id',
-            
+            "context_type": "action",
+            "name": "task_id",
+            "parameters": "summary",
+            "task_name": "task_id",
+            "id": "task_id",
             # Content variations (file_io tool)
-            'data': 'content',
-            'text': 'content',
-            'body': 'content',
-            'file_content': 'content',
+            "data": "content",
+            "text": "content",
+            "body": "content",
+            "file_content": "content",
         }
-        
+
         # Tool-specific mappings for better accuracy
         tool_specific_mappings = {
-            'bash': {
-                'cmd': 'command',
-                'script': 'command',
-                'exec': 'command',
-                'shell': 'command',
-                'run': 'command',
-                'execute': 'command',
-                'bash_command': 'command',
-                'shell_command': 'command',
-                'dir': 'working_directory',
-                'cwd': 'working_directory',
-                'working_dir': 'working_directory',
-                'workdir': 'working_directory',  # Map old workdir to working_directory
-                'work_dir': 'working_directory',
-                'directory': 'working_directory',
-                'path': 'working_directory',  # Path should also map to working_directory for bash
+            "bash": {
+                "cmd": "command",
+                "script": "command",
+                "exec": "command",
+                "shell": "command",
+                "run": "command",
+                "execute": "command",
+                "bash_command": "command",
+                "shell_command": "command",
+                "dir": "working_directory",
+                "cwd": "working_directory",
+                "working_dir": "working_directory",
+                "workdir": "working_directory",  # Map old workdir to working_directory
+                "work_dir": "working_directory",
+                "directory": "working_directory",
+                "path": "working_directory",  # Path should also map to working_directory for bash
             },
-            'file_io': {
-                'file': 'path',
-                'filename': 'path',
-                'filepath': 'path',
-                'file_path': 'path',
-                'operation': 'action',
-                'op': 'action',
-                'data': 'content',
-                'text': 'content',
+            "file_io": {
+                "file": "path",
+                "filename": "path",
+                "filepath": "path",
+                "file_path": "path",
+                "operation": "action",
+                "op": "action",
+                "data": "content",
+                "text": "content",
             },
-            'project_setup': {
-                'url': 'repository_url',
-                'repo': 'repository_url',
-                'destination': 'target_directory',
-                'dest': 'target_directory',
-                'output': 'target_directory',
+            "project_setup": {
+                "url": "repository_url",
+                "repo": "repository_url",
+                "destination": "target_directory",
+                "dest": "target_directory",
+                "output": "target_directory",
             },
-            'maven': {
+            "maven": {
                 # Don't map 'goals' - it's a separate parameter from 'command'
-                'options': 'properties',
-                'dir': 'working_directory',
-                'project_dir': 'working_directory',
-                'cmd': 'command',  # Common mistake
-                'maven_command': 'command',
+                "options": "properties",
+                "dir": "working_directory",
+                "project_dir": "working_directory",
+                "cmd": "command",  # Common mistake
+                "maven_command": "command",
             },
-            'manage_context': {
-                'type': 'action',
-                'operation': 'action',
-                'context_type': 'action',
-                'name': 'task_id',
-                'id': 'task_id',
-                'target': 'action',  # Map target to action for switch-like operations
-                'switch': 'action',  # Map switch to action
-                'task_name': 'task_id',
-                'branch_name': 'task_id',
+            "manage_context": {
+                "type": "action",
+                "operation": "action",
+                "context_type": "action",
+                "name": "task_id",
+                "id": "task_id",
+                "target": "action",  # Map target to action for switch-like operations
+                "switch": "action",  # Map switch to action
+                "task_name": "task_id",
+                "branch_name": "task_id",
                 # CRITICAL FIX: Map content-related parameters to 'entry' for add_context action
-                'description': 'entry',  # Fixed: was incorrectly mapped to 'summary'
-                'content': 'entry',
-                'data': 'entry',
-                'info': 'entry',
-                'details': 'entry',
-                'context': 'entry',
-                'observation': 'entry',
-                'result': 'entry',
-                # For complete_task action, these should map to summary  
-                'completion_summary': 'summary',
-                'task_summary': 'summary',
-                'results': 'summary',
-            }
+                "description": "entry",  # Fixed: was incorrectly mapped to 'summary'
+                "content": "entry",
+                "data": "entry",
+                "info": "entry",
+                "details": "entry",
+                "context": "entry",
+                "observation": "entry",
+                "result": "entry",
+                # For complete_task action, these should map to summary
+                "completion_summary": "summary",
+                "task_summary": "summary",
+                "results": "summary",
+            },
         }
-        
+
         # Apply tool-specific mappings first (higher priority)
         if tool_name in tool_specific_mappings:
             tool_mappings = tool_specific_mappings[tool_name]
@@ -1915,21 +2048,32 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         # Check if the existing value is a default/placeholder value
                         existing_value = fixed_params[new_name]
                         old_value = fixed_params[old_name]
-                        if (existing_value in ['help', '', None] or 
-                            str(existing_value).strip() == '' or
-                            (isinstance(existing_value, str) and len(old_value) > len(existing_value))):
+                        if (
+                            existing_value in ["help", "", None]
+                            or str(existing_value).strip() == ""
+                            or (
+                                isinstance(existing_value, str)
+                                and len(old_value) > len(existing_value)
+                            )
+                        ):
                             fixed_params[new_name] = old_value
-                            logger.info(f"🔧 Tool-specific rename (override): '{old_name}' → '{new_name}' for {tool_name}")
+                            logger.info(
+                                f"🔧 Tool-specific rename (override): '{old_name}' → '{new_name}' for {tool_name}"
+                            )
                         else:
-                            logger.debug(f"🔧 Skipping rename '{old_name}' → '{new_name}' (target has value: {existing_value})")
+                            logger.debug(
+                                f"🔧 Skipping rename '{old_name}' → '{new_name}' (target has value: {existing_value})"
+                            )
                     else:
                         # Target doesn't exist, normal mapping
                         fixed_params[new_name] = fixed_params[old_name]
-                        logger.info(f"🔧 Tool-specific rename: '{old_name}' → '{new_name}' for {tool_name}")
-                    
+                        logger.info(
+                            f"🔧 Tool-specific rename: '{old_name}' → '{new_name}' for {tool_name}"
+                        )
+
                     # Always delete the old parameter
                     del fixed_params[old_name]
-        
+
         # Apply general mappings if target parameter exists in schema
         mappings_applied = []
         for old_name, new_name in name_mappings.items():
@@ -1939,18 +2083,24 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 if isinstance(old_value, dict) and len(old_value) == 1 and new_name in old_value:
                     # Handle case where we have {'summary': {'summary': '...'}} -> extract the inner value
                     fixed_params[new_name] = old_value[new_name]
-                    logger.info(f"🔧 Extracted nested value from '{old_name}' to '{new_name}' for {tool_name}")
+                    logger.info(
+                        f"🔧 Extracted nested value from '{old_name}' to '{new_name}' for {tool_name}"
+                    )
                 else:
                     fixed_params[new_name] = old_value
-                    logger.info(f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}")
-                
+                    logger.info(
+                        f"🔧 Renamed parameter '{old_name}' to '{new_name}' for {tool_name}"
+                    )
+
                 del fixed_params[old_name]
                 mappings_applied.append(f"{old_name} → {new_name}")
-        
+
         # Log all mappings applied for debugging
         if mappings_applied:
-            logger.debug(f"Parameter mappings applied for {tool_name}: {', '.join(mappings_applied)}")
-        
+            logger.debug(
+                f"Parameter mappings applied for {tool_name}: {', '.join(mappings_applied)}"
+            )
+
         return fixed_params
 
     def _update_successful_states(self, tool_name: str, params: Dict[str, Any], result: ToolResult):
@@ -1962,46 +2112,66 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 action = params.get("action", "")
                 # Include all context-changing actions
                 context_changing_actions = [
-                    "start_task", "complete_with_results", "complete_task", 
-                    "switch_to_trunk", "create_branch", "switch_to_branch"
+                    "start_task",
+                    "complete_with_results",
+                    "complete_task",
+                    "switch_to_trunk",
+                    "create_branch",
+                    "switch_to_branch",
                 ]
                 if action in context_changing_actions:
                     # Reset the counter regardless of success/failure
                     self.steps_since_context_switch = 0
                     if result.success:
-                        logger.info(f"✅ Reset steps_since_context_switch counter after successful {action}")
+                        logger.info(
+                            f"✅ Reset steps_since_context_switch counter after successful {action}"
+                        )
                     else:
-                        logger.info(f"⚠️ Reset steps_since_context_switch counter after failed {action} attempt")
-            
+                        logger.info(
+                            f"⚠️ Reset steps_since_context_switch counter after failed {action} attempt"
+                        )
+
             if tool_name == "bash":
                 # CRITICAL FIX: Get actual working directory from tool result metadata
                 # This handles cases where bash tool had to fall back to alternative directories
                 actual_working_dir = None
-                
+
                 # First try to get the actual working directory from metadata
-                if hasattr(result, 'metadata') and result.metadata:
-                    actual_working_dir = result.metadata.get('working_directory')
-                
+                if hasattr(result, "metadata") and result.metadata:
+                    actual_working_dir = result.metadata.get("working_directory")
+
                 # Fallback to parameter if metadata not available
                 if not actual_working_dir:
                     actual_working_dir = params.get("working_directory")
-                
+
                 if actual_working_dir:
                     # Check if working directory changed (fallback occurred)
                     original_dir = params.get("working_directory", "/workspace")
                     if actual_working_dir != original_dir:
                         # PRIORITY CHECK: Is this a workspace-related fallback?
-                        if original_dir.startswith("/workspace") and not actual_working_dir.startswith("/workspace"):
-                            logger.error(f"🚨 WORKSPACE FALLBACK: Failed to use {original_dir}, fell back to {actual_working_dir}")
-                            logger.error(f"🚨 This is a MAJOR ISSUE - projects should be in /workspace")
-                            logger.error(f"🚨 Clone operations may not work correctly in {actual_working_dir}")
-                            
+                        if original_dir.startswith(
+                            "/workspace"
+                        ) and not actual_working_dir.startswith("/workspace"):
+                            logger.error(
+                                f"🚨 WORKSPACE FALLBACK: Failed to use {original_dir}, fell back to {actual_working_dir}"
+                            )
+                            logger.error(
+                                f"🚨 This is a MAJOR ISSUE - projects should be in /workspace"
+                            )
+                            logger.error(
+                                f"🚨 Clone operations may not work correctly in {actual_working_dir}"
+                            )
+
                             # Mark this as an abnormal state
-                            self.successful_states['workspace_fallback'] = True
-                            self.successful_states['fallback_reason'] = f"Could not establish {original_dir}"
+                            self.successful_states["workspace_fallback"] = True
+                            self.successful_states["fallback_reason"] = (
+                                f"Could not establish {original_dir}"
+                            )
                         else:
-                            logger.warning(f"🔧 Working directory change: {original_dir} → {actual_working_dir}")
-                        
+                            logger.warning(
+                                f"🔧 Working directory change: {original_dir} → {actual_working_dir}"
+                            )
+
                         # CRITICAL: Update all related tools to use the new working directory
                         self._propagate_working_directory_change(actual_working_dir, original_dir)
                     else:
@@ -2009,43 +2179,45 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                         if actual_working_dir.startswith("/workspace"):
                             logger.debug(f"✅ Workspace operation normal: {actual_working_dir}")
                             # Clear any previous fallback flags
-                            self.successful_states.pop('workspace_fallback', None)
-                            self.successful_states.pop('fallback_reason', None)
-                    
-                    self.successful_states['working_directory'] = actual_working_dir
+                            self.successful_states.pop("workspace_fallback", None)
+                            self.successful_states.pop("fallback_reason", None)
+
+                    self.successful_states["working_directory"] = actual_working_dir
                     logger.debug(f"Updated successful working directory: {actual_working_dir}")
-            
+
             elif tool_name == "maven" and params.get("working_directory"):
                 # Remember successful Maven working directory
                 if "BUILD SUCCESS" in (result.output or ""):
                     # Get working_directory parameter (standardized across all tools)
-                    maven_workdir = params.get('working_directory', '/workspace')
-                    self.successful_states['working_directory'] = maven_workdir
-                    self.successful_states['maven_success'] = True
-                    
+                    maven_workdir = params.get("working_directory", "/workspace")
+                    self.successful_states["working_directory"] = maven_workdir
+                    self.successful_states["maven_success"] = True
+
                     # Check if Maven is working outside workspace (concerning)
                     if not maven_workdir.startswith("/workspace"):
                         logger.warning(f"⚠️ Maven succeeded outside workspace: {maven_workdir}")
                         logger.warning(f"⚠️ This may indicate workspace issues")
                     else:
                         logger.info(f"✅ Maven success in workspace: {maven_workdir}")
-                    
+
                     logger.info(f"Maven success recorded for directory: {maven_workdir}")
-            
+
             elif tool_name == "project_setup":
                 # Remember cloned repositories and project type
                 if params.get("repository_url"):
-                    self.successful_states['cloned_repos'].add(params['repository_url'])
+                    self.successful_states["cloned_repos"].add(params["repository_url"])
                     logger.debug(f"Recorded cloned repo: {params['repository_url']}")
-                    
+
                     # Set working directory based on cloned repository
                     if params.get("action") == "clone":
-                        repo_name = params['repository_url'].split('/')[-1].replace('.git', '')
-                        
+                        repo_name = params["repository_url"].split("/")[-1].replace(".git", "")
+
                         # PRIORITY: Always try to clone in /workspace first
-                        if self.successful_states.get('workspace_fallback'):
+                        if self.successful_states.get("workspace_fallback"):
                             # We're in fallback mode - this is not ideal for cloning
-                            current_workdir = self.successful_states.get('working_directory', '/root')
+                            current_workdir = self.successful_states.get(
+                                "working_directory", "/root"
+                            )
                             clone_dir = f"{current_workdir}/{repo_name}"
                             logger.error(f"🚨 CLONING IN FALLBACK LOCATION: {clone_dir}")
                             logger.error(f"🚨 This is SUBOPTIMAL - prefer /workspace for projects")
@@ -2053,25 +2225,25 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                             # Normal case - clone in workspace
                             clone_dir = f"/workspace/{repo_name}"
                             logger.info(f"✅ Cloning in proper workspace location: {clone_dir}")
-                        
-                        self.successful_states['working_directory'] = clone_dir
+
+                        self.successful_states["working_directory"] = clone_dir
                         logger.info(f"Updated working directory after clone: {clone_dir}")
-                
+
                 # Check for project type detection in output
                 output = result.output or ""
                 if "maven" in output.lower() or "pom.xml" in output.lower():
-                    self.successful_states['project_type'] = 'maven'
+                    self.successful_states["project_type"] = "maven"
                     logger.debug("Detected Maven project type")
                 elif "gradle" in output.lower() or "build.gradle" in output.lower():
-                    self.successful_states['project_type'] = 'gradle'
+                    self.successful_states["project_type"] = "gradle"
                     logger.debug("Detected Gradle project type")
 
             elif tool_name == "report":
                 snapshot = {}
-                if hasattr(result, 'metadata') and result.metadata:
-                    snapshot = result.metadata.get('report_snapshot') or {}
+                if hasattr(result, "metadata") and result.metadata:
+                    snapshot = result.metadata.get("report_snapshot") or {}
                 if snapshot:
-                    self.successful_states['report_snapshot'] = dict(snapshot)
+                    self.successful_states["report_snapshot"] = dict(snapshot)
                     logger.debug("Stored report snapshot for completion guidance")
 
         except Exception as e:
@@ -2080,51 +2252,63 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
     def _propagate_working_directory_change(self, new_workdir: str, old_workdir: str):
         """
         Propagate working directory changes to ensure consistency across all tools.
-        
+
         When bash tool falls back to a different directory, we need to update
         Agent's understanding of where the project is located.
         """
         try:
             logger.info(f"📁 Propagating working directory change: {old_workdir} → {new_workdir}")
-            
+
             # Update successful states
-            self.successful_states['working_directory'] = new_workdir
-            
+            self.successful_states["working_directory"] = new_workdir
+
             # PRIORITY CHECK: Warn about workspace fallbacks
             if old_workdir.startswith("/workspace") and not new_workdir.startswith("/workspace"):
-                logger.error(f"🚨 WORKSPACE LOST: Propagating fallback from {old_workdir} to {new_workdir}")
+                logger.error(
+                    f"🚨 WORKSPACE LOST: Propagating fallback from {old_workdir} to {new_workdir}"
+                )
                 logger.error(f"🚨 Future clone operations will be affected")
                 logger.error(f"🚨 Consider fixing the underlying workspace issue")
-                
+
                 # Mark this propagation as problematic
-                self.successful_states['workspace_fallback'] = True
-                self.successful_states['fallback_reason'] = f"Propagated from failed {old_workdir}"
+                self.successful_states["workspace_fallback"] = True
+                self.successful_states["fallback_reason"] = f"Propagated from failed {old_workdir}"
             elif new_workdir.startswith("/workspace"):
                 logger.info(f"✅ Workspace propagation successful: {new_workdir}")
                 # Clear fallback flags if we're back in workspace
-                self.successful_states.pop('workspace_fallback', None)
-                self.successful_states.pop('fallback_reason', None)
-            
+                self.successful_states.pop("workspace_fallback", None)
+                self.successful_states.pop("fallback_reason", None)
+
             # If we have cloned repositories, we might need to adjust their paths
-            if self.successful_states.get('cloned_repos'):
-                logger.info(f"📁 Note: Cloned repositories may need path adjustment for new working directory")
-                
+            if self.successful_states.get("cloned_repos"):
+                logger.info(
+                    f"📁 Note: Cloned repositories may need path adjustment for new working directory"
+                )
+
                 # If we're falling back from workspace, this is a major concern
-                if self.successful_states.get('workspace_fallback'):
-                    logger.error(f"🚨 CRITICAL: Cloned repositories were in workspace, now using {new_workdir}")
-                    logger.error(f"🚨 Project files may be in /workspace but operations will run in {new_workdir}")
-                
+                if self.successful_states.get("workspace_fallback"):
+                    logger.error(
+                        f"🚨 CRITICAL: Cloned repositories were in workspace, now using {new_workdir}"
+                    )
+                    logger.error(
+                        f"🚨 Project files may be in /workspace but operations will run in {new_workdir}"
+                    )
+
             # Log for debugging
             logger.debug(f"📁 Agent state updated - new working directory: {new_workdir}")
-            logger.debug(f"📁 All future operations will use this directory unless explicitly overridden")
-            
+            logger.debug(
+                f"📁 All future operations will use this directory unless explicitly overridden"
+            )
+
         except Exception as e:
             logger.error(f"Failed to propagate working directory change: {e}")
 
-    def _apply_basic_parameter_fixes(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _apply_basic_parameter_fixes(
+        self, tool_name: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Apply basic parameter fixes when schema is not available."""
         fixed_params = params.copy()
-        
+
         # Tool-specific basic fixes
         if tool_name == "maven":
             if not fixed_params.get("command"):
@@ -2151,38 +2335,44 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         elif tool_name == "web_search":
             if not fixed_params.get("query"):
                 fixed_params["query"] = "help"
-        
+
         return fixed_params
 
     def _apply_tool_specific_fixes(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Apply tool-specific parameter fixes using state memory."""
         fixed_params = params.copy()
-        
+
         if tool_name == "project_setup":
             # Auto-inject repository URL if available and action is clone
             if fixed_params.get("action") == "clone" and not fixed_params.get("repository_url"):
                 if self.repository_url:
                     fixed_params["repository_url"] = self.repository_url
                     logger.info(f"🔧 Auto-injected repository URL: {self.repository_url}")
-            
+
             # CRITICAL FIX: Handle target_directory correctly for workspace vs fallback modes
             if fixed_params.get("action") == "clone":
                 # Check current workspace status
-                is_fallback_mode = self.successful_states.get('workspace_fallback', False)
-                current_workdir = self.successful_states.get('working_directory', "/workspace")
-                
+                is_fallback_mode = self.successful_states.get("workspace_fallback", False)
+                current_workdir = self.successful_states.get("working_directory", "/workspace")
+
                 if is_fallback_mode:
                     # We're in abnormal fallback mode - need to specify full path
-                    fallback_reason = self.successful_states.get('fallback_reason', 'Unknown reason')
-                    
+                    fallback_reason = self.successful_states.get(
+                        "fallback_reason", "Unknown reason"
+                    )
+
                     logger.error(f"🚨 CLONE IN FALLBACK MODE: Using {current_workdir}")
                     logger.error(f"🚨 Reason: {fallback_reason}")
                     logger.error(f"🚨 This is SUBOPTIMAL - clone should happen in /workspace")
-                    
+
                     # For fallback mode, we need to specify the full path
                     if not fixed_params.get("target_directory"):
                         # Extract project name from URL
-                        repo_name = fixed_params.get("repository_url", "").split('/')[-1].replace('.git', '')
+                        repo_name = (
+                            fixed_params.get("repository_url", "")
+                            .split("/")[-1]
+                            .replace(".git", "")
+                        )
                         if repo_name:
                             fallback_target = f"{current_workdir}/{repo_name}"
                             fixed_params["target_directory"] = fallback_target
@@ -2194,16 +2384,20 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 else:
                     # Normal case - workspace is available
                     logger.info(f"✅ CLONE IN WORKSPACE: Standard workspace cloning")
-                    
+
                     # CRITICAL FIX: Don't set target_directory to /workspace!
                     # Let project_setup tool auto-generate the project subdirectory name
                     if fixed_params.get("target_directory") == "/workspace":
                         # Remove the incorrect target_directory - let tool auto-generate
                         del fixed_params["target_directory"]
-                        logger.info(f"🔧 Removed incorrect target_directory, will auto-generate project subdirectory")
+                        logger.info(
+                            f"🔧 Removed incorrect target_directory, will auto-generate project subdirectory"
+                        )
                     elif not fixed_params.get("target_directory"):
                         # No target_directory specified - this is correct, tool will auto-generate
-                        logger.info(f"✅ No target_directory specified - project_setup will create subdirectory")
+                        logger.info(
+                            f"✅ No target_directory specified - project_setup will create subdirectory"
+                        )
                     else:
                         # Explicit target_directory specified
                         target_dir = fixed_params["target_directory"]
@@ -2212,53 +2406,63 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                             logger.warning(f"⚠️ This may cause project layout issues")
                         else:
                             logger.info(f"✅ Workspace subdirectory clone: {target_dir}")
-            
+
             # Prevent duplicate cloning
-            if (fixed_params.get("action") == "clone" and 
-                fixed_params.get("repository_url") in self.successful_states['cloned_repos']):
-                logger.warning(f"🔧 Repository already cloned, changing action to detect_project_type")
+            if (
+                fixed_params.get("action") == "clone"
+                and fixed_params.get("repository_url") in self.successful_states["cloned_repos"]
+            ):
+                logger.warning(
+                    f"🔧 Repository already cloned, changing action to detect_project_type"
+                )
                 fixed_params["action"] = "detect_project_type"
-        
+
         elif tool_name == "maven":
             # Ensure maven has a valid command
             if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
                 # Use intelligent default based on current state
-                if self.successful_states['maven_success']:
+                if self.successful_states["maven_success"]:
                     fixed_params["command"] = "test"  # If compile succeeded before, try test
                 else:
                     fixed_params["command"] = "compile"  # Start with compile
-            
+
             # Auto-inject successful working directory for Maven operations
             if "working_directory" not in fixed_params:
-                if self.successful_states['working_directory']:
-                    fixed_params["working_directory"] = self.successful_states['working_directory']
-                    logger.info(f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}")
+                if self.successful_states["working_directory"]:
+                    fixed_params["working_directory"] = self.successful_states["working_directory"]
+                    logger.info(
+                        f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}"
+                    )
                 else:
                     # Try to infer from repository URL
                     if self.repository_url:
-                        repo_name = self.repository_url.split('/')[-1].replace('.git', '')
+                        repo_name = self.repository_url.split("/")[-1].replace(".git", "")
                         fixed_params["working_directory"] = f"/workspace/{repo_name}"
-                        logger.info(f"🔧 Inferred working directory from repo: /workspace/{repo_name}")
-            
+                        logger.info(
+                            f"🔧 Inferred working directory from repo: /workspace/{repo_name}"
+                        )
+
             # Convert common typos
             command = fixed_params.get("command", "")
             if command in ["test", "tests"]:
                 fixed_params["command"] = "test"
             elif command in ["build", "compile"]:
-                fixed_params["command"] = "compile" 
+                fixed_params["command"] = "compile"
             elif command in ["install", "package"]:
                 fixed_params["command"] = "package"
-                
+
         elif tool_name == "bash":
             # Ensure bash has a command
             if not fixed_params.get("command") or fixed_params.get("command").strip() == "":
                 fixed_params["command"] = "pwd"
-            
+
             # Auto-inject successful working directory for bash operations
             if "working_directory" not in fixed_params:
-                if self.successful_states['working_directory']:
-                    fixed_params["working_directory"] = self.successful_states['working_directory']
-                    logger.info(f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}")
+                if self.successful_states["working_directory"]:
+                    fixed_params["working_directory"] = self.successful_states["working_directory"]
+                    logger.info(
+                        f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}"
+                    )
                 else:
                     fixed_params["working_directory"] = "/workspace"
 
@@ -2266,73 +2470,85 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             if command_str and "mvn" in command_str and "--fail-at-end" not in command_str:
                 fixed_params["command"] = f"{command_str} --fail-at-end"
                 logger.info("🔧 Appended --fail-at-end to bash Maven command")
-                
+
         elif tool_name == "file_io":
             # Ensure file_io has an action
             if not fixed_params.get("action"):
                 fixed_params["action"] = "read"
-                
+
             # CRITICAL PRIORITY: Use workspace paths when possible, warn about fallbacks
-            current_workdir = self.successful_states.get('working_directory', "/workspace")
-            is_fallback_mode = self.successful_states.get('workspace_fallback', False)
-            
+            current_workdir = self.successful_states.get("working_directory", "/workspace")
+            is_fallback_mode = self.successful_states.get("workspace_fallback", False)
+
             # If reading but no file path, default to current directory listing
             if fixed_params.get("action") == "read" and not fixed_params.get("path"):
                 fixed_params["action"] = "list"
                 fixed_params["path"] = current_workdir
-                
+
                 if is_fallback_mode:
-                    logger.error(f"🚨 FILE_IO FALLBACK: Listing {current_workdir} (not in workspace)")
+                    logger.error(
+                        f"🚨 FILE_IO FALLBACK: Listing {current_workdir} (not in workspace)"
+                    )
                 else:
                     logger.info(f"✅ FILE_IO WORKSPACE: Listing {current_workdir}")
-            
+
             # If path is relative and we have a known working directory, make it absolute
-            elif fixed_params.get("path") and not fixed_params["path"].startswith('/'):
+            elif fixed_params.get("path") and not fixed_params["path"].startswith("/"):
                 relative_path = fixed_params["path"]
                 absolute_path = f"{current_workdir}/{relative_path}"
                 fixed_params["path"] = absolute_path
-                
+
                 if is_fallback_mode:
-                    logger.error(f"🚨 FILE_IO FALLBACK PATH: {relative_path} → {absolute_path} (not in workspace)")
+                    logger.error(
+                        f"🚨 FILE_IO FALLBACK PATH: {relative_path} → {absolute_path} (not in workspace)"
+                    )
                 else:
                     logger.info(f"✅ FILE_IO WORKSPACE PATH: {relative_path} → {absolute_path}")
-            
+
             # PRIORITY CHECK: If path points to /workspace but we're in fallback mode, this is concerning
             elif fixed_params.get("path") and fixed_params["path"].startswith("/workspace"):
                 if is_fallback_mode and not current_workdir.startswith("/workspace"):
                     original_path = fixed_params["path"]
-                    logger.error(f"🚨 FILE_IO MISMATCH: Requesting {original_path} but workspace unavailable")
+                    logger.error(
+                        f"🚨 FILE_IO MISMATCH: Requesting {original_path} but workspace unavailable"
+                    )
                     logger.error(f"🚨 Current fallback directory: {current_workdir}")
-                    
-                    # Try to map /workspace/... to current_workdir/... 
+
+                    # Try to map /workspace/... to current_workdir/...
                     relative_part = original_path.replace("/workspace", "").lstrip("/")
                     if relative_part:
                         adjusted_path = f"{current_workdir}/{relative_part}"
-                        logger.error(f"🚨 ATTEMPTING PATH MAPPING: {original_path} → {adjusted_path}")
+                        logger.error(
+                            f"🚨 ATTEMPTING PATH MAPPING: {original_path} → {adjusted_path}"
+                        )
                         logger.error(f"🚨 This may fail if files are actually in /workspace")
                     else:
                         adjusted_path = current_workdir
                         logger.error(f"🚨 MAPPING WORKSPACE ROOT to fallback: {adjusted_path}")
-                    
+
                     fixed_params["path"] = adjusted_path
                 else:
                     # Normal case - workspace path and we're in workspace
                     if not is_fallback_mode:
                         logger.debug(f"✅ FILE_IO WORKSPACE: Accessing {fixed_params['path']}")
                     else:
-                        logger.info(f"✅ FILE_IO WORKSPACE: Accessing {fixed_params['path']} (workspace available)")
-            
+                        logger.info(
+                            f"✅ FILE_IO WORKSPACE: Accessing {fixed_params['path']} (workspace available)"
+                        )
+
             # If we're in fallback mode, warn about any non-fallback paths
             elif is_fallback_mode and fixed_params.get("path"):
                 path = fixed_params["path"]
                 if not path.startswith(current_workdir):
-                    logger.warning(f"⚠️ FILE_IO OUTSIDE FALLBACK: Accessing {path} while in fallback mode ({current_workdir})")
+                    logger.warning(
+                        f"⚠️ FILE_IO OUTSIDE FALLBACK: Accessing {path} while in fallback mode ({current_workdir})"
+                    )
                     logger.warning(f"⚠️ This may fail if the path doesn't exist")
-        
+
         elif tool_name == "manage_context":
             # Fix common action name errors with comprehensive alias mapping
             action = fixed_params.get("action", "")
-            
+
             # Map common variations to correct actions
             action_aliases = {
                 # Start task aliases
@@ -2342,13 +2558,11 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 "create_branch": "start_task",
                 "new": "start_task",
                 "new_task": "start_task",
-                
                 # Get info aliases
                 "info": "get_info",
                 "status": "get_info",
                 "current": "get_info",
                 "check": "get_info",
-                
                 # Complete task aliases
                 "complete": "complete_task",
                 "finish": "complete_task",
@@ -2358,33 +2572,34 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 "switch_to_trunk": "complete_task",
                 "failure": "complete_task",
                 "failed": "complete_task",
-                
                 # Add context aliases
                 "add": "add_context",
                 "record": "add_context",
                 "log": "add_context",
-                
                 # Get context aliases
                 "get": "get_full_context",
                 "show": "get_full_context",
                 "view": "get_full_context",
                 "history": "get_full_context",
-                
                 # Compact context aliases
                 "compress": "compact_context",
                 "compact": "compact_context",
-                "reduce": "compact_context"
+                "reduce": "compact_context",
             }
-            
+
             if action in action_aliases:
                 original_action = action
                 fixed_params["action"] = action_aliases[action]
-                logger.info(f"🔧 Converted action '{original_action}' to '{action_aliases[action]}' for manage_context")
-                
+                logger.info(
+                    f"🔧 Converted action '{original_action}' to '{action_aliases[action]}' for manage_context"
+                )
+
                 # Add default summary for completion actions
                 if action_aliases[action] == "complete_task" and not fixed_params.get("summary"):
                     if action in ["failure", "failed"]:
-                        fixed_params["summary"] = "Task failed to complete successfully due to encountered issues"
+                        fixed_params["summary"] = (
+                            "Task failed to complete successfully due to encountered issues"
+                        )
                     else:
                         fixed_params["summary"] = "Task completed with mixed results"
                     logger.info(f"🔧 Added default summary for complete_task action")
@@ -2393,7 +2608,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 if not fixed_params.get("summary"):
                     fixed_params["summary"] = "Switching back to trunk context"
                     logger.info(f"🔧 Added default summary for switch_to_trunk action")
-            
+
             # Ensure required parameters for create_branch
             if fixed_params.get("action") == "create_branch":
                 if not fixed_params.get("task_id"):
@@ -2402,20 +2617,20 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     task_id = summary.replace(" ", "_").lower()[:20]
                     fixed_params["task_id"] = task_id
                     logger.info(f"🔧 Generated missing task_id: {task_id}")
-            
+
             # For start_task, ensure we have task_id
             elif fixed_params.get("action") == "start_task":
                 if not fixed_params.get("task_id"):
                     # Auto-inject the correct next task ID based on context
                     fixed_params["task_id"] = "task_1"  # Default to first task
                     logger.info("🔧 Auto-injected default task_id: task_1 for start_task")
-                    
+
             # For complete_task, ensure we have summary
             elif fixed_params.get("action") == "complete_task":
                 if not fixed_params.get("summary"):
                     fixed_params["summary"] = "Task completed with mixed results"
                     logger.info(f"🔧 Added default summary for complete_task action")
-        
+
         return fixed_params
 
     def _format_tool_result(self, tool_name: str, result: ToolResult) -> str:
@@ -2423,15 +2638,15 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         if result.success:
             # For successful results, preserve key status information
             formatted = f"✅ {tool_name} executed successfully"
-            
+
             # Add command information for bash tool
             if tool_name == "bash" and result.metadata and "command" in result.metadata:
                 formatted += f"\nCommand: {result.metadata['command']}"
-            
+
             # Add output (already processed by BaseTool truncation)
             if result.output:
                 formatted += f"\n\nOutput: {result.output}"
-            
+
             # Add metadata if available
             if result.metadata:
                 if "exit_code" in result.metadata:
@@ -2443,33 +2658,37 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     original_len = result.metadata.get("original_length", 0)
                     truncated_len = result.metadata.get("truncated_length", 0)
                     formatted += f"\n📏 Output truncated: {original_len} → {truncated_len} chars"
-                    
+
         else:
             # For failed results, show error and suggestions
             error_msg = result.error if result.error else "Unknown error occurred"
             formatted = f"❌ {tool_name} failed: {error_msg}"
-            
+
             # Add command information for failed bash tool
             if tool_name == "bash" and result.metadata and "command" in result.metadata:
                 formatted += f"\nCommand: {result.metadata['command']}"
-            
+
             # Show extracted error details from output (especially important for maven tool)
             if result.output and result.output.strip():
                 formatted += f"\n\n{result.output}"
-            
+
             if result.suggestions:
-                formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])
-                
+                formatted += f"\n\nSuggestions:\n" + "\n".join(
+                    f"• {s}" for s in result.suggestions[:3]
+                )
+
             if result.error_code:
                 formatted += f"\nError code: {result.error_code}"
-            
+
             # Add full raw output if available and error message is unclear (and no specific output was provided)
-            if result.raw_output and (not result.error or len(result.error.strip()) < 10) and (not result.output or len(result.output.strip()) < 20):
+            if (
+                result.raw_output
+                and (not result.error or len(result.error.strip()) < 10)
+                and (not result.output or len(result.output.strip()) < 20)
+            ):
                 formatted += f"\n\nRaw output: {result.raw_output}"
-                
+
         return formatted
-
-
 
     def _get_repetition_level(self, tool_signature: str) -> int:
         """
@@ -2481,12 +2700,15 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             3: Force break level (5+ repetitions)
         """
         # Count exact matches
-        exact_match_count = sum(1 for exec_info in self.recent_tool_executions 
-                               if exec_info["signature"] == tool_signature)
-        
+        exact_match_count = sum(
+            1
+            for exec_info in self.recent_tool_executions
+            if exec_info["signature"] == tool_signature
+        )
+
         # Extract tool name
-        tool_name = tool_signature.split(':')[0]
-        
+        tool_name = tool_signature.split(":")[0]
+
         # Special handling for manage_context
         if tool_name == "manage_context":
             if "start_task" in tool_signature or "get_info" in tool_signature:
@@ -2499,12 +2721,15 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 elif exact_match_count >= 4:
                     return 1
                 return 0
-        
+
         # Count tool executions
-        tool_executions = [exec_info for exec_info in self.recent_tool_executions 
-                          if exec_info["signature"].startswith(tool_name + ':')]
+        tool_executions = [
+            exec_info
+            for exec_info in self.recent_tool_executions
+            if exec_info["signature"].startswith(tool_name + ":")
+        ]
         tool_count = len(tool_executions)
-        
+
         # Determine level based on counts
         if exact_match_count >= 5 or tool_count >= 8:
             return 3  # Force break
@@ -2512,72 +2737,90 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             return 2  # Guidance
         elif exact_match_count >= 3 or tool_count >= 5:
             return 1  # Warning
-        
+
         return 0  # No concern
-    
-    def _generate_alternative_suggestions(self, tool_name: str, params: Dict, recent_executions: List) -> str:
+
+    def _generate_alternative_suggestions(
+        self, tool_name: str, params: Dict, recent_executions: List
+    ) -> str:
         """Generate context-aware alternative suggestions."""
         suggestions = []
-        
+
         if tool_name == "bash":
             # Check for common bash issues
             if any("update-alternatives" in str(e) for e in recent_executions):
-                suggestions.append("Use system tool's install_java action instead of manual update-alternatives")
+                suggestions.append(
+                    "Use system tool's install_java action instead of manual update-alternatives"
+                )
             if any("java" in str(e) for e in recent_executions):
-                suggestions.append("Try: system(action='verify_java') to check current Java version")
+                suggestions.append(
+                    "Try: system(action='verify_java') to check current Java version"
+                )
             suggestions.append("Use file_io tool to examine files before executing commands")
-            
+
         elif tool_name == "maven":
             suggestions.append("Try: bash(command='mvn --version') to verify Maven installation")
             suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
             suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
-            
+
         elif tool_name == "system":
             if params.get("action") == "install_java":
-                suggestions.append("Java might already be installed - verify with: system(action='verify_java')")
-                suggestions.append("Check available Java versions: bash(command='ls /usr/lib/jvm/')")
-                
+                suggestions.append(
+                    "Java might already be installed - verify with: system(action='verify_java')"
+                )
+                suggestions.append(
+                    "Check available Java versions: bash(command='ls /usr/lib/jvm/')"
+                )
+
         return "\n• ".join(suggestions) if suggestions else "Try a different tool or approach"
-    
+
     def _auto_fix_java_configuration(self) -> ToolResult:
         """Automatically fix Java configuration issues."""
         logger.info("Attempting automatic Java configuration fix")
-        
+
         # Use the system tool which now has proper architecture detection
         if "system" in self.tools:
             # First verify what Java is needed
             verify_result = self.tools["system"].safe_execute(action="verify_java")
-            
+
             # Check if Java 17 is needed (common for Tika)
             if "17" in str(self.context_manager.get_current_context()):
-                logger.info("Detected Java 17 requirement, using system tool for proper installation")
-                install_result = self.tools["system"].safe_execute(action="install_java", java_version="17")
-                
+                logger.info(
+                    "Detected Java 17 requirement, using system tool for proper installation"
+                )
+                install_result = self.tools["system"].safe_execute(
+                    action="install_java", java_version="17"
+                )
+
                 if install_result.success:
                     return ToolResult(
                         success=True,
-                        output="✅ Auto-fixed Java configuration using enhanced system tool\n" + install_result.output,
-                        metadata={"auto_fixed": True, "java_version": "17"}
+                        output="✅ Auto-fixed Java configuration using enhanced system tool\n"
+                        + install_result.output,
+                        metadata={"auto_fixed": True, "java_version": "17"},
                     )
-        
+
         # Fallback response
         return ToolResult(
             success=False,
             output="Could not auto-fix Java configuration. Skipping to next task.",
             error="Auto-fix failed",
             error_code="AUTO_FIX_FAILED",
-            suggestions=["Manual intervention may be required", "Check Java installation logs"]
+            suggestions=["Manual intervention may be required", "Check Java installation logs"],
         )
-    
+
     def _is_repetitive_execution(self, tool_signature: str) -> bool:
         """Check if this tool execution is repetitive."""
         # Count recent executions of the same tool with same parameters
-        exact_match_count = sum(1 for exec_info in self.recent_tool_executions 
-                               if exec_info["signature"] == tool_signature)
-        
+        exact_match_count = sum(
+            1
+            for exec_info in self.recent_tool_executions
+            if exec_info["signature"] == tool_signature
+        )
+
         # Extract tool name from signature
-        tool_name = tool_signature.split(':')[0]
-        
+        tool_name = tool_signature.split(":")[0]
+
         # Special handling for manage_context actions
         if tool_name == "manage_context":
             # Never block start_task or get_info - these should always be allowed
@@ -2586,34 +2829,35 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             # Allow more retries for task completion since agent often needs to correct parameters
             if "complete_with_results" in tool_signature:
                 return exact_match_count >= 4
-        
+
         # Count recent executions of the same tool (regardless of parameters)
-        tool_executions = [exec_info for exec_info in self.recent_tool_executions 
-                          if exec_info["signature"].startswith(tool_name + ':')]
-        
+        tool_executions = [
+            exec_info
+            for exec_info in self.recent_tool_executions
+            if exec_info["signature"].startswith(tool_name + ":")
+        ]
+
         # Check for patterns that indicate repetitive execution
         recent_tool_count = len(tool_executions)
         recent_failures = sum(1 for exec_info in tool_executions if not exec_info["success"])
-        
+
         # Stricter thresholds to catch failures earlier and prevent stuck states
-        # Block if: 
+        # Block if:
         # 1. Exact same call attempted 2+ times (reduced from 3), OR
-        # 2. Same tool failed 3+ times recently (reduced from 5), OR  
+        # 2. Same tool failed 3+ times recently (reduced from 5), OR
         # 3. Same tool called 5+ times in recent executions (reduced from 8)
-        return (exact_match_count >= 2 or 
-                recent_failures >= 3 or 
-                recent_tool_count >= 5)
+        return exact_match_count >= 2 or recent_failures >= 3 or recent_tool_count >= 5
 
     def _track_tool_execution(self, tool_signature: str, success: bool):
         """Track tool execution to detect repetitive patterns."""
         execution_info = {
             "signature": tool_signature,
             "success": success,
-            "timestamp": self._get_timestamp()
+            "timestamp": self._get_timestamp(),
         }
-        
+
         self.recent_tool_executions.append(execution_info)
-        
+
         # Keep only recent executions to prevent memory bloat
         if len(self.recent_tool_executions) > self.max_recent_executions:
             self.recent_tool_executions.pop(0)
@@ -2624,38 +2868,38 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
         # Common tool name mappings
         tool_mappings = {
-            'git': 'project_setup',
-            'git_clone': 'project_setup',
-            'clone': 'project_setup',
-            'setup': 'project_setup',
-            'mvn': 'maven',
-            'gradle_build': 'gradle',
-            'npm': 'bash',
-            'pip': 'bash',
-            'python': 'bash',
-            'ls': 'bash',
-            'cd': 'bash',
-            'cat': 'file_io',
-            'echo': 'bash',
-            'mkdir': 'bash',
-            'rm': 'bash',
-            'cp': 'bash',
-            'mv': 'bash',
-            'find': 'file_search',
-            'grep': 'file_search',
-            'test': 'bash',
-            'build': 'maven or gradle or bash',
-            'compile': 'maven or gradle',
-            'install': 'system or bash',
-            'package': 'maven or gradle',
-            'analyze': 'project_analyzer',
-            'review': 'code_review',
-            'report': 'report',
-            'context': 'manage_context',
-            'search': 'file_search or web_search',
-            'read': 'file_io',
-            'write': 'file_io',
-            'edit': 'file_io'
+            "git": "project_setup",
+            "git_clone": "project_setup",
+            "clone": "project_setup",
+            "setup": "project_setup",
+            "mvn": "maven",
+            "gradle_build": "gradle",
+            "npm": "bash",
+            "pip": "bash",
+            "python": "bash",
+            "ls": "bash",
+            "cd": "bash",
+            "cat": "file_io",
+            "echo": "bash",
+            "mkdir": "bash",
+            "rm": "bash",
+            "cp": "bash",
+            "mv": "bash",
+            "find": "file_search",
+            "grep": "file_search",
+            "test": "bash",
+            "build": "maven or gradle or bash",
+            "compile": "maven or gradle",
+            "install": "system or bash",
+            "package": "maven or gradle",
+            "analyze": "project_analyzer",
+            "review": "code_review",
+            "report": "report",
+            "context": "manage_context",
+            "search": "file_search or web_search",
+            "read": "file_io",
+            "write": "file_io",
+            "edit": "file_io",
         }
 
         # Build feedback message
@@ -2667,14 +2911,22 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             feedback_parts.append(f"\n✅ Did you mean: {suggested}?")
 
             # Add usage example for the suggested tool
-            if suggested == 'project_setup':
-                feedback_parts.append("\n📝 Usage: Use 'project_setup' with action='clone' and repo_url to clone repositories")
-            elif suggested == 'maven':
-                feedback_parts.append("\n📝 Usage: Use 'maven' with command='compile' or 'test' or 'package'")
-            elif suggested == 'bash':
-                feedback_parts.append(f"\n📝 Usage: Use 'bash' with command='{requested_tool} <args>' to run shell commands")
-            elif suggested == 'manage_context':
-                feedback_parts.append("\n📝 Usage: Use 'manage_context' with action='get_info' or 'create_branch'")
+            if suggested == "project_setup":
+                feedback_parts.append(
+                    "\n📝 Usage: Use 'project_setup' with action='clone' and repo_url to clone repositories"
+                )
+            elif suggested == "maven":
+                feedback_parts.append(
+                    "\n📝 Usage: Use 'maven' with command='compile' or 'test' or 'package'"
+                )
+            elif suggested == "bash":
+                feedback_parts.append(
+                    f"\n📝 Usage: Use 'bash' with command='{requested_tool} <args>' to run shell commands"
+                )
+            elif suggested == "manage_context":
+                feedback_parts.append(
+                    "\n📝 Usage: Use 'manage_context' with action='get_info' or 'create_branch'"
+                )
         else:
             # Find similar tool names
             available_tools = list(self.tools.keys())
@@ -2686,19 +2938,19 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             # Always list available tools for reference
             feedback_parts.append("\n\n📋 Available tools:")
             tool_descriptions = {
-                'bash': 'Execute shell commands',
-                'file_io': 'Read, write, and manipulate files',
-                'file_search': 'Search for files and content',
-                'web_search': 'Search the web for information',
-                'project_setup': 'Clone repositories and install dependencies',
-                'project_analyzer': 'Analyze project structure and requirements',
-                'maven': 'Run Maven build commands',
-                'gradle': 'Run Gradle build commands',
-                'system': 'Install system packages and configure Java',
-                'manage_context': 'Manage task context and branching',
-                'report': 'Generate project reports',
-                'code_review': 'Review code quality and security',
-                'output_search': 'Search truncated outputs'
+                "bash": "Execute shell commands",
+                "file_io": "Read, write, and manipulate files",
+                "file_search": "Search for files and content",
+                "web_search": "Search the web for information",
+                "project_setup": "Clone repositories and install dependencies",
+                "project_analyzer": "Analyze project structure and requirements",
+                "maven": "Run Maven build commands",
+                "gradle": "Run Gradle build commands",
+                "system": "Install system packages and configure Java",
+                "manage_context": "Manage task context and branching",
+                "report": "Generate project reports",
+                "code_review": "Review code quality and security",
+                "output_search": "Search truncated outputs",
             }
 
             for tool in available_tools[:10]:  # Show first 10 tools
@@ -2713,19 +2965,21 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         feedback_parts.append("• For shell commands, use 'bash' tool with command parameter")
         feedback_parts.append("• For file operations, use 'file_io' tool with action parameter")
         feedback_parts.append("• For Java projects, use 'maven' or 'gradle' tools")
-        feedback_parts.append("• Check tool parameter requirements with action='help' where supported")
+        feedback_parts.append(
+            "• Check tool parameter requirements with action='help' where supported"
+        )
 
-        return '\n'.join(feedback_parts)
+        return "\n".join(feedback_parts)
 
     def _add_observation_step(self, observation: str):
         """Add an observation step, enriched with physical validation state."""
         # Get physical validation state if relevant
         physical_state = self._get_physical_validation_state(observation)
-        
+
         # Enrich observation with physical state if available
         if physical_state:
             observation = self._enrich_observation_with_physical_state(observation, physical_state)
-        
+
         obs_step = ReActStep(
             step_type=StepType.OBSERVATION, content=observation, timestamp=self._get_timestamp()
         )
@@ -2734,7 +2988,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         # FIXED: Only log once to prevent duplicate output in logs
         # Use logger.info for main logging, agent_logger for internal tracking only
         logger.info(f"👁️ OBSERVATION: {observation}")
-        
+
         # DEPRECATED: Task completion detection now handled by state_evaluator
         # self._check_task_completion_opportunity(observation)
 
@@ -2742,7 +2996,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         """Check if the current task is complete."""
         # Check for report tool completion signal (highest priority)
         recent_steps = self.steps[-3:] if len(self.steps) >= 3 else self.steps
-        
+
         for step in recent_steps:
             if step.step_type == StepType.ACTION and step.tool_name == "report":
                 if step.tool_result and step.tool_result.success:
@@ -2750,12 +3004,12 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     if metadata.get("completion_signal") or metadata.get("task_completed"):
                         logger.info("Task completion detected via report tool")
                         return True
-        
+
         # Check for successful Maven test completion (rule-based completion)
         if self._check_maven_completion():
             logger.info("Task completion detected via Maven success criteria")
             return True
-        
+
         # Look at recent steps for EXPLICIT completion indicators
         recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
 
@@ -2767,11 +3021,11 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     phrase in content_lower
                     for phrase in [
                         "all tasks completed",
-                        "project setup complete", 
+                        "project setup complete",
                         "setup finished",
                         "build and test complete",
                         "maven build successful and report generated",
-                        "final report completed"
+                        "final report completed",
                     ]
                 ):
                     logger.info(f"Task completion detected via thought: {step.content[:100]}...")
@@ -2784,11 +3038,10 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     if step.tool_result and step.tool_result.success and step.tool_result.metadata:
                         metadata = step.tool_result.metadata
                         # Only complete if there are no more tasks OR if explicit completion signal
-                        if (metadata.get("all_tasks_completed") or 
-                            not metadata.get("next_task")):
+                        if metadata.get("all_tasks_completed") or not metadata.get("next_task"):
                             logger.info("Task completion detected: all TODO tasks completed")
                             return True
-                
+
                 # Don't treat individual branch task completion as overall completion
                 # The agent should continue with the next task in the TODO list
 
@@ -2798,38 +3051,47 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         """Check if Maven project has been successfully built and tested."""
         # Look for successful Maven test execution in recent steps
         recent_steps = self.steps[-10:] if len(self.steps) >= 10 else self.steps
-        
+
         maven_compile_success = False
         maven_test_success = False
-        
+
         for step in recent_steps:
-            if (step.step_type == StepType.ACTION and 
-                step.tool_name == "maven" and 
-                step.tool_result and step.tool_result.success):
-                
+            if (
+                step.step_type == StepType.ACTION
+                and step.tool_name == "maven"
+                and step.tool_result
+                and step.tool_result.success
+            ):
+
                 output = step.tool_result.output or ""
                 command = step.tool_params.get("command", "") if step.tool_params else ""
-                
+
                 # Check for successful compilation
-                if ("compile" in command.lower() and 
-                    "BUILD SUCCESS" in output):
+                if "compile" in command.lower() and "BUILD SUCCESS" in output:
                     maven_compile_success = True
                     logger.debug("Maven compile success detected")
-                
+
                 # Check for successful test execution
-                if ("test" in command.lower() and 
-                    "BUILD SUCCESS" in output and
-                    "Tests run:" in output):
-                    
+                if (
+                    "test" in command.lower()
+                    and "BUILD SUCCESS" in output
+                    and "Tests run:" in output
+                ):
+
                     # Parse test results
                     import re
-                    test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
+
+                    test_match = re.search(
+                        r"Tests run: (\d+), Failures: (\d+), Errors: (\d+)", output
+                    )
                     if test_match:
                         total, failures, errors = map(int, test_match.groups())
                         if failures == 0 and errors == 0 and total > 0:
                             maven_test_success = True
-                            logger.info(f"Maven test success detected: {total} tests, 0 failures, 0 errors")
-        
+                            logger.info(
+                                f"Maven test success detected: {total} tests, 0 failures, 0 errors"
+                            )
+
         # Consider task complete if test succeeded (test usually includes compilation)
         # OR if both compile and test succeeded explicitly
         if maven_test_success or (maven_compile_success and maven_test_success):
@@ -2837,14 +3099,14 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             # Add completion guidance for the agent
             self._add_completion_guidance("Maven build and test completed successfully")
             return True
-            
+
         return False
 
     def _add_completion_guidance(self, reason: str):
         """Add guidance to help agent recognize task completion."""
         guidance_segments: List[str] = []
 
-        snapshot = self.successful_states.get('report_snapshot')
+        snapshot = self.successful_states.get("report_snapshot")
         if snapshot:
             try:
                 guidance_segments.append(render_condensed_summary(snapshot))
@@ -2865,54 +3127,62 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             timestamp=self._get_timestamp(),
         )
         self.steps.append(guidance_step)
-        
+
         self.agent_logger.info(f"🏁 COMPLETION GUIDANCE: {guidance}")
         logger.info(f"🏁 COMPLETION GUIDANCE: Task completion detected - {reason}")
 
     def _check_completion_suggestion(self) -> str:
         """Check if we should strongly suggest task completion."""
         # Check if Maven build and test succeeded but no report generated yet
-        if (self.successful_states['maven_success'] and 
-            not self._has_report_been_generated()):
-            
+        if self.successful_states["maven_success"] and not self._has_report_been_generated():
+
             # Look for recent Maven test success
             recent_steps = self.steps[-10:] if len(self.steps) >= 10 else self.steps
             for step in recent_steps:
-                if (step.step_type == StepType.ACTION and 
-                    step.tool_name == "maven" and 
-                    step.tool_result and step.tool_result.success):
-                    
+                if (
+                    step.step_type == StepType.ACTION
+                    and step.tool_name == "maven"
+                    and step.tool_result
+                    and step.tool_result.success
+                ):
+
                     output = step.tool_result.output or ""
-                    if ("test" in step.tool_params.get("command", "").lower() and
-                        "BUILD SUCCESS" in output and
-                        "Tests run:" in output):
-                        
+                    if (
+                        "test" in step.tool_params.get("command", "").lower()
+                        and "BUILD SUCCESS" in output
+                        and "Tests run:" in output
+                    ):
+
                         # Parse test results to confirm no failures
                         import re
-                        test_match = re.search(r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)', output)
+
+                        test_match = re.search(
+                            r"Tests run: (\d+), Failures: (\d+), Errors: (\d+)", output
+                        )
                         if test_match:
                             total, failures, errors = map(int, test_match.groups())
                             if failures == 0 and errors == 0 and total > 0:
                                 return f"Maven build and test completed successfully ({total} tests passed)"
-        
+
         # Check if we've been running for many iterations without progress
         if self.current_iteration >= 25 and not self._has_report_been_generated():
             # Check if we have any clear successes
-            if self.successful_states['cloned_repos'] or self.successful_states['maven_success']:
+            if self.successful_states["cloned_repos"] or self.successful_states["maven_success"]:
                 return "Task has been running for many iterations with some successes"
-        
+
         return None
-    
+
     def _has_report_been_generated(self) -> bool:
         """Check if a report has already been generated."""
         for step in self.steps:
-            if (step.step_type == StepType.ACTION and 
-                step.tool_name == "report" and 
-                step.tool_result and step.tool_result.success):
+            if (
+                step.step_type == StepType.ACTION
+                and step.tool_name == "report"
+                and step.tool_result
+                and step.tool_result.success
+            ):
                 return True
         return False
-    
-
 
     def _build_next_prompt(self) -> str:
         """Build the prompt for the next iteration."""
@@ -2921,7 +3191,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         # Limit recent steps to avoid context window overflow
         # Keep the most recent steps, but cap the total length
         max_steps = 7  # Start with fewer steps to stay within context window
-        
+
         # If we have more steps, take the first few and the most recent ones
         if len(self.steps) > max_steps * 2:
             # Take first 2 steps (usually context and first action) and last max_steps
@@ -2956,7 +3226,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 thoughts_without_actions += 1
             elif step.step_type == StepType.ACTION:
                 break
-        
+
         if thoughts_without_actions >= 3:
             # Model seems stuck in thinking without acting
             if self.supports_function_calling:
@@ -3012,10 +3282,10 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
 """
 
         prompt += "Continue with your next THOUGHT and ACTION:\n\n"
-        
+
         # Apply memory protection to prevent critical info loss due to context pollution
         prompt = self._inject_memory_protection(prompt)
-        
+
         return prompt
 
     def _get_timestamp(self) -> str:
@@ -3023,8 +3293,6 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
         from datetime import datetime
 
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
 
     def _log_llm_request(
         self, model: str, prompt: str, temperature: float, max_tokens: int, is_thinking: bool
@@ -3146,81 +3414,93 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
     def _get_physical_validation_state(self, observation: str) -> Optional[Dict[str, any]]:
         """
         Get physical validation state for build/test related observations.
-        
+
         Args:
             observation: The observation text
-            
+
         Returns:
             Physical validation state dict or None
         """
         # Only validate for build/test related observations
         obs_lower = observation.lower()
-        if not any(keyword in obs_lower for keyword in ['build', 'compile', 'test', 'maven', 'gradle', 'success', 'fail']):
+        if not any(
+            keyword in obs_lower
+            for keyword in ["build", "compile", "test", "maven", "gradle", "success", "fail"]
+        ):
             return None
-        
+
         try:
             # Get project name from context or use default
             project_name = None
-            if hasattr(self.context_manager, 'project_name'):
+            if hasattr(self.context_manager, "project_name"):
                 project_name = self.context_manager.project_name
-            
+
             # Run physical validation
             validation_result = self.physical_validator.validate_build_artifacts(project_name)
-            
+
             # Check if we need to replay commands
-            if 'build success' in obs_lower or 'build fail' in obs_lower:
+            if "build success" in obs_lower or "build fail" in obs_lower:
                 # Try to get the last build command from command tracker if available
-                if hasattr(self, 'command_tracker') and self.command_tracker:
+                if hasattr(self, "command_tracker") and self.command_tracker:
                     last_build = self.command_tracker.get_last_build_command()
                     if last_build:
                         replay_result = self.physical_validator.replay_last_build_command(
-                            last_build['command'],
-                            last_build.get('working_dir')
+                            last_build["command"], last_build.get("working_dir")
                         )
-                        validation_result['build_replay'] = replay_result
-            
+                        validation_result["build_replay"] = replay_result
+
             return validation_result
-            
+
         except Exception as e:
             logger.warning(f"Physical validation failed: {e}")
             return None
-    
-    def _enrich_observation_with_physical_state(self, observation: str, physical_state: Dict[str, any]) -> str:
+
+    def _enrich_observation_with_physical_state(
+        self, observation: str, physical_state: Dict[str, any]
+    ) -> str:
         """
         Enrich observation with physical validation facts.
-        
+
         Args:
             observation: Original observation text
             physical_state: Physical validation state dict
-            
+
         Returns:
             Enriched observation text
         """
         # Build physical evidence summary
         evidence_lines = []
-        
-        if physical_state.get('class_files', 0) > 0:
-            evidence_lines.append(f"[PHYSICAL EVIDENCE: {physical_state['class_files']} .class files exist]")
+
+        if physical_state.get("class_files", 0) > 0:
+            evidence_lines.append(
+                f"[PHYSICAL EVIDENCE: {physical_state['class_files']} .class files exist]"
+            )
         else:
-            evidence_lines.append("[PHYSICAL EVIDENCE: No .class files found - compilation may have failed]")
-        
-        if physical_state.get('jar_files', 0) > 0:
-            evidence_lines.append(f"[PHYSICAL EVIDENCE: {physical_state['jar_files']} JAR files exist]")
-        
-        if physical_state.get('missing_classes'):
-            count = len(physical_state['missing_classes'])
-            evidence_lines.append(f"[PHYSICAL EVIDENCE: {count} Java files have no corresponding .class files]")
-        
-        if 'build_replay' in physical_state:
-            if physical_state['build_replay']:
+            evidence_lines.append(
+                "[PHYSICAL EVIDENCE: No .class files found - compilation may have failed]"
+            )
+
+        if physical_state.get("jar_files", 0) > 0:
+            evidence_lines.append(
+                f"[PHYSICAL EVIDENCE: {physical_state['jar_files']} JAR files exist]"
+            )
+
+        if physical_state.get("missing_classes"):
+            count = len(physical_state["missing_classes"])
+            evidence_lines.append(
+                f"[PHYSICAL EVIDENCE: {count} Java files have no corresponding .class files]"
+            )
+
+        if "build_replay" in physical_state:
+            if physical_state["build_replay"]:
                 evidence_lines.append("[PHYSICAL EVIDENCE: Build command replay succeeded]")
             else:
                 evidence_lines.append("[PHYSICAL EVIDENCE: Build command replay failed]")
-        
+
         # Add evidence to observation
         if evidence_lines:
             return observation + "\n" + "\n".join(evidence_lines)
-        
+
         return observation
 
     def _log_tool_result_verbose(self, tool_name: str, result):
@@ -3292,49 +3572,54 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
         This acts as a 'short-term memory' protection mechanism.
         """
         critical_info = []
-        
+
         # Always preserve repository URL if we have it
         if self.repository_url:
             critical_info.append(f"🔗 Repository URL: {self.repository_url}")
-        
+
         # ENHANCED: Preserve dynamic project state information
-        if self.successful_states.get('working_directory'):
-            workdir = self.successful_states['working_directory']
+        if self.successful_states.get("working_directory"):
+            workdir = self.successful_states["working_directory"]
             critical_info.append(f"📁 Working Directory: {workdir}")
             # Add explicit reminder for Maven/Gradle projects
-            if workdir != "/workspace" and self.successful_states.get('project_type') in ['maven', 'gradle']:
-                critical_info.append(f"⚠️ IMPORTANT: All Maven/Gradle commands must run in: {workdir}")
-        
+            if workdir != "/workspace" and self.successful_states.get("project_type") in [
+                "maven",
+                "gradle",
+            ]:
+                critical_info.append(
+                    f"⚠️ IMPORTANT: All Maven/Gradle commands must run in: {workdir}"
+                )
+
         # Preserve project structure awareness
-        if self.successful_states.get('project_name'):
+        if self.successful_states.get("project_name"):
             critical_info.append(f"📦 Project Name: {self.successful_states['project_name']}")
-        
+
         # Preserve build system information with more details
-        build_system = self.successful_states.get('build_system')
+        build_system = self.successful_states.get("build_system")
         if build_system:
-            status_indicator = " (working)" if self.successful_states.get('maven_success') else ""
+            status_indicator = " (working)" if self.successful_states.get("maven_success") else ""
             critical_info.append(f"🔧 Build System: {build_system}{status_indicator}")
-        
+
         # Preserve critical project structure findings
-        if self.successful_states.get('has_pom_xml'):
+        if self.successful_states.get("has_pom_xml"):
             critical_info.append("📄 Found: pom.xml (Maven project confirmed)")
-        
-        if self.successful_states.get('repository_cloned'):
+
+        if self.successful_states.get("repository_cloned"):
             critical_info.append("✅ Repository: Successfully cloned")
-        
+
         # Preserve successful tool states
         successful_tools = []
         for tool, success in [
-            ('project_setup', 'project_setup' in self.successful_states.get('tools_used', [])),
-            ('maven', self.successful_states.get('maven_success', False)),
-            ('git', 'git' in self.successful_states.get('tools_used', [])),
+            ("project_setup", "project_setup" in self.successful_states.get("tools_used", [])),
+            ("maven", self.successful_states.get("maven_success", False)),
+            ("git", "git" in self.successful_states.get("tools_used", [])),
         ]:
             if success:
                 successful_tools.append(tool)
-        
+
         if successful_tools:
             critical_info.append(f"✅ Working Tools: {', '.join(successful_tools)}")
-        
+
         # CRITICAL: Preserve task plan to prevent context pollution from causing hallucinated task IDs
         try:
             # Use cached trunk context to avoid frequent file I/O
@@ -3343,7 +3628,7 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
                 current_task = None
                 next_task = None
                 completed_count = 0
-                
+
                 for task in trunk_context.todo_list:
                     if task.status.value == "completed":
                         completed_count += 1
@@ -3351,42 +3636,56 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
                         current_task = task
                     elif task.status.value == "pending" and not next_task:
                         next_task = task
-                
-                plan_summary = [f"📋 TASK PLAN ({completed_count}/{len(trunk_context.todo_list)} completed):"]
-                
+
+                plan_summary = [
+                    f"📋 TASK PLAN ({completed_count}/{len(trunk_context.todo_list)} completed):"
+                ]
+
                 if current_task:
-                    plan_summary.append(f"  🔄 CURRENT: {current_task.id} - {current_task.description}")
-                
+                    plan_summary.append(
+                        f"  🔄 CURRENT: {current_task.id} - {current_task.description}"
+                    )
+
                 if next_task:
                     plan_summary.append(f"  ⏭️ NEXT: {next_task.id} - {next_task.description}")
-                
+
                 # Show available task IDs to prevent hallucinations
                 all_task_ids = [task.id for task in trunk_context.todo_list]
                 plan_summary.append(f"  📝 VALID IDs: {', '.join(all_task_ids)}")
-                
+
                 # CRITICAL: Add previous task's key results as context for next task
                 previous_task_results = []
                 for task in trunk_context.todo_list:
                     if task.status.value == "completed" and task.key_results:
                         previous_task_results.append(f"    - {task.id}: {task.key_results}")
-                
+
                 if previous_task_results:
                     plan_summary.append("  🔑 PREVIOUS_TASK_RESULTS:")
                     plan_summary.extend(previous_task_results)
-                
+
                 # CRITICAL: Add clear workflow guidance to prevent mental model confusion
-                plan_summary.append('  💡 WORKFLOW: manage_context(action="start_task", task_id="...") → [work on task] → manage_context(action="complete_with_results", summary="...", key_results="...")')
-                plan_summary.append('  ⚠️ USE manage_context(action="complete_with_results", summary="...", key_results="...") - NOT a separate tool!')
-                plan_summary.append("  ⚠️ NO 'branch_start' or 'branch_end' - context switching is automatic!")
-                
+                plan_summary.append(
+                    '  💡 WORKFLOW: manage_context(action="start_task", task_id="...") → [work on task] → manage_context(action="complete_with_results", summary="...", key_results="...")'
+                )
+                plan_summary.append(
+                    '  ⚠️ USE manage_context(action="complete_with_results", summary="...", key_results="...") - NOT a separate tool!'
+                )
+                plan_summary.append(
+                    "  ⚠️ NO 'branch_start' or 'branch_end' - context switching is automatic!"
+                )
+
                 critical_info.extend(plan_summary)
-                
+
         except Exception as e:
             # Don't let context loading errors break the memory protection
             critical_info.append("⚠️ Task plan unavailable - use manage_context(action='get_info')")
-        
+
         if critical_info:
-            return "\n🧠 CRITICAL MEMORY (preserved to prevent context pollution losses):\n" + "\n".join(critical_info) + "\n"
+            return (
+                "\n🧠 CRITICAL MEMORY (preserved to prevent context pollution losses):\n"
+                + "\n".join(critical_info)
+                + "\n"
+            )
         return ""
 
     def _inject_memory_protection(self, prompt: str) -> str:
@@ -3404,19 +3703,20 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
                 return critical_memory + "\n" + prompt
         return prompt
 
-
     def _get_cached_trunk_context(self):
         """
         Get trunk context with intelligent caching to avoid frequent file I/O.
         Only reloads when necessary (every 5 steps or after context changes).
         """
         current_step = len(self.steps)
-        
+
         # Cache for 5 steps or if cache is empty
-        if (self._cached_trunk_context is None or 
-            self._trunk_context_cache_timestamp is None or 
-            current_step - self._trunk_context_cache_timestamp >= 5):
-            
+        if (
+            self._cached_trunk_context is None
+            or self._trunk_context_cache_timestamp is None
+            or current_step - self._trunk_context_cache_timestamp >= 5
+        ):
+
             try:
                 self._cached_trunk_context = self.context_manager.load_trunk_context()
                 self._trunk_context_cache_timestamp = current_step
@@ -3424,7 +3724,7 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
             except Exception as e:
                 logger.warning(f"Failed to refresh trunk context cache: {e}")
                 # Keep using old cache if refresh fails
-        
+
         return self._cached_trunk_context
 
     def _invalidate_trunk_cache(self):
@@ -3445,38 +3745,46 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
             prefix = "⚠️ IMPORTANT GUIDANCE"
         else:
             prefix = "💡 SYSTEM GUIDANCE"
-            
+
         full_message = f"{prefix} (Priority: {priority}):\n{guidance_message}"
-        
+
         guidance_step = ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
             content=full_message,
             timestamp=self._get_timestamp(),
         )
         self.steps.append(guidance_step)
-        
+
         self.agent_logger.info(f"{prefix}: {guidance_message[:100]}...")
         logger.info(f"{prefix} added with priority {priority}")
 
     def test_state_evaluator_integration(self):
         """Test method to verify state evaluator is working correctly."""
         logger.info("Testing state evaluator integration...")
-        
+
         # Simulate some steps
         test_steps = [
-            ReActStep(step_type=StepType.THOUGHT, content="Test thought", timestamp=self._get_timestamp()),
-            ReActStep(step_type=StepType.ACTION, content="Test action", timestamp=self._get_timestamp()),
-            ReActStep(step_type=StepType.OBSERVATION, content="BUILD SUCCESS", timestamp=self._get_timestamp())
+            ReActStep(
+                step_type=StepType.THOUGHT, content="Test thought", timestamp=self._get_timestamp()
+            ),
+            ReActStep(
+                step_type=StepType.ACTION, content="Test action", timestamp=self._get_timestamp()
+            ),
+            ReActStep(
+                step_type=StepType.OBSERVATION,
+                content="BUILD SUCCESS",
+                timestamp=self._get_timestamp(),
+            ),
         ]
-        
+
         # Test evaluation
         analysis = self.state_evaluator.evaluate(
             steps=test_steps,
             current_iteration=1,
             recent_tool_executions=[],
-            steps_since_context_switch=5
+            steps_since_context_switch=5,
         )
-        
+
         logger.info(f"State analysis: {analysis.status}, needs_guidance: {analysis.needs_guidance}")
         return analysis
 
@@ -3529,9 +3837,9 @@ Remember: You are the THINKING brain, not the ACTING hands. Analyze and recommen
 
 CURRENT SITUATION TO ANALYZE:
 """
-        
+
         return thinking_instructions + base_prompt
-        
+
     def _build_action_model_prompt(self, base_prompt: str) -> str:
         """
         Build specialized prompt for action model.
@@ -3582,70 +3890,73 @@ Remember: You are the ACTING hands, not the thinking brain. Execute the planned 
 
 EXECUTE ACTIONS FOR:
 """
-        
+
         return action_instructions + base_prompt
 
-    def _attempt_error_recovery(self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+    def _attempt_error_recovery(
+        self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """
         Attempt to recover from tool execution failures using intelligent strategies.
         This is critical for robustness when individual tools fail.
         """
         try:
-            recovery_info = {
-                "attempted": False,
-                "success": False,
-                "message": "",
-                "result": None
-            }
-            
+            recovery_info = {"attempted": False, "success": False, "message": "", "result": None}
+
             error_msg = failed_result.error or "Unknown error"
-            error_code = getattr(failed_result, 'error_code', None)
-            
+            error_code = getattr(failed_result, "error_code", None)
+
             logger.info(f"🔧 Attempting error recovery for {tool_name}: {error_msg[:100]}")
-            
+
             # Context management tool recovery
             if tool_name == "manage_context":
                 recovery_info = self._recover_context_management_error(params, failed_result)
-            
+
             # Maven tool recovery
             elif tool_name == "maven":
                 recovery_info = self._recover_maven_error(params, failed_result)
-            
+
+            # Gradle tool recovery
+            elif tool_name == "gradle":
+                recovery_info = self._recover_gradle_error(params, failed_result)
+
             # Project setup tool recovery
             elif tool_name == "project_setup":
                 recovery_info = self._recover_project_setup_error(params, failed_result)
-            
+
             # Bash tool recovery
             elif tool_name == "bash":
                 recovery_info = self._recover_bash_error(params, failed_result)
-            
+
             # File I/O tool recovery
             elif tool_name == "file_io":
                 recovery_info = self._recover_file_io_error(params, failed_result)
-            
+
             else:
                 # Generic recovery strategies
                 recovery_info = self._recover_generic_error(tool_name, params, failed_result)
-            
+
             if recovery_info["attempted"]:
                 logger.info(f"Recovery attempt for {tool_name}: {recovery_info['message']}")
-            
+
             return recovery_info
-            
+
         except Exception as e:
             logger.error(f"Error recovery itself failed for {tool_name}: {e}")
             return {
                 "attempted": False,
                 "success": False,
                 "message": f"Recovery mechanism failed: {str(e)}",
-                "result": None
+                "result": None,
             }
 
-    def _recover_context_management_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+    def _recover_context_management_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """Recover from context management tool failures."""
         action = params.get("action", "")
-        error_code = getattr(failed_result, 'error_code', None)
-        
+        error_code = getattr(failed_result, "error_code", None)
+
         # Handle "No active task to complete" error
         if error_code == "NO_ACTIVE_TASK" and action in ["complete_task", "complete_with_results"]:
             # Try to recover by checking trunk context state
@@ -3653,41 +3964,43 @@ EXECUTE ACTIONS FOR:
                 trunk_context = self.context_manager.load_trunk_context()
                 if trunk_context:
                     # Look for in-progress tasks
-                    in_progress_tasks = [t for t in trunk_context.todo_list if t.status.value == "in_progress"]
-                    
+                    in_progress_tasks = [
+                        t for t in trunk_context.todo_list if t.status.value == "in_progress"
+                    ]
+
                     if len(in_progress_tasks) == 1:
                         # Found one in-progress task - set it as current and retry
                         recovered_task = in_progress_tasks[0]
                         self.context_manager.current_task_id = recovered_task.id
-                        
+
                         # Retry the operation
                         tool = self.tools["manage_context"]
                         result = tool.safe_execute(**params)
-                        
+
                         return {
                             "attempted": True,
                             "success": result.success,
                             "message": f"Recovered by setting current task to {recovered_task.id}",
-                            "result": result
+                            "result": result,
                         }
                     elif len(in_progress_tasks) > 1:
                         # Multiple in-progress tasks - choose most recent
                         recovered_task = max(in_progress_tasks, key=lambda t: t.id)
                         self.context_manager.current_task_id = recovered_task.id
-                        
+
                         tool = self.tools["manage_context"]
                         result = tool.safe_execute(**params)
-                        
+
                         return {
                             "attempted": True,
                             "success": result.success,
                             "message": f"Recovered by choosing most recent task {recovered_task.id} from multiple in-progress",
-                            "result": result
+                            "result": result,
                         }
-                        
+
             except Exception as e:
                 logger.warning(f"Context recovery failed: {e}")
-        
+
         # Handle invalid task ID errors
         elif error_code == "INVALID_TASK_ID" and action == "start_task":
             # Try to find the next valid task
@@ -3699,25 +4012,27 @@ EXECUTE ACTIONS FOR:
                         # Update params with valid task ID and retry
                         recovery_params = params.copy()
                         recovery_params["task_id"] = next_task.id
-                        
+
                         tool = self.tools["manage_context"]
                         result = tool.safe_execute(**recovery_params)
-                        
+
                         return {
                             "attempted": True,
                             "success": result.success,
                             "message": f"Recovered by using next valid task ID: {next_task.id}",
-                            "result": result
+                            "result": result,
                         }
             except Exception as e:
                 logger.warning(f"Task ID recovery failed: {e}")
-        
+
         return {"attempted": False, "success": False, "message": "No recovery strategy applicable"}
 
-    def _recover_maven_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+    def _recover_maven_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """Recover from Maven tool failures."""
         error_msg = failed_result.error or ""
-        error_code = getattr(failed_result, 'error_code', None)
+        error_code = getattr(failed_result, "error_code", None)
 
         def normalize_properties(raw_props: Any) -> List[str]:
             if not raw_props:
@@ -3725,7 +4040,7 @@ EXECUTE ACTIONS FOR:
             if isinstance(raw_props, list):
                 return [p for p in raw_props if p]
             if isinstance(raw_props, str):
-                return [p.strip() for p in raw_props.split(',') if p.strip()]
+                return [p.strip() for p in raw_props.split(",") if p.strip()]
             return [str(raw_props)]
 
         def ensure_flag(props: List[str], flag: str) -> List[str]:
@@ -3742,115 +4057,125 @@ EXECUTE ACTIONS FOR:
             cleaned = (name or "").strip()
             if not cleaned:
                 return cleaned
-            if '.' in cleaned and '#' not in cleaned:
-                cls, method = cleaned.rsplit('.', 1)
+            if "." in cleaned and "#" not in cleaned:
+                cls, method = cleaned.rsplit(".", 1)
                 return f"{cls}#{method}"
             return cleaned
 
         # Check for Java version mismatch (highest priority)
         if error_code == "JAVA_VERSION_MISMATCH":
             # Extract required Java version from metadata
-            metadata = getattr(failed_result, 'metadata', {})
-            analysis = metadata.get('analysis', {})
-            java_error = analysis.get('java_version_error', {})
-            
-            if java_error and java_error.get('required'):
-                required_version = java_error['required']
-                current_version = java_error.get('current', 'unknown')
-                
-                logger.info(f"🔧 Attempting Java version recovery: Installing Java {required_version} (current: {current_version})")
-                
+            metadata = getattr(failed_result, "metadata", {})
+            analysis = metadata.get("analysis", {})
+            java_error = analysis.get("java_version_error", {})
+
+            if java_error and java_error.get("required"):
+                required_version = java_error["required"]
+                current_version = java_error.get("current", "unknown")
+
+                logger.info(
+                    f"🔧 Attempting Java version recovery: Installing Java {required_version} (current: {current_version})"
+                )
+
                 # First, verify the current Java version
                 if "system" in self.tools:
                     verify_result = self.tools["system"].safe_execute(
-                        action="verify_java",
-                        java_version=required_version
+                        action="verify_java", java_version=required_version
                     )
-                    
+
                     # If verification shows we already have the right version, just retry Maven
                     if verify_result.success:
-                        logger.info(f"Java {required_version} is already installed, retrying Maven command")
+                        logger.info(
+                            f"Java {required_version} is already installed, retrying Maven command"
+                        )
                         tool = self.tools["maven"]
                         result = tool.safe_execute(**params)
                         return {
                             "attempted": True,
                             "success": result.success,
                             "message": f"Java {required_version} was already installed, retried Maven command",
-                            "result": result
+                            "result": result,
                         }
-                    
+
                     # Install the required Java version
                     install_result = self.tools["system"].safe_execute(
-                        action="install_java",
-                        java_version=required_version
+                        action="install_java", java_version=required_version
                     )
-                    
+
                     if install_result.success:
-                        logger.info(f"✅ Successfully installed Java {required_version}, retrying Maven command")
-                        
+                        logger.info(
+                            f"✅ Successfully installed Java {required_version}, retrying Maven command"
+                        )
+
                         # Retry the original Maven command
                         tool = self.tools["maven"]
                         result = tool.safe_execute(**params)
-                        
+
                         return {
                             "attempted": True,
                             "success": result.success,
                             "message": f"Recovered by installing Java {required_version} and retrying",
-                            "result": result
+                            "result": result,
                         }
                     else:
-                        logger.warning(f"Failed to install Java {required_version}: {install_result.error}")
+                        logger.warning(
+                            f"Failed to install Java {required_version}: {install_result.error}"
+                        )
                         return {
                             "attempted": True,
                             "success": False,
                             "message": f"Attempted to install Java {required_version} but failed",
-                            "result": install_result
+                            "result": install_result,
                         }
                 else:
                     logger.warning("System tool not available for Java installation")
-        
+
         # Try to fix working directory issues
         if "not found" in error_msg.lower() or "no such file" in error_msg.lower():
-            if self.successful_states.get('working_directory'):
+            if self.successful_states.get("working_directory"):
                 recovery_params = params.copy()
-                recovery_params["working_directory"] = self.successful_states['working_directory']
-                
+                recovery_params["working_directory"] = self.successful_states["working_directory"]
+
                 tool = self.tools["maven"]
                 result = tool.safe_execute(**recovery_params)
-                
+
                 return {
                     "attempted": True,
                     "success": result.success,
                     "message": f"Recovered by using known working directory: {self.successful_states['working_directory']}",
-                    "result": result
+                    "result": result,
                 }
-        
+
         # Try to simplify Maven command for initial failures
         command = params.get("command", "")
         if "test" in command and "compilation" in error_msg.lower():
             # If test failed due to compilation, try just compile first
             recovery_params = params.copy()
             recovery_params["command"] = "compile"
-            
+
             tool = self.tools["maven"]
             result = tool.safe_execute(**recovery_params)
-            
+
             return {
                 "attempted": True,
                 "success": result.success,
                 "message": "Recovered by trying compile before test",
-                "result": result
+                "result": result,
             }
 
-        analysis = getattr(failed_result, 'metadata', {}).get('analysis', {})
-        if analysis and (analysis.get("error_type") == "MISSING_PROJECT" or "pom" in error_msg.lower() and "not" in error_msg.lower()):
-            orchestrator = getattr(self.context_manager, 'orchestrator', None)
+        analysis = getattr(failed_result, "metadata", {}).get("analysis", {})
+        if analysis and (
+            analysis.get("error_type") == "MISSING_PROJECT"
+            or "pom" in error_msg.lower()
+            and "not" in error_msg.lower()
+        ):
+            orchestrator = getattr(self.context_manager, "orchestrator", None)
             if orchestrator:
                 try:
                     locate_cmd = "find /workspace -maxdepth 4 -name pom.xml | head -20"
                     locate_res = orchestrator.execute_command(locate_cmd)
                     pom_candidates = (locate_res.get("output") or "").strip().splitlines()
-                    project_name = getattr(orchestrator, 'project_name', None)
+                    project_name = getattr(orchestrator, "project_name", None)
                     target_pom = None
                     if project_name:
                         root_candidate = f"/workspace/{project_name}/pom.xml"
@@ -3858,10 +4183,12 @@ EXECUTE ACTIONS FOR:
                             target_pom = root_candidate
                     if not target_pom and project_name:
                         # Prefer candidates directly under /workspace/<project_name>/
-                        scoped = [c for c in pom_candidates if c.startswith(f"/workspace/{project_name}/")]
+                        scoped = [
+                            c for c in pom_candidates if c.startswith(f"/workspace/{project_name}/")
+                        ]
                         if scoped:
                             # Sort by path depth to pick the shallowest (closest to root pom)
-                            scoped.sort(key=lambda p: p.count('/'))
+                            scoped.sort(key=lambda p: p.count("/"))
                             target_pom = scoped[0]
                     if not target_pom and pom_candidates:
                         target_pom = pom_candidates[0]
@@ -3876,10 +4203,12 @@ EXECUTE ACTIONS FOR:
                             "attempted": True,
                             "success": result.success,
                             "message": f"Recovered by targeting detected pom: {target_pom}",
-                            "result": result
+                            "result": result,
                         }
                 except Exception as exc:
-                    logger.warning(f"Automatic pom.xml discovery failed during Maven recovery: {exc}")
+                    logger.warning(
+                        f"Automatic pom.xml discovery failed during Maven recovery: {exc}"
+                    )
 
         if analysis:
             failed_modules: List[str] = []
@@ -3892,14 +4221,18 @@ EXECUTE ACTIONS FOR:
                     if pom_path:
                         failed_modules.append(Path(pom_path).parent.name)
 
-            failed_tests = [format_test_exclusion(test) for test in analysis.get("failed_tests", [])]
+            failed_tests = [
+                format_test_exclusion(test) for test in analysis.get("failed_tests", [])
+            ]
 
             recovery_params = params.copy()
             recovery_params["fail_at_end"] = True
             new_exclusions = False
 
             if failed_modules:
-                excluded_modules: Set[str] = self.successful_states.setdefault('excluded_modules', set())
+                excluded_modules: Set[str] = self.successful_states.setdefault(
+                    "excluded_modules", set()
+                )
                 for module_name in failed_modules:
                     if module_name and module_name not in excluded_modules:
                         excluded_modules.add(module_name)
@@ -3907,13 +4240,15 @@ EXECUTE ACTIONS FOR:
                 if excluded_modules and new_exclusions:
                     props = normalize_properties(recovery_params.get("properties"))
                     props = [prop for prop in props if not prop.startswith("-pl")]
-                    module_clause = ','.join(f"!{name}" for name in sorted(excluded_modules))
+                    module_clause = ",".join(f"!{name}" for name in sorted(excluded_modules))
                     props.append(f"-pl {module_clause}")
                     props = ensure_flag(props, "-am")
                     recovery_params["properties"] = props
 
             if failed_tests:
-                excluded_tests: Set[str] = self.successful_states.setdefault('excluded_tests', set())
+                excluded_tests: Set[str] = self.successful_states.setdefault(
+                    "excluded_tests", set()
+                )
                 added_test = False
                 for test_name in failed_tests:
                     if test_name and test_name not in excluded_tests:
@@ -3934,104 +4269,349 @@ EXECUTE ACTIONS FOR:
                     "attempted": True,
                     "success": result.success,
                     "message": "Recovered by excluding failing modules/tests and rerunning Maven",
-                    "result": result
+                    "result": result,
                 }
 
-        return {"attempted": False, "success": False, "message": "No Maven recovery strategy applicable"}
+        # ★ TIMEOUT RECOVERY: Handle Maven tool timeout scenarios
+        error_code = getattr(failed_result, "error_code", "")
 
-    def _recover_project_setup_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        if error_code and error_code.startswith("TIMEOUT_"):
+            # Extract timeout information from metadata
+            metadata = getattr(failed_result, "metadata", {})
+            termination_reason = metadata.get("termination_reason", "unknown")
+            execution_time = metadata.get("execution_time", 0)
+            command = params.get("command", "unknown")
+
+            # Provide Maven-specific timeout guidance
+            maven_timeout_guidance = [
+                f"Maven command '{command}' timed out after {execution_time:.1f}s",
+                "Consider breaking down the Maven build into smaller phases",
+                "Try running 'mvn dependency:resolve' first to download dependencies",
+                "Consider using '-T 1C' flag for parallel builds",
+                "Check if the build is waiting for user input or network resources",
+                "For large projects, consider building specific modules with '-pl' flag",
+            ]
+
+            # Add system guidance specific to Maven timeouts
+            self._add_system_guidance(
+                f"⏰ MAVEN TIMEOUT: The Maven command '{command}' timed out after {execution_time:.1f}s. "
+                f"This is often due to dependency downloads or large compilation tasks. Consider breaking the build into phases.",
+                priority="high",
+            )
+
+            return {
+                "attempted": True,
+                "success": False,  # Don't retry timeouts automatically
+                "message": f"Maven timeout handled gracefully - provided guidance for alternative approaches",
+                "result": ToolResult(
+                    success=False,
+                    output=f"⏰ Maven command timed out after {execution_time:.1f}s due to {termination_reason}.\n\nSuggestions:\n"
+                    + "\n".join(f"• {g}" for g in maven_timeout_guidance),
+                    error=f"Maven command timed out ({termination_reason})",
+                    error_code="MAVEN_TIMEOUT_HANDLED",
+                    suggestions=maven_timeout_guidance,
+                    metadata={
+                        "timeout_handled": True,
+                        "execution_time": execution_time,
+                        "termination_reason": termination_reason,
+                        "original_command": command,
+                        "tool_type": "maven",
+                    },
+                ),
+            }
+
+        return {
+            "attempted": False,
+            "success": False,
+            "message": "No Maven recovery strategy applicable",
+        }
+
+    def _recover_gradle_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
+        """Recover from Gradle tool failures with timeout handling."""
+        error_msg = failed_result.error or ""
+        error_code = getattr(failed_result, "error_code", "")
+
+        # ★ TIMEOUT RECOVERY: Handle Gradle tool timeout scenarios
+        if error_code and error_code.startswith("TIMEOUT_"):
+            # Extract timeout information from metadata
+            metadata = getattr(failed_result, "metadata", {})
+            termination_reason = metadata.get("termination_reason", "unknown")
+            execution_time = metadata.get("execution_time", 0)
+            task = params.get("task", "unknown")
+
+            # Provide Gradle-specific timeout guidance
+            gradle_timeout_guidance = [
+                f"Gradle task '{task}' timed out after {execution_time:.1f}s",
+                "Consider breaking down the Gradle build into smaller tasks",
+                "Try running './gradlew dependencies' first to download dependencies",
+                "Consider using '--parallel' flag for parallel builds",
+                "Check if the build is waiting for user input or network resources",
+                "For large projects, consider building specific modules or subprojects",
+                "Use '--info' or '--debug' flags to monitor build progress",
+            ]
+
+            # Add system guidance specific to Gradle timeouts
+            self._add_system_guidance(
+                f"⏰ GRADLE TIMEOUT: The Gradle task '{task}' timed out after {execution_time:.1f}s. "
+                f"This is often due to dependency downloads or large compilation tasks. Consider breaking the build into phases.",
+                priority="high",
+            )
+
+            return {
+                "attempted": True,
+                "success": False,  # Don't retry timeouts automatically
+                "message": f"Gradle timeout handled gracefully - provided guidance for alternative approaches",
+                "result": ToolResult(
+                    success=False,
+                    output=f"⏰ Gradle task timed out after {execution_time:.1f}s due to {termination_reason}.\n\nSuggestions:\n"
+                    + "\n".join(f"• {g}" for g in gradle_timeout_guidance),
+                    error=f"Gradle task timed out ({termination_reason})",
+                    error_code="GRADLE_TIMEOUT_HANDLED",
+                    suggestions=gradle_timeout_guidance,
+                    metadata={
+                        "timeout_handled": True,
+                        "execution_time": execution_time,
+                        "termination_reason": termination_reason,
+                        "original_task": task,
+                        "tool_type": "gradle",
+                    },
+                ),
+            }
+
+        # Basic Gradle error recovery strategies (similar to Maven)
+
+        # Try to fix working directory issues
+        if "not found" in error_msg.lower() or "no such file" in error_msg.lower():
+            if self.successful_states.get("working_directory"):
+                recovery_params = params.copy()
+                recovery_params["working_directory"] = self.successful_states["working_directory"]
+
+                tool = self.tools["gradle"]
+                result = tool.safe_execute(**recovery_params)
+
+                return {
+                    "attempted": True,
+                    "success": result.success,
+                    "message": f"Recovered by using known working directory: {self.successful_states['working_directory']}",
+                    "result": result,
+                }
+
+        # Try to simplify Gradle task for initial failures
+        task = params.get("task", "")
+        if "test" in task and "compilation" in error_msg.lower():
+            # If test failed due to compilation, try just compileJava first
+            recovery_params = params.copy()
+            recovery_params["task"] = "compileJava"
+
+            tool = self.tools["gradle"]
+            result = tool.safe_execute(**recovery_params)
+
+            return {
+                "attempted": True,
+                "success": result.success,
+                "message": "Recovered by trying compileJava before test",
+                "result": result,
+            }
+
+        return {
+            "attempted": False,
+            "success": False,
+            "message": "No Gradle recovery strategy applicable",
+        }
+
+    def _recover_project_setup_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """Recover from project setup tool failures."""
         action = params.get("action", "")
-        
+
         # Auto-inject repository URL if missing
         if action == "clone" and not params.get("repository_url") and self.repository_url:
             recovery_params = params.copy()
             recovery_params["repository_url"] = self.repository_url
-            
+
             tool = self.tools["project_setup"]
             result = tool.safe_execute(**recovery_params)
-            
+
             return {
                 "attempted": True,
                 "success": result.success,
                 "message": f"Recovered by injecting repository URL: {self.repository_url}",
-                "result": result
+                "result": result,
             }
-        
-        return {"attempted": False, "success": False, "message": "No project setup recovery strategy applicable"}
 
-    def _recover_bash_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        return {
+            "attempted": False,
+            "success": False,
+            "message": "No project setup recovery strategy applicable",
+        }
+
+    def _recover_bash_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """
         Recover from bash tool failures.
-        
+
         ★ PRIORITY FIX: Add chain recovery for exit code 127 (OCI runtime exec failed).
         When workspace directory is missing, fix it and retry the same command.
+        ★ TIMEOUT FIX: Add proper timeout handling to prevent ReAct loop hanging.
         """
         error_msg = failed_result.error or ""
-        
+        error_code = getattr(failed_result, "error_code", "")
+
+        # ★ CRITICAL TIMEOUT RECOVERY: Handle timeout scenarios
+        if error_code and error_code.startswith("TIMEOUT_"):
+            termination_reason = (
+                failed_result.metadata.get("termination_reason", "")
+                if hasattr(failed_result, "metadata") and failed_result.metadata
+                else ""
+            )
+            execution_time = (
+                failed_result.metadata.get("monitoring_info", {}).get("execution_time", 0)
+                if hasattr(failed_result, "metadata") and failed_result.metadata
+                else 0
+            )
+
+            logger.warning(
+                f"🕐 TIMEOUT RECOVERY: Command timed out after {execution_time:.1f}s due to {termination_reason}"
+            )
+
+            # For timeout cases, provide specific guidance without retry (to prevent loops)
+            timeout_guidance = []
+            command = params.get("command", "")
+
+            if "mvn" in command or "maven" in command:
+                timeout_guidance = [
+                    "Maven command timed out - this is common for large projects",
+                    "Consider breaking down into smaller steps: mvn compile, then mvn test",
+                    "Use maven tool instead of bash for better timeout handling",
+                    "For multi-module projects, use fail_at_end=True to continue despite module failures",
+                ]
+            elif "gradle" in command:
+                timeout_guidance = [
+                    "Gradle command timed out - use gradle tool for better timeout handling",
+                    "Consider breaking down into smaller tasks",
+                    "Try with --parallel flag for faster execution",
+                ]
+            else:
+                timeout_guidance = [
+                    f"Command '{command}' exceeded timeout limits",
+                    "Consider breaking the task into smaller steps",
+                    "Check if the command requires user interaction",
+                    "Investigate if the process is stuck waiting for resources",
+                ]
+
+            # Add system guidance to help the agent understand what to do next
+            self._add_system_guidance(
+                f"⏰ TIMEOUT HANDLED: The command '{command}' timed out after {execution_time:.1f}s. "
+                f"This is a normal timeout, not a system failure. Consider alternative approaches or breaking the task into smaller steps.",
+                priority="high",
+            )
+
+            return {
+                "attempted": True,
+                "success": False,  # Don't retry timeouts automatically
+                "message": f"Timeout handled gracefully - provided guidance for alternative approaches",
+                "result": ToolResult(
+                    success=False,
+                    output=f"⏰ Command timed out after {execution_time:.1f}s due to {termination_reason}.\n\nSuggestions:\n"
+                    + "\n".join(f"• {g}" for g in timeout_guidance),
+                    error=f"Command timed out ({termination_reason})",
+                    error_code="TIMEOUT_HANDLED",
+                    suggestions=timeout_guidance,
+                    metadata={
+                        "timeout_handled": True,
+                        "execution_time": execution_time,
+                        "termination_reason": termination_reason,
+                        "original_command": command,
+                    },
+                ),
+            }
+
         # ★ CRITICAL RECOVERY: Handle exit code 127 / OCI runtime exec failed
-        if hasattr(failed_result, 'metadata') and failed_result.metadata:
-            exit_code = failed_result.metadata.get('exit_code', 0)
-            
-            if exit_code == 127 or "OCI runtime exec failed" in error_msg or "no such file or directory" in error_msg:
+        if hasattr(failed_result, "metadata") and failed_result.metadata:
+            exit_code = failed_result.metadata.get("exit_code", 0)
+
+            if (
+                exit_code == 127
+                or "OCI runtime exec failed" in error_msg
+                or "no such file or directory" in error_msg
+            ):
                 logger.info("🔧 RECOVERY: Detected exit code 127 / workspace directory issue")
-                
+
                 # Try to recreate workspace and retry the exact same command
                 recovery_steps = [
                     ("mkdir -p /workspace", "Create workspace directory"),
                     ("chmod 755 /workspace", "Set workspace permissions"),
-                    ("touch /workspace/.sag_workspace_marker", "Create workspace marker")
+                    ("touch /workspace/.sag_workspace_marker", "Create workspace marker"),
                 ]
-                
+
                 # Execute recovery steps
                 workspace_fixed = True
                 for recovery_cmd, description in recovery_steps:
                     logger.info(f"🔧 RECOVERY STEP: {description}")
                     # Use the orchestrator directly to avoid recursion
                     # Fix: Use context_manager.orchestrator instead of non-existent self.docker_orchestrator
-                    if hasattr(self.context_manager, 'orchestrator') and self.context_manager.orchestrator:
-                        recovery_result = self.context_manager.orchestrator.execute_command(recovery_cmd, workdir=None)
+                    if (
+                        hasattr(self.context_manager, "orchestrator")
+                        and self.context_manager.orchestrator
+                    ):
+                        recovery_result = self.context_manager.orchestrator.execute_command(
+                            recovery_cmd, workdir=None
+                        )
                     else:
                         # Fallback to bash tool if orchestrator not available
                         logger.warning("No orchestrator available, using bash tool for recovery")
                         bash_tool = self.tools.get("bash")
                         if bash_tool:
-                            bash_result = bash_tool.safe_execute(command=recovery_cmd, working_directory="/")
-                            recovery_result = {"success": bash_result.success, "output": bash_result.output}
+                            bash_result = bash_tool.safe_execute(
+                                command=recovery_cmd, working_directory="/"
+                            )
+                            recovery_result = {
+                                "success": bash_result.success,
+                                "output": bash_result.output,
+                            }
                         else:
-                            recovery_result = {"success": False, "output": "No recovery mechanism available"}
-                    
+                            recovery_result = {
+                                "success": False,
+                                "output": "No recovery mechanism available",
+                            }
+
                     if not recovery_result["success"]:
                         logger.warning(f"⚠️ Recovery step failed: {description}")
                         workspace_fixed = False
                         break
                     else:
                         logger.info(f"✅ Recovery step successful: {description}")
-                
+
                 if workspace_fixed:
                     # Retry the original command with fixed workspace
                     logger.info("🔧 RECOVERY: Retrying original command after workspace fix")
                     recovery_params = params.copy()
                     recovery_params["working_directory"] = "/workspace"  # Force workspace use
-                    
+
                     tool = self.tools["bash"]
                     result = tool.safe_execute(**recovery_params)
-                    
+
                     if result.success:
                         logger.info("✅ RECOVERY SUCCESS: Command succeeded after workspace fix")
                         return {
                             "attempted": True,
                             "success": True,
                             "message": "Recovered by recreating workspace directory and retrying command",
-                            "result": result
+                            "result": result,
                         }
                     else:
-                        logger.warning("⚠️ RECOVERY PARTIAL: Workspace fixed but command still failed")
+                        logger.warning(
+                            "⚠️ RECOVERY PARTIAL: Workspace fixed but command still failed"
+                        )
                         return {
                             "attempted": True,
                             "success": False,
                             "message": "Workspace recreated but command still failed - may be a different issue",
-                            "result": result
+                            "result": result,
                         }
                 else:
                     logger.error("❌ RECOVERY FAILED: Could not recreate workspace directory")
@@ -4039,62 +4619,81 @@ EXECUTE ACTIONS FOR:
                         "attempted": True,
                         "success": False,
                         "message": "Failed to recreate workspace directory",
-                        "result": None
+                        "result": None,
                     }
-        
+
         # Fallback: Try to fix working directory issues using successful states
-        if self.successful_states.get('working_directory'):
-            logger.info(f"🔧 RECOVERY: Trying known working directory: {self.successful_states['working_directory']}")
+        if self.successful_states.get("working_directory"):
+            logger.info(
+                f"🔧 RECOVERY: Trying known working directory: {self.successful_states['working_directory']}"
+            )
             recovery_params = params.copy()
-            recovery_params["working_directory"] = self.successful_states['working_directory']
-            
+            recovery_params["working_directory"] = self.successful_states["working_directory"]
+
             tool = self.tools["bash"]
             result = tool.safe_execute(**recovery_params)
-            
+
             return {
                 "attempted": True,
                 "success": result.success,
                 "message": f"Recovered by using known working directory: {self.successful_states['working_directory']}",
-                "result": result
+                "result": result,
             }
-        
-        return {"attempted": False, "success": False, "message": "No bash recovery strategy applicable"}
 
-    def _recover_file_io_error(self, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        return {
+            "attempted": False,
+            "success": False,
+            "message": "No bash recovery strategy applicable",
+        }
+
+    def _recover_file_io_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """Recover from file I/O tool failures."""
         action = params.get("action", "")
         path = params.get("path", "")
-        
+
         # Try to fix path issues with working directory context
         if action == "read" and "not found" in (failed_result.error or "").lower():
-            if self.successful_states.get('working_directory') and not path.startswith('/'):
+            if self.successful_states.get("working_directory") and not path.startswith("/"):
                 # Try with working directory prefix
                 recovery_params = params.copy()
                 recovery_params["path"] = f"{self.successful_states['working_directory']}/{path}"
-                
+
                 tool = self.tools["file_io"]
                 result = tool.safe_execute(**recovery_params)
-                
+
                 return {
                     "attempted": True,
                     "success": result.success,
                     "message": f"Recovered by adjusting path with working directory",
-                    "result": result
+                    "result": result,
                 }
-        
-        return {"attempted": False, "success": False, "message": "No file I/O recovery strategy applicable"}
 
-    def _recover_generic_error(self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult) -> Dict[str, Any]:
+        return {
+            "attempted": False,
+            "success": False,
+            "message": "No file I/O recovery strategy applicable",
+        }
+
+    def _recover_generic_error(
+        self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult
+    ) -> Dict[str, Any]:
         """Generic recovery strategies for any tool."""
         # For now, just return no recovery
         # Can be extended with more generic strategies
-        return {"attempted": False, "success": False, "message": "No generic recovery strategy available"}
+        return {
+            "attempted": False,
+            "success": False,
+            "message": "No generic recovery strategy available",
+        }
 
     def _export_token_usage_csv(self):
         """Export token usage to CSV file when ReAct loop completes."""
         try:
             # Get session logger for CSV path
             from config.logger import get_session_logger
+
             session_logger = get_session_logger()
 
             if session_logger:
@@ -4104,6 +4703,7 @@ EXECUTE ACTIONS FOR:
                 # Fallback to logs directory
                 from datetime import datetime
                 from pathlib import Path
+
                 logs_dir = Path("logs")
                 logs_dir.mkdir(exist_ok=True)
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
