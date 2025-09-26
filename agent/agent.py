@@ -103,7 +103,7 @@ class SetupAgent:
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
             ProjectAnalyzerTool(self.orchestrator, self.context_manager),  # 🆕 添加项目分析工具
-            OutputSearchTool(contexts_dir=self.context_manager.contexts_dir),  # 🆕 添加输出搜索工具
+            OutputSearchTool(orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir),  # 🆕 添加输出搜索工具
             ReportTool(
                 self.orchestrator, 
                 execution_history_callback=self._get_execution_history, 
