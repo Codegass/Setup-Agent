@@ -24,12 +24,22 @@ Example Usage:
         print("Project built and tested successfully!")
 """
 
+import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from loguru import logger
 from urllib.parse import quote
+from testcases.catalog import (
+    RuntimeTestCaseRecord,
+    TestCaseCatalog,
+    TestCaseDescriptor,
+    normalize_testcase_identifier,
+    merge_testcase_status,
+    build_java_test_catalog
+)
 
 
 class PhysicalValidator:
@@ -611,14 +621,15 @@ class PhysicalValidator:
         
         return stats
     
-    def parse_test_reports(self, project_dir: str) -> Dict[str, any]:
+    def parse_test_reports(self, project_dir: str, test_catalog: Optional[TestCaseCatalog] = None) -> Dict[str, any]:
         """
         Parse test report XML files to get accurate test statistics.
         Supports both Maven Surefire and Gradle test reports.
-        
+
         Args:
             project_dir: Project directory path
-            
+            test_catalog: Optional pre-built catalog from static analysis
+
         Returns:
             Dictionary with detailed test statistics and status
         """
@@ -694,9 +705,14 @@ class PhysicalValidator:
 
             logger.info(f"📊 Processing {len(report_files)} test report XML files...")
 
+            # Build catalog if not provided
+            if test_catalog is None and project_dir.startswith("/workspace"):
+                logger.debug("Building test catalog for comparison...")
+                test_catalog = build_java_test_catalog(project_dir, self.docker_orchestrator)
+
             # Step 3: Parse all XML files
-            # Track deduplicated testcases by normalized identifier
-            unique_cases: Dict[str, str] = {}
+            # Track runtime test cases with full metadata
+            test_case_records: Dict[str, RuntimeTestCaseRecord] = {}
 
             # Debug: track processing
             files_with_testcases = 0
@@ -727,20 +743,43 @@ class PhysicalValidator:
                             total_testcases_found += len(testcases_in_file)
 
                         for testcase in testcases_in_file:
-                            normalized = self._normalize_testcase_identifier(
+                            normalized_key = normalize_testcase_identifier(
                                 testcase.get("classname"),
                                 testcase.get("name"),
                                 testcase.get("file")
                             )
-                            status = testcase.get("status", "passed")
-                            if not normalized:
+                            if not normalized_key:
                                 continue
-                            if normalized not in unique_cases:
-                                unique_cases[normalized] = status
-                            else:
-                                unique_cases[normalized] = self._merge_testcase_status(
-                                    unique_cases[normalized], status
+
+                            status = testcase.get("status", "passed")
+                            execution_time = testcase.get("time", 0.0)
+
+                            # Try to resolve descriptor from catalog
+                            descriptor = None
+                            if test_catalog:
+                                descriptor_from_catalog = test_catalog.get(normalized_key)
+                                if descriptor_from_catalog:
+                                    descriptor = descriptor_from_catalog
+
+                            # Create or update runtime record
+                            if normalized_key not in test_case_records:
+                                test_case_records[normalized_key] = RuntimeTestCaseRecord(
+                                    descriptor=descriptor,
+                                    key=normalized_key,
+                                    statuses=[status],
+                                    final_status=status,
+                                    execution_time_ms=float(execution_time) * 1000 if execution_time else 0.0,
+                                    sources={report_file},
+                                    raw_names=[testcase.get("name", "")]
                                 )
+                            else:
+                                record = test_case_records[normalized_key]
+                                record.statuses.append(status)
+                                record.final_status = merge_testcase_status(record.final_status, status)
+                                record.execution_time_ms += float(execution_time) * 1000 if execution_time else 0.0
+                                record.sources.add(report_file)
+                                if testcase.get("name") not in record.raw_names:
+                                    record.raw_names.append(testcase.get("name", ""))
                     else:
                         test_result["parsing_errors"].append(
                             f"Failed to parse XML structure in {report_file}"
@@ -750,9 +789,9 @@ class PhysicalValidator:
                     logger.warning(f"Failed to parse test report {report_file}: {e}")
 
             logger.info(f"📊 Debug: Found {total_testcases_found} total testcases in {files_with_testcases} files")
-            logger.info(f"📊 Collected {len(unique_cases)} unique test cases from all XML files")
+            logger.info(f"📊 Collected {len(test_case_records)} unique test cases from all XML files")
 
-            if unique_cases:
+            if test_case_records:
                 # Preserve raw metrics before overwriting with deduplicated counts
                 test_result["raw_total_tests"] = test_result["total_tests"]
                 test_result["raw_passed_tests"] = test_result["passed_tests"]
@@ -760,15 +799,20 @@ class PhysicalValidator:
                 test_result["raw_error_tests"] = test_result["error_tests"]
                 test_result["raw_skipped_tests"] = test_result["skipped_tests"]
 
-                test_result["unique_tests"] = len(unique_cases)
-                for status in unique_cases.values():
-                    if status == "passed":
+                # Store runtime records in result
+                test_result["test_case_records"] = {
+                    key: record.to_dict() for key, record in test_case_records.items()
+                }
+
+                test_result["unique_tests"] = len(test_case_records)
+                for record in test_case_records.values():
+                    if record.final_status == "passed":
                         test_result["unique_passed_tests"] += 1
-                    elif status == "failed":
+                    elif record.final_status == "failed":
                         test_result["unique_failed_tests"] += 1
-                    elif status == "error":
+                    elif record.final_status == "error":
                         test_result["unique_error_tests"] += 1
-                    elif status == "skipped":
+                    elif record.final_status == "skipped":
                         test_result["unique_skipped_tests"] += 1
 
                 # Log deduplication results
@@ -791,6 +835,37 @@ class PhysicalValidator:
                     and test_result["error_tests"] == 0
                     and test_result["total_tests"] > 0
                 )
+
+                # Detect unexecuted tests by comparing catalog with runtime
+                if test_catalog:
+                    unexecuted_tests = []
+                    catalog_keys = set(test_catalog.get_all().keys())
+                    runtime_keys = set(test_case_records.keys())
+
+                    missing_keys = catalog_keys - runtime_keys
+                    for key in missing_keys:
+                        descriptor = test_catalog.get(key)
+                        if descriptor:
+                            unexecuted_tests.append({
+                                "key": key,
+                                "package": descriptor.package,
+                                "class": descriptor.class_name,
+                                "method": descriptor.method_name,
+                                "path": descriptor.file_path,
+                                "module": descriptor.module
+                            })
+
+                    if unexecuted_tests:
+                        test_result["unexecuted_tests"] = unexecuted_tests
+                        test_result["unexecuted_count"] = len(unexecuted_tests)
+                        logger.warning(f"⚠️ Found {len(unexecuted_tests)} tests that were not executed:")
+                        for test in unexecuted_tests[:5]:  # Log first 5
+                            logger.warning(f"   - {test['key']}")
+                        if len(unexecuted_tests) > 5:
+                            logger.warning(f"   ... and {len(unexecuted_tests) - 5} more")
+
+                        # Save unexecuted tests to log file
+                        self._save_unexecuted_tests_log(project_dir, unexecuted_tests, test_catalog)
 
             # Determine test success: only if no failures and no errors
             test_result["test_success"] = (
@@ -979,13 +1054,14 @@ class PhysicalValidator:
             logger.warning(f"Failed to check modules without tests: {e}")
             return []
 
-    def _collect_testcases_from_suite(self, testsuite: ET.Element, file_path: str) -> List[Dict[str, str]]:
+    def _collect_testcases_from_suite(self, testsuite: ET.Element, file_path: str) -> List[Dict[str, any]]:
         """Collect individual testcase entries from a testsuite element."""
-        cases: List[Dict[str, str]] = []
+        cases: List[Dict[str, any]] = []
         for testcase in testsuite.findall("testcase"):
             name = (testcase.get("name") or "").strip()
             classname = (testcase.get("classname") or "").strip()
             file_attr = testcase.get("file") or testsuite.get("file") or file_path
+            time_attr = testcase.get("time")
             status = self._determine_testcase_status(testcase)
             cases.append(
                 {
@@ -993,6 +1069,7 @@ class PhysicalValidator:
                     "classname": classname,
                     "file": file_attr,
                     "status": status,
+                    "time": float(time_attr) if time_attr else 0.0
                 }
             )
         # Debug logging
@@ -1012,35 +1089,157 @@ class PhysicalValidator:
             return "skipped"
         return "passed"
 
-    @staticmethod
-    def _merge_testcase_status(current: str, new: str) -> str:
-        """Merge testcase statuses, keeping the most severe outcome."""
-        severity = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
-        return new if severity.get(new, 0) > severity.get(current, 0) else current
 
-    @staticmethod
-    def _normalize_testcase_identifier(classname: Optional[str], name: Optional[str], file_path: Optional[str]) -> Optional[str]:
-        """Normalize testcase identifier for deduplication across parameterized runs."""
-        base_name = (name or "").strip()
-        if not base_name:
-            return None
+    def _save_unexecuted_tests_log(self, project_dir: str, unexecuted_tests: List[Dict], test_catalog: Optional[TestCaseCatalog] = None):
+        """
+        Save unexecuted tests to a JSON log file for post-analysis review.
 
-        # Strip parameter decorations like method(arg)[index]
-        for separator in ("(", "["):
-            idx = base_name.find(separator)
-            if idx != -1:
-                base_name = base_name[:idx]
-                break
-        base_name = base_name.strip()
-        if not base_name:
-            return None
+        The log file is saved to /workspace/.setup_agent/unexecuted_tests.json.
+        It includes metadata about when the analysis was performed and what tests were expected.
 
-        class_name = (classname or "").strip()
-        if not class_name and file_path:
-            # Derive something stable from file path
-            class_name = file_path.replace("/", ".").rsplit(".", 1)[0]
+        Args:
+            project_dir: Project directory path (used for metadata, not for save location)
+            unexecuted_tests: List of unexecuted test dictionaries
+            test_catalog: Optional test catalog for additional metadata
+        """
+        try:
+            # Create .setup_agent directory in /workspace if it doesn't exist
+            setup_agent_dir = "/workspace/.setup_agent"
+            if self.docker_orchestrator:
+                mkdir_cmd = f"mkdir -p {setup_agent_dir}"
+                self.docker_orchestrator.execute_command(mkdir_cmd)
 
-        return f"{class_name}::{base_name}" if class_name else base_name
+            # Prepare log data
+            log_data = {
+                "timestamp": datetime.now().isoformat(),
+                "project_dir": project_dir,
+                "total_unexecuted": len(unexecuted_tests),
+                "total_expected": test_catalog.count() if test_catalog else None,
+                "unexecuted_tests": unexecuted_tests,
+                "summary": {
+                    "by_module": {},
+                    "by_package": {},
+                    "by_class": {}
+                }
+            }
+
+            # Generate summaries
+            for test in unexecuted_tests:
+                # By module
+                module = test.get("module", "default")
+                if module not in log_data["summary"]["by_module"]:
+                    log_data["summary"]["by_module"][module] = []
+                log_data["summary"]["by_module"][module].append(test["key"])
+
+                # By package
+                package = test.get("package", "unknown")
+                if package not in log_data["summary"]["by_package"]:
+                    log_data["summary"]["by_package"][package] = []
+                log_data["summary"]["by_package"][package].append(test["key"])
+
+                # By class
+                class_name = f"{test.get('package', '')}.{test.get('class', '')}"
+                if class_name not in log_data["summary"]["by_class"]:
+                    log_data["summary"]["by_class"][class_name] = []
+                log_data["summary"]["by_class"][class_name].append(test["method"])
+
+            # Count summaries
+            log_data["summary"]["module_counts"] = {
+                module: len(tests) for module, tests in log_data["summary"]["by_module"].items()
+            }
+            log_data["summary"]["package_counts"] = {
+                pkg: len(tests) for pkg, tests in log_data["summary"]["by_package"].items()
+            }
+            log_data["summary"]["class_counts"] = {
+                cls: len(methods) for cls, methods in log_data["summary"]["by_class"].items()
+            }
+
+            # Save to JSON file
+            log_file_path = os.path.join(setup_agent_dir, "unexecuted_tests.json")
+            json_content = json.dumps(log_data, indent=2, ensure_ascii=False)
+
+            if self.docker_orchestrator:
+                # Write file using Docker orchestrator
+                write_cmd = f"cat > {log_file_path} << 'EOF'\n{json_content}\nEOF"
+                result = self.docker_orchestrator.execute_command(write_cmd)
+                if result.get("success"):
+                    logger.info(f"📝 Saved unexecuted tests log to: {log_file_path}")
+                    logger.info(f"   Review with: cat {log_file_path}")
+                else:
+                    logger.warning(f"Failed to save unexecuted tests log: {result.get('error', 'Unknown error')}")
+            else:
+                # Fallback: write directly if no orchestrator (for testing)
+                with open(log_file_path, 'w', encoding='utf-8') as f:
+                    json.dump(log_data, f, indent=2, ensure_ascii=False)
+                logger.info(f"📝 Saved unexecuted tests log to: {log_file_path}")
+
+            # Also create a simple text version for quick review
+            self._save_unexecuted_tests_text_log(setup_agent_dir, log_data)
+
+        except Exception as e:
+            logger.error(f"Failed to save unexecuted tests log: {e}")
+
+    def _save_unexecuted_tests_text_log(self, setup_agent_dir: str, log_data: Dict):
+        """
+        Save a human-readable text version of unexecuted tests.
+
+        Args:
+            setup_agent_dir: Directory to save the log file
+            log_data: Structured log data from JSON
+        """
+        try:
+            text_content = []
+            text_content.append("=" * 80)
+            text_content.append("UNEXECUTED TESTS REPORT")
+            text_content.append("=" * 80)
+            text_content.append(f"Generated: {log_data['timestamp']}")
+            text_content.append(f"Project: {log_data['project_dir']}")
+            text_content.append(f"Total Unexecuted: {log_data['total_unexecuted']}")
+            if log_data.get('total_expected'):
+                text_content.append(f"Total Expected: {log_data['total_expected']}")
+                coverage = ((log_data['total_expected'] - log_data['total_unexecuted']) / log_data['total_expected'] * 100)
+                text_content.append(f"Test Coverage: {coverage:.1f}%")
+            text_content.append("")
+
+            # Summary by module
+            if log_data['summary']['module_counts']:
+                text_content.append("BY MODULE:")
+                for module, count in sorted(log_data['summary']['module_counts'].items()):
+                    text_content.append(f"  {module}: {count} unexecuted tests")
+                text_content.append("")
+
+            # Summary by package
+            if log_data['summary']['package_counts']:
+                text_content.append("BY PACKAGE:")
+                for package, count in sorted(log_data['summary']['package_counts'].items()):
+                    text_content.append(f"  {package}: {count} unexecuted tests")
+                text_content.append("")
+
+            # Detailed list
+            text_content.append("DETAILED LIST OF UNEXECUTED TESTS:")
+            text_content.append("-" * 80)
+            for i, test in enumerate(log_data['unexecuted_tests'], 1):
+                text_content.append(f"{i}. {test['key']}")
+                text_content.append(f"   Module: {test.get('module', 'N/A')}")
+                text_content.append(f"   File: {test.get('path', 'N/A')}")
+                text_content.append("")
+
+            # Join all lines
+            text_report = "\n".join(text_content)
+
+            # Save text file
+            text_file_path = os.path.join(setup_agent_dir, "unexecuted_tests.txt")
+            if self.docker_orchestrator:
+                write_cmd = f"cat > {text_file_path} << 'EOF'\n{text_report}\nEOF"
+                result = self.docker_orchestrator.execute_command(write_cmd)
+                if result.get("success"):
+                    logger.info(f"📄 Saved text report to: {text_file_path}")
+            else:
+                with open(text_file_path, 'w', encoding='utf-8') as f:
+                    f.write(text_report)
+
+        except Exception as e:
+            logger.error(f"Failed to save text log: {e}")
 
     def _extract_test_stats_fallback(self, xml_content: str, file_path: str) -> Dict[str, int]:
         """
@@ -1274,8 +1473,8 @@ class PhysicalValidator:
         
         project_dir = f"{self.project_path}/{project_name}" if project_name else self.project_path
         
-        # Parse test reports with enhanced metrics
-        test_metrics = self.parse_test_reports_with_metrics(project_dir)
+        # Parse test reports with enhanced metrics and catalog integration
+        test_metrics = self.parse_test_reports_with_catalog(project_dir)
         
         # Calculate pass rate
         pass_rate = self.calculate_test_pass_rate(test_metrics)
@@ -1407,6 +1606,77 @@ class PhysicalValidator:
             )
 
         return result
+
+    def parse_test_reports_with_catalog(self, project_dir: str, test_catalog: Optional[TestCaseCatalog] = None) -> Dict[str, any]:
+        """
+        Enhanced test report parsing with test catalog integration.
+
+        Automatically builds a test catalog if not provided and uses it for
+        comparison to detect unexecuted tests.
+
+        Args:
+            project_dir: Project directory path
+            test_catalog: Optional pre-built catalog from static analysis
+
+        Returns:
+            Dictionary with test metrics including unexecuted test detection
+        """
+        # Build catalog if not provided and project is in workspace
+        if test_catalog is None and project_dir.startswith("/workspace"):
+            logger.debug("Building test catalog for enhanced analysis...")
+            test_catalog = build_java_test_catalog(project_dir, self.docker_orchestrator)
+            logger.info(f"📊 Built catalog with {test_catalog.count()} test methods")
+
+        # Parse with catalog for enhanced analysis
+        result = self.parse_test_reports(project_dir, test_catalog)
+
+        # Add catalog metadata to result if available
+        if test_catalog:
+            result["catalog_test_count"] = test_catalog.count()
+            result["catalog_by_module"] = test_catalog.to_dict()["by_module"]
+
+        return result
+
+    def get_unexecuted_tests_log(self, project_dir: str) -> Optional[Dict[str, any]]:
+        """
+        Retrieve the unexecuted tests log if it exists.
+
+        Args:
+            project_dir: Project directory path (for reference, log is in /workspace/.setup_agent/)
+
+        Returns:
+            Dictionary with unexecuted test data or None if not found
+        """
+        try:
+            log_file_path = "/workspace/.setup_agent/unexecuted_tests.json"
+
+            if self.docker_orchestrator:
+                # Check if file exists
+                check_cmd = f"test -f {log_file_path} && echo 'exists'"
+                check_result = self.docker_orchestrator.execute_command(check_cmd)
+
+                if check_result.get("success") and "exists" in check_result.get("output", ""):
+                    # Read the file
+                    read_cmd = f"cat {log_file_path}"
+                    read_result = self.docker_orchestrator.execute_command(read_cmd)
+
+                    if read_result.get("success"):
+                        try:
+                            return json.loads(read_result.get("output", "{}"))
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse unexecuted tests log: {e}")
+                            return None
+            else:
+                # Direct file read for testing
+                if os.path.exists(log_file_path):
+                    with open(log_file_path, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error retrieving unexecuted tests log: {e}")
+            return None
 
     def parse_test_reports_with_metrics(self, project_dir: str) -> Dict[str, any]:
         """
