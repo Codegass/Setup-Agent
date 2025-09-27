@@ -3424,8 +3424,13 @@ class ReportTool(BaseTool):
 
         if exec_rate is not None and static_count:
             # Execution rate now reflects coverage of static test methods
-            exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
-            exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count})"
+            if executed > static_count:
+                # Handle case where runtime discovered more tests than static analysis
+                exec_icon = "✅"  # More tests run than expected is generally good
+                exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed} run, {static_count} expected)"
+            else:
+                exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
+                exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count})"
             lines.append(f"│ Execution Rate  │ {exec_msg:<32} │")
         
         if pass_rate is not None:
@@ -3482,13 +3487,19 @@ class ReportTool(BaseTool):
 
         # Execution rate now measures coverage of declared test methods
         if exec_rate is not None and static_count:
-            exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
-            actual_tests_run = int(exec_rate * static_count / 100)
-            lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} of {static_count} tests run | {exec_icon} |")
-            if exec_rate < 100:
-                skipped_est = static_count - actual_tests_run
-                if skipped_est > 0:
-                    lines.append(f"| | *~{skipped_est} tests* | *possibly not executed* | ⚠️ |")
+            # Handle case where executed tests exceed static count (e.g., dynamically generated tests)
+            if executed > static_count:
+                exec_icon = "✅"  # More tests run than expected is generally good
+                lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} tests run (exceeded {static_count} expected) | {exec_icon} |")
+                lines.append(f"| | *Note:* | *Runtime discovered more tests than static analysis* | 📊 |")
+            else:
+                exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
+                actual_tests_run = int(exec_rate * static_count / 100)
+                lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} of {static_count} tests run | {exec_icon} |")
+                if exec_rate < 100:
+                    skipped_est = static_count - actual_tests_run
+                    if skipped_est > 0:
+                        lines.append(f"| | *~{skipped_est} tests* | *possibly not executed* | ⚠️ |")
         
         if pass_rate is not None:
             pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"

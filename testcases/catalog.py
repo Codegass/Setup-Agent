@@ -285,9 +285,38 @@ def extract_class_name(content, file_name):
 
 def extract_test_methods(content):
     # Find all @Test, @ParameterizedTest, @RepeatedTest, etc.
-    pattern = r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate)\\s*.*?\\s+(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\('
+    # Improved pattern to handle various test annotation styles and modifiers
+    # Handles: @Test, @Test(...), annotations on separate lines, various method modifiers
+    methods = []
+
+    # Primary pattern for common test annotations
+    pattern = r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|DataProvider)(?:\([^)]*\))?\\s*(?:.*?\\s+)?(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\('
     matches = re.findall(pattern, content, re.DOTALL)
-    return [method_name for _, method_name in matches]
+    methods.extend([method_name for _, method_name in matches])
+
+    # Secondary pattern to catch tests where annotation is on a different line
+    # Look for public void methods that likely are tests (common test method pattern)
+    lines = content.split('\\n')
+    for i, line in enumerate(lines):
+        if '@Test' in line or '@ParameterizedTest' in line or '@RepeatedTest' in line:
+            # Look ahead for the method declaration (within next 5 lines)
+            for j in range(i+1, min(i+6, len(lines))):
+                method_match = re.search(r'(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\(', lines[j])
+                if method_match:
+                    method_name = method_match.group(1)
+                    if method_name not in methods and not method_name.startswith('set') and not method_name.startswith('get'):
+                        methods.append(method_name)
+                    break
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_methods = []
+    for method in methods:
+        if method not in seen:
+            seen.add(method)
+            unique_methods.append(method)
+
+    return unique_methods
 
 def is_excluded(path):
     return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
