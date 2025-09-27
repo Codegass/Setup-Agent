@@ -718,6 +718,14 @@ class PhysicalValidator:
             files_with_testcases = 0
             total_testcases_found = 0
 
+            # First, identify which test classes are from Groovy sources
+            groovy_test_classes = set()
+            groovy_check_cmd = "find /workspace -path '*/src/test/groovy/*' -name '*.groovy' -exec grep -l '@Test' {} \\; 2>/dev/null | xargs -I{} basename {} .groovy 2>/dev/null"
+            groovy_result = self.docker_orchestrator.execute_command(groovy_check_cmd)
+            if groovy_result.get("exit_code") == 0 and groovy_result.get("output"):
+                groovy_test_classes = set(line.strip() for line in groovy_result.get("output", "").split("\n") if line.strip())
+                logger.info(f"📊 Identified {len(groovy_test_classes)} Groovy test classes to exclude")
+
             for report_file in report_files:
                 try:
                     xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
@@ -729,7 +737,7 @@ class PhysicalValidator:
                     if not xml_content.strip():
                         continue
 
-                    stats = self._parse_single_test_xml(xml_content, report_file)
+                    stats = self._parse_single_test_xml(xml_content, report_file, groovy_test_classes)
                     if stats:
                         test_result["total_tests"] += stats.get("total", 0)
                         test_result["passed_tests"] += stats.get("passed", 0)
@@ -743,8 +751,17 @@ class PhysicalValidator:
                             total_testcases_found += len(testcases_in_file)
 
                         for testcase in testcases_in_file:
+                            classname = testcase.get("classname", "")
+
+                            # Skip Groovy test cases - check if the class name matches any Groovy test class
+                            # Extract just the class name without package
+                            simple_classname = classname.split('.')[-1] if classname else ""
+                            if simple_classname in groovy_test_classes:
+                                logger.debug(f"Skipping Groovy test case: {classname}")
+                                continue
+
                             normalized_key = normalize_testcase_identifier(
-                                testcase.get("classname"),
+                                classname,
                                 testcase.get("name"),
                                 testcase.get("file")
                             )
@@ -899,10 +916,11 @@ class PhysicalValidator:
         self._cache_result(cache_key, test_result)
         return test_result
 
-    def _parse_single_test_xml(self, xml_content: str, file_path: str) -> Optional[Dict[str, int]]:
+    def _parse_single_test_xml(self, xml_content: str, file_path: str, groovy_test_classes: set = None) -> Optional[Dict[str, int]]:
         """
         Parse a single test XML file and extract statistics.
         Handles both Maven Surefire and Gradle formats.
+        Excludes Groovy test classes if provided.
         """
         try:
             root = ET.fromstring(xml_content)
@@ -910,13 +928,26 @@ class PhysicalValidator:
 
             # Maven Surefire format: <testsuite tests="X" failures="Y" errors="Z" skipped="W">
             if root.tag == "testsuite":
-                total = int(root.get("tests", "0"))
-                failures = int(root.get("failures", "0"))
-                errors = int(root.get("errors", "0"))
-                skipped = int(root.get("skipped", "0"))
-                passed = total - failures - errors - skipped
+                # Collect all testcases first
+                all_testcases = self._collect_testcases_from_suite(root, file_path)
 
-                testcase_entries.extend(self._collect_testcases_from_suite(root, file_path))
+                # Filter out Groovy tests if groovy_test_classes is provided
+                if groovy_test_classes:
+                    testcase_entries = []
+                    for tc in all_testcases:
+                        classname = tc.get("classname", "")
+                        simple_classname = classname.split('.')[-1] if classname else ""
+                        if simple_classname not in groovy_test_classes:
+                            testcase_entries.append(tc)
+                else:
+                    testcase_entries = all_testcases
+
+                # Recalculate statistics based on filtered test cases
+                total = len(testcase_entries)
+                failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
+                errors = sum(1 for tc in testcase_entries if tc.get("status") == "error")
+                skipped = sum(1 for tc in testcase_entries if tc.get("status") == "skipped")
+                passed = sum(1 for tc in testcase_entries if tc.get("status") == "passed")
 
                 return {
                     "total": total,
@@ -929,49 +960,73 @@ class PhysicalValidator:
 
             # Gradle format: <testsuites> containing multiple <testsuite>
             elif root.tag == "testsuites":
-                total_stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-
+                # Collect all testcases from all suites
+                all_testcases = []
                 for testsuite in root.findall("testsuite"):
-                    suite_total = int(testsuite.get("tests", "0"))
-                    suite_failures = int(testsuite.get("failures", "0"))
-                    suite_errors = int(testsuite.get("errors", "0"))
-                    suite_skipped = int(testsuite.get("skipped", "0"))
-                    suite_passed = suite_total - suite_failures - suite_errors - suite_skipped
+                    all_testcases.extend(self._collect_testcases_from_suite(testsuite, file_path))
 
-                    total_stats["total"] += suite_total
-                    total_stats["passed"] += max(0, suite_passed)
-                    total_stats["failed"] += suite_failures
-                    total_stats["errors"] += suite_errors
-                    total_stats["skipped"] += suite_skipped
+                # Filter out Groovy tests if groovy_test_classes is provided
+                if groovy_test_classes:
+                    testcase_entries = []
+                    for tc in all_testcases:
+                        classname = tc.get("classname", "")
+                        simple_classname = classname.split('.')[-1] if classname else ""
+                        if simple_classname not in groovy_test_classes:
+                            testcase_entries.append(tc)
+                else:
+                    testcase_entries = all_testcases
 
-                    testcase_entries.extend(self._collect_testcases_from_suite(testsuite, file_path))
+                # Calculate statistics based on filtered test cases
+                total = len(testcase_entries)
+                failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
+                errors = sum(1 for tc in testcase_entries if tc.get("status") == "error")
+                skipped = sum(1 for tc in testcase_entries if tc.get("status") == "skipped")
+                passed = sum(1 for tc in testcase_entries if tc.get("status") == "passed")
 
-                total_stats["testcases"] = testcase_entries
-                return total_stats
+                return {
+                    "total": total,
+                    "passed": max(0, passed),
+                    "failed": failures,
+                    "errors": errors,
+                    "skipped": skipped,
+                    "testcases": testcase_entries
+                }
 
             # Try to find testsuite elements even if root is different
             testsuites = root.findall(".//testsuite")
             if testsuites:
-                total_stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-
+                # Collect all testcases from all suites
+                all_testcases = []
                 for testsuite in testsuites:
-                    suite_total = int(testsuite.get("tests", "0"))
-                    suite_failures = int(testsuite.get("failures", "0"))
-                    suite_errors = int(testsuite.get("errors", "0"))
-                    suite_skipped = int(testsuite.get("skipped", "0"))
-                    suite_passed = suite_total - suite_failures - suite_errors - suite_skipped
+                    all_testcases.extend(self._collect_testcases_from_suite(testsuite, file_path))
 
-                    total_stats["total"] += suite_total
-                    total_stats["passed"] += max(0, suite_passed)
-                    total_stats["failed"] += suite_failures
-                    total_stats["errors"] += suite_errors
-                    total_stats["skipped"] += suite_skipped
+                # Filter out Groovy tests if groovy_test_classes is provided
+                if groovy_test_classes:
+                    testcase_entries = []
+                    for tc in all_testcases:
+                        classname = tc.get("classname", "")
+                        simple_classname = classname.split('.')[-1] if classname else ""
+                        if simple_classname not in groovy_test_classes:
+                            testcase_entries.append(tc)
+                else:
+                    testcase_entries = all_testcases
 
-                    testcase_entries.extend(self._collect_testcases_from_suite(testsuite, file_path))
+                if testcase_entries:
+                    # Calculate statistics based on filtered test cases
+                    total = len(testcase_entries)
+                    failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
+                    errors = sum(1 for tc in testcase_entries if tc.get("status") == "error")
+                    skipped = sum(1 for tc in testcase_entries if tc.get("status") == "skipped")
+                    passed = sum(1 for tc in testcase_entries if tc.get("status") == "passed")
 
-                if total_stats["total"] > 0:
-                    total_stats["testcases"] = testcase_entries
-                    return total_stats
+                    return {
+                        "total": total,
+                        "passed": max(0, passed),
+                        "failed": failures,
+                        "errors": errors,
+                        "skipped": skipped,
+                        "testcases": testcase_entries
+                    }
                 return None
 
             logger.warning(f"Unrecognized XML format in {file_path}, root tag: {root.tag}")
