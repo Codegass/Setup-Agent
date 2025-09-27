@@ -56,8 +56,11 @@ class AgentStateEvaluator:
     def __init__(self, context_manager: ContextManager, physical_validator: PhysicalValidator = None):
         self.context_manager = context_manager
         self.physical_validator = physical_validator
-        
-        # Completion signal patterns
+
+        # Completion signal patterns - used for task completion detection
+        # IMPORTANT: Patterns must be unique to their signal type to avoid false positives
+        # Example: 'BUILD SUCCESS' should only be in build_success, not tests_passed
+        # Bug fix: Removed 'BUILD SUCCESS' from tests_passed to prevent false test completion
         self.completion_signals = {
             'repository_cloned': [
                 'successfully cloned',
@@ -83,10 +86,16 @@ class AgentStateEvaluator:
                 'build completed successfully'
             ],
             'tests_passed': [
-                'Tests run:',
+                'Tests run:',  # Maven/Surefire pattern
                 'all tests passed',
                 'test suite passed',
-                'BUILD SUCCESS'
+                # Removed 'BUILD SUCCESS' - too ambiguous, overlaps with build_success
+                'test execution completed',  # Gradle specific
+                '> Task :test',  # Gradle task execution marker
+                'test results:',  # Generic test output marker
+                'test summary:',  # Generic test summary marker
+                'tests completed',  # Generic completion
+                'test report generated'  # Report generation indicator
             ],
             'environment_setup': [
                 'environment configured',
@@ -391,7 +400,12 @@ class AgentStateEvaluator:
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
     
     def _check_task_completion_opportunity(self, steps: List[Any]) -> AgentStateAnalysis:
-        """Check if recent observations indicate task completion opportunity."""
+        """Check if recent observations indicate task completion opportunity.
+
+        Note: This method looks at the last 5 observations for completion signals.
+        Patterns must be carefully chosen to avoid false positives between tasks.
+        For example, 'BUILD SUCCESS' from a build task should not trigger test completion.
+        """
         # Look at recent observations
         recent_observations = []
         for step in reversed(steps[-5:]):  # Last 5 steps
