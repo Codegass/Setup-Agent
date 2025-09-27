@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolResult
+from testcases.catalog import build_java_test_catalog, TestCaseCatalog
 
 
 class ProjectAnalyzerTool(BaseTool):
@@ -174,30 +175,35 @@ class ProjectAnalyzerTool(BaseTool):
         test_config = self._analyze_test_configuration(project_path, analysis["project_type"])
         analysis.update(test_config)
 
-        # Step 4.5: Count test methods for Java projects with accurate expansion counting
-        # This now accurately counts parameterized test expansions for precise metrics
+        # Step 4.5: Build test catalog for Java projects
+        # This provides structured test discovery with full metadata
         if analysis["project_type"] == "Java":
-            test_count_result = self._count_java_test_with_expansions(project_path)
-            method_count = test_count_result.get('method_count')
-            total_test_count = test_count_result.get('total_test_count')
+            test_catalog = build_java_test_catalog(project_path, self.docker_orchestrator)
+            test_count = test_catalog.count()
 
-            if method_count is not None and total_test_count is not None:
-                # Store both the method count and the accurate total count
-                analysis["static_test_count"] = total_test_count  # This is now the TRUE total
-                analysis["method_count"] = method_count  # Original method annotations
-                analysis["test_count_method"] = "accurate_expansion_counting"
-                analysis["parameterized_info"] = test_count_result.get('parameterized_info', {})
+            if test_count > 0:
+                # Store catalog and metrics
+                analysis["test_catalog"] = test_catalog.to_dict()
+                analysis["static_test_count"] = test_count
+                analysis["method_count"] = test_count  # For now, same as static count
+                analysis["test_count_method"] = "catalog_based_discovery"
 
-                logger.info(f"📊 Test counting complete:")
-                logger.info(f"   - Method annotations: {method_count}")
-                logger.info(f"   - Total test cases (with expansions): {total_test_count}")
+                # Extract module information if multi-module
+                by_module = test_catalog.to_dict()['by_module']
+                if by_module:
+                    analysis["test_modules"] = by_module
 
-                if total_test_count > method_count:
-                    expansion_factor = total_test_count / method_count if method_count > 0 else 1.0
-                    analysis["test_expansion_factor"] = expansion_factor
-                    logger.info(f"   - Expansion factor: {expansion_factor:.1f}x (from parameterized tests)")
+                logger.info(f"📊 Test catalog built:")
+                logger.info(f"   - Total test methods discovered: {test_count}")
+                if by_module and len(by_module) > 1:
+                    logger.info(f"   - Multi-module distribution: {by_module}")
+
+                # For backward compatibility, still get annotation counts
+                test_count_result = self._count_java_test_with_expansions(project_path)
+                if test_count_result.get('parameterized_info'):
+                    analysis["parameterized_info"] = test_count_result.get('parameterized_info', {})
             else:
-                logger.debug("Unable to count test methods or no tests found")
+                logger.debug("No test methods discovered in Java project")
 
         # Step 5: 生成智能执行计划
         execution_plan = self._generate_execution_plan(analysis)
@@ -1358,6 +1364,14 @@ PY"""
                     parameterized_info = analysis.get("parameterized_info")
                     if parameterized_info:
                         trunk_context.environment_summary["parameterized_info"] = parameterized_info
+
+                    # Store test catalog summary if available
+                    test_catalog = analysis.get("test_catalog")
+                    if test_catalog:
+                        trunk_context.environment_summary["test_catalog_summary"] = {
+                            "total_tests": test_catalog.get("total_count", 0),
+                            "by_module": test_catalog.get("by_module", {})
+                        }
 
                 # 保存更新后的context
                 self.context_manager._save_trunk_context(trunk_context)
