@@ -1,6 +1,6 @@
 [project]
 name = "setup-agent"
-version = "0.1.0"
+version = "0.1.2"
 description = "LLM Powered open source project setup agent"
 authors = [
     {name = "Setup-Agent Contributors"}
