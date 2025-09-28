@@ -42,6 +42,9 @@ class Config(BaseModel):
     azure_api_base: Optional[str] = Field(default=None)
     azure_api_version: str = Field(default="2023-12-01-preview")
 
+    # Ollama-specific settings
+    use_ollama_chat: bool = Field(default=False)  # Use ollama_chat prefix for better responses
+
     # Logging configuration
     log_level: LogLevel = Field(default=LogLevel.INFO)
     log_file: Optional[str] = Field(default="logs/sag.log")
@@ -91,6 +94,8 @@ class Config(BaseModel):
             ollama_base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             azure_api_base=os.getenv("AZURE_API_BASE"),
             azure_api_version=os.getenv("AZURE_API_VERSION", "2023-12-01-preview"),
+            # Ollama settings
+            use_ollama_chat=os.getenv("SAG_USE_OLLAMA_CHAT", "false").lower() in ("true", "1", "yes"),
             # System config
             log_level=LogLevel(os.getenv("SAG_LOG_LEVEL", "INFO")),
             log_file=os.getenv("SAG_LOG_FILE", "logs/sag.log"),
@@ -120,7 +125,9 @@ class Config(BaseModel):
         elif provider == "groq":
             return f"groq/{model}"
         elif provider == "ollama":
-            return f"ollama/{model}"
+            # Use ollama_chat prefix if configured for better responses
+            prefix = "ollama_chat" if self.use_ollama_chat else "ollama"
+            return f"{prefix}/{model}"
         elif provider == "azure":
             return f"azure/{model}"
         else:

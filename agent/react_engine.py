@@ -154,22 +154,32 @@ class ReActEngine:
         action_model = self.config.get_litellm_model_name("action")
         thinking_model = self.config.get_litellm_model_name("thinking")
 
-        # Check action model function calling support
-        self.supports_function_calling = litellm.supports_function_calling(action_model)
-
-        # Determine if this is a Claude model
+        # Determine model type
+        self.is_ollama_model = (
+            "ollama" in action_model.lower() or "ollama_chat" in action_model.lower()
+        )
         self.is_claude_model = (
             "claude" in action_model.lower() or "anthropic" in action_model.lower()
         )
 
-        if self.supports_function_calling:
+        # Check action model function calling support
+        self.supports_function_calling = litellm.supports_function_calling(action_model)
+
+        if self.is_ollama_model:
+            # Ollama models typically don't support native function calling
+            logger.info(
+                f"Ollama model {action_model} detected, using enhanced prompt-based approach"
+            )
+            self.supports_function_calling = False  # Force prompt-based for Ollama
+            # Don't use litellm.add_function_to_prompt for Ollama - we'll handle it ourselves
+        elif self.supports_function_calling:
             model_type = "Claude" if self.is_claude_model else "OpenAI"
             logger.info(f"Action model {action_model} supports {model_type} function calling")
         else:
             logger.warning(
                 f"Action model {action_model} does not support function calling, falling back to prompt-based approach"
             )
-            # Enable fallback for models without function calling support
+            # Enable fallback for non-Ollama models without function calling support
             litellm.add_function_to_prompt = True
 
         # Check parallel function calling support
@@ -672,10 +682,48 @@ class ReActEngine:
             return content_str
 
         except Exception as e:
-            logger.error(f"LLM request failed: {e}")
-            if self.config.verbose:
-                self._log_llm_error(e)
-            return None
+            error_str = str(e)
+
+            # Ollama-specific error handling
+            if self.is_ollama_model:
+                # Check for common Ollama errors
+                if "Connection refused" in error_str or "Connection error" in error_str:
+                    logger.error(f"🔌 Ollama connection failed: {e}")
+                    logger.error("Please ensure Ollama is running: 'ollama serve'")
+                    logger.error("You can check if Ollama is running with: 'curl http://localhost:11434'")
+                    if self.config.verbose:
+                        self._log_llm_error(e)
+                    # Try to provide helpful guidance
+                    return "I cannot connect to Ollama. Please ensure Ollama is running (ollama serve) and try again."
+
+                elif "model not found" in error_str.lower() or "not found" in error_str.lower():
+                    model_name = model.split('/')[-1] if '/' in model else model
+                    logger.error(f"📥 Ollama model '{model_name}' not found")
+                    logger.error(f"Please pull the model first: 'ollama pull {model_name}'")
+                    logger.error(f"You can list available models with: 'ollama list'")
+                    if self.config.verbose:
+                        self._log_llm_error(e)
+                    return f"The model '{model_name}' is not available. Please pull it with 'ollama pull {model_name}' and try again."
+
+                elif "timeout" in error_str.lower():
+                    logger.warning(f"⏱️ Ollama request timed out. The model might be loading or processing.")
+                    logger.info("Large models can take time to load on first use. Retrying...")
+                    # Could implement retry logic here if needed
+                    if self.config.verbose:
+                        self._log_llm_error(e)
+                    return None
+
+                else:
+                    logger.error(f"Ollama error: {e}")
+                    if self.config.verbose:
+                        self._log_llm_error(e)
+                    return None
+            else:
+                # Non-Ollama error handling
+                logger.error(f"LLM request failed: {e}")
+                if self.config.verbose:
+                    self._log_llm_error(e)
+                return None
 
     def _try_parse_json_function_calls(self, content: str) -> Optional[str]:
         """Try to parse JSON function calls from content when function calling format is not used."""
@@ -1187,6 +1235,126 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
         return prompt
 
+    def _parse_ollama_response(self, response: str, model_used: str) -> Optional[List[ReActStep]]:
+        """
+        Enhanced parsing for Ollama models that may not follow strict formatting.
+        Tries multiple parsing strategies to extract actions and parameters.
+        """
+        steps = []
+
+        # Strategy 1: Look for common action patterns
+        lines = response.strip().split('\n')
+
+        for i, line in enumerate(lines):
+            # Look for various action indicators
+            line_lower = line.lower().strip()
+
+            # Check for tool invocation patterns
+            if any(pattern in line_lower for pattern in ['i will use', 'i\'ll use', 'using tool', 'calling', 'executing']):
+                # Try to extract tool name and parameters from surrounding context
+                tool_name = None
+                params = {}
+
+                # Look for tool names in the line
+                for tool in self.tools.keys():
+                    if tool.lower() in line_lower:
+                        tool_name = tool
+                        break
+
+                if tool_name:
+                    # Look for parameters in subsequent lines
+                    for j in range(i+1, min(i+5, len(lines))):
+                        next_line = lines[j].strip()
+                        # Check for JSON
+                        if next_line.startswith('{') and next_line.endswith('}'):
+                            try:
+                                params = json.loads(next_line)
+                                break
+                            except json.JSONDecodeError:
+                                continue
+                        # Check for key-value patterns
+                        elif '=' in next_line or ':' in next_line:
+                            # Try to parse simple key-value pairs
+                            if ':' in next_line:
+                                parts = next_line.split(':', 1)
+                                if len(parts) == 2:
+                                    key = parts[0].strip().lower().replace(' ', '_')
+                                    value = parts[1].strip().strip('"').strip("'")
+                                    params[key] = value
+
+                    if tool_name:
+                        steps.append(
+                            ReActStep(
+                                step_type=StepType.ACTION,
+                                content=f"Using tool: {tool_name}",
+                                tool_name=tool_name,
+                                tool_params=params,
+                                timestamp=self._get_timestamp(),
+                                model_used=model_used,
+                            )
+                        )
+                        return steps
+
+        # Strategy 2: Look for markdown code blocks with tool calls
+        if '```' in response:
+            code_blocks = re.findall(r'```(?:json|python|bash)?\s*(.*?)```', response, re.DOTALL)
+            for block in code_blocks:
+                block = block.strip()
+                # Try to parse as JSON tool call
+                if block.startswith('{'):
+                    try:
+                        data = json.loads(block)
+                        if 'tool' in data or 'action' in data or 'function' in data:
+                            tool_name = data.get('tool') or data.get('action') or data.get('function')
+                            params = {k: v for k, v in data.items() if k not in ['tool', 'action', 'function']}
+                            steps.append(
+                                ReActStep(
+                                    step_type=StepType.ACTION,
+                                    content=f"Using tool: {tool_name}",
+                                    tool_name=tool_name,
+                                    tool_params=params,
+                                    timestamp=self._get_timestamp(),
+                                    model_used=model_used,
+                                )
+                            )
+                            return steps
+                    except json.JSONDecodeError:
+                        continue
+
+        # Strategy 3: Look for function call syntax
+        func_pattern = r'(\w+)\((.*?)\)'
+        matches = re.findall(func_pattern, response)
+        for match in matches:
+            func_name = match[0]
+            if func_name in self.tools:
+                # Try to parse arguments
+                args_str = match[1]
+                params = {}
+                if args_str:
+                    # Simple argument parsing
+                    parts = args_str.split(',')
+                    for part in parts:
+                        if '=' in part:
+                            key, value = part.split('=', 1)
+                            key = key.strip()
+                            value = value.strip().strip('"').strip("'")
+                            params[key] = value
+
+                steps.append(
+                    ReActStep(
+                        step_type=StepType.ACTION,
+                        content=f"Using tool: {func_name}",
+                        tool_name=func_name,
+                        tool_params=params,
+                        timestamp=self._get_timestamp(),
+                        model_used=model_used,
+                    )
+                )
+                return steps
+
+        # If no action found, return None to fall back to standard parsing
+        return None
+
     def _parse_llm_response(self, response: str, was_thinking_model: bool) -> List[ReActStep]:
         """Parse LLM response into ReAct steps."""
         steps = []
@@ -1196,6 +1364,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
         # Log the raw response for debugging
         logger.debug(f"Parsing LLM response: {repr(response)}")
+
+        # Special handling for Ollama models
+        if self.is_ollama_model and not was_thinking_model:
+            # Try enhanced parsing for Ollama models
+            ollama_steps = self._parse_ollama_response(response, model_used)
+            if ollama_steps:
+                return ollama_steps
 
         # Split response into sections
         sections = re.split(r"\n\n(?=THOUGHT:|ACTION:|OBSERVATION:)", response.strip())
@@ -1224,9 +1399,6 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             # Parse ACTION
             elif section.startswith("ACTION:"):
                 action_lines = section.split("\n")
-                if len(action_lines) < 2:
-                    continue
-
                 tool_name = action_lines[0][7:].strip()
 
                 # Check for invalid tool names
@@ -1245,7 +1417,9 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
                 # Look for PARAMETERS line
                 params = {}
-                for line in action_lines[1:]:
+                # Try multiple formats for parameters
+                for i, line in enumerate(action_lines[1:]):
+                    line = line.strip()
                     if line.startswith("PARAMETERS:"):
                         try:
                             params_str = line[11:].strip()
@@ -1253,6 +1427,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                                 params = json.loads(params_str)
                         except json.JSONDecodeError:
                             logger.warning(f"Failed to parse parameters: {params_str}")
+                        break
+                    elif line.startswith("{") and line.endswith("}"):
+                        # Sometimes models put parameters directly on next line
+                        try:
+                            params = json.loads(line)
+                        except json.JSONDecodeError:
+                            logger.warning(f"Failed to parse JSON parameters: {line}")
                         break
 
                 steps.append(
@@ -3845,7 +4026,46 @@ CURRENT SITUATION TO ANALYZE:
         Build specialized prompt for action model.
         Action model should execute tools based on reasoning.
         """
-        action_instructions = """
+        # Special handling for Ollama models - more explicit format
+        if self.is_ollama_model:
+            action_instructions = """
+🔧 ACTION MODEL INSTRUCTIONS FOR TOOL EXECUTION:
+You must execute tools using the EXACT format below. Your response should contain ONLY the action format, no additional explanation.
+
+REQUIRED FORMAT:
+ACTION: tool_name
+PARAMETERS: {"key1": "value1", "key2": "value2"}
+
+EXAMPLE RESPONSES:
+ACTION: project_setup
+PARAMETERS: {"action": "clone", "repository_url": "https://github.com/user/repo.git"}
+
+ACTION: bash
+PARAMETERS: {"command": "ls -la", "working_directory": "/workspace"}
+
+ACTION: maven
+PARAMETERS: {"command": "compile", "working_directory": "/workspace/project"}
+
+ACTION: file_io
+PARAMETERS: {"action": "read", "path": "/workspace/README.md"}
+
+CRITICAL RULES:
+1. Use EXACTLY the format shown above
+2. Tool name goes after "ACTION:" on the same line
+3. Parameters must be valid JSON on the line starting with "PARAMETERS:"
+4. No extra text before or after the ACTION/PARAMETERS lines
+5. Execute the action recommended by the previous analysis
+
+RESPONSE FORMAT (when function calling is supported):
+Use function calling directly to execute the recommended tool. Minimal reasoning needed.
+
+RESPONSE FORMAT (when function calling not supported):
+ACTION: [tool_name]
+PARAMETERS: [JSON object with required parameters]
+
+CRITICAL: Output ONLY the action format. No explanations or additional text."""
+        else:
+            action_instructions = """
 🔧 ACTION MODEL INSTRUCTIONS:
 You are in ACTION MODE. Your role is to execute specific actions based on thinking model analysis.
 
@@ -3865,7 +4085,10 @@ RESPONSE FORMAT (when function calling not supported):
 ACTION: [tool_name]
 PARAMETERS: [JSON object with required parameters]
 
-CRITICAL: If the thinking model recommended a specific tool and action, execute it precisely.
+CRITICAL: If the thinking model recommended a specific tool and action, execute it precisely."""
+
+        # Add tool descriptions
+        action_instructions += """
 
 AVAILABLE TOOLS AND THEIR PURPOSE:
 - project_setup: Clone repositories and detect project types
@@ -3878,7 +4101,7 @@ AVAILABLE TOOLS AND THEIR PURPOSE:
 
 📖 PROJECT SETUP ACTION PRIORITIES:
 1. After cloning, IMMEDIATELY read project documentation:
-   • file_io(action="read", file_path="README.md") 
+   • file_io(action="read", file_path="README.md")
    • Look for setup instructions, build commands, dependencies
    • Check for testing procedures and environment requirements
 2. Follow the project's own instructions rather than making assumptions
