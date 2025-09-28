@@ -16,29 +16,35 @@ import re
 
 class OutputStorageManager:
     """Manages storage of full outputs with indexing for efficient retrieval."""
-    
+
     def __init__(self, storage_dir: Path, orchestrator=None):
         """
         Initialize the output storage manager.
-        
+
         Args:
             storage_dir: Directory to store full outputs (usually .setup_agent/contexts/)
             orchestrator: Docker orchestrator for container file operations
         """
         self.storage_dir = Path(storage_dir)
         self.orchestrator = orchestrator
-        
+
+        # Define container paths as strings for Docker commands
+        # These are the actual paths inside the container, not host paths
+        self.container_storage_dir = "/workspace/.setup_agent/contexts"
+        self.container_storage_file = f"{self.container_storage_dir}/full_outputs.jsonl"
+        self.container_index_file = f"{self.container_storage_dir}/output_index.json"
+
         # If we have an orchestrator, ensure directory exists in container
         if self.orchestrator:
             try:
-                # Create directory in container
-                mkdir_result = self.orchestrator.execute_command(f"mkdir -p {self.storage_dir}")
+                # Create directory in container using container path
+                mkdir_result = self.orchestrator.execute_command(f"mkdir -p {self.container_storage_dir}")
                 if mkdir_result.get("exit_code") == 0:
-                    logger.debug(f"Output storage directory ensured in container: {self.storage_dir}")
+                    logger.debug(f"Output storage directory ensured in container: {self.container_storage_dir}")
                 else:
                     logger.warning(f"Failed to create directory in container: {mkdir_result.get('output')}")
             except Exception as e:
-                logger.error(f"Failed to create storage directory in container {self.storage_dir}: {e}")
+                logger.error(f"Failed to create storage directory in container {self.container_storage_dir}: {e}")
         else:
             # Fallback to local filesystem (for testing)
             try:
@@ -57,21 +63,24 @@ class OutputStorageManager:
             except Exception as e:
                 logger.error(f"Failed to create storage directory {self.storage_dir}: {e}")
 
-        # Set file paths (may have been updated in exception handler)
+        # Set file paths for local operations (may have been updated in exception handler)
         if not hasattr(self, 'storage_file'):
             self.storage_file = self.storage_dir / "full_outputs.jsonl"
             self.index_file = self.storage_dir / "output_index.json"
-        
-        # Log initialization
-        logger.info(f"OutputStorageManager initialized: storage_file={self.storage_file}, index_file={self.index_file}")
-        
+
+        # Log initialization - show both container and local paths when using orchestrator
+        if self.orchestrator:
+            logger.info(f"OutputStorageManager initialized with orchestrator: container_files={self.container_storage_file}, {self.container_index_file}")
+        else:
+            logger.info(f"OutputStorageManager initialized locally: storage_file={self.storage_file}, index_file={self.index_file}")
+
         self.current_index = self._load_index()
         
     def _load_index(self) -> Dict[str, Dict[str, Any]]:
         """Load the existing index or create a new one."""
         if self.orchestrator:
-            # Check if index exists in container
-            check_cmd = f"test -f {self.index_file} && cat {self.index_file}"
+            # Check if index exists in container using container path
+            check_cmd = f"test -f {self.container_index_file} && cat {self.container_index_file}"
             check_result = self.orchestrator.execute_command(check_cmd)
             
             if check_result.get("exit_code") == 0 and check_result.get("output"):
@@ -93,9 +102,9 @@ class OutputStorageManager:
         """Save the current index to disk."""
         try:
             if self.orchestrator:
-                # Save to container
+                # Save to container using container path
                 index_json = json.dumps(self.current_index, indent=2).replace('"', '\\"').replace('$', '\\$')
-                save_cmd = f'echo "{index_json}" > {self.index_file}'
+                save_cmd = f'echo "{index_json}" > {self.container_index_file}'
                 save_result = self.orchestrator.execute_command(save_cmd)
                 
                 if save_result.get("exit_code") != 0:
@@ -148,9 +157,9 @@ class OutputStorageManager:
         try:
             # Store in container if orchestrator is available
             if self.orchestrator:
-                # Write to container using echo command
+                # Write to container using echo command with container path
                 json_line = json.dumps(record).replace('"', '\\"').replace('$', '\\$')
-                write_cmd = f'echo "{json_line}" >> {self.storage_file}'
+                write_cmd = f'echo "{json_line}" >> {self.container_storage_file}'
                 write_result = self.orchestrator.execute_command(write_cmd)
                 
                 if write_result.get("exit_code") == 0:
@@ -191,8 +200,8 @@ class OutputStorageManager:
     def _count_lines_in_file(self) -> int:
         """Count the number of lines in the storage file."""
         if self.orchestrator:
-            # Count lines in container file
-            count_cmd = f"test -f {self.storage_file} && wc -l < {self.storage_file} || echo 0"
+            # Count lines in container file using container path
+            count_cmd = f"test -f {self.container_storage_file} && wc -l < {self.container_storage_file} || echo 0"
             count_result = self.orchestrator.execute_command(count_cmd)
             
             if count_result.get("exit_code") == 0:
@@ -230,8 +239,8 @@ class OutputStorageManager:
         
         try:
             if self.orchestrator:
-                # Retrieve from container
-                retrieve_cmd = f"sed -n '{line_number}p' {self.storage_file}"
+                # Retrieve from container using container path
+                retrieve_cmd = f"sed -n '{line_number}p' {self.container_storage_file}"
                 retrieve_result = self.orchestrator.execute_command(retrieve_cmd)
                 
                 if retrieve_result.get("exit_code") == 0 and retrieve_result.get("output"):
