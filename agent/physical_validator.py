@@ -1214,14 +1214,51 @@ class PhysicalValidator:
             json_content = json.dumps(log_data, indent=2, ensure_ascii=False)
 
             if self.docker_orchestrator:
-                # Write file using Docker orchestrator
-                write_cmd = f"cat > {log_file_path} << 'EOF'\n{json_content}\nEOF"
-                result = self.docker_orchestrator.execute_command(write_cmd)
-                if result.get("success"):
+                # Write file using chunked approach for large data
+                # This is the most robust solution for any data size
+
+                # For small data (< 100KB), use simple heredoc
+                if len(json_content) < 100000:
+                    write_cmd = f"cat > {log_file_path} << 'EOF'\n{json_content}\nEOF"
+                    result = self.docker_orchestrator.execute_command(write_cmd)
+                else:
+                    # For large data, write in chunks to avoid "argument list too long"
+                    temp_file = "/tmp/unexecuted_tests_temp.json"
+
+                    # First, ensure temp file doesn't exist
+                    self.docker_orchestrator.execute_command(f"rm -f {temp_file}")
+
+                    # Write to temp file in chunks
+                    chunk_size = 50000  # 50KB chunks - very safe size
+                    result = {"exit_code": 0}
+
+                    for i in range(0, len(json_content), chunk_size):
+                        chunk = json_content[i:i + chunk_size]
+                        # Use base64 for each chunk to avoid escaping issues
+                        import base64
+                        encoded_chunk = base64.b64encode(chunk.encode('utf-8')).decode('ascii')
+
+                        # Append each chunk (first chunk creates file)
+                        append_symbol = ">>" if i > 0 else ">"
+                        write_chunk_cmd = f"echo '{encoded_chunk}' | base64 -d {append_symbol} {temp_file}"
+
+                        chunk_result = self.docker_orchestrator.execute_command(write_chunk_cmd)
+                        if chunk_result.get("exit_code") != 0:
+                            result = chunk_result
+                            logger.warning(f"Failed to write chunk {i//chunk_size + 1}")
+                            break
+
+                    # If all chunks written successfully, move to final location
+                    if result.get("exit_code") == 0:
+                        move_cmd = f"mv {temp_file} {log_file_path}"
+                        result = self.docker_orchestrator.execute_command(move_cmd)
+
+                # Check exit_code
+                if result.get("exit_code") == 0:
                     logger.info(f"📝 Saved unexecuted tests log to: {log_file_path}")
                     logger.info(f"   Review with: cat {log_file_path}")
                 else:
-                    logger.warning(f"Failed to save unexecuted tests log: {result.get('error', 'Unknown error')}")
+                    logger.warning(f"Failed to save unexecuted tests log: exit_code={result.get('exit_code')}, error={result.get('error', 'Unknown error')}")
             else:
                 # Fallback: write directly if no orchestrator (for testing)
                 with open(log_file_path, 'w', encoding='utf-8') as f:
@@ -1285,10 +1322,49 @@ class PhysicalValidator:
             # Save text file
             text_file_path = os.path.join(setup_agent_dir, "unexecuted_tests.txt")
             if self.docker_orchestrator:
-                write_cmd = f"cat > {text_file_path} << 'EOF'\n{text_report}\nEOF"
-                result = self.docker_orchestrator.execute_command(write_cmd)
-                if result.get("success"):
+                # Write text file using same chunked approach as JSON
+
+                # For small text (< 100KB), use simple heredoc
+                if len(text_report) < 100000:
+                    write_cmd = f"cat > {text_file_path} << 'EOF'\n{text_report}\nEOF"
+                    result = self.docker_orchestrator.execute_command(write_cmd)
+                else:
+                    # For large text, write in chunks to avoid "argument list too long"
+                    temp_file = "/tmp/unexecuted_tests_temp.txt"
+
+                    # Clean up any existing temp file
+                    self.docker_orchestrator.execute_command(f"rm -f {temp_file}")
+
+                    # Write to temp file in chunks
+                    chunk_size = 50000  # 50KB chunks - safe for all systems
+                    result = {"exit_code": 0}
+
+                    for i in range(0, len(text_report), chunk_size):
+                        chunk = text_report[i:i + chunk_size]
+                        # Use base64 for each chunk to handle special characters
+                        import base64
+                        encoded_chunk = base64.b64encode(chunk.encode('utf-8')).decode('ascii')
+
+                        # Append each chunk (first chunk creates file)
+                        append_symbol = ">>" if i > 0 else ">"
+                        write_chunk_cmd = f"echo '{encoded_chunk}' | base64 -d {append_symbol} {temp_file}"
+
+                        chunk_result = self.docker_orchestrator.execute_command(write_chunk_cmd)
+                        if chunk_result.get("exit_code") != 0:
+                            result = chunk_result
+                            logger.warning(f"Failed to write text chunk {i//chunk_size + 1}")
+                            break
+
+                    # If all chunks written successfully, move to final location
+                    if result.get("exit_code") == 0:
+                        move_cmd = f"mv {temp_file} {text_file_path}"
+                        result = self.docker_orchestrator.execute_command(move_cmd)
+
+                # Check exit_code
+                if result.get("exit_code") == 0:
                     logger.info(f"📄 Saved text report to: {text_file_path}")
+                else:
+                    logger.warning(f"Failed to save text report: exit_code={result.get('exit_code')}, error={result.get('error', 'Unknown error')}")
             else:
                 with open(text_file_path, 'w', encoding='utf-8') as f:
                     f.write(text_report)
