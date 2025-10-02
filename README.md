@@ -112,7 +112,7 @@ flowchart TD
         Think["THOUGHT: Thinking model plans next step<br/>TokenTracker absorbs usage"]
         ActionDecision{Action needed?}
         Act["ACTION: Action model decides tool call"]
-        CtxSwitch["`manage_context` updates trunk↔branch state<br/>Branch history written to `.setup_agent/contexts`"]
+        CtxSwitch["manage_context updates trunk↔branch state<br/>Branch history written to .setup_agent/contexts"]
         ToolExec["Domain tools run inside container<br/>• `project_analyzer`, `maven`, `gradle`, `project_setup`, `system`, etc."]
         OutputPersist["Observations shortened for context<br/>Full logs stored via OutputStorageManager"]
         Observation["OBSERVATION: Summaries + ref IDs recorded"]
