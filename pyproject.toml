@@ -9,22 +9,22 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.3.0",
-    "docker>=6.0.0",
-    "litellm==1.76.3",
-    "requests>=2.28.0",
-    "pydantic>=2.0.0",
+    "docker>=7.1.0",
+    "litellm==1.77.5",
+    "requests>=2.32.5",
+    "pydantic>=2.11.9",
     "rich>=14.1.0",
-    "loguru>=0.7.0",
-    "python-dotenv>=1.0.0",
-    "openai>=1.109.1",
+    "loguru>=0.7.3",
+    "python-dotenv>=1.1.1",
+    "openai>=2.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0.0",
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "mypy>=1.0.0",
+    "pytest>=8.4.2",
+    "black>=25.9.0",
+    "isort>=6.1.0",
+    "mypy>=1.18.2",
 ]
 
 [project.scripts]
@@ -39,11 +39,11 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "black>=25.1.0",
-    "isort>=6.0.1",
-    "mypy>=1.16.1",
-    "pytest>=8.4.1",
-    "pytest-cov>=6.3.0",
+    "black>=25.9.0",
+    "isort>=6.1.0",
+    "mypy>=1.18.2",
+    "pytest>=8.4.2",
+    "pytest-cov>=7.0.0",
 ]
 
 [tool.black]
