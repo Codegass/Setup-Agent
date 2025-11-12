@@ -61,6 +61,11 @@ class DockerOrchestrator:
             # if not self._volume_exists():
             #     self._create_volume()
 
+            # Ensure the base image is available locally
+            if not self._ensure_image_available():
+                logger.error(f"Failed to ensure image {self.base_image} is available")
+                return False
+
             # Prepare container configuration
             container_config = self._get_container_config()
 
@@ -1206,6 +1211,38 @@ class DockerOrchestrator:
             return False
         except Exception as e:
             logger.error(f"Error checking volume existence: {e}")
+            return False
+
+    def _ensure_image_available(self) -> bool:
+        """Ensure the Docker image is available locally, pull if needed."""
+        
+        try:
+            # Check if image exists locally
+            try:
+                self.client.images.get(self.base_image)
+                logger.info(f"Image {self.base_image} already exists locally")
+                return True
+            except NotFound:
+                logger.info(f"Image {self.base_image} not found locally, pulling...")
+                
+            # Pull the image
+            logger.info(f"Pulling Docker image: {self.base_image}")
+            logger.info("This may take a few minutes on first run...")
+            
+            # Pull with progress logging
+            for line in self.client.api.pull(self.base_image, stream=True, decode=True):
+                if 'status' in line:
+                    status = line['status']
+                    if 'id' in line:
+                        logger.debug(f"{line['id']}: {status}")
+                    else:
+                        logger.info(status)
+                        
+            logger.info(f"✅ Successfully pulled image: {self.base_image}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to pull image {self.base_image}: {e}")
             return False
 
     def _wait_for_container_ready(self, timeout: int = 30) -> bool:
