@@ -37,15 +37,16 @@ class SessionLogger:
         # Remove default logger
         logger.remove()
 
-        # Console logger - respects verbose setting
-        console_level = "DEBUG" if self.config.verbose else self.config.log_level.value
-        logger.add(
-            sys.stderr,
-            level=console_level,
-            format=self._get_console_format(),
-            colorize=True,
-            filter=self._console_filter,
-        )
+        # Console logger - suppressed in UI mode, respects verbose setting otherwise
+        if not self.config.ui_mode:
+            console_level = "DEBUG" if self.config.verbose else self.config.log_level.value
+            logger.add(
+                sys.stderr,
+                level=console_level,
+                format=self._get_console_format(),
+                colorize=True,
+                filter=self._console_filter,
+            )
 
         # Main session log file - always captures everything
         main_log_file = self.session_log_dir / "main.log"
@@ -237,3 +238,90 @@ def create_command_logger(command: str, project_name: str):
         return _session_logger.create_command_logger(command, project_name)
     else:
         return logger.bind(command=command, project_name=project_name), None
+
+
+def suppress_console_logging():
+    """
+    Suppress console logging for UI mode.
+
+    Removes all stderr/console handlers while keeping file handlers intact.
+    This should be called after --ui flag is detected in subcommands.
+    """
+    global _session_logger
+
+    # Remove all handlers that write to stderr/console
+    # Loguru uses handler IDs, we need to track and remove console handlers
+    import sys
+
+    # Get all current handlers (loguru stores them internally)
+    # We'll remove the handler that outputs to sys.stderr
+    # and re-add it as a null handler
+
+    # Remove the existing console logger by removing all handlers
+    # then re-add only the file handlers
+    logger.remove()  # Remove all handlers
+
+    if _session_logger:
+        # Re-add only file handlers (not console)
+        config = _session_logger.config
+
+        # Main session log file
+        main_log_file = _session_logger.session_log_dir / "main.log"
+        logger.add(
+            str(main_log_file),
+            level="DEBUG",
+            format=_session_logger._get_file_format(),
+            rotation=config.log_rotation,
+            retention=config.log_retention,
+            compression="gz",
+            enqueue=True,
+        )
+
+        # Agent execution log
+        agent_log_file = _session_logger.session_log_dir / "agent_execution.log"
+        logger.add(
+            str(agent_log_file),
+            level="INFO",
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {extra[context_id]} | {message}",
+            filter=lambda record: "AGENT_TRACE" in record.get("extra", {}),
+            rotation="100 MB",
+            retention="7 days",
+        )
+
+        # Error log
+        error_log_file = _session_logger.session_log_dir / "errors.log"
+        logger.add(
+            str(error_log_file),
+            level="ERROR",
+            format=_session_logger._get_file_format(),
+            rotation="10 MB",
+            retention="90 days",
+        )
+
+        # Verbose debug log if verbose mode was enabled
+        if config.verbose:
+            debug_log_file = _session_logger.session_log_dir / "debug_verbose.log"
+            logger.add(
+                str(debug_log_file),
+                level="TRACE",
+                format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
+                rotation="200 MB",
+                retention="3 days",
+                filter=lambda record: "VERBOSE" in record.get("extra", {})
+                or record["level"].name in ["TRACE", "DEBUG"],
+            )
+
+        # Legacy log file if configured
+        if config.log_file:
+            from pathlib import Path
+            legacy_log_path = Path(config.log_file)
+            logger.add(
+                str(legacy_log_path),
+                level="INFO",
+                format=_session_logger._get_file_format(),
+                rotation=config.log_rotation,
+                retention=config.log_retention,
+                compression="gz",
+            )
+
+    logger.info("Console logging suppressed for UI mode")

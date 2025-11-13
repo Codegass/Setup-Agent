@@ -8,6 +8,7 @@ from .logger import (
     create_verbose_logger,
     get_session_logger,
     setup_session_logging,
+    suppress_console_logging,
 )
 from .models import LogLevel
 from .settings import Config, setup_litellm_environment
@@ -52,4 +53,5 @@ __all__ = [
     "create_command_logger",
     "get_session_logger",
     "create_verbose_logger",
+    "suppress_console_logging",
 ]

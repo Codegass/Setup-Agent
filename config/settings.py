@@ -46,6 +46,7 @@ class Config(BaseModel):
     log_level: LogLevel = Field(default=LogLevel.INFO)
     log_file: Optional[str] = Field(default="logs/sag.log")
     verbose: bool = Field(default=False)  # Enable verbose debugging output
+    ui_mode: bool = Field(default=False)  # Enable enhanced UI mode with live progress display
     log_rotation: str = Field(default="50 MB")  # Log file rotation size
     log_retention: str = Field(default="30 days")  # Log file retention period
 
@@ -95,6 +96,7 @@ class Config(BaseModel):
             log_level=LogLevel(os.getenv("SAG_LOG_LEVEL", "INFO")),
             log_file=os.getenv("SAG_LOG_FILE", "logs/sag.log"),
             verbose=os.getenv("SAG_VERBOSE", "false").lower() in ("true", "1", "yes"),
+            ui_mode=os.getenv("SAG_UI_MODE", "false").lower() in ("true", "1", "yes"),
             log_rotation=os.getenv("SAG_LOG_ROTATION", "50 MB"),
             log_retention=os.getenv("SAG_LOG_RETENTION", "30 days"),
             docker_base_image=os.getenv("SAG_DOCKER_BASE_IMAGE", "ubuntu:22.04"),

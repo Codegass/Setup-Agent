@@ -12,6 +12,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from config import Config, create_agent_logger, create_command_logger, get_session_logger
 from docker_orch.orch import DockerOrchestrator
+from ui import UIManager, UIEvent, EventType, PhaseType
 
 from .context_manager import ContextManager
 from .react_engine import ReActEngine
@@ -25,6 +26,9 @@ class SetupAgent:
         self.orchestrator = orchestrator
         self.max_iterations = max_iterations if max_iterations is not None else config.max_iterations
         self.console = Console()
+
+        # UI Manager for enhanced UI mode
+        self.ui_manager: Optional[UIManager] = None
 
         # Context manager will be initialized after Docker setup
         self.context_manager = None
@@ -61,6 +65,10 @@ class SetupAgent:
 
         # Initialize ReAct engine (repository URL will be set later)
         self.react_engine = ReActEngine(context_manager=self.context_manager, tools=self.tools)
+
+        # Pass UIManager to ReActEngine if in UI mode
+        if self.config.ui_mode and self.ui_manager:
+            self.react_engine.set_ui_manager(self.ui_manager)
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
 
@@ -139,25 +147,72 @@ class SetupAgent:
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
         cmd_logger.info(f"Starting project setup: {project_name}")
 
-        self.console.print(
-            Panel.fit(
-                f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
-                f"[dim]Repository: {project_url}[/dim]\n"
-                f"[dim]Goal: {goal}[/dim]",
-                border_style="blue",
+        # Initialize UI Manager if in UI mode
+        if self.config.ui_mode:
+            self.ui_manager = UIManager(project_name=project_name, console=self.console)
+            self.ui_manager.start()
+        else:
+            self.console.print(
+                Panel.fit(
+                    f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
+                    f"[dim]Repository: {project_url}[/dim]\n"
+                    f"[dim]Goal: {goal}[/dim]",
+                    border_style="blue",
+                )
             )
-        )
 
         try:
             # Step 1: Setup Docker environment
+            if self.config.ui_mode:
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_START,
+                    message="Setting up environment",
+                    phase=PhaseType.SETUP,
+                    level="info"
+                ))
+
             if not self._setup_docker_environment(project_name):
                 return False
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
+            if self.config.ui_mode:
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.STEP_START,
+                    message="Context Initialization",
+                    phase=PhaseType.SETUP,
+                    details="Initializing context system...",
+                    level="info"
+                ))
+
+                # Update status for initializing tools
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.STATUS_UPDATE,
+                    message="Loading tools...",
+                    phase=PhaseType.SETUP,
+                    level="info"
+                ))
+
             self._initialize_context_and_tools()
 
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url)
+
+            if self.config.ui_mode:
+                # Update status for finalizing
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.STATUS_UPDATE,
+                    message="Configuring ReAct engine...",
+                    phase=PhaseType.SETUP,
+                    level="info"
+                ))
+
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.STEP_COMPLETE,
+                    message="Context Initialization",
+                    phase=PhaseType.SETUP,
+                    details="Context manager ready",
+                    level="success"
+                ))
 
             # Step 2: Initialize trunk context with intelligent planning approach
             # Here we provide the initial steps. Split complex task into clear, executable steps
@@ -190,14 +245,41 @@ class SetupAgent:
             except Exception as e:
                 self.agent_logger.error(f"❌ Failed to create trunk context: {e}")
                 logger.error(f"Trunk context creation failed: {e}")
+                # Always show critical errors
                 self.console.print(f"[bold red]❌ Failed to create project context: {e}[/bold red]")
                 return False
+
+            # Step 2.5: Complete setup phase
+            if self.config.ui_mode:
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_COMPLETE,
+                    message="Setup phase completed",
+                    phase=PhaseType.SETUP,
+                    level="success"
+                ))
 
             # Step 3: Run the unified setup process
             success = self._run_unified_setup(project_url, project_name, goal, interactive)
 
-            # Step 5: Cleanup and summary
-            self._provide_setup_summary(success)
+            # Step 5: Handle final status
+            if self.config.ui_mode:
+                if success:
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.SUCCESS,
+                        message="Project setup completed successfully",
+                        level="success"
+                    ))
+                else:
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.FAILURE,
+                        message="Project setup incomplete",
+                        level="error"
+                    ))
+                # Display final summary and stop UI manager
+                self.ui_manager.display_final_summary()
+            else:
+                # Provide traditional summary
+                self._provide_setup_summary(success)
 
             cmd_logger.info(f"Project setup completed: success={success}")
 
@@ -210,6 +292,7 @@ class SetupAgent:
 
         except Exception as e:
             cmd_logger.error(f"Setup failed: {e}", exc_info=True)
+            # Always show critical errors
             self.console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
 
             # Cleanup command logger
@@ -260,6 +343,7 @@ class SetupAgent:
             except Exception as e:
                 self.agent_logger.error(f"❌ Failed to load/create context: {e}")
                 logger.error(f"Context loading failed: {e}")
+                # Always show critical errors
                 self.console.print(f"[bold red]❌ Failed to load project context: {e}[/bold red]")
                 return False
 
@@ -277,6 +361,7 @@ class SetupAgent:
 
         except Exception as e:
             logger.error(f"Continue project failed: {e}", exc_info=True)
+            # Always show critical errors
             self.console.print(f"[bold red]❌ Continue project failed: {e}[/bold red]")
             return False
 
@@ -287,16 +372,29 @@ class SetupAgent:
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
         cmd_logger.info(f"Starting task execution: {task_description}")
 
-        self.console.print(
-            Panel.fit(
-                f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
-                f"[dim]Task: {task_description}[/dim]",
-                border_style="cyan",
+        # Initialize UI Manager if in UI mode
+        if self.config.ui_mode:
+            self.ui_manager = UIManager(project_name=project_name, console=self.console)
+            self.ui_manager.start()
+        else:
+            self.console.print(
+                Panel.fit(
+                    f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
+                    f"[dim]Task: {task_description}[/dim]",
+                    border_style="cyan",
+                )
             )
-        )
 
         try:
             # Step 1: Ensure Docker container is running
+            if self.config.ui_mode:
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_START,
+                    message="Preparing environment",
+                    phase=PhaseType.SETUP,
+                    level="info"
+                ))
+
             if not self._ensure_container_running(project_name):
                 return False
 
@@ -325,8 +423,18 @@ class SetupAgent:
             except Exception as e:
                 self.agent_logger.error(f"❌ Failed to load/create context: {e}")
                 logger.error(f"Context loading failed: {e}")
+                # Always show critical errors
                 self.console.print(f"[bold red]❌ Failed to load project context: {e}[/bold red]")
                 return False
+
+            # Step 2.5: Complete setup phase
+            if self.config.ui_mode:
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_COMPLETE,
+                    message="Environment ready",
+                    phase=PhaseType.SETUP,
+                    level="success"
+                ))
 
             # Step 3: Add the specific task
             trunk_context.add_task(task_description)
@@ -347,25 +455,63 @@ I should:
 Please start by checking the current context and then proceed with the task.
 """
 
-            self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
+            # Step 5: Execute task
+            if self.config.ui_mode:
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_START,
+                    message="Executing task",
+                    phase=PhaseType.BUILD,
+                    level="info"
+                ))
+            else:
+                self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
 
-            # Step 5: Run the task execution loop
+            # Run the task execution loop
             success = self.react_engine.run_react_loop(
                 initial_prompt=task_prompt, max_iterations=self.max_iterations
             )
 
-            # Step 6: Update last comment in container
+            # Step 6: Update last comment in container and handle completion
             if success:
                 comment = f"Task completed: {task_description}"
                 self.orchestrator.update_last_comment(comment)
-                self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
+                if self.config.ui_mode:
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.PHASE_COMPLETE,
+                        message="Task completed",
+                        phase=PhaseType.BUILD,
+                        level="success"
+                    ))
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.SUCCESS,
+                        message=f"Task completed: {task_description}",
+                        level="success"
+                    ))
+                else:
+                    self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
             else:
                 comment = f"Task in progress: {task_description}"
                 self.orchestrator.update_last_comment(comment)
-                self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
+                if self.config.ui_mode:
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.PHASE_ERROR,
+                        message="Task incomplete",
+                        phase=PhaseType.BUILD,
+                        level="error"
+                    ))
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.FAILURE,
+                        message=f"Task incomplete: {task_description}",
+                        level="error"
+                    ))
+                else:
+                    self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
 
             # Step 7: Provide execution summary
-            self._provide_task_summary(success, task_description)
+            if self.config.ui_mode:
+                self.ui_manager.display_final_summary()
+            else:
+                self._provide_task_summary(success, task_description)
 
             cmd_logger.info(f"Task execution completed: success={success}")
 
@@ -378,6 +524,7 @@ Please start by checking the current context and then proceed with the task.
 
         except Exception as e:
             cmd_logger.error(f"Task execution failed: {e}", exc_info=True)
+            # Always show critical errors
             self.console.print(f"[bold red]❌ Task execution failed: {e}[/bold red]")
 
             # Update last comment with error
@@ -394,43 +541,109 @@ Please start by checking the current context and then proceed with the task.
     def _setup_docker_environment(self, project_name: str) -> bool:
         """Setup the Docker environment for the project."""
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task("Setting up Docker environment...", total=None)
+        if self.config.ui_mode:
+            # UI Mode: emit detailed step events
+            self.ui_manager.handle_event(UIEvent(
+                event_type=EventType.STEP_START,
+                message="Docker Environment",
+                phase=PhaseType.SETUP,
+                details="Checking Docker availability...",
+                level="info"
+            ))
+
+            # Update status for creating container
+            self.ui_manager.handle_event(UIEvent(
+                event_type=EventType.STATUS_UPDATE,
+                message="Creating container...",
+                phase=PhaseType.SETUP,
+                level="info"
+            ))
 
             try:
                 # Create and start container
                 success = self.orchestrator.create_and_start_container()
 
                 if success:
-                    progress.update(task, description="✅ Docker environment ready")
+                    # Update status for configuring environment
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.STATUS_UPDATE,
+                        message="Configuring environment...",
+                        phase=PhaseType.SETUP,
+                        level="info"
+                    ))
+
+                    # Mark step complete
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.STEP_COMPLETE,
+                        message="Docker Environment",
+                        phase=PhaseType.SETUP,
+                        details="Container ready",
+                        level="success"
+                    ))
                     logger.info("Docker environment setup completed")
                     return True
                 else:
-                    progress.update(task, description="❌ Docker environment setup failed")
+                    self.ui_manager.handle_event(UIEvent(
+                        event_type=EventType.STEP_ERROR,
+                        message="Docker Environment",
+                        phase=PhaseType.SETUP,
+                        details="Failed to create container",
+                        level="error"
+                    ))
                     logger.error("Docker environment setup failed")
                     return False
 
             except Exception as e:
-                progress.update(task, description=f"❌ Docker setup error: {e}")
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.ERROR,
+                    message=f"Docker setup error: {e}",
+                    phase=PhaseType.SETUP,
+                    level="error"
+                ))
                 logger.error(f"Docker setup error: {e}")
                 return False
+        else:
+            # Normal Mode: use Rich Progress
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+            ) as progress:
+                task = progress.add_task("Setting up Docker environment...", total=None)
+
+                try:
+                    # Create and start container
+                    success = self.orchestrator.create_and_start_container()
+
+                    if success:
+                        progress.update(task, description="✅ Docker environment ready")
+                        logger.info("Docker environment setup completed")
+                        return True
+                    else:
+                        progress.update(task, description="❌ Docker environment setup failed")
+                        logger.error("Docker environment setup failed")
+                        return False
+
+                except Exception as e:
+                    progress.update(task, description=f"❌ Docker setup error: {e}")
+                    logger.error(f"Docker setup error: {e}")
+                    return False
 
     def _ensure_container_running(self, project_name: str) -> bool:
         """Ensure the Docker container is running."""
 
         try:
             if not self.orchestrator.container_exists():
+                # Always show critical errors
                 self.console.print(
                     f"[bold red]❌ No container found for project: {project_name}[/bold red]"
                 )
                 return False
 
             if not self.orchestrator.is_container_running():
-                self.console.print("[yellow]⚠️ Container is not running. Starting...[/yellow]")
+                # Show container starting message in non-UI mode only
+                if not self.config.ui_mode:
+                    self.console.print("[yellow]⚠️ Container is not running. Starting...[/yellow]")
                 return self.orchestrator.start_container()
 
             return True
@@ -491,15 +704,14 @@ The repository URL is already provided: {project_url}
 START by checking context, then clone if needed, then IMMEDIATELY analyze the project!
 """
 
-        self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
-
-        # Run the unified setup process
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            console=self.console,
-        ) as progress:
-            task = progress.add_task("Running setup process...", total=None)
+        if self.config.ui_mode:
+            # UI Mode: emit phase events for build
+            self.ui_manager.handle_event(UIEvent(
+                event_type=EventType.PHASE_START,
+                message="Running project setup",
+                phase=PhaseType.BUILD,
+                level="info"
+            ))
 
             success = self.react_engine.run_react_loop(
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
@@ -508,12 +720,47 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
             # Check if a report was generated and get the verified status
             verified_success = self._get_verified_final_status(success)
 
+            # Emit build phase completion
             if verified_success:
-                progress.update(task, description="✅ Setup process completed")
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_COMPLETE,
+                    message="Build and test completed",
+                    phase=PhaseType.BUILD,
+                    level="success"
+                ))
             else:
-                progress.update(task, description="❌ Setup process incomplete")
+                self.ui_manager.handle_event(UIEvent(
+                    event_type=EventType.PHASE_ERROR,
+                    message="Build or test failed",
+                    phase=PhaseType.BUILD,
+                    level="error"
+                ))
 
-        return verified_success
+            return verified_success
+        else:
+            # Normal Mode: use Rich Progress
+            self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=self.console,
+            ) as progress:
+                task = progress.add_task("Running setup process...", total=None)
+
+                success = self.react_engine.run_react_loop(
+                    initial_prompt=setup_prompt, max_iterations=self.max_iterations
+                )
+
+                # Check if a report was generated and get the verified status
+                verified_success = self._get_verified_final_status(success)
+
+                if verified_success:
+                    progress.update(task, description="✅ Setup process completed")
+                else:
+                    progress.update(task, description="❌ Setup process incomplete")
+
+            return verified_success
 
     def _verify_build_artifacts(self, project_name: str) -> bool:
         """
