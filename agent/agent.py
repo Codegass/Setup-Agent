@@ -70,6 +70,13 @@ class SetupAgent:
         if self.config.ui_mode and self.ui_manager:
             self.react_engine.set_ui_manager(self.ui_manager)
 
+            # Also set UI manager for all tools that support it
+            from ui.events import UIEventEmitter
+            for tool in self.tools:
+                if isinstance(tool, UIEventEmitter):
+                    tool.set_ui_manager(self.ui_manager)
+                    logger.debug(f"Set UI manager for tool: {tool.name}")
+
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
 
     def _initialize_tools(self) -> List:

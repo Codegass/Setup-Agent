@@ -18,6 +18,10 @@ from docker_orch.orch import DockerOrchestrator
 
 console = Console()
 
+# Note: You may see "Exception ignored while finalizing... ValueError: I/O operation on closed file"
+# at the end of execution. This is a harmless cleanup issue from urllib3/docker-py during
+# garbage collection and does not affect functionality. Python already handles it gracefully.
+
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:
     """Copy setup artifacts from Docker container to local session logs.

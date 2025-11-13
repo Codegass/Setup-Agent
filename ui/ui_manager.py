@@ -75,6 +75,9 @@ class UIManager:
         self.is_complete = False
         self.final_status: Optional[str] = None
 
+        # Report information
+        self.report_data: Optional[dict] = None  # Report metadata (path, status, metrics)
+
         # Live display
         self.live: Optional[Live] = None
 
@@ -140,6 +143,178 @@ class UIManager:
             return f"({', '.join(formatted_parts)})"
         return ""
 
+    def _detect_phase_from_action(self, tool_name: str, tool_params: dict) -> Optional[PhaseType]:
+        """
+        Detect which phase the agent is in based on tool usage.
+
+        Args:
+            tool_name: Name of the tool being used
+            tool_params: Tool parameters
+
+        Returns:
+            PhaseType if phase detected, None otherwise
+        """
+        # Already in verification or all phases complete - don't transition back
+        if self.current_phase == PhaseType.VERIFICATION:
+            return None
+
+        # Report tool = verification phase
+        if tool_name == "report":
+            return PhaseType.VERIFICATION
+
+        # Check for test-related activities
+        if tool_name in ["maven", "gradle"]:
+            goal = tool_params.get("goal", "")
+            task = tool_params.get("task", "")
+            action = tool_params.get("action", "")
+
+            # Test phase indicators
+            if "test" in goal.lower() or "test" in task.lower() or "test" in action.lower():
+                return PhaseType.TEST
+
+            # Build phase indicators (compile, package, install)
+            if any(keyword in goal.lower() or keyword in task.lower()
+                   for keyword in ["compile", "package", "install", "build", "assemble"]):
+                return PhaseType.BUILD
+
+        # Bash commands
+        if tool_name == "bash":
+            command = tool_params.get("command", "")
+            command_lower = command.lower()
+
+            # Test indicators in bash commands
+            if any(keyword in command_lower for keyword in ["mvn test", "gradle test", "pytest", "npm test", "test"]):
+                return PhaseType.TEST
+
+            # Build indicators in bash commands
+            if any(keyword in command_lower for keyword in ["mvn compile", "mvn package", "mvn install",
+                                                            "gradle build", "gradle assemble", "make", "npm run build"]):
+                return PhaseType.BUILD
+
+        return None
+
+    def _extract_thought_summary(self, thought: str) -> str:
+        """
+        Extract a meaningful summary from agent thought.
+
+        Args:
+            thought: Full thought content
+
+        Returns:
+            Concise summary (30-80 chars) with ellipsis
+        """
+        # Remove common prefixes
+        thought = thought.strip()
+        thought = thought.replace("I need to ", "").replace("I should ", "").replace("I will ", "")
+
+        # Find first sentence or meaningful chunk
+        sentences = thought.split(". ")
+        if sentences:
+            summary = sentences[0].strip()
+            # Limit length
+            if len(summary) > 80:
+                summary = summary[:77] + "..."
+            elif len(summary) < 20:
+                # If too short, include second sentence if available
+                if len(sentences) > 1:
+                    summary = f"{summary}. {sentences[1][:40]}..."
+            else:
+                summary = summary + "..."
+
+            return summary
+
+        # Fallback
+        return thought[:77] + "..." if len(thought) > 80 else thought
+
+    def _extract_observation_summary(self, observation: str) -> str:
+        """
+        Extract a meaningful summary from agent observation.
+
+        Args:
+            observation: Full observation content
+
+        Returns:
+            Concise summary (50-100 chars) with ellipsis
+        """
+        # Clean up observation
+        observation = observation.strip()
+
+        # Look for key indicators of success/failure
+        if "successfully" in observation.lower() or "success" in observation.lower():
+            # Extract success message
+            lines = observation.split("\n")
+            for line in lines:
+                if "success" in line.lower():
+                    summary = line.strip()
+                    if len(summary) > 100:
+                        return summary[:97] + "..."
+                    return summary + "..."
+
+        # Look for error indicators
+        if "error" in observation.lower() or "failed" in observation.lower():
+            lines = observation.split("\n")
+            for line in lines:
+                if "error" in line.lower() or "failed" in line.lower():
+                    summary = line.strip()
+                    if len(summary) > 100:
+                        return summary[:97] + "..."
+                    return summary + "..."
+
+        # Default: first meaningful line
+        lines = observation.split("\n")
+        for line in lines:
+            line = line.strip()
+            if len(line) > 10:  # Skip very short lines
+                if len(line) > 100:
+                    return line[:97] + "..."
+                return line + "..."
+
+        # Fallback
+        return observation[:97] + "..." if len(observation) > 100 else observation
+
+    def _format_report_summary(self) -> Panel:
+        """
+        Format report summary panel for display.
+
+        Returns:
+            Rich Panel with report information
+        """
+        if not self.report_data:
+            return Panel("No report data available", border_style="yellow")
+
+        # Extract report data
+        report_path = self.report_data.get("report_path", "Unknown")
+        status = self.report_data.get("status", "unknown")
+        build_success = self.report_data.get("build_success", False)
+        test_success = self.report_data.get("test_success", False)
+        total_tests = self.report_data.get("total_tests", 0)
+        passed_tests = self.report_data.get("passed_tests", 0)
+        test_pass_rate = self.report_data.get("test_pass_rate", 0)
+
+        # Calculate pass rate if not provided or if it's 0 but we have test data
+        if test_pass_rate == 0 and total_tests > 0:
+            test_pass_rate = (passed_tests / total_tests) * 100
+
+        # Build content
+        content = f"📄 [bold cyan]Final Report Generated[/bold cyan]\n\n"
+        content += f"  [cyan]Location:[/cyan] {report_path}\n"
+        content += f"  [cyan]Status:[/cyan] {status.upper()}\n\n"
+
+        content += "  [bold]Results:[/bold]\n"
+        build_icon = "✅" if build_success else "❌"
+        content += f"    {build_icon} Build: {'SUCCESS' if build_success else 'FAILED'}\n"
+
+        if total_tests > 0:
+            test_icon = "✅" if test_success else "❌"
+            content += f"    {test_icon} Tests: {passed_tests}/{total_tests} passed ({test_pass_rate:.1f}%)\n"
+
+        return Panel(
+            content,
+            title="📊 Setup Report",
+            border_style="green" if status == "success" else "yellow",
+            padding=(1, 2)
+        )
+
     def handle_event(self, event: UIEvent):
         """
         Handle a UI event and update the display
@@ -170,6 +345,8 @@ class UIManager:
             self._handle_success(event)
         elif event.event_type == EventType.FAILURE:
             self._handle_failure(event)
+        elif event.event_type == EventType.REPORT_GENERATED:
+            self._handle_report_generated(event)
         elif event.event_type in [EventType.AGENT_THOUGHT, EventType.AGENT_ACTION, EventType.AGENT_OBSERVATION]:
             self._handle_agent_event(event)
 
@@ -263,6 +440,18 @@ class UIManager:
         self.final_status = "failure"
         self.current_status = event.message
 
+    def _handle_report_generated(self, event: UIEvent):
+        """Handle report generation event"""
+        # Store report metadata
+        self.report_data = event.metadata
+
+        # Complete verification phase
+        if self.current_phase == PhaseType.VERIFICATION:
+            self.phases_data[PhaseType.VERIFICATION]["status"] = "success"
+
+        # Update status
+        self.current_status = "Report generated"
+
     def _handle_agent_event(self, event: UIEvent):
         """Handle agent ReAct events (thought, action, observation)"""
         # Track agent steps for collapsible display
@@ -271,8 +460,11 @@ class UIManager:
             self.agent_current_step_num = event.metadata.get("step_num", self.agent_current_step_num + 1)
             self.agent_current_action = "thinking"
             self.agent_current_tool = None
-            self.agent_detail = f"Step {self.agent_current_step_num}: Analyzing situation..."
-            self.current_status = "Agent thinking"
+
+            # Extract meaningful summary from thought
+            thought_summary = self._extract_thought_summary(event.message)
+            self.agent_detail = f"Step {self.agent_current_step_num}: {thought_summary}"
+            self.current_status = thought_summary
 
             self.current_agent_step = {
                 "thought": event.message,
@@ -281,6 +473,7 @@ class UIManager:
                 "status": "running"
             }
             self.agent_steps.append(self.current_agent_step)
+
         elif event.event_type == EventType.AGENT_ACTION and self.current_agent_step:
             self.agent_current_action = "acting"
             tool_name = event.metadata.get("tool_name", "unknown")
@@ -288,6 +481,18 @@ class UIManager:
 
             self.agent_current_tool = tool_name
             self.agent_tool_params = tool_params
+
+            # Detect phase transition based on tool usage
+            detected_phase = self._detect_phase_from_action(tool_name, tool_params)
+            if detected_phase and detected_phase != self.current_phase:
+                # Transition to new phase
+                # Complete previous phase if it was running
+                if self.current_phase and self.phases_data[self.current_phase]["status"] == "running":
+                    self.phases_data[self.current_phase]["status"] = "success"
+
+                # Start new phase
+                self.current_phase = detected_phase
+                self.phases_data[detected_phase]["status"] = "running"
 
             # Format parameters for display
             params_str = self._format_tool_params(tool_name, tool_params)
@@ -301,10 +506,14 @@ class UIManager:
                 self.current_status = f"Using {tool_name}"
 
             self.current_agent_step["action"] = event.message
+
         elif event.event_type == EventType.AGENT_OBSERVATION and self.current_agent_step:
             self.agent_current_action = "observing"
-            self.agent_detail = f"Step {self.agent_current_step_num}: Processing results..."
-            self.current_status = "Processing observation"
+
+            # Extract meaningful summary from observation
+            observation_summary = self._extract_observation_summary(event.message)
+            self.agent_detail = f"Step {self.agent_current_step_num}: {observation_summary}"
+            self.current_status = observation_summary
 
             self.current_agent_step["observation"] = event.message
             self.current_agent_step["status"] = "complete"
@@ -394,17 +603,8 @@ class UIManager:
             )
             elements.append(warning_panel)
 
-        # 5. Final status if complete
-        if self.is_complete and self.final_status == "success":
-            elements.append("")  # Spacing
-            success_panel = create_success_panel(
-                self.current_status,
-                summary_items=[
-                    ("Total time", elapsed_str),
-                    ("Phases completed", f"{sum(1 for p in self.phases_data.values() if p['status'] == 'success')}/4")
-                ]
-            )
-            elements.append(success_panel)
+        # Note: Final success panel is NOT shown here to avoid duplication
+        # It will be shown in display_final_summary() instead
 
         return Group(*elements)
 
@@ -442,6 +642,12 @@ class UIManager:
                     details=latest_error.details
                 )
                 self.console.print(error_panel)
+
+        # Print report information if available
+        if self.report_data:
+            self.console.print()
+            report_info = self._format_report_summary()
+            self.console.print(report_info)
 
         # Print detailed phase tree with all steps expanded
         self.console.print()
