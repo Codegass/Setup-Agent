@@ -12,6 +12,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from config import create_agent_logger, create_verbose_logger, get_config
+from ui.events import UIEventEmitter, EventType, PhaseType
 
 from tools.base import BaseTool, ToolResult
 from reporting import render_condensed_summary
@@ -43,12 +44,13 @@ class ReActStep(BaseModel):
     model_used: Optional[str] = None
 
 
-class ReActEngine:
+class ReActEngine(UIEventEmitter):
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
     def __init__(
         self, context_manager: ContextManager, tools: List[BaseTool], repository_url: str = None
     ):
+        super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
@@ -1307,6 +1309,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 self.agent_logger.info(f"💭 THOUGHT ({step.model_used}): {step.content}")
                 logger.info(f"💭 THOUGHT: {step.content}")
 
+                # Emit UI event for thought
+                self.emit(
+                    EventType.AGENT_THOUGHT,
+                    message=step.content[:200] + ("..." if len(step.content) > 200 else ""),  # Truncate for display
+                    step_num=self.current_iteration
+                )
+
                 # Detailed logging in verbose mode
                 if self.config.verbose:
                     self._log_react_step_verbose(step)
@@ -1325,6 +1334,15 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             elif step.step_type == StepType.ACTION:
                 self.agent_logger.info(f"🔧 ACTION: {step.content}")
                 logger.info(f"🔧 ACTION: {step.content}")
+
+                # Emit UI event for action with parameters
+                self.emit(
+                    EventType.AGENT_ACTION,
+                    message=f"Using {step.tool_name or 'tool'}",
+                    step_num=self.current_iteration,
+                    tool_name=step.tool_name or "unknown",
+                    tool_params=step.tool_params or {}
+                )
 
                 # Update token tracker with actual tool name for the last action token record
                 if step.tool_name:
@@ -2988,6 +3006,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         # FIXED: Only log once to prevent duplicate output in logs
         # Use logger.info for main logging, agent_logger for internal tracking only
         logger.info(f"👁️ OBSERVATION: {observation}")
+
+        # Emit UI event for observation
+        self.emit(
+            EventType.AGENT_OBSERVATION,
+            message=observation[:200] + ("..." if len(observation) > 200 else ""),  # Truncate for display
+            step_num=self.current_iteration
+        )
 
         # DEPRECATED: Task completion detection now handled by state_evaluator
         # self._check_task_completion_opportunity(observation)
