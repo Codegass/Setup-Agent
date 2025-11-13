@@ -21,6 +21,10 @@ from docker_orch.orch import DockerOrchestrator
 
 console = Console()
 
+# Note: You may see "Exception ignored while finalizing... ValueError: I/O operation on closed file"
+# at the end of execution. This is a harmless cleanup issue from urllib3/docker-py during
+# garbage collection and does not affect functionality. Python already handles it gracefully.
+
 
 def detect_project_directory_in_container(orchestrator: DockerOrchestrator) -> Optional[str]:
     """

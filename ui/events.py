@@ -54,6 +54,9 @@ class EventType(str, Enum):
     # Project events
     PROJECT_ANALYSIS = "project_analysis"
 
+    # Report events
+    REPORT_GENERATED = "report_generated"
+
     # Error events
     ERROR = "error"
     WARNING = "warning"

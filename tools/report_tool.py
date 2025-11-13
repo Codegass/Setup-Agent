@@ -8,9 +8,10 @@ from loguru import logger
 
 from .base import BaseTool, ToolResult
 from reporting import render_condensed_summary, truncate_list, format_percentage
+from ui.events import UIEventEmitter, EventType
 
 
-class ReportTool(BaseTool):
+class ReportTool(BaseTool, UIEventEmitter):
     """
     Tool for generating comprehensive project setup reports and marking task completion.
     
@@ -27,12 +28,14 @@ class ReportTool(BaseTool):
     """
 
     def __init__(self, docker_orchestrator=None, execution_history_callback=None, context_manager=None, physical_validator=None):
-        super().__init__(
+        BaseTool.__init__(
+            self,
             name="report",
             description="Generate comprehensive project setup report and mark task as complete. "
             "Creates both console output and a Markdown file in /workspace. "
             "Use this tool when all main tasks are finished to summarize the work done.",
         )
+        UIEventEmitter.__init__(self)
         self.docker_orchestrator = docker_orchestrator
         self.execution_history_callback = execution_history_callback
         self.context_manager = context_manager
@@ -165,6 +168,19 @@ class ReportTool(BaseTool):
                     report_filename,
                     actual_accomplishments,
                     report_snapshot,
+                )
+
+                # Emit UI event for report generation
+                self.emit(
+                    EventType.REPORT_GENERATED,
+                    message=f"Report generated: {report_filename}",
+                    report_path=f"/workspace/{report_filename}",
+                    status=verified_status,
+                    build_success=actual_accomplishments.get('build_success', False),
+                    test_success=actual_accomplishments.get('test_success', False),
+                    test_pass_rate=actual_accomplishments.get('physical_validation', {}).get('test_analysis', {}).get('pass_rate', 0),
+                    total_tests=actual_accomplishments.get('physical_validation', {}).get('test_analysis', {}).get('total_tests', 0),
+                    passed_tests=actual_accomplishments.get('physical_validation', {}).get('test_analysis', {}).get('passed_tests', 0)
                 )
 
                 return ToolResult(
