@@ -186,9 +186,94 @@ uv run sag shell sag-fastapi
 uv run sag remove sag-fastapi
 ```
 
+### 4. Debugging & Troubleshooting
+
+When a setup fails or you want to understand what the agent did, SAG provides several debugging tools:
+
+#### Enable Verbose Mode & Recording
+
+```bash
+# Run with verbose output for detailed logs
+uv run sag --verbose project https://github.com/example/repo.git
+
+# Save artifacts locally for post-run inspection
+uv run sag project https://github.com/example/repo.git --record
+
+# Combine both for maximum visibility
+uv run sag --verbose project https://github.com/example/repo.git --record
+```
+
+#### Inspect Container Context Files
+
+The agent stores execution context inside the container under `/workspace/.setup_agent/`:
+
+```bash
+# List all context files
+docker exec sag-<project> ls -la /workspace/.setup_agent/contexts/
+
+# Read the trunk context (main task list and overall status)
+docker exec sag-<project> cat /workspace/.setup_agent/contexts/trunk_*.json | python3 -m json.tool
+
+# Check specific task contexts for detailed execution history
+docker exec sag-<project> cat /workspace/.setup_agent/contexts/task_*.json | python3 -m json.tool
+
+# Search for errors across all context files
+docker exec sag-<project> grep -r "error\|failed\|ERROR" /workspace/.setup_agent/contexts/
+```
+
+#### Review Setup Reports
+
+```bash
+# List generated reports
+docker exec sag-<project> ls -la /workspace/setup-report-*.md
+
+# Read the setup report
+docker exec sag-<project> cat /workspace/setup-report-*.md
+```
+
+#### Check Session Logs (with --record)
+
+When using `--record`, artifacts are saved to local session logs:
+
+```bash
+# Find the session log directory
+ls -la logs/session_*/
+
+# Review the main session log
+cat logs/session_<timestamp>/main.log
+
+# Check for specific error patterns
+grep -r "BUILD FAILURE\|compilation error" logs/session_<timestamp>/
+```
+
+#### Common Debugging Scenarios
+
+| Scenario | What to Check |
+|---|---|
+| Build failed | `grep "BUILD FAILURE" /workspace/.setup_agent/contexts/*.json` |
+| Java version mismatch | `docker exec sag-<project> java -version` and check for `RequireJavaVersion` in logs |
+| Missing dependencies | `docker exec sag-<project> which mvn npm gradle` |
+| Empty tool outputs | Check if stderr is captured in context files |
+| Agent stuck in loop | Review trunk context TODO list for repetitive patterns |
+
+#### Interactive Debugging
+
+```bash
+# Connect to the container shell for manual investigation
+uv run sag shell sag-<project>
+
+# Inside the container, you can:
+# - Run build commands manually
+# - Check environment variables
+# - Inspect project files
+# - Review logs in /workspace/.setup_agent/
+```
+
 ## 🛠️ CLI Command Reference
 
 SAG provides a clean and powerful set of CLI commands.
+
+### Commands
 
 | Command | Description | Example |
 |---|---|---|
@@ -200,9 +285,54 @@ SAG provides a clean and powerful set of CLI commands.
 | `sag version` | Displays SAG's version information. | `sag version` |
 | `sag --help` | Shows the help message. | `sag --help` |
 
-**Global Options:**
-- `--log-level [DEBUG|INFO|...]`: Overrides the log level set in the `.env` file.
-- `--log-file <path>`: Specifies a custom path for the log file.
+### Global Options
+
+| Option | Description |
+|---|---|
+| `--log-level [DEBUG\|INFO\|WARNING\|ERROR]` | Overrides the log level set in the `.env` file. |
+| `--log-file <path>` | Specifies a custom path for the log file. |
+| `--verbose` | Enable verbose debugging output with detailed logs. |
+
+### Command-Specific Options
+
+#### `sag project <url>`
+
+| Option | Description |
+|---|---|
+| `--name <name>` | Override the Docker container name (default: extracted from URL). **Note:** This only affects the Docker container/volume naming (`sag-<name>`), not the project directory name. The cloned repository will always use the directory name from the URL. |
+| `--goal <goal>` | Custom setup goal (default: auto-generated based on project name). |
+| `--record` | Save setup artifacts (contexts, reports) to local session logs for debugging and auditing. |
+
+**Example with custom Docker name:**
+```bash
+# Clone commons-cli but name the Docker container "cli-test"
+sag project https://github.com/apache/commons-cli.git --name cli-test
+
+# Result:
+# - Docker container: sag-cli-test
+# - Project directory: /workspace/commons-cli (always matches git repo name)
+# - To run tasks later: sag run sag-cli-test --task "..."
+```
+
+#### `sag run <name>`
+
+| Option | Description |
+|---|---|
+| `--task <description>` | **(Required)** The task or requirement for the agent to execute. |
+| `--max-iterations <n>` | Maximum number of agent iterations (overrides `SAG_MAX_ITERATIONS` from config). |
+| `--record` | Save setup artifacts (contexts, reports) to local session logs for debugging and auditing. |
+
+#### `sag shell <name>`
+
+| Option | Description |
+|---|---|
+| `--shell <path>` | Shell to use in the container (default: `/bin/bash`). |
+
+#### `sag remove <name>`
+
+| Option | Description |
+|---|---|
+| `--force` | Force removal without confirmation prompt. |
 
 ## ✅ Running Tests Locally
 
