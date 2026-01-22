@@ -3,6 +3,12 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> ICSE-NIER ’26 paper: [Setup AGent (SAG)](https://doi.org/10.1145/3786582.3786818) — Wei et al.
+
+> [!IMPORTANT]
+> The paper will be available soon this April.
+
+
 **SAG (Setup-Agent)** is an advanced AI agent designed to fully automate the initial setup, configuration, and ongoing tasks for any software project. It operates within an isolated Docker environment, intelligently interacting with project files, shell commands, and web resources to transform hours—or even days—of manual setup into a process that takes just a few minutes.
 
 ## 🔦 Highlights
@@ -390,3 +396,21 @@ We warmly welcome contributions of all kinds! Whether it's a bug report, a featu
 ## 📝 License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+## Cite this work
+
+BibTeX:
+
+```bibtex
+@inproceedings{Wei2026SAG,
+  author    = {Wei, Chenhao and Zhao, Gengwu and Ye, Billy and Xiao, Lu and Li, Xinyi},
+  title     = {Setup AGent (SAG): A Dual-Model LLM Agent for Autonomous End-to-End Java Project Configuration},
+  booktitle = {Proceedings of the 48th International Conference on Software Engineering: New Ideas and Emerging Results (ICSE-NIER '26)},
+  year      = {2026},
+  address   = {Rio de Janeiro, Brazil},
+  publisher = {ACM},
+  isbn      = {979-8-4007-2425-1},
+  month     = apr,
+  doi       = {10.1145/3786582.3786818}
+}
+```
