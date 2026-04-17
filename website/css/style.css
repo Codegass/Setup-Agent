@@ -1015,6 +1015,42 @@ header.g {
 
 /* Phone: vertical single-column stack with explicit connector strips */
 @media (max-width: 700px) {
+  /* Tabs: 2×2 grid so all 4 labels are always fully visible */
+  .arch-tabs {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    border-bottom: none;
+    border-top: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    gap: 0;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .arch-tab {
+    min-width: 0;
+    padding: 12px 8px;
+    font-size: 0.625rem;
+    letter-spacing: 0.06em;
+    border-left: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    bottom: 0;
+    text-align: center;
+    white-space: normal;
+    line-height: 1.3;
+    word-break: break-word;
+  }
+  .arch-tab.active {
+    border-bottom-width: 2px;
+  }
+  /* Reduce outer horizontal padding on phone so content uses more width */
+  .arch-content {
+    padding: 16px 12px 24px;
+  }
+  .arch-title {
+    font-size: 1.5rem;
+    margin-bottom: 16px;
+  }
+
   .arch-grid {
     grid-template-columns: 1fr;
     grid-template-rows: auto;
