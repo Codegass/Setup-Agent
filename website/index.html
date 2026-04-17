@@ -220,15 +220,27 @@
             </div>
           </div>
 
-          <!-- Col 3 spanning 2 rows: horizontal bridge -->
+          <!-- Col 3 spanning 2 rows: bridges ReAct↔Docker and Validation↔Docker -->
           <div class="ag ag-bridge">
-            <div class="ag-bridge-row">
-              <span class="arr">→</span>
-              <span class="lbl">use tool</span>
+            <div class="bridge-slot bridge-slot-react">
+              <div class="ag-bridge-row">
+                <span class="arr">→</span>
+                <span class="lbl">use tool</span>
+              </div>
+              <div class="ag-bridge-row">
+                <span class="arr">←</span>
+                <span class="lbl">tool output</span>
+              </div>
             </div>
-            <div class="ag-bridge-row">
-              <span class="arr">←</span>
-              <span class="lbl">tool output</span>
+            <div class="bridge-slot bridge-slot-valid">
+              <div class="ag-bridge-row bridge-row-mem">
+                <span class="arr">→</span>
+                <span class="lbl">checks memory</span>
+              </div>
+              <div class="ag-bridge-row bridge-row-files">
+                <span class="arr">→</span>
+                <span class="lbl">checks files</span>
+              </div>
             </div>
           </div>
 
@@ -267,28 +279,26 @@
           <div class="ag ag-valid">
             <div class="ag-feedback-top">
               <span class="arr">↑</span>
-              <span class="lbl">feedback → Observation</span>
+              <span class="lbl">feedback → Observation (ReAct Loop)</span>
             </div>
             <div class="ag-section-header c-amber">Validation System</div>
             <div class="v-grid">
-              <div class="dia-box c-green">
+              <div class="dia-box c-blue v-box">
+                <h5>Agent State Evaluator</h5>
+                <ul>
+                  <li>Rule based</li>
+                  <li>Detects stuck loops</li>
+                </ul>
+                <div class="v-target"><span class="arr">→</span> Agent Memory</div>
+              </div>
+              <div class="dia-box c-green v-box">
                 <h5>File Validator</h5>
                 <ul>
                   <li>Rule based</li>
-                  <li>Reads Java files directly</li>
+                  <li>Ground truth over claims</li>
                 </ul>
+                <div class="v-target"><span class="arr">→</span> Java Project Files</div>
               </div>
-              <div class="dia-box c-blue">
-                <h5>State Evaluator</h5>
-                <ul>
-                  <li>Rule based</li>
-                  <li>Reads Agent Memory</li>
-                </ul>
-              </div>
-            </div>
-            <div class="v-links">
-              <span class="vlink"><span class="arr">→</span> checks memory</span>
-              <span class="vlink"><span class="arr">→</span> checks files</span>
             </div>
           </div>
 

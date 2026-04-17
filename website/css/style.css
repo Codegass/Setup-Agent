@@ -850,14 +850,24 @@ header.g {
   font-weight: 500;
 }
 
-/* Horizontal bridge column between ReAct and Docker */
+/* Bridge column: two slots, aligned to ReAct row and Validation row respectively */
 .ag-bridge {
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: 1 / span 2;
+  padding: 0 4px;
+}
+
+.bridge-slot {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 24px;
-  padding: 0 4px;
+  align-items: center;
+  gap: 20px;
 }
+
+.bridge-slot-valid .ag-bridge-row .arr,
+.bridge-slot-valid .ag-bridge-row .lbl { color: #d97706; }
 
 .ag-bridge-row {
   display: flex;
@@ -880,6 +890,25 @@ header.g {
   color: var(--fg-faint);
   white-space: nowrap;
 }
+
+/* Validator target label */
+.v-box { display: flex; flex-direction: column; }
+
+.v-target {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #d97706;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.v-target .arr { font-size: 12px; line-height: 1; }
 
 /* Docker internals */
 .ag-fs {
@@ -935,31 +964,14 @@ header.g {
   gap: 8px;
 }
 
-.v-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 14px;
-  padding-top: 6px;
-  border-top: 1px dashed var(--border);
-}
-
-.vlink {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-family: var(--mono);
-  font-size: 0.5rem;
-  letter-spacing: 0.04em;
-  color: var(--fg-dim);
-}
-
-.vlink .arr { color: var(--fg-faint); font-size: 12px; line-height: 1; }
-
 /* Input/Report columns: compact, centered */
 .ag-input,
 .ag-report {
   align-self: stretch;
 }
+
+/* ── Mobile-only connector strips (hidden on desktop) ── */
+.mobile-flow { display: none; }
 
 /* Responsive: reflow on narrow viewports */
 @media (max-width: 1000px) {
@@ -970,31 +982,86 @@ header.g {
       "input  react   docker"
       "report react   docker"
       "valid  valid   docker";
+    grid-auto-flow: dense;
   }
   .ag-bridge { display: none; }
+  .ag-valid { border-top: 2px solid #d97706; }
 }
 
+/* Phone: vertical single-column stack with explicit connector strips */
 @media (max-width: 700px) {
   .arch-grid {
     grid-template-columns: 1fr;
+    grid-template-rows: auto;
     grid-template-areas:
       "input"
       "react"
-      "valid"
       "docker"
+      "valid"
       "report";
+    gap: 0;
   }
+
+  /* Each section gets a mobile-only flow strip on top via ::before */
+  .arch-grid .ag { position: relative; }
+
+  .ag-react::before,
+  .ag-docker::before,
+  .ag-valid::before,
+  .ag-report::before {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 12px;
+    margin: 0 -12px 10px -12px;
+    font-family: var(--mono);
+    font-size: 0.5rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-faint);
+    background: var(--bg-subtle);
+    border-bottom: 1px dashed var(--border);
+  }
+
+  .ag-react::before  { content: "↓  from User Input"; }
+  .ag-docker::before { content: "↓ use tool  /  ↑ tool output"; color: var(--fg-dim); }
+  .ag-valid::before  { content: "↑ checks memory & files  (Docker)"; color: #d97706; }
+  .ag-report::before { content: "↓ when all tasks finished  (ReAct → Report)"; color: #16a34a; }
+
+  /* Validation's highlighted feedback strip stays on top */
+  .ag-valid .ag-feedback-top {
+    margin-top: 0;
+  }
+
+  /* ReAct quad: 2×2 compact grid with inline arrows inside boxes */
   .react-quad {
-    grid-template-columns: 1fr;
-    grid-template-rows: repeat(6, auto);
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: auto auto;
+    gap: 6px;
   }
   .r-thinking    { grid-column: 1; grid-row: 1; }
-  .r-plan        { grid-column: 1; grid-row: 2; }
-  .r-action      { grid-column: 1; grid-row: 3; }
-  .r-observation { grid-column: 1; grid-row: 4; }
-  .r-obs         { grid-column: 1; grid-row: 5; }
-  .r-decision    { grid-column: 1; grid-row: 6; }
+  .r-action      { grid-column: 2; grid-row: 1; }
+  .r-decision    { grid-column: 1; grid-row: 2; }
+  .r-observation { grid-column: 2; grid-row: 2; }
+  .r-plan, .r-obs { display: none; }
+
+  /* Two-column docker stays readable on phone */
+  .ag-fs-inner { flex-direction: column; }
+
+  /* Validation grid stays 2 cols (validator + evaluator); stack below 440px */
+  .v-grid { grid-template-columns: 1fr 1fr; }
+}
+
+@media (max-width: 440px) {
   .v-grid { grid-template-columns: 1fr; }
+  .react-quad {
+    grid-template-columns: 1fr;
+  }
+  .r-thinking    { grid-column: 1; grid-row: 1; }
+  .r-action      { grid-column: 1; grid-row: 2; }
+  .r-observation { grid-column: 1; grid-row: 3; }
+  .r-decision    { grid-column: 1; grid-row: 4; }
 }
 
 /* ============================================================
