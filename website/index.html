@@ -161,91 +161,157 @@
 
     <!-- Overview -->
     <div id="p-overview" class="arch-panel active">
-      <div class="diagram">
-        <div class="dia-row">
-          <div class="dia-box c-dark" style="flex:0 0 auto; align-self:center;">
-            <h5>User Input</h5>
-            <ul><li>repo URL + goal</li></ul>
+      <div class="diagram arch-overview">
+
+        <!-- Top row: Input → ReAct Loop ⇄ Docker Container -->
+        <div class="arch-primary">
+
+          <!-- User Input + Setup Report -->
+          <div class="arch-io">
+            <div class="dia-box c-dark">
+              <h5>User Input</h5>
+              <ul>
+                <li>Repository URL</li>
+                <li>Goal description</li>
+              </ul>
+            </div>
+            <div class="arch-io-flow">
+              <span class="arr">↓</span>
+              <span class="lbl">when all tasks finished</span>
+            </div>
+            <div class="dia-box c-green">
+              <h5>Setup Report</h5>
+              <ul>
+                <li>Build &amp; test outcome</li>
+                <li>Per-task summary</li>
+              </ul>
+            </div>
           </div>
-          <div class="dia-arrow"><span class="arr">→</span></div>
-          <div class="dia-section" style="flex:2;">
-            <div class="dia-section-header c-amber">ReAct Loop</div>
-            <div class="dia-row">
+
+          <!-- ReAct Loop (SAG Agent) -->
+          <div class="dia-section arch-react">
+            <div class="dia-section-header c-amber">SAG Agent &middot; ReAct Loop</div>
+
+            <!-- Forward: Thinking → Action -->
+            <div class="react-stage">
               <div class="dia-box c-amber">
                 <h5>Thinking Model</h5>
                 <ul>
-                  <li>Analyze observations</li>
+                  <li>Reasoning</li>
                   <li>Plan next action</li>
-                  <li>Recover from errors</li>
                 </ul>
-                <div class="meta">o4-mini / GPT-5 &middot; 16,584 tokens avg</div>
+                <div class="meta">o4-mini / GPT-5</div>
               </div>
-              <div class="dia-bidi">
-                <div class="dia-bidi-item">plan →</div>
-                <div class="dia-bidi-item">← obs</div>
-              </div>
+              <div class="dia-flow"><span class="lbl">action plan →</span></div>
               <div class="dia-box c-blue">
                 <h5>Action Model</h5>
                 <ul>
                   <li>Function calling</li>
                   <li>Tool invocation</li>
-                  <li>Capture results</li>
                 </ul>
-                <div class="meta">GPT-4.1-mini / o4-m &middot; 1,372 tokens avg</div>
+                <div class="meta">GPT-4.1-mini / o4-m</div>
+              </div>
+            </div>
+
+            <!-- Return: Observation ← Decision -->
+            <div class="react-stage react-stage-back">
+              <div class="dia-box c-dark decision">
+                <h5>All tasks finished?</h5>
+                <ul>
+                  <li><span class="tag-yes">Yes</span> → emit Setup Report</li>
+                  <li><span class="tag-no">No</span> → back to Thinking</li>
+                </ul>
+              </div>
+              <div class="dia-flow"><span class="lbl">← observation</span></div>
+              <div class="dia-box c-green obs-box">
+                <h5>Observation</h5>
+                <ul>
+                  <li>Tool Execution Results</li>
+                  <li>Project Running Status</li>
+                  <li class="obs-feedback">+ Validation feedback ↓</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <!-- Horizontal bridge -->
+          <div class="arch-bridge">
+            <div class="arch-bridge-row"><span class="arr">→</span><span class="lbl">use tool</span></div>
+            <div class="arch-bridge-row"><span class="arr">←</span><span class="lbl">tool output</span></div>
+          </div>
+
+          <!-- Docker Container -->
+          <div class="dia-section arch-docker">
+            <div class="dia-section-header c-red">Docker Container</div>
+
+            <div class="dia-box c-blue">
+              <h5>Tool Sets</h5>
+              <ul>
+                <li>Bash · Maven · Gradle</li>
+                <li>Sys Package · Analyzer</li>
+              </ul>
+            </div>
+
+            <div class="arch-fs">
+              <div class="arch-fs-label">File System</div>
+              <div class="arch-fs-inner">
+                <div class="dia-box c-green">
+                  <h5>Agent Memory</h5>
+                  <ul>
+                    <li>Trunk: general, tasks</li>
+                    <li>Branch: detail context</li>
+                  </ul>
+                </div>
+                <div class="dia-box c-dark">
+                  <h5>Java Project Files</h5>
+                  <ul>
+                    <li>src/ · pom.xml · build.xml</li>
+                    <li>target/ · surefire reports</li>
+                  </ul>
+                </div>
               </div>
             </div>
           </div>
         </div>
-        <div class="dia-row" style="margin-top:16px;">
-          <div class="dia-section" style="flex:1;">
-            <div class="dia-section-header c-red">Docker Container</div>
-            <div class="dia-row">
-              <div class="dia-box c-green" style="flex:1;">
-                <h5>Agent Memory</h5>
-                <ul>
-                  <li>Trunk: global state, tasks</li>
-                  <li>Branch: subtask detail</li>
-                </ul>
-              </div>
-              <div class="dia-box c-blue" style="flex:1;">
-                <h5>Tool Sets</h5>
-                <ul>
-                  <li>Bash, Maven, Gradle</li>
-                  <li>Sys Package, Analyzer</li>
-                  <li>↕ fallback hierarchy</li>
-                </ul>
-              </div>
-              <div class="dia-box c-dark" style="flex:1;">
-                <h5>Project</h5>
-                <ul>
-                  <li>/workspace/src/</li>
-                  <li>.class files, JARs</li>
-                  <li>surefire XML reports</li>
-                </ul>
-              </div>
+
+        <!-- Feedback connector: arrow rises from Validation → Observation -->
+        <div class="arch-feedback-connector">
+          <span class="arr">↑</span>
+          <span class="lbl">feedback closes the loop → written back into <em>Observation</em></span>
+        </div>
+
+        <!-- Validation System -->
+        <div class="dia-section arch-validation">
+          <div class="dia-section-header c-amber">Validation System &middot; Rule-Based, Out-of-Band</div>
+
+          <div class="validation-grid">
+            <div class="dia-box c-green">
+              <h5>File Validator</h5>
+              <ul>
+                <li>Reads Java project files directly</li>
+                <li>.class files, surefire XML, JARs</li>
+                <li>Ground truth over model claims</li>
+              </ul>
+            </div>
+            <div class="dia-box c-blue">
+              <h5>Agent State Evaluator</h5>
+              <ul>
+                <li>Reads Agent Memory directly</li>
+                <li>Detects stuck / repeating loops</li>
+                <li>Produces corrective signals</li>
+              </ul>
             </div>
           </div>
-          <div class="dia-arrow">
-            <span class="lbl">artifacts</span>
-            <span class="arr">→</span>
-          </div>
-          <div class="dia-section" style="flex:0 0 240px;">
-            <div class="dia-section-header c-green">Validation System</div>
-            <div class="dia-col">
-              <div class="dia-box c-green">
-                <h5>File Validator</h5>
-                <ul><li>Check .class &amp; XML</li><li>Verify build artifacts</li></ul>
-              </div>
-              <div class="dia-box c-amber">
-                <h5>State Evaluator</h5>
-                <ul><li>Detect stuck loops</li><li>Corrective feedback</li></ul>
-              </div>
-            </div>
+
+          <div class="validation-links">
+            <span class="vlink"><span class="arr">→</span> inspects Java Project Files <em>(Docker)</em></span>
+            <span class="vlink"><span class="arr">→</span> inspects Agent Memory <em>(Docker)</em></span>
+            <span class="vlink vlink-feedback"><span class="arr">↑</span> feeds Observation <em>(ReAct Loop)</em></span>
           </div>
         </div>
       </div>
       <p class="explain">
-        SAG's architecture has three interconnected subsystems: the <strong>ReAct loop</strong> for intelligent control, the <strong>Docker container</strong> for isolated execution with hierarchical memory, and the <strong>Validation System</strong> for objective assessment independent of the agent.
+        SAG has three tightly coupled subsystems. The <strong>ReAct Loop</strong> alternates between reasoning (Thinking) and tool use (Action); on each turn it checks whether all tasks are finished and either emits the Setup Report or continues. The <strong>Docker Container</strong> isolates execution and hosts a shared file system containing both the agent's hierarchical memory and the Java project files. The <strong>Validation System</strong> runs out of band: it reads files and memory directly from the container and <strong>writes an independent observation back into the ReAct loop</strong>, so each iteration is anchored to ground truth rather than the model's own claims.
       </p>
     </div>
 

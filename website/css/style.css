@@ -723,6 +723,247 @@ header.g {
 
 .explain strong { color: var(--fg); font-weight: 500; }
 
+/* ── Architecture Overview diagram ── */
+.arch-overview .arch-primary {
+  display: grid;
+  grid-template-columns: minmax(180px, 200px) minmax(0, 2fr) auto minmax(240px, 280px);
+  gap: 12px;
+  align-items: stretch;
+}
+
+.arch-io {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.arch-io-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 0;
+}
+
+.arch-io-flow .arr {
+  font-size: 16px;
+  color: var(--fg-faint);
+  line-height: 1;
+}
+
+.arch-io-flow .lbl {
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  text-align: center;
+  line-height: 1.4;
+}
+
+.arch-react,
+.arch-docker {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.react-stage {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+}
+
+.react-stage > .dia-box {
+  flex: 1;
+}
+
+.react-stage-back { flex-direction: row-reverse; }
+
+.dia-flow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 0 4px;
+}
+
+.dia-flow .lbl {
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+
+.dia-box.decision {
+  border-style: dashed;
+}
+
+.tag-yes,
+.tag-no {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 2px;
+  margin-right: 4px;
+}
+
+.tag-yes { color: #16a34a; background: rgba(22, 163, 74, 0.12); }
+.tag-no  { color: #dc2626; background: rgba(220, 38, 38, 0.12); }
+
+.obs-box { border-width: 2px; }
+
+.obs-feedback {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.arch-bridge {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 18px;
+  padding: 0 4px;
+  min-width: 80px;
+}
+
+.arch-bridge-row {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.arch-bridge-row .arr {
+  font-size: 18px;
+  color: var(--fg-faint);
+  line-height: 1;
+}
+
+.arch-bridge-row .lbl {
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+  white-space: nowrap;
+}
+
+.arch-fs {
+  border: 1px dashed var(--border);
+  padding: 10px;
+  background: var(--bg);
+}
+
+.arch-fs-label {
+  font-family: var(--mono);
+  font-size: 0.5625rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  margin-bottom: 8px;
+}
+
+.arch-fs-inner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.arch-feedback-connector {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 16px auto 0;
+  padding: 10px 16px;
+  max-width: 520px;
+  border: 1px solid var(--accent);
+  border-left-width: 3px;
+  background: var(--accent-bg);
+}
+
+.arch-feedback-connector .arr {
+  font-size: 18px;
+  color: var(--accent);
+  line-height: 1;
+  font-weight: 700;
+}
+
+.arch-feedback-connector .lbl {
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+
+.arch-feedback-connector em {
+  font-style: normal;
+  color: var(--fg-dim);
+}
+
+.arch-validation {
+  margin-top: 12px;
+}
+
+.validation-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.validation-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px dashed var(--border);
+}
+
+.vlink {
+  font-family: var(--mono);
+  font-size: 0.625rem;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.vlink .arr { color: var(--fg-faint); }
+.vlink em { font-style: normal; color: var(--fg-faint); }
+
+.vlink-feedback { color: var(--accent); font-weight: 500; }
+.vlink-feedback .arr,
+.vlink-feedback em { color: var(--accent); }
+
+/* Responsive: stack primary grid on narrow viewports */
+@media (max-width: 900px) {
+  .arch-overview .arch-primary {
+    grid-template-columns: 1fr;
+  }
+  .arch-bridge {
+    flex-direction: row;
+    justify-content: center;
+    gap: 24px;
+  }
+  .react-stage,
+  .react-stage-back {
+    flex-direction: column;
+  }
+  .validation-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ============================================================
    TEAM
    ============================================================ */
