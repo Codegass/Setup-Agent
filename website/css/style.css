@@ -723,81 +723,110 @@ header.g {
 
 .explain strong { color: var(--fg); font-weight: 500; }
 
-/* ── Architecture Overview diagram ── */
-.arch-overview .arch-primary {
+/* ── Architecture Overview · single-screen 2x2 grid ── */
+.arch-overview .diagram,
+.diagram.arch-overview {
+  padding: 16px;
+}
+
+.arch-grid {
   display: grid;
-  grid-template-columns: minmax(180px, 200px) minmax(0, 2fr) auto minmax(240px, 280px);
-  gap: 12px;
+  grid-template-columns: 150px minmax(0, 1fr) 72px 280px;
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    "input  react   bridge  docker"
+    "report valid   bridge  docker";
+  gap: 10px;
   align-items: stretch;
 }
 
-.arch-io {
+.ag-input  { grid-area: input;  }
+.ag-report { grid-area: report; }
+.ag-react  { grid-area: react;  }
+.ag-valid  { grid-area: valid;  }
+.ag-bridge { grid-area: bridge; }
+.ag-docker { grid-area: docker; }
+
+/* Compact panel skeleton */
+.ag-react,
+.ag-valid,
+.ag-docker {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  padding: 10px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  justify-content: space-between;
+  gap: 8px;
 }
 
-.arch-io-flow {
+/* Dashed outer box for SAG Agent + Validation grouping vibe */
+.ag-react  { border-top: 2px solid #d97706; }
+.ag-valid  { border-top: 2px solid #d97706; }
+.ag-docker { border-top: 2px solid #dc2626; }
+
+.ag-section-header {
+  font-family: var(--mono);
+  font-size: 0.5625rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-light);
+}
+
+.ag-section-header.c-amber { color: #d97706; }
+.ag-section-header.c-red   { color: #dc2626; }
+
+/* Compact dia-box inside arch grid — smaller padding, smaller list gaps */
+.arch-grid .dia-box {
+  padding: 8px 10px;
+}
+.arch-grid .dia-box h5 {
+  font-size: 0.5rem;
+  margin-bottom: 4px;
+}
+.arch-grid .dia-box ul {
+  font-size: 0.625rem;
+  line-height: 1.55;
+}
+
+/* ReAct internal quad: 2 rows × (box arrow box) */
+.react-quad {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 48px minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  gap: 8px 0;
+  align-items: stretch;
+}
+
+.r-thinking    { grid-column: 1; grid-row: 1; }
+.r-plan        { grid-column: 2; grid-row: 1; }
+.r-action      { grid-column: 3; grid-row: 1; }
+.r-decision    { grid-column: 1; grid-row: 2; }
+.r-obs         { grid-column: 2; grid-row: 2; }
+.r-observation { grid-column: 3; grid-row: 2; }
+
+.r-arr {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 6px 0;
+  justify-content: center;
+  gap: 2px;
 }
-
-.arch-io-flow .arr {
+.r-arr .arr {
   font-size: 16px;
   color: var(--fg-faint);
   line-height: 1;
 }
-
-.arch-io-flow .lbl {
+.r-arr .lbl {
   font-family: var(--mono);
-  font-size: 0.5rem;
+  font-size: 0.4375rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--fg-faint);
-  text-align: center;
-  line-height: 1.4;
 }
 
-.arch-react,
-.arch-docker {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.react-stage {
-  display: flex;
-  align-items: stretch;
-  gap: 10px;
-}
-
-.react-stage > .dia-box {
-  flex: 1;
-}
-
-.react-stage-back { flex-direction: row-reverse; }
-
-.dia-flow {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 auto;
-  padding: 0 4px;
-}
-
-.dia-flow .lbl {
-  font-family: var(--mono);
-  font-size: 0.5rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--fg-faint);
-  white-space: nowrap;
-}
-
+/* Decision box visual */
 .dia-box.decision {
   border-style: dashed;
 }
@@ -806,47 +835,44 @@ header.g {
 .tag-no {
   display: inline-block;
   font-family: var(--mono);
-  font-size: 0.5rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 1px 6px;
+  font-size: 0.4375rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 0 4px;
+  margin-right: 2px;
   border-radius: 2px;
-  margin-right: 4px;
 }
-
-.tag-yes { color: #16a34a; background: rgba(22, 163, 74, 0.12); }
-.tag-no  { color: #dc2626; background: rgba(220, 38, 38, 0.12); }
-
-.obs-box { border-width: 2px; }
+.tag-yes { color: #16a34a; background: rgba(22, 163, 74, 0.14); }
+.tag-no  { color: #dc2626; background: rgba(220, 38, 38, 0.14); }
 
 .obs-feedback {
   color: var(--accent);
   font-weight: 500;
 }
 
-.arch-bridge {
+/* Horizontal bridge column between ReAct and Docker */
+.ag-bridge {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  gap: 18px;
+  gap: 24px;
   padding: 0 4px;
-  min-width: 80px;
 }
 
-.arch-bridge-row {
+.ag-bridge-row {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 2px;
 }
 
-.arch-bridge-row .arr {
-  font-size: 18px;
+.ag-bridge-row .arr {
+  font-size: 20px;
   color: var(--fg-faint);
   line-height: 1;
 }
 
-.arch-bridge-row .lbl {
+.ag-bridge-row .lbl {
   font-family: var(--mono);
   font-size: 0.5rem;
   letter-spacing: 0.08em;
@@ -855,113 +881,120 @@ header.g {
   white-space: nowrap;
 }
 
-.arch-fs {
+/* Docker internals */
+.ag-fs {
   border: 1px dashed var(--border);
-  padding: 10px;
-  background: var(--bg);
+  padding: 8px;
 }
 
-.arch-fs-label {
+.ag-fs-label {
   font-family: var(--mono);
-  font-size: 0.5625rem;
+  font-size: 0.5rem;
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--fg-dim);
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 
-.arch-fs-inner {
+.ag-fs-inner {
   display: flex;
   flex-direction: column;
+  gap: 6px;
+}
+
+/* Validation: feedback arrow on top, boxes in middle, links at bottom */
+.ag-feedback-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px -12px 4px -12px;
+  padding: 6px 12px;
+  background: var(--accent-bg);
+  border-bottom: 1px solid var(--accent);
+}
+
+.ag-feedback-top .arr {
+  color: var(--accent);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.ag-feedback-top .lbl {
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.v-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: 8px;
 }
 
-.arch-feedback-connector {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  margin: 16px auto 0;
-  padding: 10px 16px;
-  max-width: 520px;
-  border: 1px solid var(--accent);
-  border-left-width: 3px;
-  background: var(--accent-bg);
-}
-
-.arch-feedback-connector .arr {
-  font-size: 18px;
-  color: var(--accent);
-  line-height: 1;
-  font-weight: 700;
-}
-
-.arch-feedback-connector .lbl {
-  font-family: var(--mono);
-  font-size: 0.625rem;
-  letter-spacing: 0.06em;
-  color: var(--accent);
-}
-
-.arch-feedback-connector em {
-  font-style: normal;
-  color: var(--fg-dim);
-}
-
-.arch-validation {
-  margin-top: 12px;
-}
-
-.validation-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-
-.validation-links {
+.v-links {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px 18px;
-  margin-top: 12px;
-  padding-top: 12px;
+  gap: 4px 14px;
+  padding-top: 6px;
   border-top: 1px dashed var(--border);
 }
 
 .vlink {
-  font-family: var(--mono);
-  font-size: 0.625rem;
-  letter-spacing: 0.04em;
-  color: var(--fg-dim);
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
+  font-family: var(--mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
 }
 
-.vlink .arr { color: var(--fg-faint); }
-.vlink em { font-style: normal; color: var(--fg-faint); }
+.vlink .arr { color: var(--fg-faint); font-size: 12px; line-height: 1; }
 
-.vlink-feedback { color: var(--accent); font-weight: 500; }
-.vlink-feedback .arr,
-.vlink-feedback em { color: var(--accent); }
+/* Input/Report columns: compact, centered */
+.ag-input,
+.ag-report {
+  align-self: stretch;
+}
 
-/* Responsive: stack primary grid on narrow viewports */
-@media (max-width: 900px) {
-  .arch-overview .arch-primary {
+/* Responsive: reflow on narrow viewports */
+@media (max-width: 1000px) {
+  .arch-grid {
+    grid-template-columns: 140px minmax(0, 1fr) 260px;
+    grid-template-rows: auto auto auto;
+    grid-template-areas:
+      "input  react   docker"
+      "report react   docker"
+      "valid  valid   docker";
+  }
+  .ag-bridge { display: none; }
+}
+
+@media (max-width: 700px) {
+  .arch-grid {
     grid-template-columns: 1fr;
+    grid-template-areas:
+      "input"
+      "react"
+      "valid"
+      "docker"
+      "report";
   }
-  .arch-bridge {
-    flex-direction: row;
-    justify-content: center;
-    gap: 24px;
-  }
-  .react-stage,
-  .react-stage-back {
-    flex-direction: column;
-  }
-  .validation-grid {
+  .react-quad {
     grid-template-columns: 1fr;
+    grid-template-rows: repeat(6, auto);
   }
+  .r-thinking    { grid-column: 1; grid-row: 1; }
+  .r-plan        { grid-column: 1; grid-row: 2; }
+  .r-action      { grid-column: 1; grid-row: 3; }
+  .r-observation { grid-column: 1; grid-row: 4; }
+  .r-obs         { grid-column: 1; grid-row: 5; }
+  .r-decision    { grid-column: 1; grid-row: 6; }
+  .v-grid { grid-template-columns: 1fr; }
 }
 
 /* ============================================================

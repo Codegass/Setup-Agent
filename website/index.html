@@ -162,156 +162,140 @@
     <!-- Overview -->
     <div id="p-overview" class="arch-panel active">
       <div class="diagram arch-overview">
+        <div class="arch-grid">
 
-        <!-- Top row: Input → ReAct Loop ⇄ Docker Container -->
-        <div class="arch-primary">
-
-          <!-- User Input + Setup Report -->
-          <div class="arch-io">
-            <div class="dia-box c-dark">
-              <h5>User Input</h5>
-              <ul>
-                <li>Repository URL</li>
-                <li>Goal description</li>
-              </ul>
-            </div>
-            <div class="arch-io-flow">
-              <span class="arr">↓</span>
-              <span class="lbl">when all tasks finished</span>
-            </div>
-            <div class="dia-box c-green">
-              <h5>Setup Report</h5>
-              <ul>
-                <li>Build &amp; test outcome</li>
-                <li>Per-task summary</li>
-              </ul>
-            </div>
+          <!-- Col 1: User Input (top) + Setup Report (bottom) -->
+          <div class="ag ag-input dia-box c-dark">
+            <h5>User Input</h5>
+            <ul>
+              <li>Repository URL</li>
+              <li>Goal description</li>
+            </ul>
           </div>
 
-          <!-- ReAct Loop (SAG Agent) -->
-          <div class="dia-section arch-react">
-            <div class="dia-section-header c-amber">SAG Agent &middot; ReAct Loop</div>
+          <div class="ag ag-report dia-box c-green">
+            <h5>Setup Report</h5>
+            <ul>
+              <li>Build &amp; test outcome</li>
+              <li>Per-task summary</li>
+            </ul>
+          </div>
 
-            <!-- Forward: Thinking → Action -->
-            <div class="react-stage">
-              <div class="dia-box c-amber">
+          <!-- Col 2 top: SAG Agent · ReAct Loop -->
+          <div class="ag ag-react">
+            <div class="ag-section-header c-amber">SAG Agent &middot; ReAct Loop</div>
+            <div class="react-quad">
+              <div class="dia-box c-amber r-thinking">
                 <h5>Thinking Model</h5>
                 <ul>
                   <li>Reasoning</li>
                   <li>Plan next action</li>
                 </ul>
-                <div class="meta">o4-mini / GPT-5</div>
               </div>
-              <div class="dia-flow"><span class="lbl">action plan →</span></div>
-              <div class="dia-box c-blue">
+              <div class="r-arr r-plan"><span class="arr">→</span><span class="lbl">plan</span></div>
+              <div class="dia-box c-blue r-action">
                 <h5>Action Model</h5>
                 <ul>
                   <li>Function calling</li>
                   <li>Tool invocation</li>
                 </ul>
-                <div class="meta">GPT-4.1-mini / o4-m</div>
               </div>
-            </div>
 
-            <!-- Return: Observation ← Decision -->
-            <div class="react-stage react-stage-back">
-              <div class="dia-box c-dark decision">
-                <h5>All tasks finished?</h5>
+              <div class="dia-box c-dark decision r-decision">
+                <h5>Tasks finished?</h5>
                 <ul>
-                  <li><span class="tag-yes">Yes</span> → emit Setup Report</li>
-                  <li><span class="tag-no">No</span> → back to Thinking</li>
+                  <li><span class="tag-yes">Y</span>→ Report</li>
+                  <li><span class="tag-no">N</span>→ Thinking</li>
                 </ul>
               </div>
-              <div class="dia-flow"><span class="lbl">← observation</span></div>
-              <div class="dia-box c-green obs-box">
+              <div class="r-arr r-obs"><span class="arr">←</span><span class="lbl">obs</span></div>
+              <div class="dia-box c-green r-observation">
                 <h5>Observation</h5>
                 <ul>
-                  <li>Tool Execution Results</li>
-                  <li>Project Running Status</li>
-                  <li class="obs-feedback">+ Validation feedback ↓</li>
+                  <li>Tool Results</li>
+                  <li>Run Status</li>
+                  <li class="obs-feedback">+ Validation ↑</li>
                 </ul>
               </div>
             </div>
           </div>
 
-          <!-- Horizontal bridge -->
-          <div class="arch-bridge">
-            <div class="arch-bridge-row"><span class="arr">→</span><span class="lbl">use tool</span></div>
-            <div class="arch-bridge-row"><span class="arr">←</span><span class="lbl">tool output</span></div>
+          <!-- Col 3 spanning 2 rows: horizontal bridge -->
+          <div class="ag ag-bridge">
+            <div class="ag-bridge-row">
+              <span class="arr">→</span>
+              <span class="lbl">use tool</span>
+            </div>
+            <div class="ag-bridge-row">
+              <span class="arr">←</span>
+              <span class="lbl">tool output</span>
+            </div>
           </div>
 
-          <!-- Docker Container -->
-          <div class="dia-section arch-docker">
-            <div class="dia-section-header c-red">Docker Container</div>
-
-            <div class="dia-box c-blue">
+          <!-- Col 4 spanning 2 rows: Docker Container -->
+          <div class="ag ag-docker">
+            <div class="ag-section-header c-red">Docker Container</div>
+            <div class="dia-box c-blue ag-tools">
               <h5>Tool Sets</h5>
               <ul>
                 <li>Bash · Maven · Gradle</li>
                 <li>Sys Package · Analyzer</li>
               </ul>
             </div>
-
-            <div class="arch-fs">
-              <div class="arch-fs-label">File System</div>
-              <div class="arch-fs-inner">
+            <div class="ag-fs">
+              <div class="ag-fs-label">File System</div>
+              <div class="ag-fs-inner">
                 <div class="dia-box c-green">
                   <h5>Agent Memory</h5>
                   <ul>
-                    <li>Trunk: general, tasks</li>
-                    <li>Branch: detail context</li>
+                    <li>Trunk context</li>
+                    <li>Branch context</li>
                   </ul>
                 </div>
                 <div class="dia-box c-dark">
                   <h5>Java Project Files</h5>
                   <ul>
-                    <li>src/ · pom.xml · build.xml</li>
-                    <li>target/ · surefire reports</li>
+                    <li>src/ · pom.xml</li>
+                    <li>target/ · reports/</li>
                   </ul>
                 </div>
               </div>
             </div>
           </div>
-        </div>
 
-        <!-- Feedback connector: arrow rises from Validation → Observation -->
-        <div class="arch-feedback-connector">
-          <span class="arr">↑</span>
-          <span class="lbl">feedback closes the loop → written back into <em>Observation</em></span>
-        </div>
-
-        <!-- Validation System -->
-        <div class="dia-section arch-validation">
-          <div class="dia-section-header c-amber">Validation System &middot; Rule-Based, Out-of-Band</div>
-
-          <div class="validation-grid">
-            <div class="dia-box c-green">
-              <h5>File Validator</h5>
-              <ul>
-                <li>Reads Java project files directly</li>
-                <li>.class files, surefire XML, JARs</li>
-                <li>Ground truth over model claims</li>
-              </ul>
+          <!-- Col 2 bottom: Validation System -->
+          <div class="ag ag-valid">
+            <div class="ag-feedback-top">
+              <span class="arr">↑</span>
+              <span class="lbl">feedback → Observation</span>
             </div>
-            <div class="dia-box c-blue">
-              <h5>Agent State Evaluator</h5>
-              <ul>
-                <li>Reads Agent Memory directly</li>
-                <li>Detects stuck / repeating loops</li>
-                <li>Produces corrective signals</li>
-              </ul>
+            <div class="ag-section-header c-amber">Validation System</div>
+            <div class="v-grid">
+              <div class="dia-box c-green">
+                <h5>File Validator</h5>
+                <ul>
+                  <li>Rule based</li>
+                  <li>Reads Java files directly</li>
+                </ul>
+              </div>
+              <div class="dia-box c-blue">
+                <h5>State Evaluator</h5>
+                <ul>
+                  <li>Rule based</li>
+                  <li>Reads Agent Memory</li>
+                </ul>
+              </div>
+            </div>
+            <div class="v-links">
+              <span class="vlink"><span class="arr">→</span> checks memory</span>
+              <span class="vlink"><span class="arr">→</span> checks files</span>
             </div>
           </div>
 
-          <div class="validation-links">
-            <span class="vlink"><span class="arr">→</span> inspects Java Project Files <em>(Docker)</em></span>
-            <span class="vlink"><span class="arr">→</span> inspects Agent Memory <em>(Docker)</em></span>
-            <span class="vlink vlink-feedback"><span class="arr">↑</span> feeds Observation <em>(ReAct Loop)</em></span>
-          </div>
         </div>
       </div>
       <p class="explain">
-        SAG has three tightly coupled subsystems. The <strong>ReAct Loop</strong> alternates between reasoning (Thinking) and tool use (Action); on each turn it checks whether all tasks are finished and either emits the Setup Report or continues. The <strong>Docker Container</strong> isolates execution and hosts a shared file system containing both the agent's hierarchical memory and the Java project files. The <strong>Validation System</strong> runs out of band: it reads files and memory directly from the container and <strong>writes an independent observation back into the ReAct loop</strong>, so each iteration is anchored to ground truth rather than the model's own claims.
+        The <strong>ReAct Loop</strong> cycles Thinking → Action → Observation → Decision; on each turn it either emits the Setup Report or goes back to Thinking. The <strong>Docker Container</strong> isolates execution and stores both the Agent Memory and the Java project files in one file system. The <strong>Validation System</strong> runs out of band — it reads memory and files directly from the container and <strong>feeds an independent observation back into the ReAct loop</strong>, anchoring reasoning to ground truth rather than the model's own claims.
       </p>
     </div>
 
