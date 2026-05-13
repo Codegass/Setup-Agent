@@ -887,6 +887,37 @@ class ReActEngine(UIEventEmitter):
 
         return None
 
+    def _render_skills_section(self) -> str:
+        """Return the AVAILABLE SKILLS section to splice into the system prompt.
+
+        Skills are surfaced as a short, scannable list — names + one-line
+        descriptions. The full body is fetched on demand via the `skill` tool,
+        so this stays cheap on every prompt rebuild.
+        """
+        skill_tool = self.tools.get("skill")
+        if skill_tool is None:
+            return ""
+        try:
+            skills = skill_tool._registry.list()
+        except Exception as e:
+            logger.warning(f"Failed to render skills section: {e}")
+            return ""
+        if not skills:
+            return ""
+
+        lines = [
+            "",
+            "AVAILABLE SKILLS (invoke with `skill(name=\"...\")` to load the full guidance):",
+        ]
+        for skill in skills:
+            lines.append(f"- {skill.name} — {skill.description}")
+        lines.append("")
+        lines.append(
+            "Prefer invoking a relevant skill over relying on memory for project-setup workflows."
+        )
+        lines.append("")
+        return "\n".join(lines)
+
     def _build_initial_system_prompt(self) -> str:
         """Build the initial system prompt with context and tool information."""
 
@@ -995,8 +1026,11 @@ EXAMPLE FLOW:
 4. Execute the intelligent plan
 
 Use these tools as needed to complete your tasks.
+"""
 
-## Handling Maven POM Parsing Errors
+        prompt += self._render_skills_section()
+
+        prompt += """## Handling Maven POM Parsing Errors
 
 When encountering Maven POM parsing errors during test execution, follow this decision tree:
 

@@ -117,6 +117,7 @@ class SetupAgent:
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
         from agent.physical_validator import PhysicalValidator
+        from agent.skill_engine import SkillRegistry, default_search_paths
         from tools.bash import BashTool, BashToolConfig
         from tools.context_tool import ContextTool
         from tools.file_io import FileIOTool
@@ -126,6 +127,7 @@ class SetupAgent:
         from tools.project_analyzer import ProjectAnalyzerTool
         from tools.project_setup_tool import ProjectSetupTool
         from tools.report_tool import ReportTool
+        from tools.skill_tool import SkillTool
         from tools.system_tool import SystemTool
         from tools.web_search import WebSearchTool
 
@@ -143,6 +145,11 @@ class SetupAgent:
         self.physical_validator = PhysicalValidator(
             docker_orchestrator=self.orchestrator, project_path=self.config.workspace_path
         )
+
+        # Discover skills (Claude-Code-style guidance modules). See
+        # docs/SKILL_ENGINE_DESIGN.md.
+        self.skill_registry = SkillRegistry(default_search_paths())
+        self.skill_registry.load()
 
         tools = [
             BashTool(self.orchestrator, config=bash_config),
@@ -163,6 +170,7 @@ class SetupAgent:
                 context_manager=self.context_manager,
                 physical_validator=self.physical_validator,
             ),
+            SkillTool(self.skill_registry),
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
