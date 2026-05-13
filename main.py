@@ -1,12 +1,10 @@
 """Main CLI interface for SAG (Setup-Agent)."""
 
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlparse
 
 import click
 from loguru import logger
@@ -17,6 +15,7 @@ from rich.text import Text
 
 from agent.agent import SetupAgent
 from config import Config, LogLevel, get_config, get_session_logger, set_config, suppress_console_logging
+from config.git_utils import extract_project_name_from_url
 from docker_orch.orch import DockerOrchestrator
 
 console = Console()
@@ -123,76 +122,6 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
     except Exception as e:
         logger.warning(f"Failed to read project metadata: {e}")
         return None
-
-
-def extract_project_name_from_url(repo_url: str) -> str:
-    """
-    Extract project name from a Git repository URL.
-
-    Supports various Git hosting services:
-    - GitHub: https://github.com/user/repo.git
-    - GitLab: https://gitlab.com/user/repo.git
-    - Gitee: https://gitee.com/user/repo.git
-    - Bitbucket: https://bitbucket.org/user/repo.git
-    - Azure DevOps: https://dev.azure.com/org/project/_git/repo
-    - SSH URLs: git@github.com:user/repo.git
-    - Local paths: /path/to/repo or file:///path/to/repo
-
-    Args:
-        repo_url: Git repository URL
-
-    Returns:
-        Extracted project name (without .git suffix)
-
-    Examples:
-        >>> extract_project_name_from_url("https://github.com/apache/commons-cli.git")
-        'commons-cli'
-        >>> extract_project_name_from_url("git@github.com:fastapi/fastapi.git")
-        'fastapi'
-        >>> extract_project_name_from_url("https://dev.azure.com/org/project/_git/myrepo")
-        'myrepo'
-    """
-    if not repo_url:
-        raise ValueError("Repository URL cannot be empty")
-
-    # Normalize the URL
-    url = repo_url.strip()
-
-    # Handle SSH URLs: git@host:user/repo.git
-    ssh_match = re.match(r"^git@[^:]+:(.+)$", url)
-    if ssh_match:
-        path = ssh_match.group(1)
-        # Extract repo name from path like "user/repo.git"
-        repo_name = path.split("/")[-1]
-        return repo_name.removesuffix(".git")
-
-    # Handle Azure DevOps URLs: https://dev.azure.com/org/project/_git/repo
-    azure_match = re.match(r".*/_git/([^/]+)/?$", url)
-    if azure_match:
-        return azure_match.group(1).removesuffix(".git")
-
-    # Handle standard HTTPS/HTTP URLs and file:// URLs
-    try:
-        parsed = urlparse(url)
-        path = parsed.path
-
-        # Remove trailing slashes
-        path = path.rstrip("/")
-
-        # Get the last component of the path
-        if path:
-            repo_name = path.split("/")[-1]
-            return repo_name.removesuffix(".git")
-    except Exception:
-        pass
-
-    # Fallback: try simple split on '/' and take the last non-empty part
-    parts = [p for p in url.replace("\\", "/").split("/") if p]
-    if parts:
-        repo_name = parts[-1]
-        return repo_name.removesuffix(".git")
-
-    raise ValueError(f"Could not extract project name from URL: {repo_url}")
 
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:

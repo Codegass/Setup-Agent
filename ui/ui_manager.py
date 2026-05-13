@@ -74,6 +74,9 @@ class UIManager:
         # Final result
         self.is_complete = False
         self.final_status: Optional[str] = None
+        # Guards display_final_summary so callers (including cleanup paths)
+        # can invoke it unconditionally without producing a duplicate panel.
+        self._summary_shown = False
 
         # Report information
         self.report_data: Optional[dict] = None  # Report metadata (path, status, metrics)
@@ -608,8 +611,31 @@ class UIManager:
         if self.live:
             self.live.update(self._render_display())
 
+    def abort_running_phases(self, reason: str = "Phase aborted") -> None:
+        """Mark any still-running phase as errored.
+
+        Callers (e.g. agent cleanup paths) use this when teardown happens before
+        an explicit PHASE_COMPLETE / PHASE_ERROR has been emitted, so the
+        rendered phase tree truthfully reflects that the phase did not finish.
+        """
+        for phase, data in self.phases_data.items():
+            if data.get("status") == "running":
+                self.handle_event(UIEvent(
+                    event_type=EventType.PHASE_ERROR,
+                    message=reason,
+                    phase=phase,
+                    level="error",
+                ))
+
     def display_final_summary(self):
-        """Display final summary with expandable sections"""
+        """Display final summary with expandable sections.
+
+        Idempotent: subsequent calls are no-ops, so cleanup paths can invoke
+        this unconditionally without risking duplicate panels.
+        """
+        if self._summary_shown:
+            return
+        self._summary_shown = True
         self.stop()
 
         # Print final status
