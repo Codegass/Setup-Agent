@@ -3,7 +3,7 @@
  */
 
 // Architecture tab switching
-function showTab(name) {
+function showTab(event, name) {
   document.querySelectorAll('.arch-panel').forEach(function(p) {
     p.classList.remove('active');
   });
@@ -11,14 +11,25 @@ function showTab(name) {
     t.classList.remove('active');
   });
   document.getElementById('p-' + name).classList.add('active');
-  event.target.classList.add('active');
+  if (event && event.currentTarget) {
+    event.currentTarget.classList.add('active');
+  } else {
+    var btn = document.querySelector('.arch-tab[data-tab="' + name + '"]');
+    if (btn) btn.classList.add('active');
+  }
 }
 
 // Copy-to-clipboard for command blocks and bibtex
 document.addEventListener('DOMContentLoaded', function() {
   document.querySelectorAll('.cp').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      var container = btn.closest('.cmd') || btn.closest('.bibtex');
+      // In the install layout the button is a sibling of .cmd under
+      // .install-step, so closest('.cmd') would not find it — fall back to
+      // looking for a .cmd inside the surrounding .install-step wrapper.
+      var step = btn.closest('.install-step');
+      var container = btn.closest('.cmd')
+        || btn.closest('.bibtex')
+        || (step && step.querySelector('.cmd'));
       if (!container) return;
 
       var text;

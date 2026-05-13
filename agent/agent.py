@@ -243,21 +243,25 @@ class SetupAgent:
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
         cmd_logger.info(f"Starting project setup: {project_name} (docker_label={docker_label})")
 
-        # Initialize UI Manager if in UI mode
-        if self.config.ui_mode:
-            self.ui_manager = UIManager(project_name=project_name, console=self.console)
-            self.ui_manager.start()
-        else:
-            self.console.print(
-                Panel.fit(
-                    f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
-                    f"[dim]Repository: {project_url}[/dim]\n"
-                    f"[dim]Goal: {goal}[/dim]",
-                    border_style="blue",
-                )
-            )
+        # Track whether we already displayed the final UI summary so the
+        # cleanup `finally` below doesn't re-display or skip it incorrectly.
+        final_summary_shown = False
 
         try:
+            # Initialize UI Manager if in UI mode
+            if self.config.ui_mode:
+                self.ui_manager = UIManager(project_name=project_name, console=self.console)
+                self.ui_manager.start()
+            else:
+                self.console.print(
+                    Panel.fit(
+                        f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
+                        f"[dim]Repository: {project_url}[/dim]\n"
+                        f"[dim]Goal: {goal}[/dim]",
+                        border_style="blue",
+                    )
+                )
+
             # Step 1: Setup Docker environment
             if self.config.ui_mode:
                 self.ui_manager.handle_event(UIEvent(
@@ -389,30 +393,54 @@ class SetupAgent:
                     ))
                 # Display final summary and stop UI manager
                 self.ui_manager.display_final_summary()
+                final_summary_shown = True
             else:
                 # Provide traditional summary
                 self._provide_setup_summary(success)
 
             cmd_logger.info(f"Project setup completed: success={success}")
-
-            # Cleanup command logger
-            session_logger = get_session_logger()
-            if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-
             return success
 
         except Exception as e:
             cmd_logger.error(f"Setup failed: {e}", exc_info=True)
             # Always show critical errors
             self.console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
+            return False
 
-            # Cleanup command logger
+        finally:
+            # Tear down the live UI on every exit path (early returns, exceptions,
+            # normal completion). If the happy-path branch above didn't get to
+            # `display_final_summary`, do it now so the user sees the failure
+            # state instead of a frozen spinner.
+            if self.config.ui_mode and self.ui_manager and not final_summary_shown:
+                # Any phase still in 'running' was aborted, not completed.
+                for phase, data in self.ui_manager.phases_data.items():
+                    if data.get("status") == "running":
+                        try:
+                            self.ui_manager.handle_event(UIEvent(
+                                event_type=EventType.PHASE_ERROR,
+                                message="Phase aborted",
+                                phase=phase,
+                                level="error",
+                            ))
+                        except Exception:
+                            pass
+                try:
+                    self.ui_manager.display_final_summary()
+                except Exception:
+                    # display_final_summary itself failed; at minimum stop Live.
+                    try:
+                        self.ui_manager.stop()
+                    except Exception:
+                        pass
+
+            # Always release the command-specific loguru handler.
             session_logger = get_session_logger()
             if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-
-            return False
+                try:
+                    session_logger.cleanup_command_logger(cmd_logger_id)
+                except Exception:
+                    pass
 
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
         """Continue working on an existing project."""
@@ -486,20 +514,24 @@ class SetupAgent:
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
         cmd_logger.info(f"Starting task execution: {task_description}")
 
-        # Initialize UI Manager if in UI mode
-        if self.config.ui_mode:
-            self.ui_manager = UIManager(project_name=project_name, console=self.console)
-            self.ui_manager.start()
-        else:
-            self.console.print(
-                Panel.fit(
-                    f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
-                    f"[dim]Task: {task_description}[/dim]",
-                    border_style="cyan",
-                )
-            )
+        # Track whether we already displayed the final UI summary so the
+        # cleanup `finally` below doesn't re-display or skip it incorrectly.
+        final_summary_shown = False
 
         try:
+            # Initialize UI Manager if in UI mode
+            if self.config.ui_mode:
+                self.ui_manager = UIManager(project_name=project_name, console=self.console)
+                self.ui_manager.start()
+            else:
+                self.console.print(
+                    Panel.fit(
+                        f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
+                        f"[dim]Task: {task_description}[/dim]",
+                        border_style="cyan",
+                    )
+                )
+
             # Step 1: Ensure Docker container is running
             if self.config.ui_mode:
                 self.ui_manager.handle_event(UIEvent(
@@ -626,16 +658,11 @@ Please start by checking the current context and then proceed with the task.
             # Step 7: Provide execution summary
             if self.config.ui_mode:
                 self.ui_manager.display_final_summary()
+                final_summary_shown = True
             else:
                 self._provide_task_summary(success, task_description)
 
             cmd_logger.info(f"Task execution completed: success={success}")
-
-            # Cleanup command logger
-            session_logger = get_session_logger()
-            if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-
             return success
 
         except Exception as e:
@@ -643,16 +670,46 @@ Please start by checking the current context and then proceed with the task.
             # Always show critical errors
             self.console.print(f"[bold red]❌ Task execution failed: {e}[/bold red]")
 
-            # Update last comment with error
-            error_comment = f"Task failed: {task_description} - Error: {str(e)[:100]}"
-
-            # Cleanup command logger
-            session_logger = get_session_logger()
-            if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-            self.orchestrator.update_last_comment(error_comment)
+            # Best-effort: record the failure on the container's last-comment marker.
+            try:
+                error_comment = f"Task failed: {task_description} - Error: {str(e)[:100]}"
+                self.orchestrator.update_last_comment(error_comment)
+            except Exception:
+                pass
 
             return False
+
+        finally:
+            # Tear down the live UI on every exit path. Without this, early
+            # `return False` paths above would leave Rich's Live thread
+            # refreshing the terminal indefinitely and swallowing any error
+            # message printed afterwards.
+            if self.config.ui_mode and self.ui_manager and not final_summary_shown:
+                for phase, data in self.ui_manager.phases_data.items():
+                    if data.get("status") == "running":
+                        try:
+                            self.ui_manager.handle_event(UIEvent(
+                                event_type=EventType.PHASE_ERROR,
+                                message="Phase aborted",
+                                phase=phase,
+                                level="error",
+                            ))
+                        except Exception:
+                            pass
+                try:
+                    self.ui_manager.display_final_summary()
+                except Exception:
+                    try:
+                        self.ui_manager.stop()
+                    except Exception:
+                        pass
+
+            session_logger = get_session_logger()
+            if session_logger:
+                try:
+                    session_logger.cleanup_command_logger(cmd_logger_id)
+                except Exception:
+                    pass
 
     def _setup_docker_environment(self, project_name: str) -> bool:
         """Setup the Docker environment for the project."""

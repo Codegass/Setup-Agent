@@ -153,10 +153,10 @@
     <span class="arch-title">How SAG Works.</span>
 
     <div class="arch-tabs">
-      <button class="arch-tab active" onclick="showTab('overview')">Overview</button>
-      <button class="arch-tab" onclick="showTab('dual')">Dual-Model</button>
-      <button class="arch-tab" onclick="showTab('docker')">Docker</button>
-      <button class="arch-tab" onclick="showTab('verify')">Validation</button>
+      <button class="arch-tab active" data-tab="overview" onclick="showTab(event, 'overview')">Overview</button>
+      <button class="arch-tab" data-tab="dual" onclick="showTab(event, 'dual')">Dual-Model</button>
+      <button class="arch-tab" data-tab="docker" onclick="showTab(event, 'docker')">Docker</button>
+      <button class="arch-tab" data-tab="verify" onclick="showTab(event, 'verify')">Validation</button>
     </div>
 
     <!-- Overview -->

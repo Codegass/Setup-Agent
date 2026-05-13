@@ -314,9 +314,7 @@ def cli(ctx, log_level, log_file, verbose, ui):
             logger.info(f"Logs directory: {session_logger.session_log_dir}")
 
     # Display welcome message for main commands (skip in UI mode, will be shown by UIManager)
-    # Note: UI mode is only enabled at subcommand level, so we show it here in non-verbose mode
-    # It will be suppressed when actual UI starts
-    if ctx.invoked_subcommand not in ["list"] and not config.verbose:
+    if ctx.invoked_subcommand not in ["list"] and not config.verbose and not config.ui_mode:
         console.print(
             Panel.fit(
                 "[bold blue]SAG[/bold blue] - [dim]Setup Agent[/dim]\n"
