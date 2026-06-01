@@ -495,9 +495,9 @@ class BaseTool(ABC):
 
     def get_parameter_schema(self) -> Dict[str, Any]:
         """Return this tool's JSON parameter schema for function calling."""
-        override = type(self).__dict__.get("_get_parameters_schema")
-        if override is not None:
-            return override(self)
+        schema_method = self._get_parameters_schema
+        if getattr(schema_method, "__func__", None) is not BaseTool._get_parameters_schema:
+            return schema_method()
         return self._parameter_schema
 
     def get_usage_example(self) -> str:

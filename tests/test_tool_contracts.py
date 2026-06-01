@@ -11,6 +11,10 @@ class ExampleTool(BaseTool):
         return ToolResult(success=True, output=command)
 
 
+class DerivedReportTool(ReportTool):
+    pass
+
+
 def test_base_tool_exposes_public_parameter_schema():
     tool = ExampleTool()
     schema = tool.get_parameter_schema()
@@ -36,6 +40,14 @@ def test_real_tool_custom_schema_is_preserved():
     schema = ReportTool().get_parameter_schema()
 
     assert schema["type"] == "object"
+    assert schema["properties"]["action"]["enum"] == ["generate"]
+    assert "status" in schema["properties"]
+    assert "details" in schema["properties"]
+
+
+def test_inherited_custom_schema_is_preserved():
+    schema = DerivedReportTool().get_parameter_schema()
+
     assert schema["properties"]["action"]["enum"] == ["generate"]
     assert "status" in schema["properties"]
     assert "details" in schema["properties"]
