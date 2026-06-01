@@ -11,9 +11,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from config import Config, create_agent_logger, create_command_logger, get_session_logger
-from docker_orch.orch import DockerOrchestrator
-from ui import UIManager, UIEvent, EventType, PhaseType
+from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
+from sag.docker_orch.orch import DockerOrchestrator
+from sag.ui import UIManager, UIEvent, EventType, PhaseType
 
 from .context_manager import ContextManager
 from .react_engine import ReActEngine
@@ -52,7 +52,7 @@ class SetupAgent:
             return  # Already initialized
 
         # Initialize ErrorLogger with container workspace path
-        from agent.error_logger import ErrorLogger
+        from sag.agent.error_logger import ErrorLogger
 
         error_logger = ErrorLogger.get_instance(
             workspace_path=self.config.workspace_path,
@@ -79,7 +79,7 @@ class SetupAgent:
             self.react_engine.set_ui_manager(self.ui_manager)
 
             # Also set UI manager for all tools that support it
-            from ui.events import UIEventEmitter
+            from sag.ui.events import UIEventEmitter
             for tool in self.tools:
                 if isinstance(tool, UIEventEmitter):
                     tool.set_ui_manager(self.ui_manager)
@@ -89,18 +89,18 @@ class SetupAgent:
 
     def _initialize_tools(self) -> List:
         """Initialize all available tools."""
-        from agent.physical_validator import PhysicalValidator
-        from tools.bash import BashTool, BashToolConfig
-        from tools.context_tool import ContextTool
-        from tools.file_io import FileIOTool
-        from tools.gradle_tool import GradleTool
-        from tools.maven_tool import MavenTool
-        from tools.output_search_tool import OutputSearchTool
-        from tools.project_analyzer import ProjectAnalyzerTool
-        from tools.project_setup_tool import ProjectSetupTool
-        from tools.report_tool import ReportTool
-        from tools.system_tool import SystemTool
-        from tools.web_search import WebSearchTool
+        from sag.agent.physical_validator import PhysicalValidator
+        from sag.tools.bash import BashTool, BashToolConfig
+        from sag.tools.context_tool import ContextTool
+        from sag.tools.file_io import FileIOTool
+        from sag.tools.gradle_tool import GradleTool
+        from sag.tools.maven_tool import MavenTool
+        from sag.tools.output_search_tool import OutputSearchTool
+        from sag.tools.project_analyzer import ProjectAnalyzerTool
+        from sag.tools.project_setup_tool import ProjectSetupTool
+        from sag.tools.report_tool import ReportTool
+        from sag.tools.system_tool import SystemTool
+        from sag.tools.web_search import WebSearchTool
 
         # Configure bash tool with enhanced features
         bash_config = BashToolConfig(
@@ -896,7 +896,7 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 
         # Initialize PhysicalValidator if not already done
         if not hasattr(self, "physical_validator") or self.physical_validator is None:
-            from agent.physical_validator import PhysicalValidator
+            from sag.agent.physical_validator import PhysicalValidator
 
             self.physical_validator = PhysicalValidator(
                 docker_orchestrator=self.orchestrator, project_path="/workspace"
@@ -940,7 +940,7 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 
         # Initialize PhysicalValidator if not already done
         if not hasattr(self, "physical_validator") or self.physical_validator is None:
-            from agent.physical_validator import PhysicalValidator
+            from sag.agent.physical_validator import PhysicalValidator
 
             self.physical_validator = PhysicalValidator(
                 docker_orchestrator=self.orchestrator, project_path="/workspace"

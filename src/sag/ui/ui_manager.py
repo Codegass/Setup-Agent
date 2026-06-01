@@ -14,8 +14,8 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from ui.events import UIEvent, EventType, PhaseType
-from ui.components import (
+from sag.ui.events import UIEvent, EventType, PhaseType
+from sag.ui.components import (
     create_status_panel,
     create_phase_tree,
     create_error_panel,

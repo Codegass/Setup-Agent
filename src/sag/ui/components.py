@@ -13,7 +13,7 @@ from rich.text import Text
 from rich.console import Group
 from rich.padding import Padding
 
-from ui.events import PhaseType
+from sag.ui.events import PhaseType
 
 
 # Status icons

@@ -410,7 +410,7 @@ class BaseTool(ABC):
 
             # Log to centralized error logger
             try:
-                from agent.error_logger import ErrorLogger
+                from sag.agent.error_logger import ErrorLogger
                 error_logger = ErrorLogger.get_instance()
                 error_logger.log_tool_error(
                     tool_name=self.name,
@@ -453,7 +453,7 @@ class BaseTool(ABC):
 
             # Log system error to centralized logger
             try:
-                from agent.error_logger import ErrorLogger
+                from sag.agent.error_logger import ErrorLogger
                 error_logger = ErrorLogger.get_instance()
                 error_logger.log_tool_error(
                     tool_name=self.name,

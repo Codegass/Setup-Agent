@@ -7,8 +7,8 @@ from datetime import datetime
 from loguru import logger
 
 from .base import BaseTool, ToolResult
-from reporting import render_condensed_summary, truncate_list, format_percentage
-from ui.events import UIEventEmitter, EventType
+from sag.reporting import render_condensed_summary, truncate_list, format_percentage
+from sag.ui.events import UIEventEmitter, EventType
 
 
 class ReportTool(BaseTool, UIEventEmitter):
@@ -2893,7 +2893,7 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _get_centralized_error_analysis(self) -> list:
         """Get error analysis from centralized error logger."""
         try:
-            from agent.error_logger import ErrorLogger
+            from sag.agent.error_logger import ErrorLogger
 
             # Get error logger instance - ensure we use the correct workspace path
             workspace_path = "/workspace"  # Default workspace path in container

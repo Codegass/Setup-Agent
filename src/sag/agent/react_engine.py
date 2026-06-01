@@ -11,11 +11,11 @@ import litellm
 from loguru import logger
 from pydantic import BaseModel
 
-from config import create_agent_logger, create_verbose_logger, get_config
-from ui.events import UIEventEmitter, EventType, PhaseType
+from sag.config import create_agent_logger, create_verbose_logger, get_config
+from sag.ui.events import UIEventEmitter, EventType, PhaseType
 
-from tools.base import BaseTool, ToolResult
-from reporting import render_condensed_summary
+from sag.tools.base import BaseTool, ToolResult
+from sag.reporting import render_condensed_summary
 from .context_manager import BranchContext, ContextManager, TrunkContext, BranchContextHistory
 from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
 from .output_storage import OutputStorageManager
@@ -1359,7 +1359,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
                     # Log unknown tool attempt to centralized error logger
                     try:
-                        from agent.error_logger import ErrorLogger
+                        from sag.agent.error_logger import ErrorLogger
 
                         error_logger = ErrorLogger.get_instance()
 
@@ -4717,7 +4717,7 @@ EXECUTE ACTIONS FOR:
         """Export token usage to CSV file when ReAct loop completes."""
         try:
             # Get session logger for CSV path
-            from config.logger import get_session_logger
+            from sag.config.logger import get_session_logger
 
             session_logger = get_session_logger()
 

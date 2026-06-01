@@ -6,7 +6,7 @@ from typing import Dict, Any, List, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolResult
-from testcases.catalog import build_java_test_catalog, TestCaseCatalog
+from sag.testcases.catalog import build_java_test_catalog, TestCaseCatalog
 
 
 class ProjectAnalyzerTool(BaseTool):

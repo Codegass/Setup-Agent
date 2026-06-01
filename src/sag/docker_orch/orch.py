@@ -11,7 +11,7 @@ import docker
 from docker.errors import APIError, DockerException, NotFound
 from loguru import logger
 
-from config import get_config
+from sag.config import get_config
 
 
 class DockerOrchestrator:

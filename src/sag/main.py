@@ -15,9 +15,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from agent.agent import SetupAgent
-from config import Config, LogLevel, get_config, get_session_logger, set_config, suppress_console_logging
-from docker_orch.orch import DockerOrchestrator
+from sag.agent.agent import SetupAgent
+from sag.config import Config, LogLevel, get_config, get_session_logger, set_config, suppress_console_logging
+from sag.docker_orch.orch import DockerOrchestrator
 
 console = Console()
 

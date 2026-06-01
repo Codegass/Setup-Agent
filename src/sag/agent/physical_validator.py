@@ -32,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
 from loguru import logger
 from urllib.parse import quote
-from testcases.catalog import (
+from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
     TestCaseCatalog,
     TestCaseDescriptor,
