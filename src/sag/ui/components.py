@@ -6,15 +6,15 @@ progress indicators, and status displays.
 """
 
 from typing import Optional
-from rich.panel import Panel
-from rich.tree import Tree
-from rich.table import Table
-from rich.text import Text
+
 from rich.console import Group
 from rich.padding import Padding
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich.tree import Tree
 
 from sag.ui.events import PhaseType
-
 
 # Status icons
 ICONS = {
@@ -40,7 +40,7 @@ def create_status_panel(
     current_phase: Optional[PhaseType],
     status: str,
     elapsed_time: str,
-    extra_info: Optional[str] = None
+    extra_info: Optional[str] = None,
 ) -> Panel:
     """
     Create the top status dashboard panel
@@ -58,13 +58,12 @@ def create_status_panel(
     phase_text = current_phase.value.title() if current_phase else "Initializing"
 
     # Build clean single-line status (fixed width, no extra_info)
-    content = f"[bold cyan]SAG[/bold cyan] │ {project_name} │ {phase_text} │ {status} │ {elapsed_time}"
+    content = (
+        f"[bold cyan]SAG[/bold cyan] │ {project_name} │ {phase_text} │ {status} │ {elapsed_time}"
+    )
 
     return Panel(
-        content,
-        border_style="cyan",
-        padding=(0, 1),
-        width=80  # Fixed width for consistent display
+        content, border_style="cyan", padding=(0, 1), width=80  # Fixed width for consistent display
     )
 
 
@@ -158,12 +157,7 @@ def create_error_panel(error_message: str, details: Optional[str] = None) -> Pan
     if details:
         content = f"{content}\n\n[dim]{details}[/dim]"
 
-    return Panel(
-        content,
-        title="Error",
-        border_style="red",
-        padding=(1, 2)
-    )
+    return Panel(content, title="Error", border_style="red", padding=(1, 2))
 
 
 def create_warning_panel(warning_message: str, details: Optional[str] = None) -> Panel:
@@ -182,17 +176,11 @@ def create_warning_panel(warning_message: str, details: Optional[str] = None) ->
     if details:
         content = f"{content}\n\n[dim]{details}[/dim]"
 
-    return Panel(
-        content,
-        title="Warning",
-        border_style="yellow",
-        padding=(1, 2)
-    )
+    return Panel(content, title="Warning", border_style="yellow", padding=(1, 2))
 
 
 def create_success_panel(
-    message: str,
-    summary_items: Optional[list[tuple[str, str]]] = None
+    message: str, summary_items: Optional[list[tuple[str, str]]] = None
 ) -> Panel:
     """
     Create a success panel
@@ -211,12 +199,7 @@ def create_success_panel(
         for label, value in summary_items:
             content += f"  [cyan]{label}:[/cyan] {value}\n"
 
-    return Panel(
-        content,
-        title="Success",
-        border_style="green",
-        padding=(1, 2)
-    )
+    return Panel(content, title="Success", border_style="green", padding=(1, 2))
 
 
 def create_info_panel(message: str, items: Optional[list[str]] = None) -> Panel:
@@ -237,12 +220,7 @@ def create_info_panel(message: str, items: Optional[list[str]] = None) -> Panel:
         for item in items:
             content += f"  • {item}\n"
 
-    return Panel(
-        content,
-        title="Information",
-        border_style="blue",
-        padding=(1, 2)
-    )
+    return Panel(content, title="Information", border_style="blue", padding=(1, 2))
 
 
 def format_duration(seconds: float) -> str:

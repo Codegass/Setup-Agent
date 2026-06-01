@@ -1,9 +1,9 @@
 """Shared reporting utilities."""
 
 from .utils import (
-    render_condensed_summary,
     format_attention_items,
     format_percentage,
+    render_condensed_summary,
     truncate_list,
 )
 

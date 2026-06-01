@@ -26,7 +26,7 @@ class TokenTracker:
         model: str,
         step_type: str,
         tool_name: Optional[str] = None,
-        iteration: Optional[int] = None
+        iteration: Optional[int] = None,
     ) -> None:
         """
         Extract and record token usage from LLM response.
@@ -66,16 +66,16 @@ class TokenTracker:
 
             # Create token record
             record = {
-                'iteration': iter_num,
-                'timestamp': datetime.now().isoformat(),
-                'type': step_type,
-                'tool_name': tool_name,
-                'model': model,
-                'total_tokens': total_tokens,
-                'prompt_tokens': prompt_tokens,
-                'completion_tokens': completion_tokens,
-                'reasoning_tokens': reasoning_tokens,
-                'actual_output_tokens': actual_output_tokens
+                "iteration": iter_num,
+                "timestamp": datetime.now().isoformat(),
+                "type": step_type,
+                "tool_name": tool_name,
+                "model": model,
+                "total_tokens": total_tokens,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "reasoning_tokens": reasoning_tokens,
+                "actual_output_tokens": actual_output_tokens,
             }
 
             self.token_records.append(record)
@@ -104,9 +104,11 @@ class TokenTracker:
 
         # Models that support reasoning tokens
         reasoning_patterns = [
-            "gpt5", "gpt-5",          # GPT-5 variants
-            "o1",                     # O1 models
-            "o4", "o4-mini"          # O4 models
+            "gpt5",
+            "gpt-5",  # GPT-5 variants
+            "o1",  # O1 models
+            "o4",
+            "o4-mini",  # O4 models
         ]
 
         return any(pattern in model_lower for pattern in reasoning_patterns)
@@ -123,16 +125,16 @@ class TokenTracker:
         """
         try:
             # Check for reasoning tokens in completion_tokens_details
-            if (hasattr(response, "usage") and
-                response.usage and
-                hasattr(response.usage, "completion_tokens_details") and
-                response.usage.completion_tokens_details):
+            if (
+                hasattr(response, "usage")
+                and response.usage
+                and hasattr(response.usage, "completion_tokens_details")
+                and response.usage.completion_tokens_details
+            ):
 
                 # Get reasoning tokens attribute
                 reasoning_tokens = getattr(
-                    response.usage.completion_tokens_details,
-                    'reasoning_tokens',
-                    0
+                    response.usage.completion_tokens_details, "reasoning_tokens", 0
                 )
                 return reasoning_tokens if reasoning_tokens is not None else 0
 
@@ -151,7 +153,7 @@ class TokenTracker:
             tool_name: The actual tool name to set
         """
         if self.token_records:
-            self.token_records[-1]['tool_name'] = tool_name
+            self.token_records[-1]["tool_name"] = tool_name
             logger.debug(f"Updated last token record tool name to: {tool_name}")
 
     def export_to_csv(self, filepath: str) -> bool:
@@ -174,20 +176,26 @@ class TokenTracker:
 
             # Define CSV columns
             fieldnames = [
-                'iteration', 'timestamp', 'type', 'tool_name', 'model',
-                'total_tokens', 'prompt_tokens', 'completion_tokens',
-                'reasoning_tokens', 'actual_output_tokens'
+                "iteration",
+                "timestamp",
+                "type",
+                "tool_name",
+                "model",
+                "total_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+                "reasoning_tokens",
+                "actual_output_tokens",
             ]
 
             # Write CSV file
-            with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+            with open(filepath, "w", newline="", encoding="utf-8") as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(self.token_records)
 
             logger.info(
-                f"Token usage exported to CSV: {filepath} "
-                f"({len(self.token_records)} records)"
+                f"Token usage exported to CSV: {filepath} " f"({len(self.token_records)} records)"
             )
             return True
 
@@ -204,47 +212,50 @@ class TokenTracker:
         """
         if not self.token_records:
             return {
-                'total_records': 0,
-                'total_tokens': 0,
-                'total_prompt_tokens': 0,
-                'total_reasoning_tokens': 0,
-                'total_output_tokens': 0
+                "total_records": 0,
+                "total_tokens": 0,
+                "total_prompt_tokens": 0,
+                "total_reasoning_tokens": 0,
+                "total_output_tokens": 0,
             }
 
         # Calculate totals
         total_records = len(self.token_records)
-        total_tokens = sum(record.get('total_tokens', 0) for record in self.token_records)
-        total_prompt_tokens = sum(record.get('prompt_tokens', 0) for record in self.token_records)
-        total_reasoning_tokens = sum(record.get('reasoning_tokens', 0) for record in self.token_records)
-        total_output_tokens = sum(record.get('actual_output_tokens', 0) for record in self.token_records)
+        total_tokens = sum(record.get("total_tokens", 0) for record in self.token_records)
+        total_prompt_tokens = sum(record.get("prompt_tokens", 0) for record in self.token_records)
+        total_reasoning_tokens = sum(
+            record.get("reasoning_tokens", 0) for record in self.token_records
+        )
+        total_output_tokens = sum(
+            record.get("actual_output_tokens", 0) for record in self.token_records
+        )
 
         # Count by type
-        thoughts = sum(1 for record in self.token_records if record.get('type') == 'thought')
-        actions = sum(1 for record in self.token_records if record.get('type') == 'action')
+        thoughts = sum(1 for record in self.token_records if record.get("type") == "thought")
+        actions = sum(1 for record in self.token_records if record.get("type") == "action")
 
         # Count by model
         models = {}
         for record in self.token_records:
-            model = record.get('model', 'unknown')
-            models[model] = models.get(model, 0) + record.get('total_tokens', 0)
+            model = record.get("model", "unknown")
+            models[model] = models.get(model, 0) + record.get("total_tokens", 0)
 
         # Count reasoning model usage
         reasoning_model_records = sum(
-            1 for record in self.token_records
-            if self.is_reasoning_model(record.get('model', ''))
+            1 for record in self.token_records if self.is_reasoning_model(record.get("model", ""))
         )
 
         return {
-            'total_records': total_records,
-            'total_tokens': total_tokens,
-            'total_prompt_tokens': total_prompt_tokens,
-            'total_reasoning_tokens': total_reasoning_tokens,
-            'total_output_tokens': total_output_tokens,
-            'thoughts_count': thoughts,
-            'actions_count': actions,
-            'reasoning_model_records': reasoning_model_records,
-            'tokens_by_model': models,
-            'average_tokens_per_call': total_tokens / total_records if total_records > 0 else 0
+            "total_records": total_records,
+            "total_tokens": total_tokens,
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_reasoning_tokens": total_reasoning_tokens,
+            "total_output_tokens": total_output_tokens,
+            "thoughts_count": thoughts,
+            "actions_count": actions,
+            "reasoning_model_records": reasoning_model_records,
+            "tokens_by_model": models,
+            "average_tokens_per_call": total_tokens / total_records if total_records > 0 else 0,
         }
 
     def log_summary(self):
@@ -261,7 +272,7 @@ class TokenTracker:
         logger.info(f"  Reasoning model calls: {stats['reasoning_model_records']}")
         logger.info(f"  Average tokens per call: {stats['average_tokens_per_call']:.1f}")
 
-        if stats['tokens_by_model']:
+        if stats["tokens_by_model"]:
             logger.info("  Tokens by model:")
-            for model, tokens in stats['tokens_by_model'].items():
+            for model, tokens in stats["tokens_by_model"].items():
                 logger.info(f"    {model}: {tokens:,}")

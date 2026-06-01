@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 RUNTIME_ROOT = Path(__file__).resolve().parents[1] / "src" / "sag"
 
 DISALLOWED_IMPORT_PREFIXES = (

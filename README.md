@@ -10,11 +10,11 @@
 **SAG (Setup-Agent)** is an advanced AI agent designed to fully automate the initial setup, configuration, and ongoing tasks for any software project. It operates within an isolated Docker environment, intelligently interacting with project files, shell commands, and web resources to transform hours—or even days—of manual setup into a process that takes just a few minutes.
 
 ## 🔦 Highlights
-- **Container-native execution** powered by `docker_orch/`, ensuring each project is built inside an isolated Docker workspace with disposable volumes.
-- **Dual-model ReAct loop** in `agent/react_engine.py` with live token telemetry from `agent/token_tracker.py` and agent-state evaluation for resilient planning.
-- **Fact-based validation** through `agent/physical_validator.py`, combining build artifact inspection with the structured test catalog in `testcases/catalog.py` for accurate pass/fail reporting.
-- **Rich automation toolkit** (`tools/`) spanning foundational helpers (`bash`, `file_io`, `context_tool`, `web_search`) and higher-level orchestrators like `project_analyzer`, `report_tool`, `output_search_tool`, and language-specific build runners that translate intent into reproducible actions.
-- **Centralized diagnostics** via `agent/error_logger.py` and `agent/output_storage.py`, making every action, log, and generated report searchable across runs.
+- **Container-native execution** powered by `src/sag/docker_orch/`, ensuring each project is built inside an isolated Docker workspace with disposable volumes.
+- **Dual-model ReAct loop** in `src/sag/agent/react_engine.py` with live token telemetry from `src/sag/agent/token_tracker.py` and agent-state evaluation for resilient planning.
+- **Fact-based validation** through `src/sag/agent/physical_validator.py`, combining build artifact inspection with the structured test catalog in `src/sag/testcases/catalog.py` for accurate pass/fail reporting.
+- **Rich automation toolkit** (`src/sag/tools/`) spanning foundational helpers (`bash`, `file_io`, `context_tool`, `web_search`) and higher-level orchestrators like `project_analyzer`, `report_tool`, `output_search_tool`, and language-specific build runners that translate intent into reproducible actions.
+- **Centralized diagnostics** via `src/sag/agent/error_logger.py` and `src/sag/agent/output_storage.py`, making every action, log, and generated report searchable across runs.
 
 ---
 
@@ -75,42 +75,42 @@ This layered approach allows the agent to delegate complexity. Instead of figuri
 
 SAG is composed of several core components:
 
-1. **CLI (`main.py`)**: Entry point for user commands such as `project`, `run`, and `list`, with optional artifact recording for post-run inspection.
-2. **Configuration Layer (`config/`)**: Loads `.env` settings, provider credentials, and model presets, and wires logging streams used across the agent.
-3. **Setup Agent & Contexts (`agent/agent.py`, `agent/context_manager.py`)**: Orchestrates the workflow, persists trunk/branch contexts inside the container workspace, and initializes the full tool-suite.
-4. **ReAct Engine & State Evaluation (`agent/react_engine.py`, `agent/agent_state_evaluator.py`)**: Dual-model reasoning loop with completion sign detection, retry guards, and live token telemetry.
-5. **Physical Validation & Diagnostics (`agent/physical_validator.py`, `agent/output_storage.py`, `agent/error_logger.py`, `agent/token_tracker.py`)**: Verifies build/test results from artifacts, snapshots execution outputs, and centralizes structured error logs.
-6. **Automation Tool-belt (`tools/`)**: Intent-driven helpers including `project_analyzer`, `project_setup_tool`, `gradle_tool`, `maven_tool`, `system_tool`, and the cross-run `output_search_tool`.
-7. **Reporting & Test Intelligence (`tools/report_tool.py`, `testcases/catalog.py`, `reporting/`)**: Generates markdown setup reports, merges runtime and static test metadata, and tracks annotation-level metrics.
-8. **Docker Orchestrator (`docker_orch/orch.py`)**: Guarantees container lifecycle management, volume persistence, and shell connectivity for every project.
+1. **CLI (`src/sag/main.py`)**: Entry point for user commands such as `project`, `run`, and `list`, with optional artifact recording for post-run inspection.
+2. **Configuration Layer (`src/sag/config/`)**: Loads `.env` settings, provider credentials, and model presets, and wires logging streams used across the agent.
+3. **Setup Agent & Contexts (`src/sag/agent/agent.py`, `src/sag/agent/context_manager.py`)**: Orchestrates the workflow, persists trunk/branch contexts inside the container workspace, and initializes the full tool-suite.
+4. **ReAct Engine & State Evaluation (`src/sag/agent/react_engine.py`, `src/sag/agent/agent_state_evaluator.py`)**: Dual-model reasoning loop with completion sign detection, retry guards, and live token telemetry.
+5. **Physical Validation & Diagnostics (`src/sag/agent/physical_validator.py`, `src/sag/agent/output_storage.py`, `src/sag/agent/error_logger.py`, `src/sag/agent/token_tracker.py`)**: Verifies build/test results from artifacts, snapshots execution outputs, and centralizes structured error logs.
+6. **Automation Tool-belt (`src/sag/tools/`)**: Intent-driven helpers including `project_analyzer`, `project_setup_tool`, `gradle_tool`, `maven_tool`, `system_tool`, and the cross-run `output_search_tool`.
+7. **Reporting & Test Intelligence (`src/sag/tools/report_tool.py`, `src/sag/testcases/catalog.py`, `src/sag/reporting/`)**: Generates markdown setup reports, merges runtime and static test metadata, and tracks annotation-level metrics.
+8. **Docker Orchestrator (`src/sag/docker_orch/orch.py`)**: Guarantees container lifecycle management, volume persistence, and shell connectivity for every project.
 9. **Knowledge Base & Regression Suites (`docs/`, `examples/`, `tests/`, `student_tasks/`)**: Documentation and executable scenarios that codify best practices and guard against regressions.
 
 ## 🧠 Advanced Automation Tooling
-- **Foundation Utilities** (`tools/bash.py`, `tools/file_io.py`, `tools/context_tool.py`, `tools/web_search.py`): Provide container-aware shell execution, safe file interactions, context updates, and web lookups for knowledge gaps.
-- **Project Analyzer** (`tools/project_analyzer.py`): Performs static scanning to classify project types, detect build tools, and enumerate unit, integration, and parameterized tests before execution.
-- **Report Tool** (`tools/report_tool.py`): Produces `setup-report-*.md` summaries that combine physical validator evidence, execution history, and actionable remediation guidance.
-- **Output Search Tool** (`tools/output_search_tool.py`): Indexes prior observations and context files to let the agent recall log snippets or stack traces across iterations.
-- **Build & Dependency Helpers** (`tools/maven_tool.py`, `tools/gradle_tool.py`, `tools/system_tool.py`): Provide domain-specific command wrappers with structured output parsing and retry logic.
-- **Project Setup Tool** (`tools/project_setup_tool.py`): Encapsulates cloning, environment bootstrapping, and language-specific install steps into a single orchestrated action.
+- **Foundation Utilities** (`src/sag/tools/bash.py`, `src/sag/tools/file_io.py`, `src/sag/tools/context_tool.py`, `src/sag/tools/web_search.py`): Provide container-aware shell execution, safe file interactions, context updates, and web lookups for knowledge gaps.
+- **Project Analyzer** (`src/sag/tools/project_analyzer.py`): Performs static scanning to classify project types, detect build tools, and enumerate unit, integration, and parameterized tests before execution.
+- **Report Tool** (`src/sag/tools/report_tool.py`): Produces `setup-report-*.md` summaries that combine physical validator evidence, execution history, and actionable remediation guidance.
+- **Output Search Tool** (`src/sag/tools/output_search_tool.py`): Indexes prior observations and context files to let the agent recall log snippets or stack traces across iterations.
+- **Build & Dependency Helpers** (`src/sag/tools/maven_tool.py`, `src/sag/tools/gradle_tool.py`, `src/sag/tools/system_tool.py`): Provide domain-specific command wrappers with structured output parsing and retry logic.
+- **Project Setup Tool** (`src/sag/tools/project_setup_tool.py`): Encapsulates cloning, environment bootstrapping, and language-specific install steps into a single orchestrated action.
 
 ## ✅ Validation & Observability
-- **Physical Validator** (`agent/physical_validator.py`): Inspects build artifacts, XML test reports, and compilation timestamps to ground decisions in physical evidence.
-- **Test Case Catalog** (`testcases/catalog.py`): Normalizes runtime results, parameterized expansions, and Groovy/Kotlin discovery to keep counts consistent across tools.
-- **Error Logger** (`agent/error_logger.py`): Aggregates issues from every tool call with canonical error codes, making retrospectives and reports actionable.
-- **Output Storage Manager** (`agent/output_storage.py`): Persists observations, plan snapshots, and generated artifacts under `.setup_agent/` inside the container workspace.
-- **Token Tracker** (`agent/token_tracker.py`): Captures prompt, completion, and reasoning token usage per ReAct step for cost and performance analysis.
+- **Physical Validator** (`src/sag/agent/physical_validator.py`): Inspects build artifacts, XML test reports, and compilation timestamps to ground decisions in physical evidence.
+- **Test Case Catalog** (`src/sag/testcases/catalog.py`): Normalizes runtime results, parameterized expansions, and Groovy/Kotlin discovery to keep counts consistent across tools.
+- **Error Logger** (`src/sag/agent/error_logger.py`): Aggregates issues from every tool call with canonical error codes, making retrospectives and reports actionable.
+- **Output Storage Manager** (`src/sag/agent/output_storage.py`): Persists observations, plan snapshots, and generated artifacts under `.setup_agent/` inside the container workspace.
+- **Token Tracker** (`src/sag/agent/token_tracker.py`): Captures prompt, completion, and reasoning token usage per ReAct step for cost and performance analysis.
 
 ## 🧭 End-to-End Flow
 
 ```mermaid
 flowchart TD
-    CLI["CLI (`main.py`)<br/>`sag project` / `sag run`"]
-    Config["Load configuration & session logging<br/>`config/__init__.py`"]
-    Docker["Docker orchestrator provisions container + volume<br/>`docker_orch/orch.py`"]
-    AgentInit["SetupAgent constructed<br/>`agent/agent.py`"]
-    ToolsInit["Context & tool initialization<br/>• ErrorLogger (`agent/error_logger.py`)<br/>• ContextManager + `manage_context` tool<br/>• Bash/FileIO/WebSearch helpers<br/>• ProjectSetup/Analyzer/System/Maven/Gradle tools<br/>• OutputStorageManager + OutputSearch<br/>• ReportTool + PhysicalValidator"]
+    CLI["CLI (`src/sag/main.py`)<br/>`sag project` / `sag run`"]
+    Config["Load configuration & session logging<br/>`src/sag/config/__init__.py`"]
+    Docker["Docker orchestrator provisions container + volume<br/>`src/sag/docker_orch/orch.py`"]
+    AgentInit["SetupAgent constructed<br/>`src/sag/agent/agent.py`"]
+    ToolsInit["Context & tool initialization<br/>• ErrorLogger (`src/sag/agent/error_logger.py`)<br/>• ContextManager + `manage_context` tool<br/>• Bash/FileIO/WebSearch helpers<br/>• ProjectSetup/Analyzer/System/Maven/Gradle tools<br/>• OutputStorageManager + OutputSearch<br/>• ReportTool + PhysicalValidator"]
     Trunk["Create trunk context & TODO list<br/>Tasks persisted via ContextManager"]
-    LoopStart["Kick off ReAct loop<br/>`agent/react_engine.py`"]
+    LoopStart["Kick off ReAct loop<br/>`src/sag/agent/react_engine.py`"]
 
     subgraph ReActIteration[ReAct Iteration]
         Think["THOUGHT: Thinking model plans next step<br/>TokenTracker absorbs usage"]
@@ -323,7 +323,7 @@ sag project https://github.com/apache/commons-cli.git --name cli-test
 | Option | Description |
 |---|---|
 | `--task <description>` | **(Required)** The task or requirement for the agent to execute. |
-| `--max-iterations <n>` | Maximum number of agent iterations (overrides `SAG_MAX_ITERATIONS` from config). |
+| `--max-iterations <n>` | Maximum number of agent iterations (overrides `SAG_MAX_ITERATIONS` in configuration). |
 | `--record` | Save setup artifacts (contexts, reports) to local session logs for debugging and auditing. |
 
 #### `sag shell <name>`
@@ -344,8 +344,8 @@ sag project https://github.com/apache/commons-cli.git --name cli-test
 # Run the full pytest suite (integration + smoke tests)
 uv run pytest
 
-# Or execute a focused scenario for faster feedback
-uv run pytest test_report_format.py
+# Or execute a focused contract/smoke scenario for faster feedback
+uv run pytest tests/test_report_contract.py
 ```
 
 ## ⚙️ Configuration Explained

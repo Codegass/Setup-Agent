@@ -1,8 +1,8 @@
 """Agent State Evaluator for intelligent state analysis and guidance generation."""
 
-from typing import List, Dict, Any
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any, Dict, List
 
 from loguru import logger
 
@@ -12,6 +12,7 @@ from .physical_validator import PhysicalValidator
 
 class StepType(str, Enum):
     """Types of steps in the ReAct loop (local definition to avoid circular import)."""
+
     THOUGHT = "thought"
     ACTION = "action"
     OBSERVATION = "observation"
@@ -20,6 +21,7 @@ class StepType(str, Enum):
 
 class AgentStatus(str, Enum):
     """Agent operational status."""
+
     PROCEEDING = "proceeding"  # Normal operation
     STUCK = "stuck"  # Needs guidance to proceed
     STUCK_REPETITION = "stuck_repetition"  # Repeating failed actions
@@ -33,6 +35,7 @@ class AgentStatus(str, Enum):
 @dataclass
 class AgentStateAnalysis:
     """Result of agent state evaluation."""
+
     status: AgentStatus
     needs_guidance: bool = False
     guidance_message: str = ""
@@ -40,7 +43,7 @@ class AgentStateAnalysis:
     is_task_complete: bool = False
     detected_signals: List[str] = None
     metadata: Dict[str, Any] = None
-    
+
     def __post_init__(self):
         if self.detected_signals is None:
             self.detected_signals = []
@@ -53,8 +56,10 @@ class AgentStateEvaluator:
     Centralized state evaluator that consolidates all state checking logic.
     This replaces scattered _check_* methods in ReActEngine.
     """
-    
-    def __init__(self, context_manager: ContextManager, physical_validator: PhysicalValidator = None):
+
+    def __init__(
+        self, context_manager: ContextManager, physical_validator: PhysicalValidator = None
+    ):
         self.context_manager = context_manager
         self.physical_validator = physical_validator
 
@@ -63,81 +68,81 @@ class AgentStateEvaluator:
         # Example: 'BUILD SUCCESS' should only be in build_success, not tests_passed
         # Bug fix: Removed 'BUILD SUCCESS' from tests_passed to prevent false test completion
         self.completion_signals = {
-            'repository_cloned': [
-                'successfully cloned',
-                'cloning into',
-                'clone completed',
-                'repository cloned'
+            "repository_cloned": [
+                "successfully cloned",
+                "cloning into",
+                "clone completed",
+                "repository cloned",
             ],
-            'project_detected': [
-                'found pom.xml',
-                'maven project detected',
-                'package.json found',
-                'project type:',
-                'build file detected'
+            "project_detected": [
+                "found pom.xml",
+                "maven project detected",
+                "package.json found",
+                "project type:",
+                "build file detected",
             ],
-            'dependencies_installed': [
-                'dependencies installed',
-                'package installation complete',
-                'resolved dependencies'
+            "dependencies_installed": [
+                "dependencies installed",
+                "package installation complete",
+                "resolved dependencies",
             ],
-            'build_success': [
-                'BUILD SUCCESS',
-                'compilation successful',
-                'build completed successfully'
+            "build_success": [
+                "BUILD SUCCESS",
+                "compilation successful",
+                "build completed successfully",
             ],
-            'tests_passed': [
-                'Tests run:',  # Maven/Surefire pattern
-                'all tests passed',
-                'test suite passed',
+            "tests_passed": [
+                "Tests run:",  # Maven/Surefire pattern
+                "all tests passed",
+                "test suite passed",
                 # Removed 'BUILD SUCCESS' - too ambiguous, overlaps with build_success
-                'test execution completed',  # Gradle specific
-                '> Task :test',  # Gradle task execution marker
-                'test results:',  # Generic test output marker
-                'test summary:',  # Generic test summary marker
-                'tests completed',  # Generic completion
-                'test report generated'  # Report generation indicator
+                "test execution completed",  # Gradle specific
+                "> Task :test",  # Gradle task execution marker
+                "test results:",  # Generic test output marker
+                "test summary:",  # Generic test summary marker
+                "tests completed",  # Generic completion
+                "test report generated",  # Report generation indicator
             ],
-            'environment_setup': [
-                'environment configured',
-                'setup completed',
-                'configuration complete'
-            ]
+            "environment_setup": [
+                "environment configured",
+                "setup completed",
+                "configuration complete",
+            ],
         }
-        
+
     def evaluate(
-        self, 
-        steps: List[Any], 
+        self,
+        steps: List[Any],
         current_iteration: int,
         recent_tool_executions: List[Dict],
-        steps_since_context_switch: int
+        steps_since_context_switch: int,
     ) -> AgentStateAnalysis:
         """
         Comprehensive evaluation of agent state.
         Consolidates all state checking logic into one place.
-        
+
         Args:
             steps: All ReAct steps taken so far
             current_iteration: Current iteration number
             recent_tool_executions: Recent tool execution history
             steps_since_context_switch: Steps since last context change
-            
+
         Returns:
             AgentStateAnalysis with status and guidance
         """
-        
+
         # Priority order of checks (highest priority first)
-        
+
         # 1. Check for stuck/repetitive execution
         repetition_analysis = self._check_repetitive_execution(recent_tool_executions)
         if repetition_analysis.needs_guidance:
             return repetition_analysis
-            
+
         # 2. Check if working outside task context (ghost state prevention)
         ghost_state_analysis = self._check_ghost_state(steps)
         if ghost_state_analysis.needs_guidance:
             return ghost_state_analysis
-            
+
         # 2.5. Check if task_2 requires project_analyzer enforcement
         task2_analysis = self._check_task2_project_analyzer_requirement(steps)
         if task2_analysis.needs_guidance:
@@ -154,33 +159,30 @@ class AgentStateEvaluator:
             completion_analysis = self._check_task_completion_opportunity(steps)
             if completion_analysis.needs_guidance:
                 return completion_analysis
-        
+
         # 3. Check if thinking too much without action
         idle_analysis = self._check_idle_thinking(steps)
         if idle_analysis.needs_guidance:
             return idle_analysis
-            
+
         # 4. Check if context switch is needed
         if self.context_manager.current_task_id:
             context_analysis = self._check_context_switch_needed(steps_since_context_switch)
             if context_analysis.needs_guidance:
                 return context_analysis
-                
+
         # 5. Check if ready for final report
         report_analysis = self._check_ready_for_report(steps)
         if report_analysis.needs_guidance:
             return report_analysis
-            
+
         # 6. Check for overall task completion
         if self._is_task_complete(steps):
-            return AgentStateAnalysis(
-                status=AgentStatus.PROCEEDING,
-                is_task_complete=True
-            )
-        
+            return AgentStateAnalysis(status=AgentStatus.PROCEEDING, is_task_complete=True)
+
         # Default: Everything is proceeding normally
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_project_analysis_status(self) -> AgentStateAnalysis:
         """
         Check if project analysis has been performed using physical validator.
@@ -191,23 +193,23 @@ class AgentStateEvaluator:
             validation = self.physical_validator.validate_project_analysis_status()
 
             # If analysis is missing and we have a prompt to inject
-            if not validation.get('analyzed') and validation.get('missing_analysis_prompt'):
+            if not validation.get("analyzed") and validation.get("missing_analysis_prompt"):
                 # Only enforce if we're past task_1 (repository should be cloned)
                 current_task = self.context_manager.current_task_id
-                if current_task and current_task != 'task_1':
+                if current_task and current_task != "task_1":
                     # Check priority based on current task
                     priority = 5  # Default priority
-                    if current_task == 'task_2':
+                    if current_task == "task_2":
                         priority = 10  # Highest priority during task_2
-                    elif current_task in ['task_4', 'task_5']:
+                    elif current_task in ["task_4", "task_5"]:
                         priority = 7  # High priority before tests/report
 
                     return AgentStateAnalysis(
                         status=AgentStatus.CONFUSED,
-                        needs_guidance = True,
-                        guidance_message=validation['missing_analysis_prompt'],
-                        guidance_priority = priority,
-                        metadata={'static_test_count': validation.get('static_test_count')}
+                        needs_guidance=True,
+                        guidance_message=validation["missing_analysis_prompt"],
+                        guidance_priority=priority,
+                        metadata={"static_test_count": validation.get("static_test_count")},
                     )
 
         except Exception as e:
@@ -221,31 +223,35 @@ class AgentStateEvaluator:
         Task_2 is critical for static test counting and must use project_analyzer.
         """
         # Check if current task is task_2
-        if self.context_manager.current_task_id != 'task_2':
+        if self.context_manager.current_task_id != "task_2":
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-        
+
         # Check if project_analyzer has been used in this task
         project_analyzer_used = False
         for step in steps[-20:]:  # Check last 20 steps
-            if (hasattr(step, 'tool_name') and step.tool_name == 'project_analyzer' and
-                hasattr(step, 'tool_result') and step.tool_result.success):
+            if (
+                hasattr(step, "tool_name")
+                and step.tool_name == "project_analyzer"
+                and hasattr(step, "tool_result")
+                and step.tool_result.success
+            ):
                 project_analyzer_used = True
                 break
-        
+
         # If working on task_2 but hasn't used project_analyzer yet
         if not project_analyzer_used:
             # Check if agent is trying to analyze manually (reading pom.xml, etc.)
             manual_analysis_detected = False
             for step in steps[-5:]:
-                if hasattr(step, 'tool_name') and step.tool_name in ['file_io', 'bash']:
-                    if hasattr(step, 'input') and 'pom.xml' in str(step.input).lower():
+                if hasattr(step, "tool_name") and step.tool_name in ["file_io", "bash"]:
+                    if hasattr(step, "input") and "pom.xml" in str(step.input).lower():
                         manual_analysis_detected = True
                         break
-            
+
             if manual_analysis_detected:
                 return AgentStateAnalysis(
                     status=AgentStatus.STUCK,
-                    needs_guidance = True,
+                    needs_guidance=True,
                     guidance_message=(
                         "⚠️ CRITICAL: USE PROJECT_ANALYZER TOOL FOR TASK_2!\n\n"
                         "You are attempting to manually analyze the project structure.\n"
@@ -257,11 +263,11 @@ class AgentStateEvaluator:
                         "IMMEDIATELY use: project_analyzer(action='analyze', project_path='/workspace/<project>')\n\n"
                         "DO NOT manually read pom.xml or analyze files - the tool does this automatically!"
                     ),
-                    guidance_priority = 10  # Highest priority
+                    guidance_priority=10,  # Highest priority
                 )
-        
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_ghost_state(self, steps: List[Any]) -> AgentStateAnalysis:
         """
         Check if agent is working outside of task context (ghost state).
@@ -270,25 +276,31 @@ class AgentStateEvaluator:
         # Only check if not in a task context
         if self.context_manager.current_task_id:
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-        
+
         # Check if recently completed a task (within last 5 steps)
         recent_completion = False
         for step in steps[-5:] if len(steps) > 5 else steps:
-            if (hasattr(step, 'tool_name') and step.tool_name == 'manage_context' and
-                hasattr(step, 'output') and 'task completed' in str(step.output).lower()):
+            if (
+                hasattr(step, "tool_name")
+                and step.tool_name == "manage_context"
+                and hasattr(step, "output")
+                and "task completed" in str(step.output).lower()
+            ):
                 recent_completion = True
                 break
-        
+
         # If just completed a task, remind to check for next task
         if recent_completion:
             trunk_context = self.context_manager.load_trunk_context()
-            if trunk_context and 'todo_list' in trunk_context:
-                pending_tasks = [t for t in trunk_context['todo_list'] if t.get('status') == 'pending']
+            if trunk_context and "todo_list" in trunk_context:
+                pending_tasks = [
+                    t for t in trunk_context["todo_list"] if t.get("status") == "pending"
+                ]
                 if pending_tasks:
                     next_task = pending_tasks[0]
                     return AgentStateAnalysis(
                         status=AgentStatus.STUCK,
-                        needs_guidance = True,
+                        needs_guidance=True,
                         guidance_message=(
                             f"✅ TASK COMPLETED - NOW CHECK FOR NEXT TASK!\n\n"
                             f"You just completed a task. Follow the workflow:\n"
@@ -297,30 +309,32 @@ class AgentStateEvaluator:
                             f"Next pending task: {next_task['description']}\n\n"
                             f"DON'T skip ahead - follow the workflow!"
                         ),
-                        guidance_priority = 9
+                        guidance_priority=9,
                     )
-        
+
         # Look for recent work-related tool usage outside of task context
         recent_steps = steps[-10:] if len(steps) > 10 else steps
-        
-        work_tools = ['maven', 'bash', 'file_io', 'project_analyzer', 'project_setup']
+
+        work_tools = ["maven", "bash", "file_io", "project_analyzer", "project_setup"]
         work_actions_found = []
-        
+
         for step in recent_steps:
-            if hasattr(step, 'tool_name') and step.tool_name in work_tools:
+            if hasattr(step, "tool_name") and step.tool_name in work_tools:
                 work_actions_found.append(step.tool_name)
-        
+
         # If doing actual work outside task context, this is a ghost state
         if work_actions_found:
             # Check if there are pending tasks
             trunk_context = self.context_manager.load_trunk_context()
-            if trunk_context and 'todo_list' in trunk_context:
-                pending_tasks = [t for t in trunk_context['todo_list'] if t.get('status') == 'pending']
+            if trunk_context and "todo_list" in trunk_context:
+                pending_tasks = [
+                    t for t in trunk_context["todo_list"] if t.get("status") == "pending"
+                ]
                 if pending_tasks:
                     next_task = pending_tasks[0]
                     return AgentStateAnalysis(
                         status=AgentStatus.STUCK,
-                        needs_guidance = True,
+                        needs_guidance=True,
                         guidance_message=(
                             f"🚨 GHOST STATE DETECTED: Working outside task context!\n\n"
                             f"You are executing {', '.join(set(work_actions_found))} without an active task.\n"
@@ -331,21 +345,21 @@ class AgentStateEvaluator:
                             f"3. Only then continue with your {work_actions_found[-1]} work\n\n"
                             f"Next pending task: {next_task['description']}"
                         ),
-                        guidance_priority = 10  # Highest priority
+                        guidance_priority=10,  # Highest priority
                     )
-        
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_repetitive_execution(self, recent_tool_executions: List[Dict]) -> AgentStateAnalysis:
         """Check if agent is stuck in repetitive failed execution."""
         if not recent_tool_executions:
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-            
+
         # Count consecutive failures for the same tool
         if len(recent_tool_executions) >= 3:
             last_tool = recent_tool_executions[-1].get("signature", "").split(":")[0]
             consecutive_failures = 0
-            
+
             for exec_record in reversed(recent_tool_executions):
                 if exec_record["signature"].startswith(last_tool + ":"):
                     if not exec_record["success"]:
@@ -354,13 +368,13 @@ class AgentStateEvaluator:
                         break
                 else:
                     break
-                    
+
             if consecutive_failures >= 2:  # Reduced from 3 to catch issues earlier
                 guidance = (
                     f"🔁 REPETITIVE EXECUTION DETECTED: Tool '{last_tool}' has failed {consecutive_failures} times consecutively.\n\n"
                     f"This indicates the current approach is not working. Consider:\n"
                 )
-                
+
                 if last_tool == "maven":
                     guidance += (
                         "• Check the project structure and pom.xml location\n"
@@ -389,17 +403,17 @@ class AgentStateEvaluator:
                         "• Use thinking model to analyze root cause\n"
                         "• Consider using alternative tools"
                     )
-                
+
                 return AgentStateAnalysis(
                     status=AgentStatus.STUCK_REPETITION,
-                    needs_guidance = True,
+                    needs_guidance=True,
                     guidance_message=guidance,
-                    guidance_priority = 10,  # High priority
-                    metadata={"failed_tool": last_tool, "failure_count": consecutive_failures}
+                    guidance_priority=10,  # High priority
+                    metadata={"failed_tool": last_tool, "failure_count": consecutive_failures},
                 )
-                
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_task_completion_opportunity(self, steps: List[Any]) -> AgentStateAnalysis:
         """Check if recent observations indicate task completion opportunity.
 
@@ -410,12 +424,12 @@ class AgentStateEvaluator:
         # Look at recent observations
         recent_observations = []
         for step in reversed(steps[-5:]):  # Last 5 steps
-            if hasattr(step, 'step_type') and step.step_type == StepType.OBSERVATION:
+            if hasattr(step, "step_type") and step.step_type == StepType.OBSERVATION:
                 recent_observations.append(step.content)
-                
+
         if not recent_observations:
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-            
+
         # Check for completion signals
         detected_signals = []
         for observation in recent_observations:
@@ -425,7 +439,7 @@ class AgentStateEvaluator:
                     if pattern.lower() in observation_lower:
                         detected_signals.append(signal_type)
                         break
-                        
+
         if detected_signals:
             current_task = self.context_manager.current_task_id
             guidance = (
@@ -440,29 +454,29 @@ class AgentStateEvaluator:
                 f"This is MANDATORY to prevent 'ghost states' where work is done but not recorded.\n"
                 f"DO NOT continue to other work without updating the official task status!"
             )
-            
+
             return AgentStateAnalysis(
                 status=AgentStatus.TASK_COMPLETE_SIGNAL,
-                needs_guidance = True,
+                needs_guidance=True,
                 guidance_message=guidance,
-                guidance_priority = 9,  # Very high priority
+                guidance_priority=9,  # Very high priority
                 detected_signals=list(set(detected_signals)),
-                metadata={"current_task": current_task}
+                metadata={"current_task": current_task},
             )
-            
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_idle_thinking(self, steps: List[Any]) -> AgentStateAnalysis:
         """Check if agent is thinking too much without taking action."""
         # Count consecutive thoughts without actions
         consecutive_thoughts = 0
         for step in reversed(steps[-10:]):  # Look at last 10 steps
-            if hasattr(step, 'step_type'):
+            if hasattr(step, "step_type"):
                 if step.step_type == StepType.THOUGHT:
                     consecutive_thoughts += 1
                 elif step.step_type == StepType.ACTION:
                     break
-                    
+
         if consecutive_thoughts >= 3:
             guidance = (
                 f"⚠️ IDLE THINKING DETECTED: You have been thinking for {consecutive_thoughts} steps without action.\n\n"
@@ -474,21 +488,21 @@ class AgentStateEvaluator:
                 f"• project_setup - Clone repositories\n\n"
                 f"Stop overthinking and ACT! The tools will handle the execution."
             )
-            
+
             return AgentStateAnalysis(
                 status=AgentStatus.IDLE_THINKING,
-                needs_guidance = True,
+                needs_guidance=True,
                 guidance_message=guidance,
-                guidance_priority = 7,
-                metadata={"consecutive_thoughts": consecutive_thoughts}
+                guidance_priority=7,
+                metadata={"consecutive_thoughts": consecutive_thoughts},
             )
-            
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_context_switch_needed(self, steps_since_switch: int) -> AgentStateAnalysis:
         """Check if agent has been in branch context too long."""
         threshold = 15  # Reasonable threshold for task completion
-        
+
         if steps_since_switch >= threshold:
             guidance = (
                 f"📊 CONTEXT SWITCH REMINDER: You have been working on the current task for {steps_since_switch} steps.\n\n"
@@ -498,17 +512,17 @@ class AgentStateEvaluator:
                 f"• If scope creeping: Focus on the specific task requirements\n\n"
                 f"Long-running tasks often indicate either completion or blocking issues."
             )
-            
+
             return AgentStateAnalysis(
                 status=AgentStatus.CONTEXT_SWITCH_NEEDED,
-                needs_guidance = True,
+                needs_guidance=True,
                 guidance_message=guidance,
-                guidance_priority = 5,
-                metadata={"steps_in_context": steps_since_switch}
+                guidance_priority=5,
+                metadata={"steps_in_context": steps_since_switch},
             )
-            
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _check_ready_for_report(self, steps: List[Any]) -> AgentStateAnalysis:
         """Check if all tasks are done and ready for final report."""
         # This requires checking trunk context
@@ -516,13 +530,15 @@ class AgentStateEvaluator:
             # Look for recent successful Maven test completion
             recent_success = False
             for step in reversed(steps[-10:]):
-                if (hasattr(step, 'step_type') and 
-                    step.step_type == StepType.OBSERVATION and 
-                    "BUILD SUCCESS" in step.content and 
-                    "Tests run:" in step.content):
+                if (
+                    hasattr(step, "step_type")
+                    and step.step_type == StepType.OBSERVATION
+                    and "BUILD SUCCESS" in step.content
+                    and "Tests run:" in step.content
+                ):
                     recent_success = True
                     break
-                    
+
             if recent_success and not self.context_manager.current_task_id:
                 # We're in trunk context after successful tests
                 guidance = (
@@ -532,71 +548,75 @@ class AgentStateEvaluator:
                     "• Example: report(summary='Successfully set up and tested Maven project', status='success')\n\n"
                     "This will create a comprehensive report and mark the project as complete."
                 )
-                
+
                 return AgentStateAnalysis(
                     status=AgentStatus.READY_FOR_REPORT,
-                    needs_guidance = True,
+                    needs_guidance=True,
                     guidance_message=guidance,
-                    guidance_priority = 8,
-                    metadata={"maven_success": True}
+                    guidance_priority=8,
+                    metadata={"maven_success": True},
                 )
-                
+
         except Exception as e:
             logger.warning(f"Error checking report readiness: {e}")
-            
+
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
-    
+
     def _is_task_complete(self, steps: List[Any]) -> bool:
         """Check if the overall task is complete."""
         # Check for successful report generation
         for step in reversed(steps[-5:]):
-            if hasattr(step, 'step_type') and step.step_type == StepType.ACTION:
-                if (hasattr(step, 'tool_name') and step.tool_name == "report" and
-                    hasattr(step, 'tool_result') and step.tool_result and 
-                    step.tool_result.success):
+            if hasattr(step, "step_type") and step.step_type == StepType.ACTION:
+                if (
+                    hasattr(step, "tool_name")
+                    and step.tool_name == "report"
+                    and hasattr(step, "tool_result")
+                    and step.tool_result
+                    and step.tool_result.success
+                ):
                     # Check for completion signal in metadata
-                    metadata = getattr(step.tool_result, 'metadata', {})
+                    metadata = getattr(step.tool_result, "metadata", {})
                     if metadata.get("completion_signal") or metadata.get("task_completed"):
                         logger.info("Task completion detected via report tool")
                         return True
-                        
+
         return False
-    
+
     def get_completion_signals_for_task(self, task_description: str) -> List[str]:
         """Get relevant completion signals based on task description."""
         task_lower = task_description.lower()
         relevant_signals = []
-        
+
         if "clone" in task_lower or "repository" in task_lower:
-            relevant_signals.extend(self.completion_signals['repository_cloned'])
+            relevant_signals.extend(self.completion_signals["repository_cloned"])
         if "detect" in task_lower or "analyze" in task_lower:
-            relevant_signals.extend(self.completion_signals['project_detected'])
+            relevant_signals.extend(self.completion_signals["project_detected"])
         if "dependen" in task_lower or "install" in task_lower:
-            relevant_signals.extend(self.completion_signals['dependencies_installed'])
+            relevant_signals.extend(self.completion_signals["dependencies_installed"])
         if "build" in task_lower or "compile" in task_lower:
-            relevant_signals.extend(self.completion_signals['build_success'])
+            relevant_signals.extend(self.completion_signals["build_success"])
         if "test" in task_lower:
-            relevant_signals.extend(self.completion_signals['tests_passed'])
-            
+            relevant_signals.extend(self.completion_signals["tests_passed"])
+
         return relevant_signals
-    
+
     def validate_build_state_physically(self, project_name: str = None) -> Dict[str, Any]:
         """
         Use physical validator to get ground truth about build state.
-        
+
         Args:
             project_name: Name of the project to validate
-            
+
         Returns:
             Physical validation results
         """
         if not self.physical_validator:
             return {"available": False, "reason": "No physical validator configured"}
-        
+
         try:
             # Get physical evidence
             validation = self.physical_validator.validate_build_artifacts(project_name)
-            
+
             # Create summary for agent guidance
             summary = {
                 "available": True,
@@ -604,19 +624,21 @@ class AgentStateEvaluator:
                 "class_files": validation.get("class_files", 0),
                 "jar_files": validation.get("jar_files", 0),
                 "missing_compilations": len(validation.get("missing_classes", [])),
-                "evidence": validation.get("evidence", [])
+                "evidence": validation.get("evidence", []),
             }
-            
+
             # Add interpretation
             if summary["build_artifacts_exist"]:
-                summary["interpretation"] = "BUILD VERIFIED: Physical artifacts confirm successful compilation"
+                summary["interpretation"] = (
+                    "BUILD VERIFIED: Physical artifacts confirm successful compilation"
+                )
             elif summary["class_files"] > 0 and summary["missing_compilations"] > 0:
                 summary["interpretation"] = "PARTIAL BUILD: Some files compiled but others failed"
             else:
                 summary["interpretation"] = "BUILD FAILED: No compilation artifacts found"
-            
+
             return summary
-            
+
         except Exception as e:
             logger.error(f"Physical validation failed: {e}")
             return {"available": False, "reason": str(e)}

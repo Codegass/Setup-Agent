@@ -26,12 +26,13 @@ class WebSearchTool(BaseTool):
 
         if not query.strip():
             from .base import ToolError
+
             raise ToolError(
                 message="Empty search query provided",
                 category="validation",
                 error_code="EMPTY_QUERY",
                 suggestions=["Provide a non-empty search query"],
-                retryable=True
+                retryable=True,
             )
 
         logger.debug(f"Searching web for: {query}")

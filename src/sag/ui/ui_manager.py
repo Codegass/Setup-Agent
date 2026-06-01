@@ -8,21 +8,22 @@ an interactive, auto-updating CLI interface.
 import time
 from datetime import datetime
 from typing import Optional
+
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from sag.ui.events import UIEvent, EventType, PhaseType
 from sag.ui.components import (
-    create_status_panel,
-    create_phase_tree,
     create_error_panel,
-    create_warning_panel,
+    create_phase_tree,
+    create_status_panel,
     create_success_panel,
+    create_warning_panel,
     format_duration,
 )
+from sag.ui.events import EventType, PhaseType, UIEvent
 
 
 class UIManager:
@@ -88,10 +89,7 @@ class UIManager:
     def start(self):
         """Start the live display"""
         self.live = Live(
-            self._render_display(),
-            console=self.console,
-            refresh_per_second=4,
-            transient=False
+            self._render_display(), console=self.console, refresh_per_second=4, transient=False
         )
         self.live.start()
 
@@ -173,8 +171,10 @@ class UIManager:
                 return PhaseType.TEST
 
             # Build phase indicators (compile, package, install)
-            if any(keyword in goal.lower() or keyword in task.lower()
-                   for keyword in ["compile", "package", "install", "build", "assemble"]):
+            if any(
+                keyword in goal.lower() or keyword in task.lower()
+                for keyword in ["compile", "package", "install", "build", "assemble"]
+            ):
                 return PhaseType.BUILD
 
         # Bash commands
@@ -183,12 +183,25 @@ class UIManager:
             command_lower = command.lower()
 
             # Test indicators in bash commands
-            if any(keyword in command_lower for keyword in ["mvn test", "gradle test", "pytest", "npm test", "test"]):
+            if any(
+                keyword in command_lower
+                for keyword in ["mvn test", "gradle test", "pytest", "npm test", "test"]
+            ):
                 return PhaseType.TEST
 
             # Build indicators in bash commands
-            if any(keyword in command_lower for keyword in ["mvn compile", "mvn package", "mvn install",
-                                                            "gradle build", "gradle assemble", "make", "npm run build"]):
+            if any(
+                keyword in command_lower
+                for keyword in [
+                    "mvn compile",
+                    "mvn package",
+                    "mvn install",
+                    "gradle build",
+                    "gradle assemble",
+                    "make",
+                    "npm run build",
+                ]
+            ):
                 return PhaseType.BUILD
 
         return None
@@ -312,7 +325,7 @@ class UIManager:
             content,
             title="📊 Setup Report",
             border_style="green" if status == "success" else "yellow",
-            padding=(1, 2)
+            padding=(1, 2),
         )
 
     def handle_event(self, event: UIEvent):
@@ -347,7 +360,11 @@ class UIManager:
             self._handle_failure(event)
         elif event.event_type == EventType.REPORT_GENERATED:
             self._handle_report_generated(event)
-        elif event.event_type in [EventType.AGENT_THOUGHT, EventType.AGENT_ACTION, EventType.AGENT_OBSERVATION]:
+        elif event.event_type in [
+            EventType.AGENT_THOUGHT,
+            EventType.AGENT_ACTION,
+            EventType.AGENT_OBSERVATION,
+        ]:
             self._handle_agent_event(event)
 
         # Update the display
@@ -380,11 +397,9 @@ class UIManager:
             # Add step to phase
             phase_data = self.phases_data.get(event.phase)
             if phase_data:
-                phase_data["steps"].append({
-                    "name": event.message,
-                    "status": "running",
-                    "details": event.details
-                })
+                phase_data["steps"].append(
+                    {"name": event.message, "status": "running", "details": event.details}
+                )
 
     def _handle_step_complete(self, event: UIEvent):
         """Handle step complete event"""
@@ -457,7 +472,9 @@ class UIManager:
         # Track agent steps for collapsible display
         if event.event_type == EventType.AGENT_THOUGHT:
             # Start a new agent step
-            self.agent_current_step_num = event.metadata.get("step_num", self.agent_current_step_num + 1)
+            self.agent_current_step_num = event.metadata.get(
+                "step_num", self.agent_current_step_num + 1
+            )
             self.agent_current_action = "thinking"
             self.agent_current_tool = None
 
@@ -470,7 +487,7 @@ class UIManager:
                 "thought": event.message,
                 "action": None,
                 "observation": None,
-                "status": "running"
+                "status": "running",
             }
             self.agent_steps.append(self.current_agent_step)
 
@@ -487,7 +504,10 @@ class UIManager:
             if detected_phase and detected_phase != self.current_phase:
                 # Transition to new phase
                 # Complete previous phase if it was running
-                if self.current_phase and self.phases_data[self.current_phase]["status"] == "running":
+                if (
+                    self.current_phase
+                    and self.phases_data[self.current_phase]["status"] == "running"
+                ):
                     self.phases_data[self.current_phase]["status"] = "success"
 
                 # Start new phase
@@ -563,10 +583,7 @@ class UIManager:
             status_line.append(elapsed_str, style="blue")
 
             status_panel = Panel(
-                Group(spinner, status_line),
-                border_style="cyan",
-                padding=(0, 1),
-                width=80
+                Group(spinner, status_line), border_style="cyan", padding=(0, 1), width=80
             )
         else:
             # Regular status panel without spinner
@@ -574,7 +591,7 @@ class UIManager:
                 project_name=self.project_name,
                 current_phase=self.current_phase,
                 status=self.current_status,
-                elapsed_time=elapsed_str
+                elapsed_time=elapsed_str,
             )
         elements.append(status_panel)
         elements.append("")  # Spacing
@@ -587,10 +604,7 @@ class UIManager:
         if self.errors:
             elements.append("")  # Spacing
             latest_error = self.errors[-1]
-            error_panel = create_error_panel(
-                latest_error.message,
-                details=latest_error.details
-            )
+            error_panel = create_error_panel(latest_error.message, details=latest_error.details)
             elements.append(error_panel)
 
         # 4. Show warnings if any
@@ -598,8 +612,7 @@ class UIManager:
             elements.append("")  # Spacing
             latest_warning = self.warnings[-1]
             warning_panel = create_warning_panel(
-                latest_warning.message,
-                details=latest_warning.details
+                latest_warning.message, details=latest_warning.details
             )
             elements.append(warning_panel)
 
@@ -630,17 +643,17 @@ class UIManager:
                 self.current_status,
                 summary_items=[
                     ("Total time", elapsed_str),
-                    ("Phases completed", f"{sum(1 for p in self.phases_data.values() if p['status'] == 'success')}/4")
-                ]
+                    (
+                        "Phases completed",
+                        f"{sum(1 for p in self.phases_data.values() if p['status'] == 'success')}/4",
+                    ),
+                ],
             )
             self.console.print(success_panel)
         elif self.final_status == "failure":
             if self.errors:
                 latest_error = self.errors[-1]
-                error_panel = create_error_panel(
-                    latest_error.message,
-                    details=latest_error.details
-                )
+                error_panel = create_error_panel(latest_error.message, details=latest_error.details)
                 self.console.print(error_panel)
 
         # Print report information if available
@@ -659,10 +672,9 @@ class UIManager:
         # Print agent steps if any (collapsible summary)
         if self.agent_steps:
             self.console.print()
-            self.console.print(Panel(
-                f"🤖 Agent executed {len(self.agent_steps)} ReAct steps",
-                border_style="blue"
-            ))
+            self.console.print(
+                Panel(f"🤖 Agent executed {len(self.agent_steps)} ReAct steps", border_style="blue")
+            )
             self.console.print("[dim]Run with --verbose to see detailed agent reasoning[/dim]")
 
         self.console.print()

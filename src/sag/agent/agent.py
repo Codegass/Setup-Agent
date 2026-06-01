@@ -13,7 +13,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
 from sag.docker_orch.orch import DockerOrchestrator
-from sag.ui import UIManager, UIEvent, EventType, PhaseType
+from sag.ui import EventType, PhaseType, UIEvent, UIManager
 
 from .context_manager import ContextManager
 from .react_engine import ReActEngine
@@ -80,6 +80,7 @@ class SetupAgent:
 
             # Also set UI manager for all tools that support it
             from sag.ui.events import UIEventEmitter
+
             for tool in self.tools:
                 if isinstance(tool, UIEventEmitter):
                     tool.set_ui_manager(self.ui_manager)
@@ -260,33 +261,39 @@ class SetupAgent:
         try:
             # Step 1: Setup Docker environment
             if self.config.ui_mode:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_START,
-                    message="Setting up environment",
-                    phase=PhaseType.SETUP,
-                    level="info"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_START,
+                        message="Setting up environment",
+                        phase=PhaseType.SETUP,
+                        level="info",
+                    )
+                )
 
             if not self._setup_docker_environment(project_name):
                 return False
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
             if self.config.ui_mode:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.STEP_START,
-                    message="Context Initialization",
-                    phase=PhaseType.SETUP,
-                    details="Initializing context system...",
-                    level="info"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.STEP_START,
+                        message="Context Initialization",
+                        phase=PhaseType.SETUP,
+                        details="Initializing context system...",
+                        level="info",
+                    )
+                )
 
                 # Update status for initializing tools
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.STATUS_UPDATE,
-                    message="Loading tools...",
-                    phase=PhaseType.SETUP,
-                    level="info"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.STATUS_UPDATE,
+                        message="Loading tools...",
+                        phase=PhaseType.SETUP,
+                        level="info",
+                    )
+                )
 
             self._initialize_context_and_tools()
 
@@ -295,20 +302,24 @@ class SetupAgent:
 
             if self.config.ui_mode:
                 # Update status for finalizing
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.STATUS_UPDATE,
-                    message="Configuring ReAct engine...",
-                    phase=PhaseType.SETUP,
-                    level="info"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.STATUS_UPDATE,
+                        message="Configuring ReAct engine...",
+                        phase=PhaseType.SETUP,
+                        level="info",
+                    )
+                )
 
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.STEP_COMPLETE,
-                    message="Context Initialization",
-                    phase=PhaseType.SETUP,
-                    details="Context manager ready",
-                    level="success"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.STEP_COMPLETE,
+                        message="Context Initialization",
+                        phase=PhaseType.SETUP,
+                        details="Context manager ready",
+                        level="success",
+                    )
+                )
 
             # Step 2: Initialize trunk context with intelligent planning approach
             # Here we provide the initial steps. Split complex task into clear, executable steps
@@ -363,12 +374,14 @@ class SetupAgent:
 
             # Step 2.5: Complete setup phase
             if self.config.ui_mode:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_COMPLETE,
-                    message="Setup phase completed",
-                    phase=PhaseType.SETUP,
-                    level="success"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_COMPLETE,
+                        message="Setup phase completed",
+                        phase=PhaseType.SETUP,
+                        level="success",
+                    )
+                )
 
             # Step 3: Run the unified setup process
             success = self._run_unified_setup(project_url, project_name, goal, interactive)
@@ -376,17 +389,21 @@ class SetupAgent:
             # Step 5: Handle final status
             if self.config.ui_mode:
                 if success:
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.SUCCESS,
-                        message="Project setup completed successfully",
-                        level="success"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.SUCCESS,
+                            message="Project setup completed successfully",
+                            level="success",
+                        )
+                    )
                 else:
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.FAILURE,
-                        message="Project setup incomplete",
-                        level="error"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.FAILURE,
+                            message="Project setup incomplete",
+                            level="error",
+                        )
+                    )
                 # Display final summary and stop UI manager
                 self.ui_manager.display_final_summary()
             else:
@@ -502,12 +519,14 @@ class SetupAgent:
         try:
             # Step 1: Ensure Docker container is running
             if self.config.ui_mode:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_START,
-                    message="Preparing environment",
-                    phase=PhaseType.SETUP,
-                    level="info"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_START,
+                        message="Preparing environment",
+                        phase=PhaseType.SETUP,
+                        level="info",
+                    )
+                )
 
             if not self._ensure_container_running(project_name):
                 return False
@@ -545,12 +564,14 @@ class SetupAgent:
 
             # Step 2.5: Complete setup phase
             if self.config.ui_mode:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_COMPLETE,
-                    message="Environment ready",
-                    phase=PhaseType.SETUP,
-                    level="success"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_COMPLETE,
+                        message="Environment ready",
+                        phase=PhaseType.SETUP,
+                        level="success",
+                    )
+                )
 
             # Step 3: Add the specific task
             trunk_context.add_task(task_description)
@@ -573,12 +594,14 @@ Please start by checking the current context and then proceed with the task.
 
             # Step 5: Execute task
             if self.config.ui_mode:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_START,
-                    message="Executing task",
-                    phase=PhaseType.BUILD,
-                    level="info"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_START,
+                        message="Executing task",
+                        phase=PhaseType.BUILD,
+                        level="info",
+                    )
+                )
             else:
                 self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
 
@@ -592,34 +615,42 @@ Please start by checking the current context and then proceed with the task.
                 comment = f"Task completed: {task_description}"
                 self.orchestrator.update_last_comment(comment)
                 if self.config.ui_mode:
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.PHASE_COMPLETE,
-                        message="Task completed",
-                        phase=PhaseType.BUILD,
-                        level="success"
-                    ))
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.SUCCESS,
-                        message=f"Task completed: {task_description}",
-                        level="success"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.PHASE_COMPLETE,
+                            message="Task completed",
+                            phase=PhaseType.BUILD,
+                            level="success",
+                        )
+                    )
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.SUCCESS,
+                            message=f"Task completed: {task_description}",
+                            level="success",
+                        )
+                    )
                 else:
                     self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
             else:
                 comment = f"Task in progress: {task_description}"
                 self.orchestrator.update_last_comment(comment)
                 if self.config.ui_mode:
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.PHASE_ERROR,
-                        message="Task incomplete",
-                        phase=PhaseType.BUILD,
-                        level="error"
-                    ))
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.FAILURE,
-                        message=f"Task incomplete: {task_description}",
-                        level="error"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.PHASE_ERROR,
+                            message="Task incomplete",
+                            phase=PhaseType.BUILD,
+                            level="error",
+                        )
+                    )
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.FAILURE,
+                            message=f"Task incomplete: {task_description}",
+                            level="error",
+                        )
+                    )
                 else:
                     self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
 
@@ -659,21 +690,25 @@ Please start by checking the current context and then proceed with the task.
 
         if self.config.ui_mode:
             # UI Mode: emit detailed step events
-            self.ui_manager.handle_event(UIEvent(
-                event_type=EventType.STEP_START,
-                message="Docker Environment",
-                phase=PhaseType.SETUP,
-                details="Checking Docker availability...",
-                level="info"
-            ))
+            self.ui_manager.handle_event(
+                UIEvent(
+                    event_type=EventType.STEP_START,
+                    message="Docker Environment",
+                    phase=PhaseType.SETUP,
+                    details="Checking Docker availability...",
+                    level="info",
+                )
+            )
 
             # Update status for creating container
-            self.ui_manager.handle_event(UIEvent(
-                event_type=EventType.STATUS_UPDATE,
-                message="Creating container...",
-                phase=PhaseType.SETUP,
-                level="info"
-            ))
+            self.ui_manager.handle_event(
+                UIEvent(
+                    event_type=EventType.STATUS_UPDATE,
+                    message="Creating container...",
+                    phase=PhaseType.SETUP,
+                    level="info",
+                )
+            )
 
             try:
                 # Create and start container
@@ -681,41 +716,49 @@ Please start by checking the current context and then proceed with the task.
 
                 if success:
                     # Update status for configuring environment
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.STATUS_UPDATE,
-                        message="Configuring environment...",
-                        phase=PhaseType.SETUP,
-                        level="info"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.STATUS_UPDATE,
+                            message="Configuring environment...",
+                            phase=PhaseType.SETUP,
+                            level="info",
+                        )
+                    )
 
                     # Mark step complete
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.STEP_COMPLETE,
-                        message="Docker Environment",
-                        phase=PhaseType.SETUP,
-                        details="Container ready",
-                        level="success"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.STEP_COMPLETE,
+                            message="Docker Environment",
+                            phase=PhaseType.SETUP,
+                            details="Container ready",
+                            level="success",
+                        )
+                    )
                     logger.info("Docker environment setup completed")
                     return True
                 else:
-                    self.ui_manager.handle_event(UIEvent(
-                        event_type=EventType.STEP_ERROR,
-                        message="Docker Environment",
-                        phase=PhaseType.SETUP,
-                        details="Failed to create container",
-                        level="error"
-                    ))
+                    self.ui_manager.handle_event(
+                        UIEvent(
+                            event_type=EventType.STEP_ERROR,
+                            message="Docker Environment",
+                            phase=PhaseType.SETUP,
+                            details="Failed to create container",
+                            level="error",
+                        )
+                    )
                     logger.error("Docker environment setup failed")
                     return False
 
             except Exception as e:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.ERROR,
-                    message=f"Docker setup error: {e}",
-                    phase=PhaseType.SETUP,
-                    level="error"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.ERROR,
+                        message=f"Docker setup error: {e}",
+                        phase=PhaseType.SETUP,
+                        level="error",
+                    )
+                )
                 logger.error(f"Docker setup error: {e}")
                 return False
         else:
@@ -824,12 +867,14 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 
         if self.config.ui_mode:
             # UI Mode: emit phase events for build
-            self.ui_manager.handle_event(UIEvent(
-                event_type=EventType.PHASE_START,
-                message="Running project setup",
-                phase=PhaseType.BUILD,
-                level="info"
-            ))
+            self.ui_manager.handle_event(
+                UIEvent(
+                    event_type=EventType.PHASE_START,
+                    message="Running project setup",
+                    phase=PhaseType.BUILD,
+                    level="info",
+                )
+            )
 
             success = self.react_engine.run_react_loop(
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
@@ -840,19 +885,23 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 
             # Emit build phase completion
             if verified_success:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_COMPLETE,
-                    message="Build and test completed",
-                    phase=PhaseType.BUILD,
-                    level="success"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_COMPLETE,
+                        message="Build and test completed",
+                        phase=PhaseType.BUILD,
+                        level="success",
+                    )
+                )
             else:
-                self.ui_manager.handle_event(UIEvent(
-                    event_type=EventType.PHASE_ERROR,
-                    message="Build or test failed",
-                    phase=PhaseType.BUILD,
-                    level="error"
-                ))
+                self.ui_manager.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_ERROR,
+                        message="Build or test failed",
+                        phase=PhaseType.BUILD,
+                        level="error",
+                    )
+                )
 
             return verified_success
         else:

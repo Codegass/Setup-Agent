@@ -314,6 +314,7 @@ def suppress_console_logging():
         # Legacy log file if configured
         if config.log_file:
             from pathlib import Path
+
             legacy_log_path = Path(config.log_file)
             logger.add(
                 str(legacy_log_path),

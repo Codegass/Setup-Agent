@@ -10,8 +10,9 @@ exist in code vs what actually ran.
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Any
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 from loguru import logger
 
 
@@ -26,6 +27,7 @@ class TestCaseDescriptor:
         file_path: Path to source file relative to project root
         module: Optional module name for multi-module projects
     """
+
     package: str
     class_name: str
     method_name: str
@@ -39,7 +41,7 @@ class TestCaseDescriptor:
             "class_name": self.class_name,
             "method_name": self.method_name,
             "file_path": self.file_path,
-            "module": self.module
+            "module": self.module,
         }
 
 
@@ -56,6 +58,7 @@ class RuntimeTestCaseRecord:
         sources: Set of report file paths this test appeared in
         raw_names: Original test names before normalization (for debugging)
     """
+
     descriptor: Optional[TestCaseDescriptor]
     key: str
     statuses: List[str] = field(default_factory=list)
@@ -73,7 +76,7 @@ class RuntimeTestCaseRecord:
             "final_status": self.final_status,
             "execution_time_ms": self.execution_time_ms,
             "sources": list(self.sources),
-            "raw_names": self.raw_names[:5]  # Limit for memory
+            "raw_names": self.raw_names[:5],  # Limit for memory
         }
 
 
@@ -131,13 +134,8 @@ class TestCaseCatalog:
         """Convert catalog to dictionary for serialization."""
         return {
             "total_count": self.count(),
-            "by_module": {
-                module: len(keys) for module, keys in self._by_module.items()
-            },
-            "descriptors": {
-                key: desc.to_dict()
-                for key, desc in self._descriptors.items()
-            }
+            "by_module": {module: len(keys) for module, keys in self._by_module.items()},
+            "descriptors": {key: desc.to_dict() for key, desc in self._descriptors.items()},
         }
 
 
@@ -152,9 +150,7 @@ def generate_test_case_key(descriptor: TestCaseDescriptor) -> str:
 
 
 def normalize_testcase_identifier(
-    classname: Optional[str],
-    name: Optional[str],
-    file_path: Optional[str] = None
+    classname: Optional[str], name: Optional[str], file_path: Optional[str] = None
 ) -> Optional[str]:
     """Normalize a test case identifier from runtime XML data.
 
@@ -177,12 +173,12 @@ def normalize_testcase_identifier(
     # Clean up classname
     if classname:
         # Handle nested classes
-        classname = classname.replace('$', '.')
+        classname = classname.replace("$", ".")
         classname = classname.strip()
     elif file_path:
         # Try to derive from file path as fallback
-        classname = file_path.replace('/', '.').replace('.java', '').replace('.class', '')
-        classname = classname.strip('.')
+        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "")
+        classname = classname.strip(".")
     else:
         # Can't create a proper key without class context
         return method_name
@@ -207,16 +203,16 @@ def normalize_method_name(method_name: str) -> str:
 
     # Strip parameterized test indices and parameters
     # Handle [index] format
-    if '[' in name:
-        name = name.split('[')[0]
+    if "[" in name:
+        name = name.split("[")[0]
 
     # Handle (parameters) format
-    if '(' in name:
-        name = name.split('(')[0]
+    if "(" in name:
+        name = name.split("(")[0]
 
     # Handle Spock-style #index format
-    if ' #' in name:
-        name = name.split(' #')[0]
+    if " #" in name:
+        name = name.split(" #")[0]
 
     # Don't remove trailing digits - they may be part of the method name!
     # Only clean up trailing whitespace
@@ -393,22 +389,22 @@ PY"""
 
         try:
             data = json.loads(output.splitlines()[-1])
-            test_cases = data.get('test_cases', [])
+            test_cases = data.get("test_cases", [])
 
             for tc in test_cases:
                 descriptor = TestCaseDescriptor(
-                    package=tc.get('package', ''),
-                    class_name=tc.get('class_name', ''),
-                    method_name=tc.get('method_name', ''),
-                    file_path=tc.get('file_path', ''),
-                    module=tc.get('module')
+                    package=tc.get("package", ""),
+                    class_name=tc.get("class_name", ""),
+                    method_name=tc.get("method_name", ""),
+                    file_path=tc.get("file_path", ""),
+                    module=tc.get("module"),
                 )
                 catalog.add(descriptor)
 
             logger.info(f"📊 Built test catalog with {catalog.count()} test methods")
 
             # Log module breakdown if multi-module
-            by_module = catalog.to_dict()['by_module']
+            by_module = catalog.to_dict()["by_module"]
             if by_module and len(by_module) > 1:
                 logger.info(f"   Multi-module breakdown: {by_module}")
 

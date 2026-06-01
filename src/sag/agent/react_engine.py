@@ -12,12 +12,12 @@ from loguru import logger
 from pydantic import BaseModel
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
-from sag.ui.events import UIEventEmitter, EventType, PhaseType
-
-from sag.tools.base import BaseTool, ToolResult
 from sag.reporting import render_condensed_summary
-from .context_manager import BranchContext, ContextManager, TrunkContext, BranchContextHistory
-from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
+from sag.tools.base import BaseTool, ToolResult
+from sag.ui.events import EventType, PhaseType, UIEventEmitter
+
+from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
+from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
 from .token_tracker import TokenTracker
@@ -1307,8 +1307,9 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                 # Emit UI event for thought
                 self.emit(
                     EventType.AGENT_THOUGHT,
-                    message=step.content[:200] + ("..." if len(step.content) > 200 else ""),  # Truncate for display
-                    step_num=self.current_iteration
+                    message=step.content[:200]
+                    + ("..." if len(step.content) > 200 else ""),  # Truncate for display
+                    step_num=self.current_iteration,
                 )
 
                 # Detailed logging in verbose mode
@@ -1336,7 +1337,7 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
                     message=f"Using {step.tool_name or 'tool'}",
                     step_num=self.current_iteration,
                     tool_name=step.tool_name or "unknown",
-                    tool_params=step.tool_params or {}
+                    tool_params=step.tool_params or {},
                 )
 
                 # Update token tracker with actual tool name for the last action token record
@@ -3005,8 +3006,9 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         # Emit UI event for observation
         self.emit(
             EventType.AGENT_OBSERVATION,
-            message=observation[:200] + ("..." if len(observation) > 200 else ""),  # Truncate for display
-            step_num=self.current_iteration
+            message=observation[:200]
+            + ("..." if len(observation) > 200 else ""),  # Truncate for display
+            step_num=self.current_iteration,
         )
 
         # DEPRECATED: Task completion detection now handled by state_evaluator

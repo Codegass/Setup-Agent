@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 class PhaseType(str, Enum):
     """High-level phases of the setup process"""
+
     SETUP = "setup"
     BUILD = "build"
     TEST = "test"
@@ -21,6 +22,7 @@ class PhaseType(str, Enum):
 
 class EventType(str, Enum):
     """Types of UI events"""
+
     # Phase events
     PHASE_START = "phase_start"
     PHASE_COMPLETE = "phase_complete"
@@ -80,6 +82,7 @@ class UIEvent:
         level: Importance level (info, warning, error)
         metadata: Additional metadata for the event
     """
+
     event_type: EventType
     message: str
     phase: Optional[PhaseType] = None
@@ -119,7 +122,7 @@ class UIEventEmitter:
         phase: Optional[PhaseType] = None,
         details: Optional[str] = None,
         level: str = "info",
-        **metadata
+        **metadata,
     ):
         """
         Convenience method to create and emit an event
@@ -138,6 +141,6 @@ class UIEventEmitter:
             phase=phase,
             details=details,
             level=level,
-            metadata=metadata
+            metadata=metadata,
         )
         self.emit_event(event)

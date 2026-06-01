@@ -32,7 +32,9 @@ def format_percentage(value: Optional[float], precision: int = 1) -> str:
     return f"{round(float(value), precision):.{precision}f}%"
 
 
-def format_attention_items(attention_items: List[str], max_items: int = DEFAULT_MAX_ATTENTION_ITEMS) -> List[str]:
+def format_attention_items(
+    attention_items: List[str], max_items: int = DEFAULT_MAX_ATTENTION_ITEMS
+) -> List[str]:
     """Limit attention lines to a manageable number while preserving order."""
     if not attention_items:
         return []
@@ -107,14 +109,14 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
             pass_pct = evidence.get("tests_pass_pct")
             execution_rate = status.get("execution_rate")
             test_line = f"🧪 Tests: {evidence['tests_total']} executed"
-            
+
             # Add pass rate
             test_line += f" (pass rate {format_percentage(pass_pct)}"
-            
+
             # Add execution rate if available
             if execution_rate is not None:
                 test_line += f", execution rate {format_percentage(execution_rate)}"
-            
+
             test_line += ")"
             lines.append(test_line)
 

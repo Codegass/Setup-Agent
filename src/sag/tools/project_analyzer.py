@@ -2,11 +2,13 @@
 
 import json
 import re
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
+
 from loguru import logger
 
+from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
+
 from .base import BaseTool, ToolResult
-from sag.testcases.catalog import build_java_test_catalog, TestCaseCatalog
 
 
 class ProjectAnalyzerTool(BaseTool):
@@ -29,17 +31,17 @@ class ProjectAnalyzerTool(BaseTool):
         action: str = "analyze",
         project_path: str = "/workspace",
         update_context: bool = True,
-        **kwargs
+        **kwargs,
     ) -> ToolResult:
         """
         Analyze project and generate execution plan.
-        
+
         Args:
             action: Action to perform ('analyze' for full analysis)
             project_path: Path to the project directory in container
             update_context: Whether to update the trunk context with new tasks
         """
-        
+
         # Check for unexpected parameters
         if kwargs:
             invalid_params = list(kwargs.keys())
@@ -54,9 +56,9 @@ class ProjectAnalyzerTool(BaseTool):
                     f"Example: project_analyzer(action='analyze', project_path='/workspace/myproject')\n"
                     f"Example: project_analyzer()"  # Uses all defaults
                 ),
-                error=f"Invalid parameters: {invalid_params}"
+                error=f"Invalid parameters: {invalid_params}",
             )
-        
+
         logger.info(f"Starting project analysis at: {project_path}")
 
         try:
@@ -72,16 +74,16 @@ class ProjectAnalyzerTool(BaseTool):
                             "Ensure the project has been cloned successfully",
                             "Check if the project contains build files (pom.xml, build.gradle, package.json, etc.)",
                             "Try specifying the exact project directory path",
-                            "Use bash tool to list directory contents: bash(command='ls -la /workspace')"
+                            "Use bash tool to list directory contents: bash(command='ls -la /workspace')",
                         ],
-                        error_code="PROJECT_NOT_FOUND"
+                        error_code="PROJECT_NOT_FOUND",
                     )
-                
+
                 logger.info(f"✅ Using validated project path: {validated_path}")
-                
+
                 # Step 2: Perform comprehensive analysis
                 analysis_result = self._perform_comprehensive_analysis(validated_path)
-                
+
                 # Step 3: Validate analysis results
                 if not self._is_analysis_valid(analysis_result):
                     return ToolResult(
@@ -92,11 +94,11 @@ class ProjectAnalyzerTool(BaseTool):
                             "Verify the project is properly structured",
                             "Check if build files are accessible",
                             "Ensure the project directory is correct",
-                            "Try manual analysis with bash tool"
+                            "Try manual analysis with bash tool",
                         ],
-                        error_code="ANALYSIS_FAILED"
+                        error_code="ANALYSIS_FAILED",
                     )
-                
+
                 # Step 4: Update context if requested
                 if update_context and self.context_manager:
                     success = self._update_trunk_context_with_plan(analysis_result)
@@ -105,11 +107,11 @@ class ProjectAnalyzerTool(BaseTool):
                     else:
                         analysis_result["context_updated"] = False
                         analysis_result["context_error"] = "Failed to update trunk context"
-                
+
                 return ToolResult(
                     success=True,
                     output=self._format_analysis_output(analysis_result),
-                    metadata=analysis_result
+                    metadata=analysis_result,
                 )
             else:
                 return ToolResult(
@@ -126,10 +128,10 @@ class ProjectAnalyzerTool(BaseTool):
                     error=f"Invalid action: {action}",
                     suggestions=[
                         "Use action='analyze' to perform comprehensive project analysis",
-                        "Check the tool documentation for valid actions"
-                    ]
+                        "Check the tool documentation for valid actions",
+                    ],
                 )
-                
+
         except Exception as e:
             logger.error(f"Failed to analyze project: {e}")
             return ToolResult(
@@ -139,9 +141,9 @@ class ProjectAnalyzerTool(BaseTool):
                 suggestions=[
                     "Check if project is properly cloned and accessible",
                     "Verify Docker container has access to the project directory",
-                    "Try using bash tool to manually inspect the project structure"
+                    "Try using bash tool to manually inspect the project structure",
                 ],
-                error_code="ANALYSIS_EXCEPTION"
+                error_code="ANALYSIS_EXCEPTION",
             )
 
     def _perform_comprehensive_analysis(self, project_path: str) -> Dict[str, Any]:
@@ -156,7 +158,7 @@ class ProjectAnalyzerTool(BaseTool):
             "documentation": {},
             "special_requirements": [],
             "execution_plan": [],
-            "static_test_count": None  # Add static test count field
+            "static_test_count": None,  # Add static test count field
         }
 
         # Step 1: 检测项目基本结构
@@ -189,7 +191,7 @@ class ProjectAnalyzerTool(BaseTool):
                 analysis["test_count_method"] = "catalog_based_discovery"
 
                 # Extract module information if multi-module
-                by_module = test_catalog.to_dict()['by_module']
+                by_module = test_catalog.to_dict()["by_module"]
                 if by_module:
                     analysis["test_modules"] = by_module
 
@@ -200,8 +202,8 @@ class ProjectAnalyzerTool(BaseTool):
 
                 # For backward compatibility, still get annotation counts
                 test_count_result = self._count_java_test_with_expansions(project_path)
-                if test_count_result.get('parameterized_info'):
-                    analysis["parameterized_info"] = test_count_result.get('parameterized_info', {})
+                if test_count_result.get("parameterized_info"):
+                    analysis["parameterized_info"] = test_count_result.get("parameterized_info", {})
             else:
                 logger.debug("No test methods discovered in Java project")
 
@@ -218,18 +220,18 @@ class ProjectAnalyzerTool(BaseTool):
 
         # 检查关键文件存在性
         files_to_check = [
-            "pom.xml",           # Maven
-            "build.gradle",      # Gradle  
-            "package.json",      # Node.js
+            "pom.xml",  # Maven
+            "build.gradle",  # Gradle
+            "package.json",  # Node.js
             "requirements.txt",  # Python
-            "pyproject.toml",    # Python Poetry
-            "Cargo.toml",        # Rust
-            "go.mod",           # Go
-            "CMakeLists.txt",   # CMake
-            "Makefile",         # Make
+            "pyproject.toml",  # Python Poetry
+            "Cargo.toml",  # Rust
+            "go.mod",  # Go
+            "CMakeLists.txt",  # CMake
+            "Makefile",  # Make
             "README.md",
             "README.txt",
-            "README"
+            "README",
         ]
 
         existing_files = []
@@ -268,7 +270,7 @@ class ProjectAnalyzerTool(BaseTool):
         return {
             "project_type": project_type,
             "build_system": build_system,
-            "existing_files": existing_files
+            "existing_files": existing_files,
         }
 
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
@@ -279,7 +281,7 @@ class ProjectAnalyzerTool(BaseTool):
             "build_commands": [],
             "test_commands": [],
             "requirements": [],
-            "java_version_requirement": None
+            "java_version_requirement": None,
         }
 
         if not self.docker_orchestrator:
@@ -304,9 +306,9 @@ class ProjectAnalyzerTool(BaseTool):
                 r"Java\s+(\d+)",
                 r"JDK\s+(\d+)",
                 r"java\.version.*?(\d+)",
-                r"requires.*Java\s+(\d+)"
+                r"requires.*Java\s+(\d+)",
             ]
-            
+
             for pattern in java_patterns:
                 match = re.search(pattern, readme_content, re.IGNORECASE)
                 if match:
@@ -321,7 +323,7 @@ class ProjectAnalyzerTool(BaseTool):
                 r"gradle.*?build",
                 r"npm.*?build",
                 r"pip install",
-                r"python setup\.py"
+                r"python setup\.py",
             ]
 
             for pattern in build_patterns:
@@ -338,7 +340,7 @@ class ProjectAnalyzerTool(BaseTool):
                 r"gradle.*?test",
                 r"npm.*?test",
                 r"pytest",
-                r"python.*?test"
+                r"python.*?test",
             ]
 
             for pattern in test_patterns:
@@ -349,41 +351,41 @@ class ProjectAnalyzerTool(BaseTool):
                     # Filter out invalid test commands
                     if clean_cmd and clean_cmd not in documentation["test_commands"]:
                         # Skip commands with -Dtest without a value (invalid Maven syntax)
-                        if '-Dtest' in clean_cmd and not re.search(r'-Dtest=\S+', clean_cmd):
+                        if "-Dtest" in clean_cmd and not re.search(r"-Dtest=\S+", clean_cmd):
                             # Fix the command by removing invalid -Dtest
-                            clean_cmd = clean_cmd.replace('-Dtest', '').strip()
+                            clean_cmd = clean_cmd.replace("-Dtest", "").strip()
                             # If it becomes just 'mvn clean install', change to 'mvn clean test'
-                            if clean_cmd == 'mvn clean install -Dossindex.skip':
-                                clean_cmd = 'mvn clean test -Dossindex.skip'
+                            if clean_cmd == "mvn clean install -Dossindex.skip":
+                                clean_cmd = "mvn clean test -Dossindex.skip"
                         documentation["test_commands"].append(clean_cmd)
 
         return documentation
-    
+
     def _clean_markdown_command(self, command: str) -> str:
         """清理从markdown中提取的命令，移除格式化字符"""
         if not command:
             return ""
-        
+
         clean_cmd = command.strip()
-        
+
         # 移除markdown代码块标记
-        clean_cmd = re.sub(r'^```[a-z]*\s*', '', clean_cmd)  # 移除开始的```bash等
-        clean_cmd = re.sub(r'\s*```$', '', clean_cmd)        # 移除结束的```
-        
+        clean_cmd = re.sub(r"^```[a-z]*\s*", "", clean_cmd)  # 移除开始的```bash等
+        clean_cmd = re.sub(r"\s*```$", "", clean_cmd)  # 移除结束的```
+
         # 移除反引号
-        clean_cmd = re.sub(r'^`+|`+$', '', clean_cmd)        # 移除首尾反引号
-        
+        clean_cmd = re.sub(r"^`+|`+$", "", clean_cmd)  # 移除首尾反引号
+
         # 移除shell提示符
-        clean_cmd = re.sub(r'^[>$#]\s*', '', clean_cmd)      # 移除常见的shell提示符
-        
+        clean_cmd = re.sub(r"^[>$#]\s*", "", clean_cmd)  # 移除常见的shell提示符
+
         # 移除多余的空白字符
-        clean_cmd = ' '.join(clean_cmd.split())
-        
+        clean_cmd = " ".join(clean_cmd.split())
+
         # 如果命令被截断或包含省略号，标记为需要验证
-        if '...' in clean_cmd or clean_cmd.endswith('.'):
+        if "..." in clean_cmd or clean_cmd.endswith("."):
             # 移除省略号
-            clean_cmd = clean_cmd.replace('...', '').rstrip('.')
-        
+            clean_cmd = clean_cmd.replace("...", "").rstrip(".")
+
         return clean_cmd.strip()
 
     def _analyze_build_configuration(self, project_path: str, project_type: str) -> Dict[str, Any]:
@@ -393,7 +395,7 @@ class ProjectAnalyzerTool(BaseTool):
             "dependencies": [],
             "plugins": [],
             "profiles": [],
-            "build_system": None
+            "build_system": None,
         }
 
         if not self.docker_orchestrator:
@@ -401,15 +403,22 @@ class ProjectAnalyzerTool(BaseTool):
 
         if project_type == "Java":
             # 首先检查是Maven还是Gradle项目
-            maven_exists = self.docker_orchestrator.execute_command(f"test -f {project_path}/pom.xml && echo 'exists'")
-            gradle_exists = self.docker_orchestrator.execute_command(f"test -f {project_path}/build.gradle && echo 'exists'")
-            gradle_kts_exists = self.docker_orchestrator.execute_command(f"test -f {project_path}/build.gradle.kts && echo 'exists'")
-            
+            maven_exists = self.docker_orchestrator.execute_command(
+                f"test -f {project_path}/pom.xml && echo 'exists'"
+            )
+            gradle_exists = self.docker_orchestrator.execute_command(
+                f"test -f {project_path}/build.gradle && echo 'exists'"
+            )
+            gradle_kts_exists = self.docker_orchestrator.execute_command(
+                f"test -f {project_path}/build.gradle.kts && echo 'exists'"
+            )
+
             if maven_exists.get("success") and "exists" in maven_exists.get("output", ""):
                 config["build_system"] = "Maven"
                 self._analyze_maven_configuration(project_path, config)
-            elif (gradle_exists.get("success") and "exists" in gradle_exists.get("output", "")) or \
-                 (gradle_kts_exists.get("success") and "exists" in gradle_kts_exists.get("output", "")):
+            elif (gradle_exists.get("success") and "exists" in gradle_exists.get("output", "")) or (
+                gradle_kts_exists.get("success") and "exists" in gradle_kts_exists.get("output", "")
+            ):
                 config["build_system"] = "Gradle"
                 self._analyze_gradle_configuration(project_path, config)
 
@@ -421,27 +430,31 @@ class ProjectAnalyzerTool(BaseTool):
         result = self.docker_orchestrator.execute_command(f"cat {project_path}/pom.xml")
         if not result.get("success"):
             return
-            
+
         main_pom_content = result.get("output", "")
-        
+
         # Check if this is a multi-module project and look for parent POMs
         all_pom_contents = [main_pom_content]
         pom_locations = [f"{project_path}/pom.xml"]
-        
+
         # Check for parent module reference (e.g., tika-parent)
-        parent_match = re.search(r"<parent>.*?<artifactId>([^<]+)</artifactId>.*?</parent>", main_pom_content, re.DOTALL)
+        parent_match = re.search(
+            r"<parent>.*?<artifactId>([^<]+)</artifactId>.*?</parent>", main_pom_content, re.DOTALL
+        )
         if parent_match:
             parent_artifact = parent_match.group(1)
             # Try to find the parent POM in common locations
             potential_parent_paths = [
                 f"{project_path}/{parent_artifact}/pom.xml",
                 f"{project_path}/../{parent_artifact}/pom.xml",
-                f"{project_path}/parent/pom.xml"
+                f"{project_path}/parent/pom.xml",
             ]
-            
+
             for parent_path in potential_parent_paths:
                 # First check if parent POM exists
-                check_result = self.docker_orchestrator.execute_command(f"test -f {parent_path} && echo 'exists' 2>/dev/null")
+                check_result = self.docker_orchestrator.execute_command(
+                    f"test -f {parent_path} && echo 'exists' 2>/dev/null"
+                )
                 if check_result.get("success") and "exists" in check_result.get("output", ""):
                     # Extract just the properties section to avoid truncation
                     props_result = self.docker_orchestrator.execute_command(
@@ -454,42 +467,48 @@ class ProjectAnalyzerTool(BaseTool):
                         pom_locations.append(parent_path)
                         logger.info(f"Found parent POM at: {parent_path}")
                     break
-        
+
         # Analyze all POM contents for Java version
         java_version = None
         java_version_source = None
         java_version_enforced = False
-        
+
         for idx, pom_content in enumerate(all_pom_contents):
             if java_version:
                 break  # Already found
-                
+
             # 1. First check Maven Enforcer plugin for RequireJavaVersion
-            enforcer_pattern = r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            enforcer_pattern = (
+                r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            )
             enforcer_match = re.search(enforcer_pattern, pom_content, re.DOTALL | re.IGNORECASE)
             if enforcer_match:
                 java_version = enforcer_match.group(1).strip()
                 java_version_source = "maven-enforcer"
                 java_version_enforced = True
-                logger.info(f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}")
+                logger.info(
+                    f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
+                )
                 break
-            
+
             # 2. Check standard properties
             java_version_patterns = [
                 r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
                 r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
                 r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
-                r"<java\.version>([^<]+)</java\.version>"
+                r"<java\.version>([^<]+)</java\.version>",
             ]
-            
+
             for pattern in java_version_patterns:
                 match = re.search(pattern, pom_content)
                 if match:
                     java_version = match.group(1).strip()
                     java_version_source = "maven-compiler"
-                    logger.info(f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}")
+                    logger.info(
+                        f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
+                    )
                     break
-        
+
         if java_version:
             # Normalize version (e.g., "1.8" -> "8")
             if java_version.startswith("1."):
@@ -513,35 +532,43 @@ class ProjectAnalyzerTool(BaseTool):
             config["is_multi_module"] = False
 
         # Extract dependencies from main POM only
-        dependency_matches = re.findall(r"<groupId>([^<]+)</groupId>.*?<artifactId>([^<]+)</artifactId>", main_pom_content, re.DOTALL)
-        config["dependencies"] = [f"{group}:{artifact}" for group, artifact in dependency_matches[:10]]  # 限制输出
+        dependency_matches = re.findall(
+            r"<groupId>([^<]+)</groupId>.*?<artifactId>([^<]+)</artifactId>",
+            main_pom_content,
+            re.DOTALL,
+        )
+        config["dependencies"] = [
+            f"{group}:{artifact}" for group, artifact in dependency_matches[:10]
+        ]  # 限制输出
 
     def _analyze_gradle_configuration(self, project_path: str, config: Dict[str, Any]):
         """分析Gradle配置（build.gradle 或 build.gradle.kts）"""
         # 首先尝试读取 build.gradle
         gradle_content = ""
         gradle_file = ""
-        
+
         result = self.docker_orchestrator.execute_command(f"cat {project_path}/build.gradle")
         if result.get("success"):
             gradle_content = result.get("output", "")
             gradle_file = "build.gradle"
         else:
             # 尝试读取 build.gradle.kts
-            result = self.docker_orchestrator.execute_command(f"cat {project_path}/build.gradle.kts")
+            result = self.docker_orchestrator.execute_command(
+                f"cat {project_path}/build.gradle.kts"
+            )
             if result.get("success"):
                 gradle_content = result.get("output", "")
                 gradle_file = "build.gradle.kts"
 
         if gradle_content:
             logger.info(f"Analyzing Gradle configuration from {gradle_file}")
-            
+
             # 提取 Java 版本
             self._extract_gradle_java_version(gradle_content, config)
-            
+
             # 提取依赖信息
             self._extract_gradle_dependencies(gradle_content, config)
-            
+
             # 提取插件信息
             self._extract_gradle_plugins(gradle_content, config)
 
@@ -552,18 +579,16 @@ class ProjectAnalyzerTool(BaseTool):
             r"java\s*\{\s*toolchain\s*\{\s*languageVersion\s*=\s*JavaLanguageVersion\.of\((\d+)\)",
             r"languageVersion\.set\(JavaLanguageVersion\.of\((\d+)\)\)",
             r"java\.toolchain\.languageVersion\s*=\s*JavaLanguageVersion\.of\((\d+)\)",
-            
             # Source/Target compatibility
             r"sourceCompatibility\s*=\s*['\"]?(\d+(?:\.\d+)?)['\"]?",
             r"targetCompatibility\s*=\s*['\"]?(\d+(?:\.\d+)?)['\"]?",
             r"sourceCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)",
             r"targetCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)",
-            
             # Kotlin DSL style
             r"java\.sourceCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)",
             r"java\.targetCompatibility\s*=\s*JavaVersion\.VERSION_(\d+)",
         ]
-        
+
         for pattern in java_version_patterns:
             match = re.search(pattern, gradle_content, re.IGNORECASE | re.MULTILINE)
             if match:
@@ -591,7 +616,7 @@ class ProjectAnalyzerTool(BaseTool):
             r"implementation\(['\"]([^:]+):([^:]+):[^'\"]+['\"]\)",
             r"api\(['\"]([^:]+):([^:]+):[^'\"]+['\"]\)",
         ]
-        
+
         dependencies = []
         for pattern in dependency_patterns:
             matches = re.findall(pattern, gradle_content, re.MULTILINE)
@@ -599,7 +624,7 @@ class ProjectAnalyzerTool(BaseTool):
                 dep = f"{group}:{artifact}"
                 if dep not in dependencies:
                     dependencies.append(dep)
-        
+
         # 限制输出数量并去重
         config["dependencies"] = dependencies[:15]
         if dependencies:
@@ -615,14 +640,14 @@ class ProjectAnalyzerTool(BaseTool):
             # Kotlin DSL: id("plugin-name")
             r"id\(['\"]([^'\"]+)['\"]\)",
         ]
-        
+
         plugins = []
         for pattern in plugin_patterns:
             matches = re.findall(pattern, gradle_content, re.MULTILINE)
             for plugin in matches:
                 if plugin not in plugins:
                     plugins.append(plugin)
-        
+
         config["plugins"] = plugins[:10]  # 限制输出
         if plugins:
             logger.info(f"Found Gradle plugins: {', '.join(plugins)}")
@@ -633,7 +658,7 @@ class ProjectAnalyzerTool(BaseTool):
             "test_framework": "unknown",
             "test_directories": [],
             "test_patterns": [],
-            "build_system": None
+            "build_system": None,
         }
 
         if not self.docker_orchestrator:
@@ -642,22 +667,31 @@ class ProjectAnalyzerTool(BaseTool):
         # 检查测试目录
         test_dirs = ["src/test", "test", "tests", "__tests__"]
         for test_dir in test_dirs:
-            result = self.docker_orchestrator.execute_command(f"test -d {project_path}/{test_dir} && echo 'exists'")
+            result = self.docker_orchestrator.execute_command(
+                f"test -d {project_path}/{test_dir} && echo 'exists'"
+            )
             if result.get("success") and "exists" in result.get("output", ""):
                 test_config["test_directories"].append(test_dir)
 
         # 根据项目类型检测测试框架
         if project_type == "Java":
             # 检查是Maven还是Gradle项目
-            maven_exists = self.docker_orchestrator.execute_command(f"test -f {project_path}/pom.xml && echo 'exists'")
-            gradle_exists = self.docker_orchestrator.execute_command(f"test -f {project_path}/build.gradle && echo 'exists'")
-            gradle_kts_exists = self.docker_orchestrator.execute_command(f"test -f {project_path}/build.gradle.kts && echo 'exists'")
-            
+            maven_exists = self.docker_orchestrator.execute_command(
+                f"test -f {project_path}/pom.xml && echo 'exists'"
+            )
+            gradle_exists = self.docker_orchestrator.execute_command(
+                f"test -f {project_path}/build.gradle && echo 'exists'"
+            )
+            gradle_kts_exists = self.docker_orchestrator.execute_command(
+                f"test -f {project_path}/build.gradle.kts && echo 'exists'"
+            )
+
             if maven_exists.get("success") and "exists" in maven_exists.get("output", ""):
                 test_config["build_system"] = "Maven"
                 self._detect_maven_test_framework(project_path, test_config)
-            elif (gradle_exists.get("success") and "exists" in gradle_exists.get("output", "")) or \
-                 (gradle_kts_exists.get("success") and "exists" in gradle_kts_exists.get("output", "")):
+            elif (gradle_exists.get("success") and "exists" in gradle_exists.get("output", "")) or (
+                gradle_kts_exists.get("success") and "exists" in gradle_kts_exists.get("output", "")
+            ):
                 test_config["build_system"] = "Gradle"
                 self._detect_gradle_test_framework(project_path, test_config)
 
@@ -669,9 +703,11 @@ class ProjectAnalyzerTool(BaseTool):
         result = self.docker_orchestrator.execute_command(f"grep -r 'junit' {project_path}/pom.xml")
         if result.get("success") and result.get("output"):
             test_config["test_framework"] = "JUnit"
-        
+
         # 检查是否使用 TestNG
-        result = self.docker_orchestrator.execute_command(f"grep -r 'testng' {project_path}/pom.xml")
+        result = self.docker_orchestrator.execute_command(
+            f"grep -r 'testng' {project_path}/pom.xml"
+        )
         if result.get("success") and result.get("output"):
             test_config["test_framework"] = "TestNG"
 
@@ -684,7 +720,9 @@ class ProjectAnalyzerTool(BaseTool):
             gradle_content = result.get("output", "")
         else:
             # 尝试读取build.gradle.kts文件
-            result = self.docker_orchestrator.execute_command(f"cat {project_path}/build.gradle.kts")
+            result = self.docker_orchestrator.execute_command(
+                f"cat {project_path}/build.gradle.kts"
+            )
             if result.get("success"):
                 gradle_content = result.get("output", "")
 
@@ -695,7 +733,9 @@ class ProjectAnalyzerTool(BaseTool):
                 test_config["test_framework"] = ", ".join(test_frameworks)
                 logger.info(f"Found Gradle test frameworks: {test_frameworks}")
 
-    def _estimate_total_test_cases(self, project_path: str, project_type: str, build_system: str) -> Optional[int]:
+    def _estimate_total_test_cases(
+        self, project_path: str, project_type: str, build_system: str
+    ) -> Optional[int]:
         """(Deprecated) Test estimation disabled."""
         return None
 
@@ -804,7 +844,7 @@ PY"""
             - 'parameterized_info': Details about parameterized tests
         """
         if not self.docker_orchestrator:
-            return {'method_count': None, 'total_test_count': None}
+            return {"method_count": None, "total_test_count": None}
 
         # Always calculate the raw annotation total first so we have a baseline
         # even if the per-annotation breakdown command fails.
@@ -812,21 +852,27 @@ PY"""
 
         counts = self._get_java_test_annotation_counts(project_path)
         if counts is None and method_count is None:
-            return {'method_count': None, 'total_test_count': None}
+            return {"method_count": None, "total_test_count": None}
 
         # When both approaches succeed use the scripted breakdown so we can
         # populate the parameterized metadata, but prefer the streaming grep
         # total as a guard against bugs in either implementation.
         if counts is None:
-            counts = {'Test': 0, 'ParameterizedTest': 0, 'RepeatedTest': 0,
-                      'TestFactory': 0, 'TestTemplate': 0, 'DynamicTest': 0}
+            counts = {
+                "Test": 0,
+                "ParameterizedTest": 0,
+                "RepeatedTest": 0,
+                "TestFactory": 0,
+                "TestTemplate": 0,
+                "DynamicTest": 0,
+            }
 
-        regular_tests = counts.get('Test', 0)
-        parameterized_methods = counts.get('ParameterizedTest', 0)
-        repeated_tests = counts.get('RepeatedTest', 0)
-        factory_methods = counts.get('TestFactory', 0)
-        template_methods = counts.get('TestTemplate', 0)
-        dynamic_tests = counts.get('DynamicTest', 0)
+        regular_tests = counts.get("Test", 0)
+        parameterized_methods = counts.get("ParameterizedTest", 0)
+        repeated_tests = counts.get("RepeatedTest", 0)
+        factory_methods = counts.get("TestFactory", 0)
+        template_methods = counts.get("TestTemplate", 0)
+        dynamic_tests = counts.get("DynamicTest", 0)
 
         breakdown_total = (
             regular_tests
@@ -850,17 +896,17 @@ PY"""
         total_test_count = method_count
 
         result = {
-            'method_count': method_count,
-            'total_test_count': total_test_count,
-            'parameterized_info': {
-                'regular_tests': regular_tests,
-                'parameterized_methods': parameterized_methods,
-                'parameterized_expansions': parameterized_methods,
-                'repeated_tests': repeated_tests,
-                'test_factory_methods': factory_methods,
-                'test_template_methods': template_methods,
-                'dynamic_tests': dynamic_tests,
-            }
+            "method_count": method_count,
+            "total_test_count": total_test_count,
+            "parameterized_info": {
+                "regular_tests": regular_tests,
+                "parameterized_methods": parameterized_methods,
+                "parameterized_expansions": parameterized_methods,
+                "repeated_tests": repeated_tests,
+                "test_factory_methods": factory_methods,
+                "test_template_methods": template_methods,
+                "dynamic_tests": dynamic_tests,
+            },
         }
 
         logger.info("📊 Test count analysis:")
@@ -879,14 +925,14 @@ PY"""
 
     def _count_java_test_annotations(self, project_path: str) -> Optional[int]:
         """Count all test annotations across Java test sources for a project.
-        
+
         Includes:
         - @Test (standard JUnit 4/5 tests)
         - @ParameterizedTest (JUnit 5 - runs multiple times with different parameters)
         - @RepeatedTest (JUnit 5 - runs multiple times)
         - @TestFactory (JUnit 5 - generates tests dynamically)
         - @TestTemplate (JUnit 5 - template for tests)
-        
+
         Note: This counts test METHOD declarations, not test EXECUTIONS.
         Parameterized tests will execute multiple times but are counted once here.
         """
@@ -898,30 +944,30 @@ PY"""
             return None
 
         total = (
-            counts.get('Test', 0)
-            + counts.get('ParameterizedTest', 0)
-            + counts.get('RepeatedTest', 0)
-            + counts.get('TestFactory', 0)
-            + counts.get('TestTemplate', 0)
-            + counts.get('DynamicTest', 0)
+            counts.get("Test", 0)
+            + counts.get("ParameterizedTest", 0)
+            + counts.get("RepeatedTest", 0)
+            + counts.get("TestFactory", 0)
+            + counts.get("TestTemplate", 0)
+            + counts.get("DynamicTest", 0)
         )
 
         if total > 0:
             logger.info(
                 f"📊 Found {total} test method annotations (Test/Parameterized/Repeated/Factory/Template)."
             )
-            param_methods = counts.get('ParameterizedTest', 0)
+            param_methods = counts.get("ParameterizedTest", 0)
             if param_methods:
                 logger.info(f"   - Includes {param_methods} parameterized test methods")
 
         return total if total > 0 else None
-    
+
     def _count_actual_test_executions(self, project_path: str) -> Optional[int]:
         """Count actual test executions (including parameterized test expansions).
-        
+
         This method attempts to get the true count of test cases that will execute,
         including all parameter variations of parameterized tests.
-        
+
         Approaches:
         1. Check existing surefire-reports XML files for test counts
         2. Run tests with minimal overhead to generate reports
@@ -929,7 +975,7 @@ PY"""
         """
         if not self.docker_orchestrator:
             return None
-        
+
         # First, try to get counts from existing test reports if available
         xml_count_cmd = (
             "if [ -d {project}/target/surefire-reports ]; then "
@@ -938,7 +984,7 @@ PY"""
             "awk '{{sum += $1}} END {{if (sum > 0) print sum; else print \"0\"}}'; "
             "else echo '0'; fi"
         ).format(project=project_path)
-        
+
         result = self.docker_orchestrator.execute_command(xml_count_cmd)
         if result.get("success"):
             output = (result.get("output") or "").strip()
@@ -949,11 +995,11 @@ PY"""
                     return count
             except ValueError:
                 pass
-        
+
         # If no existing reports, try to run tests in list-only mode (if supported)
         # Note: This is a lightweight operation that discovers tests without executing them
         # However, JUnit 5's console launcher or Maven's test discovery might be needed
-        
+
         # For now, we'll check if we can get a quick test count by running with failfast
         # This is still not ideal as it runs tests, but we limit the time
         discover_cmd = (
@@ -961,7 +1007,7 @@ PY"""
             "-DtrimStackTrace=false 2>&1 | grep -E '^\\[INFO\\] Tests run: [0-9]+' | "
             "tail -1 | sed 's/.*Tests run: \\([0-9]*\\).*/\\1/'"
         ).format(project=project_path)
-        
+
         # Actually, let's not run tests here - that's too expensive
         # Instead, return None to indicate we couldn't get actual execution count
         logger.debug("No existing test reports found, actual execution count unavailable")
@@ -970,52 +1016,52 @@ PY"""
     def _parse_gradle_test_frameworks(self, gradle_content: str) -> List[str]:
         """从Gradle配置中解析测试框架"""
         frameworks = []
-        
+
         # JUnit 检测模式
         junit_patterns = [
             r"junit['\"]?\s*:\s*['\"]?[0-9]",  # junit: '5.8.2'
-            r"['\"]junit['\"]",                # 'junit'
-            r"org\.junit\.jupiter",            # JUnit 5
-            r"junit-jupiter",                  # JUnit 5
-            r"junit-vintage",                  # JUnit 4 via JUnit 5
-            r"useJUnitPlatform\(\)",          # JUnit Platform configuration
+            r"['\"]junit['\"]",  # 'junit'
+            r"org\.junit\.jupiter",  # JUnit 5
+            r"junit-jupiter",  # JUnit 5
+            r"junit-vintage",  # JUnit 4 via JUnit 5
+            r"useJUnitPlatform\(\)",  # JUnit Platform configuration
         ]
-        
+
         # TestNG 检测模式
         testng_patterns = [
-            r"testng['\"]?\s*:\s*['\"]?[0-9]", # testng: '7.4.0'
-            r"['\"]testng['\"]",               # 'testng'
-            r"org\.testng",                    # TestNG package
+            r"testng['\"]?\s*:\s*['\"]?[0-9]",  # testng: '7.4.0'
+            r"['\"]testng['\"]",  # 'testng'
+            r"org\.testng",  # TestNG package
         ]
-        
+
         # Spock 检测模式（Groovy测试框架）
         spock_patterns = [
             r"spock-core",
             r"['\"]spock['\"]",
             r"org\.spockframework",
         ]
-        
+
         # 检测各种测试框架
         if any(re.search(pattern, gradle_content, re.IGNORECASE) for pattern in junit_patterns):
             frameworks.append("JUnit")
-        
+
         if any(re.search(pattern, gradle_content, re.IGNORECASE) for pattern in testng_patterns):
             frameworks.append("TestNG")
-        
+
         if any(re.search(pattern, gradle_content, re.IGNORECASE) for pattern in spock_patterns):
             frameworks.append("Spock")
-        
+
         # 检测Kotlin测试相关
         if re.search(r"kotlin.*test", gradle_content, re.IGNORECASE):
             frameworks.append("Kotlin Test")
-        
+
         return frameworks
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
         Generate intelligent execution plan based on THREE CORE STEPS:
         1. Clone repository (assumed already done by project_setup)
-        2. Build project (compile/package)  
+        2. Build project (compile/package)
         3. Test project (run tests)
         4. Generate report
         """
@@ -1026,7 +1072,9 @@ PY"""
         java_version = analysis.get("java_version")
         documentation = analysis.get("documentation", {})
 
-        logger.info(f"Generating three-step execution plan for {project_type} project with {build_system}")
+        logger.info(
+            f"Generating three-step execution plan for {project_type} project with {build_system}"
+        )
 
         # Handle unknown projects with fallback strategies
         if project_type == "unknown" or build_system == "unknown":
@@ -1038,77 +1086,91 @@ PY"""
             # Check if Java version is enforced (stricter requirement)
             is_enforced = analysis.get("java_version_enforced", False)
             version_source = analysis.get("java_version_source", "unknown")
-            
+
             if is_enforced:
-                plan.append({
-                    "id": "setup_java_environment",
-                    "description": f"Install and configure Java {java_version} (Required by Maven Enforcer)",
-                    "priority": "critical",
-                    "type": "environment",
-                    "core_step": "preparation",
-                    "commands": [
-                        f"bash(command='java -version 2>&1 | grep \"version\" || echo \"Java not found\"')",
-                        f"bash(command='apt-get update && apt-get install -y openjdk-{java_version}-jdk')",
-                        f"bash(command='update-alternatives --set java /usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
-                        f"bash(command='export JAVA_HOME=/usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture) && java -version')"
-                    ]
-                })
+                plan.append(
+                    {
+                        "id": "setup_java_environment",
+                        "description": f"Install and configure Java {java_version} (Required by Maven Enforcer)",
+                        "priority": "critical",
+                        "type": "environment",
+                        "core_step": "preparation",
+                        "commands": [
+                            f'bash(command=\'java -version 2>&1 | grep "version" || echo "Java not found"\')',
+                            f"bash(command='apt-get update && apt-get install -y openjdk-{java_version}-jdk')",
+                            f"bash(command='update-alternatives --set java /usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
+                            f"bash(command='export JAVA_HOME=/usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture) && java -version')",
+                        ],
+                    }
+                )
             else:
-                plan.append({
-                    "id": "setup_environment",
-                    "description": f"Verify Java {java_version} environment and install dependencies",
-                    "priority": "high",
-                    "type": "environment",
-                    "core_step": "preparation"
-                })
+                plan.append(
+                    {
+                        "id": "setup_environment",
+                        "description": f"Verify Java {java_version} environment and install dependencies",
+                        "priority": "high",
+                        "type": "environment",
+                        "core_step": "preparation",
+                    }
+                )
 
         # STEP 2: BUILD - Compile/package the project
         if project_type == "Java" and build_system == "Maven":
-            plan.append({
-                "id": "build_project",
-                "description": "Compile project using Maven",
-                "priority": "critical",
-                "type": "build", 
-                "core_step": "build"
-            })
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": "Compile project using Maven",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
         elif project_type == "Java" and build_system == "Gradle":
-            plan.append({
-                "id": "build_project", 
-                "description": "Compile project using Gradle",
-                "priority": "critical",
-                "type": "build",
-                "core_step": "build"
-            })
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": "Compile project using Gradle",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
         elif project_type == "Node.js":
-            plan.append({
-                "id": "build_project",
-                "description": "Build project using npm/yarn",
-                "priority": "critical", 
-                "type": "build",
-                "core_step": "build"
-            })
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": "Build project using npm/yarn",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
         elif project_type == "Python":
-            plan.append({
-                "id": "build_project",
-                "description": "Setup and validate Python project",
-                "priority": "critical",
-                "type": "build", 
-                "core_step": "build"
-            })
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": "Setup and validate Python project",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
         else:
             # Generic build step
-            plan.append({
-                "id": "build_project",
-                "description": f"Build {project_type} project using {build_system}",
-                "priority": "critical",
-                "type": "build",
-                "core_step": "build"
-            })
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": f"Build {project_type} project using {build_system}",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
 
         # STEP 3: TEST - Run project tests
         test_framework = analysis.get("test_framework", "unknown")
         test_commands = documentation.get("test_commands", [])
-        
+
         if test_commands:
             test_desc = f"Run tests using documented commands: {', '.join(test_commands[:2])}"
         elif project_type == "Java" and build_system == "Maven":
@@ -1138,31 +1200,37 @@ PY"""
             "description": test_desc,
             "priority": "critical",
             "type": "test",
-            "core_step": "test"
+            "core_step": "test",
         }
 
         # Add specific commands for multi-module Maven projects
-        if project_type == "Java" and build_system == "Maven" and analysis.get("is_multi_module", False):
+        if (
+            project_type == "Java"
+            and build_system == "Maven"
+            and analysis.get("is_multi_module", False)
+        ):
             test_step["commands"] = [
                 "maven(command='test', fail_at_end=True)",
-                "# This ensures all modules are tested even if some have failures"
+                "# This ensures all modules are tested even if some have failures",
             ]
             test_step["notes"] = "Multi-module project: use fail_at_end=True to test all modules"
 
         plan.append(test_step)
 
         # STEP 4: REPORT - Generate completion report
-        plan.append({
-            "id": "generate_completion_report",
-            "description": "Generate comprehensive setup completion report",
-            "priority": "high",
-            "type": "report",
-            "core_step": "report"
-        })
+        plan.append(
+            {
+                "id": "generate_completion_report",
+                "description": "Generate comprehensive setup completion report",
+                "priority": "high",
+                "type": "report",
+                "core_step": "report",
+            }
+        )
 
         logger.info(f"Generated {len(plan)} tasks in three-step execution plan")
         logger.info(f"Core steps: {[task.get('core_step') for task in plan]}")
-        
+
         return plan
 
     def _generate_fallback_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -1175,114 +1243,122 @@ PY"""
 
         # 检查是否有任何构建文件
         if "pom.xml" in existing_files:
-            plan.extend([
-                {
-                    "id": "analyze_maven_project",
-                    "description": "Analyze Maven project structure and dependencies",
-                    "priority": "high",
-                    "type": "analysis"
-                },
-                {
-                    "id": "setup_maven_environment",
-                    "description": "Setup Maven build environment and install dependencies",
-                    "priority": "high",
-                    "type": "environment"
-                },
-                {
-                    "id": "build_maven_project",
-                    "description": "Compile Maven project",
-                    "priority": "high",
-                    "type": "build"
-                },
-                {
-                    "id": "test_maven_project",
-                    "description": "Execute Maven project tests",
-                    "priority": "high",
-                    "type": "test"
-                }
-            ])
+            plan.extend(
+                [
+                    {
+                        "id": "analyze_maven_project",
+                        "description": "Analyze Maven project structure and dependencies",
+                        "priority": "high",
+                        "type": "analysis",
+                    },
+                    {
+                        "id": "setup_maven_environment",
+                        "description": "Setup Maven build environment and install dependencies",
+                        "priority": "high",
+                        "type": "environment",
+                    },
+                    {
+                        "id": "build_maven_project",
+                        "description": "Compile Maven project",
+                        "priority": "high",
+                        "type": "build",
+                    },
+                    {
+                        "id": "test_maven_project",
+                        "description": "Execute Maven project tests",
+                        "priority": "high",
+                        "type": "test",
+                    },
+                ]
+            )
         elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
-            plan.extend([
-                {
-                    "id": "analyze_gradle_project",
-                    "description": "Analyze Gradle project structure and dependencies",
-                    "priority": "high",
-                    "type": "analysis"
-                },
-                {
-                    "id": "setup_gradle_environment",
-                    "description": "Setup Gradle build environment and install dependencies",
-                    "priority": "high",
-                    "type": "environment"
-                },
-                {
-                    "id": "build_gradle_project",
-                    "description": "Compile Gradle project",
-                    "priority": "high",
-                    "type": "build"
-                },
-                {
-                    "id": "test_gradle_project",
-                    "description": "Execute Gradle project tests",
-                    "priority": "high",
-                    "type": "test"
-                }
-            ])
+            plan.extend(
+                [
+                    {
+                        "id": "analyze_gradle_project",
+                        "description": "Analyze Gradle project structure and dependencies",
+                        "priority": "high",
+                        "type": "analysis",
+                    },
+                    {
+                        "id": "setup_gradle_environment",
+                        "description": "Setup Gradle build environment and install dependencies",
+                        "priority": "high",
+                        "type": "environment",
+                    },
+                    {
+                        "id": "build_gradle_project",
+                        "description": "Compile Gradle project",
+                        "priority": "high",
+                        "type": "build",
+                    },
+                    {
+                        "id": "test_gradle_project",
+                        "description": "Execute Gradle project tests",
+                        "priority": "high",
+                        "type": "test",
+                    },
+                ]
+            )
         elif "package.json" in existing_files:
-            plan.extend([
-                {
-                    "id": "analyze_nodejs_project",
-                    "description": "Analyze Node.js project dependencies and scripts",
-                    "priority": "high",
-                    "type": "analysis"
-                },
-                {
-                    "id": "install_npm_dependencies",
-                    "description": "Install Node.js dependencies using npm/yarn",
-                    "priority": "high",
-                    "type": "dependencies"
-                },
-                {
-                    "id": "build_nodejs_project",
-                    "description": "Build Node.js project",
-                    "priority": "high",
-                    "type": "build"
-                },
-                {
-                    "id": "test_nodejs_project",
-                    "description": "Execute Node.js project tests",
-                    "priority": "high",
-                    "type": "test"
-                }
-            ])
+            plan.extend(
+                [
+                    {
+                        "id": "analyze_nodejs_project",
+                        "description": "Analyze Node.js project dependencies and scripts",
+                        "priority": "high",
+                        "type": "analysis",
+                    },
+                    {
+                        "id": "install_npm_dependencies",
+                        "description": "Install Node.js dependencies using npm/yarn",
+                        "priority": "high",
+                        "type": "dependencies",
+                    },
+                    {
+                        "id": "build_nodejs_project",
+                        "description": "Build Node.js project",
+                        "priority": "high",
+                        "type": "build",
+                    },
+                    {
+                        "id": "test_nodejs_project",
+                        "description": "Execute Node.js project tests",
+                        "priority": "high",
+                        "type": "test",
+                    },
+                ]
+            )
         else:
             # 完全未知的项目，使用通用方法
-            plan.extend([
-                {
-                    "id": "manual_project_exploration",
-                    "description": f"Manually explore project structure at {project_path}",
-                    "priority": "high",
-                    "type": "exploration"
-                },
-                {
-                    "id": "identify_build_system",
-                    "description": "Identify project build system and requirements",
-                    "priority": "high",
-                    "type": "analysis"
-                },
-                {
-                    "id": "setup_development_environment",
-                    "description": "Setup appropriate development environment",
-                    "priority": "high",
-                    "type": "environment"
-                },
-                {
-                    "id": "attempt_project_build",
-                    "description": "Attempt to build project using identified tools",
-                    "priority": "medium",
-                    "type": "build"
-                }
-            ])
+            plan.extend(
+                [
+                    {
+                        "id": "manual_project_exploration",
+                        "description": f"Manually explore project structure at {project_path}",
+                        "priority": "high",
+                        "type": "exploration",
+                    },
+                    {
+                        "id": "identify_build_system",
+                        "description": "Identify project build system and requirements",
+                        "priority": "high",
+                        "type": "analysis",
+                    },
+                    {
+                        "id": "setup_development_environment",
+                        "description": "Setup appropriate development environment",
+                        "priority": "high",
+                        "type": "environment",
+                    },
+                    {
+                        "id": "attempt_project_build",
+                        "description": "Attempt to build project using identified tools",
+                        "priority": "medium",
+                        "type": "build",
+                    },
+                ]
+            )
 
         return plan
 
@@ -1293,20 +1369,20 @@ PY"""
                 "id": "verify_project_structure",
                 "description": "Verify project structure and identify key components",
                 "priority": "high",
-                "type": "verification"
+                "type": "verification",
             },
             {
                 "id": "setup_basic_environment",
                 "description": "Setup basic development environment",
                 "priority": "high",
-                "type": "environment"
+                "type": "environment",
             },
             {
                 "id": "manual_build_attempt",
                 "description": "Attempt manual project build",
                 "priority": "medium",
-                "type": "build"
-            }
+                "type": "build",
+            },
         ]
 
     def _update_trunk_context_with_plan(self, analysis: Dict[str, Any]) -> bool:
@@ -1328,18 +1404,25 @@ PY"""
 
             # 验证执行计划的质量
             if not self._is_execution_plan_valid(execution_plan):
-                logger.warning("Generated execution plan appears invalid, preserving existing tasks")
+                logger.warning(
+                    "Generated execution plan appears invalid, preserving existing tasks"
+                )
                 return False
 
             # 获取当前pending任务数量
-            current_pending = len([task for task in trunk_context.todo_list if task.status.value == "pending"])
-            logger.info(f"Current pending tasks: {current_pending}, new plan has {len(execution_plan)} tasks")
+            current_pending = len(
+                [task for task in trunk_context.todo_list if task.status.value == "pending"]
+            )
+            logger.info(
+                f"Current pending tasks: {current_pending}, new plan has {len(execution_plan)} tasks"
+            )
 
             # 只有在新计划看起来合理时才替换现有任务
             if len(execution_plan) >= 3:  # 至少3个任务才认为是合理的计划
                 # 清除现有的pending任务（保留已完成的和进行中的）
-                remaining_tasks = [task for task in trunk_context.todo_list 
-                                 if task.status.value not in ["pending"]]
+                remaining_tasks = [
+                    task for task in trunk_context.todo_list if task.status.value not in ["pending"]
+                ]
                 trunk_context.todo_list = remaining_tasks
 
                 # 添加新的智能任务
@@ -1353,13 +1436,17 @@ PY"""
                 static_test_count = analysis.get("static_test_count")
                 if static_test_count is not None:
                     trunk_context.environment_summary["static_test_count"] = static_test_count
-                    logger.info(f"📊 Stored total test count in trunk context: {static_test_count} test cases")
+                    logger.info(
+                        f"📊 Stored total test count in trunk context: {static_test_count} test cases"
+                    )
 
                     # Also store method count and parameterized info for detailed reporting
                     method_count = analysis.get("method_count")
                     if method_count is not None:
                         trunk_context.environment_summary["method_count"] = method_count
-                        trunk_context.environment_summary["test_count_method"] = analysis.get("test_count_method", "unknown")
+                        trunk_context.environment_summary["test_count_method"] = analysis.get(
+                            "test_count_method", "unknown"
+                        )
 
                     parameterized_info = analysis.get("parameterized_info")
                     if parameterized_info:
@@ -1370,15 +1457,19 @@ PY"""
                     if test_catalog:
                         trunk_context.environment_summary["test_catalog_summary"] = {
                             "total_tests": test_catalog.get("total_count", 0),
-                            "by_module": test_catalog.get("by_module", {})
+                            "by_module": test_catalog.get("by_module", {}),
                         }
 
                 # 保存更新后的context
                 self.context_manager._save_trunk_context(trunk_context)
-                logger.info(f"✅ Successfully updated trunk context with {len(execution_plan)} new intelligent tasks")
+                logger.info(
+                    f"✅ Successfully updated trunk context with {len(execution_plan)} new intelligent tasks"
+                )
                 return True
             else:
-                logger.warning(f"Execution plan too short ({len(execution_plan)} tasks), preserving existing tasks")
+                logger.warning(
+                    f"Execution plan too short ({len(execution_plan)} tasks), preserving existing tasks"
+                )
                 return False
 
         except Exception as e:
@@ -1392,19 +1483,23 @@ PY"""
             return False
 
         # 检查是否只有报告任务（这通常意味着分析失败）
-        non_report_tasks = [task for task in execution_plan 
-                           if task.get("type") != "report" and 
-                           "report" not in task.get("description", "").lower()]
-        
+        non_report_tasks = [
+            task
+            for task in execution_plan
+            if task.get("type") != "report" and "report" not in task.get("description", "").lower()
+        ]
+
         if len(non_report_tasks) < 2:
             logger.debug("Execution plan contains mostly report tasks")
             return False
 
         # 检查是否有实际的构建/测试任务
         has_build_or_test = any(
-            task.get("type") in ["build", "test", "dependencies", "environment"] or
-            any(keyword in task.get("description", "").lower() 
-                for keyword in ["build", "compile", "test", "install", "setup"])
+            task.get("type") in ["build", "test", "dependencies", "environment"]
+            or any(
+                keyword in task.get("description", "").lower()
+                for keyword in ["build", "compile", "test", "install", "setup"]
+            )
             for task in execution_plan
         )
 
@@ -1418,72 +1513,76 @@ PY"""
     def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
         """格式化分析输出"""
         output = "🔍 PROJECT ANALYSIS COMPLETED\n\n"
-        
+
         # 分析路径信息
-        project_path = analysis.get('project_path', 'Unknown')
+        project_path = analysis.get("project_path", "Unknown")
         output += f"📁 Analyzed Path: {project_path}\n"
-        
+
         # 基本信息
-        project_type = analysis.get('project_type', 'Unknown')
-        build_system = analysis.get('build_system', 'Unknown')
+        project_type = analysis.get("project_type", "Unknown")
+        build_system = analysis.get("build_system", "Unknown")
         output += f"📂 Project Type: {project_type}\n"
         output += f"🔧 Build System: {build_system}\n"
-        
+
         # 显示发现的文件
-        existing_files = analysis.get('existing_files', [])
+        existing_files = analysis.get("existing_files", [])
         if existing_files:
             output += f"📄 Project Files Found: {', '.join(existing_files[:5])}\n"
             if len(existing_files) > 5:
                 output += f"    ... and {len(existing_files) - 5} more files\n"
         else:
             output += f"⚠️ No project files detected\n"
-        
-        if analysis.get('java_version'):
+
+        if analysis.get("java_version"):
             output += f"☕ Java Version: {analysis['java_version']}\n"
-        
+
         # 依赖信息
-        dependencies = analysis.get('dependencies', [])
+        dependencies = analysis.get("dependencies", [])
         if dependencies:
-            output += f"📦 Dependencies: {len(dependencies)} found ({', '.join(dependencies[:3])}...)\n"
-        
+            output += (
+                f"📦 Dependencies: {len(dependencies)} found ({', '.join(dependencies[:3])}...)\n"
+            )
+
         # 文档分析
-        doc = analysis.get('documentation', {})
-        if doc.get('java_version_requirement'):
+        doc = analysis.get("documentation", {})
+        if doc.get("java_version_requirement"):
             output += f"📋 Required Java Version: {doc['java_version_requirement']}\n"
-        
-        if doc.get('build_commands'):
+
+        if doc.get("build_commands"):
             output += f"🔨 Build Commands Found: {', '.join(doc['build_commands'][:3])}\n"
-        
-        if doc.get('test_commands'):
+
+        if doc.get("test_commands"):
             output += f"🧪 Test Commands Found: {', '.join(doc['test_commands'][:3])}\n"
-        
+
         # 测试框架
-        test_framework = analysis.get('test_framework', 'unknown')
-        if test_framework != 'unknown':
+        test_framework = analysis.get("test_framework", "unknown")
+        if test_framework != "unknown":
             output += f"🧪 Test Framework: {test_framework}\n"
-        
+
         # Test count analysis - now with accurate parameterized expansion
-        static_test_count = analysis.get('static_test_count')
-        method_count = analysis.get('method_count')
-        test_count_method = analysis.get('test_count_method', 'unknown')
+        static_test_count = analysis.get("static_test_count")
+        method_count = analysis.get("method_count")
+        test_count_method = analysis.get("test_count_method", "unknown")
 
         if static_test_count is not None:
-            if test_count_method == 'accurate_expansion_counting':
+            if test_count_method == "accurate_expansion_counting":
                 output += f"📊 Test Count Analysis (Accurate with Expansions):\n"
                 output += f"   • Total Test Cases: {static_test_count} (includes parameterized expansions)\n"
                 if method_count and method_count != static_test_count:
                     output += f"   • Method Annotations: {method_count} (@Test, @ParameterizedTest, etc.)\n"
                     expansion = static_test_count / method_count if method_count > 0 else 1
-                    output += f"   • Expansion Factor: {expansion:.1f}x (from parameterized tests)\n"
+                    output += (
+                        f"   • Expansion Factor: {expansion:.1f}x (from parameterized tests)\n"
+                    )
 
                 # Show breakdown if available
-                param_info = analysis.get('parameterized_info', {})
+                param_info = analysis.get("parameterized_info", {})
                 if param_info:
-                    regular = param_info.get('regular_tests', 0)
-                    param_expansions = param_info.get('parameterized_expansions', 0)
+                    regular = param_info.get("regular_tests", 0)
+                    param_expansions = param_info.get("parameterized_expansions", 0)
                     if regular or param_expansions:
                         output += f"   • Breakdown: {regular} regular tests + {param_expansions} parameterized expansions\n"
-            elif test_count_method == 'actual_executions':
+            elif test_count_method == "actual_executions":
                 output += f"📊 Test Count: {static_test_count} actual test executions (from test reports)\n"
                 output += f"   ℹ️ This includes all parameterized test expansions\n"
             else:
@@ -1491,54 +1590,54 @@ PY"""
                 output += f"   ℹ️ Note: Parameterized tests will execute multiple times\n"
 
         # 执行计划
-        execution_plan = analysis.get('execution_plan', [])
+        execution_plan = analysis.get("execution_plan", [])
         if execution_plan:
             # 分析计划类型
-            plan_types = [task.get('type', 'general') for task in execution_plan]
+            plan_types = [task.get("type", "general") for task in execution_plan]
             type_counts = {}
             for t in plan_types:
                 type_counts[t] = type_counts.get(t, 0) + 1
-            
+
             output += f"\n📋 GENERATED EXECUTION PLAN ({len(execution_plan)} tasks):\n"
             for i, task in enumerate(execution_plan, 1):
-                task_type = task.get('type', 'general')
-                task_desc = task.get('description', 'Unknown task')
-                priority = task.get('priority', 'medium')
+                task_type = task.get("type", "general")
+                task_desc = task.get("description", "Unknown task")
+                priority = task.get("priority", "medium")
                 type_emoji = {
-                    'environment': '🔧',
-                    'dependencies': '📦',
-                    'build': '🔨',
-                    'test': '🧪',
-                    'report': '📊',
-                    'analysis': '🔍',
-                    'exploration': '🗺️'
-                }.get(task_type, '📋')
+                    "environment": "🔧",
+                    "dependencies": "📦",
+                    "build": "🔨",
+                    "test": "🧪",
+                    "report": "📊",
+                    "analysis": "🔍",
+                    "exploration": "🗺️",
+                }.get(task_type, "📋")
                 output += f"  {i}. {type_emoji} {task_desc} [{priority}]\n"
-            
+
             # 显示计划质量指标
-            non_report_tasks = [t for t in execution_plan if t.get('type') != 'report']
+            non_report_tasks = [t for t in execution_plan if t.get("type") != "report"]
             if len(non_report_tasks) >= 3:
                 output += f"\n✅ Plan Quality: Good ({len(non_report_tasks)} actionable tasks)\n"
             else:
                 output += f"\n⚠️ Plan Quality: Limited ({len(non_report_tasks)} actionable tasks)\n"
         else:
             output += f"\n❌ No execution plan generated\n"
-        
+
         # Context更新状态
-        if analysis.get('context_updated'):
+        if analysis.get("context_updated"):
             output += f"\n✅ Trunk context updated with new intelligent task plan\n"
-        elif analysis.get('context_updated') == False:
-            context_error = analysis.get('context_error', 'Unknown error')
+        elif analysis.get("context_updated") == False:
+            context_error = analysis.get("context_error", "Unknown error")
             output += f"\n⚠️ Context update failed: {context_error}\n"
-        
+
         # 最终状态
-        if project_type != 'Unknown' and build_system != 'Unknown' and execution_plan:
+        if project_type != "Unknown" and build_system != "Unknown" and execution_plan:
             output += f"\n🎯 Ready to execute intelligent project setup plan!"
-        elif project_type == 'Unknown' or build_system == 'Unknown':
+        elif project_type == "Unknown" or build_system == "Unknown":
             output += f"\n⚠️ Project analysis incomplete - manual investigation may be needed"
         else:
             output += f"\n❌ Analysis failed - please check project structure and try again"
-        
+
         return output
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
@@ -1643,26 +1742,29 @@ OUTPUT:
 - Plan quality assessment and validation
 - Safe context updates with rollback protection
 - Clear core step identification for each task
-""" 
+"""
 
     def _validate_and_discover_project_path(self, initial_path: str) -> Optional[str]:
         """Validate project path and discover actual project location if needed."""
         if not self.docker_orchestrator:
             logger.warning("No orchestrator available for path validation")
             return initial_path
-        
+
         # List of paths to check (in order of preference)
         candidate_paths = [initial_path]
-        
+
         # If initial path is /workspace, also check common subdirectories
         if initial_path == "/workspace":
             # Get list of subdirectories in workspace
             result = self.docker_orchestrator.execute_command("find /workspace -maxdepth 1 -type d")
             if result.get("success"):
-                subdirs = [line.strip() for line in result.get("output", "").split('\n') 
-                          if line.strip() and line.strip() != "/workspace"]
+                subdirs = [
+                    line.strip()
+                    for line in result.get("output", "").split("\n")
+                    if line.strip() and line.strip() != "/workspace"
+                ]
                 candidate_paths.extend(subdirs)
-        
+
         # Check each candidate path for project indicators
         for path in candidate_paths:
             if self._is_valid_project_directory(path):
@@ -1670,42 +1772,42 @@ OUTPUT:
                 return path
             else:
                 logger.debug(f"❌ No project found at: {path}")
-        
+
         return None
-    
+
     def _is_valid_project_directory(self, path: str) -> bool:
         """Check if a directory contains valid project indicators."""
         if not self.docker_orchestrator:
             return False
-        
+
         # Check if directory exists
         result = self.docker_orchestrator.execute_command(f"test -d {path}")
         if result.get("exit_code") != 0:
             logger.debug(f"Directory does not exist: {path}")
             return False
-        
+
         # Check for common project files
         project_indicators = [
-            "pom.xml",           # Maven
-            "build.gradle",      # Gradle (Groovy)
+            "pom.xml",  # Maven
+            "build.gradle",  # Gradle (Groovy)
             "build.gradle.kts",  # Gradle (Kotlin)
-            "package.json",      # Node.js
+            "package.json",  # Node.js
             "requirements.txt",  # Python
-            "pyproject.toml",    # Python Poetry
-            "Cargo.toml",        # Rust
-            "go.mod",           # Go
-            "CMakeLists.txt",   # CMake
-            "Makefile",         # Make
-            "composer.json",    # PHP
-            "Gemfile",          # Ruby
+            "pyproject.toml",  # Python Poetry
+            "Cargo.toml",  # Rust
+            "go.mod",  # Go
+            "CMakeLists.txt",  # CMake
+            "Makefile",  # Make
+            "composer.json",  # PHP
+            "Gemfile",  # Ruby
         ]
-        
+
         for indicator in project_indicators:
             result = self.docker_orchestrator.execute_command(f"test -f {path}/{indicator}")
             if result.get("exit_code") == 0:
                 logger.debug(f"Found project indicator {indicator} in {path}")
                 return True
-        
+
         # Check for source code directories as secondary indicators
         source_dirs = ["src", "lib", "app", "source"]
         for src_dir in source_dirs:
@@ -1718,29 +1820,29 @@ OUTPUT:
                 if result.get("success") and result.get("output", "").strip():
                     logger.debug(f"Found source files in {path}/{src_dir}")
                     return True
-        
+
         return False
-    
+
     def _is_analysis_valid(self, analysis: Dict[str, Any]) -> bool:
         """Validate that the analysis produced meaningful results."""
         # Check if we detected a valid project type
         if analysis.get("project_type") == "unknown" and analysis.get("build_system") == "unknown":
             logger.warning("Analysis failed to detect project type and build system")
             return False
-        
+
         # Check if we found any project files
         existing_files = analysis.get("existing_files", [])
         if not existing_files:
             logger.warning("Analysis found no project files")
             return False
-        
+
         # Check if execution plan was generated
         execution_plan = analysis.get("execution_plan", [])
         if not execution_plan or len(execution_plan) < 2:
             logger.warning("Analysis generated insufficient execution plan")
             return False
-        
-        return True 
+
+        return True
 
     def _generate_three_step_fallback_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """Generate three-step fallback plan for unknown project types."""
@@ -1752,104 +1854,126 @@ OUTPUT:
 
         # STEP 1: Environment/Dependencies
         if "pom.xml" in existing_files:
-            plan.append({
-                "id": "setup_environment",
-                "description": "Install Maven dependencies and verify build environment",
-                "priority": "high",
-                "type": "environment",
-                "core_step": "preparation"
-            })
-            plan.append({
-                "id": "build_project",
-                "description": "Compile project using Maven", 
-                "priority": "critical",
-                "type": "build",
-                "core_step": "build"
-            })
-            plan.append({
-                "id": "run_tests",
-                "description": "Execute Maven project tests",
-                "priority": "critical", 
-                "type": "test",
-                "core_step": "test"
-            })
-        elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
-            plan.append({
-                "id": "setup_environment",
-                "description": "Install Gradle dependencies and verify build environment",
-                "priority": "high",
-                "type": "environment",
-                "core_step": "preparation" 
-            })
-            plan.append({
-                "id": "build_project",
-                "description": "Compile project using Gradle",
-                "priority": "critical",
-                "type": "build",
-                "core_step": "build"
-            })
-            plan.append({
-                "id": "run_tests", 
-                "description": "Execute Gradle project tests",
-                "priority": "critical",
-                "type": "test",
-                "core_step": "test"
-            })
-        elif "package.json" in existing_files:
-            plan.append({
-                "id": "setup_environment",
-                "description": "Install Node.js dependencies using npm/yarn",
-                "priority": "high",
-                "type": "environment",
-                "core_step": "preparation"
-            })
-            plan.append({
-                "id": "build_project",
-                "description": "Build Node.js project",
-                "priority": "critical",
-                "type": "build", 
-                "core_step": "build"
-            })
-            plan.append({
-                "id": "run_tests",
-                "description": "Execute Node.js project tests",
-                "priority": "critical",
-                "type": "test",
-                "core_step": "test"
-            })
-        else:
-            # Completely unknown project  
-            plan.extend([
+            plan.append(
                 {
-                    "id": "explore_project",
-                    "description": f"Manually explore and identify project structure at {project_path}",
+                    "id": "setup_environment",
+                    "description": "Install Maven dependencies and verify build environment",
                     "priority": "high",
-                    "type": "exploration",
-                    "core_step": "preparation"
-                },
+                    "type": "environment",
+                    "core_step": "preparation",
+                }
+            )
+            plan.append(
                 {
-                    "id": "attempt_build",
-                    "description": "Attempt to build project using identified tools",
+                    "id": "build_project",
+                    "description": "Compile project using Maven",
                     "priority": "critical",
                     "type": "build",
-                    "core_step": "build"
-                },
-                {
-                    "id": "attempt_tests",
-                    "description": "Attempt to run project tests",
-                    "priority": "critical", 
-                    "type": "test",
-                    "core_step": "test"
+                    "core_step": "build",
                 }
-            ])
+            )
+            plan.append(
+                {
+                    "id": "run_tests",
+                    "description": "Execute Maven project tests",
+                    "priority": "critical",
+                    "type": "test",
+                    "core_step": "test",
+                }
+            )
+        elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
+            plan.append(
+                {
+                    "id": "setup_environment",
+                    "description": "Install Gradle dependencies and verify build environment",
+                    "priority": "high",
+                    "type": "environment",
+                    "core_step": "preparation",
+                }
+            )
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": "Compile project using Gradle",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
+            plan.append(
+                {
+                    "id": "run_tests",
+                    "description": "Execute Gradle project tests",
+                    "priority": "critical",
+                    "type": "test",
+                    "core_step": "test",
+                }
+            )
+        elif "package.json" in existing_files:
+            plan.append(
+                {
+                    "id": "setup_environment",
+                    "description": "Install Node.js dependencies using npm/yarn",
+                    "priority": "high",
+                    "type": "environment",
+                    "core_step": "preparation",
+                }
+            )
+            plan.append(
+                {
+                    "id": "build_project",
+                    "description": "Build Node.js project",
+                    "priority": "critical",
+                    "type": "build",
+                    "core_step": "build",
+                }
+            )
+            plan.append(
+                {
+                    "id": "run_tests",
+                    "description": "Execute Node.js project tests",
+                    "priority": "critical",
+                    "type": "test",
+                    "core_step": "test",
+                }
+            )
+        else:
+            # Completely unknown project
+            plan.extend(
+                [
+                    {
+                        "id": "explore_project",
+                        "description": f"Manually explore and identify project structure at {project_path}",
+                        "priority": "high",
+                        "type": "exploration",
+                        "core_step": "preparation",
+                    },
+                    {
+                        "id": "attempt_build",
+                        "description": "Attempt to build project using identified tools",
+                        "priority": "critical",
+                        "type": "build",
+                        "core_step": "build",
+                    },
+                    {
+                        "id": "attempt_tests",
+                        "description": "Attempt to run project tests",
+                        "priority": "critical",
+                        "type": "test",
+                        "core_step": "test",
+                    },
+                ]
+            )
 
         # STEP 4: Always add report
-        plan.append({
-            "id": "generate_completion_report",
-            "description": "Generate comprehensive setup completion report",
-            "priority": "high",
-            "type": "report",
-            "core_step": "report"
-        })
+        plan.append(
+            {
+                "id": "generate_completion_report",
+                "description": "Generate comprehensive setup completion report",
+                "priority": "high",
+                "type": "report",
+                "core_step": "report",
+            }
+        )
 
-        return plan 
+        return plan

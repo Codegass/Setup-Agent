@@ -2,8 +2,8 @@
 
 import os
 import subprocess
-import time
 import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -210,7 +210,7 @@ class DockerOrchestrator:
 
         # Check if we're in an interactive terminal
         is_tty = sys.stdin.isatty()
-        
+
         if is_tty:
             # Use docker exec with -it for interactive terminal
             cmd = ["docker", "exec", "-it", self.container_name, shell]
@@ -241,14 +241,15 @@ class DockerOrchestrator:
         检测是否为JSON内容，避免对JSON文件进行破坏性截断
         """
         # 如果command包含.json文件路径
-        if '.json' in command and ('cat' in command or 'head' in command or 'tail' in command):
+        if ".json" in command and ("cat" in command or "head" in command or "tail" in command):
             return True
 
         # 如果输出内容看起来像JSON结构
         stripped = output.strip()
-        if stripped.startswith('{') and stripped.endswith('}'):
+        if stripped.startswith("{") and stripped.endswith("}"):
             try:
                 import json
+
                 json.loads(stripped)  # 验证是否为有效JSON
                 return True
             except json.JSONDecodeError:
@@ -261,12 +262,14 @@ class DockerOrchestrator:
         Detect if content is XML/POM file to avoid destructive truncation
         """
         # Check if command is reading a POM or XML file
-        if ('.xml' in command or 'pom.xml' in command) and ('cat' in command or 'head' in command or 'tail' in command):
+        if (".xml" in command or "pom.xml" in command) and (
+            "cat" in command or "head" in command or "tail" in command
+        ):
             return True
 
         # Check if output looks like XML
         stripped = output.strip()
-        if stripped.startswith('<?xml') or stripped.startswith('<project'):
+        if stripped.startswith("<?xml") or stripped.startswith("<project"):
             return True
 
         return False
@@ -275,7 +278,7 @@ class DockerOrchestrator:
         """
         Smart truncation for XML/POM files that preserves error-prone sections
         """
-        lines = xml_content.split('\n')
+        lines = xml_content.split("\n")
 
         if len(lines) <= max_lines:
             return xml_content
@@ -289,11 +292,11 @@ class DockerOrchestrator:
         properties_sections = []
         i = 0
         while i < len(lines):
-            if '<properties>' in lines[i]:
+            if "<properties>" in lines[i]:
                 start_idx = i
                 # Find the matching closing tag
                 for j in range(i + 1, min(i + 50, len(lines))):  # Look up to 50 lines ahead
-                    if '</properties>' in lines[j]:
+                    if "</properties>" in lines[j]:
                         # Include a few lines before and after for context
                         properties_sections.append((max(0, start_idx - 2), min(len(lines), j + 3)))
                         i = j
@@ -305,7 +308,16 @@ class DockerOrchestrator:
             # Check for orphaned tags or malformed XML patterns
             stripped = line.strip()
             # Common problematic patterns
-            if any(tag in stripped for tag in ['<groupId>', '<artifactId>', '<version>', '<dependency>', '</dependency>']):
+            if any(
+                tag in stripped
+                for tag in [
+                    "<groupId>",
+                    "<artifactId>",
+                    "<version>",
+                    "<dependency>",
+                    "</dependency>",
+                ]
+            ):
                 # Get context around these tags (5 lines before and after)
                 start = max(0, i - 5)
                 end = min(len(lines), i + 6)
@@ -340,7 +352,9 @@ class DockerOrchestrator:
             # Build truncated output preserving error-prone sections
             result = []
             result.extend(lines[:30])  # First 30 lines (header, organization info)
-            result.append(f"\n... [SMART XML TRUNCATION: Preserving error-prone sections including properties] ...\n")
+            result.append(
+                f"\n... [SMART XML TRUNCATION: Preserving error-prone sections including properties] ...\n"
+            )
 
             for start, end in merged:
                 # Skip sections that are already included in the first 30 or last 20 lines
@@ -356,11 +370,17 @@ class DockerOrchestrator:
             result.append(f"\n... [End of error-prone sections] ...\n")
             result.extend(lines[-20:])  # Last 20 lines
 
-            logger.info(f"🔧 Applied XML-aware truncation: {len(lines)} lines → {len(result)} lines (preserved error-prone sections)")
-            return '\n'.join(result)
+            logger.info(
+                f"🔧 Applied XML-aware truncation: {len(lines)} lines → {len(result)} lines (preserved error-prone sections)"
+            )
+            return "\n".join(result)
         else:
             # Fallback to standard truncation if no error-prone sections found
-            truncated = '\n'.join(lines[:50]) + f"\n... [XML TRUNCATED: {len(lines)} total lines] ...\n" + '\n'.join(lines[-50:])
+            truncated = (
+                "\n".join(lines[:50])
+                + f"\n... [XML TRUNCATED: {len(lines)} total lines] ...\n"
+                + "\n".join(lines[-50:])
+            )
             logger.info(f"🔧 Applied XML truncation: {len(lines)} lines → 100 lines")
             return truncated
 
@@ -371,38 +391,54 @@ class DockerOrchestrator:
         """
         try:
             import json
+
             data = json.loads(json_content)
 
             # 如果是branch context history，可以安全截断history数组
-            if isinstance(data, dict) and 'history' in data and isinstance(data['history'], list):
-                history = data['history']
+            if isinstance(data, dict) and "history" in data and isinstance(data["history"], list):
+                history = data["history"]
                 if len(history) > max_entries:
                     # 保留前5个和后5个history条目，中间标记截断
                     truncated_count = len(history) - max_entries
-                    data['history'] = (
-                        history[:5] +
-                        [{"type": "truncated", "message": f"[SMART TRUNCATION: {truncated_count} entries omitted to prevent context pollution]", "timestamp": "system"}] +
-                        history[-5:]
+                    data["history"] = (
+                        history[:5]
+                        + [
+                            {
+                                "type": "truncated",
+                                "message": f"[SMART TRUNCATION: {truncated_count} entries omitted to prevent context pollution]",
+                                "timestamp": "system",
+                            }
+                        ]
+                        + history[-5:]
                     )
                     # 更新元数据
-                    data['entry_count'] = len(data['history'])
+                    data["entry_count"] = len(data["history"])
                     # 重新计算token count
-                    if 'token_count' in data:
-                        data['token_count'] = len(json.dumps(data)) // 4
-                    
-                    logger.info(f"📊 Applied smart JSON truncation: {len(history)} → {len(data['history'])} entries")
+                    if "token_count" in data:
+                        data["token_count"] = len(json.dumps(data)) // 4
+
+                    logger.info(
+                        f"📊 Applied smart JSON truncation: {len(history)} → {len(data['history'])} entries"
+                    )
                     return json.dumps(data, indent=2)
-            
+
             # 如果无法安全截断，返回原内容（但会有警告）
-            logger.warning("🚨 Large JSON file detected but cannot be safely truncated - preserving integrity")
+            logger.warning(
+                "🚨 Large JSON file detected but cannot be safely truncated - preserving integrity"
+            )
             return json_content
-            
+
         except json.JSONDecodeError:
             # 如果不是有效JSON，返回原内容
             return json_content
 
-    def execute_command(self, command: str, workdir: Optional[str] = None,
-                       capture_stderr: bool = True, environment: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    def execute_command(
+        self,
+        command: str,
+        workdir: Optional[str] = None,
+        capture_stderr: bool = True,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """
         Execute a command in the container.
 
@@ -418,10 +454,12 @@ class DockerOrchestrator:
         # Ensure container is running and get container object
         if not self.is_container_running():
             if not self.container_exists():
-                raise RuntimeError(f"Container {self.container_name} does not exist. Create it first.")
+                raise RuntimeError(
+                    f"Container {self.container_name} does not exist. Create it first."
+                )
             if not self.start_container():
                 raise RuntimeError(f"Failed to start container {self.container_name}")
-        
+
         # Get the container object
         container = self.client.containers.get(self.container_name)
 
@@ -436,7 +474,7 @@ class DockerOrchestrator:
             # No working directory specified, use default behavior
             wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
         exec_command = ["/bin/bash", "-c", wrapped_command]
-        
+
         logger.info(f"Executing command in container: {command}")
         if workdir:
             logger.info(f"Working directory: {workdir}")
@@ -444,42 +482,44 @@ class DockerOrchestrator:
         try:
             # Prepare environment
             exec_env = environment if environment else {}
-            
+
             # Execute the command with stderr capture
             # Use demux to separate stdout and stderr when requested
-            # NOTE: We don't use Docker's workdir parameter here because we handle it 
+            # NOTE: We don't use Docker's workdir parameter here because we handle it
             # explicitly with cd in the bash command for better reliability
             result = container.exec_run(
-                exec_command, 
+                exec_command,
                 workdir=None,  # Handled by cd command in bash
                 stderr=True,  # Explicitly capture stderr
                 stdout=True,  # Explicitly capture stdout
                 demux=capture_stderr,  # Separate stdout/stderr when True
-                environment=exec_env
+                environment=exec_env,
             )
 
             # Handle output based on whether demux was used
             if capture_stderr and isinstance(result.output, tuple):
                 # demux=True returns (stdout, stderr)
                 stdout, stderr = result.output
-                stdout_str = stdout.decode('utf-8', errors='replace').strip() if stdout else ""
-                stderr_str = stderr.decode('utf-8', errors='replace').strip() if stderr else ""
+                stdout_str = stdout.decode("utf-8", errors="replace").strip() if stdout else ""
+                stderr_str = stderr.decode("utf-8", errors="replace").strip() if stderr else ""
                 # Combine for backward compatibility
                 output = (stdout_str + "\n" + stderr_str).strip() if stderr_str else stdout_str
                 exit_code = result.exit_code
             else:
                 # demux=False returns combined output
-                output = result.output.decode("utf-8", errors='replace').strip() if result.output else ""
+                output = (
+                    result.output.decode("utf-8", errors="replace").strip() if result.output else ""
+                )
                 stdout_str = output
                 stderr_str = ""
                 exit_code = result.exit_code
 
             logger.debug(f"Command finished with exit code: {exit_code}")
-            
+
             # IMPROVED: Content-aware truncation logic
             original_length = len(output)
             if original_length > 10000:  # ~100 lines threshold
-                lines = output.split('\n')
+                lines = output.split("\n")
                 if len(lines) > 100:
                     # Check if this is JSON content that needs protection
                     if self._is_json_content(output, command):
@@ -490,19 +530,33 @@ class DockerOrchestrator:
                     elif self._is_xml_content(output, command):
                         # For XML/POM files, apply smart truncation that preserves error-prone sections
                         output = self._smart_xml_truncate(output, max_lines=150)
-                        logger.info(f"🔧 Applied XML-aware truncation to preserve error-prone sections")
+                        logger.info(
+                            f"🔧 Applied XML-aware truncation to preserve error-prone sections"
+                        )
                     else:
                         # Apply normal truncation for non-JSON/XML content
-                        truncated = '\n'.join(lines[:25]) + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n" + '\n'.join(lines[-25:])
-                        logger.warning(f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution")
+                        truncated = (
+                            "\n".join(lines[:25])
+                            + f"\n... [ORCHESTRATOR TRUNCATED: {len(lines)} lines, {original_length} chars] ...\n"
+                            + "\n".join(lines[-25:])
+                        )
+                        logger.warning(
+                            f"🚨 Orchestrator applied emergency truncation: {len(lines)} lines → 50 lines to prevent context pollution"
+                        )
                         output = truncated
-            
+
             # Smart debug logging: show structure of truncated output
-            if original_length > 10000 and len(output.split('\n')) <= 60:  # If we applied truncation
+            if (
+                original_length > 10000 and len(output.split("\n")) <= 60
+            ):  # If we applied truncation
                 # For truncated output, show the structure more clearly
-                output_lines = output.split('\n')
+                output_lines = output.split("\n")
                 if len(output_lines) > 10:
-                    debug_display = '\n'.join(output_lines[:5]) + f"\n... [Truncated output: showing first 5 + last 5 lines of {len(output_lines)} total] ...\n" + '\n'.join(output_lines[-5:])
+                    debug_display = (
+                        "\n".join(output_lines[:5])
+                        + f"\n... [Truncated output: showing first 5 + last 5 lines of {len(output_lines)} total] ...\n"
+                        + "\n".join(output_lines[-5:])
+                    )
                 else:
                     debug_display = output
                 logger.debug(f"Command output (showing truncation structure):\n{debug_display}")
@@ -529,10 +583,10 @@ class DockerOrchestrator:
                 if "npm ERR!" in output or "ERR!" in stderr_str:
                     build_failed = True
                     logger.warning("NPM error detected despite exit code")
-            
+
             # Determine final success status
             success = (exit_code == 0) and not build_failed
-            
+
             return {
                 "success": success,
                 "exit_code": exit_code,
@@ -540,15 +594,11 @@ class DockerOrchestrator:
                 "stdout": stdout_str,
                 "stderr": stderr_str,
                 "signal": None,  # Docker doesn't directly provide signal info
-                "build_failed": build_failed  # Additional flag for build failures
+                "build_failed": build_failed,  # Additional flag for build failures
             }
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
-            return {
-                "success": False,
-                "exit_code": -1,
-                "output": str(e)
-            }
+            return {"success": False, "exit_code": -1, "output": str(e)}
 
     def execute_command_with_monitoring(
         self,
@@ -558,11 +608,11 @@ class DockerOrchestrator:
         absolute_timeout: int = 2400,  # 40 minutes total
         use_timeout_wrapper: bool = True,
         enable_cpu_monitoring: bool = True,
-        optimize_for_maven: bool = True
+        optimize_for_maven: bool = True,
     ) -> Dict[str, Any]:
         """
         Enhanced execute_command with comprehensive timeout and monitoring capabilities.
-        
+
         Args:
             command: Command to execute
             workdir: Working directory
@@ -572,28 +622,28 @@ class DockerOrchestrator:
             enable_cpu_monitoring: Whether to monitor CPU usage for hang detection
             optimize_for_maven: Whether to apply Maven-specific optimizations
         """
-        
+
         # Get the container object
         container = self.client.containers.get(self.container_name)
-        
+
         # Apply Maven optimizations if requested
         # Only optimize if the command actually starts with mvn, not if it's part of a compound command
-        if optimize_for_maven and (command.startswith('mvn ') or command == 'mvn'):
+        if optimize_for_maven and (command.startswith("mvn ") or command == "mvn"):
             command = self._optimize_maven_command(command, absolute_timeout)
             logger.info(f"🔧 Applied Maven optimizations to command")
-        elif optimize_for_maven and '&&' in command and 'mvn' in command:
+        elif optimize_for_maven and "&&" in command and "mvn" in command:
             # For compound commands, only optimize the mvn part
-            parts = command.split('&&')
+            parts = command.split("&&")
             optimized_parts = []
             for part in parts:
                 part = part.strip()
-                if part.startswith('mvn ') or part == 'mvn':
+                if part.startswith("mvn ") or part == "mvn":
                     optimized_parts.append(self._optimize_maven_command(part, absolute_timeout))
                 else:
                     optimized_parts.append(part)
-            command = ' && '.join(optimized_parts)
+            command = " && ".join(optimized_parts)
             logger.info(f"🔧 Applied Maven optimizations to mvn parts of compound command")
-        
+
         # Build the command with proper working directory handling
         # CRITICAL FIX: Source environment files BEFORE changing directory
         # This prevents the source commands from resetting the working directory
@@ -604,7 +654,7 @@ class DockerOrchestrator:
         else:
             # No working directory specified, use default
             base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
-        
+
         # Wrap with GNU timeout if requested
         if use_timeout_wrapper:
             # Use timeout with preserve-status to get the actual exit code
@@ -615,69 +665,69 @@ class DockerOrchestrator:
             logger.info(f"🕐 Wrapped command with {absolute_timeout}s absolute timeout")
         else:
             final_command = base_cmd
-        
+
         exec_command = ["/bin/bash", "-c", final_command]
-        
+
         logger.info(f"Executing command with monitoring: {command}")
         if workdir:
             logger.info(f"Working directory: {workdir}")
         logger.info(f"⏱️ Timeouts: Silent={silent_timeout}s, Absolute={absolute_timeout}s")
-        
+
         # Monitoring state
         monitoring_state = {
-            'last_output_time': time.time(),
-            'start_time': time.time(),
-            'total_output': '',
-            'process_terminated': False,
-            'termination_reason': None,
-            'cpu_warnings': 0
+            "last_output_time": time.time(),
+            "start_time": time.time(),
+            "total_output": "",
+            "process_terminated": False,
+            "termination_reason": None,
+            "cpu_warnings": 0,
         }
-        
+
         try:
             # Start the command execution
-            # NOTE: We don't use Docker's workdir parameter here because we handle it 
+            # NOTE: We don't use Docker's workdir parameter here because we handle it
             # explicitly with cd in the bash command for better compatibility with timeout wrapper
             exec_result = container.exec_run(
-                exec_command, 
+                exec_command,
                 workdir=None,  # Handled by cd command in bash
                 stream=True,  # Enable streaming to monitor output
-                demux=True    # Separate stdout/stderr
+                demux=True,  # Separate stdout/stderr
             )
-            
+
             # Start CPU monitoring thread if enabled
             cpu_monitor_thread = None
             if enable_cpu_monitoring:
                 cpu_monitor_thread = threading.Thread(
                     target=self._monitor_cpu_usage,
-                    args=(monitoring_state, silent_timeout // 2),  # Check every half of silent timeout
-                    daemon=True
+                    args=(
+                        monitoring_state,
+                        silent_timeout // 2,
+                    ),  # Check every half of silent timeout
+                    daemon=True,
                 )
                 cpu_monitor_thread.start()
-            
+
             # Monitor the execution with timeouts
             result = self._monitor_execution_with_timeouts(
-                exec_result, 
-                monitoring_state, 
-                silent_timeout, 
-                absolute_timeout
+                exec_result, monitoring_state, silent_timeout, absolute_timeout
             )
-            
+
             # Clean up monitoring thread
-            monitoring_state['process_terminated'] = True
+            monitoring_state["process_terminated"] = True
             if cpu_monitor_thread:
                 cpu_monitor_thread.join(timeout=1)  # Give it 1 second to finish
-            
+
             return result
-            
+
         except Exception as e:
-            monitoring_state['process_terminated'] = True
+            monitoring_state["process_terminated"] = True
             logger.error(f"Failed to execute command '{command}': {e}")
             return {
                 "success": False,
                 "exit_code": -1,
                 "output": f"Execution failed: {str(e)}",
                 "termination_reason": "exception",
-                "monitoring_info": monitoring_state
+                "monitoring_info": monitoring_state,
             }
 
     def _optimize_maven_command(self, command: str, timeout_seconds: int) -> str:
@@ -687,43 +737,49 @@ class DockerOrchestrator:
         optimizations = []
 
         # Add batch mode and quiet flags if not present
-        if '-B' not in command:
-            optimizations.append('-B')  # Batch mode (non-interactive)
+        if "-B" not in command:
+            optimizations.append("-B")  # Batch mode (non-interactive)
 
         # CRITICAL: Don't add -q for commands that run tests as it suppresses test output and reports
         # This was causing test reports to not be generated (issue found 2025-09-13)
 
         # Check if tests are explicitly skipped
         skip_patterns = [
-            r'-DskipTests(?:=true)?(?:\s|$)',
-            r'-Dmaven\.test\.skip(?:=true)?(?:\s|$)',
-            r'-DskipITs?(?:=true)?(?:\s|$)',
-            r'-DskipUTs?(?:=true)?(?:\s|$)'
+            r"-DskipTests(?:=true)?(?:\s|$)",
+            r"-Dmaven\.test\.skip(?:=true)?(?:\s|$)",
+            r"-DskipITs?(?:=true)?(?:\s|$)",
+            r"-DskipUTs?(?:=true)?(?:\s|$)",
         ]
         tests_explicitly_skipped = any(re.search(pattern, command) for pattern in skip_patterns)
 
         # Check if tests are explicitly enabled (overrides skip)
-        tests_explicitly_enabled = re.search(r'-DskipTests=false', command) is not None
+        tests_explicitly_enabled = re.search(r"-DskipTests=false", command) is not None
 
         # Lifecycle phases that run tests (unless explicitly skipped)
         # Note: test-compile and test-jar don't actually run tests
         test_lifecycle_phases = [
-            'test', 'verify', 'integration-test',
-            'package', 'install', 'deploy'
+            "test",
+            "verify",
+            "integration-test",
+            "package",
+            "install",
+            "deploy",
         ]
 
         # Plugin goals that run tests
-        test_plugin_goals = [
-            'surefire:test',
-            'failsafe:integration-test',
-            'failsafe:verify'
-        ]
+        test_plugin_goals = ["surefire:test", "failsafe:integration-test", "failsafe:verify"]
 
         # Build regex pattern for precise matching
         # Maven goals are typically separated by spaces or are at the start/end of the command
         # We need to ensure we don't match "test" in "test-compile" or "contest"
-        lifecycle_pattern = r'(?:^|\s)(' + '|'.join(re.escape(phase) for phase in test_lifecycle_phases) + r')(?:\s|$)'
-        plugin_pattern = r'(?:^|\s)(' + '|'.join(re.escape(goal) for goal in test_plugin_goals) + r')(?:\s|$)'
+        lifecycle_pattern = (
+            r"(?:^|\s)("
+            + "|".join(re.escape(phase) for phase in test_lifecycle_phases)
+            + r")(?:\s|$)"
+        )
+        plugin_pattern = (
+            r"(?:^|\s)(" + "|".join(re.escape(goal) for goal in test_plugin_goals) + r")(?:\s|$)"
+        )
 
         # Determine if this command will run tests
         contains_test_phase = re.search(lifecycle_pattern, command) is not None
@@ -732,27 +788,31 @@ class DockerOrchestrator:
         # A command runs tests if:
         # 1. It contains a test-running phase/plugin AND
         # 2. Tests are not explicitly skipped OR tests are explicitly enabled
-        will_run_tests = (contains_test_phase or contains_test_plugin) and (not tests_explicitly_skipped or tests_explicitly_enabled)
+        will_run_tests = (contains_test_phase or contains_test_plugin) and (
+            not tests_explicitly_skipped or tests_explicitly_enabled
+        )
 
         # Don't add -q if tests will run or if debug mode is on
-        if '-q' not in command and '-X' not in command and not will_run_tests:
-            optimizations.append('-q')  # Quiet mode (reduce output - but NOT for tests!)
-        
+        if "-q" not in command and "-X" not in command and not will_run_tests:
+            optimizations.append("-q")  # Quiet mode (reduce output - but NOT for tests!)
+
         # Add Maven-specific timeout settings
         maven_timeout_props = [
-            f'-Dmaven.execution.timeout={timeout_seconds}000',  # Maven timeout in milliseconds
-            '-Dmaven.artifact.threads=4',  # Parallel downloads
-            '-Dmaven.resolver.transport=wagon',  # Use wagon transport for better reliability
+            f"-Dmaven.execution.timeout={timeout_seconds}000",  # Maven timeout in milliseconds
+            "-Dmaven.artifact.threads=4",  # Parallel downloads
+            "-Dmaven.resolver.transport=wagon",  # Use wagon transport for better reliability
         ]
-        
+
         # Insert optimizations after 'mvn' but before other arguments
-        parts = command.split(' ', 1)
+        parts = command.split(" ", 1)
         if len(parts) == 2:
             maven_cmd, remaining_args = parts
             optimized_command = f"{maven_cmd} {' '.join(optimizations)} {' '.join(maven_timeout_props)} {remaining_args}"
         else:
-            optimized_command = f"{command} {' '.join(optimizations)} {' '.join(maven_timeout_props)}"
-        
+            optimized_command = (
+                f"{command} {' '.join(optimizations)} {' '.join(maven_timeout_props)}"
+            )
+
         # Log optimization details, especially for test commands
         if will_run_tests:
             details = []
@@ -764,98 +824,102 @@ class DockerOrchestrator:
                 details.append(f"plugin goal: {match.group(1)}")
             if tests_explicitly_enabled:
                 details.append("tests explicitly enabled with -DskipTests=false")
-            logger.info(f"🧪 Maven TEST command detected ({', '.join(details)}) - preserving output for test reports")
+            logger.info(
+                f"🧪 Maven TEST command detected ({', '.join(details)}) - preserving output for test reports"
+            )
         elif tests_explicitly_skipped:
             logger.info("⏭️ Tests explicitly skipped - applying quiet mode for faster execution")
-        logger.info(f"🔧 Maven optimizations applied: {', '.join(optimizations + maven_timeout_props)}")
+        logger.info(
+            f"🔧 Maven optimizations applied: {', '.join(optimizations + maven_timeout_props)}"
+        )
         return optimized_command
 
     def _monitor_execution_with_timeouts(
-        self, 
-        exec_result, 
-        monitoring_state: dict, 
-        silent_timeout: int, 
-        absolute_timeout: int
+        self, exec_result, monitoring_state: dict, silent_timeout: int, absolute_timeout: int
     ) -> Dict[str, Any]:
         """Monitor command execution with dual timeout mechanism."""
-        
+
         output_buffer = []
         last_chunk_time = time.time()
-        
+
         try:
             # Read output stream with timeout monitoring
             for chunk in exec_result.output:
                 current_time = time.time()
-                
+
                 # Check absolute timeout
-                if current_time - monitoring_state['start_time'] > absolute_timeout:
+                if current_time - monitoring_state["start_time"] > absolute_timeout:
                     logger.error(f"⏰ ABSOLUTE TIMEOUT: Command exceeded {absolute_timeout}s limit")
-                    monitoring_state['termination_reason'] = 'absolute_timeout'
+                    monitoring_state["termination_reason"] = "absolute_timeout"
                     self._terminate_container_processes()
                     break
-                
+
                 # Check silent timeout
                 if current_time - last_chunk_time > silent_timeout:
                     logger.warning(f"🔇 SILENT TIMEOUT: No output for {silent_timeout}s")
-                    monitoring_state['termination_reason'] = 'silent_timeout'
+                    monitoring_state["termination_reason"] = "silent_timeout"
                     self._terminate_container_processes()
                     break
-                
+
                 # Process the chunk
                 if chunk[0]:  # stdout
-                    decoded_chunk = chunk[0].decode('utf-8')
+                    decoded_chunk = chunk[0].decode("utf-8")
                     output_buffer.append(decoded_chunk)
-                    monitoring_state['total_output'] += decoded_chunk
+                    monitoring_state["total_output"] += decoded_chunk
                     last_chunk_time = current_time
-                    monitoring_state['last_output_time'] = current_time
-                    
+                    monitoring_state["last_output_time"] = current_time
+
                     # Log progress periodically
                     if len(output_buffer) % 50 == 0:  # Every 50 chunks
-                        elapsed = current_time - monitoring_state['start_time']
-                        logger.info(f"📊 Progress: {len(output_buffer)} chunks, {elapsed:.1f}s elapsed")
-                
+                        elapsed = current_time - monitoring_state["start_time"]
+                        logger.info(
+                            f"📊 Progress: {len(output_buffer)} chunks, {elapsed:.1f}s elapsed"
+                        )
+
                 if chunk[1]:  # stderr
-                    decoded_chunk = chunk[1].decode('utf-8')
+                    decoded_chunk = chunk[1].decode("utf-8")
                     output_buffer.append(f"STDERR: {decoded_chunk}")
                     last_chunk_time = current_time
-                    monitoring_state['last_output_time'] = current_time
-            
+                    monitoring_state["last_output_time"] = current_time
+
             # Get final execution result
             exit_code = exec_result.exit_code
-            
+
             # For streaming execution, exit_code might be None until stream is fully consumed
             if exit_code is None:
                 # If we got output without errors, assume success
                 exit_code = 0
-            
+
             # Combine all output
-            full_output = ''.join(output_buffer)
-            
+            full_output = "".join(output_buffer)
+
             # Apply truncation if needed
             if len(full_output) > 10000:
                 full_output = self._truncate_output_smartly(full_output)
-            
-            success = exit_code == 0 and monitoring_state['termination_reason'] is None
-            
+
+            success = exit_code == 0 and monitoring_state["termination_reason"] is None
+
             # Generate monitoring summary
             monitoring_info = {
-                'execution_time': time.time() - monitoring_state['start_time'],
-                'termination_reason': monitoring_state['termination_reason'],
-                'cpu_warnings': monitoring_state['cpu_warnings'],
-                'output_chunks': len(output_buffer)
+                "execution_time": time.time() - monitoring_state["start_time"],
+                "termination_reason": monitoring_state["termination_reason"],
+                "cpu_warnings": monitoring_state["cpu_warnings"],
+                "output_chunks": len(output_buffer),
             }
-            
-            if not success and monitoring_state['termination_reason']:
-                logger.error(f"❌ Command terminated due to: {monitoring_state['termination_reason']}")
-            
+
+            if not success and monitoring_state["termination_reason"]:
+                logger.error(
+                    f"❌ Command terminated due to: {monitoring_state['termination_reason']}"
+                )
+
             return {
                 "success": success,
                 "exit_code": exit_code or 0,
                 "output": full_output,
-                "termination_reason": monitoring_state['termination_reason'],
-                "monitoring_info": monitoring_info
+                "termination_reason": monitoring_state["termination_reason"],
+                "monitoring_info": monitoring_info,
             }
-            
+
         except Exception as e:
             logger.error(f"Error during execution monitoring: {e}")
             return {
@@ -863,43 +927,43 @@ class DockerOrchestrator:
                 "exit_code": -1,
                 "output": f"Monitoring error: {str(e)}",
                 "termination_reason": "monitoring_error",
-                "monitoring_info": monitoring_state
+                "monitoring_info": monitoring_state,
             }
 
     def _monitor_cpu_usage(self, monitoring_state: dict, check_interval: int):
         """Monitor CPU usage to detect hung processes."""
-        
+
         consecutive_low_cpu = 0
         cpu_threshold = 1.0  # Consider CPU usage below 1% as potentially hung
-        
-        while not monitoring_state['process_terminated']:
+
+        while not monitoring_state["process_terminated"]:
             try:
                 time.sleep(check_interval)
-                
-                if monitoring_state['process_terminated']:
+
+                if monitoring_state["process_terminated"]:
                     break
-                
+
                 # Get CPU stats
                 container = self.client.containers.get(self.container_name)
                 stats = container.stats(stream=False)
-                
+
                 # Calculate CPU percentage
                 cpu_percent = self._calculate_cpu_percentage(stats)
-                
+
                 current_time = time.time()
-                silent_duration = current_time - monitoring_state['last_output_time']
-                
+                silent_duration = current_time - monitoring_state["last_output_time"]
+
                 # Check for potential hang: low CPU + no output for a while
                 if cpu_percent < cpu_threshold and silent_duration > check_interval:
                     consecutive_low_cpu += 1
-                    monitoring_state['cpu_warnings'] += 1
-                    
+                    monitoring_state["cpu_warnings"] += 1
+
                     logger.warning(
                         f"⚠️ CPU MONITOR: {cpu_percent:.2f}% CPU, "
                         f"{silent_duration:.1f}s since last output "
                         f"(warning #{consecutive_low_cpu})"
                     )
-                    
+
                     # Alert after 3 consecutive low CPU readings
                     if consecutive_low_cpu >= 3:
                         logger.error(
@@ -907,10 +971,10 @@ class DockerOrchestrator:
                             f"with {silent_duration:.1f}s silence"
                         )
                         # Don't auto-terminate here, let the silent timeout handle it
-                        
+
                 else:
                     consecutive_low_cpu = 0  # Reset counter if CPU is normal
-                    
+
             except Exception as e:
                 logger.warning(f"CPU monitoring error: {e}")
                 time.sleep(check_interval)
@@ -918,59 +982,63 @@ class DockerOrchestrator:
     def _calculate_cpu_percentage(self, stats: dict) -> float:
         """Calculate CPU percentage from Docker stats."""
         try:
-            cpu_stats = stats['cpu_stats']
-            precpu_stats = stats['precpu_stats']
-            
-            cpu_delta = cpu_stats['cpu_usage']['total_usage'] - precpu_stats['cpu_usage']['total_usage']
-            system_delta = cpu_stats['system_cpu_usage'] - precpu_stats['system_cpu_usage']
-            
+            cpu_stats = stats["cpu_stats"]
+            precpu_stats = stats["precpu_stats"]
+
+            cpu_delta = (
+                cpu_stats["cpu_usage"]["total_usage"] - precpu_stats["cpu_usage"]["total_usage"]
+            )
+            system_delta = cpu_stats["system_cpu_usage"] - precpu_stats["system_cpu_usage"]
+
             if system_delta > 0 and cpu_delta > 0:
-                cpu_percent = (cpu_delta / system_delta) * len(cpu_stats['cpu_usage']['percpu_usage']) * 100.0
+                cpu_percent = (
+                    (cpu_delta / system_delta) * len(cpu_stats["cpu_usage"]["percpu_usage"]) * 100.0
+                )
                 return cpu_percent
-            
+
         except (KeyError, ZeroDivisionError, TypeError):
             pass
-        
+
         return 0.0
 
     def _terminate_container_processes(self):
         """Gracefully terminate processes in the container."""
         try:
             container = self.client.containers.get(self.container_name)
-            
+
             logger.info("🛑 Attempting graceful termination (SIGTERM)...")
             # Send SIGTERM to all java/mvn processes
             container.exec_run(["pkill", "-TERM", "java"], detach=True)
             container.exec_run(["pkill", "-TERM", "mvn"], detach=True)
-            
+
             # Wait 30 seconds for graceful shutdown
             time.sleep(30)
-            
+
             # Force kill if still running
             logger.info("🔪 Force terminating remaining processes (SIGKILL)...")
             container.exec_run(["pkill", "-KILL", "java"], detach=True)
             container.exec_run(["pkill", "-KILL", "mvn"], detach=True)
-            
+
         except Exception as e:
             logger.error(f"Failed to terminate container processes: {e}")
 
     def _truncate_output_smartly(self, output: str) -> str:
         """Smart output truncation that preserves important information."""
-        lines = output.split('\n')
-        
+        lines = output.split("\n")
+
         if len(lines) <= 100:
             return output
-        
+
         # Keep more lines from the end (recent output) than the beginning
         head_lines = 30
         tail_lines = 50
-        
+
         truncated = (
-            '\n'.join(lines[:head_lines]) +
-            f"\n... [TRUNCATED: {len(lines) - head_lines - tail_lines} lines omitted] ...\n" +
-            '\n'.join(lines[-tail_lines:])
+            "\n".join(lines[:head_lines])
+            + f"\n... [TRUNCATED: {len(lines) - head_lines - tail_lines} lines omitted] ...\n"
+            + "\n".join(lines[-tail_lines:])
         )
-        
+
         return truncated
 
     def get_container_info(self) -> Optional[Dict[str, Any]]:
@@ -1157,8 +1225,7 @@ class DockerOrchestrator:
             logger.error(f"Failed to get comment from volume: {e}")
             return "Error reading comment"
 
-
-    ## TODO：Need to add default java and python related config 
+    ## TODO：Need to add default java and python related config
     def _get_container_config(self) -> Dict[str, Any]:
         """Get container configuration."""
 
@@ -1175,7 +1242,11 @@ class DockerOrchestrator:
                 "setup-agent.created": datetime.now().isoformat(),
             },
             # Add a command to keep container running
-            "command": ["/bin/bash", "-c", f"mkdir -p {self.config.workspace_path} && while true; do sleep 30; done"],
+            "command": [
+                "/bin/bash",
+                "-c",
+                f"mkdir -p {self.config.workspace_path} && while true; do sleep 30; done",
+            ],
         }
 
         return config
@@ -1215,7 +1286,7 @@ class DockerOrchestrator:
 
     def _ensure_image_available(self) -> bool:
         """Ensure the Docker image is available locally, pull if needed."""
-        
+
         try:
             # Check if image exists locally
             try:
@@ -1224,23 +1295,23 @@ class DockerOrchestrator:
                 return True
             except NotFound:
                 logger.info(f"Image {self.base_image} not found locally, pulling...")
-                
+
             # Pull the image
             logger.info(f"Pulling Docker image: {self.base_image}")
             logger.info("This may take a few minutes on first run...")
-            
+
             # Pull with progress logging
             for line in self.client.api.pull(self.base_image, stream=True, decode=True):
-                if 'status' in line:
-                    status = line['status']
-                    if 'id' in line:
+                if "status" in line:
+                    status = line["status"]
+                    if "id" in line:
                         logger.debug(f"{line['id']}: {status}")
                     else:
                         logger.info(status)
-                        
+
             logger.info(f"✅ Successfully pulled image: {self.base_image}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to pull image {self.base_image}: {e}")
             return False
@@ -1274,7 +1345,7 @@ class DockerOrchestrator:
     def _setup_container_environment(self) -> bool:
         """
         Setup the basic environment in the container.
-        
+
         ★★★ CRITICAL FIX: Ensure /workspace directory always exists to prevent OCI runtime exec failed.
         ★★ PRIORITY FIX: Install Git during environment initialization to prevent chain failures.
         """
@@ -1290,12 +1361,14 @@ class DockerOrchestrator:
                 f"touch {self.config.workspace_path}/.sag_workspace_marker",  # Marker to verify persistence
                 f"ls -la {self.config.workspace_path}",  # Verify creation
             ]
-            
+
             logger.info("🔧 CRITICAL: Creating persistent workspace directory")
             for i, command in enumerate(workspace_commands):
                 logger.info(f"Workspace setup {i+1}/{len(workspace_commands)}: {command}")
-                result = self.execute_command(command, workdir=None)  # Use no workdir for workspace creation
-                
+                result = self.execute_command(
+                    command, workdir=None
+                )  # Use no workdir for workspace creation
+
                 if not result["success"]:
                     logger.error(f"❌ CRITICAL: Workspace setup failed at step {i+1}: {command}")
                     logger.error(f"Exit code: {result.get('exit_code', 'unknown')}")
@@ -1306,7 +1379,7 @@ class DockerOrchestrator:
 
             # ★★ STEP 2: PRIORITY - Install Git and essential tools during initialization
             logger.info("🔧 PRIORITY: Installing Git and essential tools")
-            
+
             # Update package lists first
             logger.info("📦 Updating package lists...")
             update_result = self.execute_command("apt-get update -qq", workdir=None)
@@ -1315,26 +1388,38 @@ class DockerOrchestrator:
 
             # Install essential packages including Git - this prevents chain failure B
             essential_packages = [
-                "curl", "wget", "git", "nano", "vim", 
-                "python3", "python3-pip", "nodejs", "npm", 
-                "build-essential", "grep", "findutils", "less"
+                "curl",
+                "wget",
+                "git",
+                "nano",
+                "vim",
+                "python3",
+                "python3-pip",
+                "nodejs",
+                "npm",
+                "build-essential",
+                "grep",
+                "findutils",
+                "less",
             ]
-            
+
             install_command = f"apt-get install -y -qq {' '.join(essential_packages)}"
             logger.info(f"📦 Installing essential packages: {' '.join(essential_packages)}")
-            
+
             install_result = self.execute_command(install_command, workdir=None)
-            
+
             if not install_result["success"]:
                 logger.error("❌ Essential package installation failed")
                 logger.error(f"Exit code: {install_result.get('exit_code', 'unknown')}")
                 logger.error(f"Output: {install_result.get('output', 'no output')}")
-                
+
                 # Try to install Git separately as it's critical for the workflow
                 logger.info("🔧 Attempting to install Git separately...")
                 git_result = self.execute_command("apt-get install -y git", workdir=None)
                 if not git_result["success"]:
-                    logger.error("❌ CRITICAL: Git installation failed - this will cause chain failure B")
+                    logger.error(
+                        "❌ CRITICAL: Git installation failed - this will cause chain failure B"
+                    )
                     return False
                 else:
                     logger.info("✅ Git installed successfully as fallback")
@@ -1344,30 +1429,44 @@ class DockerOrchestrator:
             # STEP 3: Verify critical tools are available and log versions
             verification_commands = [
                 ("git --version", "Git"),
-                ("grep --version | head -1", "grep"), 
+                ("grep --version | head -1", "grep"),
                 ("curl --version | head -1", "curl"),
                 ("python3 --version", "Python3"),
-                (f"test -d {self.config.workspace_path} && echo 'Workspace exists' || echo 'Workspace missing'", "Workspace"),
-                (f"test -f {self.config.workspace_path}/.sag_workspace_marker && echo 'Marker exists' || echo 'Marker missing'", "Workspace marker"),
+                (
+                    f"test -d {self.config.workspace_path} && echo 'Workspace exists' || echo 'Workspace missing'",
+                    "Workspace",
+                ),
+                (
+                    f"test -f {self.config.workspace_path}/.sag_workspace_marker && echo 'Marker exists' || echo 'Marker missing'",
+                    "Workspace marker",
+                ),
             ]
-            
+
             logger.info("🔍 Verifying critical tools and workspace...")
             verification_failed = False
-            
+
             for cmd, tool_name in verification_commands:
                 result = self.execute_command(cmd, workdir=None)
                 if result["success"]:
-                    output_summary = result["output"][:100] + "..." if len(result["output"]) > 100 else result["output"]
+                    output_summary = (
+                        result["output"][:100] + "..."
+                        if len(result["output"]) > 100
+                        else result["output"]
+                    )
                     logger.info(f"✅ {tool_name}: {output_summary}")
                 else:
                     logger.error(f"❌ {tool_name} verification failed")
                     verification_failed = True
-                    
+
                     # Special handling for critical failures
                     if tool_name == "Git":
-                        logger.error("❌ CRITICAL: Git verification failed - this will cause project clone failures")
+                        logger.error(
+                            "❌ CRITICAL: Git verification failed - this will cause project clone failures"
+                        )
                     elif tool_name == "Workspace":
-                        logger.error("❌ CRITICAL: Workspace verification failed - this will cause OCI runtime exec failures")
+                        logger.error(
+                            "❌ CRITICAL: Workspace verification failed - this will cause OCI runtime exec failures"
+                        )
 
             # STEP 4: Create environment script for persistent environment variables
             env_script = f"""#!/bin/bash
@@ -1386,13 +1485,13 @@ fi
 
 cd "$WORKSPACE_PATH" 2>/dev/null || cd /root
 """
-            
+
             # Write environment script
             script_result = self.execute_command(
-                f'echo \'{env_script}\' > /etc/profile.d/sag_env.sh && chmod +x /etc/profile.d/sag_env.sh',
-                workdir=None
+                f"echo '{env_script}' > /etc/profile.d/sag_env.sh && chmod +x /etc/profile.d/sag_env.sh",
+                workdir=None,
             )
-            
+
             if script_result["success"]:
                 logger.info("✅ Environment script created successfully")
             else:
@@ -1402,7 +1501,9 @@ cd "$WORKSPACE_PATH" 2>/dev/null || cd /root
                 logger.error("❌ Environment setup completed with failures")
                 return False
             else:
-                logger.info("✅ Container environment setup completed successfully with all verifications passing")
+                logger.info(
+                    "✅ Container environment setup completed successfully with all verifications passing"
+                )
                 return True
 
         except Exception as e:

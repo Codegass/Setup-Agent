@@ -1,9 +1,22 @@
 """Agent package for Setup-Agent."""
 
 from .agent import SetupAgent
-from .context_manager import BranchContext, ContextManager, TrunkContext  # BranchContext is DEPRECATED
+from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
+from .context_manager import (  # BranchContext is DEPRECATED
+    BranchContext,
+    ContextManager,
+    TrunkContext,
+)
 from .react_engine import ReActEngine
-from .agent_state_evaluator import AgentStateEvaluator, AgentStateAnalysis, AgentStatus
 
 # Note: BranchContext is deprecated and replaced by BranchContextHistory
-__all__ = ["SetupAgent", "ReActEngine", "ContextManager", "TrunkContext", "BranchContext", "AgentStateEvaluator", "AgentStateAnalysis", "AgentStatus"]
+__all__ = [
+    "SetupAgent",
+    "ReActEngine",
+    "ContextManager",
+    "TrunkContext",
+    "BranchContext",
+    "AgentStateEvaluator",
+    "AgentStateAnalysis",
+    "AgentStatus",
+]

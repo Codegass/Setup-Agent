@@ -1,33 +1,40 @@
 """Report tool for generating task summaries and marking completion."""
 
 import json
-from typing import Dict, Any, Iterable, List, Optional, Tuple
 from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
+from sag.reporting import format_percentage, render_condensed_summary, truncate_list
+from sag.ui.events import EventType, UIEventEmitter
+
 from .base import BaseTool, ToolResult
-from sag.reporting import render_condensed_summary, truncate_list, format_percentage
-from sag.ui.events import UIEventEmitter, EventType
 
 
 class ReportTool(BaseTool, UIEventEmitter):
     """
     Tool for generating comprehensive project setup reports and marking task completion.
-    
+
     Enhanced Features (v2024.09):
     - Physical evidence-based validation via PhysicalValidator integration
-    - Consistent report filename generation for log display and file saving  
+    - Consistent report filename generation for log display and file saving
     - Safe markdown file writing using here-doc with base64 fallback
     - Unified execution metrics with phase status driven by physical validation
     - Comprehensive error analysis and next-steps recommendations
-    
+
     The ReportTool now prioritizes physical evidence over log inference for accurate
     status determination, eliminating false positives and providing detailed
     validation evidence in the generated reports.
     """
 
-    def __init__(self, docker_orchestrator=None, execution_history_callback=None, context_manager=None, physical_validator=None):
+    def __init__(
+        self,
+        docker_orchestrator=None,
+        execution_history_callback=None,
+        context_manager=None,
+        physical_validator=None,
+    ):
         BaseTool.__init__(
             self,
             name="report",
@@ -47,11 +54,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         summary: Optional[str] = None,
         status: str = "success",
         details: Optional[str] = None,
-        **kwargs
+        **kwargs,
     ) -> ToolResult:
         """
         Generate project setup report and mark completion.
-        
+
         Args:
             action: Action to perform ('generate' for final report)
             summary: Brief summary of what was accomplished
@@ -60,7 +67,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                    - 'fail': Build failed OR test report not found OR test pass rate <= 80%
             details: Additional details about the setup process
         """
-        
+
         # IDEMPOTENCY CHECK: Prevent multiple report generation
         # Check if a report was already generated recently (within last 5 minutes)
         if action == "generate" and self.docker_orchestrator:
@@ -68,36 +75,40 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # Check for ANY existing reports (broader check to prevent duplicates)
                 check_cmd = "find /workspace -maxdepth 1 -name '*report*.md' -type f 2>/dev/null | grep -E '(setup.*report|final.*report|report.*md)' | head -1"
                 result = self.docker_orchestrator.execute_command(check_cmd)
-                existing_report = result.get('output', '').strip()
+                existing_report = result.get("output", "").strip()
 
                 if existing_report:
                     # A report was already generated
-                    logger.warning(f"Report already exists at {existing_report}, skipping duplicate generation")
+                    logger.warning(
+                        f"Report already exists at {existing_report}, skipping duplicate generation"
+                    )
 
                     # Read and return the existing report content
                     read_cmd = f"head -100 {existing_report}"
                     read_result = self.docker_orchestrator.execute_command(read_cmd)
-                    existing_content = read_result.get('output', '') if read_result.get('success') else ""
+                    existing_content = (
+                        read_result.get("output", "") if read_result.get("success") else ""
+                    )
 
                     # Return the information about the existing report
                     return ToolResult(
                         success=True,
                         output=f"📄 Report already generated: {existing_report}\n"
-                               f"Status: {status.upper()}\n"
-                               f"(Using existing report to prevent duplicates)\n\n"
-                               f"{existing_content[:500]}...",
+                        f"Status: {status.upper()}\n"
+                        f"(Using existing report to prevent duplicates)\n\n"
+                        f"{existing_content[:500]}...",
                         metadata={
                             "task_completed": True,
                             "completion_signal": True,
                             "status": status,
                             "existing_report": existing_report,
-                            "duplicate_prevention": True
-                        }
+                            "duplicate_prevention": True,
+                        },
                     )
             except Exception as e:
                 logger.debug(f"Failed to check for existing reports: {e}")
                 # Continue with report generation if check fails
-        
+
         # Check for unexpected parameters
         if kwargs:
             invalid_params = list(kwargs.keys())
@@ -116,18 +127,18 @@ class ReportTool(BaseTool, UIEventEmitter):
                     f"Example: report(action='generate', summary='Project built successfully', status='success')\n"
                     f"Example: report(action='generate', summary='Project built successfully', status='success', details='All build and test tasks completed successfully')"
                 ),
-                error=f"Invalid parameters: {invalid_params}"
+                error=f"Invalid parameters: {invalid_params}",
             )
 
         if not status:
             return ToolResult(
                 success=False,
                 output="❌ Missing required parameter: 'status'. Must be either 'success' or 'fail'\n"
-                      "• 'success': Build passed AND test pass rate > 80%\n"
-                      "• 'fail': Build failed OR tests not found OR pass rate <= 80%",
-                error="Missing required parameter: status"
+                "• 'success': Build passed AND test pass rate > 80%\n"
+                "• 'fail': Build failed OR tests not found OR pass rate <= 80%",
+                error="Missing required parameter: status",
             )
-        
+
         logger.info(f"Generating project report with status: {status}")
 
         try:
@@ -140,9 +151,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                         output="",
                         error=context_validation["error"],
                         suggestions=context_validation["suggestions"],
-                        error_code="PREREQUISITE_TASKS_INCOMPLETE"
+                        error_code="PREREQUISITE_TASKS_INCOMPLETE",
                     )
-                
+
                 (
                     report,
                     verified_status,
@@ -150,7 +161,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     actual_accomplishments,
                     report_snapshot,
                 ) = self._generate_comprehensive_report(summary, status, details)
-                
+
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
                     "task_completed": True,
@@ -176,11 +187,17 @@ class ReportTool(BaseTool, UIEventEmitter):
                     message=f"Report generated: {report_filename}",
                     report_path=f"/workspace/{report_filename}",
                     status=verified_status,
-                    build_success=actual_accomplishments.get('build_success', False),
-                    test_success=actual_accomplishments.get('test_success', False),
-                    test_pass_rate=actual_accomplishments.get('physical_validation', {}).get('test_analysis', {}).get('pass_rate', 0),
-                    total_tests=actual_accomplishments.get('physical_validation', {}).get('test_analysis', {}).get('total_tests', 0),
-                    passed_tests=actual_accomplishments.get('physical_validation', {}).get('test_analysis', {}).get('passed_tests', 0)
+                    build_success=actual_accomplishments.get("build_success", False),
+                    test_success=actual_accomplishments.get("test_success", False),
+                    test_pass_rate=actual_accomplishments.get("physical_validation", {})
+                    .get("test_analysis", {})
+                    .get("pass_rate", 0),
+                    total_tests=actual_accomplishments.get("physical_validation", {})
+                    .get("test_analysis", {})
+                    .get("total_tests", 0),
+                    passed_tests=actual_accomplishments.get("physical_validation", {})
+                    .get("test_analysis", {})
+                    .get("passed_tests", 0),
                 )
 
                 return ToolResult(
@@ -191,35 +208,37 @@ class ReportTool(BaseTool, UIEventEmitter):
                     raw_data={
                         "full_report": report,
                         "report_snapshot": report_snapshot,
-                    }  # Store full report outside condensed metadata
+                    },  # Store full report outside condensed metadata
                 )
             else:
                 return ToolResult(
                     success=False,
                     output="",
                     error=f"Invalid action '{action}'. Use 'generate' to create report.",
-                    suggestions=["Use action='generate' to create the final report"]
+                    suggestions=["Use action='generate' to create the final report"],
                 )
-                
+
         except Exception as e:
             logger.error(f"Failed to generate report: {e}")
             return ToolResult(
                 success=False,
                 output="",
                 error=f"Report generation failed: {str(e)}",
-                suggestions=["Check if all required information is available"]
+                suggestions=["Check if all required information is available"],
             )
 
-    def _generate_comprehensive_report(self, summary: str, status: str, details: str) -> Tuple[str, str, str, dict, dict]:
+    def _generate_comprehensive_report(
+        self, summary: str, status: str, details: str
+    ) -> Tuple[str, str, str, dict, dict]:
         """Generate a comprehensive project setup report."""
-        
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # Generate consistent report filename for both display and saving
         report_filename = f"setup-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
-        
+
         # Get project information if available
         project_info = self._get_project_info()
-        
+
         # Collect execution metrics
         execution_metrics = self._collect_execution_metrics()
 
@@ -228,45 +247,49 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Ensure the report action itself is reflected as a successful execution
         self._finalize_report_metrics(execution_metrics, verified_status)
-        
+
         # CRITICAL: Update phase status based on physical validation results
         if actual_accomplishments:
             # Update phase status with detailed validation results
-            clone_success = actual_accomplishments.get('repository_cloned', False)
-            build_success = actual_accomplishments.get('build_success', False) 
-            test_success = actual_accomplishments.get('test_success', False)
-            
-            execution_metrics['phases']['clone']['status'] = clone_success
-            execution_metrics['phases']['analyze']['status'] = clone_success  # Can only analyze if cloned
-            execution_metrics['phases']['build']['status'] = build_success
-            execution_metrics['phases']['test']['status'] = test_success
-            
+            clone_success = actual_accomplishments.get("repository_cloned", False)
+            build_success = actual_accomplishments.get("build_success", False)
+            test_success = actual_accomplishments.get("test_success", False)
+
+            execution_metrics["phases"]["clone"]["status"] = clone_success
+            execution_metrics["phases"]["analyze"][
+                "status"
+            ] = clone_success  # Can only analyze if cloned
+            execution_metrics["phases"]["build"]["status"] = build_success
+            execution_metrics["phases"]["test"]["status"] = test_success
+
             # Add validation evidence to phases
-            if 'physical_validation' in actual_accomplishments:
-                physical_data = actual_accomplishments['physical_validation']
-                execution_metrics['phases']['build']['evidence'] = {
-                    'class_files': physical_data.get('class_files', 0),
-                    'jar_files': physical_data.get('jar_files', 0),
-                    'recent_compilation': physical_data.get('recent_compilation', False),
-                    'missing_classes': physical_data.get('missing_classes', 0)
+            if "physical_validation" in actual_accomplishments:
+                physical_data = actual_accomplishments["physical_validation"]
+                execution_metrics["phases"]["build"]["evidence"] = {
+                    "class_files": physical_data.get("class_files", 0),
+                    "jar_files": physical_data.get("jar_files", 0),
+                    "recent_compilation": physical_data.get("recent_compilation", False),
+                    "missing_classes": physical_data.get("missing_classes", 0),
                 }
-                
-                if 'test_analysis' in physical_data:
-                    test_data = physical_data['test_analysis']
-                    execution_metrics['phases']['test']['evidence'] = {
-                        'total_tests': test_data.get('total_tests', 0),
-                        'passed_tests': test_data.get('passed_tests', 0),
-                        'failed_tests': test_data.get('failed_tests', 0),
-                        'error_tests': test_data.get('error_tests', 0),
-                        'report_files_count': test_data.get('report_files_count', 0)
+
+                if "test_analysis" in physical_data:
+                    test_data = physical_data["test_analysis"]
+                    execution_metrics["phases"]["test"]["evidence"] = {
+                        "total_tests": test_data.get("total_tests", 0),
+                        "passed_tests": test_data.get("passed_tests", 0),
+                        "failed_tests": test_data.get("failed_tests", 0),
+                        "error_tests": test_data.get("error_tests", 0),
+                        "report_files_count": test_data.get("report_files_count", 0),
                     }
-            
+
             # Estimate phase durations based on execution history if available
             self._estimate_phase_durations(execution_metrics, actual_accomplishments)
-            
-            logger.info(f"📊 Phase status updated from physical validation: Clone={clone_success}, "
-                       f"Build={build_success}, Test={test_success}")
-        
+
+            logger.info(
+                f"📊 Phase status updated from physical validation: Clone={clone_success}, "
+                f"Build={build_success}, Test={test_success}"
+            )
+
         report_snapshot = self._build_report_snapshot(
             verified_status,
             report_filename,
@@ -296,11 +319,17 @@ class ReportTool(BaseTool, UIEventEmitter):
             execution_metrics,
             report_snapshot,
         )
-        
+
         # Save markdown report to workspace with consistent filename
         self._save_markdown_report(markdown_report, timestamp, report_filename)
-        
-        return console_report, verified_status, report_filename, actual_accomplishments, report_snapshot
+
+        return (
+            console_report,
+            verified_status,
+            report_filename,
+            actual_accomplishments,
+            report_snapshot,
+        )
 
     def _finalize_report_metrics(self, execution_metrics: dict, verified_status: str) -> None:
         """Ensure the metrics snapshot accounts for the report tool invocation."""
@@ -337,11 +366,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         """
         Collect simple three-phase status directly from trunk context tasks.
         This is the simplified version that avoids complex execution history parsing.
-        
+
         Returns:
             dict: {
                 'clone_success': bool,
-                'build_success': bool, 
+                'build_success': bool,
                 'test_success': bool,
                 'build_errors': [],
                 'failing_tests': [],
@@ -349,66 +378,81 @@ class ReportTool(BaseTool, UIEventEmitter):
             }
         """
         simple_status = {
-            'clone_success': False,
-            'build_success': False,
-            'test_success': False,
-            'build_errors': [],
-            'failing_tests': [],
-            'project_info': {}
+            "clone_success": False,
+            "build_success": False,
+            "test_success": False,
+            "build_errors": [],
+            "failing_tests": [],
+            "project_info": {},
         }
-        
+
         try:
             if not self.context_manager:
                 return simple_status
-                
+
             trunk_context = self.context_manager.load_trunk_context()
-            if not trunk_context or not hasattr(trunk_context, 'todo_list'):
+            if not trunk_context or not hasattr(trunk_context, "todo_list"):
                 return simple_status
-            
+
             # Analyze completed tasks for three core phases
             for task in trunk_context.todo_list:
-                if task.status.value == 'completed' and task.key_results:
+                if task.status.value == "completed" and task.key_results:
                     task_desc = task.description.lower()
                     key_results = task.key_results.lower()
-                    
+
                     # Phase 1: Repository Clone
-                    if any(keyword in task_desc for keyword in ['clone', 'repository', 'setup']):
-                        clone_indicators = ['project_type=', 'repository', 'cloned', 'path=/workspace/', 'repo_dir=']
+                    if any(keyword in task_desc for keyword in ["clone", "repository", "setup"]):
+                        clone_indicators = [
+                            "project_type=",
+                            "repository",
+                            "cloned",
+                            "path=/workspace/",
+                            "repo_dir=",
+                        ]
                         if any(indicator in key_results for indicator in clone_indicators):
-                            simple_status['clone_success'] = True
-                    
+                            simple_status["clone_success"] = True
+
                     # Phase 2: Build/Compilation
-                    if any(keyword in task_desc for keyword in ['compile', 'build', 'maven', 'gradle']):
-                        build_indicators = ['modules_compiled:', 'build_status=success', 'build_success=true', 'compiled']
+                    if any(
+                        keyword in task_desc for keyword in ["compile", "build", "maven", "gradle"]
+                    ):
+                        build_indicators = [
+                            "modules_compiled:",
+                            "build_status=success",
+                            "build_success=true",
+                            "compiled",
+                        ]
                         if any(indicator in key_results for indicator in build_indicators):
-                            simple_status['build_success'] = True
+                            simple_status["build_success"] = True
                         # TODO: Extract build errors if any
-                    
+
                     # Phase 3: Testing
-                    if any(keyword in task_desc for keyword in ['test', 'run test']):
-                        test_indicators = ['test_status=success', 'tests_passed=true', 'all tests']
+                    if any(keyword in task_desc for keyword in ["test", "run test"]):
+                        test_indicators = ["test_status=success", "tests_passed=true", "all tests"]
                         if any(indicator in key_results for indicator in test_indicators):
-                            simple_status['test_success'] = True
+                            simple_status["test_success"] = True
                         # TODO: Extract failing tests if any
-            
+
             # Get project info using existing method
-            simple_status['project_info'] = self._get_project_info()
-            
-            logger.debug(f"🔍 Simple status: Clone={simple_status['clone_success']}, "
-                       f"Build={simple_status['build_success']}, Test={simple_status['test_success']}")
-                       
+            simple_status["project_info"] = self._get_project_info()
+
+            logger.debug(
+                f"🔍 Simple status: Clone={simple_status['clone_success']}, "
+                f"Build={simple_status['build_success']}, Test={simple_status['test_success']}"
+            )
+
         except Exception as e:
             logger.warning(f"Failed to collect simple status from tasks: {e}")
-            
+
         return simple_status
 
     def _render_simple_summary_top(self, simple_status: dict) -> str:
         """
         Render the simple three-phase summary at the top of the report.
-        
+
         Args:
             simple_status: Status dict from _collect_simple_status_from_tasks
-            
+
         Returns:
             str: Formatted simple summary for console output
         """
@@ -416,68 +460,68 @@ class ReportTool(BaseTool, UIEventEmitter):
             "📋 SETUP RESULT SUMMARY",
             "=" * 50,
         ]
-        
+
         # Phase 1: Repository Clone
-        if simple_status['clone_success']:
+        if simple_status["clone_success"]:
             lines.append("✅ Repository Clone: SUCCESS")
         else:
             lines.append("❌ Repository Clone: FAILED")
-        
+
         # Phase 2: Project Build
-        if simple_status['build_success']:
+        if simple_status["build_success"]:
             lines.append("✅ Project Build: SUCCESS")
         else:
             lines.append("❌ Project Build: FAILED")
-            if simple_status['build_errors']:
-                error_count = len(simple_status['build_errors'])
+            if simple_status["build_errors"]:
+                error_count = len(simple_status["build_errors"])
                 lines.append(f"   └─ {error_count} build error(s) detected")
-        
+
         # Phase 3: Test Suite
-        if simple_status['test_success']:
+        if simple_status["test_success"]:
             lines.append("✅ Test Suite: SUCCESS")
         else:
             lines.append("❌ Test Suite: FAILED")
-            if simple_status['failing_tests']:
-                test_count = len(simple_status['failing_tests'])
+            if simple_status["failing_tests"]:
+                test_count = len(simple_status["failing_tests"])
                 lines.append(f"   └─ {test_count} test case(s) failed")
-        
+
         # Add test metrics if available
         if self.context_manager:
             try:
                 trunk_context = self.context_manager.load_trunk_context()
                 if trunk_context and trunk_context.environment_summary:
-                    static_test_count = trunk_context.environment_summary.get('static_test_count')
+                    static_test_count = trunk_context.environment_summary.get("static_test_count")
                     if static_test_count:
                         lines.append(f"📊 Total @Test Annotations: {static_test_count}")
             except:
                 pass
-        
+
         # Project Information
-        project_info = simple_status.get('project_info', {})
-        if project_info.get('type'):
+        project_info = simple_status.get("project_info", {})
+        if project_info.get("type"):
             lines.append(f"📂 Project Type: {project_info['type']}")
-        
+
         # Next Steps Recommendations
         lines.append("")
         lines.append("💡 Next Steps:")
-        
-        if not simple_status['clone_success']:
+
+        if not simple_status["clone_success"]:
             lines.append("   → Fix repository access and retry clone")
-        elif not simple_status['build_success']:
+        elif not simple_status["build_success"]:
             lines.append("   → Check build dependencies and fix compilation errors")
-        elif not simple_status['test_success']:
+        elif not simple_status["test_success"]:
             lines.append("   → Review test failures and fix issues")
             # TODO: Add specific Maven/Gradle recovery commands
-            build_system = project_info.get('build_system', '').lower()
-            if 'maven' in build_system:
+            build_system = project_info.get("build_system", "").lower()
+            if "maven" in build_system:
                 lines.append("   → Continue with remaining tests: mvn -fae test")
-            elif 'gradle' in build_system:
+            elif "gradle" in build_system:
                 lines.append("   → Continue with remaining tests: ./gradlew test --continue")
         else:
             lines.append("   → Project is ready for development/deployment! 🎉")
-        
+
         lines.extend(["", "=" * 50, ""])
-        
+
         return "\n".join(lines)
 
     def _load_test_history(self, max_lines: int = 40, max_bytes: int = 16384) -> Dict[str, Any]:
@@ -505,13 +549,13 @@ class ReportTool(BaseTool, UIEventEmitter):
                 return {}
 
         history: Dict[str, Any] = {
-            'ignored_lines': 0,
-            'last_cmd': {},
-            'aggregate': {},
-            'per_module': {},
-            'exclusions': {'tests': [], 'modules': []},
-            'failed_tests': [],
-            'flags': {},
+            "ignored_lines": 0,
+            "last_cmd": {},
+            "aggregate": {},
+            "per_module": {},
+            "exclusions": {"tests": [], "modules": []},
+            "failed_tests": [],
+            "flags": {},
         }
 
         modules_seen: Dict[str, Dict[str, Any]] = {}
@@ -543,11 +587,11 @@ class ReportTool(BaseTool, UIEventEmitter):
                             return None
                 return None
 
-            total = pick(['total', 'tests_total', 'total_tests'])
-            failed = pick(['failed', 'failures', 'tests_failed', 'tests_failures']) or 0
-            errors = pick(['errors', 'error', 'tests_errors']) or 0
-            skipped = pick(['skipped', 'tests_skipped']) or 0
-            passed = pick(['passed', 'passes', 'tests_passed'])
+            total = pick(["total", "tests_total", "total_tests"])
+            failed = pick(["failed", "failures", "tests_failed", "tests_failures"]) or 0
+            errors = pick(["errors", "error", "tests_errors"]) or 0
+            skipped = pick(["skipped", "tests_skipped"]) or 0
+            passed = pick(["passed", "passes", "tests_passed"])
 
             if passed is None and total is not None:
                 try:
@@ -563,12 +607,12 @@ class ReportTool(BaseTool, UIEventEmitter):
                     pass_pct = None
 
             return {
-                'total': cast(total),
-                'passed': cast(passed),
-                'failed': cast(failed),
-                'error': cast(errors),
-                'skipped': cast(skipped),
-                'pass_pct': pass_pct,
+                "total": cast(total),
+                "passed": cast(passed),
+                "failed": cast(failed),
+                "error": cast(errors),
+                "skipped": cast(skipped),
+                "pass_pct": pass_pct,
             }
 
         for raw_line in raw_lines:
@@ -576,115 +620,119 @@ class ReportTool(BaseTool, UIEventEmitter):
             if not line:
                 continue
             if len(line) > max_bytes:
-                history['ignored_lines'] += 1
+                history["ignored_lines"] += 1
                 continue
 
             try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
-                history['ignored_lines'] += 1
+                history["ignored_lines"] += 1
                 continue
 
-            event_type = entry.get('event') or 'legacy_session'
+            event_type = entry.get("event") or "legacy_session"
 
-            if event_type == 'test_module_summary':
-                module_name = entry.get('module') or entry.get('module_name')
+            if event_type == "test_module_summary":
+                module_name = entry.get("module") or entry.get("module_name")
                 if not module_name:
                     continue
-                counts = normalize_tests(entry.get('tests', entry))
+                counts = normalize_tests(entry.get("tests", entry))
                 modules_seen[module_name] = {
-                    'total': counts['total'],
-                    'passed': counts['passed'],
-                    'failed': counts['failed'],
-                    'error': counts['error'],
-                    'skipped': counts['skipped'],
-                    'pass_pct': counts['pass_pct'],
+                    "total": counts["total"],
+                    "passed": counts["passed"],
+                    "failed": counts["failed"],
+                    "error": counts["error"],
+                    "skipped": counts["skipped"],
+                    "pass_pct": counts["pass_pct"],
                 }
 
-                excluded = entry.get('exclusions', {})
+                excluded = entry.get("exclusions", {})
                 if isinstance(excluded, dict):
-                    excluded_tests.update(excluded.get('tests', []) or [])
-                    excluded_modules.update(excluded.get('modules', []) or [])
-                skipped_modules.update(entry.get('skipped_modules', []) or [])
-                failed_tests.update(entry.get('failed_tests', []) or [])
+                    excluded_tests.update(excluded.get("tests", []) or [])
+                    excluded_modules.update(excluded.get("modules", []) or [])
+                skipped_modules.update(entry.get("skipped_modules", []) or [])
+                failed_tests.update(entry.get("failed_tests", []) or [])
                 continue
 
-            if event_type in {'test_session_end', 'legacy_session'}:
+            if event_type in {"test_session_end", "legacy_session"}:
                 aggregate_entry = entry
-                counts = normalize_tests(entry.get('tests', entry))
-                aggregate_entry['_normalized_tests'] = counts
+                counts = normalize_tests(entry.get("tests", entry))
+                aggregate_entry["_normalized_tests"] = counts
 
-                modules_expected = entry.get('modules_expected', modules_expected)
-                if entry.get('modules_seen'):
+                modules_expected = entry.get("modules_expected", modules_expected)
+                if entry.get("modules_seen"):
                     try:
-                        seen = int(entry['modules_seen'])
-                        aggregate_entry['_modules_seen'] = seen
+                        seen = int(entry["modules_seen"])
+                        aggregate_entry["_modules_seen"] = seen
                     except (TypeError, ValueError):
                         pass
 
-                skipped_modules.update(entry.get('skipped_modules', []) or [])
-                failed_tests.update(entry.get('failed_tests', []) or [])
+                skipped_modules.update(entry.get("skipped_modules", []) or [])
+                failed_tests.update(entry.get("failed_tests", []) or [])
 
-                exclusions_field = entry.get('exclusions')
+                exclusions_field = entry.get("exclusions")
                 if isinstance(exclusions_field, dict):
-                    excluded_tests.update(exclusions_field.get('tests', []) or [])
-                    excluded_modules.update(exclusions_field.get('modules', []) or [])
+                    excluded_tests.update(exclusions_field.get("tests", []) or [])
+                    excluded_modules.update(exclusions_field.get("modules", []) or [])
                 else:
-                    excluded_tests.update(entry.get('excluded_tests', []) or [])
-                    excluded_modules.update(entry.get('excluded_modules', []) or [])
+                    excluded_tests.update(entry.get("excluded_tests", []) or [])
+                    excluded_modules.update(entry.get("excluded_modules", []) or [])
 
-                history['last_cmd'] = {
-                    'tool': entry.get('tool'),
-                    'workdir': entry.get('working_directory'),
-                    'exit_code': entry.get('exit_code'),
-                    'command': entry.get('command'),
-                    'fail_at_end': entry.get('fail_at_end')
+                history["last_cmd"] = {
+                    "tool": entry.get("tool"),
+                    "workdir": entry.get("working_directory"),
+                    "exit_code": entry.get("exit_code"),
+                    "command": entry.get("command"),
+                    "fail_at_end": entry.get("fail_at_end"),
                 }
 
                 # Infer fail_at_end from command if not explicit
-                if history['last_cmd'].get('fail_at_end') is None:
-                    command_str = entry.get('command') or ''
-                    history['last_cmd']['fail_at_end'] = '--fail-at-end' in command_str or ' -fae' in command_str
+                if history["last_cmd"].get("fail_at_end") is None:
+                    command_str = entry.get("command") or ""
+                    history["last_cmd"]["fail_at_end"] = (
+                        "--fail-at-end" in command_str or " -fae" in command_str
+                    )
 
         if not modules_seen and not aggregate_entry:
             return {}
 
-        aggregate_counts = aggregate_entry.get('_normalized_tests', {}) if aggregate_entry else {}
+        aggregate_counts = aggregate_entry.get("_normalized_tests", {}) if aggregate_entry else {}
         aggregate: Dict[str, Any] = {
-            'modules_expected': modules_expected,
-            'skipped_modules': sorted(skipped_modules) if skipped_modules else [],
-            'tests': {
-                'total': aggregate_counts.get('total'),
-                'passed': aggregate_counts.get('passed'),
-                'failed': aggregate_counts.get('failed'),
-                'error': aggregate_counts.get('error'),
-                'skipped': aggregate_counts.get('skipped'),
+            "modules_expected": modules_expected,
+            "skipped_modules": sorted(skipped_modules) if skipped_modules else [],
+            "tests": {
+                "total": aggregate_counts.get("total"),
+                "passed": aggregate_counts.get("passed"),
+                "failed": aggregate_counts.get("failed"),
+                "error": aggregate_counts.get("error"),
+                "skipped": aggregate_counts.get("skipped"),
             },
-            'pass_pct': aggregate_counts.get('pass_pct'),
+            "pass_pct": aggregate_counts.get("pass_pct"),
         }
 
-        modules_seen_count = aggregate_entry.get('_modules_seen') if aggregate_entry else None
+        modules_seen_count = aggregate_entry.get("_modules_seen") if aggregate_entry else None
         if modules_seen_count is None:
             modules_seen_count = len(modules_seen)
-        aggregate['modules_seen'] = modules_seen_count
+        aggregate["modules_seen"] = modules_seen_count
 
         # Detect inconsistencies between per-module totals and aggregate
-        if aggregate_counts.get('total') is not None and modules_seen:
+        if aggregate_counts.get("total") is not None and modules_seen:
             module_total = 0.0
             for module_info in modules_seen.values():
-                if module_info.get('total') is not None:
-                    module_total += module_info['total']
+                if module_info.get("total") is not None:
+                    module_total += module_info["total"]
             try:
-                aggregate['inconsistent'] = abs(module_total - aggregate_counts['total']) > 0.5
+                aggregate["inconsistent"] = abs(module_total - aggregate_counts["total"]) > 0.5
             except TypeError:
-                aggregate['inconsistent'] = True
+                aggregate["inconsistent"] = True
 
-        history['aggregate'] = aggregate
-        history['per_module'] = modules_seen
-        history['exclusions']['tests'] = sorted(excluded_tests)
-        history['exclusions']['modules'] = sorted(excluded_modules)
-        history['failed_tests'] = sorted(failed_tests)
-        history['flags']['fail_at_end'] = history['last_cmd'].get('fail_at_end') if history['last_cmd'] else None
+        history["aggregate"] = aggregate
+        history["per_module"] = modules_seen
+        history["exclusions"]["tests"] = sorted(excluded_tests)
+        history["exclusions"]["modules"] = sorted(excluded_modules)
+        history["failed_tests"] = sorted(failed_tests)
+        history["flags"]["fail_at_end"] = (
+            history["last_cmd"].get("fail_at_end") if history["last_cmd"] else None
+        )
 
         return history
 
@@ -701,10 +749,10 @@ class ReportTool(BaseTool, UIEventEmitter):
         actual_accomplishments = actual_accomplishments or {}
         execution_metrics = execution_metrics or {}
 
-        test_history = execution_metrics.get('test_history', {}) or {}
-        aggregate = test_history.get('aggregate', {}) or {}
-        per_module = test_history.get('per_module', {}) or {}
-        
+        test_history = execution_metrics.get("test_history", {}) or {}
+        aggregate = test_history.get("aggregate", {}) or {}
+        per_module = test_history.get("per_module", {}) or {}
+
         # Get test count metrics from trunk context if available
         static_test_count = None
         method_count = None
@@ -714,11 +762,13 @@ class ReportTool(BaseTool, UIEventEmitter):
                 trunk_context = self.context_manager.load_trunk_context()
                 if trunk_context and trunk_context.environment_summary:
                     # Get the static test method count collected during analysis
-                    static_test_count = trunk_context.environment_summary.get('static_test_count')
+                    static_test_count = trunk_context.environment_summary.get("static_test_count")
                     # Get the method count for comparison
-                    method_count = trunk_context.environment_summary.get('method_count')
+                    method_count = trunk_context.environment_summary.get("method_count")
                     # Get parameterized test breakdown
-                    parameterized_info = trunk_context.environment_summary.get('parameterized_info', {})
+                    parameterized_info = trunk_context.environment_summary.get(
+                        "parameterized_info", {}
+                    )
 
                     if static_test_count:
                         logger.info("📊 Retrieved test counts from trunk context:")
@@ -739,33 +789,33 @@ class ReportTool(BaseTool, UIEventEmitter):
             except (TypeError, ValueError):
                 return None
 
-        tests_counts = aggregate.get('tests', {}) or {}
-        aggregate_total = tests_counts.get('total')
-        aggregate_passed = tests_counts.get('passed')
-        aggregate_failed = tests_counts.get('failed')
-        aggregate_error = tests_counts.get('error')
-        aggregate_skipped = tests_counts.get('skipped')
-        aggregate_pass_pct = aggregate.get('pass_pct')
+        tests_counts = aggregate.get("tests", {}) or {}
+        aggregate_total = tests_counts.get("total")
+        aggregate_passed = tests_counts.get("passed")
+        aggregate_failed = tests_counts.get("failed")
+        aggregate_error = tests_counts.get("error")
+        aggregate_skipped = tests_counts.get("skipped")
+        aggregate_pass_pct = aggregate.get("pass_pct")
 
-        physical_validation = actual_accomplishments.get('physical_validation', {}) or {}
-        test_analysis = physical_validation.get('test_analysis', {}) or {}
+        physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
+        test_analysis = physical_validation.get("test_analysis", {}) or {}
 
-        tests_total = test_analysis.get('total_tests')
-        tests_failed = test_analysis.get('failed_tests')
-        tests_error = test_analysis.get('error_tests')
-        tests_skipped = test_analysis.get('skipped_tests')
-        tests_passed = test_analysis.get('passed_tests')
+        tests_total = test_analysis.get("total_tests")
+        tests_failed = test_analysis.get("failed_tests")
+        tests_error = test_analysis.get("error_tests")
+        tests_skipped = test_analysis.get("skipped_tests")
+        tests_passed = test_analysis.get("passed_tests")
         pass_pct = (
-            test_analysis.get('pass_rate')
-            or test_analysis.get('pass_pct')
-            or test_analysis.get('pass_percentage')
+            test_analysis.get("pass_rate")
+            or test_analysis.get("pass_pct")
+            or test_analysis.get("pass_percentage")
         )
 
-        raw_total_tests = test_analysis.get('raw_total_tests')
-        raw_passed_tests = test_analysis.get('raw_passed_tests')
-        raw_failed_tests = test_analysis.get('raw_failed_tests')
-        raw_error_tests = test_analysis.get('raw_error_tests')
-        raw_skipped_tests = test_analysis.get('raw_skipped_tests')
+        raw_total_tests = test_analysis.get("raw_total_tests")
+        raw_passed_tests = test_analysis.get("raw_passed_tests")
+        raw_failed_tests = test_analysis.get("raw_failed_tests")
+        raw_error_tests = test_analysis.get("raw_error_tests")
+        raw_skipped_tests = test_analysis.get("raw_skipped_tests")
 
         if tests_total is None:
             tests_total = aggregate_total
@@ -806,18 +856,18 @@ class ReportTool(BaseTool, UIEventEmitter):
             except ZeroDivisionError:
                 pass_pct = None
 
-        modules_expected = aggregate.get('modules_expected')
-        modules_seen = aggregate.get('modules_seen')
-        skipped_modules = aggregate.get('skipped_modules', []) or []
+        modules_expected = aggregate.get("modules_expected")
+        modules_seen = aggregate.get("modules_seen")
+        skipped_modules = aggregate.get("skipped_modules", []) or []
 
-        exclusions = test_history.get('exclusions', {}) or {}
-        exclusions_tests = exclusions.get('tests', []) or []
-        exclusions_modules = exclusions.get('modules', []) or []
+        exclusions = test_history.get("exclusions", {}) or {}
+        exclusions_tests = exclusions.get("tests", []) or []
+        exclusions_modules = exclusions.get("modules", []) or []
 
         phases = {
-            'clone': actual_accomplishments.get('repository_cloned', False),
-            'build': actual_accomplishments.get('build_success', False),
-            'test': actual_accomplishments.get('test_success', False),
+            "clone": actual_accomplishments.get("repository_cloned", False),
+            "build": actual_accomplishments.get("build_success", False),
+            "test": actual_accomplishments.get("test_success", False),
         }
 
         # Calculate test metrics with consistent counting
@@ -832,14 +882,18 @@ class ReportTool(BaseTool, UIEventEmitter):
         if static_test_count and executed_tests is not None:
             try:
                 execution_rate = (executed_tests / static_test_count) * 100
-                logger.info(f"📊 Test Coverage: {execution_rate:.1f}% ({executed_tests} of {static_test_count} tests executed)")
+                logger.info(
+                    f"📊 Test Coverage: {execution_rate:.1f}% ({executed_tests} of {static_test_count} tests executed)"
+                )
             except (TypeError, ZeroDivisionError):
                 execution_rate = None
 
         if raw_executed_tests and executed_tests and raw_executed_tests > executed_tests:
             try:
                 expansion_factor = raw_executed_tests / executed_tests
-                logger.info(f"📊 Parameterized expansion detected: {raw_executed_tests} raw runs vs {executed_tests} deduplicated")
+                logger.info(
+                    f"📊 Parameterized expansion detected: {raw_executed_tests} raw runs vs {executed_tests} deduplicated"
+                )
                 logger.info(f"   - Average expansions per test: {expansion_factor:.2f}x")
             except ZeroDivisionError:
                 expansion_factor = None
@@ -847,80 +901,89 @@ class ReportTool(BaseTool, UIEventEmitter):
             try:
                 # Provide coverage relative to declared methods when deduplicated counts are available
                 method_coverage = (executed_tests / method_count) * 100
-                logger.info(f"📊 Method coverage: {method_coverage:.1f}% ({executed_tests} of {method_count} methods)")
+                logger.info(
+                    f"📊 Method coverage: {method_coverage:.1f}% ({executed_tests} of {method_count} methods)"
+                )
             except ZeroDivisionError:
                 pass
-        
+
         status = {
-            'overall': verified_status,
-            'tests_total': to_int(tests_total),
-            'tests_total_raw': to_int(raw_total_tests),
-            'tests_passed': to_int(tests_passed),
-            'tests_passed_raw': to_int(raw_passed_tests),
-            'tests_failed': to_int(tests_failed),
-            'tests_failed_raw': to_int(raw_failed_tests),
-            'tests_errors': to_int(tests_error),
-            'tests_errors_raw': to_int(raw_error_tests),
-            'tests_skipped': to_int(tests_skipped),
-            'tests_skipped_raw': to_int(raw_skipped_tests),
-            'pass_pct': pass_pct,
-            'static_test_count': static_test_count,
-            'method_count': method_count,  # Original method annotations
-            'execution_rate': execution_rate,
-            'expansion_factor': expansion_factor,
-            'parameterized_info': parameterized_info,
-            'modules_expected': to_int(modules_expected),
-            'modules_seen': to_int(modules_seen),
-            'skipped_modules': skipped_modules,
+            "overall": verified_status,
+            "tests_total": to_int(tests_total),
+            "tests_total_raw": to_int(raw_total_tests),
+            "tests_passed": to_int(tests_passed),
+            "tests_passed_raw": to_int(raw_passed_tests),
+            "tests_failed": to_int(tests_failed),
+            "tests_failed_raw": to_int(raw_failed_tests),
+            "tests_errors": to_int(tests_error),
+            "tests_errors_raw": to_int(raw_error_tests),
+            "tests_skipped": to_int(tests_skipped),
+            "tests_skipped_raw": to_int(raw_skipped_tests),
+            "pass_pct": pass_pct,
+            "static_test_count": static_test_count,
+            "method_count": method_count,  # Original method annotations
+            "execution_rate": execution_rate,
+            "expansion_factor": expansion_factor,
+            "parameterized_info": parameterized_info,
+            "modules_expected": to_int(modules_expected),
+            "modules_seen": to_int(modules_seen),
+            "skipped_modules": skipped_modules,
         }
 
-        if status['tests_passed'] is None and status['tests_total'] is not None and status['tests_failed'] is not None:
+        if (
+            status["tests_passed"] is None
+            and status["tests_total"] is not None
+            and status["tests_failed"] is not None
+        ):
             try:
-                status['tests_passed'] = max(status['tests_total'] - status['tests_failed'] - (status['tests_errors'] or 0), 0)
+                status["tests_passed"] = max(
+                    status["tests_total"] - status["tests_failed"] - (status["tests_errors"] or 0),
+                    0,
+                )
             except TypeError:
-                status['tests_passed'] = None
+                status["tests_passed"] = None
 
         tests_ok = None
         if pass_pct is not None:
             tests_ok = pass_pct >= 80
-        elif status['tests_total'] is not None:
-            tests_ok = actual_accomplishments.get('test_success', False)
-        status['tests_ok'] = tests_ok
+        elif status["tests_total"] is not None:
+            tests_ok = actual_accomplishments.get("test_success", False)
+        status["tests_ok"] = tests_ok
 
         physical_evidence = {
-            'class_files': physical_validation.get('class_files'),
-            'jar_files': physical_validation.get('jar_files'),
-            'tests_total': status['tests_total'],
-            'tests_pass_pct': pass_pct,
+            "class_files": physical_validation.get("class_files"),
+            "jar_files": physical_validation.get("jar_files"),
+            "tests_total": status["tests_total"],
+            "tests_pass_pct": pass_pct,
         }
 
         flags = {
-            'fail_at_end': test_history.get('flags', {}).get('fail_at_end'),
-            'excluded_tests': exclusions_tests,
-            'excluded_modules': exclusions_modules,
+            "fail_at_end": test_history.get("flags", {}).get("fail_at_end"),
+            "excluded_tests": exclusions_tests,
+            "excluded_modules": exclusions_modules,
         }
 
         snapshot = {
-            'status': status,
-            'project': {
-                'type': project_info.get('type', 'Unknown'),
-                'build_system': project_info.get('build_system', 'Unknown'),
+            "status": status,
+            "project": {
+                "type": project_info.get("type", "Unknown"),
+                "build_system": project_info.get("build_system", "Unknown"),
             },
-            'phases': phases,
-            'report_path': f"/workspace/{report_filename}",
-            'physical_evidence': physical_evidence,
-            'test_history': test_history,
-            'per_module': per_module,
-            'flags': flags,
-            'last_command': test_history.get('last_cmd', {}),
-            'failed_tests': test_history.get('failed_tests', []),
+            "phases": phases,
+            "report_path": f"/workspace/{report_filename}",
+            "physical_evidence": physical_evidence,
+            "test_history": test_history,
+            "per_module": per_module,
+            "flags": flags,
+            "last_command": test_history.get("last_cmd", {}),
+            "failed_tests": test_history.get("failed_tests", []),
         }
 
         attention = self._evaluate_attention_flags(snapshot)
-        snapshot['attention'] = {
-            'items': [f"{item['icon']} {item['message']}" for item in attention],
-            'raw': attention,
-            'ignored_lines': test_history.get('ignored_lines', 0),
+        snapshot["attention"] = {
+            "items": [f"{item['icon']} {item['message']}" for item in attention],
+            "raw": attention,
+            "ignored_lines": test_history.get("ignored_lines", 0),
         }
 
         return snapshot
@@ -928,77 +991,79 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _evaluate_attention_flags(self, snapshot: Dict[str, Any]) -> List[Dict[str, str]]:
         """Evaluate needs-attention rules and return ordered severity entries."""
 
-        severity_order = {'BLOCKER': 0, 'WARNING': 1, 'INFO': 2}
-        severity_icons = {'BLOCKER': '🔴', 'WARNING': '🟠', 'INFO': '🔵'}
+        severity_order = {"BLOCKER": 0, "WARNING": 1, "INFO": 2}
+        severity_icons = {"BLOCKER": "🔴", "WARNING": "🟠", "INFO": "🔵"}
         items: List[Dict[str, str]] = []
 
-        phases = snapshot.get('phases', {})
-        status = snapshot.get('status', {})
-        test_history = snapshot.get('test_history', {})
-        per_module = snapshot.get('per_module', {})
-        flags = snapshot.get('flags', {})
+        phases = snapshot.get("phases", {})
+        status = snapshot.get("status", {})
+        test_history = snapshot.get("test_history", {})
+        per_module = snapshot.get("per_module", {})
+        flags = snapshot.get("flags", {})
 
         def add(severity: str, message: str):
-            items.append({'severity': severity, 'icon': severity_icons[severity], 'message': message})
+            items.append(
+                {"severity": severity, "icon": severity_icons[severity], "message": message}
+            )
 
         # BLOCKER: build failure
-        if not phases.get('build', False):
-            add('BLOCKER', 'Build failed - compilation or packaging incomplete.')
+        if not phases.get("build", False):
+            add("BLOCKER", "Build failed - compilation or packaging incomplete.")
 
         # BLOCKER: tests flagged unsuccessful despite telemetry
-        if status.get('tests_total') and phases.get('test') is False:
-            pass_rate = format_percentage(status.get('pass_pct'))
-            add('BLOCKER', f'Tests reported failures (pass rate {pass_rate}).')
+        if status.get("tests_total") and phases.get("test") is False:
+            pass_rate = format_percentage(status.get("pass_pct"))
+            add("BLOCKER", f"Tests reported failures (pass rate {pass_rate}).")
 
         # BLOCKER: build succeeded but no test telemetry captured
-        if phases.get('build') and not status.get('tests_total'):
-            add('BLOCKER', 'No test reports detected despite successful build.')
+        if phases.get("build") and not status.get("tests_total"):
+            add("BLOCKER", "No test reports detected despite successful build.")
 
         # WARNING: pass rate below threshold (unless already blocker)
-        if status.get('pass_pct') is not None and status['pass_pct'] < 80:
-            pass_rate = format_percentage(status['pass_pct'])
-            add('WARNING', f'Test pass rate below threshold (80%): {pass_rate}.')
+        if status.get("pass_pct") is not None and status["pass_pct"] < 80:
+            pass_rate = format_percentage(status["pass_pct"])
+            add("WARNING", f"Test pass rate below threshold (80%): {pass_rate}.")
 
         # WARNING: module coverage shortfall
-        if status.get('modules_expected') and status.get('modules_seen') is not None:
-            if status['modules_seen'] < status['modules_expected']:
+        if status.get("modules_expected") and status.get("modules_seen") is not None:
+            if status["modules_seen"] < status["modules_expected"]:
                 add(
-                    'WARNING',
+                    "WARNING",
                     f"Module coverage incomplete ({status['modules_seen']}/{status['modules_expected']} tested).",
                 )
 
         # WARNING: skipped modules or exclusions present
-        skipped_modules = status.get('skipped_modules') or []
+        skipped_modules = status.get("skipped_modules") or []
         if skipped_modules:
             skipped_str = truncate_list(skipped_modules)
-            add('WARNING', f'Skipped modules detected: {skipped_str}.')
+            add("WARNING", f"Skipped modules detected: {skipped_str}.")
 
-        exclusions_tests = flags.get('excluded_tests') or []
+        exclusions_tests = flags.get("excluded_tests") or []
         if exclusions_tests:
             exclusion_str = truncate_list(exclusions_tests)
-            add('WARNING', f'Excluded tests patterns applied: {exclusion_str}.')
+            add("WARNING", f"Excluded tests patterns applied: {exclusion_str}.")
 
         # INFO: fail_at_end flag
-        if flags.get('fail_at_end'):
-            add('INFO', 'fail_at_end enabled (test failures may be deferred).')
+        if flags.get("fail_at_end"):
+            add("INFO", "fail_at_end enabled (test failures may be deferred).")
 
         # INFO: modules with low pass percentage
         low_modules = []
         for module, data in per_module.items():
-            module_pass = data.get('pass_pct')
+            module_pass = data.get("pass_pct")
             if module_pass is not None and module_pass < 80:
                 low_modules.append(f"{module} ({format_percentage(module_pass)})")
 
         if low_modules:
             low_modules.sort(key=lambda entry: entry)
-            add('INFO', f"Modules below 80% pass rate: {truncate_list(low_modules)}.")
+            add("INFO", f"Modules below 80% pass rate: {truncate_list(low_modules)}.")
 
         # INFO: ignored telemetry lines
-        ignored_lines = test_history.get('ignored_lines', 0)
+        ignored_lines = test_history.get("ignored_lines", 0)
         if ignored_lines:
-            add('INFO', f'Telemetry entries ignored during aggregation: {ignored_lines}.')
+            add("INFO", f"Telemetry entries ignored during aggregation: {ignored_lines}.")
 
-        items.sort(key=lambda entry: severity_order[entry['severity']])
+        items.sort(key=lambda entry: severity_order[entry["severity"]])
         return items
 
     def _generate_condensed_log_output(
@@ -1011,55 +1076,61 @@ class ReportTool(BaseTool, UIEventEmitter):
         """Generate condensed output for logs using the shared rendering utility."""
         if report_snapshot:
             snapshot = dict(report_snapshot)
-            snapshot['report_path'] = snapshot.get('report_path') or f"/workspace/{report_filename}"
+            snapshot["report_path"] = snapshot.get("report_path") or f"/workspace/{report_filename}"
         else:
             project_info = self._get_project_info()
             if actual_accomplishments:
                 phases = {
-                    'clone': actual_accomplishments.get('repository_cloned', False),
-                    'build': actual_accomplishments.get('build_success', False),
-                    'test': actual_accomplishments.get('test_success', False),
+                    "clone": actual_accomplishments.get("repository_cloned", False),
+                    "build": actual_accomplishments.get("build_success", False),
+                    "test": actual_accomplishments.get("test_success", False),
                 }
-                physical_validation = actual_accomplishments.get('physical_validation', {})
+                physical_validation = actual_accomplishments.get("physical_validation", {})
             else:
                 simple_status = self._collect_simple_status_from_tasks()
                 phases = {
-                    'clone': simple_status.get('clone_success', False),
-                    'build': simple_status.get('build_success', False),
-                    'test': simple_status.get('test_success', False),
+                    "clone": simple_status.get("clone_success", False),
+                    "build": simple_status.get("build_success", False),
+                    "test": simple_status.get("test_success", False),
                 }
                 physical_validation = {}
 
             evidence = {}
             if physical_validation:
-                evidence['class_files'] = physical_validation.get('class_files')
-                evidence['jar_files'] = physical_validation.get('jar_files')
-                if 'test_analysis' in physical_validation:
-                    test_data = physical_validation['test_analysis']
-                    evidence['tests_total'] = test_data.get('total_tests')
-                    evidence['tests_pass_pct'] = test_data.get('pass_rate') or test_data.get('pass_pct')
-                    if evidence['tests_pass_pct'] is None:
-                        total = test_data.get('total_tests')
-                        passed = test_data.get('passed_tests')
+                evidence["class_files"] = physical_validation.get("class_files")
+                evidence["jar_files"] = physical_validation.get("jar_files")
+                if "test_analysis" in physical_validation:
+                    test_data = physical_validation["test_analysis"]
+                    evidence["tests_total"] = test_data.get("total_tests")
+                    evidence["tests_pass_pct"] = test_data.get("pass_rate") or test_data.get(
+                        "pass_pct"
+                    )
+                    if evidence["tests_pass_pct"] is None:
+                        total = test_data.get("total_tests")
+                        passed = test_data.get("passed_tests")
                         if total:
-                            evidence['tests_pass_pct'] = (passed / total) * 100 if passed is not None else None
+                            evidence["tests_pass_pct"] = (
+                                (passed / total) * 100 if passed is not None else None
+                            )
 
             snapshot = {
-                'status': {'overall': verified_status},
-                'project': {
-                    'type': project_info.get('type', 'Unknown'),
-                    'build_system': project_info.get('build_system', 'Unknown'),
+                "status": {"overall": verified_status},
+                "project": {
+                    "type": project_info.get("type", "Unknown"),
+                    "build_system": project_info.get("build_system", "Unknown"),
                 },
-                'phases': phases,
-                'report_path': f"/workspace/{report_filename}",
-                'physical_evidence': evidence,
-                'attention': {'items': []},
+                "phases": phases,
+                "report_path": f"/workspace/{report_filename}",
+                "physical_evidence": evidence,
+                "attention": {"items": []},
             }
 
-        condensed_lines = render_condensed_summary(snapshot).split('\n')
+        condensed_lines = render_condensed_summary(snapshot).split("\n")
 
         if not actual_accomplishments and not self.physical_validator:
-            condensed_lines.append("[⚠️ WARNING: No physical validator - using task-based inference only]")
+            condensed_lines.append(
+                "[⚠️ WARNING: No physical validator - using task-based inference only]"
+            )
 
         if verified_status == "success":
             condensed_lines.append("💡 Next: Project ready for development/deployment! 🎉")
@@ -1073,21 +1144,21 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _validate_context_prerequisites(self) -> Dict[str, Any]:
         """
         Check context availability for report generation.
-        
+
         IMPORTANT: TODO list completion is NOT a prerequisite for report generation.
         The final status (success/fail) is determined solely by:
         - Build validation: Must pass
         - Test pass rate: Must be > 80%
-        
+
         TODO list is tracked for visibility but does not affect the final status.
         """
         logger.info("Starting prerequisite validation for report generation")
-        
+
         if not self.context_manager:
             # If no context manager available, allow report generation (backward compatibility)
             logger.warning("No context manager available for prerequisite validation")
             return {"valid": True}
-        
+
         try:
             # Load trunk context to check task statuses with timeout protection
             logger.info("Loading trunk context for validation")
@@ -1098,50 +1169,64 @@ class ReportTool(BaseTool, UIEventEmitter):
                     "error": "Cannot generate report: No project plan found",
                     "suggestions": [
                         "Ensure the project has been properly initialized",
-                        "Use manage_context to check current project state"
-                    ]
+                        "Use manage_context to check current project state",
+                    ],
                 }
-            
+
             # Check each task status - CRITICAL: Exclude reporting tasks to avoid logical deadlock
             logger.info(f"Checking {len(trunk_context.todo_list)} tasks for completion status")
             incomplete_tasks = []
             for task in trunk_context.todo_list:
-                logger.debug(f"Checking task {task.id}: {task.description} - Status: {task.status.value}")
+                logger.debug(
+                    f"Checking task {task.id}: {task.description} - Status: {task.status.value}"
+                )
                 if task.status.value != "completed":
                     # CRITICAL FIX: Allow reporting task to be in_progress when calling report tool
                     # This prevents the chicken-and-egg problem where the report tool can't run
                     # until the "generate report" task is complete, but the task can't be completed
                     # without running the report tool.
                     if self._is_reporting_task(task):
-                        logger.info(f"✅ Allowing reporting task {task.id} to be in_progress during report generation")
+                        logger.info(
+                            f"✅ Allowing reporting task {task.id} to be in_progress during report generation"
+                        )
                         continue  # Skip reporting tasks from the prerequisite check
-                    
+
                     logger.debug(f"Task {task.id} is incomplete: {task.status.value}")
-                    incomplete_tasks.append({
-                        "id": task.id,
-                        "description": task.description,
-                        "status": task.status.value
-                    })
-            
+                    incomplete_tasks.append(
+                        {
+                            "id": task.id,
+                            "description": task.description,
+                            "status": task.status.value,
+                        }
+                    )
+
             # Log TODO status but don't block report generation
             # Status is determined by build/test results, not TODO completion
             if incomplete_tasks:
                 total_tasks = len(trunk_context.todo_list)
                 completed_tasks = total_tasks - len(incomplete_tasks)
-                completion_percentage = (completed_tasks / total_tasks) * 100 if total_tasks > 0 else 0
-                
-                logger.info(f"📊 TODO List Status: {completed_tasks}/{total_tasks} tasks complete ({completion_percentage:.1f}%)")
-                logger.info(f"📝 {len(incomplete_tasks)} tasks remain incomplete (not blocking report)")
-                
+                completion_percentage = (
+                    (completed_tasks / total_tasks) * 100 if total_tasks > 0 else 0
+                )
+
+                logger.info(
+                    f"📊 TODO List Status: {completed_tasks}/{total_tasks} tasks complete ({completion_percentage:.1f}%)"
+                )
+                logger.info(
+                    f"📝 {len(incomplete_tasks)} tasks remain incomplete (not blocking report)"
+                )
+
                 # Log incomplete tasks for visibility
                 for task in incomplete_tasks:
-                    logger.debug(f"  • Incomplete: {task['id']}: {task['description']} (status: {task['status']})")
+                    logger.debug(
+                        f"  • Incomplete: {task['id']}: {task['description']} (status: {task['status']})"
+                    )
             else:
                 logger.info("✅ All TODO tasks completed")
-            
+
             # Always allow report generation - status based on build/test results only
             return {"valid": True}
-            
+
         except Exception as e:
             logger.error(f"Failed to validate context prerequisites: {e}")
             # In case of error, allow report generation but log the issue
@@ -1150,7 +1235,7 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _estimate_phase_durations(self, execution_metrics: dict, actual_accomplishments: dict):
         """
         Estimate phase durations based on execution history and accomplishments.
-        
+
         Args:
             execution_metrics: Execution metrics dictionary to update
             actual_accomplishments: Physical validation results
@@ -1158,134 +1243,159 @@ class ReportTool(BaseTool, UIEventEmitter):
         try:
             if not self.execution_history_callback:
                 return
-            
+
             history_payload = self.execution_history_callback()
             if isinstance(history_payload, dict):
-                history = history_payload.get('steps') or []
+                history = history_payload.get("steps") or []
             else:
                 history = history_payload or []
 
             if not history:
                 return
-            
+
             # Group actions by likely phase
             clone_actions = []
             build_actions = []
             test_actions = []
-            
+
             for step in history:
                 # Handle both object and dict formats
-                if hasattr(step, 'step_type') and step.step_type == 'action':
+                if hasattr(step, "step_type") and step.step_type == "action":
                     tool_name = step.tool_name
                     tool_params = step.tool_params
                     timestamp = step.timestamp
-                elif isinstance(step, dict) and step.get('step_type') == 'action':
-                    tool_name = step.get('tool_name')
-                    tool_params = step.get('tool_params', {})
-                    timestamp = step.get('timestamp')
+                elif isinstance(step, dict) and step.get("step_type") == "action":
+                    tool_name = step.get("tool_name")
+                    tool_params = step.get("tool_params", {})
+                    timestamp = step.get("timestamp")
                 else:
                     continue
-                
+
                 if not timestamp:
                     continue
-                
+
                 # Categorize actions by phase
-                if tool_name == 'project_setup':
+                if tool_name == "project_setup":
                     clone_actions.append(timestamp)
-                elif tool_name in ['maven', 'gradle', 'bash']:
-                    command = tool_params.get('command', '').lower()
-                    if any(build_cmd in command for build_cmd in ['compile', 'package', 'build', 'install']):
+                elif tool_name in ["maven", "gradle", "bash"]:
+                    command = tool_params.get("command", "").lower()
+                    if any(
+                        build_cmd in command
+                        for build_cmd in ["compile", "package", "build", "install"]
+                    ):
                         build_actions.append(timestamp)
-                    elif 'test' in command:
+                    elif "test" in command:
                         test_actions.append(timestamp)
-            
+
             # Calculate phase durations
             from datetime import datetime
-            
+
             def calculate_duration(action_timestamps):
                 if len(action_timestamps) < 2:
                     return 0
                 try:
-                    start_time = datetime.fromisoformat(action_timestamps[0].replace('Z', '+00:00'))
-                    end_time = datetime.fromisoformat(action_timestamps[-1].replace('Z', '+00:00'))
+                    start_time = datetime.fromisoformat(action_timestamps[0].replace("Z", "+00:00"))
+                    end_time = datetime.fromisoformat(action_timestamps[-1].replace("Z", "+00:00"))
                     return (end_time - start_time).total_seconds()
                 except:
                     return 0
-            
+
             if clone_actions:
-                execution_metrics['phases']['clone']['duration'] = calculate_duration(clone_actions)
-                execution_metrics['phases']['analyze']['duration'] = execution_metrics['phases']['clone']['duration']
-            
+                execution_metrics["phases"]["clone"]["duration"] = calculate_duration(clone_actions)
+                execution_metrics["phases"]["analyze"]["duration"] = execution_metrics["phases"][
+                    "clone"
+                ]["duration"]
+
             if build_actions:
-                execution_metrics['phases']['build']['duration'] = calculate_duration(build_actions)
-            
+                execution_metrics["phases"]["build"]["duration"] = calculate_duration(build_actions)
+
             if test_actions:
-                execution_metrics['phases']['test']['duration'] = calculate_duration(test_actions)
-            
-            logger.debug(f"Phase durations estimated: Clone={execution_metrics['phases']['clone']['duration']}s, "
-                        f"Build={execution_metrics['phases']['build']['duration']}s, "
-                        f"Test={execution_metrics['phases']['test']['duration']}s")
-                        
+                execution_metrics["phases"]["test"]["duration"] = calculate_duration(test_actions)
+
+            logger.debug(
+                f"Phase durations estimated: Clone={execution_metrics['phases']['clone']['duration']}s, "
+                f"Build={execution_metrics['phases']['build']['duration']}s, "
+                f"Test={execution_metrics['phases']['test']['duration']}s"
+            )
+
         except Exception as e:
             logger.warning(f"Failed to estimate phase durations: {e}")
-    
+
     def _is_reporting_task(self, task) -> bool:
         """
         Determine if a task is related to report generation.
         This prevents logical deadlock where report tool can't run until reporting task is complete.
         """
         reporting_keywords = [
-            "report", "completion", "summary", "generate", "final", 
-            "document", "conclude", "finish", "wrap"
+            "report",
+            "completion",
+            "summary",
+            "generate",
+            "final",
+            "document",
+            "conclude",
+            "finish",
+            "wrap",
         ]
-        
+
         task_description = task.description.lower()
         return any(keyword in task_description for keyword in reporting_keywords)
 
-    def _reconcile_status(self, claimed_status: str, evidence_status: str, accomplishments: dict) -> str:
+    def _reconcile_status(
+        self, claimed_status: str, evidence_status: str, accomplishments: dict
+    ) -> str:
         """
         Reconcile claimed status with evidence-based status.
         Binary logic: success (build passed AND test >80%) or fail
         """
         # Extract core step results
-        repository_cloned = accomplishments.get('repository_cloned', False)
-        build_success = accomplishments.get('build_success', False)
-        
+        repository_cloned = accomplishments.get("repository_cloned", False)
+        build_success = accomplishments.get("build_success", False)
+
         # Calculate test pass rate if available
         test_pass_rate = 0.0
-        if 'physical_validation' in accomplishments and 'test_analysis' in accomplishments['physical_validation']:
-            test_data = accomplishments['physical_validation']['test_analysis']
+        if (
+            "physical_validation" in accomplishments
+            and "test_analysis" in accomplishments["physical_validation"]
+        ):
+            test_data = accomplishments["physical_validation"]["test_analysis"]
             # Use PhysicalValidator's method if available
             if self.physical_validator:
                 test_pass_rate = self.physical_validator.calculate_test_pass_rate(test_data)
             else:
-                total_tests = test_data.get('total_tests', 0)
-                passed_tests = test_data.get('passed_tests', 0)
+                total_tests = test_data.get("total_tests", 0)
+                passed_tests = test_data.get("passed_tests", 0)
                 if total_tests > 0:
                     test_pass_rate = (passed_tests / total_tests) * 100
-        elif accomplishments.get('test_success', False):
+        elif accomplishments.get("test_success", False):
             # If tests marked as success without detailed data, assume high pass rate
             test_pass_rate = 100.0
-        
-        logger.info(f"🔍 Status reconciliation - Claimed: '{claimed_status}', Evidence: '{evidence_status}'")
-        logger.info(f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test pass rate: {test_pass_rate:.1f}%")
-        
+
+        logger.info(
+            f"🔍 Status reconciliation - Claimed: '{claimed_status}', Evidence: '{evidence_status}'"
+        )
+        logger.info(
+            f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test pass rate: {test_pass_rate:.1f}%"
+        )
+
         # Update evidence_status to use binary logic
         if evidence_status in ["failed", "partial"]:
             evidence_status = "fail"
-        
+
         # Evidence-based status is authoritative
         if not repository_cloned:
             logger.error("❌ Repository clone failed - cannot proceed")
             return "fail"
-        
+
         if not build_success:
             logger.error("❌ Build failed - compilation issues prevent success")
             return "fail"
-        
+
         # Check test pass rate
         if test_pass_rate > 80:
-            logger.info(f"✅ Success confirmed: Build passed, Test pass rate {test_pass_rate:.1f}% > 80%")
+            logger.info(
+                f"✅ Success confirmed: Build passed, Test pass rate {test_pass_rate:.1f}% > 80%"
+            )
             return "success"
         else:
             logger.warning(f"❌ Fail: Test pass rate {test_pass_rate:.1f}% <= 80%")
@@ -1294,33 +1404,33 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _collect_execution_metrics(self) -> dict:
         """Collect comprehensive execution metrics from the session."""
         metrics = {
-            'total_runtime': 0,
-            'start_time': None,
-            'end_time': None,
-            'total_steps': 0,
-            'total_iterations': 0,
-            'max_iterations': 0,
-            'iteration_utilization': 0,
-            'total_thoughts': 0,
-            'total_actions': 0,
-            'total_observations': 0,
-            'successful_actions': 0,
-            'failed_actions': 0,
-            'success_rate': 0,
-            'tools_used': {},
-            'tool_failures': {},
-            'thinking_model_calls': 0,
-            'action_model_calls': 0,
-            'phases': {
-                'clone': {'status': False, 'duration': 0},
-                'analyze': {'status': False, 'duration': 0},
-                'build': {'status': False, 'duration': 0},
-                'test': {'status': False, 'duration': 0}
+            "total_runtime": 0,
+            "start_time": None,
+            "end_time": None,
+            "total_steps": 0,
+            "total_iterations": 0,
+            "max_iterations": 0,
+            "iteration_utilization": 0,
+            "total_thoughts": 0,
+            "total_actions": 0,
+            "total_observations": 0,
+            "successful_actions": 0,
+            "failed_actions": 0,
+            "success_rate": 0,
+            "tools_used": {},
+            "tool_failures": {},
+            "thinking_model_calls": 0,
+            "action_model_calls": 0,
+            "phases": {
+                "clone": {"status": False, "duration": 0},
+                "analyze": {"status": False, "duration": 0},
+                "build": {"status": False, "duration": 0},
+                "test": {"status": False, "duration": 0},
             },
-            'error_types': {},
-            'repetitive_failures': 0
+            "error_types": {},
+            "repetitive_failures": 0,
         }
-        
+
         # Get execution history if available
         if self.execution_history_callback:
             try:
@@ -1330,14 +1440,14 @@ class ReportTool(BaseTool, UIEventEmitter):
                 history_steps: List[Any] = []
 
                 if isinstance(history_payload, dict):
-                    history_steps = list(history_payload.get('steps') or [])
-                    summary_snapshot = history_payload.get('summary') or {}
+                    history_steps = list(history_payload.get("steps") or [])
+                    summary_snapshot = history_payload.get("summary") or {}
 
                     # Prefer direct iteration count when provided (aligns with agent summary)
-                    if summary_snapshot.get('iterations') is not None:
-                        metrics['total_iterations'] = summary_snapshot['iterations']
-                    elif history_payload.get('current_iteration') is not None:
-                        metrics['total_iterations'] = history_payload['current_iteration']
+                    if summary_snapshot.get("iterations") is not None:
+                        metrics["total_iterations"] = summary_snapshot["iterations"]
+                    elif history_payload.get("current_iteration") is not None:
+                        metrics["total_iterations"] = history_payload["current_iteration"]
                 else:
                     history_steps = list(history_payload or [])
                     summary_snapshot = {}
@@ -1346,195 +1456,236 @@ class ReportTool(BaseTool, UIEventEmitter):
                     # Calculate timing
                     first_step = history_steps[0]
                     last_step = history_steps[-1]
-                    
+
                     # Get timestamps (handle both object and dict formats)
-                    if hasattr(first_step, 'timestamp'):
-                        metrics['start_time'] = first_step.timestamp
+                    if hasattr(first_step, "timestamp"):
+                        metrics["start_time"] = first_step.timestamp
                     elif isinstance(first_step, dict):
-                        metrics['start_time'] = first_step.get('timestamp')
-                    
-                    if hasattr(last_step, 'timestamp'):
-                        metrics['end_time'] = last_step.timestamp
+                        metrics["start_time"] = first_step.get("timestamp")
+
+                    if hasattr(last_step, "timestamp"):
+                        metrics["end_time"] = last_step.timestamp
                     elif isinstance(last_step, dict):
-                        metrics['end_time'] = last_step.get('timestamp')
-                    
+                        metrics["end_time"] = last_step.get("timestamp")
+
                     # Calculate runtime if we have timestamps
-                    if metrics['start_time'] and metrics['end_time']:
+                    if metrics["start_time"] and metrics["end_time"]:
                         from datetime import datetime
+
                         try:
-                            start = datetime.fromisoformat(metrics['start_time'].replace('Z', '+00:00'))
-                            end = datetime.fromisoformat(metrics['end_time'].replace('Z', '+00:00'))
-                            metrics['total_runtime'] = (end - start).total_seconds() / 60  # in minutes
+                            start = datetime.fromisoformat(
+                                metrics["start_time"].replace("Z", "+00:00")
+                            )
+                            end = datetime.fromisoformat(metrics["end_time"].replace("Z", "+00:00"))
+                            metrics["total_runtime"] = (
+                                end - start
+                            ).total_seconds() / 60  # in minutes
                         except:
                             pass
-                    
+
                     # Count step types
                     for step in history_steps:
                         # Handle both object and dict formats
-                        if hasattr(step, 'step_type'):
+                        if hasattr(step, "step_type"):
                             step_type = step.step_type
                             tool_name = step.tool_name
                             tool_result = step.tool_result
                             model_used = step.model_used
                         elif isinstance(step, dict):
-                            step_type = step.get('step_type')
-                            tool_name = step.get('tool_name')
-                            tool_result = step.get('tool_result')
-                            model_used = step.get('model_used')
+                            step_type = step.get("step_type")
+                            tool_name = step.get("tool_name")
+                            tool_result = step.get("tool_result")
+                            model_used = step.get("model_used")
                         else:
                             continue
-                        
+
                         # Count by type
-                        if step_type == 'thought':
-                            metrics['total_thoughts'] += 1
+                        if step_type == "thought":
+                            metrics["total_thoughts"] += 1
                             # Check which model was actually used
                             if model_used:
-                                if any(thinking_model in str(model_used).lower() for thinking_model in ['o1', 'o4', 'thinking', 'claude-3-opus']):
-                                    metrics['thinking_model_calls'] += 1
+                                if any(
+                                    thinking_model in str(model_used).lower()
+                                    for thinking_model in ["o1", "o4", "thinking", "claude-3-opus"]
+                                ):
+                                    metrics["thinking_model_calls"] += 1
                                 else:
-                                    metrics['action_model_calls'] += 1
+                                    metrics["action_model_calls"] += 1
                             else:
                                 # Default to action model if not specified
-                                metrics['action_model_calls'] += 1
-                        elif step_type == 'action':
-                            metrics['total_actions'] += 1
+                                metrics["action_model_calls"] += 1
+                        elif step_type == "action":
+                            metrics["total_actions"] += 1
                             # Check which model was actually used for the action
                             if model_used:
-                                if any(thinking_model in str(model_used).lower() for thinking_model in ['o1', 'o4', 'thinking', 'claude-3-opus']):
-                                    metrics['thinking_model_calls'] += 1
+                                if any(
+                                    thinking_model in str(model_used).lower()
+                                    for thinking_model in ["o1", "o4", "thinking", "claude-3-opus"]
+                                ):
+                                    metrics["thinking_model_calls"] += 1
                                 else:
-                                    metrics['action_model_calls'] += 1
+                                    metrics["action_model_calls"] += 1
                             else:
                                 # Default to action model for actions
-                                metrics['action_model_calls'] += 1
-                            
+                                metrics["action_model_calls"] += 1
+
                             # Track tool usage
                             if tool_name:
-                                metrics['tools_used'][tool_name] = metrics['tools_used'].get(tool_name, 0) + 1
-                                
+                                metrics["tools_used"][tool_name] = (
+                                    metrics["tools_used"].get(tool_name, 0) + 1
+                                )
+
                                 # Check success/failure
                                 success = False
-                                if hasattr(tool_result, 'success'):
+                                if hasattr(tool_result, "success"):
                                     success = tool_result.success
                                 elif isinstance(tool_result, dict):
-                                    success = tool_result.get('success', False)
-                                
+                                    success = tool_result.get("success", False)
+
                                 if success:
-                                    metrics['successful_actions'] += 1
+                                    metrics["successful_actions"] += 1
                                 else:
-                                    metrics['failed_actions'] += 1
-                                    metrics['tool_failures'][tool_name] = metrics['tool_failures'].get(tool_name, 0) + 1
-                                    
+                                    metrics["failed_actions"] += 1
+                                    metrics["tool_failures"][tool_name] = (
+                                        metrics["tool_failures"].get(tool_name, 0) + 1
+                                    )
+
                                     # Track error types
                                     error_code = None
-                                    if hasattr(tool_result, 'error_code'):
+                                    if hasattr(tool_result, "error_code"):
                                         error_code = tool_result.error_code
                                     elif isinstance(tool_result, dict):
-                                        error_code = tool_result.get('error_code')
-                                    
+                                        error_code = tool_result.get("error_code")
+
                                     if error_code:
-                                        metrics['error_types'][error_code] = metrics['error_types'].get(error_code, 0) + 1
-                                        if error_code == 'REPETITIVE_EXECUTION':
-                                            metrics['repetitive_failures'] += 1
-                                
+                                        metrics["error_types"][error_code] = (
+                                            metrics["error_types"].get(error_code, 0) + 1
+                                        )
+                                        if error_code == "REPETITIVE_EXECUTION":
+                                            metrics["repetitive_failures"] += 1
+
                                 # NOTE: Phase completion tracking is now unified with simple_status
                                 # at the end of this method to avoid contradictions
-                        
-                        elif step_type == 'observation':
-                            metrics['total_observations'] += 1
-                    
+
+                        elif step_type == "observation":
+                            metrics["total_observations"] += 1
+
                     # Calculate success rate
-                    if metrics['total_actions'] > 0:
-                        metrics['success_rate'] = (metrics['successful_actions'] / metrics['total_actions']) * 100
+                    if metrics["total_actions"] > 0:
+                        metrics["success_rate"] = (
+                            metrics["successful_actions"] / metrics["total_actions"]
+                        ) * 100
 
                     # Get iteration count from context manager if available
                     if self.context_manager:
                         try:
                             # This would need to be added to context manager
-                            if not metrics['total_iterations']:
-                                metrics['total_iterations'] = len(history_steps) // 3  # Rough estimate
+                            if not metrics["total_iterations"]:
+                                metrics["total_iterations"] = (
+                                    len(history_steps) // 3
+                                )  # Rough estimate
                         except:
                             pass
-                
+
                 # Override with authoritative summary data when available
                 if summary_snapshot:
-                    metrics['total_steps'] = summary_snapshot.get('total_steps', metrics['total_steps'])
-                    metrics['total_thoughts'] = summary_snapshot.get('thoughts', metrics['total_thoughts'])
-                    metrics['total_actions'] = summary_snapshot.get('actions', metrics['total_actions'])
-                    metrics['total_observations'] = summary_snapshot.get('observations', metrics['total_observations'])
-                    metrics['successful_actions'] = summary_snapshot.get('successful_actions', metrics['successful_actions'])
-                    metrics['failed_actions'] = summary_snapshot.get('failed_actions', metrics['failed_actions'])
-                    metrics['thinking_model_calls'] = summary_snapshot.get('thinking_model_calls', metrics['thinking_model_calls'])
-                    metrics['action_model_calls'] = summary_snapshot.get('action_model_calls', metrics['action_model_calls'])
+                    metrics["total_steps"] = summary_snapshot.get(
+                        "total_steps", metrics["total_steps"]
+                    )
+                    metrics["total_thoughts"] = summary_snapshot.get(
+                        "thoughts", metrics["total_thoughts"]
+                    )
+                    metrics["total_actions"] = summary_snapshot.get(
+                        "actions", metrics["total_actions"]
+                    )
+                    metrics["total_observations"] = summary_snapshot.get(
+                        "observations", metrics["total_observations"]
+                    )
+                    metrics["successful_actions"] = summary_snapshot.get(
+                        "successful_actions", metrics["successful_actions"]
+                    )
+                    metrics["failed_actions"] = summary_snapshot.get(
+                        "failed_actions", metrics["failed_actions"]
+                    )
+                    metrics["thinking_model_calls"] = summary_snapshot.get(
+                        "thinking_model_calls", metrics["thinking_model_calls"]
+                    )
+                    metrics["action_model_calls"] = summary_snapshot.get(
+                        "action_model_calls", metrics["action_model_calls"]
+                    )
 
-                    if summary_snapshot.get('actions'):
+                    if summary_snapshot.get("actions"):
                         try:
-                            metrics['success_rate'] = (
-                                summary_snapshot.get('successful_actions', 0)
-                                / summary_snapshot['actions']
+                            metrics["success_rate"] = (
+                                summary_snapshot.get("successful_actions", 0)
+                                / summary_snapshot["actions"]
                             ) * 100
                         except ZeroDivisionError:
-                            metrics['success_rate'] = 0
+                            metrics["success_rate"] = 0
 
             except Exception as e:
                 logger.warning(f"Failed to collect execution metrics: {e}")
-        
+
         # CRITICAL FIX: Phase status should come from physical validation, not inference
         # This will be updated later with actual physical validation results
         # For now, set defaults that will be overridden
-        metrics['phases']['clone']['status'] = False
-        metrics['phases']['analyze']['status'] = False
-        metrics['phases']['build']['status'] = False
-        metrics['phases']['test']['status'] = False
+        metrics["phases"]["clone"]["status"] = False
+        metrics["phases"]["analyze"]["status"] = False
+        metrics["phases"]["build"]["status"] = False
+        metrics["phases"]["test"]["status"] = False
         logger.debug("Phase status will be determined by physical validation")
 
         test_history = self._load_test_history()
         if test_history:
-            metrics['test_history'] = test_history
+            metrics["test_history"] = test_history
 
         return metrics
-    
-    def _verify_execution_history(self, claimed_status: str, claimed_summary: str) -> tuple[str, dict]:
+
+    def _verify_execution_history(
+        self, claimed_status: str, claimed_summary: str
+    ) -> tuple[str, dict]:
         """Verify the claimed status using physical validation instead of inference."""
         # Initialize accomplishments
         actual_accomplishments = {
-            'repository_cloned': False,
-            'build_success': False,
-            'test_success': False,
-            'tools_successful': [],
-            'tools_failed': [],
-            'total_actions': 0,
-            'successful_actions': 0,
-            'detailed_results': {},  # Store detailed results for debugging
-            'physical_validation': {}  # Store physical validation results
+            "repository_cloned": False,
+            "build_success": False,
+            "test_success": False,
+            "tools_successful": [],
+            "tools_failed": [],
+            "total_actions": 0,
+            "successful_actions": 0,
+            "detailed_results": {},  # Store detailed results for debugging
+            "physical_validation": {},  # Store physical validation results
         }
-        
+
         # CRITICAL: Use physical evidence to determine true status
         # Check actual files instead of inferring from logs or task descriptions
         if self.physical_validator and self.docker_orchestrator:
             try:
                 project_info = self._get_project_info()
-                project_dir = project_info.get('directory', '/workspace')
-                
+                project_dir = project_info.get("directory", "/workspace")
+
                 # Derive project_name for validator (expects name, not full path)
                 project_name_for_validator = None
                 try:
-                    if project_dir.startswith('/workspace/'):
-                        tail = project_dir[len('/workspace/'):].strip('/')
+                    if project_dir.startswith("/workspace/"):
+                        tail = project_dir[len("/workspace/") :].strip("/")
                         # Only use single-segment project name (avoid nested paths)
-                        if tail and '/' not in tail:
+                        if tail and "/" not in tail:
                             project_name_for_validator = tail
                 except Exception:
                     project_name_for_validator = None
-                
+
                 # Ensure physical_validation container exists
-                if 'physical_validation' not in actual_accomplishments:
-                    actual_accomplishments['physical_validation'] = {}
+                if "physical_validation" not in actual_accomplishments:
+                    actual_accomplishments["physical_validation"] = {}
 
                 # Primary build verdict must match agent-facing validation
-                build_status = self.physical_validator.validate_build_status(project_name_for_validator)
-                actual_accomplishments['build_success'] = build_status.get('success', False)
-                actual_accomplishments['physical_validation']['build_status'] = build_status
+                build_status = self.physical_validator.validate_build_status(
+                    project_name_for_validator
+                )
+                actual_accomplishments["build_success"] = build_status.get("success", False)
+                actual_accomplishments["physical_validation"]["build_status"] = build_status
                 logger.info(
                     f"🔍 Build status verification:"
                     f" {'SUCCESS' if actual_accomplishments['build_success'] else 'FAILED'}"
@@ -1550,272 +1701,341 @@ class ReportTool(BaseTool, UIEventEmitter):
                 test_analysis = self.physical_validator.parse_test_reports_with_metrics(project_dir)
 
                 # Also get test validation status for additional insights
-                test_status = self.physical_validator.validate_test_status(project_name_for_validator)
-                
+                test_status = self.physical_validator.validate_test_status(
+                    project_name_for_validator
+                )
+
                 # Log test status insights
-                if test_status.get('pass_rate', 0) <= 80 and test_status.get('has_test_reports'):
-                    logger.warning(f"⚠️ Test pass rate is {test_status['pass_rate']:.1f}% (below 80% threshold)")
-                if test_status.get('test_exclusions'):
-                    logger.warning(f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}")
-                
+                if test_status.get("pass_rate", 0) <= 80 and test_status.get("has_test_reports"):
+                    logger.warning(
+                        f"⚠️ Test pass rate is {test_status['pass_rate']:.1f}% (below 80% threshold)"
+                    )
+                if test_status.get("test_exclusions"):
+                    logger.warning(
+                        f"⚠️ Detected test exclusions: {', '.join(test_status['test_exclusions'])}"
+                    )
+
                 # Extract results from PhysicalValidator
                 # Repository is cloned if artifacts detected OR the project directory exists under /workspace
-                actual_accomplishments['repository_cloned'] = (
-                    validation_result.get('class_files', 0) > 0
-                    or validation_result.get('jar_files', 0) > 0
-                    or len(validation_result.get('missing_classes', [])) > 0
-                    or actual_accomplishments['build_success']
+                actual_accomplishments["repository_cloned"] = (
+                    validation_result.get("class_files", 0) > 0
+                    or validation_result.get("jar_files", 0) > 0
+                    or len(validation_result.get("missing_classes", [])) > 0
+                    or actual_accomplishments["build_success"]
                 )
                 # Strengthen with directory existence check
                 try:
                     dir_check = self.docker_orchestrator.execute_command(
                         f"test -d {project_dir} && echo EXISTS || echo MISSING"
                     )
-                    if 'EXISTS' in (dir_check.get('output') or ''):
-                        actual_accomplishments['repository_cloned'] = True
+                    if "EXISTS" in (dir_check.get("output") or ""):
+                        actual_accomplishments["repository_cloned"] = True
                 except Exception as _e:
                     logger.debug(f"Directory existence check failed: {_e}")
 
-                if test_analysis.get('valid'):
-                    actual_accomplishments['test_success'] = test_analysis['test_success']
-                    actual_accomplishments['physical_validation']['test_analysis'] = {
-                        'total_tests': test_analysis['total_tests'],
-                        'passed_tests': test_analysis['passed_tests'],
-                        'failed_tests': test_analysis['failed_tests'],
-                        'error_tests': test_analysis['error_tests'],
-                        'skipped_tests': test_analysis['skipped_tests'],
-                        'report_files_count': len(test_analysis['report_files']),
-                        'test_exclusions': test_analysis.get('test_exclusions', []),
-                        'modules_without_tests': test_analysis.get('modules_without_tests', [])
+                if test_analysis.get("valid"):
+                    actual_accomplishments["test_success"] = test_analysis["test_success"]
+                    actual_accomplishments["physical_validation"]["test_analysis"] = {
+                        "total_tests": test_analysis["total_tests"],
+                        "passed_tests": test_analysis["passed_tests"],
+                        "failed_tests": test_analysis["failed_tests"],
+                        "error_tests": test_analysis["error_tests"],
+                        "skipped_tests": test_analysis["skipped_tests"],
+                        "report_files_count": len(test_analysis["report_files"]),
+                        "test_exclusions": test_analysis.get("test_exclusions", []),
+                        "modules_without_tests": test_analysis.get("modules_without_tests", []),
                     }
-                    
+
                     # Log if tests were excluded
-                    if test_analysis.get('test_exclusions'):
-                        logger.warning(f"⚠️ Test exclusions detected: {', '.join(test_analysis['test_exclusions'])}")
-                    
-                    if test_analysis['test_success']:
-                        logger.info(f"✅ PHYSICAL: Tests passed - {test_analysis['passed_tests']}/{test_analysis['total_tests']} tests successful")
+                    if test_analysis.get("test_exclusions"):
+                        logger.warning(
+                            f"⚠️ Test exclusions detected: {', '.join(test_analysis['test_exclusions'])}"
+                        )
+
+                    if test_analysis["test_success"]:
+                        logger.info(
+                            f"✅ PHYSICAL: Tests passed - {test_analysis['passed_tests']}/{test_analysis['total_tests']} tests successful"
+                        )
                     else:
-                        logger.warning(f"❌ PHYSICAL: Tests failed - {test_analysis['failed_tests']} failures, {test_analysis['error_tests']} errors out of {test_analysis['total_tests']} total")
+                        logger.warning(
+                            f"❌ PHYSICAL: Tests failed - {test_analysis['failed_tests']} failures, {test_analysis['error_tests']} errors out of {test_analysis['total_tests']} total"
+                        )
                 else:
-                    actual_accomplishments['test_success'] = False
+                    actual_accomplishments["test_success"] = False
                     logger.info("⚠️ PHYSICAL: No test reports found or parsing failed")
-                
+
                 # Store validation results - initialize if not exists
-                actual_accomplishments['physical_validation'].update({
-                    'class_files': validation_result.get('class_files', 0),
-                    'jar_files': validation_result.get('jar_files', 0),
-                    'recent_compilation': validation_result.get('recent_compilation', False),
-                    'missing_classes': len(validation_result.get('missing_classes', []))
-                })
-                
+                actual_accomplishments["physical_validation"].update(
+                    {
+                        "class_files": validation_result.get("class_files", 0),
+                        "jar_files": validation_result.get("jar_files", 0),
+                        "recent_compilation": validation_result.get("recent_compilation", False),
+                        "missing_classes": len(validation_result.get("missing_classes", [])),
+                    }
+                )
+
                 # CRITICAL: ENFORCE LOGICAL CONSISTENCY
-                if not actual_accomplishments['repository_cloned']:
-                    if actual_accomplishments['build_success'] or actual_accomplishments['test_success']:
+                if not actual_accomplishments["repository_cloned"]:
+                    if (
+                        actual_accomplishments["build_success"]
+                        or actual_accomplishments["test_success"]
+                    ):
                         logger.error("🚨 IMPOSSIBLE STATE: Build/test without repository!")
-                    actual_accomplishments['build_success'] = False
-                    actual_accomplishments['test_success'] = False
+                    actual_accomplishments["build_success"] = False
+                    actual_accomplishments["test_success"] = False
                     logger.info("⚠️ CONSISTENCY: No clone → no build/test")
-                elif not actual_accomplishments['build_success']:
-                    if actual_accomplishments['test_success']:
+                elif not actual_accomplishments["build_success"]:
+                    if actual_accomplishments["test_success"]:
                         logger.error("🚨 IMPOSSIBLE STATE: Test without build!")
-                    actual_accomplishments['test_success'] = False
+                    actual_accomplishments["test_success"] = False
                     logger.info("⚠️ CONSISTENCY: No build → no test")
-                
+
                 logger.info(
                     f"📊 PHYSICAL TRUTH: Clone={actual_accomplishments['repository_cloned']}, "
                     f"Build={actual_accomplishments['build_success']}, "
                     f"Test={actual_accomplishments['test_success']}"
                 )
-                
+
             except Exception as e:
                 logger.warning(f"Physical validation error: {e}")
         elif self.docker_orchestrator:
             # Fallback to simplified physical checks if no PhysicalValidator injected
             try:
                 project_info = self._get_project_info()
-                project_dir = project_info.get('directory', '/workspace')
-                
+                project_dir = project_info.get("directory", "/workspace")
+
                 # Simplified repository check
                 source_count = self.docker_orchestrator.execute_command(
                     f"find {project_dir} -type f \\( -name '*.java' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.cpp' -o -name '*.c' \\) 2>/dev/null | head -100 | wc -l"
                 )
-                source_files = int(source_count.get('output', '0').strip())
-                actual_accomplishments['repository_cloned'] = source_files > 0
-                
+                source_files = int(source_count.get("output", "0").strip())
+                actual_accomplishments["repository_cloned"] = source_files > 0
+
                 # Simplified build check
                 class_count_result = self.docker_orchestrator.execute_command(
                     f"find {project_dir} -name '*.class' -type f 2>/dev/null | wc -l"
                 )
-                class_count = int(class_count_result.get('output', '0').strip())
-                actual_accomplishments['build_success'] = class_count > 0
-                
+                class_count = int(class_count_result.get("output", "0").strip())
+                actual_accomplishments["build_success"] = class_count > 0
+
                 # Simplified test check - conservative approach
                 test_reports = self.docker_orchestrator.execute_command(
                     f"find {project_dir} -type f \\( -path '*/surefire-reports/*.xml' -o -path '*/test-results/*.xml' \\) 2>/dev/null | wc -l"
                 )
-                test_report_count = int(test_reports.get('output', '0').strip())
-                actual_accomplishments['test_success'] = False  # Conservative without parsing
-                
-                logger.info(f"📊 FALLBACK PHYSICAL CHECK: Clone={actual_accomplishments['repository_cloned']}, "
-                           f"Build={actual_accomplishments['build_success']}, Test={actual_accomplishments['test_success']}")
-                
+                test_report_count = int(test_reports.get("output", "0").strip())
+                actual_accomplishments["test_success"] = False  # Conservative without parsing
+
+                logger.info(
+                    f"📊 FALLBACK PHYSICAL CHECK: Clone={actual_accomplishments['repository_cloned']}, "
+                    f"Build={actual_accomplishments['build_success']}, Test={actual_accomplishments['test_success']}"
+                )
+
             except Exception as e:
                 logger.warning(f"Fallback physical validation error: {e}")
-        
+
         # Fallback to old methods if physical validation unavailable
-        if not actual_accomplishments.get('physical_validation'):
+        if not actual_accomplishments.get("physical_validation"):
             # Method 1: Check current session execution history
             if self.execution_history_callback:
                 try:
                     # Get execution history from callback
                     history_payload = self.execution_history_callback()
                     if isinstance(history_payload, dict):
-                        history = history_payload.get('steps') or []
+                        history = history_payload.get("steps") or []
                     else:
                         history = history_payload or []
                     self._analyze_execution_steps(history, actual_accomplishments)
                 except Exception as e:
                     logger.warning(f"Failed to get execution history from callback: {e}")
-            
+
             # Method 2: Check project context for completed tasks
             if self.context_manager:
                 try:
                     trunk_context = self.context_manager.load_trunk_context()
                     if trunk_context:
                         self._analyze_completed_tasks(trunk_context, actual_accomplishments)
-                        logger.debug(f"📊 Analyzed {len(trunk_context.todo_list)} tasks from project context")
+                        logger.debug(
+                            f"📊 Analyzed {len(trunk_context.todo_list)} tasks from project context"
+                        )
                 except Exception as e:
                     logger.warning(f"Failed to get project context: {e}")
-        
+
         # CRITICAL FIX: Enforce logical consistency
         # If build failed, tests cannot have succeeded
-        if not actual_accomplishments['build_success']:
-            actual_accomplishments['test_success'] = False
-            actual_accomplishments['test_status'] = 'not_run'
-            logger.info("⚠️ Build failed - marking tests as not run (impossible to test without successful build)")
-        
+        if not actual_accomplishments["build_success"]:
+            actual_accomplishments["test_success"] = False
+            actual_accomplishments["test_status"] = "not_run"
+            logger.info(
+                "⚠️ Build failed - marking tests as not run (impossible to test without successful build)"
+            )
+
         # Determine actual status based on accomplishments
         actual_status = self._determine_actual_status(actual_accomplishments)
-        
+
         # Smart status reconciliation
         if actual_status != claimed_status:
-            logger.warning(f"🔍 Status verification: Claimed '{claimed_status}' but evidence suggests '{actual_status}'")
+            logger.warning(
+                f"🔍 Status verification: Claimed '{claimed_status}' but evidence suggests '{actual_status}'"
+            )
             logger.info(f"🔍 Actual accomplishments: {actual_accomplishments}")
-            
+
             # Reconcile the status - prioritize physical evidence
-            if actual_accomplishments.get('physical_validation'):
+            if actual_accomplishments.get("physical_validation"):
                 logger.info("Using physical validation as primary source of truth")
                 return actual_status, actual_accomplishments
-            
-            reconciled_status = self._reconcile_status(claimed_status, actual_status, actual_accomplishments)
+
+            reconciled_status = self._reconcile_status(
+                claimed_status, actual_status, actual_accomplishments
+            )
             logger.info(f"🤝 Status reconciled: Using '{reconciled_status}' as final status")
             return reconciled_status, actual_accomplishments
-        
+
         return actual_status, actual_accomplishments
-    
+
     def _analyze_execution_steps(self, history: list, actual_accomplishments: dict):
         """Analyze execution steps from current session history."""
         for step in history:
             # Handle ReActStep objects
-            if hasattr(step, 'step_type') and step.step_type == 'action' and hasattr(step, 'tool_result'):
+            if (
+                hasattr(step, "step_type")
+                and step.step_type == "action"
+                and hasattr(step, "tool_result")
+            ):
                 tool_name = step.tool_name
                 tool_result = step.tool_result
                 tool_params = step.tool_params
             # Handle dict format
-            elif isinstance(step, dict) and step.get('step_type') == 'action' and step.get('tool_result'):
-                tool_name = step.get('tool_name')
-                tool_result = step.get('tool_result')
-                tool_params = step.get('tool_params', {})
+            elif (
+                isinstance(step, dict)
+                and step.get("step_type") == "action"
+                and step.get("tool_result")
+            ):
+                tool_name = step.get("tool_name")
+                tool_result = step.get("tool_result")
+                tool_params = step.get("tool_params", {})
             else:
                 continue
-                
-            actual_accomplishments['total_actions'] += 1
-            
+
+            actual_accomplishments["total_actions"] += 1
+
             # Handle both object and dict format for tool_result
-            if hasattr(tool_result, 'success'):
+            if hasattr(tool_result, "success"):
                 # ToolResult object
                 success = tool_result.success
                 output = tool_result.output
             elif isinstance(tool_result, dict):
                 # Dictionary format
-                success = tool_result.get('success', False)
-                output = tool_result.get('output', '')
+                success = tool_result.get("success", False)
+                output = tool_result.get("output", "")
             else:
                 # Unknown format, assume failure
                 success = False
                 output = str(tool_result)
-            
+
             if success:
-                actual_accomplishments['successful_actions'] += 1
-                actual_accomplishments['tools_successful'].append(tool_name)
-                
+                actual_accomplishments["successful_actions"] += 1
+                actual_accomplishments["tools_successful"].append(tool_name)
+
                 # STEP 1: Check for repository clone
-                if tool_name == 'project_setup':
+                if tool_name == "project_setup":
                     # project_setup tool success means repository was cloned
                     # Check output for confirmation
-                    if 'Repository cloned' in output or 'successfully cloned' in output or 'Directory:' in output:
-                        actual_accomplishments['repository_cloned'] = True
+                    if (
+                        "Repository cloned" in output
+                        or "successfully cloned" in output
+                        or "Directory:" in output
+                    ):
+                        actual_accomplishments["repository_cloned"] = True
                         logger.debug("✅ Repository clone detected as successful via project_setup")
-                
+
                 # STEP 2: Check for build success (multiple build systems)
-                elif tool_name in ['maven', 'gradle', 'bash']:
-                    command = tool_params.get('command', '').lower()
-                    
+                elif tool_name in ["maven", "gradle", "bash"]:
+                    command = tool_params.get("command", "").lower()
+
                     # Maven build detection - support multiple patterns
-                    if tool_name == 'maven':
+                    if tool_name == "maven":
                         # Check for explicit build commands OR generic maven success
-                        is_build_command = any(cmd in command for cmd in ['compile', 'package', 'install']) or command == ''
-                        has_build_success = any(pattern in output for pattern in ['BUILD SUCCESS', 'Maven build completed successfully', 'build completed successfully'])
-                        
+                        is_build_command = (
+                            any(cmd in command for cmd in ["compile", "package", "install"])
+                            or command == ""
+                        )
+                        has_build_success = any(
+                            pattern in output
+                            for pattern in [
+                                "BUILD SUCCESS",
+                                "Maven build completed successfully",
+                                "build completed successfully",
+                            ]
+                        )
+
                         if is_build_command and has_build_success:
-                            actual_accomplishments['build_success'] = True
-                            logger.debug(f"✅ Maven build success detected: {command or 'default goal'}")
-                    
+                            actual_accomplishments["build_success"] = True
+                            logger.debug(
+                                f"✅ Maven build success detected: {command or 'default goal'}"
+                            )
+
                     # Gradle build detection - ENHANCED to check for failures
-                    elif tool_name == 'gradle' and any(cmd in command for cmd in ['build', 'compile', 'assemble']):
+                    elif tool_name == "gradle" and any(
+                        cmd in command for cmd in ["build", "compile", "assemble"]
+                    ):
                         # Check for BUILD FAILED first to avoid false positives
-                        if 'BUILD FAILED' in output:
-                            actual_accomplishments['build_failed'] = True
+                        if "BUILD FAILED" in output:
+                            actual_accomplishments["build_failed"] = True
                             # Count compilation errors if present
                             import re
-                            error_count = len(re.findall(r'unmappable character|error:', output, re.IGNORECASE))
+
+                            error_count = len(
+                                re.findall(r"unmappable character|error:", output, re.IGNORECASE)
+                            )
                             if error_count > 0:
-                                actual_accomplishments['compilation_errors'] = error_count
-                                logger.error(f"❌ Gradle build FAILED with {error_count} compilation errors: {command}")
+                                actual_accomplishments["compilation_errors"] = error_count
+                                logger.error(
+                                    f"❌ Gradle build FAILED with {error_count} compilation errors: {command}"
+                                )
                             else:
                                 logger.error(f"❌ Gradle build FAILED: {command}")
-                        elif 'BUILD SUCCESSFUL' in output:
-                            actual_accomplishments['build_success'] = True
+                        elif "BUILD SUCCESSFUL" in output:
+                            actual_accomplishments["build_success"] = True
                             logger.info(f"✅ Gradle build success detected: {command}")
-                    
+
                     # Generic build via bash (npm, make, etc.)
-                    elif tool_name == 'bash':
-                        if any(build_cmd in command for build_cmd in ['npm run build', 'make', 'cargo build', 'go build']):
+                    elif tool_name == "bash":
+                        if any(
+                            build_cmd in command
+                            for build_cmd in ["npm run build", "make", "cargo build", "go build"]
+                        ):
                             # Check exit code or common success indicators
-                            if 'error' not in output.lower() and 'failed' not in output.lower():
-                                actual_accomplishments['build_success'] = True
+                            if "error" not in output.lower() and "failed" not in output.lower():
+                                actual_accomplishments["build_success"] = True
                                 logger.info(f"✅ Build success detected via bash: {command}")
-                
+
                 # STEP 3: Check for test success (multiple test frameworks)
-                if tool_name in ['maven', 'gradle', 'bash']:
-                    command = tool_params.get('command', '').lower()
-                    
+                if tool_name in ["maven", "gradle", "bash"]:
+                    command = tool_params.get("command", "").lower()
+
                     # Maven test detection - enhanced patterns
-                    if tool_name == 'maven':
+                    if tool_name == "maven":
                         # Check for test commands OR generic maven success with test results
-                        is_test_command = 'test' in command or command == ''
-                        has_test_success = any(pattern in output for pattern in ['BUILD SUCCESS', 'Maven build completed successfully', 'build completed successfully'])
-                        has_test_results = 'Tests run:' in output or 'tests run' in output.lower()
-                        
+                        is_test_command = "test" in command or command == ""
+                        has_test_success = any(
+                            pattern in output
+                            for pattern in [
+                                "BUILD SUCCESS",
+                                "Maven build completed successfully",
+                                "build completed successfully",
+                            ]
+                        )
+                        has_test_results = "Tests run:" in output or "tests run" in output.lower()
+
                         if is_test_command and has_test_success and has_test_results:
                             # Parse test results - support multiple formats
                             import re
+
                             test_patterns = [
-                                r'Tests run: (\d+), Failures: (\d+), Errors: (\d+)',  # Standard format
-                                r'Tests: (\d+) run, (\d+) failures, (\d+) errors'      # Alternative format
+                                r"Tests run: (\d+), Failures: (\d+), Errors: (\d+)",  # Standard format
+                                r"Tests: (\d+) run, (\d+) failures, (\d+) errors",  # Alternative format
                             ]
-                            
+
                             for pattern in test_patterns:
                                 test_match = re.search(pattern, output)
                                 if test_match:
@@ -1828,104 +2048,146 @@ class ReportTool(BaseTool, UIEventEmitter):
                                         total_tests = int(test_match.group(1))
                                         failures = int(test_match.group(2))
                                         errors = int(test_match.group(3))
-                                    
+
                                     if failures == 0 and errors == 0:
-                                        actual_accomplishments['test_success'] = True
-                                        logger.info(f"✅ Maven tests passed: {total_tests} tests, 0 failures")
+                                        actual_accomplishments["test_success"] = True
+                                        logger.info(
+                                            f"✅ Maven tests passed: {total_tests} tests, 0 failures"
+                                        )
                                     else:
-                                        logger.warning(f"⚠️ Maven tests had issues: {failures} failures, {errors} errors")
+                                        logger.warning(
+                                            f"⚠️ Maven tests had issues: {failures} failures, {errors} errors"
+                                        )
                                     break
-                    
+
                     # Gradle test detection - ENHANCED to check for failures and extract stats
-                    elif tool_name == 'gradle' and 'test' in command:
+                    elif tool_name == "gradle" and "test" in command:
                         # Check for BUILD FAILED first
-                        if 'BUILD FAILED' in output:
-                            actual_accomplishments['test_failed'] = True
+                        if "BUILD FAILED" in output:
+                            actual_accomplishments["test_failed"] = True
                             # Extract test statistics if available
                             import re
-                            test_match = re.search(r'(\d+)\s+tests?\s+completed.*?(\d+)\s+failed', output, re.IGNORECASE)
+
+                            test_match = re.search(
+                                r"(\d+)\s+tests?\s+completed.*?(\d+)\s+failed",
+                                output,
+                                re.IGNORECASE,
+                            )
                             if test_match:
                                 total_tests = int(test_match.group(1))
                                 failed_tests = int(test_match.group(2))
-                                actual_accomplishments['test_stats'] = {
-                                    'total': total_tests,
-                                    'failed': failed_tests,
-                                    'passed': total_tests - failed_tests
+                                actual_accomplishments["test_stats"] = {
+                                    "total": total_tests,
+                                    "failed": failed_tests,
+                                    "passed": total_tests - failed_tests,
                                 }
-                                logger.error(f"❌ Gradle tests FAILED: {failed_tests}/{total_tests} tests failed")
+                                logger.error(
+                                    f"❌ Gradle tests FAILED: {failed_tests}/{total_tests} tests failed"
+                                )
                             else:
                                 logger.error(f"❌ Gradle tests FAILED")
-                        elif 'BUILD SUCCESSFUL' in output:
+                        elif "BUILD SUCCESSFUL" in output:
                             # Also check for specific test failures even if build reports success
-                            if 'test failed' in output.lower() or 'tests failed' in output.lower():
-                                actual_accomplishments['test_failed'] = True
+                            if "test failed" in output.lower() or "tests failed" in output.lower():
+                                actual_accomplishments["test_failed"] = True
                                 logger.warning(f"⚠️ Gradle build successful but some tests failed")
                             else:
-                                actual_accomplishments['test_success'] = True
+                                actual_accomplishments["test_success"] = True
                                 logger.info(f"✅ Gradle tests passed")
-                    
+
                     # Generic test via bash (npm test, pytest, etc.)
-                    elif tool_name == 'bash' and any(test_cmd in command for test_cmd in ['npm test', 'pytest', 'go test', 'cargo test']):
-                        if 'failed' not in output.lower() and 'error' not in output.lower():
-                            actual_accomplishments['test_success'] = True
+                    elif tool_name == "bash" and any(
+                        test_cmd in command
+                        for test_cmd in ["npm test", "pytest", "go test", "cargo test"]
+                    ):
+                        if "failed" not in output.lower() and "error" not in output.lower():
+                            actual_accomplishments["test_success"] = True
                             logger.info(f"✅ Tests passed via bash: {command}")
-                
+
                 # Store detailed results for debugging
-                actual_accomplishments['detailed_results'][f"{tool_name}_{actual_accomplishments['total_actions']}"] = {
-                    'tool': tool_name,
-                    'command': tool_params.get('command', ''),
-                    'success': success,
-                    'output_snippet': output[:200] if output else ""
+                actual_accomplishments["detailed_results"][
+                    f"{tool_name}_{actual_accomplishments['total_actions']}"
+                ] = {
+                    "tool": tool_name,
+                    "command": tool_params.get("command", ""),
+                    "success": success,
+                    "output_snippet": output[:200] if output else "",
                 }
-                
+
             else:
-                actual_accomplishments['tools_failed'].append(tool_name)
-    
+                actual_accomplishments["tools_failed"].append(tool_name)
+
     def _analyze_completed_tasks(self, trunk_context, actual_accomplishments: dict):
         """Analyze completed tasks from project context to determine core accomplishments."""
         if not trunk_context or not trunk_context.todo_list:
             return
-        
+
         for task in trunk_context.todo_list:
             if task.status.value == "completed":
                 task_desc = task.description.lower()
-                
-                key_results = getattr(task, 'key_results', '') or ''
-                
+
+                key_results = getattr(task, "key_results", "") or ""
+
                 # Check for repository clone
-                if any(keyword in task_desc for keyword in ['clone', 'repository', 'setup']):
+                if any(keyword in task_desc for keyword in ["clone", "repository", "setup"]):
                     # More flexible detection for repository clone
-                    clone_indicators = ['repo_dir=', 'repository', 'cloned', '/workspace/', 'project_type=', 'directory']
+                    clone_indicators = [
+                        "repo_dir=",
+                        "repository",
+                        "cloned",
+                        "/workspace/",
+                        "project_type=",
+                        "directory",
+                    ]
                     if any(indicator in key_results.lower() for indicator in clone_indicators):
-                        actual_accomplishments['repository_cloned'] = True
-                        logger.debug(f"✅ Repository clone confirmed from task: {task.description[:50]}...")
-                
+                        actual_accomplishments["repository_cloned"] = True
+                        logger.debug(
+                            f"✅ Repository clone confirmed from task: {task.description[:50]}..."
+                        )
+
                 # Check for build success
-                if any(keyword in task_desc for keyword in ['compile', 'build', 'maven']):
+                if any(keyword in task_desc for keyword in ["compile", "build", "maven"]):
                     build_indicators = [
-                        'compile_success=true', 'build_success=true', 'build_status=success',
-                        'modules_compiled:', 'output_directory', 'target/', 'compiled', 'build'
+                        "compile_success=true",
+                        "build_success=true",
+                        "build_status=success",
+                        "modules_compiled:",
+                        "output_directory",
+                        "target/",
+                        "compiled",
+                        "build",
                     ]
                     if any(indicator in key_results.lower() for indicator in build_indicators):
-                        actual_accomplishments['build_success'] = True
-                        logger.debug(f"✅ Build success confirmed from task: {task.description[:50]}...")
-                
+                        actual_accomplishments["build_success"] = True
+                        logger.debug(
+                            f"✅ Build success confirmed from task: {task.description[:50]}..."
+                        )
+
                 # Check for test success
-                if any(keyword in task_desc for keyword in ['test', 'run test']):
+                if any(keyword in task_desc for keyword in ["test", "run test"]):
                     test_indicators = [
-                        'tests passed', 'test reports', 'all tests', 'surefire-reports',
-                        'tests_passed=true', 'tests_passed": true', 
-                        'test_status=success',  # FIXED: Added missing key indicator
-                        'test_command=', 'exit_code=0', 'mvn.*success', 'test.*success'
+                        "tests passed",
+                        "test reports",
+                        "all tests",
+                        "surefire-reports",
+                        "tests_passed=true",
+                        'tests_passed": true',
+                        "test_status=success",  # FIXED: Added missing key indicator
+                        "test_command=",
+                        "exit_code=0",
+                        "mvn.*success",
+                        "test.*success",
                     ]
                     # FIXED: Removed 'build_success=true' from test indicators as it's misleading
                     if any(indicator in key_results.lower() for indicator in test_indicators):
-                        actual_accomplishments['test_success'] = True
-                        logger.debug(f"✅ Test success confirmed from task: {task.description[:50]}...")
-                
+                        actual_accomplishments["test_success"] = True
+                        logger.debug(
+                            f"✅ Test success confirmed from task: {task.description[:50]}..."
+                        )
+
                 # Count successful completion
-                actual_accomplishments['total_actions'] += 1
-                actual_accomplishments['successful_actions'] += 1
+                actual_accomplishments["total_actions"] += 1
+                actual_accomplishments["successful_actions"] += 1
 
     def _verify_physical_artifacts(self, accomplishments: dict) -> bool:
         """
@@ -1934,55 +2196,63 @@ class ReportTool(BaseTool, UIEventEmitter):
         """
         if not self.docker_orchestrator:
             return True  # Can't verify without orchestrator, assume success
-        
+
         try:
-            project_info = accomplishments.get('project_info', {}) or self._get_project_info()
-            project_dir = project_info.get('directory', '/workspace')
-            build_system = project_info.get('build_system', '').lower()
-            
+            project_info = accomplishments.get("project_info", {}) or self._get_project_info()
+            project_dir = project_info.get("directory", "/workspace")
+            build_system = project_info.get("build_system", "").lower()
+
             # Different artifact patterns based on build system
             artifact_checks = []
-            
-            if 'maven' in build_system:
+
+            if "maven" in build_system:
                 # Check for .class files in target/classes
-                artifact_checks.extend([
-                    f"find {project_dir} -path '*/target/classes/*.class' -type f | head -5",
-                    f"find {project_dir} -name '*.jar' -path '*/target/*' -type f | head -5"
-                ])
-            elif 'gradle' in build_system:
+                artifact_checks.extend(
+                    [
+                        f"find {project_dir} -path '*/target/classes/*.class' -type f | head -5",
+                        f"find {project_dir} -name '*.jar' -path '*/target/*' -type f | head -5",
+                    ]
+                )
+            elif "gradle" in build_system:
                 # Check for .class files in build/classes
-                artifact_checks.extend([
-                    f"find {project_dir} -path '*/build/classes/*/*.class' -type f | head -5",
-                    f"find {project_dir} -name '*.jar' -path '*/build/*' -type f | head -5"
-                ])
+                artifact_checks.extend(
+                    [
+                        f"find {project_dir} -path '*/build/classes/*/*.class' -type f | head -5",
+                        f"find {project_dir} -name '*.jar' -path '*/build/*' -type f | head -5",
+                    ]
+                )
             else:
                 # Generic checks for any build system
-                artifact_checks.extend([
-                    f"find {project_dir} -name '*.class' -type f | head -5",
-                    f"find {project_dir} -name '*.jar' -type f | head -5",
-                    f"find {project_dir} -name '*.war' -type f | head -5"
-                ])
-            
+                artifact_checks.extend(
+                    [
+                        f"find {project_dir} -name '*.class' -type f | head -5",
+                        f"find {project_dir} -name '*.jar' -type f | head -5",
+                        f"find {project_dir} -name '*.war' -type f | head -5",
+                    ]
+                )
+
             # Execute checks
             artifacts_found = False
             for check_cmd in artifact_checks:
                 result = self.docker_orchestrator.execute_command(check_cmd)
-                if result.get('exit_code') == 0 and result.get('output', '').strip():
+                if result.get("exit_code") == 0 and result.get("output", "").strip():
                     artifacts_found = True
                     logger.debug(f"✅ Found build artifacts: {result['output'][:100]}...")
                     break
-            
+
             if not artifacts_found:
-                logger.warning("⚠️ No compiled artifacts (.class/.jar files) found despite build success claim")
+                logger.warning(
+                    "⚠️ No compiled artifacts (.class/.jar files) found despite build success claim"
+                )
                 # Store details for reporting
-                accomplishments['missing_artifacts'] = True
-            
+                accomplishments["missing_artifacts"] = True
+
             return artifacts_found
-            
+
         except Exception as e:
             logger.warning(f"Failed to verify physical artifacts: {e}")
             return True  # Don't fail on verification errors
-    
+
     def _determine_actual_status(self, accomplishments: dict) -> str:
         """
         Determine the actual status based on build and test results.
@@ -1991,28 +2261,32 @@ class ReportTool(BaseTool, UIEventEmitter):
         - FAIL: Build failed OR test report not found OR test pass rate <= 80%
         """
         # Extract the three core indicators
-        repository_cloned = accomplishments.get('repository_cloned', False)
-        build_success = accomplishments.get('build_success', False) 
-        test_success = accomplishments.get('test_success', False)
-        
+        repository_cloned = accomplishments.get("repository_cloned", False)
+        build_success = accomplishments.get("build_success", False)
+        test_success = accomplishments.get("test_success", False)
+
         # Check for explicit build/test failures (higher priority than success flags)
-        build_failed = accomplishments.get('build_failed', False)
-        test_failed = accomplishments.get('test_failed', False)
-        compilation_errors = accomplishments.get('compilation_errors', 0)
-        
-        logger.debug(f"🔍 Core status check - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}")
-        logger.debug(f"🔍 Failure check - Build Failed: {build_failed}, Test Failed: {test_failed}, Compilation Errors: {compilation_errors}")
-        
+        build_failed = accomplishments.get("build_failed", False)
+        test_failed = accomplishments.get("test_failed", False)
+        compilation_errors = accomplishments.get("compilation_errors", 0)
+
+        logger.debug(
+            f"🔍 Core status check - Clone: {repository_cloned}, Build: {build_success}, Test: {test_success}"
+        )
+        logger.debug(
+            f"🔍 Failure check - Build Failed: {build_failed}, Test Failed: {test_failed}, Compilation Errors: {compilation_errors}"
+        )
+
         # Step 1: Check if repository was cloned
         if not repository_cloned:
             logger.error("❌ Repository clone failed - this is a fundamental failure")
             return "fail"
-        
+
         # Step 2: Check for explicit build failures or compilation errors
         if build_failed or compilation_errors > 0:
             logger.error(f"❌ Build explicitly failed with {compilation_errors} compilation errors")
             return "fail"
-        
+
         # Step 3: Verify physical artifacts if build claims success
         if build_success and self.docker_orchestrator:
             artifacts_exist = self._verify_physical_artifacts(accomplishments)
@@ -2020,36 +2294,41 @@ class ReportTool(BaseTool, UIEventEmitter):
                 logger.warning("⚠️ Build reported success but no compiled artifacts found")
                 # Override the success flag
                 build_success = False
-                accomplishments['build_success'] = False
-                accomplishments['artifact_verification_failed'] = True
-        
-        # Step 4: Check if build completed successfully  
+                accomplishments["build_success"] = False
+                accomplishments["artifact_verification_failed"] = True
+
+        # Step 4: Check if build completed successfully
         if not build_success:
             logger.error("❌ Build failed - cannot proceed without successful compilation")
             return "fail"
-        
+
         # Step 5: Calculate test pass rate for final determination
         test_pass_rate = 0.0
-        
+
         # Check if we have physical validation test data
-        if 'physical_validation' in accomplishments and 'test_analysis' in accomplishments['physical_validation']:
-            test_data = accomplishments['physical_validation']['test_analysis']
-            
+        if (
+            "physical_validation" in accomplishments
+            and "test_analysis" in accomplishments["physical_validation"]
+        ):
+            test_data = accomplishments["physical_validation"]["test_analysis"]
+
             # Use PhysicalValidator's method if available for consistency
             if self.physical_validator:
                 test_pass_rate = self.physical_validator.calculate_test_pass_rate(test_data)
             else:
                 # Fallback to manual calculation
-                total_tests = test_data.get('total_tests', 0)
-                passed_tests = test_data.get('passed_tests', 0)
+                total_tests = test_data.get("total_tests", 0)
+                passed_tests = test_data.get("passed_tests", 0)
                 if total_tests > 0:
                     test_pass_rate = (passed_tests / total_tests) * 100
-            
-            if test_pass_rate == 0 and test_data.get('total_tests', 0) == 0:
+
+            if test_pass_rate == 0 and test_data.get("total_tests", 0) == 0:
                 logger.warning("⚠️ No test reports found - treating as 0% pass rate")
                 return "fail"
             else:
-                logger.info(f"📊 Test pass rate: {test_pass_rate:.1f}% ({test_data.get('passed_tests', 0)}/{test_data.get('total_tests', 0)})")
+                logger.info(
+                    f"📊 Test pass rate: {test_pass_rate:.1f}% ({test_data.get('passed_tests', 0)}/{test_data.get('total_tests', 0)})"
+                )
         elif test_success:
             # If we don't have detailed test data but tests marked as success, check for test_failed flag
             if test_failed:
@@ -2061,7 +2340,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         else:
             logger.warning("⚠️ No test execution detected - treating as 0% pass rate")
             return "fail"
-        
+
         # Final determination based on pass rate threshold
         if test_pass_rate > 80:
             logger.info(f"✅ SUCCESS: Build passed ✓, Test pass rate {test_pass_rate:.1f}% > 80% ✓")
@@ -2082,11 +2361,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         report_snapshot: dict = None,
     ) -> str:
         """Generate console-formatted report with simple summary at the top."""
-        
+
         # ENHANCED: Add simple three-phase summary at the top
         simple_status = self._collect_simple_status_from_tasks()
         simple_summary = self._render_simple_summary_top(simple_status)
-        
+
         report_lines = [
             simple_summary,  # NEW: Simple summary first
             "=" * 80,
@@ -2096,30 +2375,36 @@ class ReportTool(BaseTool, UIEventEmitter):
             f"📊 Status: {status.upper()}",
             "",
         ]
-        
+
         # Add project information
         if project_info:
-            report_lines.extend([
-                "📂 PROJECT INFORMATION:",
-                f"   • Project Directory: {project_info.get('directory', 'Unknown')}",
-                f"   • Project Type: {project_info.get('type', 'Unknown')}",
-                f"   • Build System: {project_info.get('build_system', 'Unknown')}",
-                "",
-            ])
-        
+            report_lines.extend(
+                [
+                    "📂 PROJECT INFORMATION:",
+                    f"   • Project Directory: {project_info.get('directory', 'Unknown')}",
+                    f"   • Project Type: {project_info.get('type', 'Unknown')}",
+                    f"   • Build System: {project_info.get('build_system', 'Unknown')}",
+                    "",
+                ]
+            )
+
         # Add summary
         if summary:
-            report_lines.extend([
-                "📋 SUMMARY:",
-                f"   {summary}",
-                "",
-            ])
-        
+            report_lines.extend(
+                [
+                    "📋 SUMMARY:",
+                    f"   {summary}",
+                    "",
+                ]
+            )
+
         # CRITICAL FIX: Use actual TODO list from trunk context instead of hardcoded tasks
-        report_lines.extend([
-            "✅ TASK COMPLETION STATUS:",
-        ])
-        
+        report_lines.extend(
+            [
+                "✅ TASK COMPLETION STATUS:",
+            ]
+        )
+
         # Try to get actual task status from trunk context first
         todo_list_used = False
         if self.context_manager:
@@ -2127,7 +2412,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 trunk_context = self.context_manager.load_trunk_context()
                 if trunk_context and trunk_context.todo_list:
                     todo_list_used = True
-                    
+
                     for task in trunk_context.todo_list:
                         if task.status.value == "completed":
                             icon = "✅"
@@ -2143,222 +2428,266 @@ class ReportTool(BaseTool, UIEventEmitter):
                         else:
                             icon = "⏳"
                             status_text = "Pending"
-                        
+
                         report_lines.append(f"   • {icon} {task.description} - {status_text}")
-                        
+
             except Exception as e:
                 logger.warning(f"Failed to load trunk context for console report: {e}")
-        
+
         # Fallback to technical accomplishments if no TODO list available
         if not todo_list_used:
             logger.info("Using technical accomplishments as fallback for task status")
-            
+
             # Use actual accomplishments if available
             if actual_accomplishments:
                 # Environment setup
-                if actual_accomplishments.get('environment_setup'):
+                if actual_accomplishments.get("environment_setup"):
                     report_lines.append("   • ✅ Docker environment setup")
                 else:
                     report_lines.append("   • ❌ Docker environment setup")
-                
+
                 # Repository cloning
-                if actual_accomplishments.get('repository_cloned'):
+                if actual_accomplishments.get("repository_cloned"):
                     report_lines.append("   • ✅ Project repository cloning")
                 else:
                     report_lines.append("   • ❌ Project repository cloning")
-                
+
                 # Project detection
-                if actual_accomplishments.get('project_detected'):
+                if actual_accomplishments.get("project_detected"):
                     report_lines.append("   • ✅ Development environment configuration")
                 else:
                     report_lines.append("   • ⚠️ Development environment configuration (partial)")
-                
+
                 # Compilation status
-                if actual_accomplishments.get('maven_compile_success'):
+                if actual_accomplishments.get("maven_compile_success"):
                     report_lines.append("   • ✅ Project compilation")
                 else:
                     report_lines.append("   • ❌ Project compilation (failed)")
-                
+
                 # Test execution status
-                if actual_accomplishments.get('maven_test_success'):
+                if actual_accomplishments.get("maven_test_success"):
                     report_lines.append("   • ✅ Test execution")
                 else:
                     report_lines.append("   • ❌ Test execution (failed)")
             else:
                 # Final fallback to old behavior if no accomplishments data
-                report_lines.extend([
-                    "   • ✅ Docker environment setup",
-                    "   • ✅ Project repository cloning",
-                    "   • ✅ Development environment configuration",
-                ])
-                
+                report_lines.extend(
+                    [
+                        "   • ✅ Docker environment setup",
+                        "   • ✅ Project repository cloning",
+                        "   • ✅ Development environment configuration",
+                    ]
+                )
+
                 # Add build/test status based on overall status
                 if status == "success":
-                    report_lines.extend([
-                        "   • ✅ Project compilation",
-                        "   • ✅ Test execution",
-                    ])
+                    report_lines.extend(
+                        [
+                            "   • ✅ Project compilation",
+                            "   • ✅ Test execution",
+                        ]
+                    )
                 elif status == "partial":
-                    report_lines.extend([
-                        "   • ⚠️ Project compilation (partial)",
-                        "   • ⚠️ Test execution (some issues)",
-                    ])
+                    report_lines.extend(
+                        [
+                            "   • ⚠️ Project compilation (partial)",
+                            "   • ⚠️ Test execution (some issues)",
+                        ]
+                    )
                 else:
-                    report_lines.extend([
-                        "   • ❌ Project compilation (failed)",
-                        "   • ❌ Test execution (failed)",
-                    ])
-        
+                    report_lines.extend(
+                        [
+                            "   • ❌ Project compilation (failed)",
+                            "   • ❌ Test execution (failed)",
+                        ]
+                    )
+
         # Add comprehensive execution metrics
         if execution_metrics:
-            report_lines.extend([
-                "",
-                "📊 EXECUTION METRICS:",
-            ])
-            
+            report_lines.extend(
+                [
+                    "",
+                    "📊 EXECUTION METRICS:",
+                ]
+            )
+
             # Runtime metrics
-            if execution_metrics.get('total_runtime'):
-                report_lines.append(f"   • Total runtime: {execution_metrics['total_runtime']:.1f} minutes")
-            
+            if execution_metrics.get("total_runtime"):
+                report_lines.append(
+                    f"   • Total runtime: {execution_metrics['total_runtime']:.1f} minutes"
+                )
+
             # Iteration metrics
-            if execution_metrics.get('total_iterations'):
-                report_lines.append(f"   • Iterations used: {execution_metrics['total_iterations']}")
-            
+            if execution_metrics.get("total_iterations"):
+                report_lines.append(
+                    f"   • Iterations used: {execution_metrics['total_iterations']}"
+                )
+
             # Step breakdown
-            report_lines.extend([
-                f"   • Total thoughts: {execution_metrics.get('total_thoughts', 0)}",
-                f"   • Total actions: {execution_metrics.get('total_actions', 0)}",
-                f"   • Total observations: {execution_metrics.get('total_observations', 0)}",
-            ])
-            
+            report_lines.extend(
+                [
+                    f"   • Total thoughts: {execution_metrics.get('total_thoughts', 0)}",
+                    f"   • Total actions: {execution_metrics.get('total_actions', 0)}",
+                    f"   • Total observations: {execution_metrics.get('total_observations', 0)}",
+                ]
+            )
+
             # Success metrics
-            successful = execution_metrics.get('successful_actions', 0)
-            failed = execution_metrics.get('failed_actions', 0)
-            success_rate = execution_metrics.get('success_rate', 0)
-            report_lines.extend([
-                f"   • Successful actions: {successful}",
-                f"   • Failed actions: {failed}",
-                f"   • Success rate: {success_rate:.1f}%",
-            ])
-            
+            successful = execution_metrics.get("successful_actions", 0)
+            failed = execution_metrics.get("failed_actions", 0)
+            success_rate = execution_metrics.get("success_rate", 0)
+            report_lines.extend(
+                [
+                    f"   • Successful actions: {successful}",
+                    f"   • Failed actions: {failed}",
+                    f"   • Success rate: {success_rate:.1f}%",
+                ]
+            )
+
             # Model usage
-            report_lines.extend([
-                f"   • Thinking model calls: {execution_metrics.get('thinking_model_calls', 0)}",
-                f"   • Action model calls: {execution_metrics.get('action_model_calls', 0)}",
-            ])
-            
+            report_lines.extend(
+                [
+                    f"   • Thinking model calls: {execution_metrics.get('thinking_model_calls', 0)}",
+                    f"   • Action model calls: {execution_metrics.get('action_model_calls', 0)}",
+                ]
+            )
+
             # Tool usage
-            if execution_metrics.get('tools_used'):
-                top_tools = sorted(execution_metrics['tools_used'].items(), key=lambda x: x[1], reverse=True)[:5]
+            if execution_metrics.get("tools_used"):
+                top_tools = sorted(
+                    execution_metrics["tools_used"].items(), key=lambda x: x[1], reverse=True
+                )[:5]
                 tools_str = ", ".join([f"{tool}({count})" for tool, count in top_tools])
                 report_lines.append(f"   • Most used tools: {tools_str}")
-            
+
             # Error patterns
-            if execution_metrics.get('repetitive_failures', 0) > 0:
-                report_lines.append(f"   • ⚠️ Repetitive failures: {execution_metrics['repetitive_failures']}")
-            
-            if execution_metrics.get('error_types'):
-                top_errors = sorted(execution_metrics['error_types'].items(), key=lambda x: x[1], reverse=True)[:3]
+            if execution_metrics.get("repetitive_failures", 0) > 0:
+                report_lines.append(
+                    f"   • ⚠️ Repetitive failures: {execution_metrics['repetitive_failures']}"
+                )
+
+            if execution_metrics.get("error_types"):
+                top_errors = sorted(
+                    execution_metrics["error_types"].items(), key=lambda x: x[1], reverse=True
+                )[:3]
                 for error_type, count in top_errors:
                     report_lines.append(f"   • Error type '{error_type}': {count} occurrences")
-        
+
         # Add legacy execution statistics if no metrics available but accomplishments exist
         elif actual_accomplishments:
-            total = actual_accomplishments.get('total_actions', 0)
-            successful = actual_accomplishments.get('successful_actions', 0)
+            total = actual_accomplishments.get("total_actions", 0)
+            successful = actual_accomplishments.get("successful_actions", 0)
             if total > 0:
                 success_rate = (successful / total) * 100
-                report_lines.extend([
-                    "",
-                    f"📊 EXECUTION STATISTICS:",
-                    f"   • Total actions executed: {total}",
-                    f"   • Successful actions: {successful}",
-                    f"   • Success rate: {success_rate:.1f}%",
-                ])
-        
+                report_lines.extend(
+                    [
+                        "",
+                        f"📊 EXECUTION STATISTICS:",
+                        f"   • Total actions executed: {total}",
+                        f"   • Successful actions: {successful}",
+                        f"   • Success rate: {success_rate:.1f}%",
+                    ]
+                )
+
         report_lines.append("")
-        
+
         # Add details if provided
         if details:
-            report_lines.extend([
-                "📝 DETAILS:",
-                f"   {details}",
-                "",
-            ])
-        
+            report_lines.extend(
+                [
+                    "📝 DETAILS:",
+                    f"   {details}",
+                    "",
+                ]
+            )
+
         # Add next steps based on status
         if status == "success":
-            report_lines.extend([
-                "🚀 PROJECT READY:",
-                "   • The project has been successfully set up and tested",
-                "   • All dependencies are installed and configured",
-                "   • You can now start development or deployment",
-                "",
-            ])
+            report_lines.extend(
+                [
+                    "🚀 PROJECT READY:",
+                    "   • The project has been successfully set up and tested",
+                    "   • All dependencies are installed and configured",
+                    "   • You can now start development or deployment",
+                    "",
+                ]
+            )
         elif status == "partial":
-            report_lines.extend([
-                "⚠️ PARTIAL SUCCESS:",
-                "   • Basic setup completed but some issues remain",
-                "   • Review the logs for specific error details",
-                "   • Manual intervention may be needed for full functionality",
-                "",
-            ])
+            report_lines.extend(
+                [
+                    "⚠️ PARTIAL SUCCESS:",
+                    "   • Basic setup completed but some issues remain",
+                    "   • Review the logs for specific error details",
+                    "   • Manual intervention may be needed for full functionality",
+                    "",
+                ]
+            )
         else:
-            report_lines.extend([
-                "❌ SETUP ISSUES:",
-                "   • Project setup encountered significant problems",
-                "   • Check error logs and dependency requirements",
-                "   • Manual troubleshooting may be required",
-                "",
-            ])
-        
-        report_lines.extend([
-            "=" * 80,
-            "Task completed. Setup agent finished.",
-            "=" * 80,
-        ])
-        
+            report_lines.extend(
+                [
+                    "❌ SETUP ISSUES:",
+                    "   • Project setup encountered significant problems",
+                    "   • Check error logs and dependency requirements",
+                    "   • Manual troubleshooting may be required",
+                    "",
+                ]
+            )
+
+        report_lines.extend(
+            [
+                "=" * 80,
+                "Task completed. Setup agent finished.",
+                "=" * 80,
+            ]
+        )
+
         return "\n".join(report_lines)
 
     def _get_project_info(self) -> Dict[str, str]:
         """Get basic project information from the workspace."""
         import re  # FIXED: Move import to top level to avoid scope issues
+
         info = {}
-        
+
         try:
             if self.docker_orchestrator:
                 # First try to get project info from trunk context
-                trunk_context = self.context_manager.load_trunk_context() if self.context_manager else None
-                
+                trunk_context = (
+                    self.context_manager.load_trunk_context() if self.context_manager else None
+                )
+
                 # FIXED: Try to detect actual project directory from completed tasks
                 project_dir = "/workspace"
-                if trunk_context and hasattr(trunk_context, 'todo_list'):
+                if trunk_context and hasattr(trunk_context, "todo_list"):
                     for task in trunk_context.todo_list:
                         # FIXED: Use object attributes instead of dictionary access
-                        if task.status.value == 'completed' and task.key_results:
+                        if task.status.value == "completed" and task.key_results:
                             key_results = task.key_results
                             # Look for project directory in key results
-                            if 'repo_dir=' in key_results:
+                            if "repo_dir=" in key_results:
                                 # Extract repo_dir value
-                                match = re.search(r'repo_dir=([^;,.\s]+)', key_results)
+                                match = re.search(r"repo_dir=([^;,.\s]+)", key_results)
                                 if match:
                                     project_dir = match.group(1)
                                     break
-                            elif 'path=/workspace/' in key_results:
+                            elif "path=/workspace/" in key_results:
                                 # Try to extract project path - more specific pattern
-                                match = re.search(r'path=(/workspace/[\w.-]+)', key_results)
+                                match = re.search(r"path=(/workspace/[\w.-]+)", key_results)
                                 if match:
                                     project_dir = match.group(1)
                                     break
-                            elif 'Directory=' in key_results or 'directory=' in key_results:
+                            elif "Directory=" in key_results or "directory=" in key_results:
                                 # Handle 'Directory=/workspace/<name>' style
-                                match = re.search(r'[Dd]irectory=([^;,.\s]+)', key_results)
-                                if match and match.group(1).startswith('/workspace/'):
+                                match = re.search(r"[Dd]irectory=([^;,.\s]+)", key_results)
+                                if match and match.group(1).startswith("/workspace/"):
                                     project_dir = match.group(1)
                                     break
-                            elif 'clone_location' in key_results:
+                            elif "clone_location" in key_results:
                                 # Handle dict-like key results: {'clone_location': '/workspace/<name>', ...}
-                                match = re.search(r"clone_location['\"]?\s*[:=]\s*['\"](/workspace/[^'\"\s]+)['\"]", key_results)
+                                match = re.search(
+                                    r"clone_location['\"]?\s*[:=]\s*['\"](/workspace/[^'\"\s]+)['\"]",
+                                    key_results,
+                                )
                                 if match:
                                     project_dir = match.group(1)
                                     break
@@ -2374,44 +2703,53 @@ class ReportTool(BaseTool, UIEventEmitter):
                             "(find /workspace -mindepth 1 -maxdepth 1 -type d ! -name '.setup_agent' ! -name 'setup-report-*' -printf '%p\\n' 2>/dev/null | head -1)"
                         )
                         result = self.docker_orchestrator.execute_command(probe_cmd)
-                        candidate = result.get('output', '').strip().split('\n')[0]
+                        candidate = result.get("output", "").strip().split("\n")[0]
                         # Additional check: ensure the candidate is not a report file
-                        if candidate and candidate.startswith('/workspace/') and 'setup-report-' not in candidate:
+                        if (
+                            candidate
+                            and candidate.startswith("/workspace/")
+                            and "setup-report-" not in candidate
+                        ):
                             project_dir = candidate
                     except Exception:
                         pass
-                
+
                 # ENHANCED: First try to get project type from task key_results
                 project_type_from_tasks = None
-                if trunk_context and hasattr(trunk_context, 'todo_list'):
+                if trunk_context and hasattr(trunk_context, "todo_list"):
                     for task in trunk_context.todo_list:
-                        if task.status.value == 'completed' and task.key_results:
+                        if task.status.value == "completed" and task.key_results:
                             key_results = task.key_results.lower()
-                            if 'project_type=maven' in key_results:
-                                project_type_from_tasks = ('Maven Java Project', 'Maven')
+                            if "project_type=maven" in key_results:
+                                project_type_from_tasks = ("Maven Java Project", "Maven")
                                 break
-                            elif 'project_type=gradle' in key_results:
-                                project_type_from_tasks = ('Gradle Java Project', 'Gradle')
+                            elif "project_type=gradle" in key_results:
+                                project_type_from_tasks = ("Gradle Java Project", "Gradle")
                                 break
-                            elif 'project_type=node' in key_results or 'project_type=npm' in key_results:
-                                project_type_from_tasks = ('Node.js Project', 'npm/yarn')
+                            elif (
+                                "project_type=node" in key_results
+                                or "project_type=npm" in key_results
+                            ):
+                                project_type_from_tasks = ("Node.js Project", "npm/yarn")
                                 break
-                            elif 'project_type=python' in key_results:
-                                project_type_from_tasks = ('Python Project', 'pip/poetry')
+                            elif "project_type=python" in key_results:
+                                project_type_from_tasks = ("Python Project", "pip/poetry")
                                 break
-                
+
                 # Use project type from tasks if found, otherwise check files
                 if project_type_from_tasks:
                     info["type"] = project_type_from_tasks[0]
                     info["build_system"] = project_type_from_tasks[1]
                     info["directory"] = project_dir
-                    logger.debug(f"✅ Project type detected from task results: {project_type_from_tasks[0]}")
+                    logger.debug(
+                        f"✅ Project type detected from task results: {project_type_from_tasks[0]}"
+                    )
                 else:
                     # Fallback: Check for common project files in the actual project directory
                     result = self.docker_orchestrator.execute_command(f"ls -la {project_dir}")
                     if result.get("success"):
                         output = result.get("output", "")
-                        
+
                         # Determine project type based on files
                         if "pom.xml" in output:
                             info["type"] = "Maven Java Project"
@@ -2428,14 +2766,14 @@ class ReportTool(BaseTool, UIEventEmitter):
                         else:
                             info["type"] = "Generic Project"
                             info["build_system"] = "Unknown"
-                        
+
                         info["directory"] = project_dir
-                
+
         except Exception as e:
             logger.warning(f"Could not gather project info: {e}")
-            
+
         return info
-    
+
     def _generate_markdown_report(
         self,
         summary: str,
@@ -2448,7 +2786,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         report_snapshot: dict = None,
     ) -> str:
         """Generate markdown-formatted report with improved structure and clarity."""
-        
+
         # Start with enhanced header
         report_lines = self._render_enhanced_header(
             timestamp, status, project_info, report_snapshot
@@ -2459,12 +2797,12 @@ class ReportTool(BaseTool, UIEventEmitter):
             dashboard_section = self._render_summary_dashboard(report_snapshot)
             if dashboard_section:
                 report_lines.extend(dashboard_section)
-            
+
             # Add detailed test analysis
             test_analysis_section = self._render_detailed_test_analysis(report_snapshot)
             if test_analysis_section:
                 report_lines.extend(test_analysis_section)
-            
+
             # Add issues and recommendations
             issues_section = self._render_issues_recommendations(report_snapshot)
             if issues_section:
@@ -2474,9 +2812,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         task_progress_section = self._render_task_progress(actual_accomplishments)
         if task_progress_section:
             report_lines.extend(task_progress_section)
-        
+
         # Execution details section (simplified)
-        exec_details_section = self._render_execution_details_simplified(report_snapshot, execution_metrics)
+        exec_details_section = self._render_execution_details_simplified(
+            report_snapshot, execution_metrics
+        )
         if exec_details_section:
             report_lines.extend(exec_details_section)
 
@@ -2489,25 +2829,27 @@ class ReportTool(BaseTool, UIEventEmitter):
         next_steps_section = self._generate_next_steps_section(status, actual_accomplishments)
         if next_steps_section:
             report_lines.extend(next_steps_section)
-        
-        report_lines.extend([
-            "---",
-            "",
-            "**Task completed. Setup Agent has finished.**",
-            "",
-            f"*This report was automatically generated by Setup-Agent v{self._get_setup_agent_version()} at {timestamp}*",
-        ])
+
+        report_lines.extend(
+            [
+                "---",
+                "",
+                "**Task completed. Setup Agent has finished.**",
+                "",
+                f"*This report was automatically generated by Setup-Agent v{self._get_setup_agent_version()} at {timestamp}*",
+            ]
+        )
 
         return "\n".join(report_lines)
 
     def _render_conclusion_section(self, snapshot: Dict[str, Any]) -> List[str]:
-        status = snapshot.get('status', {})
-        phases = snapshot.get('phases', {})
-        evidence = snapshot.get('physical_evidence', {})
+        status = snapshot.get("status", {})
+        phases = snapshot.get("phases", {})
+        evidence = snapshot.get("physical_evidence", {})
 
-        build_icon = '✅' if phases.get('build') else '❌'
-        class_files = evidence.get('class_files')
-        jar_files = evidence.get('jar_files')
+        build_icon = "✅" if phases.get("build") else "❌"
+        class_files = evidence.get("class_files")
+        jar_files = evidence.get("jar_files")
         build_details = []
         if class_files is not None:
             build_details.append(f"{class_files} .class files")
@@ -2519,15 +2861,15 @@ class ReportTool(BaseTool, UIEventEmitter):
             else "No build artifacts detected"
         )
 
-        tests_total = status.get('tests_total')
-        tests_passed = status.get('tests_passed')
-        tests_failed = status.get('tests_failed')
-        tests_errors = status.get('tests_errors')
-        tests_skipped = status.get('tests_skipped')
-        pass_pct = status.get('pass_pct')
+        tests_total = status.get("tests_total")
+        tests_passed = status.get("tests_passed")
+        tests_failed = status.get("tests_failed")
+        tests_errors = status.get("tests_errors")
+        tests_skipped = status.get("tests_skipped")
+        pass_pct = status.get("pass_pct")
 
         if tests_total:
-            test_icon = '✅' if status.get('tests_ok', False) else '❌'
+            test_icon = "✅" if status.get("tests_ok", False) else "❌"
             test_summary = (
                 f"{tests_passed or 0}/{tests_total} passed"
                 f", {tests_failed or 0} failed, {tests_errors or 0} errors"
@@ -2536,11 +2878,11 @@ class ReportTool(BaseTool, UIEventEmitter):
                 test_summary += f", {tests_skipped} skipped"
             test_summary += f" (pass rate {format_percentage(pass_pct)})"
         else:
-            test_icon = '⚠️'
+            test_icon = "⚠️"
             test_summary = "No test telemetry captured"
 
-        modules_expected = status.get('modules_expected')
-        modules_seen = status.get('modules_seen')
+        modules_expected = status.get("modules_expected")
+        modules_seen = status.get("modules_seen")
         if modules_expected:
             coverage_line = f"{modules_seen or 0}/{modules_expected} modules executed"
         elif modules_seen is not None:
@@ -2562,7 +2904,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         return lines
 
     def _render_attention_section(self, snapshot: Dict[str, Any]) -> List[str]:
-        attention_raw = snapshot.get('attention', {}).get('raw', [])
+        attention_raw = snapshot.get("attention", {}).get("raw", [])
         if not attention_raw:
             return [
                 "## 🚨 Needs Attention",
@@ -2582,28 +2924,28 @@ class ReportTool(BaseTool, UIEventEmitter):
         return lines
 
     def _render_test_coverage_section(self, snapshot: Dict[str, Any]) -> List[str]:
-        status = snapshot.get('status', {})
-        per_module = snapshot.get('per_module', {}) or {}
-        flags = snapshot.get('flags', {})
+        status = snapshot.get("status", {})
+        per_module = snapshot.get("per_module", {}) or {}
+        flags = snapshot.get("flags", {})
 
         lines = ["## 🧪 Test Coverage", ""]
 
-        if status.get('tests_total'):
+        if status.get("tests_total"):
             # Build test summary line with pass rate and execution rate
             test_line = f"- **Total Tests Executed:** {status['tests_total']}"
-            
+
             # Add pass rate
             test_line += f" (pass rate {format_percentage(status.get('pass_pct'))}"
-            
+
             # Add execution rate if available
-            if status.get('execution_rate') is not None:
+            if status.get("execution_rate") is not None:
                 test_line += f", execution rate {format_percentage(status.get('execution_rate'))}"
-                if status.get('static_test_count'):
+                if status.get("static_test_count"):
                     test_line += f" of {status['static_test_count']} total @Test"
-            
+
             test_line += ")"
             lines.append(test_line)
-            
+
             lines.append(
                 f"- **Failures/Errors:** {status.get('tests_failed', 0)} failed, "
                 f"{status.get('tests_errors', 0)} errors"
@@ -2611,39 +2953,43 @@ class ReportTool(BaseTool, UIEventEmitter):
         else:
             lines.append("- ⚠️ No aggregated test results available.")
 
-        if status.get('modules_expected'):
+        if status.get("modules_expected"):
             lines.append(
                 f"- **Module Coverage:** {status.get('modules_seen', 0)}/"
                 f"{status['modules_expected']} modules executed"
             )
 
-        skipped_modules = status.get('skipped_modules') or []
+        skipped_modules = status.get("skipped_modules") or []
         if skipped_modules:
             lines.append(f"- **Skipped Modules:** {truncate_list(skipped_modules)}")
 
-        exclusions_tests = flags.get('excluded_tests') or []
+        exclusions_tests = flags.get("excluded_tests") or []
         if exclusions_tests:
             lines.append(f"- **Excluded Tests:** {truncate_list(exclusions_tests)}")
 
         lines.append("")
 
         if per_module:
-            lines.extend([
-                "| Module | Pass % | Pass/Fail/Error/Skip |",
-                "|--------|-------:|---------------------|",
-            ])
+            lines.extend(
+                [
+                    "| Module | Pass % | Pass/Fail/Error/Skip |",
+                    "|--------|-------:|---------------------|",
+                ]
+            )
 
             sorted_modules = sorted(
                 per_module.items(),
-                key=lambda item: (item[1].get('pass_pct') if item[1].get('pass_pct') is not None else 101.0,
-                                  item[0])
+                key=lambda item: (
+                    item[1].get("pass_pct") if item[1].get("pass_pct") is not None else 101.0,
+                    item[0],
+                ),
             )
 
             max_rows = 6
             for idx, (module, data) in enumerate(sorted_modules):
                 if idx >= max_rows:
                     break
-                pass_pct = format_percentage(data.get('pass_pct'))
+                pass_pct = format_percentage(data.get("pass_pct"))
                 summary = (
                     f"{data.get('passed', 0)}/{data.get('failed', 0)}/"
                     f"{data.get('error', 0)}/{data.get('skipped', 0)}"
@@ -2664,17 +3010,17 @@ class ReportTool(BaseTool, UIEventEmitter):
         """
         lines = ["## 📊 Current Situation", ""]
 
-        status = snapshot.get('status', {})
-        phases = snapshot.get('phases', {})
-        attention_raw = snapshot.get('attention', {}).get('raw', [])
+        status = snapshot.get("status", {})
+        phases = snapshot.get("phases", {})
+        attention_raw = snapshot.get("attention", {}).get("raw", [])
 
-        tests_total = status.get('tests_total')
-        tests_failed = status.get('tests_failed', 0) or 0
-        tests_errors = status.get('tests_errors', 0) or 0
-        tests_skipped = status.get('tests_skipped', 0) or 0
-        pass_pct = status.get('pass_pct')
+        tests_total = status.get("tests_total")
+        tests_failed = status.get("tests_failed", 0) or 0
+        tests_errors = status.get("tests_errors", 0) or 0
+        tests_skipped = status.get("tests_skipped", 0) or 0
+        pass_pct = status.get("pass_pct")
 
-        agent_narrative = snapshot.get('current_situation_narrative')
+        agent_narrative = snapshot.get("current_situation_narrative")
         if agent_narrative:
             lines.append(agent_narrative)
             lines.append("")
@@ -2682,9 +3028,9 @@ class ReportTool(BaseTool, UIEventEmitter):
         summary_items: List[str] = []
 
         phase_labels = [
-            ('clone', 'Repository clone'),
-            ('build', 'Build phase'),
-            ('test', 'Test execution'),
+            ("clone", "Repository clone"),
+            ("build", "Build phase"),
+            ("test", "Test execution"),
         ]
         for key, label in phase_labels:
             state = phases.get(key)
@@ -2715,22 +3061,28 @@ class ReportTool(BaseTool, UIEventEmitter):
             lines.append("")
 
         if tests_total is not None:
-            lines.extend([
-                "### Test Execution Summary",
-                "",
-                "| Metric | Value | Status |",
-                "|--------|-------|--------|",
-            ])
-            
+            lines.extend(
+                [
+                    "### Test Execution Summary",
+                    "",
+                    "| Metric | Value | Status |",
+                    "|--------|-------|--------|",
+                ]
+            )
+
             # Add Total @Test Annotations if available
-            static_test_count = status.get('static_test_count')
+            static_test_count = status.get("static_test_count")
             if static_test_count:
                 lines.append(f"| Total @Test Annotations | {static_test_count} | 📊 |")
 
-            status_icon = "✅" if status.get('tests_ok') else "⚠️" if (tests_failed + tests_errors) == 0 else "❌"
+            status_icon = (
+                "✅"
+                if status.get("tests_ok")
+                else "⚠️" if (tests_failed + tests_errors) == 0 else "❌"
+            )
             lines.append(f"| Executed Tests | {tests_total} | {status_icon} |")
 
-            tests_passed = status.get('tests_passed')
+            tests_passed = status.get("tests_passed")
             if tests_passed is not None:
                 lines.append(f"| Passed | {tests_passed} | ✅ |")
 
@@ -2746,56 +3098,60 @@ class ReportTool(BaseTool, UIEventEmitter):
                 skip_icon = "⚠️" if tests_skipped else "✅"
                 lines.append(f"| Skipped | {tests_skipped} | {skip_icon} |")
 
-            if status.get('tests_passed') is not None:
+            if status.get("tests_passed") is not None:
                 pct_value = pass_pct if pass_pct is not None else 0
                 pass_icon = "✅" if pct_value >= 95 else "⚠️" if pct_value >= 80 else "❌"
                 lines.append(f"| Pass Rate | {format_percentage(pass_pct)} | {pass_icon} |")
-            
+
             # Add Execution Rate if available
-            execution_rate = status.get('execution_rate')
+            execution_rate = status.get("execution_rate")
             if execution_rate is not None:
                 # Handle rates over 100% (indicates parameterized tests)
                 if execution_rate > 100:
                     exec_icon = "🔄"  # Special icon for parameterized tests
                 else:
-                    exec_icon = "✅" if execution_rate >= 90 else "⚠️" if execution_rate >= 70 else "❌"
-                lines.append(f"| Execution Rate | {format_percentage(execution_rate)} | {exec_icon} |")
+                    exec_icon = (
+                        "✅" if execution_rate >= 90 else "⚠️" if execution_rate >= 70 else "❌"
+                    )
+                lines.append(
+                    f"| Execution Rate | {format_percentage(execution_rate)} | {exec_icon} |"
+                )
 
             lines.append("")
 
         return lines
 
     def _render_execution_details_section(self, snapshot: Dict[str, Any]) -> List[str]:
-        history = snapshot.get('test_history', {}) or {}
-        last_cmd = snapshot.get('last_command', {}) or {}
-        flags = snapshot.get('flags', {}) or {}
-        failed_tests = snapshot.get('failed_tests', []) or []
+        history = snapshot.get("test_history", {}) or {}
+        last_cmd = snapshot.get("last_command", {}) or {}
+        flags = snapshot.get("flags", {}) or {}
+        failed_tests = snapshot.get("failed_tests", []) or []
 
         lines = ["## 🧰 Execution Details", ""]
 
         if last_cmd:
-            command = last_cmd.get('command') or '<unknown>'
-            exit_code = last_cmd.get('exit_code')
-            tool = last_cmd.get('tool') or 'maven'
-            workdir = last_cmd.get('workdir') or 'N/A'
+            command = last_cmd.get("command") or "<unknown>"
+            exit_code = last_cmd.get("exit_code")
+            tool = last_cmd.get("tool") or "maven"
+            workdir = last_cmd.get("workdir") or "N/A"
             lines.append(f"- **Tool:** {tool}")
             lines.append(f"- **Working Directory:** {workdir}")
             lines.append(f"- **Command:** `{command}`")
             if exit_code is not None:
                 lines.append(f"- **Exit Code:** {exit_code}")
 
-        if flags.get('fail_at_end'):
+        if flags.get("fail_at_end"):
             lines.append("- **Flag:** `fail_at_end=True`")
 
-        exclusions_tests = flags.get('excluded_tests') or []
+        exclusions_tests = flags.get("excluded_tests") or []
         if exclusions_tests:
             lines.append(f"- **Excluded Tests:** {truncate_list(exclusions_tests)}")
 
-        exclusions_modules = flags.get('excluded_modules') or []
+        exclusions_modules = flags.get("excluded_modules") or []
         if exclusions_modules:
             lines.append(f"- **Excluded Modules:** {truncate_list(exclusions_modules)}")
 
-        ignored_lines = history.get('ignored_lines', 0)
+        ignored_lines = history.get("ignored_lines", 0)
         if ignored_lines:
             lines.append(f"- **Telemetry:** {ignored_lines} lines ignored during aggregation")
 
@@ -2809,17 +3165,17 @@ class ReportTool(BaseTool, UIEventEmitter):
         """Generate task completion status section based on trunk context."""
         if not self.context_manager:
             return []
-        
+
         try:
             trunk_context = self.context_manager.load_trunk_context()
             if not trunk_context or not trunk_context.todo_list:
                 return []
-            
+
             section_lines = [
                 "## ✅ Task Completion Status",
                 "",
             ]
-            
+
             for task in trunk_context.todo_list:
                 if task.status.value == "completed":
                     icon = "✅"
@@ -2835,58 +3191,64 @@ class ReportTool(BaseTool, UIEventEmitter):
                 else:
                     icon = "⏳"
                     status_text = "Pending"
-                
+
                 section_lines.append(f"- {icon} **{task.description}** - {status_text}")
-            
+
             section_lines.append("")
             return section_lines
-            
+
         except Exception as e:
             logger.warning(f"Failed to generate task status section: {e}")
             return []
 
-    def _generate_technical_accomplishments_section(self, actual_accomplishments: dict = None) -> list:
+    def _generate_technical_accomplishments_section(
+        self, actual_accomplishments: dict = None
+    ) -> list:
         """Generate technical accomplishments section based on actual execution results."""
         if not actual_accomplishments:
             return []
-        
+
         section_lines = [
             "## 🔧 Technical Accomplishments",
             "",
         ]
-        
+
         # Repository and project setup
-        if actual_accomplishments.get('repository_cloned'):
+        if actual_accomplishments.get("repository_cloned"):
             section_lines.append("- ✅ **Repository Cloned** - Source code successfully downloaded")
-        
-        if actual_accomplishments.get('project_detected'):
-            section_lines.append("- ✅ **Project Type Detected** - Build system and structure identified")
-        
+
+        if actual_accomplishments.get("project_detected"):
+            section_lines.append(
+                "- ✅ **Project Type Detected** - Build system and structure identified"
+            )
+
         # Build and compilation
-        if actual_accomplishments.get('maven_compile_success'):
+        if actual_accomplishments.get("maven_compile_success"):
             section_lines.append("- ✅ **Compilation Successful** - Project builds without errors")
-        elif actual_accomplishments.get('repository_cloned'):
+        elif actual_accomplishments.get("repository_cloned"):
             section_lines.append("- ⚠️ **Compilation Issues** - Build encountered problems")
-        
+
         # Testing
-        if actual_accomplishments.get('maven_test_success'):
+        if actual_accomplishments.get("maven_test_success"):
             section_lines.append("- ✅ **Tests Passed** - All test suites executed successfully")
-        elif actual_accomplishments.get('maven_compile_success'):
+        elif actual_accomplishments.get("maven_compile_success"):
             section_lines.append("- ⚠️ **Test Issues** - Some tests failed or couldn't run")
-        
+
         # Tool usage summary
-        successful_tools = actual_accomplishments.get('tools_successful', [])
+        successful_tools = actual_accomplishments.get("tools_successful", [])
         if successful_tools:
             unique_tools = list(set(successful_tools))
             section_lines.append(f"- 🛠️ **Tools Used** - {', '.join(unique_tools)}")
-        
+
         # Success rate
-        total_actions = actual_accomplishments.get('total_actions', 0)
-        successful_actions = actual_accomplishments.get('successful_actions', 0)
+        total_actions = actual_accomplishments.get("total_actions", 0)
+        successful_actions = actual_accomplishments.get("successful_actions", 0)
         if total_actions > 0:
             success_rate = (successful_actions / total_actions) * 100
-            section_lines.append(f"- 📊 **Success Rate** - {successful_actions}/{total_actions} actions ({success_rate:.1f}%)")
-        
+            section_lines.append(
+                f"- 📊 **Success Rate** - {successful_actions}/{total_actions} actions ({success_rate:.1f}%)"
+            )
+
         section_lines.append("")
         return section_lines
 
@@ -2897,10 +3259,18 @@ class ReportTool(BaseTool, UIEventEmitter):
 
             # Get error logger instance - ensure we use the correct workspace path
             workspace_path = "/workspace"  # Default workspace path in container
-            if hasattr(self, 'orchestrator') and self.orchestrator and hasattr(self.orchestrator, 'workspace_path'):
+            if (
+                hasattr(self, "orchestrator")
+                and self.orchestrator
+                and hasattr(self.orchestrator, "workspace_path")
+            ):
                 # If orchestrator has a workspace path, use it
                 workspace_path = self.orchestrator.workspace_path
-            elif hasattr(self, 'docker_orchestrator') and self.docker_orchestrator and hasattr(self.docker_orchestrator, 'workspace_path'):
+            elif (
+                hasattr(self, "docker_orchestrator")
+                and self.docker_orchestrator
+                and hasattr(self.docker_orchestrator, "workspace_path")
+            ):
                 # Alternative attribute name for orchestrator
                 workspace_path = self.docker_orchestrator.workspace_path
             error_logger = ErrorLogger.get_instance(workspace_path=workspace_path)
@@ -2908,65 +3278,76 @@ class ReportTool(BaseTool, UIEventEmitter):
             # Get error summary
             summary = error_logger.get_error_summary()
 
-            if summary['total_errors'] == 0:
+            if summary["total_errors"] == 0:
                 return []
 
             analysis_lines = [
                 "### 📊 Centralized Error Summary",
                 "",
                 f"**Total Errors Logged:** {summary['total_errors']}",
-                ""
+                "",
             ]
 
             # Error type breakdown
-            if summary['error_counts_by_type']:
-                analysis_lines.extend([
-                    "**Error Types:**",
-                ])
-                for error_type, count in sorted(summary['error_counts_by_type'].items(),
-                                               key=lambda x: x[1], reverse=True):
-                    percentage = (count / summary['total_errors']) * 100
+            if summary["error_counts_by_type"]:
+                analysis_lines.extend(
+                    [
+                        "**Error Types:**",
+                    ]
+                )
+                for error_type, count in sorted(
+                    summary["error_counts_by_type"].items(), key=lambda x: x[1], reverse=True
+                ):
+                    percentage = (count / summary["total_errors"]) * 100
                     emoji = {
-                        'tool_error': '🔧',
-                        'unknown_tool': '❓',
-                        'validation_error': '✅',
-                        'execution_error': '⚡',
-                        'system_error': '💥',
-                        'timeout_error': '⏰',
-                        'recovery_failed': '🔄'
-                    }.get(error_type, '⚠️')
-                    analysis_lines.append(f"- {emoji} **{error_type}**: {count} ({percentage:.1f}%)")
+                        "tool_error": "🔧",
+                        "unknown_tool": "❓",
+                        "validation_error": "✅",
+                        "execution_error": "⚡",
+                        "system_error": "💥",
+                        "timeout_error": "⏰",
+                        "recovery_failed": "🔄",
+                    }.get(error_type, "⚠️")
+                    analysis_lines.append(
+                        f"- {emoji} **{error_type}**: {count} ({percentage:.1f}%)"
+                    )
                 analysis_lines.append("")
 
             # Tool error categories
-            if summary['tool_error_categories']:
-                analysis_lines.extend([
-                    "**Tool Error Categories:**",
-                ])
-                for category, count in sorted(summary['tool_error_categories'].items(),
-                                             key=lambda x: x[1], reverse=True):
+            if summary["tool_error_categories"]:
+                analysis_lines.extend(
+                    [
+                        "**Tool Error Categories:**",
+                    ]
+                )
+                for category, count in sorted(
+                    summary["tool_error_categories"].items(), key=lambda x: x[1], reverse=True
+                ):
                     analysis_lines.append(f"- **{category}**: {count} errors")
                 analysis_lines.append("")
 
             # Unknown tools attempted
-            if summary['unknown_tools_attempted']:
-                analysis_lines.extend([
-                    "**Unknown Tools Attempted:**",
-                ])
+            if summary["unknown_tools_attempted"]:
+                analysis_lines.extend(
+                    [
+                        "**Unknown Tools Attempted:**",
+                    ]
+                )
                 # Show up to 10 unique unknown tools
-                unique_tools = list(set(summary['unknown_tools_attempted']))[:10]
+                unique_tools = list(set(summary["unknown_tools_attempted"]))[:10]
                 for tool in unique_tools:
                     analysis_lines.append(f"- `{tool}`")
-                if len(summary['unknown_tools_attempted']) > 10:
-                    analysis_lines.append(f"- ... and {len(summary['unknown_tools_attempted']) - 10} more")
+                if len(summary["unknown_tools_attempted"]) > 10:
+                    analysis_lines.append(
+                        f"- ... and {len(summary['unknown_tools_attempted']) - 10} more"
+                    )
                 analysis_lines.append("")
 
             # Recovery failure rate
-            if summary['recovery_failure_rate'] > 0:
-                analysis_lines.extend([
-                    f"**Recovery Failure Rate:** {summary['recovery_failure_rate']:.1f}%",
-                    ""
-                ])
+            if summary["recovery_failure_rate"] > 0:
+                analysis_lines.extend(
+                    [f"**Recovery Failure Rate:** {summary['recovery_failure_rate']:.1f}%", ""]
+                )
 
             # Get sample errors for detailed analysis
             errors = error_logger.get_errors_for_analysis(limit=20)
@@ -2974,37 +3355,42 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # Find most common error patterns
                 error_patterns = {}
                 for error in errors:
-                    if error.get('type') == 'tool_error':
+                    if error.get("type") == "tool_error":
                         key = f"{error.get('tool_name', 'unknown')}_{error.get('category', 'unknown')}"
                         if key not in error_patterns:
                             error_patterns[key] = {
-                                'count': 0,
-                                'tool': error.get('tool_name', 'unknown'),
-                                'category': error.get('category', 'unknown'),
-                                'sample_message': error.get('error_message', 'No message'),
-                                'suggestions': error.get('suggestions', [])
+                                "count": 0,
+                                "tool": error.get("tool_name", "unknown"),
+                                "category": error.get("category", "unknown"),
+                                "sample_message": error.get("error_message", "No message"),
+                                "suggestions": error.get("suggestions", []),
                             }
-                        error_patterns[key]['count'] += 1
+                        error_patterns[key]["count"] += 1
 
                 if error_patterns:
-                    analysis_lines.extend([
-                        "**Common Error Patterns:**",
-                    ])
+                    analysis_lines.extend(
+                        [
+                            "**Common Error Patterns:**",
+                        ]
+                    )
                     # Show top 5 patterns
-                    top_patterns = sorted(error_patterns.items(),
-                                        key=lambda x: x[1]['count'], reverse=True)[:5]
+                    top_patterns = sorted(
+                        error_patterns.items(), key=lambda x: x[1]["count"], reverse=True
+                    )[:5]
                     for pattern_key, pattern_data in top_patterns:
                         analysis_lines.append(
                             f"- **{pattern_data['tool']}** ({pattern_data['category']}): "
                             f"{pattern_data['count']} occurrences"
                         )
-                        if pattern_data['sample_message']:
-                            msg = pattern_data['sample_message'][:100]
-                            if len(pattern_data['sample_message']) > 100:
+                        if pattern_data["sample_message"]:
+                            msg = pattern_data["sample_message"][:100]
+                            if len(pattern_data["sample_message"]) > 100:
                                 msg += "..."
                             analysis_lines.append(f"  - Sample: {msg}")
-                        if pattern_data['suggestions']:
-                            analysis_lines.append(f"  - Suggestion: {pattern_data['suggestions'][0]}")
+                        if pattern_data["suggestions"]:
+                            analysis_lines.append(
+                                f"  - Suggestion: {pattern_data['suggestions'][0]}"
+                            )
                     analysis_lines.append("")
 
             return analysis_lines
@@ -3024,10 +3410,10 @@ class ReportTool(BaseTool, UIEventEmitter):
         has_accomplishment_errors = False
         if actual_accomplishments:
             has_accomplishment_errors = (
-                actual_accomplishments.get('build_failed', False) or
-                actual_accomplishments.get('test_failed', False) or
-                actual_accomplishments.get('compilation_errors', 0) > 0 or
-                actual_accomplishments.get('test_failed', False)
+                actual_accomplishments.get("build_failed", False)
+                or actual_accomplishments.get("test_failed", False)
+                or actual_accomplishments.get("compilation_errors", 0) > 0
+                or actual_accomplishments.get("test_failed", False)
             )
 
         # Return empty if no errors at all
@@ -3043,234 +3429,286 @@ class ReportTool(BaseTool, UIEventEmitter):
         if error_analysis_lines:
             section_lines.extend(error_analysis_lines)
             section_lines.append("")
-        
+
         # Report compilation errors
-        if actual_accomplishments.get('compilation_errors', 0) > 0:
-            error_count = actual_accomplishments['compilation_errors']
-            section_lines.extend([
-                "### 🔴 Compilation Errors",
-                "",
-                f"**Total Compilation Errors:** {error_count}",
-                "",
-                "**Common Issues Detected:**",
-                "- Character encoding problems (unmappable characters)",
-                "- Source files may need UTF-8 encoding",
-                "- Consider adding `-Dfile.encoding=UTF-8` to build configuration",
-                "",
-            ])
-        
+        if actual_accomplishments.get("compilation_errors", 0) > 0:
+            error_count = actual_accomplishments["compilation_errors"]
+            section_lines.extend(
+                [
+                    "### 🔴 Compilation Errors",
+                    "",
+                    f"**Total Compilation Errors:** {error_count}",
+                    "",
+                    "**Common Issues Detected:**",
+                    "- Character encoding problems (unmappable characters)",
+                    "- Source files may need UTF-8 encoding",
+                    "- Consider adding `-Dfile.encoding=UTF-8` to build configuration",
+                    "",
+                ]
+            )
+
         # Report build failures
-        if actual_accomplishments.get('build_failed', False):
-            section_lines.extend([
-                "### 🔴 Build Failure",
-                "",
-                "**Status:** BUILD FAILED",
-                "",
-                "The build process failed to complete successfully. This typically indicates:",
-                "- Compilation errors in source code",
-                "- Missing dependencies",
-                "- Configuration issues",
-                "",
-                "**Recommended Actions:**",
-                "1. Review compilation errors above",
-                "2. Check dependency configurations",
-                "3. Verify build tool setup (Maven/Gradle)",
-                "",
-            ])
-        
+        if actual_accomplishments.get("build_failed", False):
+            section_lines.extend(
+                [
+                    "### 🔴 Build Failure",
+                    "",
+                    "**Status:** BUILD FAILED",
+                    "",
+                    "The build process failed to complete successfully. This typically indicates:",
+                    "- Compilation errors in source code",
+                    "- Missing dependencies",
+                    "- Configuration issues",
+                    "",
+                    "**Recommended Actions:**",
+                    "1. Review compilation errors above",
+                    "2. Check dependency configurations",
+                    "3. Verify build tool setup (Maven/Gradle)",
+                    "",
+                ]
+            )
+
         # Report test failures with statistics
-        if actual_accomplishments.get('test_failed', False):
-            section_lines.extend([
-                "### 🔴 Test Failures",
-                "",
-            ])
-            
+        if actual_accomplishments.get("test_failed", False):
+            section_lines.extend(
+                [
+                    "### 🔴 Test Failures",
+                    "",
+                ]
+            )
+
             # Add test statistics if available
-            test_stats = actual_accomplishments.get('test_stats', {})
+            test_stats = actual_accomplishments.get("test_stats", {})
             if test_stats:
-                total = test_stats.get('total', 0)
-                failed = test_stats.get('failed', 0)
-                passed = test_stats.get('passed', total - failed)
+                total = test_stats.get("total", 0)
+                failed = test_stats.get("failed", 0)
+                passed = test_stats.get("passed", total - failed)
                 pass_rate = (passed / total * 100) if total > 0 else 0
-                
-                section_lines.extend([
-                    "**Test Statistics:**",
-                    f"- Total Tests: {total}",
-                    f"- Passed: {passed} ({pass_rate:.1f}%)",
-                    f"- Failed: {failed}",
-                    "",
-                ])
+
+                section_lines.extend(
+                    [
+                        "**Test Statistics:**",
+                        f"- Total Tests: {total}",
+                        f"- Passed: {passed} ({pass_rate:.1f}%)",
+                        f"- Failed: {failed}",
+                        "",
+                    ]
+                )
             else:
-                section_lines.extend([
-                    "**Status:** Tests failed (detailed statistics unavailable)",
+                section_lines.extend(
+                    [
+                        "**Status:** Tests failed (detailed statistics unavailable)",
+                        "",
+                    ]
+                )
+
+            section_lines.extend(
+                [
+                    "**Recommended Actions:**",
+                    "1. Review test failure output for specific failing tests",
+                    "2. Check test logs in `target/surefire-reports/` (Maven) or `build/test-results/` (Gradle)",
+                    "3. Run failing tests individually for detailed debugging",
+                    "4. Verify test environment setup and dependencies",
                     "",
-                ])
-            
-            section_lines.extend([
-                "**Recommended Actions:**",
-                "1. Review test failure output for specific failing tests",
-                "2. Check test logs in `target/surefire-reports/` (Maven) or `build/test-results/` (Gradle)",
-                "3. Run failing tests individually for detailed debugging",
-                "4. Verify test environment setup and dependencies",
-                "",
-            ])
-        
+                ]
+            )
+
         # Report tools that failed
-        if actual_accomplishments.get('tools_failed'):
-            failed_tools = actual_accomplishments['tools_failed']
-            section_lines.extend([
-                "### 🔧 Failed Tool Executions",
-                "",
-                f"The following tools encountered errors: {', '.join(set(failed_tools))}",
-                "",
-            ])
-        
+        if actual_accomplishments.get("tools_failed"):
+            failed_tools = actual_accomplishments["tools_failed"]
+            section_lines.extend(
+                [
+                    "### 🔧 Failed Tool Executions",
+                    "",
+                    f"The following tools encountered errors: {', '.join(set(failed_tools))}",
+                    "",
+                ]
+            )
+
         section_lines.append("")
         return section_lines
-    
+
     def _generate_metrics_section(self, execution_metrics: dict = None) -> list:
         """Generate execution metrics section for the markdown report."""
         if not execution_metrics:
             return []
-        
+
         section_lines = [
             "## 📈 Execution Metrics",
             "",
         ]
-        
+
         # Runtime and iterations
-        if execution_metrics.get('total_runtime'):
-            section_lines.append(f"**Total Runtime:** {execution_metrics['total_runtime']:.1f} minutes")
-        if execution_metrics.get('total_iterations'):
+        if execution_metrics.get("total_runtime"):
+            section_lines.append(
+                f"**Total Runtime:** {execution_metrics['total_runtime']:.1f} minutes"
+            )
+        if execution_metrics.get("total_iterations"):
             section_lines.append(f"**Iterations Used:** {execution_metrics['total_iterations']}")
-        
+
         section_lines.append("")
-        
+
         # Step breakdown table
-        section_lines.extend([
-            "### Step Breakdown",
-            "",
-            "| Step Type | Count |",
-            "|-----------|-------|",
-            f"| Thoughts | {execution_metrics.get('total_thoughts', 0)} |",
-            f"| Actions | {execution_metrics.get('total_actions', 0)} |",
-            f"| Observations | {execution_metrics.get('total_observations', 0)} |",
-            "",
-        ])
-        
-        # Success metrics
-        section_lines.extend([
-            "### Performance Metrics",
-            "",
-            f"- **Successful Actions:** {execution_metrics.get('successful_actions', 0)}",
-            f"- **Failed Actions:** {execution_metrics.get('failed_actions', 0)}",
-            f"- **Success Rate:** {execution_metrics.get('success_rate', 0):.1f}%",
-            f"- **Thinking Model Calls:** {execution_metrics.get('thinking_model_calls', 0)}",
-            f"- **Action Model Calls:** {execution_metrics.get('action_model_calls', 0)}",
-            "",
-        ])
-        
-        # Tool usage
-        if execution_metrics.get('tools_used'):
-            section_lines.extend([
-                "### Tool Usage",
+        section_lines.extend(
+            [
+                "### Step Breakdown",
                 "",
-                "| Tool | Calls |",
-                "|------|-------|",
-            ])
-            for tool, count in sorted(execution_metrics['tools_used'].items(), key=lambda x: x[1], reverse=True):
+                "| Step Type | Count |",
+                "|-----------|-------|",
+                f"| Thoughts | {execution_metrics.get('total_thoughts', 0)} |",
+                f"| Actions | {execution_metrics.get('total_actions', 0)} |",
+                f"| Observations | {execution_metrics.get('total_observations', 0)} |",
+                "",
+            ]
+        )
+
+        # Success metrics
+        section_lines.extend(
+            [
+                "### Performance Metrics",
+                "",
+                f"- **Successful Actions:** {execution_metrics.get('successful_actions', 0)}",
+                f"- **Failed Actions:** {execution_metrics.get('failed_actions', 0)}",
+                f"- **Success Rate:** {execution_metrics.get('success_rate', 0):.1f}%",
+                f"- **Thinking Model Calls:** {execution_metrics.get('thinking_model_calls', 0)}",
+                f"- **Action Model Calls:** {execution_metrics.get('action_model_calls', 0)}",
+                "",
+            ]
+        )
+
+        # Tool usage
+        if execution_metrics.get("tools_used"):
+            section_lines.extend(
+                [
+                    "### Tool Usage",
+                    "",
+                    "| Tool | Calls |",
+                    "|------|-------|",
+                ]
+            )
+            for tool, count in sorted(
+                execution_metrics["tools_used"].items(), key=lambda x: x[1], reverse=True
+            ):
                 section_lines.append(f"| {tool} | {count} |")
             section_lines.append("")
-        
+
         # Error analysis
-        if execution_metrics.get('error_types') or execution_metrics.get('repetitive_failures'):
-            section_lines.extend([
-                "### Error Analysis",
-                "",
-            ])
-            
-            if execution_metrics.get('repetitive_failures', 0) > 0:
-                section_lines.append(f"- ⚠️ **Repetitive Failures:** {execution_metrics['repetitive_failures']}")
-            
-            if execution_metrics.get('error_types'):
-                section_lines.extend([
+        if execution_metrics.get("error_types") or execution_metrics.get("repetitive_failures"):
+            section_lines.extend(
+                [
+                    "### Error Analysis",
                     "",
-                    "**Error Types:**",
-                    "",
-                ])
-                for error_type, count in sorted(execution_metrics['error_types'].items(), key=lambda x: x[1], reverse=True):
+                ]
+            )
+
+            if execution_metrics.get("repetitive_failures", 0) > 0:
+                section_lines.append(
+                    f"- ⚠️ **Repetitive Failures:** {execution_metrics['repetitive_failures']}"
+                )
+
+            if execution_metrics.get("error_types"):
+                section_lines.extend(
+                    [
+                        "",
+                        "**Error Types:**",
+                        "",
+                    ]
+                )
+                for error_type, count in sorted(
+                    execution_metrics["error_types"].items(), key=lambda x: x[1], reverse=True
+                ):
                     section_lines.append(f"- `{error_type}`: {count} occurrences")
-            
+
             section_lines.append("")
-        
+
         # Phase completion
-        if execution_metrics.get('phases'):
-            section_lines.extend([
-                "### Phase Completion",
-                "",
-                "| Phase | Status |",
-                "|-------|--------|",
-            ])
-            for phase, info in execution_metrics['phases'].items():
-                status_icon = "✅" if info.get('status') else "❌"
+        if execution_metrics.get("phases"):
+            section_lines.extend(
+                [
+                    "### Phase Completion",
+                    "",
+                    "| Phase | Status |",
+                    "|-------|--------|",
+                ]
+            )
+            for phase, info in execution_metrics["phases"].items():
+                status_icon = "✅" if info.get("status") else "❌"
                 section_lines.append(f"| {phase.capitalize()} | {status_icon} |")
             section_lines.append("")
-        
+
         return section_lines
-    
-    def _generate_next_steps_section(self, status: str, actual_accomplishments: dict = None) -> list:
+
+    def _generate_next_steps_section(
+        self, status: str, actual_accomplishments: dict = None
+    ) -> list:
         """Generate next steps section based on actual status and context."""
         section_lines = []
-        
+
         if status == "success":
-            section_lines.extend([
-                "## 🚀 Project Ready",
-                "",
-                "- ✅ Project has been successfully set up and tested",
-                "- ✅ All dependencies are installed and configured",
-                "- ✅ Development environment is ready for use",
-                "- 🎯 **Next Steps:** You can now start development or deployment",
-                "",
-            ])
+            section_lines.extend(
+                [
+                    "## 🚀 Project Ready",
+                    "",
+                    "- ✅ Project has been successfully set up and tested",
+                    "- ✅ All dependencies are installed and configured",
+                    "- ✅ Development environment is ready for use",
+                    "- 🎯 **Next Steps:** You can now start development or deployment",
+                    "",
+                ]
+            )
         elif status == "partial":
-            section_lines.extend([
-                "## ⚠️ Partial Success",
-                "",
-                "- ⚠️ Basic setup completed, but some issues remain",
-                "- 📋 Review the execution details for specific error information",
-                "- 🔧 Manual intervention may be required for full functionality",
-            ])
-            
+            section_lines.extend(
+                [
+                    "## ⚠️ Partial Success",
+                    "",
+                    "- ⚠️ Basic setup completed, but some issues remain",
+                    "- 📋 Review the execution details for specific error information",
+                    "- 🔧 Manual intervention may be required for full functionality",
+                ]
+            )
+
             # Add specific recommendations based on what failed
             if actual_accomplishments:
-                if not actual_accomplishments.get('maven_compile_success'):
-                    section_lines.append("- 🔨 **Recommended:** Check build dependencies and configuration")
-                if not actual_accomplishments.get('maven_test_success'):
-                    section_lines.append("- 🧪 **Recommended:** Review test failures and fix any issues")
-            
+                if not actual_accomplishments.get("maven_compile_success"):
+                    section_lines.append(
+                        "- 🔨 **Recommended:** Check build dependencies and configuration"
+                    )
+                if not actual_accomplishments.get("maven_test_success"):
+                    section_lines.append(
+                        "- 🧪 **Recommended:** Review test failures and fix any issues"
+                    )
+
             section_lines.append("")
         else:
-            section_lines.extend([
-                "## ❌ Setup Issues",
-                "",
-                "- ❌ Project setup encountered significant problems",
-                "- 📋 Check error logs and dependency requirements",
-                "- 🔧 Manual troubleshooting may be required",
-            ])
-            
+            section_lines.extend(
+                [
+                    "## ❌ Setup Issues",
+                    "",
+                    "- ❌ Project setup encountered significant problems",
+                    "- 📋 Check error logs and dependency requirements",
+                    "- 🔧 Manual troubleshooting may be required",
+                ]
+            )
+
             # Add specific recommendations based on what failed
             if actual_accomplishments:
-                if not actual_accomplishments.get('repository_cloned'):
-                    section_lines.append("- 📥 **Critical:** Repository clone failed - check URL and access")
-                elif not actual_accomplishments.get('project_detected'):
-                    section_lines.append("- 🔍 **Critical:** Project type detection failed - verify project structure")
-                elif not actual_accomplishments.get('maven_compile_success'):
-                    section_lines.append("- 🔨 **Critical:** Build compilation failed - check dependencies")
-            
+                if not actual_accomplishments.get("repository_cloned"):
+                    section_lines.append(
+                        "- 📥 **Critical:** Repository clone failed - check URL and access"
+                    )
+                elif not actual_accomplishments.get("project_detected"):
+                    section_lines.append(
+                        "- 🔍 **Critical:** Project type detection failed - verify project structure"
+                    )
+                elif not actual_accomplishments.get("maven_compile_success"):
+                    section_lines.append(
+                        "- 🔨 **Critical:** Build compilation failed - check dependencies"
+                    )
+
             section_lines.append("")
-        
+
         return section_lines
-    
+
     def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
         """Save markdown report to workspace using here-doc for safe handling."""
 
@@ -3286,16 +3724,16 @@ class ReportTool(BaseTool, UIEventEmitter):
 
                 # Use provided consistent filename
                 filepath = f"/workspace/{report_filename}"
-                
+
                 # Use here-doc for safe content writing (no escaping needed)
                 # Generate a unique delimiter to avoid conflicts with content
                 delimiter = f"EOF_{hash(markdown_content) % 10000}"
-                
+
                 # Create here-doc command
                 command = f"cat > {filepath} << '{delimiter}'\n{markdown_content}\n{delimiter}"
-                
+
                 result = self.docker_orchestrator.execute_command(command)
-                
+
                 # Check result using exit_code as primary indicator
                 if result.get("exit_code") == 0:
                     logger.info(f"✅ Markdown report saved to: {filepath}")
@@ -3304,17 +3742,21 @@ class ReportTool(BaseTool, UIEventEmitter):
                     logger.warning(f"⚠️ Here-doc failed, trying fallback method")
                     self._save_markdown_report_fallback(markdown_content, filepath)
             else:
-                logger.warning("⚠️ Docker orchestrator not available, skipping markdown file creation")
-                
+                logger.warning(
+                    "⚠️ Docker orchestrator not available, skipping markdown file creation"
+                )
+
         except Exception as e:
             logger.error(f"❌ Error saving markdown report: {e}")
             # Try fallback method on any exception
             if self.docker_orchestrator:
                 try:
-                    self._save_markdown_report_fallback(markdown_content, f"/workspace/{report_filename}")
+                    self._save_markdown_report_fallback(
+                        markdown_content, f"/workspace/{report_filename}"
+                    )
                 except Exception as fallback_error:
                     logger.error(f"❌ Fallback method also failed: {fallback_error}")
-    
+
     def _save_markdown_report_fallback(self, markdown_content: str, filepath: str):
         """
         Fallback method for saving markdown report using base64 encoding.
@@ -3322,19 +3764,19 @@ class ReportTool(BaseTool, UIEventEmitter):
         """
         try:
             import base64
-            
+
             # Encode content to base64 to avoid shell escaping issues
-            encoded_content = base64.b64encode(markdown_content.encode('utf-8')).decode('ascii')
-            
+            encoded_content = base64.b64encode(markdown_content.encode("utf-8")).decode("ascii")
+
             # Write using base64 decode
             command = f"echo '{encoded_content}' | base64 -d > {filepath}"
             result = self.docker_orchestrator.execute_command(command)
-            
+
             if result.get("exit_code") == 0:
                 logger.info(f"✅ Markdown report saved via fallback to: {filepath}")
             else:
                 logger.error(f"❌ Fallback method failed: {result.get('output', 'Unknown error')}")
-                
+
         except Exception as e:
             logger.error(f"❌ Base64 fallback failed: {e}")
 
@@ -3343,8 +3785,8 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _get_setup_agent_version(self) -> str:
         """Get the Setup-Agent version from pyproject.toml."""
         try:
-            from pathlib import Path
             import re
+            from pathlib import Path
 
             # Look for pyproject.toml in the parent directories
             current = Path(__file__).resolve()
@@ -3353,7 +3795,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 pyproject_path = current / "pyproject.toml"
                 if pyproject_path.exists():
                     # Simple parsing without requiring tomllib
-                    with open(pyproject_path, 'r', encoding='utf-8') as f:
+                    with open(pyproject_path, "r", encoding="utf-8") as f:
                         content = f.read()
                         # Look for version = "x.x.x" pattern
                         match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
@@ -3364,93 +3806,101 @@ class ReportTool(BaseTool, UIEventEmitter):
             logger.debug(f"Could not read version from pyproject.toml: {e}")
             return "0.1.2"  # Default version on error
 
-    def _render_enhanced_header(self, timestamp: str, status: str, project_info: dict,
-                                snapshot: dict = None) -> List[str]:
+    def _render_enhanced_header(
+        self, timestamp: str, status: str, project_info: dict, snapshot: dict = None
+    ) -> List[str]:
         """Render enhanced header with inline project information."""
         # Get Setup-Agent version
         version = self._get_setup_agent_version()
         version_text = f" v{version}" if version != "unknown" else ""
 
         lines = [f"# 🎯 Project Setup Report{version_text}", ""]
-        
+
         # Extract project name from directory
         project_name = "Project"
-        if project_info and project_info.get('directory'):
-            project_dir = project_info['directory']
-            if '/' in project_dir:
-                project_name = project_dir.split('/')[-1].title()
-        
+        if project_info and project_info.get("directory"):
+            project_dir = project_info["directory"]
+            if "/" in project_dir:
+                project_name = project_dir.split("/")[-1].title()
+
         # Create inline project info
-        project_type = project_info.get('type', 'Unknown') if project_info else 'Unknown'
-        build_system = project_info.get('build_system', 'Unknown') if project_info else 'Unknown'
-        
+        project_type = project_info.get("type", "Unknown") if project_info else "Unknown"
+        build_system = project_info.get("build_system", "Unknown") if project_info else "Unknown"
+
         # Extract Java version if available
         java_version = ""
         if snapshot:
-            for task in self.context_manager.load_trunk_context().todo_list if self.context_manager else []:
+            for task in (
+                self.context_manager.load_trunk_context().todo_list if self.context_manager else []
+            ):
                 if "java" in task.description.lower() and task.key_results:
                     if "java_version" in task.key_results:
                         import re
-                        match = re.search(r'java_version[\'"]?:\s*[\'"]?(\d+(?:\.\d+)?)', task.key_results)
+
+                        match = re.search(
+                            r'java_version[\'"]?:\s*[\'"]?(\d+(?:\.\d+)?)', task.key_results
+                        )
                         if match:
                             java_version = f" | Java {match.group(1)}"
                         break
-        
+
         lines.append(f"**{project_name}** | {project_type} | {build_system}{java_version}")
         lines.append(f"**Generated:** {timestamp}")
-        
+
         # Determine result message based on status and test metrics
         result_msg = f"**Result:** "
         if status.upper() == "SUCCESS":
             if snapshot:
-                pass_rate = snapshot.get('status', {}).get('pass_pct', 0)
-                result_msg += f"✅ SUCCESS (Build Passed, {format_percentage(pass_rate)} Tests Pass)"
+                pass_rate = snapshot.get("status", {}).get("pass_pct", 0)
+                result_msg += (
+                    f"✅ SUCCESS (Build Passed, {format_percentage(pass_rate)} Tests Pass)"
+                )
             else:
                 result_msg += "✅ SUCCESS"
         else:
             result_msg += "❌ FAILED"
             if snapshot:
-                phases = snapshot.get('phases', {})
-                if not phases.get('build'):
+                phases = snapshot.get("phases", {})
+                if not phases.get("build"):
                     result_msg += " (Build Failed)"
-                elif not phases.get('test'):
+                elif not phases.get("test"):
                     result_msg += " (Tests Failed)"
-        
+
         lines.extend([result_msg, ""])
         return lines
-    
+
     def _render_summary_dashboard(self, snapshot: Dict[str, Any]) -> List[str]:
         """Render summary dashboard with key metrics in a visual box."""
         lines = ["## 📊 Summary Dashboard", ""]
-        
-        status = snapshot.get('status', {})
-        phases = snapshot.get('phases', {})
-        evidence = snapshot.get('physical_evidence', {})
-        
+
+        status = snapshot.get("status", {})
+        phases = snapshot.get("phases", {})
+        evidence = snapshot.get("physical_evidence", {})
+
         # Prepare values
-        clone_status = "✅ Cloned successfully" if phases.get('clone') else "❌ Clone failed"
-        
-        build_status = "✅" if phases.get('build') else "❌"
-        class_files = evidence.get('class_files', 0)
-        jar_files = evidence.get('jar_files', 0)
+        clone_status = "✅ Cloned successfully" if phases.get("clone") else "❌ Clone failed"
+
+        build_status = "✅" if phases.get("build") else "❌"
+        class_files = evidence.get("class_files", 0)
+        jar_files = evidence.get("jar_files", 0)
         if class_files or jar_files:
             build_msg = f"{build_status} {class_files:,} classes, {jar_files} JARs"
         else:
             build_msg = f"{build_status} No artifacts"
-        
+
         # Test metrics - now with accurate counting
-        static_count = status.get('static_test_count', 0)
-        method_count = status.get('method_count', 0)
-        executed = status.get('tests_total', 0)
-        raw_executed = status.get('tests_total_raw', 0)
-        passed = status.get('tests_passed', 0)
-        exec_rate = status.get('execution_rate')
-        expansion_factor = status.get('expansion_factor')
-        pass_rate = status.get('pass_pct')
+        static_count = status.get("static_test_count", 0)
+        method_count = status.get("method_count", 0)
+        executed = status.get("tests_total", 0)
+        raw_executed = status.get("tests_total_raw", 0)
+        passed = status.get("tests_passed", 0)
+        exec_rate = status.get("execution_rate")
+        expansion_factor = status.get("expansion_factor")
+        pass_rate = status.get("pass_pct")
 
         # Module coverage
-        modules_expected = status.get('modules_expected')
-        modules_seen = status.get('modules_seen', 0)
+        modules_expected = status.get("modules_expected")
+        modules_seen = status.get("modules_seen", 0)
 
         lines.append("### Build & Test Overview")
         lines.append("```")
@@ -3476,57 +3926,68 @@ class ReportTool(BaseTool, UIEventEmitter):
                 exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
                 exec_msg = f"{exec_icon} {format_percentage(exec_rate)} ({executed}/{static_count})"
             lines.append(f"│ Execution Rate  │ {exec_msg:<32} │")
-        
+
         if pass_rate is not None:
             pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
             pass_msg = f"{pass_icon} {format_percentage(pass_rate)} ({passed}/{executed} passed)"
             lines.append(f"│ Pass Rate       │ {pass_msg:<32} │")
-        
+
         if modules_expected:
             mod_pct = (modules_seen / modules_expected * 100) if modules_expected else 0
             mod_icon = "✅" if mod_pct >= 90 else "⚠️" if mod_pct >= 50 else "❌"
             mod_msg = f"{mod_icon} {mod_pct:.1f}% ({modules_seen}/{modules_expected} modules)"
             lines.append(f"│ Module Coverage │ {mod_msg:<32} │")
-        
+
         lines.append("└─────────────────┴──────────────────────────────────┘")
         lines.append("```")
         lines.append("")
-        
+
         return lines
-    
+
     def _render_detailed_test_analysis(self, snapshot: Dict[str, Any]) -> List[str]:
         """Render detailed test analysis with all metrics clearly displayed."""
-        status = snapshot.get('status', {})
-        
+        status = snapshot.get("status", {})
+
         # Skip if no tests were run
-        if not status.get('tests_total'):
+        if not status.get("tests_total"):
             return []
-        
+
         lines = ["## 🧪 Detailed Test Analysis", ""]
-        
+
         # Test Metrics Summary
-        lines.extend(["### Test Metrics Summary", "",
-                     "| Metric | Value | Calculation | Status |",
-                     "|--------|-------|-------------|--------|"])
-        
-        static_count = status.get('static_test_count', 0)
-        method_count = status.get('method_count', 0)
-        executed = status.get('tests_total', 0)
-        raw_executed = status.get('tests_total_raw', 0)
-        passed = status.get('tests_passed', 0)
-        exec_rate = status.get('execution_rate')
-        pass_rate = status.get('pass_pct')
-        expansion_factor = status.get('expansion_factor')
+        lines.extend(
+            [
+                "### Test Metrics Summary",
+                "",
+                "| Metric | Value | Calculation | Status |",
+                "|--------|-------|-------------|--------|",
+            ]
+        )
+
+        static_count = status.get("static_test_count", 0)
+        method_count = status.get("method_count", 0)
+        executed = status.get("tests_total", 0)
+        raw_executed = status.get("tests_total_raw", 0)
+        passed = status.get("tests_passed", 0)
+        exec_rate = status.get("execution_rate")
+        pass_rate = status.get("pass_pct")
+        expansion_factor = status.get("expansion_factor")
 
         # Static test methods discovered during analysis
         if static_count:
-            lines.append(f"| **Total Test Methods** | {static_count} | @Test-style annotations discovered | 📊 |")
+            lines.append(
+                f"| **Total Test Methods** | {static_count} | @Test-style annotations discovered | 📊 |"
+            )
 
         # Highlight raw executions when we detected parameterization at runtime
         if raw_executed and raw_executed > executed and expansion_factor and expansion_factor > 1:
-            lines.append(f"| **Raw Test Executions** | {raw_executed} | Reported by test runner (~{expansion_factor:.1f}x) | 🔄 |")
+            lines.append(
+                f"| **Raw Test Executions** | {raw_executed} | Reported by test runner (~{expansion_factor:.1f}x) | 🔄 |"
+            )
 
-        lines.append(f"| **Tests Executed** | {executed} | Deduplicated runtime count | {'✅' if exec_rate and exec_rate >= 95 else '⚠️' if exec_rate and exec_rate >= 80 else '❌' if exec_rate else '📊'} |")
+        lines.append(
+            f"| **Tests Executed** | {executed} | Deduplicated runtime count | {'✅' if exec_rate and exec_rate >= 95 else '⚠️' if exec_rate and exec_rate >= 80 else '❌' if exec_rate else '📊'} |"
+        )
         lines.append(f"| **Tests Passed** | {passed} | Successful test count | ✅ |")
 
         # Execution rate now measures coverage of declared test methods
@@ -3534,107 +3995,132 @@ class ReportTool(BaseTool, UIEventEmitter):
             # Handle case where executed tests exceed static count (e.g., dynamically generated tests)
             if executed > static_count:
                 exec_icon = "✅"  # More tests run than expected is generally good
-                lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} tests run (exceeded {static_count} expected) | {exec_icon} |")
-                lines.append(f"| | *Note:* | *Runtime discovered more tests than static analysis* | 📊 |")
+                lines.append(
+                    f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} tests run (exceeded {static_count} expected) | {exec_icon} |"
+                )
+                lines.append(
+                    f"| | *Note:* | *Runtime discovered more tests than static analysis* | 📊 |"
+                )
             else:
                 exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
                 actual_tests_run = int(exec_rate * static_count / 100)
-                lines.append(f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} of {static_count} tests run | {exec_icon} |")
+                lines.append(
+                    f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} of {static_count} tests run | {exec_icon} |"
+                )
                 if exec_rate < 100:
                     skipped_est = static_count - actual_tests_run
                     if skipped_est > 0:
                         lines.append(f"| | *~{skipped_est} tests* | *possibly not executed* | ⚠️ |")
-        
+
         if pass_rate is not None:
             pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
-            lines.append(f"| **Pass Rate** | {format_percentage(pass_rate)} | {passed} ÷ {executed} | {pass_icon} |")
-        
+            lines.append(
+                f"| **Pass Rate** | {format_percentage(pass_rate)} | {passed} ÷ {executed} | {pass_icon} |"
+            )
+
         lines.append("")
-        
+
         # Test Execution Breakdown
-        lines.extend(["### Test Execution Breakdown", "",
-                     "| Total Available | Executed | Passed | Failed | Errors | Skipped |",
-                     "|-----------------|----------|--------|--------|---------|---------|"])
-        
-        failed = status.get('tests_failed', 0)
-        errors = status.get('tests_errors', 0)
-        skipped = status.get('tests_skipped', 0)
-        
-        lines.append(f"| {static_count if static_count else 'N/A'} | {executed} | {passed} | {failed} | {errors} | {skipped} |")
+        lines.extend(
+            [
+                "### Test Execution Breakdown",
+                "",
+                "| Total Available | Executed | Passed | Failed | Errors | Skipped |",
+                "|-----------------|----------|--------|--------|---------|---------|",
+            ]
+        )
+
+        failed = status.get("tests_failed", 0)
+        errors = status.get("tests_errors", 0)
+        skipped = status.get("tests_skipped", 0)
+
+        lines.append(
+            f"| {static_count if static_count else 'N/A'} | {executed} | {passed} | {failed} | {errors} | {skipped} |"
+        )
         lines.append("")
-        
+
         # Module Coverage Analysis
-        modules_expected = status.get('modules_expected')
-        modules_seen = status.get('modules_seen', 0)
-        skipped_modules = status.get('skipped_modules', [])
-        
+        modules_expected = status.get("modules_expected")
+        modules_seen = status.get("modules_seen", 0)
+        skipped_modules = status.get("skipped_modules", [])
+
         if modules_expected or skipped_modules:
             lines.extend(["### Module Coverage Analysis", ""])
-            
+
             if modules_expected:
                 lines.append(f"- **Total Modules:** {modules_expected}")
                 mod_pct = (modules_seen / modules_expected * 100) if modules_expected else 0
                 lines.append(f"- **Executed Modules:** {modules_seen} ({mod_pct:.1f}%)")
-            
+
             if skipped_modules:
                 unexecuted_tests = 0
                 if static_count and executed:
                     unexecuted_tests = static_count - executed
-                
+
                 lines.append(f"- **Skipped Modules:** {len(skipped_modules)}")
                 if unexecuted_tests:
                     lines.append(f"  (containing ~{unexecuted_tests} unexecuted tests)")
-                
+
                 # List first few skipped modules
                 for module in skipped_modules[:3]:
                     lines.append(f"  - {module}")
                 if len(skipped_modules) > 3:
                     lines.append(f"  - [+{len(skipped_modules) - 3} more...]")
-            
+
             lines.append("")
-        
+
         return lines
-    
+
     def _render_issues_recommendations(self, snapshot: Dict[str, Any]) -> List[str]:
         """Render issues and recommendations section."""
         lines = ["## 🚨 Issues & Recommendations", ""]
-        
-        status = snapshot.get('status', {})
-        attention_raw = snapshot.get('attention', {}).get('raw', [])
-        
+
+        status = snapshot.get("status", {})
+        attention_raw = snapshot.get("attention", {}).get("raw", [])
+
         # Group by severity
-        blockers = [item for item in attention_raw if item['severity'] == 'BLOCKER']
-        warnings = [item for item in attention_raw if item['severity'] == 'WARNING']
-        info_items = [item for item in attention_raw if item['severity'] == 'INFO']
-        
+        blockers = [item for item in attention_raw if item["severity"] == "BLOCKER"]
+        warnings = [item for item in attention_raw if item["severity"] == "WARNING"]
+        info_items = [item for item in attention_raw if item["severity"] == "INFO"]
+
         # Key Observations
         lines.extend(["### Key Observations"])
-        
-        pass_rate = status.get('pass_pct')
-        exec_rate = status.get('execution_rate')
-        expansion_factor = status.get('expansion_factor')
-        
+
+        pass_rate = status.get("pass_pct")
+        exec_rate = status.get("execution_rate")
+        expansion_factor = status.get("expansion_factor")
+
         if pass_rate and pass_rate >= 95:
-            lines.append(f"- ✅ **High Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
+            lines.append(
+                f"- ✅ **High Pass Rate:** {format_percentage(pass_rate)} of executed tests passed"
+            )
         elif pass_rate:
-            lines.append(f"- ⚠️ **Pass Rate:** {format_percentage(pass_rate)} of executed tests passed")
-        
+            lines.append(
+                f"- ⚠️ **Pass Rate:** {format_percentage(pass_rate)} of executed tests passed"
+            )
+
         if exec_rate:
             if exec_rate < 90:
-                lines.append(f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run")
+                lines.append(
+                    f"- ⚠️ **Low Execution Rate:** Only {format_percentage(exec_rate)} of available tests were run"
+                )
 
         if expansion_factor and expansion_factor > 1:
-            lines.append(f"- ℹ️ **Parameterized Tests Detected:** Runtime produced ~{expansion_factor:.1f}× more executions than unique tests")
-        
-        modules_expected = status.get('modules_expected')
-        modules_seen = status.get('modules_seen', 0)
+            lines.append(
+                f"- ℹ️ **Parameterized Tests Detected:** Runtime produced ~{expansion_factor:.1f}× more executions than unique tests"
+            )
+
+        modules_expected = status.get("modules_expected")
+        modules_seen = status.get("modules_seen", 0)
         if modules_expected:
-            coverage = (modules_seen / modules_expected * 100)
+            coverage = modules_seen / modules_expected * 100
             if coverage < 80:
-                lines.append(f"- ⚠️ **Incomplete Coverage:** {coverage:.0f}% of modules were tested")
-        
+                lines.append(
+                    f"- ⚠️ **Incomplete Coverage:** {coverage:.0f}% of modules were tested"
+                )
+
         lines.append("")
-        
+
         # Issues by severity
         if blockers:
             lines.extend([f"### Blockers ({len(blockers)})", ""])
@@ -3643,7 +4129,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             lines.append("")
         else:
             lines.extend(["### Blockers (0)", "✅ No blocking issues", ""])
-        
+
         if warnings:
             lines.extend([f"### Warnings ({len(warnings)})", ""])
             for item in warnings[:5]:
@@ -3651,113 +4137,134 @@ class ReportTool(BaseTool, UIEventEmitter):
             if len(warnings) > 5:
                 lines.append(f"- ... (+{len(warnings) - 5} more)")
             lines.append("")
-        
+
         # Actionable Recommendations
         lines.extend(["### Actionable Recommendations"])
-        
+
         if exec_rate and exec_rate < 90:
-            skipped_modules = status.get('skipped_modules', [])[:3]
+            skipped_modules = status.get("skipped_modules", [])[:3]
             if skipped_modules:
-                modules_str = ','.join(skipped_modules)
+                modules_str = ",".join(skipped_modules)
                 lines.append(f"1. **Increase Test Execution Rate**:")
                 lines.append(f"   ```bash")
                 lines.append(f"   mvn test -pl {modules_str}")
                 lines.append(f"   ```")
-        
+
         lines.append("2. **Run All Tests**:")
         lines.append("   ```bash")
         lines.append("   mvn clean test -DskipTests=false")
         lines.append("   ```")
-        
+
         if warnings or blockers:
             lines.append("3. **Check Skipped Reasons**:")
             lines.append("   ```bash")
-            lines.append("   mvn test -X | grep -i \"skip\\|exclude\"")
+            lines.append('   mvn test -X | grep -i "skip\\|exclude"')
             lines.append("   ```")
-        
+
         lines.append("")
-        
+
         return lines
-    
+
     def _render_task_progress(self, actual_accomplishments: dict = None) -> List[str]:
         """Render task progress in improved table format."""
         lines = ["## 📋 Task Progress", ""]
-        
+
         if not self.context_manager:
             return lines
-        
+
         try:
             trunk_context = self.context_manager.load_trunk_context()
             if not trunk_context or not trunk_context.todo_list:
                 return lines
-            
-            lines.extend(["| # | Task | Status | Key Result |",
-                         "|---|------|--------|------------|"])
-            
+
+            lines.extend(
+                ["| # | Task | Status | Key Result |", "|---|------|--------|------------|"]
+            )
+
             for i, task in enumerate(trunk_context.todo_list, 1):
-                status_icon = "✅" if task.status.value == "completed" else "🔄" if task.status.value == "in_progress" else "⏳"
-                
+                status_icon = (
+                    "✅"
+                    if task.status.value == "completed"
+                    else "🔄" if task.status.value == "in_progress" else "⏳"
+                )
+
                 # Extract key result
                 key_result = ""
                 if task.key_results:
                     # Highlight test metrics
                     if "static_test_count" in task.key_results:
                         import re
-                        match = re.search(r'static_test_count=(\d+)', task.key_results)
+
+                        match = re.search(r"static_test_count=(\d+)", task.key_results)
                         if match:
                             key_result = f"**{match.group(1)} total @Test** found"
-                    elif "test" in task.description.lower() and "executed" in task.key_results.lower():
+                    elif (
+                        "test" in task.description.lower()
+                        and "executed" in task.key_results.lower()
+                    ):
                         # Extract execution metrics
                         import re
+
                         total_match = re.search(r'total_tests[\'"]?:\s*(\d+)', task.key_results)
                         if total_match:
                             total = total_match.group(1)
                             key_result = f"**{total} executed**"
                             # Try to add rate if static count available
-                            if trunk_context.environment_summary.get('static_test_count'):
-                                static = trunk_context.environment_summary['static_test_count']
-                                rate = (int(total) / static * 100)
+                            if trunk_context.environment_summary.get("static_test_count"):
+                                static = trunk_context.environment_summary["static_test_count"]
+                                rate = int(total) / static * 100
                                 key_result = f"**{total}/{static} executed ({rate:.1f}%)**"
                     elif task.key_results:
                         # Truncate long results
-                        key_result = task.key_results[:50] + "..." if len(task.key_results) > 50 else task.key_results
-                
+                        key_result = (
+                            task.key_results[:50] + "..."
+                            if len(task.key_results) > 50
+                            else task.key_results
+                        )
+
                 # Use full task description or reasonable truncation
-                task_desc = task.description[:100] + "..." if len(task.description) > 100 else task.description
-                
+                task_desc = (
+                    task.description[:100] + "..."
+                    if len(task.description) > 100
+                    else task.description
+                )
+
                 lines.append(f"| {i} | {task_desc} | {status_icon} | {key_result} |")
-            
+
             lines.append("")
-            
+
         except Exception as e:
             logger.warning(f"Could not generate task progress: {e}")
-        
+
         return lines
-    
-    def _render_execution_details_simplified(self, snapshot: dict = None, 
-                                            execution_metrics: dict = None) -> List[str]:
+
+    def _render_execution_details_simplified(
+        self, snapshot: dict = None, execution_metrics: dict = None
+    ) -> List[str]:
         """Render simplified execution details."""
         lines = ["## 🛠 Execution Details", ""]
-        
+
         # Get command info from snapshot
         if snapshot:
-            last_cmd = snapshot.get('last_command', {})
+            last_cmd = snapshot.get("last_command", {})
             if last_cmd:
-                tool = last_cmd.get('tool', 'maven')
-                command = last_cmd.get('command', 'N/A')
-                workdir = last_cmd.get('workdir', '/workspace')
-                
-                lines.append(f"**Build Command:** `{command if 'install' in command or 'compile' in command else 'mvn clean install -DskipTests'}`")
+                tool = last_cmd.get("tool", "maven")
+                command = last_cmd.get("command", "N/A")
+                workdir = last_cmd.get("workdir", "/workspace")
+
+                lines.append(
+                    f"**Build Command:** `{command if 'install' in command or 'compile' in command else 'mvn clean install -DskipTests'}`"
+                )
                 lines.append(f"**Test Command:** `{command if 'test' in command else 'mvn test'}`")
-        
+
         # Add runtime metrics
         if execution_metrics:
-            runtime = execution_metrics.get('total_runtime', 0)
-            iterations = execution_metrics.get('total_iterations', 0)
-            total_thoughts = execution_metrics.get('total_thoughts', 0)
-            total_actions = execution_metrics.get('total_actions', 0)
-            successful_actions = execution_metrics.get('successful_actions', 0)
-            success_rate = execution_metrics.get('success_rate', 0)
+            runtime = execution_metrics.get("total_runtime", 0)
+            iterations = execution_metrics.get("total_iterations", 0)
+            total_thoughts = execution_metrics.get("total_thoughts", 0)
+            total_actions = execution_metrics.get("total_actions", 0)
+            successful_actions = execution_metrics.get("successful_actions", 0)
+            success_rate = execution_metrics.get("success_rate", 0)
 
             # Main metrics line with thoughts and actions
             if successful_actions is not None and total_actions:
@@ -3776,11 +4283,13 @@ class ReportTool(BaseTool, UIEventEmitter):
 
             # Add test metrics if available from snapshot
             if snapshot:
-                status = snapshot.get('status', {})
-                static_test_count = status.get('static_test_count')
-                tests_total = status.get('tests_total')
+                status = snapshot.get("status", {})
+                static_test_count = status.get("static_test_count")
+                tests_total = status.get("tests_total")
                 if static_test_count:
-                    test_coverage_line = f"**Test Coverage:** {tests_total or 0}/{static_test_count} tests executed"
+                    test_coverage_line = (
+                        f"**Test Coverage:** {tests_total or 0}/{static_test_count} tests executed"
+                    )
                     if tests_total and static_test_count:
                         execution_rate = (tests_total / static_test_count) * 100
                         test_coverage_line += f" ({execution_rate:.1f}% execution rate)"
@@ -3788,17 +4297,17 @@ class ReportTool(BaseTool, UIEventEmitter):
                     lines.append("")
 
             # Tool usage summary
-            tools_used = execution_metrics.get('tools_used', {})
+            tools_used = execution_metrics.get("tools_used", {})
             if tools_used:
                 tools_summary = []
                 for tool, count in sorted(tools_used.items(), key=lambda x: x[1], reverse=True):
-                    tool_name = tool.replace('_', ' ').title()
+                    tool_name = tool.replace("_", " ").title()
                     tools_summary.append(f"{tool_name} ({count})")
 
                 lines.append("### Tool Usage")
                 lines.append(", ".join(tools_summary))
                 lines.append("")
-        
+
         return lines
 
     def _get_parameters_schema(self) -> Dict[str, Any]:

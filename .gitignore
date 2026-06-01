@@ -165,6 +165,7 @@ uv.lock
 # Claude Code
 Claude.md
 .claude
+.superpowers/
 FUNCTION_CALLING_SUPPORT.md
 student_tasks/
 docs/bash_tool_enhancements.md

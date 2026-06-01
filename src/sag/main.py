@@ -16,7 +16,14 @@ from rich.table import Table
 from rich.text import Text
 
 from sag.agent.agent import SetupAgent
-from sag.config import Config, LogLevel, get_config, get_session_logger, set_config, suppress_console_logging
+from sag.config import (
+    Config,
+    LogLevel,
+    get_config,
+    get_session_logger,
+    set_config,
+    suppress_console_logging,
+)
 from sag.docker_orch.orch import DockerOrchestrator
 
 console = Console()
@@ -280,7 +287,9 @@ def cli(ctx, log_level, log_file, verbose, ui):
 
     # Check for mutually exclusive flags
     if verbose and ui:
-        console.print("[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]")
+        console.print(
+            "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
+        )
         console.print("[dim]Please choose one:[/dim]")
         console.print("  --verbose : Detailed console logs for debugging")
         console.print("  --ui      : Clean interactive UI with live updates")
@@ -400,7 +409,9 @@ def project(ctx, repo_url, name, goal, record, ui):
     if ui:
         # Check for mutual exclusion with verbose
         if config.verbose:
-            console.print("[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]")
+            console.print(
+                "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
+            )
             console.print("[dim]Please choose one:[/dim]")
             console.print("  --verbose : Detailed console logs for debugging")
             console.print("  --ui      : Clean interactive UI with live updates")
@@ -441,7 +452,9 @@ def project(ctx, repo_url, name, goal, record, ui):
         orchestrator = DockerOrchestrator(project_name=docker_label)
         if orchestrator.container_exists():
             # Always show critical errors/warnings, even in UI mode
-            console.print(f"[bold yellow]⚠️ Container '{docker_name}' already exists![/bold yellow]")
+            console.print(
+                f"[bold yellow]⚠️ Container '{docker_name}' already exists![/bold yellow]"
+            )
             console.print(
                 f"[dim]Use 'sag run {docker_name} --task \"description\"' to continue working on it.[/dim]"
             )
@@ -462,7 +475,9 @@ def project(ctx, repo_url, name, goal, record, ui):
         # Only show completion messages in non-UI mode (UI manager handles this)
         if not config.ui_mode:
             if success:
-                console.print(f"[bold green]✅ Project '{project_name}' setup completed![/bold green]")
+                console.print(
+                    f"[bold green]✅ Project '{project_name}' setup completed![/bold green]"
+                )
                 console.print(f"\n[dim]Next steps:[/dim]")
                 console.print(f'  uv run sag run {docker_name} --task "run the application"')
                 console.print(f'  uv run sag run {docker_name} --task "add tests"')
@@ -497,7 +512,9 @@ def run(ctx, docker_name, task, max_iterations, record, ui):
     if ui:
         # Check for mutual exclusion with verbose
         if config.verbose:
-            console.print("[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]")
+            console.print(
+                "[bold red]❌ Error: --verbose and --ui flags cannot be used together[/bold red]"
+            )
             console.print("[dim]Please choose one:[/dim]")
             console.print("  --verbose : Detailed console logs for debugging")
             console.print("  --ui      : Clean interactive UI with live updates")

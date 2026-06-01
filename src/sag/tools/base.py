@@ -95,12 +95,12 @@ class BaseTool(ABC):
         self.name = name
         self.description = description
         self._parameter_schema: Dict[str, Any] = {}
-        
+
         # Output truncation settings - increased for build tools
         self.max_output_length = 10000  # Maximum total output length (increased from 3000)
-        self.head_length = 4000       # Length of beginning portion (increased from 1200)
-        self.tail_length = 3000        # Length of ending portion (increased from 800)
-        
+        self.head_length = 4000  # Length of beginning portion (increased from 1200)
+        self.tail_length = 3000  # Length of ending portion (increased from 800)
+
         self._generate_parameter_schema()
 
     def _generate_parameter_schema(self):
@@ -111,11 +111,11 @@ class BaseTool(ABC):
         for param_name, param in sig.parameters.items():
             if param_name == "self":
                 continue
-            
+
             # Skip **kwargs parameters as they are handled specially
             if param.kind == inspect.Parameter.VAR_KEYWORD:
                 continue
-            
+
             # Skip *args parameters as they are not supported in JSON schema
             if param.kind == inspect.Parameter.VAR_POSITIONAL:
                 continue
@@ -149,48 +149,50 @@ class BaseTool(ABC):
     def _truncate_output(self, output: str, tool_name: str = None) -> str:
         """
         Intelligently truncate long output to preserve context window.
-        
+
         Args:
             output: The raw output to truncate
             tool_name: Name of the tool (used for custom extraction)
-            
+
         Returns:
             Truncated output with head, tail, and guidance
         """
         if not output or len(output) <= self.max_output_length:
             return output
-        
+
         # Try tool-specific extraction first
         extracted = self._extract_key_info(output, tool_name or self.name)
         if extracted and extracted != output:
-            logger.info(f"Applied {tool_name or self.name}-specific extraction, reduced from {len(output)} to {len(extracted)} chars")
+            logger.info(
+                f"Applied {tool_name or self.name}-specific extraction, reduced from {len(output)} to {len(extracted)} chars"
+            )
             # If extraction is still too long, apply general truncation
             if len(extracted) <= self.max_output_length:
                 return extracted
             output = extracted
-        
+
         # General truncation: head + tail with guidance
-        head = output[:self.head_length]
-        tail = output[-self.tail_length:]
-        
+        head = output[: self.head_length]
+        tail = output[-self.tail_length :]
+
         truncation_info = (
             f"\n\n... [OUTPUT TRUNCATED: {len(output)} chars total, showing first {self.head_length} "
             f"and last {self.tail_length} chars] ...\n"
             f"💡 TIP: If you need specific information from the full output, use 'bash' tool with 'grep' "
             f"to search for keywords, or 'file_io' to save and search through the complete output.\n\n"
         )
-        
+
         return head + truncation_info + tail
 
     def _extract_key_info(self, output: str, tool_name: str) -> str:
         """
         Extract key information from tool output.
         Override in subclasses for tool-specific extraction.
-        
+
         Args:
             output: Raw tool output
             tool_name: Name of the tool
-            
+
         Returns:
             Extracted key information or original output
         """
@@ -199,28 +201,28 @@ class BaseTool(ABC):
 
     def _extract_maven_key_info(self, output: str) -> str:
         """Extract key information from Maven output."""
-        lines = output.split('\n')
+        lines = output.split("\n")
         key_lines = []
-        
+
         # Capture key indicators
         build_status = ""
         test_summary = ""
         compilation_info = ""
         error_summary = []
-        
+
         for line in lines:
             line_lower = line.lower()
-            
+
             # Build status
             if "build success" in line_lower:
                 build_status = "✅ BUILD SUCCESS"
             elif "build failure" in line_lower:
                 build_status = "❌ BUILD FAILURE"
-            
+
             # Test results
             elif "tests run:" in line_lower:
                 test_summary = f"📊 {line.strip()}"
-            
+
             # Compilation info
             elif "compilation failure" in line_lower:
                 compilation_info = "⚠️ Compilation failures detected"
@@ -228,43 +230,54 @@ class BaseTool(ABC):
                 compilation_info = "✅ All classes up to date"
             elif "building jar:" in line_lower:
                 compilation_info = "📦 JAR artifact created"
-            
+
             # Error patterns - collect specific errors (increased limit)
-            elif any(error_pattern in line_lower for error_pattern in [
-                "error:", "[error]", "exception:", "failed to", "cannot find", "package does not exist",
-                "compilation failure", "cannot resolve", "symbol not found", "method does not exist"
-            ]):
+            elif any(
+                error_pattern in line_lower
+                for error_pattern in [
+                    "error:",
+                    "[error]",
+                    "exception:",
+                    "failed to",
+                    "cannot find",
+                    "package does not exist",
+                    "compilation failure",
+                    "cannot resolve",
+                    "symbol not found",
+                    "method does not exist",
+                ]
+            ):
                 if len(error_summary) < 15:  # Increased limit to capture more errors
                     error_summary.append(f"🚨 {line.strip()}")
-        
+
         # Build the summary
         summary_parts = []
-        
+
         if build_status:
             summary_parts.append(build_status)
-        
+
         if test_summary:
             summary_parts.append(test_summary)
-        
+
         if compilation_info:
             summary_parts.append(compilation_info)
-        
+
         if error_summary:
             summary_parts.append("Key Errors:")
             summary_parts.extend(error_summary[:10])  # Show more errors for better debugging
             if len(error_summary) > 10:
                 summary_parts.append(f"... and {len(error_summary) - 10} more errors")
-        
+
         # If we found key info, return it; otherwise return truncated original
         if summary_parts:
             key_info = "\n".join(summary_parts)
-            
+
             # Add a sample of the raw output for context
             if len(output) > 1000:
                 # Add first and last few lines for context
-                first_lines = '\n'.join(lines[:10])
-                last_lines = '\n'.join(lines[-10:])
-                
+                first_lines = "\n".join(lines[:10])
+                last_lines = "\n".join(lines[-10:])
+
                 full_summary = (
                     f"Maven Build Summary:\n{key_info}\n\n"
                     f"Build Output (first 10 lines):\n{first_lines}\n\n"
@@ -275,58 +288,68 @@ class BaseTool(ABC):
                 return full_summary
             else:
                 return f"Maven Build Summary:\n{key_info}\n\nFull Output:\n{output}"
-        
+
         return output
 
     def _extract_bash_key_info(self, output: str) -> str:
         """Extract key information from bash command output."""
         if not output or len(output) <= self.max_output_length:
             return output
-        
-        lines = output.split('\n')
-        
+
+        lines = output.split("\n")
+
         # For error cases, prioritize error messages
         error_lines = []
         warning_lines = []
         info_lines = []
-        
+
         for line in lines:
             line_lower = line.lower()
-            if any(error_word in line_lower for error_word in [
-                'error:', 'failed:', 'cannot', 'no such', 'permission denied', 'not found'
-            ]):
+            if any(
+                error_word in line_lower
+                for error_word in [
+                    "error:",
+                    "failed:",
+                    "cannot",
+                    "no such",
+                    "permission denied",
+                    "not found",
+                ]
+            ):
                 error_lines.append(line)
-            elif any(warning_word in line_lower for warning_word in ['warning:', 'warn:']):
+            elif any(warning_word in line_lower for warning_word in ["warning:", "warn:"]):
                 warning_lines.append(line)
             elif line.strip():  # Non-empty lines
                 info_lines.append(line)
-        
+
         # Build summary
         summary_parts = []
-        
+
         # Add first few lines for context
         summary_parts.append("Command output (first 15 lines):")
         summary_parts.extend(lines[:15])
-        
+
         if error_lines:
             summary_parts.append(f"\n🚨 Errors found ({len(error_lines)} total):")
             summary_parts.extend(error_lines[:5])  # Show first 5 errors
             if len(error_lines) > 5:
                 summary_parts.append(f"... and {len(error_lines) - 5} more errors")
-        
+
         if warning_lines:
             summary_parts.append(f"\n⚠️ Warnings found ({len(warning_lines)} total):")
             summary_parts.extend(warning_lines[:3])  # Show first 3 warnings
-        
+
         # Add last few lines
         if len(lines) > 20:
             summary_parts.append(f"\n... [middle content truncated, {len(lines)} total lines] ...")
             summary_parts.append("\nCommand output (last 10 lines):")
             summary_parts.extend(lines[-10:])
-        
-        summary_parts.append(f"\n💡 Full output has {len(lines)} lines. Use 'grep' to search for specific patterns.")
-        
-        return '\n'.join(summary_parts)
+
+        summary_parts.append(
+            f"\n💡 Full output has {len(lines)} lines. Use 'grep' to search for specific patterns."
+        )
+
+        return "\n".join(summary_parts)
 
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:
@@ -376,6 +399,7 @@ class BaseTool(ABC):
     def safe_execute(self, **kwargs) -> ToolResult:
         """Execute the tool with enhanced error handling and validation."""
         import time
+
         start_time = time.time()
 
         try:
@@ -412,6 +436,7 @@ class BaseTool(ABC):
             # Log to centralized error logger
             try:
                 from sag.agent.error_logger import ErrorLogger
+
                 error_logger = ErrorLogger.get_instance()
                 error_logger.log_tool_error(
                     tool_name=self.name,
@@ -421,7 +446,7 @@ class BaseTool(ABC):
                     suggestions=e.suggestions,
                     retryable=e.retryable,
                     details=e.details,
-                    context={"parameters": kwargs}
+                    context={"parameters": kwargs},
                 )
             except Exception as log_error:
                 logger.warning(f"Failed to log error to centralized logger: {log_error}")
@@ -455,6 +480,7 @@ class BaseTool(ABC):
             # Log system error to centralized logger
             try:
                 from sag.agent.error_logger import ErrorLogger
+
                 error_logger = ErrorLogger.get_instance()
                 error_logger.log_tool_error(
                     tool_name=self.name,
@@ -464,7 +490,7 @@ class BaseTool(ABC):
                     suggestions=system_error.suggestions,
                     retryable=system_error.retryable,
                     details=system_error.details,
-                    context={"parameters": kwargs, "exception_type": type(e).__name__}
+                    context={"parameters": kwargs, "exception_type": type(e).__name__},
                 )
             except Exception as log_error:
                 logger.warning(f"Failed to log system error to centralized logger: {log_error}")
