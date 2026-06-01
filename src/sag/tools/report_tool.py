@@ -191,7 +191,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     raw_data={
                         "full_report": report,
                         "report_snapshot": report_snapshot,
-                    }  # Store full report in metadata
+                    }  # Store full report outside condensed metadata
                 )
             else:
                 return ToolResult(
