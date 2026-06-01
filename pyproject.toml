@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2.0",
     "pytest>=8.4.2",
     "black>=25.9.0",
     "isort>=6.1.0",
@@ -40,6 +41,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "black>=25.9.0",
+    "build>=1.2.0",
     "isort>=6.1.0",
     "mypy>=1.18.2",
     "pytest>=8.4.2",
