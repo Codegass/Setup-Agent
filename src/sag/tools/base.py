@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union
 
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ToolError(Exception):
@@ -66,10 +66,11 @@ class ToolResult(BaseModel):
     output: str
     error: Optional[str] = None
     error_code: Optional[str] = None
-    suggestions: List[str] = []
-    documentation_links: List[str] = []
+    suggestions: List[str] = Field(default_factory=list)
+    documentation_links: List[str] = Field(default_factory=list)
     raw_output: Optional[str] = None
-    metadata: Dict[str, Any] = {}
+    raw_data: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
     def __str__(self) -> str:
         if self.success:

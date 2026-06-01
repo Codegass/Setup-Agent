@@ -21,6 +21,7 @@ class StepType(str, Enum):
 class AgentStatus(str, Enum):
     """Agent operational status."""
     PROCEEDING = "proceeding"  # Normal operation
+    STUCK = "stuck"  # Needs guidance to proceed
     STUCK_REPETITION = "stuck_repetition"  # Repeating failed actions
     IDLE_THINKING = "idle_thinking"  # Thinking without action
     TASK_COMPLETE_SIGNAL = "task_complete_signal"  # Technical work seems done
@@ -203,9 +204,9 @@ class AgentStateEvaluator:
 
                     return AgentStateAnalysis(
                         status=AgentStatus.CONFUSED,
-                        needs_guidance=True,
+                        needs_guidance = True,
                         guidance_message=validation['missing_analysis_prompt'],
-                        guidance_priority=priority,
+                        guidance_priority = priority,
                         metadata={'static_test_count': validation.get('static_test_count')}
                     )
 
@@ -244,8 +245,8 @@ class AgentStateEvaluator:
             if manual_analysis_detected:
                 return AgentStateAnalysis(
                     status=AgentStatus.STUCK,
-                    needs_guidance=True,
-                    guidance=(
+                    needs_guidance = True,
+                    guidance_message=(
                         "⚠️ CRITICAL: USE PROJECT_ANALYZER TOOL FOR TASK_2!\n\n"
                         "You are attempting to manually analyze the project structure.\n"
                         "Task_2 REQUIRES using the project_analyzer tool to:\n"
@@ -256,7 +257,7 @@ class AgentStateEvaluator:
                         "IMMEDIATELY use: project_analyzer(action='analyze', project_path='/workspace/<project>')\n\n"
                         "DO NOT manually read pom.xml or analyze files - the tool does this automatically!"
                     ),
-                    priority=10  # Highest priority
+                    guidance_priority = 10  # Highest priority
                 )
         
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
@@ -287,8 +288,8 @@ class AgentStateEvaluator:
                     next_task = pending_tasks[0]
                     return AgentStateAnalysis(
                         status=AgentStatus.STUCK,
-                        needs_guidance=True,
-                        guidance=(
+                        needs_guidance = True,
+                        guidance_message=(
                             f"✅ TASK COMPLETED - NOW CHECK FOR NEXT TASK!\n\n"
                             f"You just completed a task. Follow the workflow:\n"
                             f"1. IMMEDIATELY: manage_context(action='get_info')\n"
@@ -296,7 +297,7 @@ class AgentStateEvaluator:
                             f"Next pending task: {next_task['description']}\n\n"
                             f"DON'T skip ahead - follow the workflow!"
                         ),
-                        priority=9
+                        guidance_priority = 9
                     )
         
         # Look for recent work-related tool usage outside of task context
@@ -319,8 +320,8 @@ class AgentStateEvaluator:
                     next_task = pending_tasks[0]
                     return AgentStateAnalysis(
                         status=AgentStatus.STUCK,
-                        needs_guidance=True,
-                        guidance=(
+                        needs_guidance = True,
+                        guidance_message=(
                             f"🚨 GHOST STATE DETECTED: Working outside task context!\n\n"
                             f"You are executing {', '.join(set(work_actions_found))} without an active task.\n"
                             f"This creates a 'ghost state' where work is done but not tracked.\n\n"
@@ -330,7 +331,7 @@ class AgentStateEvaluator:
                             f"3. Only then continue with your {work_actions_found[-1]} work\n\n"
                             f"Next pending task: {next_task['description']}"
                         ),
-                        priority=10  # Highest priority
+                        guidance_priority = 10  # Highest priority
                     )
         
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
@@ -391,9 +392,9 @@ class AgentStateEvaluator:
                 
                 return AgentStateAnalysis(
                     status=AgentStatus.STUCK_REPETITION,
-                    needs_guidance=True,
+                    needs_guidance = True,
                     guidance_message=guidance,
-                    guidance_priority=10,  # High priority
+                    guidance_priority = 10,  # High priority
                     metadata={"failed_tool": last_tool, "failure_count": consecutive_failures}
                 )
                 
@@ -442,9 +443,9 @@ class AgentStateEvaluator:
             
             return AgentStateAnalysis(
                 status=AgentStatus.TASK_COMPLETE_SIGNAL,
-                needs_guidance=True,
+                needs_guidance = True,
                 guidance_message=guidance,
-                guidance_priority=9,  # Very high priority
+                guidance_priority = 9,  # Very high priority
                 detected_signals=list(set(detected_signals)),
                 metadata={"current_task": current_task}
             )
@@ -476,9 +477,9 @@ class AgentStateEvaluator:
             
             return AgentStateAnalysis(
                 status=AgentStatus.IDLE_THINKING,
-                needs_guidance=True,
+                needs_guidance = True,
                 guidance_message=guidance,
-                guidance_priority=7,
+                guidance_priority = 7,
                 metadata={"consecutive_thoughts": consecutive_thoughts}
             )
             
@@ -500,9 +501,9 @@ class AgentStateEvaluator:
             
             return AgentStateAnalysis(
                 status=AgentStatus.CONTEXT_SWITCH_NEEDED,
-                needs_guidance=True,
+                needs_guidance = True,
                 guidance_message=guidance,
-                guidance_priority=5,
+                guidance_priority = 5,
                 metadata={"steps_in_context": steps_since_switch}
             )
             
@@ -534,9 +535,9 @@ class AgentStateEvaluator:
                 
                 return AgentStateAnalysis(
                     status=AgentStatus.READY_FOR_REPORT,
-                    needs_guidance=True,
+                    needs_guidance = True,
                     guidance_message=guidance,
-                    guidance_priority=8,
+                    guidance_priority = 8,
                     metadata={"maven_success": True}
                 )
                 
@@ -618,4 +619,4 @@ class AgentStateEvaluator:
             
         except Exception as e:
             logger.error(f"Physical validation failed: {e}")
-            return {"available": False, "reason": str(e)} 
+            return {"available": False, "reason": str(e)}
