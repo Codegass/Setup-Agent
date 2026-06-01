@@ -493,6 +493,13 @@ class BaseTool(ABC):
             "usage_example": self.get_usage_example(),
         }
 
+    def get_parameter_schema(self) -> Dict[str, Any]:
+        """Return this tool's JSON parameter schema for function calling."""
+        override = type(self).__dict__.get("_get_parameters_schema")
+        if override is not None:
+            return override(self)
+        return self._parameter_schema
+
     def get_usage_example(self) -> str:
         """Get a usage example for this tool."""
         required_params = self._parameter_schema.get("required", [])

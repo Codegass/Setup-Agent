@@ -188,12 +188,7 @@ class ReActEngine(UIEventEmitter):
         tools_schema = []
 
         for tool in self.tools.values():
-            # Use the enhanced tool's parameter schema if available
-            if hasattr(tool, "get_parameter_schema"):
-                schema = tool.get_parameter_schema()
-            else:
-                # Fallback to basic schema for regular tools
-                schema = {"type": "object", "properties": {}, "required": []}
+            schema = tool.get_parameter_schema()
 
             if self.is_claude_model:
                 # Claude format - direct tool definition
