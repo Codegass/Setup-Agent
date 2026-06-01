@@ -39,11 +39,40 @@ class SetupAgent:
         self.context_manager = None
         self.tools = None
         self.react_engine = None
+        # PhysicalValidator is set during _initialize_tools() once orchestrator
+        # is available; declared here so attribute access is always safe.
+        self.physical_validator = None
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
         self.agent_logger.info(
             "Setup Agent initialized (context manager will be initialized after Docker setup)"
+        )
+
+    def _emit(
+        self,
+        event_type: "EventType",
+        message: str,
+        *,
+        phase: "Optional[PhaseType]" = None,
+        details: Optional[str] = None,
+        level: str = "info",
+    ) -> None:
+        """Emit a UI event when UI mode is active; no-op otherwise.
+
+        Replaces the repeated `if self.config.ui_mode: self.ui_manager.handle_event(UIEvent(...))`
+        pattern so call sites stay focused on event intent, not lifecycle.
+        """
+        if not (self.config.ui_mode and self.ui_manager):
+            return
+        self.ui_manager.handle_event(
+            UIEvent(
+                event_type=event_type,
+                message=message,
+                phase=phase,
+                details=details,
+                level=level,
+            )
         )
 
     def _initialize_context_and_tools(self):
@@ -111,29 +140,31 @@ class SetupAgent:
             add_sag_cli_marker=True,
         )
 
-        # Create PhysicalValidator for accurate build/test status validation
-        physical_validator = PhysicalValidator(
+        # PhysicalValidator is the canonical source of truth for build/test
+        # status — store it on the instance so other methods can reuse it
+        # without paying the cost of re-initialising it lazily.
+        self.physical_validator = PhysicalValidator(
             docker_orchestrator=self.orchestrator, project_path=self.config.workspace_path
         )
 
         tools = [
             BashTool(self.orchestrator, config=bash_config),
-            FileIOTool(self.orchestrator),  # 传递DockerOrchestrator
+            FileIOTool(self.orchestrator),
             WebSearchTool(),
             ContextTool(self.context_manager),
             MavenTool(self.orchestrator),
-            GradleTool(self.orchestrator),  # 添加Gradle工具
+            GradleTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
-            ProjectAnalyzerTool(self.orchestrator, self.context_manager),  # 🆕 添加项目分析工具
+            ProjectAnalyzerTool(self.orchestrator, self.context_manager),
             OutputSearchTool(
                 orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir
-            ),  # 🆕 添加输出搜索工具
+            ),
             ReportTool(
                 self.orchestrator,
                 execution_history_callback=self._get_execution_history,
                 context_manager=self.context_manager,
-                physical_validator=physical_validator,  # 🆕 注入物理校验器统一真值来源
+                physical_validator=self.physical_validator,
             ),
         ]
 
@@ -244,82 +275,51 @@ class SetupAgent:
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
         cmd_logger.info(f"Starting project setup: {project_name} (docker_label={docker_label})")
 
-        # Initialize UI Manager if in UI mode
-        if self.config.ui_mode:
-            self.ui_manager = UIManager(project_name=project_name, console=self.console)
-            self.ui_manager.start()
-        else:
-            self.console.print(
-                Panel.fit(
-                    f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
-                    f"[dim]Repository: {project_url}[/dim]\n"
-                    f"[dim]Goal: {goal}[/dim]",
-                    border_style="blue",
-                )
-            )
-
         try:
-            # Step 1: Setup Docker environment
+            # Initialize UI Manager if in UI mode
             if self.config.ui_mode:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_START,
-                        message="Setting up environment",
-                        phase=PhaseType.SETUP,
-                        level="info",
+                self.ui_manager = UIManager(project_name=project_name, console=self.console)
+                self.ui_manager.start()
+            else:
+                self.console.print(
+                    Panel.fit(
+                        f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
+                        f"[dim]Repository: {project_url}[/dim]\n"
+                        f"[dim]Goal: {goal}[/dim]",
+                        border_style="blue",
                     )
                 )
+
+            # Step 1: Setup Docker environment
+            self._emit(EventType.PHASE_START, "Setting up environment", phase=PhaseType.SETUP)
 
             if not self._setup_docker_environment(project_name):
                 return False
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
-            if self.config.ui_mode:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.STEP_START,
-                        message="Context Initialization",
-                        phase=PhaseType.SETUP,
-                        details="Initializing context system...",
-                        level="info",
-                    )
-                )
-
-                # Update status for initializing tools
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.STATUS_UPDATE,
-                        message="Loading tools...",
-                        phase=PhaseType.SETUP,
-                        level="info",
-                    )
-                )
+            self._emit(
+                EventType.STEP_START,
+                "Context Initialization",
+                phase=PhaseType.SETUP,
+                details="Initializing context system...",
+            )
+            self._emit(EventType.STATUS_UPDATE, "Loading tools...", phase=PhaseType.SETUP)
 
             self._initialize_context_and_tools()
 
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url)
 
-            if self.config.ui_mode:
-                # Update status for finalizing
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.STATUS_UPDATE,
-                        message="Configuring ReAct engine...",
-                        phase=PhaseType.SETUP,
-                        level="info",
-                    )
-                )
-
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.STEP_COMPLETE,
-                        message="Context Initialization",
-                        phase=PhaseType.SETUP,
-                        details="Context manager ready",
-                        level="success",
-                    )
-                )
+            self._emit(
+                EventType.STATUS_UPDATE, "Configuring ReAct engine...", phase=PhaseType.SETUP
+            )
+            self._emit(
+                EventType.STEP_COMPLETE,
+                "Context Initialization",
+                phase=PhaseType.SETUP,
+                details="Context manager ready",
+                level="success",
+            )
 
             # Step 2: Initialize trunk context with intelligent planning approach
             # Here we provide the initial steps. Split complex task into clear, executable steps
@@ -373,15 +373,12 @@ class SetupAgent:
                 return False
 
             # Step 2.5: Complete setup phase
-            if self.config.ui_mode:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_COMPLETE,
-                        message="Setup phase completed",
-                        phase=PhaseType.SETUP,
-                        level="success",
-                    )
-                )
+            self._emit(
+                EventType.PHASE_COMPLETE,
+                "Setup phase completed",
+                phase=PhaseType.SETUP,
+                level="success",
+            )
 
             # Step 3: Run the unified setup process
             success = self._run_unified_setup(project_url, project_name, goal, interactive)
@@ -389,47 +386,46 @@ class SetupAgent:
             # Step 5: Handle final status
             if self.config.ui_mode:
                 if success:
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.SUCCESS,
-                            message="Project setup completed successfully",
-                            level="success",
-                        )
+                    self._emit(
+                        EventType.SUCCESS, "Project setup completed successfully", level="success"
                     )
                 else:
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.FAILURE,
-                            message="Project setup incomplete",
-                            level="error",
-                        )
-                    )
-                # Display final summary and stop UI manager
+                    self._emit(EventType.FAILURE, "Project setup incomplete", level="error")
                 self.ui_manager.display_final_summary()
             else:
-                # Provide traditional summary
                 self._provide_setup_summary(success)
 
             cmd_logger.info(f"Project setup completed: success={success}")
-
-            # Cleanup command logger
-            session_logger = get_session_logger()
-            if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-
             return success
 
         except Exception as e:
             cmd_logger.error(f"Setup failed: {e}", exc_info=True)
             # Always show critical errors
             self.console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
+            return False
 
-            # Cleanup command logger
+        finally:
+            # Tear down the live UI on every exit path. display_final_summary
+            # is idempotent and abort_running_phases is a no-op if everything
+            # already completed, so the happy path tolerates this too.
+            if self.ui_manager:
+                try:
+                    self.ui_manager.abort_running_phases("Phase aborted")
+                    self.ui_manager.display_final_summary()
+                except Exception as e:
+                    logger.warning(f"UI teardown failed during setup_project cleanup: {e}")
+                    try:
+                        self.ui_manager.stop()
+                    except Exception as inner:
+                        logger.warning(f"UIManager.stop() also failed: {inner}")
+
+            # Always release the command-specific loguru handler.
             session_logger = get_session_logger()
             if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-
-            return False
+                try:
+                    session_logger.cleanup_command_logger(cmd_logger_id)
+                except Exception as e:
+                    logger.warning(f"cleanup_command_logger failed: {e}")
 
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
         """Continue working on an existing project."""
@@ -503,30 +499,22 @@ class SetupAgent:
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
         cmd_logger.info(f"Starting task execution: {task_description}")
 
-        # Initialize UI Manager if in UI mode
-        if self.config.ui_mode:
-            self.ui_manager = UIManager(project_name=project_name, console=self.console)
-            self.ui_manager.start()
-        else:
-            self.console.print(
-                Panel.fit(
-                    f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
-                    f"[dim]Task: {task_description}[/dim]",
-                    border_style="cyan",
-                )
-            )
-
         try:
-            # Step 1: Ensure Docker container is running
+            # Initialize UI Manager if in UI mode
             if self.config.ui_mode:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_START,
-                        message="Preparing environment",
-                        phase=PhaseType.SETUP,
-                        level="info",
+                self.ui_manager = UIManager(project_name=project_name, console=self.console)
+                self.ui_manager.start()
+            else:
+                self.console.print(
+                    Panel.fit(
+                        f"[bold cyan]Running task on: {project_name}[/bold cyan]\n"
+                        f"[dim]Task: {task_description}[/dim]",
+                        border_style="cyan",
                     )
                 )
+
+            # Step 1: Ensure Docker container is running
+            self._emit(EventType.PHASE_START, "Preparing environment", phase=PhaseType.SETUP)
 
             if not self._ensure_container_running(project_name):
                 return False
@@ -563,15 +551,12 @@ class SetupAgent:
                 return False
 
             # Step 2.5: Complete setup phase
-            if self.config.ui_mode:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_COMPLETE,
-                        message="Environment ready",
-                        phase=PhaseType.SETUP,
-                        level="success",
-                    )
-                )
+            self._emit(
+                EventType.PHASE_COMPLETE,
+                "Environment ready",
+                phase=PhaseType.SETUP,
+                level="success",
+            )
 
             # Step 3: Add the specific task
             trunk_context.add_task(task_description)
@@ -594,14 +579,7 @@ Please start by checking the current context and then proceed with the task.
 
             # Step 5: Execute task
             if self.config.ui_mode:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_START,
-                        message="Executing task",
-                        phase=PhaseType.BUILD,
-                        level="info",
-                    )
-                )
+                self._emit(EventType.PHASE_START, "Executing task", phase=PhaseType.BUILD)
             else:
                 self.console.print(f"[dim]🔧 Executing task: {task_description}[/dim]")
 
@@ -612,44 +590,30 @@ Please start by checking the current context and then proceed with the task.
 
             # Step 6: Update last comment in container and handle completion
             if success:
-                comment = f"Task completed: {task_description}"
-                self.orchestrator.update_last_comment(comment)
+                self.orchestrator.update_last_comment(f"Task completed: {task_description}")
                 if self.config.ui_mode:
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.PHASE_COMPLETE,
-                            message="Task completed",
-                            phase=PhaseType.BUILD,
-                            level="success",
-                        )
+                    self._emit(
+                        EventType.PHASE_COMPLETE,
+                        "Task completed",
+                        phase=PhaseType.BUILD,
+                        level="success",
                     )
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.SUCCESS,
-                            message=f"Task completed: {task_description}",
-                            level="success",
-                        )
+                    self._emit(
+                        EventType.SUCCESS, f"Task completed: {task_description}", level="success"
                     )
                 else:
                     self.console.print(f"[bold green]✅ Task completed successfully![/bold green]")
             else:
-                comment = f"Task in progress: {task_description}"
-                self.orchestrator.update_last_comment(comment)
+                self.orchestrator.update_last_comment(f"Task in progress: {task_description}")
                 if self.config.ui_mode:
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.PHASE_ERROR,
-                            message="Task incomplete",
-                            phase=PhaseType.BUILD,
-                            level="error",
-                        )
+                    self._emit(
+                        EventType.PHASE_ERROR,
+                        "Task incomplete",
+                        phase=PhaseType.BUILD,
+                        level="error",
                     )
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.FAILURE,
-                            message=f"Task incomplete: {task_description}",
-                            level="error",
-                        )
+                    self._emit(
+                        EventType.FAILURE, f"Task incomplete: {task_description}", level="error"
                     )
                 else:
                     self.console.print(f"[bold yellow]⚠️ Task may be incomplete.[/bold yellow]")
@@ -661,103 +625,87 @@ Please start by checking the current context and then proceed with the task.
                 self._provide_task_summary(success, task_description)
 
             cmd_logger.info(f"Task execution completed: success={success}")
-
-            # Cleanup command logger
-            session_logger = get_session_logger()
-            if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-
             return success
 
         except Exception as e:
             cmd_logger.error(f"Task execution failed: {e}", exc_info=True)
-            # Always show critical errors
             self.console.print(f"[bold red]❌ Task execution failed: {e}[/bold red]")
 
-            # Update last comment with error
-            error_comment = f"Task failed: {task_description} - Error: {str(e)[:100]}"
-
-            # Cleanup command logger
-            session_logger = get_session_logger()
-            if session_logger:
-                session_logger.cleanup_command_logger(cmd_logger_id)
-            self.orchestrator.update_last_comment(error_comment)
+            try:
+                self.orchestrator.update_last_comment(
+                    f"Task failed: {task_description} - Error: {str(e)[:100]}"
+                )
+            except Exception as inner:
+                logger.warning(f"Failed to update last comment after task failure: {inner}")
 
             return False
+
+        finally:
+            if self.ui_manager:
+                try:
+                    self.ui_manager.abort_running_phases("Phase aborted")
+                    self.ui_manager.display_final_summary()
+                except Exception as e:
+                    logger.warning(f"UI teardown failed during run_task cleanup: {e}")
+                    try:
+                        self.ui_manager.stop()
+                    except Exception as inner:
+                        logger.warning(f"UIManager.stop() also failed: {inner}")
+
+            session_logger = get_session_logger()
+            if session_logger:
+                try:
+                    session_logger.cleanup_command_logger(cmd_logger_id)
+                except Exception as e:
+                    logger.warning(f"cleanup_command_logger failed: {e}")
 
     def _setup_docker_environment(self, project_name: str) -> bool:
         """Setup the Docker environment for the project."""
 
         if self.config.ui_mode:
-            # UI Mode: emit detailed step events
-            self.ui_manager.handle_event(
-                UIEvent(
-                    event_type=EventType.STEP_START,
-                    message="Docker Environment",
-                    phase=PhaseType.SETUP,
-                    details="Checking Docker availability...",
-                    level="info",
-                )
+            self._emit(
+                EventType.STEP_START,
+                "Docker Environment",
+                phase=PhaseType.SETUP,
+                details="Checking Docker availability...",
             )
-
-            # Update status for creating container
-            self.ui_manager.handle_event(
-                UIEvent(
-                    event_type=EventType.STATUS_UPDATE,
-                    message="Creating container...",
-                    phase=PhaseType.SETUP,
-                    level="info",
-                )
-            )
+            self._emit(EventType.STATUS_UPDATE, "Creating container...", phase=PhaseType.SETUP)
 
             try:
-                # Create and start container
                 success = self.orchestrator.create_and_start_container()
 
                 if success:
-                    # Update status for configuring environment
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.STATUS_UPDATE,
-                            message="Configuring environment...",
-                            phase=PhaseType.SETUP,
-                            level="info",
-                        )
+                    self._emit(
+                        EventType.STATUS_UPDATE,
+                        "Configuring environment...",
+                        phase=PhaseType.SETUP,
                     )
-
-                    # Mark step complete
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.STEP_COMPLETE,
-                            message="Docker Environment",
-                            phase=PhaseType.SETUP,
-                            details="Container ready",
-                            level="success",
-                        )
+                    self._emit(
+                        EventType.STEP_COMPLETE,
+                        "Docker Environment",
+                        phase=PhaseType.SETUP,
+                        details="Container ready",
+                        level="success",
                     )
                     logger.info("Docker environment setup completed")
                     return True
                 else:
-                    self.ui_manager.handle_event(
-                        UIEvent(
-                            event_type=EventType.STEP_ERROR,
-                            message="Docker Environment",
-                            phase=PhaseType.SETUP,
-                            details="Failed to create container",
-                            level="error",
-                        )
+                    self._emit(
+                        EventType.STEP_ERROR,
+                        "Docker Environment",
+                        phase=PhaseType.SETUP,
+                        details="Failed to create container",
+                        level="error",
                     )
                     logger.error("Docker environment setup failed")
                     return False
 
             except Exception as e:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.ERROR,
-                        message=f"Docker setup error: {e}",
-                        phase=PhaseType.SETUP,
-                        level="error",
-                    )
+                self._emit(
+                    EventType.ERROR,
+                    f"Docker setup error: {e}",
+                    phase=PhaseType.SETUP,
+                    level="error",
                 )
                 logger.error(f"Docker setup error: {e}")
                 return False
@@ -866,41 +814,27 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 """
 
         if self.config.ui_mode:
-            # UI Mode: emit phase events for build
-            self.ui_manager.handle_event(
-                UIEvent(
-                    event_type=EventType.PHASE_START,
-                    message="Running project setup",
-                    phase=PhaseType.BUILD,
-                    level="info",
-                )
-            )
+            self._emit(EventType.PHASE_START, "Running project setup", phase=PhaseType.BUILD)
 
             success = self.react_engine.run_react_loop(
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
 
-            # Check if a report was generated and get the verified status
             verified_success = self._get_verified_final_status(success)
 
-            # Emit build phase completion
             if verified_success:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_COMPLETE,
-                        message="Build and test completed",
-                        phase=PhaseType.BUILD,
-                        level="success",
-                    )
+                self._emit(
+                    EventType.PHASE_COMPLETE,
+                    "Build and test completed",
+                    phase=PhaseType.BUILD,
+                    level="success",
                 )
             else:
-                self.ui_manager.handle_event(
-                    UIEvent(
-                        event_type=EventType.PHASE_ERROR,
-                        message="Build or test failed",
-                        phase=PhaseType.BUILD,
-                        level="error",
-                    )
+                self._emit(
+                    EventType.PHASE_ERROR,
+                    "Build or test failed",
+                    phase=PhaseType.BUILD,
+                    level="error",
                 )
 
             return verified_success
@@ -929,51 +863,6 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
 
             return verified_success
 
-    def _verify_build_artifacts(self, project_name: str) -> bool:
-        """
-        @deprecated - This method will be removed in future versions.
-        Use PhysicalValidator directly for more accurate verification.
-
-        This is now a wrapper that delegates to PhysicalValidator for
-        fact-based build artifact verification.
-        """
-        logger.info(f"Verifying build artifacts for project: {project_name}")
-
-        if not self.orchestrator:
-            logger.error("No orchestrator available for verification")
-            return False
-
-        # Initialize PhysicalValidator if not already done
-        if not hasattr(self, "physical_validator") or self.physical_validator is None:
-            from sag.agent.physical_validator import PhysicalValidator
-
-            self.physical_validator = PhysicalValidator(
-                docker_orchestrator=self.orchestrator, project_path="/workspace"
-            )
-            logger.info("Initialized PhysicalValidator for artifact verification")
-
-        try:
-            # Use the new validate_build_status method with hierarchical validation
-            validation_result = self.physical_validator.validate_build_status(project_name)
-
-            # Check the boolean success result
-            if validation_result.get("success", False):
-                reason = validation_result.get("reason", "Unknown")
-                evidence = validation_result.get("evidence", {})
-                logger.info(f"✅ Physical validation successful: {reason}")
-                logger.debug(f"Evidence details: {evidence}")
-                return True
-            else:
-                reason = validation_result.get("reason", "Unknown")
-                evidence = validation_result.get("evidence", {})
-                logger.warning(f"❌ Physical validation failed: {reason}")
-                logger.debug(f"Evidence details: {evidence}")
-                return False
-
-        except Exception as e:
-            logger.error(f"Physical validation error: {e}")
-            return False
-
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
         """Get the verified final status using separate build and test validation."""
 
@@ -987,14 +876,11 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
             logger.warning("🔍 No project name available for verification")
             return False
 
-        # Initialize PhysicalValidator if not already done
-        if not hasattr(self, "physical_validator") or self.physical_validator is None:
-            from sag.agent.physical_validator import PhysicalValidator
-
-            self.physical_validator = PhysicalValidator(
-                docker_orchestrator=self.orchestrator, project_path="/workspace"
-            )
-            logger.info("Initialized PhysicalValidator for status verification")
+        # self.physical_validator is set during _initialize_tools(); guard
+        # against unusual call orderings (e.g. direct unit-test invocations).
+        if not getattr(self, "physical_validator", None):
+            logger.warning("PhysicalValidator not initialized; cannot verify status")
+            return False
 
         # Get BUILD status (primary concern)
         build_status = self.physical_validator.validate_build_status(project_name)
@@ -1169,27 +1055,6 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
         logger.info(
             f"Task execution completed for {self.orchestrator.project_name}: {task_description}"
         )
-
-    def _extract_project_name_from_url(self, project_url: str) -> str:
-        """Extract project name from Git URL."""
-        try:
-            # Parse URL
-            parsed = urlparse(project_url)
-
-            # Get the last part of the path
-            path_parts = parsed.path.strip("/").split("/")
-            if path_parts:
-                project_name = path_parts[-1]
-                # Remove .git extension if present
-                if project_name.endswith(".git"):
-                    project_name = project_name[:-4]
-                return project_name
-
-            return "unknown-project"
-
-        except Exception as e:
-            logger.warning(f"Failed to extract project name from URL: {e}")
-            return "unknown-project"
 
     def get_status(self) -> dict:
         """Get current agent status."""

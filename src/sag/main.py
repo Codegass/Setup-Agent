@@ -1,12 +1,10 @@
 """Main CLI interface for SAG (Setup-Agent)."""
 
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
-from urllib.parse import urlparse
 
 import click
 from loguru import logger
@@ -24,6 +22,7 @@ from sag.config import (
     set_config,
     suppress_console_logging,
 )
+from sag.config.git_utils import extract_project_name_from_url
 from sag.docker_orch.orch import DockerOrchestrator
 
 console = Console()
@@ -130,76 +129,6 @@ def read_project_metadata(orchestrator: DockerOrchestrator) -> Optional[Dict[str
     except Exception as e:
         logger.warning(f"Failed to read project metadata: {e}")
         return None
-
-
-def extract_project_name_from_url(repo_url: str) -> str:
-    """
-    Extract project name from a Git repository URL.
-
-    Supports various Git hosting services:
-    - GitHub: https://github.com/user/repo.git
-    - GitLab: https://gitlab.com/user/repo.git
-    - Gitee: https://gitee.com/user/repo.git
-    - Bitbucket: https://bitbucket.org/user/repo.git
-    - Azure DevOps: https://dev.azure.com/org/project/_git/repo
-    - SSH URLs: git@github.com:user/repo.git
-    - Local paths: /path/to/repo or file:///path/to/repo
-
-    Args:
-        repo_url: Git repository URL
-
-    Returns:
-        Extracted project name (without .git suffix)
-
-    Examples:
-        >>> extract_project_name_from_url("https://github.com/apache/commons-cli.git")
-        'commons-cli'
-        >>> extract_project_name_from_url("git@github.com:fastapi/fastapi.git")
-        'fastapi'
-        >>> extract_project_name_from_url("https://dev.azure.com/org/project/_git/myrepo")
-        'myrepo'
-    """
-    if not repo_url:
-        raise ValueError("Repository URL cannot be empty")
-
-    # Normalize the URL
-    url = repo_url.strip()
-
-    # Handle SSH URLs: git@host:user/repo.git
-    ssh_match = re.match(r"^git@[^:]+:(.+)$", url)
-    if ssh_match:
-        path = ssh_match.group(1)
-        # Extract repo name from path like "user/repo.git"
-        repo_name = path.split("/")[-1]
-        return repo_name.removesuffix(".git")
-
-    # Handle Azure DevOps URLs: https://dev.azure.com/org/project/_git/repo
-    azure_match = re.match(r".*/_git/([^/]+)/?$", url)
-    if azure_match:
-        return azure_match.group(1).removesuffix(".git")
-
-    # Handle standard HTTPS/HTTP URLs and file:// URLs
-    try:
-        parsed = urlparse(url)
-        path = parsed.path
-
-        # Remove trailing slashes
-        path = path.rstrip("/")
-
-        # Get the last component of the path
-        if path:
-            repo_name = path.split("/")[-1]
-            return repo_name.removesuffix(".git")
-    except Exception:
-        pass
-
-    # Fallback: try simple split on '/' and take the last non-empty part
-    parts = [p for p in url.replace("\\", "/").split("/") if p]
-    if parts:
-        repo_name = parts[-1]
-        return repo_name.removesuffix(".git")
-
-    raise ValueError(f"Could not extract project name from URL: {repo_url}")
 
 
 def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -> None:
@@ -323,9 +252,7 @@ def cli(ctx, log_level, log_file, verbose, ui):
             logger.info(f"Logs directory: {session_logger.session_log_dir}")
 
     # Display welcome message for main commands (skip in UI mode, will be shown by UIManager)
-    # Note: UI mode is only enabled at subcommand level, so we show it here in non-verbose mode
-    # It will be suppressed when actual UI starts
-    if ctx.invoked_subcommand not in ["list"] and not config.verbose:
+    if ctx.invoked_subcommand not in ["list"] and not config.verbose and not config.ui_mode:
         console.print(
             Panel.fit(
                 "[bold blue]SAG[/bold blue] - [dim]Setup Agent[/dim]\n"
@@ -570,11 +497,15 @@ def run(ctx, docker_name, task, max_iterations, record, ui):
                 # Last resort: use docker_label as project_name
                 actual_project_name = docker_label
 
-        console.print(f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]")
-        console.print(f"[dim]Docker:[/dim] {docker_name}")
-        console.print(f"[dim]Task:[/dim] {task}")
-        if record:
-            console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
+        # Only show task info in non-UI mode (UI manager handles this)
+        if not config.ui_mode:
+            console.print(
+                f"[bold green]🔧 Running task on project: {actual_project_name}[/bold green]"
+            )
+            console.print(f"[dim]Docker:[/dim] {docker_name}")
+            console.print(f"[dim]Task:[/dim] {task}")
+            if record:
+                console.print(f"[dim]Recording:[/dim] Enabled (artifacts will be saved locally)")
 
         # Initialize agent
         final_max_iterations = (

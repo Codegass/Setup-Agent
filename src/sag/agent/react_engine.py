@@ -990,8 +990,9 @@ EXAMPLE FLOW:
 4. Execute the intelligent plan
 
 Use these tools as needed to complete your tasks.
+"""
 
-## Handling Maven POM Parsing Errors
+        prompt += """## Handling Maven POM Parsing Errors
 
 When encountering Maven POM parsing errors during test execution, follow this decision tree:
 

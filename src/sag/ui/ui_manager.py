@@ -75,6 +75,9 @@ class UIManager:
         # Final result
         self.is_complete = False
         self.final_status: Optional[str] = None
+        # Guards display_final_summary so callers (including cleanup paths)
+        # can invoke it unconditionally without producing a duplicate panel.
+        self._summary_shown = False
 
         # Report information
         self.report_data: Optional[dict] = None  # Report metadata (path, status, metrics)
@@ -214,7 +217,7 @@ class UIManager:
             thought: Full thought content
 
         Returns:
-            Concise summary (30-80 chars) with ellipsis
+            Concise summary (up to 80 chars); ellipsis only when truncated
         """
         # Remove common prefixes
         thought = thought.strip()
@@ -227,12 +230,13 @@ class UIManager:
             # Limit length
             if len(summary) > 80:
                 summary = summary[:77] + "..."
-            elif len(summary) < 20:
+            elif len(summary) < 20 and len(sentences) > 1:
                 # If too short, include second sentence if available
-                if len(sentences) > 1:
-                    summary = f"{summary}. {sentences[1][:40]}..."
-            else:
-                summary = summary + "..."
+                second = sentences[1].strip()
+                if len(second) > 40:
+                    summary = f"{summary}. {second[:37]}..."
+                else:
+                    summary = f"{summary}. {second}"
 
             return summary
 
@@ -247,7 +251,7 @@ class UIManager:
             observation: Full observation content
 
         Returns:
-            Concise summary (50-100 chars) with ellipsis
+            Concise summary (up to 100 chars); ellipsis only when truncated
         """
         # Clean up observation
         observation = observation.strip()
@@ -259,9 +263,7 @@ class UIManager:
             for line in lines:
                 if "success" in line.lower():
                     summary = line.strip()
-                    if len(summary) > 100:
-                        return summary[:97] + "..."
-                    return summary + "..."
+                    return summary[:97] + "..." if len(summary) > 100 else summary
 
         # Look for error indicators
         if "error" in observation.lower() or "failed" in observation.lower():
@@ -269,18 +271,14 @@ class UIManager:
             for line in lines:
                 if "error" in line.lower() or "failed" in line.lower():
                     summary = line.strip()
-                    if len(summary) > 100:
-                        return summary[:97] + "..."
-                    return summary + "..."
+                    return summary[:97] + "..." if len(summary) > 100 else summary
 
         # Default: first meaningful line
         lines = observation.split("\n")
         for line in lines:
             line = line.strip()
             if len(line) > 10:  # Skip very short lines
-                if len(line) > 100:
-                    return line[:97] + "..."
-                return line + "..."
+                return line[:97] + "..." if len(line) > 100 else line
 
         # Fallback
         return observation[:97] + "..." if len(observation) > 100 else observation
@@ -500,19 +498,16 @@ class UIManager:
             self.agent_tool_params = tool_params
 
             # Detect phase transition based on tool usage
+            # NOTE: tool-name detection is a pure heuristic — it carries no signal
+            # about whether the previous phase actually succeeded. Updating
+            # `current_phase` is safe (it just drives the live indicator), but we
+            # must NOT mark the previous phase as "success" here; only explicit
+            # PHASE_COMPLETE / PHASE_ERROR events may transition phase status.
             detected_phase = self._detect_phase_from_action(tool_name, tool_params)
             if detected_phase and detected_phase != self.current_phase:
-                # Transition to new phase
-                # Complete previous phase if it was running
-                if (
-                    self.current_phase
-                    and self.phases_data[self.current_phase]["status"] == "running"
-                ):
-                    self.phases_data[self.current_phase]["status"] = "success"
-
-                # Start new phase
                 self.current_phase = detected_phase
-                self.phases_data[detected_phase]["status"] = "running"
+                if self.phases_data[detected_phase]["status"] == "pending":
+                    self.phases_data[detected_phase]["status"] = "running"
 
             # Format parameters for display
             params_str = self._format_tool_params(tool_name, tool_params)
@@ -626,8 +621,33 @@ class UIManager:
         if self.live:
             self.live.update(self._render_display())
 
+    def abort_running_phases(self, reason: str = "Phase aborted") -> None:
+        """Mark any still-running phase as errored.
+
+        Callers (e.g. agent cleanup paths) use this when teardown happens before
+        an explicit PHASE_COMPLETE / PHASE_ERROR has been emitted, so the
+        rendered phase tree truthfully reflects that the phase did not finish.
+        """
+        for phase, data in self.phases_data.items():
+            if data.get("status") == "running":
+                self.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_ERROR,
+                        message=reason,
+                        phase=phase,
+                        level="error",
+                    )
+                )
+
     def display_final_summary(self):
-        """Display final summary with expandable sections"""
+        """Display final summary with expandable sections.
+
+        Idempotent: subsequent calls are no-ops, so cleanup paths can invoke
+        this unconditionally without risking duplicate panels.
+        """
+        if self._summary_shown:
+            return
+        self._summary_shown = True
         self.stop()
 
         # Print final status
