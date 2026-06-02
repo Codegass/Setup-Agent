@@ -15,6 +15,14 @@ class ContextWithoutForceNextTask:
     pass
 
 
+class FakeAgentLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message):
+        self.messages.append(message)
+
+
 def _engine_with_context(context=None):
     engine = object.__new__(ReActEngine)
     engine.tools = {"bash": object()}
@@ -75,6 +83,22 @@ def test_get_tool_orchestrator_wires_engine_dependencies():
     assert orchestrator.get_timestamp.__func__ is ReActEngine._get_timestamp
     assert orchestrator.event_sink.__self__ is engine
     assert orchestrator.event_sink.__func__ is ReActEngine._handle_tool_lifecycle_event
+
+
+def test_add_system_guidance_accepts_string_priority():
+    engine = _engine_with_context()
+    engine.steps = []
+    engine.agent_logger = FakeAgentLogger()
+
+    engine._add_system_guidance("Use Maven retry guidance", priority="high")
+
+    assert len(engine.steps) == 1
+    step = engine.steps[0]
+    assert step.step_type == StepType.SYSTEM_GUIDANCE
+    assert "IMPORTANT GUIDANCE" in step.content
+    assert "(Priority: 8)" in step.content
+    assert "Use Maven retry guidance" in step.content
+    assert engine.agent_logger.messages
 
 
 def test_handle_tool_lifecycle_event_is_temporary_no_op():

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
 from loguru import logger as default_logger
 
@@ -18,12 +20,16 @@ class ToolRecoveryHandler:
         *,
         tools: Dict[str, BaseTool],
         context_manager: Any,
+        successful_states: Dict[str, Any],
         repository_url: Optional[str],
+        add_system_guidance: Any,
         logger: Any = None,
     ) -> None:
         self.tools = tools
         self.context_manager = context_manager
+        self.successful_states = successful_states
         self.repository_url = repository_url
+        self.add_system_guidance = add_system_guidance
         self.logger = logger or default_logger
 
     def recover(
@@ -40,6 +46,10 @@ class ToolRecoveryHandler:
                 return self._recover_context_management_error(params, failed_result)
             if tool_name == "project_setup":
                 return self._recover_project_setup_error(params, failed_result)
+            if tool_name == "maven":
+                return self._recover_maven_error(params, failed_result)
+            if tool_name == "gradle":
+                return self._recover_gradle_error(params, failed_result)
             return self._recover_generic_error(tool_name, params, failed_result)
         except Exception as exc:
             message = f"Recovery mechanism failed: {exc}"
@@ -114,12 +124,448 @@ class ToolRecoveryHandler:
             None, "No project setup recovery strategy applicable"
         )
 
+    def _recover_maven_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        """Recover from Maven tool failures."""
+        error_msg = failed_result.error or ""
+        error_code = failed_result.error_code or ""
+
+        if error_code.startswith("TIMEOUT_"):
+            return self._maven_timeout_guidance(params, failed_result)
+
+        if error_code == "JAVA_VERSION_MISMATCH":
+            decision = self._recover_maven_java_version(params, failed_result)
+            if decision.should_recover:
+                return decision
+
+        analysis = failed_result.metadata.get("analysis", {})
+
+        if self._is_maven_missing_project(error_code, error_msg, analysis):
+            decision = self._recover_maven_pom_discovery(params)
+            if decision.should_recover:
+                return decision
+
+        if self._is_maven_working_directory_error(error_code, error_msg, analysis):
+            if self.successful_states.get("working_directory"):
+                recovery_params = dict(params)
+                recovery_params["working_directory"] = self.successful_states[
+                    "working_directory"
+                ]
+
+                result = self.tools["maven"].safe_execute(**recovery_params)
+                return self._attempted(
+                    strategy="maven_known_working_directory",
+                    message=(
+                        "Recovered by using known working directory: "
+                        f"{self.successful_states['working_directory']}"
+                    ),
+                    result=result,
+                    recovery_params=recovery_params,
+                )
+
+        command = params.get("command", "")
+        if "test" in command and "compilation" in error_msg.lower():
+            recovery_params = dict(params)
+            recovery_params["command"] = "compile"
+
+            result = self.tools["maven"].safe_execute(**recovery_params)
+            return self._attempted(
+                strategy="maven_compile_before_test",
+                message="Recovered by trying compile before test",
+                result=result,
+                recovery_params=recovery_params,
+            )
+
+        if analysis:
+            decision = self._recover_maven_exclusions(params, analysis)
+            if decision.should_recover:
+                return decision
+
+        return self._no_strategy(
+            "maven_no_strategy", "No Maven recovery strategy applicable"
+        )
+
+    def _recover_maven_java_version(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        metadata = failed_result.metadata
+        analysis = metadata.get("analysis", {})
+        java_error = analysis.get("java_version_error", {})
+        required_version = java_error.get("required")
+        current_version = java_error.get("current", "unknown")
+
+        if not required_version:
+            return self._no_strategy(
+                "maven_no_strategy", "No Maven recovery strategy applicable"
+            )
+
+        self.logger.info(
+            "Attempting Java version recovery: installing Java "
+            f"{required_version} (current: {current_version})"
+        )
+
+        if "system" not in self.tools:
+            self.logger.warning("System tool not available for Java installation")
+            return self._no_strategy(
+                "maven_no_strategy", "No Maven recovery strategy applicable"
+            )
+
+        verify_result = self.tools["system"].safe_execute(
+            action="verify_java", java_version=required_version
+        )
+        if verify_result.success:
+            result = self.tools["maven"].safe_execute(**params)
+            return self._attempted(
+                strategy="maven_java_version",
+                message=(
+                    f"Java {required_version} was already installed, "
+                    "retried Maven command"
+                ),
+                result=result,
+                recovery_params=params,
+            )
+
+        install_params = {
+            "action": "install_java",
+            "java_version": required_version,
+        }
+        install_result = self.tools["system"].safe_execute(**install_params)
+
+        if install_result.success:
+            result = self.tools["maven"].safe_execute(**params)
+            return self._attempted(
+                strategy="maven_java_version",
+                message=(
+                    f"Recovered by installing Java {required_version} and retrying"
+                ),
+                result=result,
+                recovery_params=params,
+            )
+
+        return self._attempted(
+            strategy="maven_java_version",
+            message=f"Attempted to install Java {required_version} but failed",
+            result=install_result,
+            recovery_params=params,
+            metadata={"repair_params": install_params},
+        )
+
+    def _recover_maven_pom_discovery(
+        self, params: Dict[str, Any]
+    ) -> RecoveryDecision:
+        orchestrator = getattr(self.context_manager, "orchestrator", None)
+        if not orchestrator:
+            return self._no_strategy(
+                "maven_no_strategy", "No Maven recovery strategy applicable"
+            )
+
+        try:
+            locate_cmd = "find /workspace -maxdepth 4 -name pom.xml | head -20"
+            locate_res = orchestrator.execute_command(locate_cmd)
+            pom_candidates = (locate_res.get("output") or "").strip().splitlines()
+            project_name = getattr(orchestrator, "project_name", None)
+            target_pom = None
+
+            if project_name:
+                root_candidate = f"/workspace/{project_name}/pom.xml"
+                if root_candidate in pom_candidates:
+                    target_pom = root_candidate
+
+            if not target_pom and project_name:
+                scoped = [
+                    candidate
+                    for candidate in pom_candidates
+                    if candidate.startswith(f"/workspace/{project_name}/")
+                ]
+                if scoped:
+                    scoped.sort(key=lambda path: path.count("/"))
+                    target_pom = scoped[0]
+
+            if not target_pom and pom_candidates:
+                target_pom = pom_candidates[0]
+
+            if target_pom:
+                recovery_params = dict(params)
+                recovery_params["pom_file"] = target_pom
+                recovery_params["working_directory"] = os.path.dirname(target_pom)
+                result = self.tools["maven"].safe_execute(**recovery_params)
+                return self._attempted(
+                    strategy="maven_pom_discovery",
+                    message=f"Recovered by targeting detected pom: {target_pom}",
+                    result=result,
+                    recovery_params=recovery_params,
+                )
+        except Exception as exc:
+            self.logger.warning(
+                f"Automatic pom.xml discovery failed during Maven recovery: {exc}"
+            )
+
+        return self._no_strategy(
+            "maven_no_strategy", "No Maven recovery strategy applicable"
+        )
+
+    def _recover_maven_exclusions(
+        self, params: Dict[str, Any], analysis: Dict[str, Any]
+    ) -> RecoveryDecision:
+        failed_modules: List[str] = []
+        for module in analysis.get("failed_modules", []):
+            artifact = module.get("artifact_id")
+            if artifact:
+                failed_modules.append(artifact)
+            else:
+                pom_path = module.get("pom_path")
+                if pom_path:
+                    failed_modules.append(Path(pom_path).parent.name)
+
+        failed_tests = [
+            self._format_test_exclusion(test)
+            for test in analysis.get("failed_tests", [])
+        ]
+
+        recovery_params = dict(params)
+        recovery_params["fail_at_end"] = True
+        new_exclusions = False
+
+        if failed_modules:
+            excluded_modules: Set[str] = self.successful_states.setdefault(
+                "excluded_modules", set()
+            )
+            for module_name in failed_modules:
+                if module_name and module_name not in excluded_modules:
+                    excluded_modules.add(module_name)
+                    new_exclusions = True
+            if excluded_modules and new_exclusions:
+                props = self._normalize_properties(recovery_params.get("properties"))
+                props = [prop for prop in props if not prop.startswith("-pl")]
+                module_clause = ",".join(
+                    f"!{name}" for name in sorted(excluded_modules)
+                )
+                props.append(f"-pl {module_clause}")
+                props = self._ensure_flag(props, "-am")
+                recovery_params["properties"] = props
+
+        if failed_tests:
+            excluded_tests: Set[str] = self.successful_states.setdefault(
+                "excluded_tests", set()
+            )
+            added_test = False
+            for test_name in failed_tests:
+                if test_name and test_name not in excluded_tests:
+                    excluded_tests.add(test_name)
+                    added_test = True
+            if excluded_tests and added_test:
+                props = self._normalize_properties(recovery_params.get("properties"))
+                test_clause = "!" + ",!".join(sorted(excluded_tests))
+                props = self._set_property(props, "test=", test_clause)
+                recovery_params["properties"] = props
+                new_exclusions = True
+
+        if new_exclusions:
+            result = self.tools["maven"].safe_execute(**recovery_params)
+            return self._attempted(
+                strategy="maven_exclude_modules_or_tests",
+                message=(
+                    "Recovered by excluding failing modules/tests and rerunning Maven"
+                ),
+                result=result,
+                recovery_params=recovery_params,
+            )
+
+        return self._no_strategy(
+            "maven_no_strategy", "No Maven recovery strategy applicable"
+        )
+
+    def _maven_timeout_guidance(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        metadata = failed_result.metadata
+        termination_reason = metadata.get("termination_reason", "unknown")
+        execution_time = metadata.get("execution_time", 0)
+        command = params.get("command", "unknown")
+        guidance = [
+            f"Maven command '{command}' timed out after {execution_time:.1f}s",
+            "Consider breaking down the Maven build into smaller phases",
+            "Try running 'mvn dependency:resolve' first to download dependencies",
+            "Consider using '-T 1C' flag for parallel builds",
+            "Check if the build is waiting for user input or network resources",
+            "For large projects, consider building specific modules with '-pl' flag",
+        ]
+
+        self.add_system_guidance(
+            f"MAVEN TIMEOUT: The Maven command '{command}' timed out after "
+            f"{execution_time:.1f}s. This is often due to dependency downloads "
+            "or large compilation tasks. Consider breaking the build into phases.",
+            priority="high",
+        )
+
+        result = ToolResult(
+            success=False,
+            output=(
+                f"Maven command timed out after {execution_time:.1f}s due to "
+                f"{termination_reason}.\n\nSuggestions:\n"
+                + "\n".join(f"- {item}" for item in guidance)
+            ),
+            error=f"Maven command timed out ({termination_reason})",
+            error_code="MAVEN_TIMEOUT_HANDLED",
+            suggestions=guidance,
+            metadata={
+                "timeout_handled": True,
+                "execution_time": execution_time,
+                "termination_reason": termination_reason,
+                "original_command": command,
+                "tool_type": "maven",
+            },
+        )
+        return self._guidance_only(
+            strategy="maven_timeout_guidance",
+            message=(
+                "Maven timeout handled gracefully - provided guidance for "
+                "alternative approaches"
+            ),
+            result=result,
+            params=params,
+        )
+
+    def _recover_gradle_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        """Recover from Gradle tool failures."""
+        error_msg = failed_result.error or ""
+        error_code = failed_result.error_code or ""
+
+        if error_code.startswith("TIMEOUT_"):
+            return self._gradle_timeout_guidance(params, failed_result)
+
+        if self._is_gradle_working_directory_error(error_code, error_msg):
+            if self.successful_states.get("working_directory"):
+                recovery_params = dict(params)
+                recovery_params["working_directory"] = self.successful_states[
+                    "working_directory"
+                ]
+                result = self.tools["gradle"].safe_execute(**recovery_params)
+                return self._attempted(
+                    strategy="gradle_known_working_directory",
+                    message=(
+                        "Recovered by using known working directory: "
+                        f"{self.successful_states['working_directory']}"
+                    ),
+                    result=result,
+                    recovery_params=recovery_params,
+                )
+
+        task = self._gradle_task_value(params)
+        if "test" in task and "compilation" in error_msg.lower():
+            recovery_params = dict(params)
+            recovery_params.pop("task", None)
+            recovery_params.pop("command", None)
+            recovery_params["tasks"] = "compileJava"
+            result = self.tools["gradle"].safe_execute(**recovery_params)
+            return self._attempted(
+                strategy="gradle_compile_before_test",
+                message="Recovered by trying compileJava before test",
+                result=result,
+                recovery_params=recovery_params,
+            )
+
+        return self._no_strategy(
+            "gradle_no_strategy", "No Gradle recovery strategy applicable"
+        )
+
+    def _gradle_timeout_guidance(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        metadata = failed_result.metadata
+        termination_reason = metadata.get("termination_reason", "unknown")
+        execution_time = metadata.get("execution_time", 0)
+        task = self._gradle_task_value(params) or "unknown"
+        guidance = [
+            f"Gradle task '{task}' timed out after {execution_time:.1f}s",
+            "Consider breaking down the Gradle build into smaller tasks",
+            "Try running './gradlew dependencies' first to download dependencies",
+            "Consider using '--parallel' flag for parallel builds",
+            "Check if the build is waiting for user input or network resources",
+            "For large projects, consider building specific modules or subprojects",
+            "Use '--info' or '--debug' flags to monitor build progress",
+        ]
+
+        self.add_system_guidance(
+            f"GRADLE TIMEOUT: The Gradle task '{task}' timed out after "
+            f"{execution_time:.1f}s. This is often due to dependency downloads "
+            "or large compilation tasks. Consider breaking the build into phases.",
+            priority="high",
+        )
+
+        result = ToolResult(
+            success=False,
+            output=(
+                f"Gradle task timed out after {execution_time:.1f}s due to "
+                f"{termination_reason}.\n\nSuggestions:\n"
+                + "\n".join(f"- {item}" for item in guidance)
+            ),
+            error=f"Gradle task timed out ({termination_reason})",
+            error_code="GRADLE_TIMEOUT_HANDLED",
+            suggestions=guidance,
+            metadata={
+                "timeout_handled": True,
+                "execution_time": execution_time,
+                "termination_reason": termination_reason,
+                "original_task": task,
+                "tool_type": "gradle",
+            },
+        )
+        return self._guidance_only(
+            strategy="gradle_timeout_guidance",
+            message=(
+                "Gradle timeout handled gracefully - provided guidance for "
+                "alternative approaches"
+            ),
+            result=result,
+            params=params,
+        )
+
     def _recover_generic_error(
         self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult
     ) -> RecoveryDecision:
         return self._no_strategy(
             "generic_no_strategy", "No generic recovery strategy available"
         )
+
+    def _is_maven_missing_project(
+        self, error_code: str, error_msg: str, analysis: Dict[str, Any]
+    ) -> bool:
+        error_lower = error_msg.lower()
+        return (
+            error_code == "NO_POM_XML"
+            or analysis.get("error_type") == "MISSING_PROJECT"
+            or "no pom.xml found" in error_lower
+            or ("pom" in error_lower and "not" in error_lower)
+        )
+
+    def _is_maven_working_directory_error(
+        self, error_code: str, error_msg: str, analysis: Dict[str, Any]
+    ) -> bool:
+        error_lower = error_msg.lower()
+        return (
+            self._is_maven_missing_project(error_code, error_msg, analysis)
+            or "not found" in error_lower
+            or "no such file" in error_lower
+        )
+
+    def _is_gradle_working_directory_error(
+        self, error_code: str, error_msg: str
+    ) -> bool:
+        error_lower = error_msg.lower()
+        return (
+            error_code == "BUILD_FILE_NOT_FOUND"
+            or "no build.gradle" in error_lower
+            or ("build.gradle" in error_lower and "not" in error_lower)
+            or "not found" in error_lower
+            or "no such file" in error_lower
+        )
+
+    def _gradle_task_value(self, params: Dict[str, Any]) -> str:
+        return str(params.get("tasks") or params.get("command") or params.get("task") or "")
 
     def _attempted(
         self,
@@ -128,8 +574,9 @@ class ToolRecoveryHandler:
         message: str,
         result: ToolResult,
         recovery_params: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> RecoveryDecision:
-        metadata = {
+        recovery_metadata = {
             "attempted": True,
             "success": result.success,
             "message": message,
@@ -137,13 +584,16 @@ class ToolRecoveryHandler:
             "replacement_result_success": result.success,
             "recovery_params": recovery_params,
         }
+        if metadata:
+            recovery_metadata.update(metadata)
+
         return RecoveryDecision(
             should_recover=True,
             strategy=strategy,
             guidance=message,
             replacement_result=result,
             replacement_params=recovery_params,
-            metadata=metadata,
+            metadata=recovery_metadata,
         )
 
     def _no_strategy(
@@ -160,3 +610,57 @@ class ToolRecoveryHandler:
                 "strategy": strategy,
             },
         )
+
+    def _guidance_only(
+        self,
+        *,
+        strategy: str,
+        message: str,
+        result: ToolResult,
+        params: Dict[str, Any],
+    ) -> RecoveryDecision:
+        metadata = {
+            "attempted": True,
+            "success": False,
+            "message": message,
+            "strategy": strategy,
+            "replacement_result_success": result.success,
+            "recovery_params": params,
+            "guidance_only": True,
+        }
+        return RecoveryDecision(
+            should_recover=True,
+            strategy=strategy,
+            guidance=message,
+            replacement_result=result,
+            replacement_params=params,
+            metadata=metadata,
+        )
+
+    def _normalize_properties(self, raw_props: Any) -> List[str]:
+        if not raw_props:
+            return []
+        if isinstance(raw_props, list):
+            return [prop for prop in raw_props if prop]
+        if isinstance(raw_props, str):
+            return [prop.strip() for prop in raw_props.split(",") if prop.strip()]
+        return [str(raw_props)]
+
+    def _ensure_flag(self, props: List[str], flag: str) -> List[str]:
+        if flag not in props:
+            props.append(flag)
+        return props
+
+    def _set_property(self, props: List[str], prefix: str, value: str) -> List[str]:
+        updated = [prop for prop in props if not prop.startswith(prefix)]
+        updated.append(f"{prefix}{value}")
+        return updated
+
+    def _format_test_exclusion(self, name: str) -> str:
+        cleaned = (name or "").strip()
+        if not cleaned:
+            return cleaned
+        if "." in cleaned and "#" not in cleaned:
+            cls, method = cleaned.rsplit(".", 1)
+            return f"{cls}#{method}"
+        return cleaned

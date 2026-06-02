@@ -155,10 +155,9 @@ class MavenTool(BaseTool):
 
         # Handle ignore_test_failures by adding to properties
         if ignore_test_failures:
-            if properties:
-                properties += ",maven.test.failure.ignore=true"
-            else:
-                properties = "maven.test.failure.ignore=true"
+            properties = self._append_maven_property(
+                properties, "maven.test.failure.ignore=true"
+            )
 
         # CRITICAL FIX: Make fail_at_end work correctly for test commands
         # Maven's --fail-at-end doesn't continue after test failures, only compilation failures
@@ -166,11 +165,9 @@ class MavenTool(BaseTool):
         if fail_at_end and command in ["test", "verify", "integration-test"]:
             logger.info("📝 Enabling test failure ignore for fail_at_end with test command")
             logger.info("   (Maven's --fail-at-end doesn't continue after test failures)")
-            if properties:
-                if "maven.test.failure.ignore" not in properties:
-                    properties += ",maven.test.failure.ignore=true"
-            else:
-                properties = "maven.test.failure.ignore=true"
+            properties = self._append_maven_property(
+                properties, "maven.test.failure.ignore=true"
+            )
 
         # Validate that pom.xml exists in the working directory
         pom_validation = self._validate_pom_exists(working_directory, pom_file)
@@ -251,6 +248,9 @@ class MavenTool(BaseTool):
             else:
                 # Use regular version for quick commands like help, version, etc.
                 result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+
+            if result.get("termination_reason"):
+                return self._timeout_result_from_command(result, maven_cmd, command)
 
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
@@ -463,6 +463,72 @@ class MavenTool(BaseTool):
                 cmd_parts.extend(shlex.split(extra_args))
 
         return " ".join(cmd_parts)
+
+    def _append_maven_property(self, properties: Any, prop: str) -> Any:
+        prop_name = prop.split("=", 1)[0]
+        if not properties:
+            return prop
+
+        if isinstance(properties, list):
+            updated = list(properties)
+            if not self._has_maven_property(updated, prop_name):
+                updated.append(prop)
+            return updated
+
+        if self._has_maven_property(properties, prop_name):
+            return properties
+        return f"{properties},{prop}"
+
+    def _has_maven_property(self, properties: Any, prop_name: str) -> bool:
+        if isinstance(properties, list):
+            return any(self._property_name(entry) == prop_name for entry in properties)
+        return any(
+            self._property_name(entry.strip()) == prop_name
+            for entry in str(properties).split(",")
+            if entry.strip()
+        )
+
+    def _property_name(self, prop: Any) -> str:
+        cleaned = str(prop).strip()
+        if cleaned.startswith("-D"):
+            cleaned = cleaned[2:]
+        return cleaned.split("=", 1)[0]
+
+    def _timeout_result_from_command(
+        self, result: Dict[str, Any], maven_cmd: str, command: str
+    ) -> ToolResult:
+        reason = str(result.get("termination_reason") or "unknown")
+        sanitized_reason = re.sub(r"[^A-Za-z0-9]+", "_", reason).strip("_").upper()
+        error_code = f"TIMEOUT_{sanitized_reason or 'UNKNOWN'}"
+        execution_time = result.get("execution_time", 0)
+        try:
+            execution_time_display = float(execution_time)
+        except (TypeError, ValueError):
+            execution_time_display = 0.0
+        suggestions = [
+            "Break the Maven build into smaller phases",
+            "Run dependency resolution before the full build",
+            "Retry with a narrower module or test selection",
+        ]
+        return ToolResult(
+            success=False,
+            output=(
+                f"Maven command timed out due to {reason} after "
+                f"{execution_time_display:.1f}s."
+            ),
+            error=f"Maven command timed out ({reason})",
+            error_code=error_code,
+            suggestions=suggestions,
+            raw_output=result.get("output"),
+            metadata={
+                "termination_reason": reason,
+                "execution_time": execution_time,
+                "command": maven_cmd,
+                "requested_command": command,
+                "exit_code": result.get("exit_code"),
+                "tool_type": "maven",
+            },
+        )
 
     def _ensure_maven_in_path(self):
         """Ensure Maven is accessible in PATH for bash tool compatibility."""

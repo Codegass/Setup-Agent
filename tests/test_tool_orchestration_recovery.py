@@ -12,8 +12,16 @@ class ResultTool(BaseTool):
             "properties": {
                 "action": {"type": "string"},
                 "command": {"type": "string"},
+                "task": {"type": "string"},
+                "tasks": {"type": "string"},
                 "repository_url": {"type": "string"},
                 "summary": {"type": "string"},
+                "java_version": {"type": "string"},
+                "working_directory": {"type": "string"},
+                "pom_file": {"type": "string"},
+                "properties": {"type": ["string", "array"]},
+                "fail_at_end": {"type": "boolean"},
+                "timeout": {"type": "integer"},
             },
             "required": [],
         }
@@ -59,26 +67,50 @@ def _orchestrator(
     repository_url=None,
     events=None,
     state_updates=None,
+    successful_states=None,
+    guidance=None,
 ):
     if events is None:
         events = []
     if state_updates is None:
         state_updates = []
+    if successful_states is None:
+        successful_states = {}
+    if guidance is None:
+        guidance = []
 
     return ToolOrchestrator(
         tools=tools,
         context_manager=context_manager,
         recent_tool_executions=[],
-        successful_states={},
+        successful_states=successful_states,
         repository_url=repository_url,
         track_tool_execution=lambda signature, success: None,
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
-        add_system_guidance=lambda message, priority=5: None,
+        add_system_guidance=lambda message, priority=5: guidance.append(
+            (message, priority)
+        ),
         get_timestamp=lambda: "ts",
         event_sink=events.append,
     )
+
+
+class FakeBuildOrchestrator:
+    def __init__(self, output, project_name=None):
+        self.output = output
+        self.project_name = project_name
+        self.commands = []
+
+    def execute_command(self, command):
+        self.commands.append(command)
+        return {"success": True, "output": self.output, "exit_code": 0}
+
+
+class BuildContextManager:
+    def __init__(self, orchestrator):
+        self.orchestrator = orchestrator
 
 
 def test_project_setup_recovery_injects_repository_url():
@@ -225,3 +257,628 @@ def test_generic_recovery_returns_failure_without_silent_success():
         execution.metadata["recovery"]["message"]
         == "No generic recovery strategy available"
     )
+
+
+def test_maven_java_version_recovery_installs_and_retries():
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Java 17 is required",
+                error_code="JAVA_VERSION_MISMATCH",
+                metadata={
+                    "analysis": {
+                        "java_version_error": {
+                            "required": "17",
+                            "current": "11",
+                        }
+                    }
+                },
+            ),
+            ToolResult(success=True, output="build ok"),
+        ],
+    )
+    system = ResultTool(
+        "system",
+        [
+            ToolResult(success=False, output="", error="missing"),
+            ToolResult(success=True, output="installed"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"maven": maven, "system": system})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    assert execution.status == "recovered"
+    assert execution.result.success is True
+    assert execution.recovery_strategy == "maven_java_version"
+    assert execution.executed_params == {"command": "test"}
+    assert maven.calls == [{"command": "test"}, {"command": "test"}]
+    assert system.calls == [
+        {"action": "verify_java", "java_version": "17"},
+        {"action": "install_java", "java_version": "17"},
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == {"command": "test"}
+
+
+def test_maven_java_version_failed_install_preserves_maven_execution_params():
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Java 17 is required",
+                error_code="JAVA_VERSION_MISMATCH",
+                metadata={
+                    "analysis": {
+                        "java_version_error": {
+                            "required": "17",
+                            "current": "11",
+                        }
+                    }
+                },
+            ),
+        ],
+    )
+    system = ResultTool(
+        "system",
+        [
+            ToolResult(success=False, output="", error="missing"),
+            ToolResult(success=False, output="", error="install failed"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"maven": maven, "system": system})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    assert execution.status == "recovery_failed"
+    assert execution.recovery_strategy == "maven_java_version"
+    assert execution.executed_params == {"command": "test"}
+    assert execution.metadata["recovery"]["recovery_params"] == {"command": "test"}
+    assert execution.metadata["recovery"]["repair_params"] == {
+        "action": "install_java",
+        "java_version": "17",
+    }
+    assert system.calls == [
+        {"action": "verify_java", "java_version": "17"},
+        {"action": "install_java", "java_version": "17"},
+    ]
+    assert maven.calls == [{"command": "test"}]
+
+
+def test_maven_working_directory_recovery_retries_known_directory():
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="pom.xml not found: no such file",
+                error_code="MISSING_PROJECT",
+            ),
+            ToolResult(success=True, output="build ok"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"maven": maven},
+        successful_states={"working_directory": "/workspace/app"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "maven_known_working_directory"
+    assert execution.executed_params == {
+        "command": "test",
+        "working_directory": "/workspace/app",
+    }
+    assert maven.calls == [
+        {"command": "test"},
+        {"command": "test", "working_directory": "/workspace/app"},
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == execution.executed_params
+
+
+def test_maven_compile_before_test_recovery():
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Compilation failure before tests",
+                error_code="BUILD_FAILED",
+            ),
+            ToolResult(success=True, output="compiled"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"maven": maven})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test", "working_directory": "/workspace/app"},
+            validated_params={"command": "test", "working_directory": "/workspace/app"},
+        )
+    )
+
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "maven_compile_before_test"
+    assert execution.executed_params == {
+        "command": "compile",
+        "working_directory": "/workspace/app",
+    }
+    assert maven.calls == [
+        {"command": "test", "working_directory": "/workspace/app"},
+        {"command": "compile", "working_directory": "/workspace/app"},
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == execution.executed_params
+
+
+def test_maven_pom_discovery_recovery_targets_detected_pom():
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="The goal requires a pom but no pom was found",
+                error_code="BUILD_FAILED",
+                metadata={"analysis": {"error_type": "MISSING_PROJECT"}},
+            ),
+            ToolResult(success=True, output="build ok"),
+        ],
+    )
+    build_orchestrator = FakeBuildOrchestrator(
+        "\n".join(
+            [
+                "/workspace/other/pom.xml",
+                "/workspace/sample/module/pom.xml",
+                "/workspace/sample/pom.xml",
+            ]
+        ),
+        project_name="sample",
+    )
+    orchestrator = _orchestrator(
+        tools={"maven": maven},
+        context_manager=BuildContextManager(build_orchestrator),
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    expected_params = {
+        "command": "test",
+        "pom_file": "/workspace/sample/pom.xml",
+        "working_directory": "/workspace/sample",
+    }
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "maven_pom_discovery"
+    assert execution.executed_params == expected_params
+    assert build_orchestrator.commands == [
+        "find /workspace -maxdepth 4 -name pom.xml | head -20"
+    ]
+    assert maven.calls == [{"command": "test"}, expected_params]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_maven_no_pom_xml_recovery_targets_detected_pom_before_known_directory():
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="No pom.xml found at /workspace",
+                error_code="NO_POM_XML",
+            ),
+            ToolResult(success=True, output="build ok"),
+        ],
+    )
+    build_orchestrator = FakeBuildOrchestrator(
+        "/workspace/sample/pom.xml",
+        project_name="sample",
+    )
+    orchestrator = _orchestrator(
+        tools={"maven": maven},
+        context_manager=BuildContextManager(build_orchestrator),
+        successful_states={"working_directory": "/workspace/known-good"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    expected_params = {
+        "command": "test",
+        "pom_file": "/workspace/sample/pom.xml",
+        "working_directory": "/workspace/sample",
+    }
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "maven_pom_discovery"
+    assert execution.executed_params == expected_params
+    assert maven.calls == [{"command": "test"}, expected_params]
+
+
+def test_maven_module_and_test_exclusion_recovery_records_exclusions():
+    successful_states = {}
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Module and test failures",
+                error_code="BUILD_FAILED",
+                metadata={
+                    "analysis": {
+                        "failed_modules": [
+                            {"artifact_id": "bad-module"},
+                            {"pom_path": "/workspace/app/other/pom.xml"},
+                        ],
+                        "failed_tests": [
+                            "com.example.FooTest.shouldFail",
+                            "com.example.BarTest#bad",
+                        ],
+                    }
+                },
+            ),
+            ToolResult(success=True, output="remaining modules ok"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"maven": maven},
+        successful_states=successful_states,
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test", "properties": ["skipITs=true"]},
+            validated_params={"command": "test", "properties": ["skipITs=true"]},
+        )
+    )
+
+    expected_params = {
+        "command": "test",
+        "properties": [
+            "skipITs=true",
+            "-pl !bad-module,!other",
+            "-am",
+            "test=!com.example.BarTest#bad,!com.example.FooTest#shouldFail",
+        ],
+        "fail_at_end": True,
+    }
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "maven_exclude_modules_or_tests"
+    assert execution.executed_params == expected_params
+    assert maven.calls == [
+        {"command": "test", "properties": ["skipITs=true"]},
+        expected_params,
+    ]
+    assert successful_states["excluded_modules"] == {"bad-module", "other"}
+    assert successful_states["excluded_tests"] == {
+        "com.example.BarTest#bad",
+        "com.example.FooTest#shouldFail",
+    }
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_maven_timeout_returns_guidance_without_retry():
+    guidance = []
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="timed out",
+                error_code="TIMEOUT_WALL",
+                metadata={
+                    "execution_time": 301.2,
+                    "termination_reason": "wall_clock_timeout",
+                },
+            ),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"maven": maven}, guidance=guidance)
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    assert execution.status == "recovery_attempted"
+    assert execution.result.success is False
+    assert execution.result.error_code == "MAVEN_TIMEOUT_HANDLED"
+    assert execution.recovery_applied is True
+    assert execution.recovery_strategy == "maven_timeout_guidance"
+    assert execution.executed_params == {"command": "test"}
+    assert maven.calls == [{"command": "test"}]
+    assert len(guidance) == 1
+    assert guidance[0][1] == "high"
+    assert "MAVEN TIMEOUT" in guidance[0][0]
+    assert execution.metadata["recovery"]["success"] is False
+    assert execution.metadata["recovery"]["replacement_result_success"] is False
+
+
+def test_maven_timeout_takes_precedence_over_retry_recovery():
+    guidance = []
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="pom not found during timeout",
+                error_code="TIMEOUT_IDLE",
+                metadata={
+                    "execution_time": 120.0,
+                    "termination_reason": "idle_timeout",
+                },
+            ),
+            ToolResult(success=True, output="should not retry"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"maven": maven},
+        successful_states={"working_directory": "/workspace/app"},
+        guidance=guidance,
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "test"},
+            validated_params={"command": "test"},
+        )
+    )
+
+    assert execution.status == "recovery_attempted"
+    assert execution.recovery_strategy == "maven_timeout_guidance"
+    assert execution.result.error_code == "MAVEN_TIMEOUT_HANDLED"
+    assert len(maven.calls) == 1
+    assert len(guidance) == 1
+    assert guidance[0][1] == "high"
+    assert "MAVEN TIMEOUT" in guidance[0][0]
+
+
+def test_gradle_timeout_returns_guidance_without_retry():
+    guidance = []
+    gradle = ResultTool(
+        "gradle",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="timed out",
+                error_code="TIMEOUT_WALL",
+                metadata={
+                    "execution_time": 250.0,
+                    "termination_reason": "wall_clock_timeout",
+                },
+            ),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"gradle": gradle}, guidance=guidance)
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="gradle",
+            raw_params={"task": "test"},
+            validated_params={"task": "test"},
+        )
+    )
+
+    assert execution.status == "recovery_attempted"
+    assert execution.result.success is False
+    assert execution.result.error_code == "GRADLE_TIMEOUT_HANDLED"
+    assert execution.recovery_applied is True
+    assert execution.recovery_strategy == "gradle_timeout_guidance"
+    assert execution.executed_params == {"task": "test"}
+    assert gradle.calls == [{"task": "test"}]
+    assert len(guidance) == 1
+    assert guidance[0][1] == "high"
+    assert "GRADLE TIMEOUT" in guidance[0][0]
+    assert execution.metadata["recovery"]["success"] is False
+    assert execution.metadata["recovery"]["replacement_result_success"] is False
+
+
+def test_gradle_working_directory_recovery_retries_known_directory():
+    gradle = ResultTool(
+        "gradle",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="build.gradle not found: no such file",
+                error_code="MISSING_PROJECT",
+            ),
+            ToolResult(success=True, output="build ok"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"gradle": gradle},
+        successful_states={"working_directory": "/workspace/app"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="gradle",
+            raw_params={"task": "test"},
+            validated_params={"task": "test"},
+        )
+    )
+
+    expected_params = {"task": "test", "working_directory": "/workspace/app"}
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "gradle_known_working_directory"
+    assert execution.executed_params == expected_params
+    assert gradle.calls == [{"task": "test"}, expected_params]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_gradle_build_file_not_found_recovery_retries_known_directory():
+    gradle = ResultTool(
+        "gradle",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="No build.gradle or build.gradle.kts found in /workspace",
+                error_code="BUILD_FILE_NOT_FOUND",
+            ),
+            ToolResult(success=True, output="build ok"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"gradle": gradle},
+        successful_states={"working_directory": "/workspace/app"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="gradle",
+            raw_params={"tasks": "test"},
+            validated_params={"tasks": "test"},
+        )
+    )
+
+    expected_params = {"tasks": "test", "working_directory": "/workspace/app"}
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "gradle_known_working_directory"
+    assert execution.executed_params == expected_params
+    assert gradle.calls == [{"tasks": "test"}, expected_params]
+
+
+def test_gradle_compile_fallback_recovery():
+    gradle = ResultTool(
+        "gradle",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Compilation failure before tests",
+                error_code="BUILD_FAILED",
+            ),
+            ToolResult(success=True, output="compiled"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"gradle": gradle})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="gradle",
+            raw_params={"task": "test", "working_directory": "/workspace/app"},
+            validated_params={"task": "test", "working_directory": "/workspace/app"},
+        )
+    )
+
+    expected_params = {"tasks": "compileJava", "working_directory": "/workspace/app"}
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "gradle_compile_before_test"
+    assert execution.executed_params == expected_params
+    assert gradle.calls == [
+        {"task": "test", "working_directory": "/workspace/app"},
+        expected_params,
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_gradle_compile_fallback_recovery_accepts_tasks_parameter():
+    gradle = ResultTool(
+        "gradle",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Compilation failure before tests",
+                error_code="BUILD_FAILED",
+            ),
+            ToolResult(success=True, output="compiled"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"gradle": gradle})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="gradle",
+            raw_params={"tasks": "test", "working_directory": "/workspace/app"},
+            validated_params={"tasks": "test", "working_directory": "/workspace/app"},
+        )
+    )
+
+    expected_params = {"tasks": "compileJava", "working_directory": "/workspace/app"}
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "gradle_compile_before_test"
+    assert execution.executed_params == expected_params
+    assert gradle.calls == [
+        {"tasks": "test", "working_directory": "/workspace/app"},
+        expected_params,
+    ]
+
+
+def test_gradle_compile_fallback_recovery_accepts_command_alias():
+    gradle = ResultTool(
+        "gradle",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Compilation failure before tests",
+                error_code="BUILD_FAILED",
+            ),
+            ToolResult(success=True, output="compiled"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"gradle": gradle})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="gradle",
+            raw_params={"command": "test", "working_directory": "/workspace/app"},
+            validated_params={"command": "test", "working_directory": "/workspace/app"},
+        )
+    )
+
+    expected_params = {"tasks": "compileJava", "working_directory": "/workspace/app"}
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "gradle_compile_before_test"
+    assert execution.executed_params == expected_params
+    assert gradle.calls == [
+        {"command": "test", "working_directory": "/workspace/app"},
+        expected_params,
+    ]

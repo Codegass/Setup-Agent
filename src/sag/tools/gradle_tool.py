@@ -182,6 +182,9 @@ class GradleTool(BaseTool):
                     gradle_cmd, workdir=working_directory, timeout=timeout
                 )
 
+            if result.get("termination_reason"):
+                return self._timeout_result_from_command(result, gradle_cmd, tasks)
+
             # Analyze the output
             analysis = self._analyze_gradle_output(result["output"], result["exit_code"])
 
@@ -415,6 +418,43 @@ class GradleTool(BaseTool):
             cmd_parts.append("build")
 
         return " ".join(cmd_parts)
+
+    def _timeout_result_from_command(
+        self, result: Dict[str, Any], gradle_cmd: str, tasks: str
+    ) -> ToolResult:
+        reason = str(result.get("termination_reason") or "unknown")
+        sanitized_reason = re.sub(r"[^A-Za-z0-9]+", "_", reason).strip("_").upper()
+        error_code = f"TIMEOUT_{sanitized_reason or 'UNKNOWN'}"
+        execution_time = result.get("execution_time", 0)
+        try:
+            execution_time_display = float(execution_time)
+        except (TypeError, ValueError):
+            execution_time_display = 0.0
+        task_name = tasks or "build"
+        suggestions = [
+            "Break the Gradle build into smaller tasks",
+            "Run dependency resolution before the full build",
+            "Retry with --info or --debug to inspect progress",
+        ]
+        return ToolResult(
+            success=False,
+            output=(
+                f"Gradle task timed out due to {reason} after "
+                f"{execution_time_display:.1f}s."
+            ),
+            error=f"Gradle task timed out ({reason})",
+            error_code=error_code,
+            suggestions=suggestions,
+            raw_output=result.get("output"),
+            metadata={
+                "termination_reason": reason,
+                "execution_time": execution_time,
+                "command": gradle_cmd,
+                "task": task_name,
+                "exit_code": result.get("exit_code"),
+                "tool_type": "gradle",
+            },
+        )
 
     def _analyze_gradle_output(self, output: str, exit_code: int) -> Dict[str, Any]:
         """Analyze Gradle output for important information."""

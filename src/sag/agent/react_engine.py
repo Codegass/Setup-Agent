@@ -2963,11 +2963,29 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
         self._trunk_context_cache_timestamp = None
         logger.debug("Trunk context cache invalidated")
 
-    def _add_system_guidance(self, guidance_message: str, priority: int = 5):
+    @staticmethod
+    def _normalize_guidance_priority(priority: Any) -> int:
+        """Convert guidance priority labels to the numeric scale used for display."""
+        if isinstance(priority, str):
+            priority_label = priority.strip().lower()
+            return {
+                "critical": 9,
+                "high": 8,
+                "important": 8,
+                "normal": 5,
+                "medium": 5,
+                "low": 3,
+            }.get(priority_label, 5)
+
+        return priority
+
+    def _add_system_guidance(self, guidance_message: str, priority: int | str = 5):
         """
         Add system guidance with priority handling.
         Higher priority messages are more prominent.
         """
+        priority = self._normalize_guidance_priority(priority)
+
         # Add visual emphasis based on priority
         if priority >= 9:
             prefix = "🚨 CRITICAL GUIDANCE"

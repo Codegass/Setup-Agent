@@ -189,7 +189,9 @@ class ToolOrchestrator:
         self.recovery_handler = ToolRecoveryHandler(
             tools=self.tools,
             context_manager=self.context_manager,
+            successful_states=self.successful_states,
             repository_url=self.repository_url,
+            add_system_guidance=self.add_system_guidance,
             logger=self.logger,
         )
 
@@ -439,7 +441,10 @@ class ToolOrchestrator:
                 if decision.replacement_result is not None:
                     result = decision.replacement_result
                     executed_params = decision.replacement_params or validated_params
-                    status = "recovered" if result.success else "recovery_failed"
+                    if recovery_metadata.get("guidance_only"):
+                        status = "recovery_attempted"
+                    else:
+                        status = "recovered" if result.success else "recovery_failed"
                     recovery_applied = True
                     recovery_metadata["success"] = result.success
                 else:
