@@ -332,6 +332,20 @@ class ToolOrchestrator:
             parameter_fixes=call.parameter_fixes,
             metadata={"execution_signature": signature},
         )
+        if result.success and call.name == "manage_context":
+            action = validated_params.get("action", "")
+            if action in {
+                "start_task",
+                "complete_task",
+                "complete_with_results",
+                "add_context",
+                "compact_context",
+                "create_branch",
+                "switch_to_trunk",
+                "switch_to_branch",
+            }:
+                execution.metadata["invalidate_trunk_cache"] = True
+
         self._emit(
             "tool_result",
             call,

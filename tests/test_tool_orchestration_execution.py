@@ -10,6 +10,15 @@ class EchoTool(BaseTool):
         return ToolResult(success=True, output=f"ran {command}", metadata={"command": command})
 
 
+class ManageContextTool(BaseTool):
+    def __init__(self, *, success=True):
+        super().__init__("manage_context", "Manage context test tool")
+        self.success = success
+
+    def execute(self, action: str, summary: str = "") -> ToolResult:
+        return ToolResult(success=self.success, output=f"{action} result")
+
+
 def test_orchestrator_executes_successful_tool_and_emits_events():
     events = []
     tracking_calls = []
@@ -46,7 +55,8 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
     assert events[-1].metadata["error_code"] is None
     assert events[-1].metadata["executed_params"] == {"command": "pwd"}
     assert events[-1].metadata["recovery_applied"] is False
-    assert tracking_calls == [("echo:[('command', 'pwd')]", True)]
+    assert execution.call.execution_signature == "echo:[('command', 'pwd')]"
+    assert tracking_calls == [(execution.call.execution_signature, True)]
     assert len(state_updates) == 1
     assert state_updates[0][0] == "echo"
     assert state_updates[0][1] == {"command": "pwd"}
@@ -150,8 +160,36 @@ def test_tool_error_metadata_and_suggestions_are_preserved():
     assert execution.result.suggestions == ["try a better command"]
     assert execution.result.metadata["failure_category"] == "validation"
     assert execution.result.metadata["retryable"] is True
-    assert tracking_calls == [("error_tool:[('command', 'bad')]", False)]
+    assert execution.call.execution_signature == "error_tool:[('command', 'bad')]"
+    assert tracking_calls == [(execution.call.execution_signature, False)]
     assert state_updates == []
+
+
+def test_manage_context_invalidation_metadata_only_for_successful_context_changes():
+    def execute_manage_context(action, *, success=True):
+        orchestrator = ToolOrchestrator(
+            tools={"manage_context": ManageContextTool(success=success)},
+            context_manager=None,
+            recent_tool_executions=[],
+            successful_states={},
+            repository_url=None,
+            track_tool_execution=lambda signature, success: None,
+            update_successful_states=lambda tool_name, params, result: None,
+            add_system_guidance=lambda message, priority=5: None,
+            get_timestamp=lambda: "ts",
+        )
+        return orchestrator.execute(
+            ToolCall(name="manage_context", raw_params={"action": action})
+        )
+
+    changing_execution = execute_manage_context("complete_task")
+    info_execution = execute_manage_context("get_info")
+    failed_changing_execution = execute_manage_context("complete_task", success=False)
+
+    assert changing_execution.status == "success"
+    assert changing_execution.metadata.get("invalidate_trunk_cache") is True
+    assert "invalidate_trunk_cache" not in info_execution.metadata
+    assert "invalidate_trunk_cache" not in failed_changing_execution.metadata
 
 
 def test_unexpected_safe_execute_exception_returns_exception_status():
