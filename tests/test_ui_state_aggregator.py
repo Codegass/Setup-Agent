@@ -33,6 +33,78 @@ def test_aggregator_tracks_phase_step_and_status_events():
     assert state.phases[0].steps[-1]["status"] == "success"
 
 
+def test_aggregator_tracks_phase_completion_status_and_timeline():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(UIEvent(EventType.PHASE_START, "Building", phase=PhaseType.BUILD))
+    state = aggregator.handle(
+        UIEvent(EventType.PHASE_COMPLETE, "Build complete", phase=PhaseType.BUILD)
+    )
+
+    build_phase = next(phase for phase in state.phases if phase.phase == PhaseType.BUILD)
+    assert build_phase.status == "success"
+    assert state.current_status == "Build complete"
+    assert state.timeline[-1].kind == "phase"
+    assert state.timeline[-1].message == "Build complete"
+
+
+def test_phase_error_uses_fixed_classification_over_conflicting_metadata():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    verification_state = aggregator.handle(
+        UIEvent(
+            EventType.PHASE_ERROR,
+            "Verification timed out",
+            phase=PhaseType.VERIFICATION,
+            level="error",
+            metadata={"failure_type": "custom_failure", "error_code": "timeout"},
+        )
+    )
+    assert verification_state.latest_error.failure_classification == "verification_failure"
+
+    setup_state = aggregator.handle(
+        UIEvent(
+            EventType.PHASE_ERROR,
+            "Setup timed out",
+            phase=PhaseType.SETUP,
+            level="error",
+            metadata={"failure_type": "custom_failure", "error_code": "timeout"},
+        )
+    )
+    assert setup_state.latest_error.failure_classification == "tool_failure"
+
+
+def test_step_error_marks_running_step_and_records_latest_error():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(UIEvent(EventType.STEP_START, "Install dependencies", phase=PhaseType.BUILD))
+    state = aggregator.handle(
+        UIEvent(
+            EventType.STEP_ERROR,
+            "Install dependencies",
+            phase=PhaseType.BUILD,
+            details="maven failed",
+            level="error",
+        )
+    )
+
+    build_phase = next(phase for phase in state.phases if phase.phase == PhaseType.BUILD)
+    assert build_phase.steps[-1]["status"] == "error"
+    assert build_phase.steps[-1]["details"] == "maven failed"
+    assert state.latest_error.message == "Install dependencies"
+    assert state.timeline[-1].kind == "error"
+
+
+def test_status_update_updates_current_status_and_timeline():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(UIEvent(EventType.STATUS_UPDATE, "Waiting for container"))
+
+    assert state.current_status == "Waiting for container"
+    assert state.timeline[-1].kind == "status"
+    assert state.timeline[-1].message == "Waiting for container"
+
+
 def test_aggregator_tracks_agent_action_as_active_operation():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
 
@@ -65,6 +137,31 @@ def test_aggregator_tracks_agent_action_as_active_operation():
     assert state.current_status.startswith("Using maven")
 
 
+def test_agent_observation_updates_active_operation_detail_current_status_and_timeline():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using bash",
+            metadata={
+                "tool_name": "bash",
+                "tool_params": {"command": "mvn test", "working_directory": "/workspace/app"},
+            },
+        )
+    )
+    state = aggregator.handle(
+        UIEvent(
+            EventType.AGENT_OBSERVATION,
+            "Build successfully completed\nTests are ready",
+        )
+    )
+
+    assert state.active_operation.detail == "Build successfully completed"
+    assert state.current_status == "Build successfully completed"
+    assert state.timeline[-1].kind == "observation"
+
+
 def test_aggregator_records_errors_warnings_completion_and_reports():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
 
@@ -90,6 +187,42 @@ def test_aggregator_records_errors_warnings_completion_and_reports():
     assert final_state.timeline[-1].failure_classification == "final_failure"
 
 
+def test_success_marks_complete_final_status_success_and_completion_timeline():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(UIEvent(EventType.SUCCESS, "Project setup complete"))
+
+    assert state.is_complete is True
+    assert state.final_status == "success"
+    assert state.current_status == "Project setup complete"
+    assert state.timeline[-1].kind == "completion"
+    assert state.timeline[-1].failure_classification is None
+
+
+def test_warning_and_failure_use_fixed_classification_over_conflicting_metadata():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    warning_state = aggregator.handle(
+        UIEvent(
+            EventType.WARNING,
+            "Retrying timeout",
+            level="warning",
+            metadata={"failure_type": "custom_failure", "error_code": "timeout"},
+        )
+    )
+    assert warning_state.latest_warning.failure_classification == "warning"
+
+    failure_state = aggregator.handle(
+        UIEvent(
+            EventType.FAILURE,
+            "Project setup incomplete after timeout",
+            level="error",
+            metadata={"failure_type": "custom_failure", "error_code": "timeout"},
+        )
+    )
+    assert failure_state.timeline[-1].failure_classification == "final_failure"
+
+
 def test_aggregator_records_validation_evidence_and_failure_classification():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
 
@@ -106,6 +239,46 @@ def test_aggregator_records_validation_evidence_and_failure_classification():
     assert validation_state.evidence[-1].kind == "validation"
     assert validation_state.evidence[-1].summary == "2 checks failed"
     assert validation_state.latest_error.failure_classification == "verification_failure"
+
+
+def test_error_level_validation_uses_fixed_classification_over_conflicting_metadata():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    validation_state = aggregator.handle(
+        UIEvent(
+            EventType.VALIDATION_CHECK,
+            "Validation timeout",
+            phase=PhaseType.VERIFICATION,
+            level="error",
+            metadata={
+                "summary": "check failed",
+                "failure_type": "custom_failure",
+                "error_code": "timeout",
+            },
+        )
+    )
+
+    assert validation_state.latest_error.failure_classification == "verification_failure"
+
+
+def test_report_data_and_evidence_metadata_are_defensive_copies():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    metadata = {
+        "report_path": "reports/setup.md",
+        "status": "success",
+        "nested": {"result": "stable"},
+    }
+
+    state = aggregator.handle(
+        UIEvent(EventType.REPORT_GENERATED, "Report generated", metadata=metadata)
+    )
+    metadata["nested"]["result"] = "mutated"
+    metadata["report_path"] = "reports/changed.md"
+
+    assert state.report_data["report_path"] == "reports/setup.md"
+    assert state.report_data["nested"]["result"] == "stable"
+    assert state.evidence[-1].metadata["report_path"] == "reports/setup.md"
+    assert state.evidence[-1].metadata["nested"]["result"] == "stable"
 
 
 def test_aggregator_degrades_unknown_event_to_warning_timeline_entry():

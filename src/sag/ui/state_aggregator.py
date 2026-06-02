@@ -77,7 +77,15 @@ class UIStateAggregator:
     def _handle_phase_error(self, event: UIEvent) -> None:
         if event.phase:
             self._state = self._replace_phase(event.phase, status="error")
-        entry = self._build_timeline(event, kind="error", level="error")
+        classification = (
+            "verification_failure" if event.phase == PhaseType.VERIFICATION else "tool_failure"
+        )
+        entry = self._build_timeline(
+            event,
+            kind="error",
+            level="error",
+            failure_classification=classification,
+        )
         self._state = replace(
             self._state,
             latest_error=entry,
@@ -178,13 +186,23 @@ class UIStateAggregator:
             )
 
         kind = "error" if event.level == "error" else "evidence"
-        entry = self._build_timeline(event, kind=kind, level=event.level)
+        entry = self._build_timeline(
+            event,
+            kind=kind,
+            level=event.level,
+            failure_classification="verification_failure" if kind == "error" else None,
+        )
         if kind == "error":
             self._state = replace(self._state, latest_error=entry)
         self._state = replace(self._state, timeline=self._state.timeline + (entry,))
 
     def _handle_warning(self, event: UIEvent) -> None:
-        entry = self._build_timeline(event, kind="warning", level="warning")
+        entry = self._build_timeline(
+            event,
+            kind="warning",
+            level="warning",
+            failure_classification="warning",
+        )
         self._state = replace(
             self._state,
             latest_warning=entry,
@@ -231,7 +249,12 @@ class UIStateAggregator:
             final_status="failure",
             current_status=event.message,
         )
-        self._state = self._append_timeline(event, kind="completion", level="error")
+        self._state = self._append_timeline(
+            event,
+            kind="completion",
+            level="error",
+            failure_classification="final_failure",
+        )
 
     def _append_timeline(
         self,
@@ -239,13 +262,25 @@ class UIStateAggregator:
         kind: str,
         message: Optional[str] = None,
         level: Optional[str] = None,
+        failure_classification: Optional[str] = None,
     ) -> UIRunState:
-        entry = self._build_timeline(event, kind, message=message, level=level)
+        entry = self._build_timeline(
+            event,
+            kind,
+            message=message,
+            level=level,
+            failure_classification=failure_classification,
+        )
         return replace(self._state, timeline=self._state.timeline + (entry,))
 
     def _append_warning(self, message: str, details: Optional[str] = None) -> UIRunState:
         event = UIEvent(EventType.WARNING, message, details=details, level="warning")
-        entry = self._build_timeline(event, kind="warning", level="warning")
+        entry = self._build_timeline(
+            event,
+            kind="warning",
+            level="warning",
+            failure_classification="warning",
+        )
         return replace(
             self._state,
             latest_warning=entry,
@@ -471,10 +506,13 @@ class UIStateAggregator:
         kind: str,
         message: Optional[str] = None,
         level: Optional[str] = None,
+        failure_classification: Optional[str] = None,
     ) -> UITimelineEntry:
-        classification = None
+        classification = failure_classification
         entry_level = level or event.level
-        if kind in {"warning", "error"} or entry_level in {"warning", "error"}:
+        if classification is None and (
+            kind in {"warning", "error"} or entry_level in {"warning", "error"}
+        ):
             classification = self._classify_failure(event)
         return UITimelineEntry(
             timestamp=self._clock(),
