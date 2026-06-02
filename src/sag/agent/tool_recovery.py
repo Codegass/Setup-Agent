@@ -50,6 +50,10 @@ class ToolRecoveryHandler:
                 return self._recover_maven_error(params, failed_result)
             if tool_name == "gradle":
                 return self._recover_gradle_error(params, failed_result)
+            if tool_name == "bash":
+                return self._recover_bash_error(params, failed_result)
+            if tool_name == "file_io":
+                return self._recover_file_io_error(params, failed_result)
             return self._recover_generic_error(tool_name, params, failed_result)
         except Exception as exc:
             message = f"Recovery mechanism failed: {exc}"
@@ -470,6 +474,214 @@ class ToolRecoveryHandler:
 
         return self._no_strategy(
             "gradle_no_strategy", "No Gradle recovery strategy applicable"
+        )
+
+    def _recover_bash_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        """Recover from bash tool failures."""
+        error_msg = failed_result.error or ""
+        error_code = failed_result.error_code or ""
+
+        if error_code.startswith("TIMEOUT_"):
+            return self._bash_timeout_guidance(params, failed_result)
+
+        metadata = failed_result.metadata or {}
+        exit_code = metadata.get("exit_code", 0)
+        if metadata and (
+            exit_code == 127
+            or "OCI runtime exec failed" in error_msg
+            or "no such file or directory" in error_msg
+        ):
+            decision = self._recover_bash_workspace_recreation(params)
+            if decision.should_recover:
+                return decision
+
+        if self.successful_states.get("working_directory"):
+            recovery_params = dict(params)
+            recovery_params["working_directory"] = self.successful_states[
+                "working_directory"
+            ]
+            result = self.tools["bash"].safe_execute(**recovery_params)
+            return self._attempted(
+                strategy="bash_known_working_directory",
+                message=(
+                    "Recovered by using known working directory: "
+                    f"{self.successful_states['working_directory']}"
+                ),
+                result=result,
+                recovery_params=recovery_params,
+            )
+
+        return self._no_strategy(
+            "bash_no_strategy", "No bash recovery strategy applicable"
+        )
+
+    def _bash_timeout_guidance(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        metadata = failed_result.metadata or {}
+        termination_reason = metadata.get("termination_reason", "")
+        execution_time = metadata.get("monitoring_info", {}).get("execution_time", 0)
+        command = params.get("command", "")
+
+        if "mvn" in command or "maven" in command:
+            timeout_guidance = [
+                "Maven command timed out - this is common for large projects",
+                "Consider breaking down into smaller steps: mvn compile, then mvn test",
+                "Use maven tool instead of bash for better timeout handling",
+                "For multi-module projects, use fail_at_end=True to continue despite module failures",
+            ]
+        elif "gradle" in command:
+            timeout_guidance = [
+                "Gradle command timed out - use gradle tool for better timeout handling",
+                "Consider breaking down into smaller tasks",
+                "Try with --parallel flag for faster execution",
+            ]
+        else:
+            timeout_guidance = [
+                f"Command '{command}' exceeded timeout limits",
+                "Consider breaking the task into smaller steps",
+                "Check if the command requires user interaction",
+                "Investigate if the process is stuck waiting for resources",
+            ]
+
+        self.add_system_guidance(
+            f"TIMEOUT HANDLED: The command '{command}' timed out after "
+            f"{execution_time:.1f}s. This is a normal timeout, not a system "
+            "failure. Consider alternative approaches or breaking the task into "
+            "smaller steps.",
+            priority="high",
+        )
+
+        result = ToolResult(
+            success=False,
+            output=(
+                f"Command timed out after {execution_time:.1f}s due to "
+                f"{termination_reason}.\n\nSuggestions:\n"
+                + "\n".join(f"- {item}" for item in timeout_guidance)
+            ),
+            error=f"Command timed out ({termination_reason})",
+            error_code="TIMEOUT_HANDLED",
+            suggestions=timeout_guidance,
+            metadata={
+                "timeout_handled": True,
+                "execution_time": execution_time,
+                "termination_reason": termination_reason,
+                "original_command": command,
+            },
+        )
+        return self._guidance_only(
+            strategy="bash_timeout_guidance",
+            message=(
+                "Timeout handled gracefully - provided guidance for alternative "
+                "approaches"
+            ),
+            result=result,
+            params=params,
+        )
+
+    def _recover_bash_workspace_recreation(
+        self, params: Dict[str, Any]
+    ) -> RecoveryDecision:
+        recovery_steps = [
+            ("mkdir -p /workspace", "Create workspace directory"),
+            ("chmod 755 /workspace", "Set workspace permissions"),
+            ("touch /workspace/.sag_workspace_marker", "Create workspace marker"),
+        ]
+
+        workspace_fixed = True
+        step_results = []
+        for recovery_cmd, description in recovery_steps:
+            recovery_result = self._execute_workspace_recovery_command(recovery_cmd)
+            step_results.append(
+                {
+                    "command": recovery_cmd,
+                    "description": description,
+                    "success": bool(recovery_result.get("success")),
+                }
+            )
+            if not recovery_result.get("success"):
+                workspace_fixed = False
+                break
+
+        if not workspace_fixed:
+            message = "Failed to recreate workspace directory"
+            return RecoveryDecision(
+                should_recover=True,
+                strategy="bash_workspace_recreation",
+                guidance=message,
+                metadata={
+                    "attempted": True,
+                    "success": False,
+                    "message": message,
+                    "strategy": "bash_workspace_recreation",
+                    "workspace_recovery_steps": step_results,
+                },
+            )
+
+        recovery_params = dict(params)
+        recovery_params["working_directory"] = "/workspace"
+        result = self.tools["bash"].safe_execute(**recovery_params)
+        message = (
+            "Recovered by recreating workspace directory and retrying command"
+            if result.success
+            else "Workspace recreated but command still failed - may be a different issue"
+        )
+        return self._attempted(
+            strategy="bash_workspace_recreation",
+            message=message,
+            result=result,
+            recovery_params=recovery_params,
+            metadata={"workspace_recovery_steps": step_results},
+        )
+
+    def _execute_workspace_recovery_command(self, command: str) -> Dict[str, Any]:
+        orchestrator = getattr(self.context_manager, "orchestrator", None)
+        if orchestrator:
+            try:
+                return orchestrator.execute_command(command, workdir=None)
+            except TypeError:
+                return orchestrator.execute_command(command)
+
+        bash_tool = self.tools.get("bash")
+        if bash_tool:
+            bash_result = bash_tool.safe_execute(
+                command=command, working_directory="/"
+            )
+            return {
+                "success": bash_result.success,
+                "output": bash_result.output,
+            }
+
+        return {
+            "success": False,
+            "output": "No recovery mechanism available",
+        }
+
+    def _recover_file_io_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        """Recover from file I/O tool failures."""
+        action = params.get("action", "")
+        path = params.get("path", "")
+
+        if action == "read" and "not found" in (failed_result.error or "").lower():
+            if self.successful_states.get("working_directory") and not path.startswith("/"):
+                recovery_params = dict(params)
+                recovery_params["path"] = (
+                    f"{self.successful_states['working_directory']}/{path}"
+                )
+                result = self.tools["file_io"].safe_execute(**recovery_params)
+                return self._attempted(
+                    strategy="file_io_known_working_directory",
+                    message="Recovered by adjusting path with working directory",
+                    result=result,
+                    recovery_params=recovery_params,
+                )
+
+        return self._no_strategy(
+            "file_io_no_strategy", "No file I/O recovery strategy applicable"
         )
 
     def _gradle_timeout_guidance(

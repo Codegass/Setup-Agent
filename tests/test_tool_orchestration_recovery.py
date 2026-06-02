@@ -19,6 +19,7 @@ class ResultTool(BaseTool):
                 "java_version": {"type": "string"},
                 "working_directory": {"type": "string"},
                 "pom_file": {"type": "string"},
+                "path": {"type": "string"},
                 "properties": {"type": ["string", "array"]},
                 "fail_at_end": {"type": "boolean"},
                 "timeout": {"type": "integer"},
@@ -111,6 +112,21 @@ class FakeBuildOrchestrator:
 class BuildContextManager:
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
+
+
+class WorkspaceRecoveryOrchestrator:
+    def __init__(self, successes=None):
+        self.successes = list(successes or [True, True, True])
+        self.commands = []
+
+    def execute_command(self, command, workdir=None):
+        self.commands.append({"command": command, "workdir": workdir})
+        success = self.successes.pop(0) if self.successes else True
+        return {
+            "success": success,
+            "output": "ok" if success else "failed",
+            "exit_code": 0 if success else 1,
+        }
 
 
 def test_project_setup_recovery_injects_repository_url():
@@ -882,3 +898,201 @@ def test_gradle_compile_fallback_recovery_accepts_command_alias():
         {"command": "test", "working_directory": "/workspace/app"},
         expected_params,
     ]
+
+
+def test_bash_timeout_guidance_adds_system_guidance():
+    guidance = []
+    bash = ResultTool(
+        "bash",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="timed out",
+                error_code="TIMEOUT_WALL",
+                metadata={
+                    "monitoring_info": {"execution_time": 180.5},
+                    "termination_reason": "wall_clock_timeout",
+                },
+            ),
+            ToolResult(success=True, output="should not retry"),
+        ],
+    )
+    orchestrator = _orchestrator(tools={"bash": bash}, guidance=guidance)
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="bash",
+            raw_params={"command": "mvn test"},
+            validated_params={"command": "mvn test"},
+        )
+    )
+
+    assert execution.status == "recovery_attempted"
+    assert execution.result.success is False
+    assert execution.result.error_code == "TIMEOUT_HANDLED"
+    assert execution.recovery_applied is True
+    assert execution.recovery_strategy == "bash_timeout_guidance"
+    assert execution.executed_params == {"command": "mvn test"}
+    assert bash.calls == [{"command": "mvn test"}]
+    assert len(guidance) == 1
+    assert guidance[0][1] == "high"
+    assert "TIMEOUT HANDLED" in guidance[0][0]
+    assert any(
+        "Maven command timed out" in suggestion
+        for suggestion in execution.result.suggestions
+    )
+    assert execution.metadata["recovery"]["recovery_params"] == {"command": "mvn test"}
+
+
+def test_bash_workspace_recreation_retries_original_command():
+    bash = ResultTool(
+        "bash",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="OCI runtime exec failed: no such file or directory",
+                metadata={"exit_code": 127},
+            ),
+            ToolResult(success=True, output="workspace fixed"),
+        ],
+    )
+    workspace_orchestrator = WorkspaceRecoveryOrchestrator()
+    orchestrator = _orchestrator(
+        tools={"bash": bash},
+        context_manager=BuildContextManager(workspace_orchestrator),
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="bash",
+            raw_params={"command": "pwd", "working_directory": "/missing"},
+            validated_params={"command": "pwd", "working_directory": "/missing"},
+        )
+    )
+
+    expected_params = {"command": "pwd", "working_directory": "/workspace"}
+    assert execution.status == "recovered"
+    assert execution.result.success is True
+    assert execution.recovery_strategy == "bash_workspace_recreation"
+    assert execution.executed_params == expected_params
+    assert bash.calls == [
+        {"command": "pwd", "working_directory": "/missing"},
+        expected_params,
+    ]
+    assert workspace_orchestrator.commands == [
+        {"command": "mkdir -p /workspace", "workdir": None},
+        {"command": "chmod 755 /workspace", "workdir": None},
+        {"command": "touch /workspace/.sag_workspace_marker", "workdir": None},
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_bash_known_working_directory_recovery():
+    bash = ResultTool(
+        "bash",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="working directory is unavailable",
+            ),
+            ToolResult(success=True, output="ok"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"bash": bash},
+        successful_states={"working_directory": "/workspace/app"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="bash",
+            raw_params={"command": "ls"},
+            validated_params={"command": "ls"},
+        )
+    )
+
+    expected_params = {"command": "ls", "working_directory": "/workspace/app"}
+    assert execution.status == "recovered"
+    assert execution.result.success is True
+    assert execution.recovery_strategy == "bash_known_working_directory"
+    assert execution.executed_params == expected_params
+    assert bash.calls == [{"command": "ls"}, expected_params]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_file_io_path_recovery_uses_known_working_directory():
+    file_io = ResultTool(
+        "file_io",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="README.md not found",
+            ),
+            ToolResult(success=True, output="contents"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"file_io": file_io},
+        successful_states={"working_directory": "/workspace/app"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="file_io",
+            raw_params={"action": "read", "path": "README.md"},
+            validated_params={"action": "read", "path": "README.md"},
+        )
+    )
+
+    expected_params = {"action": "read", "path": "/workspace/app/README.md"}
+    assert execution.status == "recovered"
+    assert execution.result.success is True
+    assert execution.recovery_strategy == "file_io_known_working_directory"
+    assert execution.executed_params == expected_params
+    assert file_io.calls == [
+        {"action": "read", "path": "README.md"},
+        expected_params,
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+
+
+def test_recovery_failed_status_when_replacement_result_fails():
+    bash = ResultTool(
+        "bash",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="working directory is unavailable",
+            ),
+            ToolResult(success=False, output="", error="still failed"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"bash": bash},
+        successful_states={"working_directory": "/workspace/app"},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="bash",
+            raw_params={"command": "ls"},
+            validated_params={"command": "ls"},
+        )
+    )
+
+    expected_params = {"command": "ls", "working_directory": "/workspace/app"}
+    assert execution.status == "recovery_failed"
+    assert execution.result.success is False
+    assert execution.recovery_applied is True
+    assert execution.recovery_strategy == "bash_known_working_directory"
+    assert execution.executed_params == expected_params
+    assert bash.calls == [{"command": "ls"}, expected_params]
+    assert execution.metadata["recovery"]["attempted"] is True
+    assert execution.metadata["recovery"]["success"] is False
+    assert execution.metadata["recovery"]["replacement_result_success"] is False
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
