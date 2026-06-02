@@ -3,10 +3,10 @@ from sag.tools.base import BaseTool, ToolError, ToolResult
 
 
 class EchoTool(BaseTool):
-    def __init__(self):
-        super().__init__("echo", "Echo test tool")
+    def __init__(self, name="echo"):
+        super().__init__(name, "Echo test tool")
 
-    def execute(self, command: str) -> ToolResult:
+    def execute(self, command: str, working_directory: str = "/workspace") -> ToolResult:
         return ToolResult(success=True, output=f"ran {command}", metadata={"command": command})
 
 
@@ -61,6 +61,53 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
     assert state_updates[0][0] == "echo"
     assert state_updates[0][1] == {"command": "pwd"}
     assert state_updates[0][2] is execution.result
+
+
+def test_lifecycle_events_include_required_metadata():
+    events = []
+    orchestrator = ToolOrchestrator(
+        tools={"bash": EchoTool("bash")},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda signature, success: None,
+        update_successful_states=lambda tool_name, params, result: None,
+        add_system_guidance=lambda message, priority=5: None,
+        get_timestamp=lambda: "ts",
+        event_sink=events.append,
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(name="bash", raw_params={"cmd": "pwd"}, source_step_index=4)
+    )
+
+    start = events[0]
+    parameters_fixed = next(
+        event for event in events if event.event_type == "tool_parameters_fixed"
+    )
+    result = events[-1]
+
+    assert start.metadata["tool_name"] == "bash"
+    assert start.metadata["source_step_index"] == 4
+    assert start.metadata["raw_params"] == {"cmd": "pwd"}
+    assert "execution_signature" in start.metadata
+    assert parameters_fixed.metadata["raw_params"] == {"cmd": "pwd"}
+    assert parameters_fixed.metadata["validated_params"] == {
+        "command": "pwd",
+        "working_directory": "/workspace",
+    }
+    assert parameters_fixed.metadata["parameter_fixes"]
+    assert parameters_fixed.metadata["params_changed"] is True
+    assert result.metadata["status"] == execution.status
+    assert result.metadata["duration_ms"] is not None
+    assert result.metadata["result_success"] is True
+    assert result.metadata["error_code"] is None
+    assert result.metadata["executed_params"] == {
+        "command": "pwd",
+        "working_directory": "/workspace",
+    }
+    assert result.metadata["recovery_applied"] is False
 
 
 def test_orchestrator_returns_missing_tool_execution_with_existing_feedback():

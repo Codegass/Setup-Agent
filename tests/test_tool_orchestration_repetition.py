@@ -75,6 +75,46 @@ def _orchestrator(*, tools, recent_tool_executions, context_manager=None, tracki
     )
 
 
+def test_java_repetition_auto_fix_emits_required_recovery_and_result_events():
+    bash_tool = CountingTool(name="bash", output="should not run")
+    system_tool = SystemTool()
+    signature = _bash_signature("update-alternatives --config java")
+    events = []
+    orchestrator = ToolOrchestrator(
+        tools={"bash": bash_tool, "system": system_tool},
+        context_manager=ContextWithCurrentContext(),
+        recent_tool_executions=_recent_executions(signature, 5),
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda signature, success: None,
+        update_successful_states=lambda tool_name, params, result: None,
+        add_system_guidance=lambda message, priority=5: None,
+        get_timestamp=lambda: "ts",
+        event_sink=events.append,
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(name="bash", raw_params={"command": "update-alternatives --config java"})
+    )
+
+    recovery_event = next(event for event in events if event.event_type == "tool_recovery")
+    result_event = events[-1]
+    assert result_event.event_type == "tool_result"
+    assert recovery_event.metadata["recovery_strategy"] == "java_configuration_auto_fix"
+    assert recovery_event.metadata["attempted"] is True
+    assert recovery_event.metadata["success"] is True
+    assert recovery_event.metadata["guidance"]
+    assert recovery_event.metadata["replacement_result_success"] is True
+    assert recovery_event.metadata["recovery_params"] == {
+        "action": "install_java",
+        "java_version": "17",
+    }
+    assert recovery_event.metadata["parameter_diff"]
+    assert result_event.metadata["status"] == execution.status
+    assert result_event.metadata["duration_ms"] is not None
+    assert result_event.metadata["recovery_applied"] is True
+
+
 def test_repetition_level_one_executes_with_warning_output():
     tool = CountingTool(output="real output")
     signature = _signature("echo", "pwd")

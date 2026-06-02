@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import time
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
@@ -196,12 +197,21 @@ class ToolOrchestrator:
         )
 
     def execute(self, call: ToolCall) -> ToolExecution:
+        started_at = time.perf_counter()
+        start_signature = call.execution_signature or self._execution_signature(
+            call.name, call.validated_params or call.raw_params
+        )
         self._emit(
             "tool_start",
             call,
             message=f"Starting {call.name}",
             level="info",
-            metadata={"raw_params": call.raw_params},
+            metadata={
+                "tool_name": call.name,
+                "source_step_index": call.source_step_index,
+                "raw_params": call.raw_params,
+                "execution_signature": start_signature,
+            },
         )
 
         if call.name not in self.tools:
@@ -212,23 +222,34 @@ class ToolOrchestrator:
                 output=feedback,
                 error=f"Unknown tool requested: {call.name}",
                 error_code="UNKNOWN_TOOL",
+                suggestions=self._unknown_tool_suggestions(call.name),
             )
+            duration_ms = self._duration_since(started_at)
             execution = ToolExecution(
                 call=call,
                 result=result,
                 status="missing_tool",
                 raw_params=call.raw_params,
                 validated_params=call.validated_params,
+                duration_ms=duration_ms,
                 observation_text=feedback,
                 attempted_execution=False,
                 parameter_fixes=call.parameter_fixes,
+                metadata={"execution_signature": start_signature},
             )
             self._emit(
                 "tool_error",
                 call,
                 message=feedback,
                 level="error",
-                metadata={"status": execution.status, "raw_params": call.raw_params},
+                metadata={
+                    "status": execution.status,
+                    "raw_params": call.raw_params,
+                    "execution_signature": start_signature,
+                    **self._tool_error_metadata(
+                        result, recovery_attempted=False, category="validation"
+                    ),
+                },
             )
             return execution
 
@@ -244,8 +265,12 @@ class ToolOrchestrator:
                     output="",
                     error=f"Tool {call.name} parameter validation failed: {exc}",
                     error_code="PARAMETER_VALIDATION_FAILED",
-                    metadata={"exception_type": type(exc).__name__},
+                    metadata={
+                        "exception_type": type(exc).__name__,
+                        "failure_category": "validation",
+                    },
                 )
+                duration_ms = self._duration_since(started_at)
                 observation_text = format_tool_result(call.name, result)
                 execution = ToolExecution(
                     call=call,
@@ -254,10 +279,14 @@ class ToolOrchestrator:
                     raw_params=call.raw_params,
                     validated_params=None,
                     executed_params=None,
+                    duration_ms=duration_ms,
                     observation_text=observation_text,
                     attempted_execution=False,
                     parameter_fixes=parameter_fixes,
-                    metadata={"validation_exception": type(exc).__name__},
+                    metadata={
+                        "execution_signature": start_signature,
+                        "validation_exception": type(exc).__name__,
+                    },
                 )
                 self._emit(
                     "tool_error",
@@ -267,7 +296,8 @@ class ToolOrchestrator:
                     metadata={
                         "status": execution.status,
                         "raw_params": call.raw_params,
-                        "error_code": result.error_code,
+                        "execution_signature": start_signature,
+                        **self._tool_error_metadata(result, recovery_attempted=False),
                     },
                 )
                 return execution
@@ -276,7 +306,7 @@ class ToolOrchestrator:
 
         call.validated_params = validated_params
         call.parameter_fixes = parameter_fixes
-        signature = f"{call.name}:{str(sorted(validated_params.items()))}"
+        signature = self._execution_signature(call.name, validated_params)
         call.execution_signature = signature
 
         if parameter_fixes:
@@ -310,12 +340,32 @@ class ToolOrchestrator:
                 if self._is_java_configuration_loop(
                     call.name, validated_params, recent_executions
                 ):
-                    return self._attempt_java_configuration_auto_fix(
+                    execution = self._attempt_java_configuration_auto_fix(
                         call,
                         signature,
                         validated_params,
                         repetition_metadata,
                     )
+                    execution.duration_ms = self._duration_since(started_at)
+                    self._emit(
+                        "tool_result",
+                        call,
+                        message=execution.observation_text,
+                        level="success" if execution.result.success else "error",
+                        metadata={
+                            "status": execution.status,
+                            "duration_ms": execution.duration_ms,
+                            "result_success": execution.result.success,
+                            "error_code": execution.result.error_code,
+                            "executed_params": execution.executed_params,
+                            "recovery_applied": execution.recovery_applied,
+                            "execution_signature": signature,
+                            "recovery_strategy": execution.recovery_strategy,
+                            "recovery": execution.metadata.get("recovery"),
+                            **repetition_metadata,
+                        },
+                    )
+                    return execution
 
                 result = ToolResult(
                     success=False,
@@ -332,8 +382,10 @@ class ToolOrchestrator:
                         "Proceeding with next task",
                         "Review logs for root cause analysis",
                     ],
+                    metadata={"failure_category": "execution"},
                 )
                 self._track_tool_execution(signature, False)
+                duration_ms = self._duration_since(started_at)
                 observation_text = format_tool_result(call.name, result)
                 metadata = {
                     "execution_signature": signature,
@@ -347,6 +399,7 @@ class ToolOrchestrator:
                     raw_params=call.raw_params,
                     validated_params=validated_params,
                     executed_params=None,
+                    duration_ms=duration_ms,
                     observation_text=observation_text,
                     attempted_execution=False,
                     parameter_fixes=call.parameter_fixes,
@@ -359,8 +412,8 @@ class ToolOrchestrator:
                     level="error",
                     metadata={
                         "status": execution.status,
-                        "error_code": result.error_code,
                         **metadata,
+                        **self._tool_error_metadata(result, recovery_attempted=False),
                     },
                 )
                 return execution
@@ -374,8 +427,12 @@ class ToolOrchestrator:
                 output="",
                 error=f"Tool {call.name} execution failed unexpectedly: {exc}",
                 error_code="TOOL_EXECUTION_EXCEPTION",
-                metadata={"exception_type": type(exc).__name__},
+                metadata={
+                    "exception_type": type(exc).__name__,
+                    "failure_category": "system",
+                },
             )
+            duration_ms = self._duration_since(started_at)
             observation_text = format_tool_result(call.name, result)
             execution = ToolExecution(
                 call=call,
@@ -384,6 +441,7 @@ class ToolOrchestrator:
                 raw_params=call.raw_params,
                 validated_params=validated_params,
                 executed_params=validated_params,
+                duration_ms=duration_ms,
                 observation_text=observation_text,
                 attempted_execution=True,
                 parameter_fixes=call.parameter_fixes,
@@ -394,7 +452,11 @@ class ToolOrchestrator:
                 call,
                 message=observation_text,
                 level="error",
-                metadata={"status": execution.status, "execution_signature": signature},
+                metadata={
+                    "status": execution.status,
+                    "execution_signature": signature,
+                    **self._tool_error_metadata(result, recovery_attempted=False),
+                },
             )
             return execution
 
@@ -418,6 +480,7 @@ class ToolOrchestrator:
                     if decision.replacement_result is not None
                     else False
                 )
+                recovery_params = decision.replacement_params or validated_params
                 self._emit(
                     "tool_recovery",
                     call,
@@ -433,14 +496,17 @@ class ToolOrchestrator:
                             if decision.replacement_result is not None
                             else None
                         ),
-                        "recovery_params": decision.replacement_params or validated_params,
+                        "recovery_params": recovery_params,
+                        "parameter_diff": self._parameter_diff(
+                            validated_params, recovery_params
+                        ),
                     },
                 )
 
                 recovery_strategy = decision.strategy
                 if decision.replacement_result is not None:
                     result = decision.replacement_result
-                    executed_params = decision.replacement_params or validated_params
+                    executed_params = recovery_params
                     if recovery_metadata.get("guidance_only"):
                         status = "recovery_attempted"
                     else:
@@ -466,6 +532,7 @@ class ToolOrchestrator:
                 f"{warning}\n\n{result.output}" if result.output else warning
             )
 
+        duration_ms = self._duration_since(started_at)
         observation_text = format_tool_result(call.name, result)
         execution_metadata = {"execution_signature": signature, **repetition_metadata}
         if repetition_level == 2:
@@ -482,6 +549,7 @@ class ToolOrchestrator:
             raw_params=call.raw_params,
             validated_params=validated_params,
             executed_params=executed_params,
+            duration_ms=duration_ms,
             observation_text=observation_text,
             recovery_applied=recovery_applied,
             recovery_strategy=recovery_strategy,
@@ -505,6 +573,7 @@ class ToolOrchestrator:
 
         event_metadata = {
             "status": execution.status,
+            "duration_ms": duration_ms,
             "result_success": result.success,
             "error_code": result.error_code,
             "executed_params": executed_params,
@@ -529,6 +598,49 @@ class ToolOrchestrator:
             metadata=event_metadata,
         )
         return execution
+
+    def _execution_signature(self, tool_name: str, params: Dict[str, Any]) -> str:
+        return f"{tool_name}:{str(sorted(params.items()))}"
+
+    def _duration_since(self, started_at: float) -> float:
+        return (time.perf_counter() - started_at) * 1000
+
+    def _tool_error_metadata(
+        self,
+        result: ToolResult,
+        *,
+        recovery_attempted: bool,
+        category: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "error_code": result.error_code,
+            "category": category or result.metadata.get("failure_category") or "execution",
+            "suggestions": list(result.suggestions),
+            "original_error": result.error,
+            "recovery_attempted": recovery_attempted,
+        }
+
+    def _unknown_tool_suggestions(self, requested_tool: str) -> list[str]:
+        suggestions = [
+            "Use one of the available tool names",
+            "For shell commands, use the bash tool with the command parameter",
+            "For file operations, use the file_io tool",
+        ]
+        close_matches = get_close_matches(requested_tool, list(self.tools), n=3, cutoff=0.6)
+        if close_matches:
+            suggestions.insert(0, f"Did you mean: {', '.join(close_matches)}")
+        return suggestions
+
+    def _parameter_diff(
+        self, before: Dict[str, Any], after: Dict[str, Any]
+    ) -> Dict[str, Dict[str, Any]]:
+        diff = {}
+        for key in sorted(set(before) | set(after)):
+            before_value = before.get(key)
+            after_value = after.get(key)
+            if before_value != after_value:
+                diff[key] = {"before": before_value, "after": after_value}
+        return diff
 
     def _recent_signature(self, execution: dict[str, Any] | ToolExecutionRecord) -> str:
         if isinstance(execution, ToolExecutionRecord):
@@ -714,9 +826,20 @@ class ToolOrchestrator:
         self._track_tool_execution(signature, result.success)
         status: ToolExecutionStatus = "recovered" if result.success else "recovery_failed"
         observation_text = format_tool_result(call.name, result)
+        recovery_params = self._java_auto_fix_recovery_params(result)
+        recovery_metadata = {
+            "attempted": True,
+            "success": result.success,
+            "message": observation_text,
+            "strategy": recovery_strategy,
+            "replacement_result_success": result.success,
+            "recovery_params": recovery_params,
+            "parameter_diff": self._parameter_diff(validated_params, recovery_params),
+        }
         metadata = {
             "execution_signature": signature,
             "recovery_strategy": recovery_strategy,
+            "recovery": recovery_metadata,
             **repetition_metadata,
         }
         execution = ToolExecution(
@@ -739,13 +862,23 @@ class ToolOrchestrator:
             message=observation_text,
             level="success" if result.success else "error",
             metadata={
-                "status": execution.status,
-                "result_success": result.success,
-                "error_code": result.error_code,
+                "recovery_strategy": recovery_strategy,
+                "attempted": True,
+                "success": result.success,
+                "guidance": observation_text,
+                "replacement_result_success": result.success,
+                "recovery_params": recovery_params,
+                "parameter_diff": recovery_metadata["parameter_diff"],
                 **metadata,
             },
         )
         return execution
+
+    def _java_auto_fix_recovery_params(self, result: ToolResult) -> Dict[str, Any]:
+        java_version = (result.metadata or {}).get("java_version")
+        if java_version:
+            return {"action": "install_java", "java_version": java_version}
+        return {"action": "verify_java"}
 
     def _auto_fix_java_configuration(self) -> ToolResult:
         """Automatically fix Java configuration issues."""

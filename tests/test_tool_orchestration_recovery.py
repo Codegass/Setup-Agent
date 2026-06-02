@@ -183,6 +183,72 @@ def test_project_setup_recovery_injects_repository_url():
     assert state_updates == [("project_setup", execution.executed_params, execution.result)]
 
 
+def test_recovery_and_error_events_include_required_metadata():
+    events = []
+    project_setup = ResultTool(
+        "project_setup",
+        [
+            ToolResult(success=False, output="", error="missing url"),
+            ToolResult(success=True, output="cloned"),
+        ],
+    )
+    orchestrator = _orchestrator(
+        tools={"project_setup": project_setup},
+        repository_url="https://example/repo.git",
+        events=events,
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="project_setup",
+            raw_params={"action": "clone"},
+            validated_params={"action": "clone"},
+        )
+    )
+
+    recovery_event = next(event for event in events if event.event_type == "tool_recovery")
+    result_event = events[-1]
+    assert recovery_event.metadata["recovery_strategy"] == "project_setup_repository_url"
+    assert recovery_event.metadata["attempted"] is True
+    assert recovery_event.metadata["success"] is True
+    assert recovery_event.metadata["guidance"]
+    assert recovery_event.metadata["replacement_result_success"] is True
+    assert (
+        recovery_event.metadata["recovery_params"]["repository_url"]
+        == "https://example/repo.git"
+    )
+    assert recovery_event.metadata["parameter_diff"]["repository_url"]["before"] is None
+    assert (
+        recovery_event.metadata["parameter_diff"]["repository_url"]["after"]
+        == "https://example/repo.git"
+    )
+    assert result_event.metadata["recovery_applied"] is True
+    assert result_event.metadata["status"] == execution.status
+
+    events = []
+    orchestrator = ToolOrchestrator(
+        tools={},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda signature, success: None,
+        update_successful_states=lambda tool_name, params, result: None,
+        add_system_guidance=lambda message, priority=5: None,
+        get_timestamp=lambda: "ts",
+        event_sink=events.append,
+    )
+    execution = orchestrator.execute(ToolCall(name="missing", raw_params={}))
+
+    error_event = events[-1]
+    assert error_event.event_type == "tool_error"
+    assert error_event.metadata["error_code"] == "UNKNOWN_TOOL"
+    assert error_event.metadata["category"] == "validation"
+    assert error_event.metadata["suggestions"]
+    assert error_event.metadata["original_error"] == execution.result.error
+    assert error_event.metadata["recovery_attempted"] is False
+
+
 def test_manage_context_recovery_uses_single_in_progress_task():
     events = []
     tool = ResultTool(

@@ -1,3 +1,5 @@
+import pytest
+
 from sag.agent.react_engine import ReActEngine
 from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
 from sag.tools.base import BaseTool, ToolResult
@@ -138,25 +140,8 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
     assert [event.event_type for event in events] == ["tool_start", "tool_error"]
 
 
-def test_react_engine_parameter_wrapper_falls_back_to_basic_fixes(monkeypatch):
+def test_react_engine_no_longer_exposes_parameter_wrapper():
     engine = ReActEngine.__new__(ReActEngine)
-    engine.tools = {"bash": BashLikeTool()}
-    engine.context_manager = None
-    engine.recent_tool_executions = []
-    engine.successful_states = {
-        "working_directory": "/workspace/project",
-        "maven_success": False,
-        "cloned_repos": set(),
-    }
-    engine.repository_url = None
 
-    def raise_validation(self, tool_name, params, parameter_fixes=None):
-        raise RuntimeError("schema broke")
-
-    monkeypatch.setattr(
-        ToolOrchestrator,
-        "_validate_and_fix_parameters",
-        raise_validation,
-    )
-
-    assert engine._validate_and_fix_parameters("bash", {}) == {"command": "pwd"}
+    with pytest.raises(AttributeError):
+        getattr(engine, "_validate_and_fix_parameters")

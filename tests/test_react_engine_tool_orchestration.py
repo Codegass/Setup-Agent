@@ -1,6 +1,7 @@
 from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
-from sag.tools.base import ToolResult
+from sag.tools.base import BaseTool, ToolResult
+from sag.ui.events import EventType
 
 
 class ContextWithForceNextTask:
@@ -12,7 +13,7 @@ class ContextWithForceNextTask:
 
 
 class ContextWithoutForceNextTask:
-    pass
+    current_task_id = None
 
 
 class FakeAgentLogger:
@@ -23,7 +24,30 @@ class FakeAgentLogger:
         self.messages.append(message)
 
 
+class FakeConfig:
+    verbose = False
+
+
+class FakeTokenTracker:
+    def __init__(self):
+        self.tool_names = []
+
+    def update_last_tool_name(self, tool_name):
+        self.tool_names.append(tool_name)
+
+
+class EchoTool(BaseTool):
+    def __init__(self):
+        super().__init__("echo", "Echo test tool")
+
+    def execute(self, command: str) -> ToolResult:
+        return ToolResult(success=True, output=f"ran {command}")
+
+
 def _engine_with_context(context=None):
+    if context is None:
+        context = ContextWithoutForceNextTask()
+
     engine = object.__new__(ReActEngine)
     engine.tools = {"bash": object()}
     engine.context_manager = context
@@ -31,7 +55,14 @@ def _engine_with_context(context=None):
     engine.successful_states = {"working_directory": None}
     engine.repository_url = "https://example.test/repo.git"
     engine.current_iteration = 7
+    engine.steps = []
+    engine.config = FakeConfig()
+    engine.agent_logger = FakeAgentLogger()
+    engine.token_tracker = FakeTokenTracker()
+    engine.output_storage = None
+    engine.emit = lambda *args, **kwargs: None
     engine._force_thinking_next = False
+    engine._force_thinking_after_success = False
     engine._cached_trunk_context = "cached"
     engine._trunk_context_cache_timestamp = 123
     return engine
@@ -101,6 +132,23 @@ def test_add_system_guidance_accepts_string_priority():
     assert engine.agent_logger.messages
 
 
+def test_format_tool_result_delegates_to_orchestrator_formatter(monkeypatch):
+    engine = _engine_with_context()
+    result = ToolResult(success=True, output="ok")
+
+    def fake_formatter(tool_name, tool_result):
+        assert tool_name == "bash"
+        assert tool_result is result
+        return "delegated observation"
+
+    monkeypatch.setattr(
+        "sag.agent.react_engine.format_orchestrated_tool_result",
+        fake_formatter,
+    )
+
+    assert engine._format_tool_result("bash", result) == "delegated observation"
+
+
 def test_handle_tool_lifecycle_event_is_temporary_no_op():
     engine = _engine_with_context()
     event = ToolLifecycleEvent(
@@ -110,6 +158,110 @@ def test_handle_tool_lifecycle_event_is_temporary_no_op():
     )
 
     assert engine._handle_tool_lifecycle_event(event) is None
+
+
+def test_react_engine_tool_event_adapter_emits_existing_ui_events():
+    engine = _engine_with_context()
+    emitted = []
+    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+
+    result_event = ToolLifecycleEvent(
+        event_type="tool_result",
+        call=ToolCall(name="echo", raw_params={"command": "pwd"}),
+        message="echo finished",
+        metadata={"status": "success", "result_success": True},
+    )
+    recovery_event = ToolLifecycleEvent(
+        event_type="tool_recovery",
+        call=ToolCall(name="echo", raw_params={"command": "pwd"}),
+        message="echo recovered",
+        level="warning",
+        metadata={"recovery_strategy": "retry"},
+    )
+    error_event = ToolLifecycleEvent(
+        event_type="tool_error",
+        call=ToolCall(name="echo", raw_params={"command": "pwd"}),
+        message="echo failed",
+        metadata={"error_code": "FAIL"},
+    )
+
+    engine._handle_tool_lifecycle_event(result_event)
+    engine._handle_tool_lifecycle_event(recovery_event)
+    engine._handle_tool_lifecycle_event(error_event)
+
+    assert len(emitted) == 2
+    assert emitted[0][0][0] == EventType.WARNING
+    assert emitted[0][1]["message"] == "echo recovered"
+    assert emitted[0][1]["level"] == "warning"
+    assert emitted[0][1]["recovery_strategy"] == "retry"
+    assert emitted[1][0][0] == EventType.ERROR
+    assert emitted[1][1]["message"] == "echo failed"
+    assert emitted[1][1]["level"] == "error"
+    assert emitted[1][1]["error_code"] == "FAIL"
+
+
+def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypatch):
+    result = ToolResult(success=True, output="ok")
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: example",
+        tool_name="example",
+        tool_params={"command": "pwd"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="example", raw_params={"command": "pwd"}),
+        result=result,
+        status="success",
+        raw_params={"command": "pwd"},
+        validated_params={"command": "pwd"},
+        executed_params={"command": "pwd"},
+        observation_text="formatted observation",
+        attempted_execution=True,
+    )
+    engine = _engine_with_context()
+    engine.tools = {}
+
+    class FakeOrchestrator:
+        def execute(self, call):
+            engine.seen_call = call
+            return execution
+
+    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
+
+    assert engine._execute_steps([step]) is True
+    assert engine.seen_call.name == "example"
+    assert engine.seen_call.raw_params == {"command": "pwd"}
+    assert step.tool_result is result
+    assert any(
+        s.step_type == StepType.OBSERVATION and s.content == "formatted observation"
+        for s in engine.steps
+    )
+    assert engine._force_thinking_after_success is True
+
+
+def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator():
+    engine = _engine_with_context()
+    engine.tools = {"echo": EchoTool()}
+    emitted = []
+    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: echo",
+        tool_name="echo",
+        tool_params={"command": "pwd"},
+        timestamp="ts",
+        model_used="model",
+    )
+
+    assert engine._execute_steps([step]) is True
+
+    observation_events = [
+        event for event in emitted if event[0][0] == EventType.AGENT_OBSERVATION
+    ]
+    assert len(observation_events) == 1
+    assert "echo executed successfully" in observation_events[0][1]["message"]
 
 
 def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
