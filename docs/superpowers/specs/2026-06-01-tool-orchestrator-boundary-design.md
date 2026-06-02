@@ -99,10 +99,31 @@ Represents a normalized request to invoke a tool.
 Fields:
 
 - `name: str`
-- `params: Dict[str, Any]`
+- `raw_params: Dict[str, Any]`
+- `validated_params: Optional[Dict[str, Any]]`
+- `parameter_fixes: List[ParameterFix]`
+- `execution_signature: Optional[str]`
 - `raw_action_text: Optional[str]`
 - `source_step_index: Optional[int]`
 - `model_used: Optional[str]`
+
+`raw_params` are the parameters exactly parsed from the model response.
+`validated_params` are the parameters after schema aliasing, default injection,
+and existing `_validate_and_fix_parameters` behavior. `execution_signature` is
+computed from the validated parameters when available, so repetition detection
+does not accidentally key off unnormalized model output.
+
+### `ParameterFix`
+
+Represents a validation or normalization change made before execution.
+
+Fields:
+
+- `field: str`
+- `before: Any`
+- `after: Any`
+- `reason: str`
+- `source: Literal["schema_alias", "default", "state_injection", "safety_fix"]`
 
 ### `ToolExecution`
 
@@ -113,12 +134,40 @@ Fields:
 
 - `call: ToolCall`
 - `result: ToolResult`
-- `status: Literal["success", "failure", "recovered", "skipped"]`
+- `status: Literal["success", "failure", "missing_tool", "validation_failed", "repetition_blocked", "recovery_attempted", "recovered", "recovery_failed", "exception"]`
+- `raw_params: Dict[str, Any]`
+- `validated_params: Optional[Dict[str, Any]]`
+- `executed_params: Optional[Dict[str, Any]]`
 - `duration_ms: Optional[float]`
 - `observation_text: str`
 - `recovery_applied: bool`
 - `recovery_strategy: Optional[str]`
+- `attempted_execution: bool`
+- `parameter_fixes: List[ParameterFix]`
 - `metadata: Dict[str, Any]`
+
+`status` describes the lifecycle outcome. `result.success` still describes the
+success flag on the returned `ToolResult`. These values normally align, but
+they are intentionally separate so handled failures such as timeout guidance can
+be represented without pretending that the original tool operation succeeded.
+
+Status transitions:
+
+| Condition | Tool execution | Recovery | Final status |
+| --- | --- | --- | --- |
+| Tool name is unknown | No | No | `missing_tool` |
+| Parameters cannot be validated or safely fixed | No | No | `validation_failed` |
+| Repetition policy blocks the call before execution | No | May add guidance | `repetition_blocked` |
+| Tool executes and returns success | Yes | No | `success` |
+| Tool executes and returns failure, no strategy applies | Yes | No | `failure` |
+| Tool executes and returns failure, strategy returns handled guidance without retry | Yes | Guidance only | `recovery_attempted` |
+| Tool executes and returns failure, retry or repair succeeds | Yes | Yes | `recovered` |
+| Tool executes and returns failure, retry or repair fails | Yes | Yes | `recovery_failed` |
+| Tool lookup, validation, execution, or recovery raises unexpectedly | Partial | Maybe | `exception` |
+
+When recovery changes parameters, `executed_params` contains the final
+parameters used for the successful or failed replacement execution. If no tool
+was called, `executed_params` is `None`.
 
 ### `RecoveryDecision`
 
@@ -150,13 +199,19 @@ Fields:
 Constructor dependencies:
 
 - `tools: Dict[str, BaseTool]`
-- `context_manager`
-- `recent_tool_executions`
+- `context_manager: ContextManagerProtocol`
+- `recent_tool_executions: MutableSequence[ToolExecutionRecord]`
 - `track_tool_execution: Callable[[str, bool], None]`
 - `update_successful_states: Callable[[str, Dict[str, Any], ToolResult], None]`
-- `add_system_guidance: Callable[[str, int], None]`
+- `add_system_guidance: Callable[[str, GuidancePriority], None]`
 - `event_sink: Optional[Callable[[ToolLifecycleEvent], None]]`
 - `logger`
+
+The first implementation can keep these protocols narrow. They should expose
+only the methods the orchestrator actually needs, such as context loading,
+orchestrator command execution for recovery, and successful-state mutation.
+`GuidancePriority` should preserve current behavior, including numeric
+priorities and existing string priorities such as `"high"`.
 
 Primary method:
 
@@ -174,8 +229,7 @@ Responsibilities:
 - Convert `ToolError` and unexpected exceptions into `ToolResult`.
 - Update tool execution tracking.
 - Update successful state through the injected callback.
-- Apply the existing recovery logic, including Maven/Java/project setup/bash
-  recovery paths.
+- Apply the existing recovery logic across the full current recovery surface.
 - Return a normalized `ToolExecution`.
 
 ## ReActEngine Changes
@@ -204,6 +258,20 @@ the orchestrator and route only a narrow execution path through it, but the
 phase is complete only when the full recovery surface is owned by the
 orchestrator.
 
+Boundary decisions for this phase:
+
+- `ReActEngine` keeps full ReAct step storage, prompt context assembly, branch
+  history, output-history storage, and execution summary generation.
+- `ToolOrchestrator` may return `observation_text` for the tool-centric
+  observation, but `ReActEngine` still decides how that text is attached to the
+  current `ReActStep` and prompt history.
+- Existing physical validation and report evidence enrichment remain in their
+  current tools/report paths. The orchestrator can pass metadata through, but it
+  does not own the evidence model in this phase.
+- The implementation plan must explicitly list any helper that remains on
+  `ReActEngine` after the phase and why it is still loop-level rather than
+  execution-lifecycle behavior.
+
 ## UI/Event Handling
 
 The orchestrator must not import `UIManager`, Rich, or UI rendering objects.
@@ -218,6 +286,19 @@ This keeps future UI work flexible:
 - Tests can capture events without constructing Rich UI state.
 - Future telemetry/reporting can consume the same lifecycle stream.
 
+Required event metadata:
+
+- `tool_start`: tool name, source step index, raw params, and execution
+  signature when available.
+- `tool_parameters_fixed`: raw params, validated params, `ParameterFix` entries,
+  and a boolean `params_changed`.
+- `tool_result`: status, duration, result success flag, error code, executed
+  params, and whether recovery was applied.
+- `tool_recovery`: recovery strategy, attempted flag, success flag, guidance,
+  replacement result success, recovery params, and parameter diff.
+- `tool_error`: error code, error category, suggestions, original error message,
+  and whether recovery was attempted.
+
 ## Recovery Handling
 
 This phase intentionally moves recovery into the orchestration layer, not just
@@ -225,16 +306,36 @@ the happy-path execution.
 
 Recovery migration includes:
 
-- repeated tool execution detection
-- Java configuration auto-fix
-- Maven-focused recovery helpers
-- project setup recovery helpers
-- bash/working-directory recovery helpers
+- repeated tool execution detection and loop-breaking guidance
+- Java configuration auto-fix triggered by repeated execution loop breaking
+- `manage_context` recovery for missing active tasks and invalid task IDs
+- Java version mismatch recovery through the system tool and Maven retry
+- Maven recovery for known working directory reuse, compile-before-test,
+  automatic `pom.xml` discovery, failed module/test exclusions, and timeout
+  guidance
+- Gradle recovery for timeout guidance, known working directory reuse, and
+  compile-before-test fallback
+- project setup recovery for repository URL injection
+- bash recovery for timeout guidance, workspace recreation, and known working
+  directory retry
+- `file_io` recovery for read-path repair using the known working directory
+- generic fallback recovery for tools without a specialized strategy
 - system guidance generated as part of recovery
 
 Recovery should still use existing helpers where practical during the
 transition, but by the end of the phase the orchestration layer should own the
 recovery entry point and decision model.
+
+The implementation plan must audit the current `_attempt_error_recovery` entry
+point, every `_recover_*_error` helper, and loop-breaking auto-fix helpers such
+as `_auto_fix_java_configuration`. Each current branch must be mapped to one of
+these outcomes:
+
+- migrated into a named orchestrator recovery strategy
+- retained outside the orchestrator because it is loop-level behavior
+- removed with an explicit behavior-preservation justification
+
+Silent omission is not acceptable for this phase.
 
 ## Testing Strategy
 
@@ -243,16 +344,31 @@ Add characterization tests before moving behavior.
 Required tests:
 
 - `ToolCall` and `ToolExecution` model construction and metadata behavior.
+- Raw, validated, and executed parameter lifecycle behavior, including
+  `ParameterFix` entries and parameter diffs.
+- Every `ToolExecution.status` value, including missing tool, validation
+  failure, repetition blocked, guidance-only recovery, recovered success,
+  recovery failure, and unexpected exception.
 - Successful tool execution emits start/result lifecycle events.
+- Lifecycle event payloads include the required metadata for each event type.
 - Missing tool returns a failure `ToolExecution` with a useful `ToolResult`.
 - Parameter validation/fix behavior remains compatible with current behavior.
 - `ToolError` becomes a failed `ToolExecution` with suggestions and metadata
   preserved.
 - Repetitive execution handling preserves the current loop-breaking behavior.
-- Recovery path tests cover at least one Maven/Java or project setup recovery
-  scenario with fake tools/context.
+- Repetition-triggered Java configuration auto-fix remains covered when the
+  loop-breaking path moves to the orchestrator.
+- Recovery characterization tests cover every current recovery category:
+  `manage_context`, Java/Maven version repair, Maven working-directory repair,
+  Maven compile-before-test, Maven `pom.xml` discovery, Maven module/test
+  exclusion, Maven timeout guidance, Gradle timeout guidance, Gradle
+  working-directory repair, Gradle compile fallback, project setup repository
+  URL injection, bash timeout guidance, bash workspace recreation, bash
+  working-directory repair, `file_io` path repair, generic fallback, and system
+  guidance emission.
 - `ReActEngine` delegates tool execution to `ToolOrchestrator` without changing
-  recorded observation semantics.
+  recorded observation semantics, branch/output history storage, or prompt
+  context assembly.
 - Existing import, static import, schema, result/state, report, and packaging
   tests remain passing.
 
