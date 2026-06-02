@@ -16,6 +16,7 @@ class ResultTool(BaseTool):
                 "tasks": {"type": "string"},
                 "repository_url": {"type": "string"},
                 "summary": {"type": "string"},
+                "task_id": {"type": "string"},
                 "java_version": {"type": "string"},
                 "working_directory": {"type": "string"},
                 "pom_file": {"type": "string"},
@@ -50,6 +51,12 @@ class Task:
 class TrunkContext:
     def __init__(self, tasks):
         self.todo_list = tasks
+
+    def get_next_pending_task(self):
+        return next(
+            (task for task in self.todo_list if task.status.value == "pending"),
+            None,
+        )
 
 
 class ContextManager:
@@ -302,6 +309,58 @@ def test_manage_context_recovery_uses_single_in_progress_task():
     assert len(recovery_events) == 1
     assert recovery_events[0].metadata["recovery_strategy"] == "manage_context_active_task"
     assert recovery_events[0].metadata["success"] is True
+
+
+def test_manage_context_invalid_task_id_recovery_uses_next_pending_task():
+    events = []
+    tool = ResultTool(
+        "manage_context",
+        [
+            ToolResult(
+                success=False,
+                output="",
+                error="Invalid task ID: task_1",
+                error_code="INVALID_TASK_ID",
+            ),
+            ToolResult(success=True, output="started task_2"),
+        ],
+    )
+    context = ContextManager(
+        TrunkContext(
+            [
+                Task("task_1", TaskStatus("completed")),
+                Task("task_2", TaskStatus("pending")),
+            ]
+        )
+    )
+    orchestrator = _orchestrator(
+        tools={"manage_context": tool},
+        context_manager=context,
+        events=events,
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="manage_context",
+            raw_params={"action": "start_task", "task_id": "task_1"},
+            validated_params={"action": "start_task", "task_id": "task_1"},
+        )
+    )
+
+    expected_params = {"action": "start_task", "task_id": "task_2"}
+    assert execution.status == "recovered"
+    assert execution.recovery_strategy == "manage_context_invalid_task_id"
+    assert execution.executed_params == expected_params
+    assert tool.calls == [
+        {"action": "start_task", "task_id": "task_1"},
+        expected_params,
+    ]
+    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+    recovery_event = next(event for event in events if event.event_type == "tool_recovery")
+    assert recovery_event.metadata["recovery_strategy"] == "manage_context_invalid_task_id"
+    assert recovery_event.metadata["parameter_diff"] == {
+        "task_id": {"before": "task_1", "after": "task_2"}
+    }
 
 
 def test_generic_recovery_returns_failure_without_silent_success():

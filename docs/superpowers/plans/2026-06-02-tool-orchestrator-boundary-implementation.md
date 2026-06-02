@@ -57,6 +57,7 @@ test before moving that branch.
 | --- | --- | --- | --- | --- |
 | Unknown tool feedback and ErrorLogger entry | `unknown_tool_feedback` | `missing_tool` | `None` | `test_orchestrator_returns_missing_tool_execution_with_existing_feedback` |
 | `manage_context` no active task recovery | `manage_context_active_task` | `recovered` or `recovery_failed` | original validated params | `test_manage_context_recovery_uses_single_in_progress_task` |
+| `manage_context` invalid task ID recovery | `manage_context_invalid_task_id` | `recovered` or `recovery_failed` | params with next pending `task_id` | `test_manage_context_invalid_task_id_recovery_uses_next_pending_task` |
 | Project setup missing repository URL | `project_setup_repository_url` | `recovered` or `recovery_failed` | params with injected `repository_url` | `test_project_setup_recovery_injects_repository_url` |
 | Maven Java version mismatch | `maven_java_version` | `recovered` or `recovery_failed` | original Maven params after system repair | `test_maven_java_version_recovery_installs_and_retries` |
 | Maven known working directory retry | `maven_known_working_directory` | `recovered` or `recovery_failed` | params with known `working_directory` | `test_maven_working_directory_recovery_retries_known_directory` |

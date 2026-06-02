@@ -102,6 +102,24 @@ class ToolRecoveryHandler:
             except Exception as exc:
                 self.logger.warning(f"Context recovery failed: {exc}")
 
+        if error_code == "INVALID_TASK_ID" and action == "start_task":
+            try:
+                trunk_context = self.context_manager.load_trunk_context()
+                if trunk_context:
+                    next_task = trunk_context.get_next_pending_task()
+                    if next_task:
+                        recovery_params = dict(params)
+                        recovery_params["task_id"] = next_task.id
+                        result = self.tools["manage_context"].safe_execute(**recovery_params)
+                        return self._attempted(
+                            strategy="manage_context_invalid_task_id",
+                            message=f"Recovered by using next valid task ID: {next_task.id}",
+                            result=result,
+                            recovery_params=recovery_params,
+                        )
+            except Exception as exc:
+                self.logger.warning(f"Task ID recovery failed: {exc}")
+
         return self._no_strategy(None, "No recovery strategy applicable")
 
     def _recover_project_setup_error(
