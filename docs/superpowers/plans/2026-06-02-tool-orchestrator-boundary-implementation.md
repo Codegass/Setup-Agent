@@ -2384,7 +2384,7 @@ Expected: PASS. Current baseline before this plan was `14 passed, 17 warnings`; 
 Run:
 
 ```bash
-rg -n "skill_engine|SkillRegistry|SkillTool|config/skills|AVAILABLE SKILLS|\\.sag/skills" src tests docs
+rg -n "skill""_engine|Skill""Registry|Skill""Tool|config/""skills|AVAILABLE ""SKILLS|\\.sag/""skills" src tests docs
 ```
 
 Expected: no output. This confirms the intentionally excluded skill-engine feature has not been reintroduced.

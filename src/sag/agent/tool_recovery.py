@@ -38,9 +38,7 @@ class ToolRecoveryHandler:
         """Return a recovery decision for a failed tool result."""
         try:
             error_msg = failed_result.error or "Unknown error"
-            self.logger.info(
-                f"Attempting tool recovery for {tool_name}: {error_msg[:100]}"
-            )
+            self.logger.info(f"Attempting tool recovery for {tool_name}: {error_msg[:100]}")
 
             if tool_name == "manage_context":
                 return self._recover_context_management_error(params, failed_result)
@@ -81,9 +79,7 @@ class ToolRecoveryHandler:
 
                     if len(in_progress_tasks) == 1:
                         recovered_task = in_progress_tasks[0]
-                        message = (
-                            f"Recovered by setting current task to {recovered_task.id}"
-                        )
+                        message = f"Recovered by setting current task to {recovered_task.id}"
                     elif len(in_progress_tasks) > 1:
                         recovered_task = max(in_progress_tasks, key=lambda task: task.id)
                         message = (
@@ -124,9 +120,7 @@ class ToolRecoveryHandler:
                 recovery_params=recovery_params,
             )
 
-        return self._no_strategy(
-            None, "No project setup recovery strategy applicable"
-        )
+        return self._no_strategy(None, "No project setup recovery strategy applicable")
 
     def _recover_maven_error(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -153,9 +147,7 @@ class ToolRecoveryHandler:
         if self._is_maven_working_directory_error(error_code, error_msg, analysis):
             if self.successful_states.get("working_directory"):
                 recovery_params = dict(params)
-                recovery_params["working_directory"] = self.successful_states[
-                    "working_directory"
-                ]
+                recovery_params["working_directory"] = self.successful_states["working_directory"]
 
                 result = self.tools["maven"].safe_execute(**recovery_params)
                 return self._attempted(
@@ -186,9 +178,7 @@ class ToolRecoveryHandler:
             if decision.should_recover:
                 return decision
 
-        return self._no_strategy(
-            "maven_no_strategy", "No Maven recovery strategy applicable"
-        )
+        return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
     def _recover_maven_java_version(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -200,9 +190,7 @@ class ToolRecoveryHandler:
         current_version = java_error.get("current", "unknown")
 
         if not required_version:
-            return self._no_strategy(
-                "maven_no_strategy", "No Maven recovery strategy applicable"
-            )
+            return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
         self.logger.info(
             "Attempting Java version recovery: installing Java "
@@ -211,9 +199,7 @@ class ToolRecoveryHandler:
 
         if "system" not in self.tools:
             self.logger.warning("System tool not available for Java installation")
-            return self._no_strategy(
-                "maven_no_strategy", "No Maven recovery strategy applicable"
-            )
+            return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
         verify_result = self.tools["system"].safe_execute(
             action="verify_java", java_version=required_version
@@ -223,8 +209,7 @@ class ToolRecoveryHandler:
             return self._attempted(
                 strategy="maven_java_version",
                 message=(
-                    f"Java {required_version} was already installed, "
-                    "retried Maven command"
+                    f"Java {required_version} was already installed, " "retried Maven command"
                 ),
                 result=result,
                 recovery_params=params,
@@ -240,9 +225,7 @@ class ToolRecoveryHandler:
             result = self.tools["maven"].safe_execute(**params)
             return self._attempted(
                 strategy="maven_java_version",
-                message=(
-                    f"Recovered by installing Java {required_version} and retrying"
-                ),
+                message=(f"Recovered by installing Java {required_version} and retrying"),
                 result=result,
                 recovery_params=params,
             )
@@ -255,14 +238,10 @@ class ToolRecoveryHandler:
             metadata={"repair_params": install_params},
         )
 
-    def _recover_maven_pom_discovery(
-        self, params: Dict[str, Any]
-    ) -> RecoveryDecision:
+    def _recover_maven_pom_discovery(self, params: Dict[str, Any]) -> RecoveryDecision:
         orchestrator = getattr(self.context_manager, "orchestrator", None)
         if not orchestrator:
-            return self._no_strategy(
-                "maven_no_strategy", "No Maven recovery strategy applicable"
-            )
+            return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
         try:
             locate_cmd = "find /workspace -maxdepth 4 -name pom.xml | head -20"
@@ -301,13 +280,9 @@ class ToolRecoveryHandler:
                     recovery_params=recovery_params,
                 )
         except Exception as exc:
-            self.logger.warning(
-                f"Automatic pom.xml discovery failed during Maven recovery: {exc}"
-            )
+            self.logger.warning(f"Automatic pom.xml discovery failed during Maven recovery: {exc}")
 
-        return self._no_strategy(
-            "maven_no_strategy", "No Maven recovery strategy applicable"
-        )
+        return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
     def _recover_maven_exclusions(
         self, params: Dict[str, Any], analysis: Dict[str, Any]
@@ -323,8 +298,7 @@ class ToolRecoveryHandler:
                     failed_modules.append(Path(pom_path).parent.name)
 
         failed_tests = [
-            self._format_test_exclusion(test)
-            for test in analysis.get("failed_tests", [])
+            self._format_test_exclusion(test) for test in analysis.get("failed_tests", [])
         ]
 
         recovery_params = dict(params)
@@ -342,17 +316,13 @@ class ToolRecoveryHandler:
             if excluded_modules and new_exclusions:
                 props = self._normalize_properties(recovery_params.get("properties"))
                 props = [prop for prop in props if not prop.startswith("-pl")]
-                module_clause = ",".join(
-                    f"!{name}" for name in sorted(excluded_modules)
-                )
+                module_clause = ",".join(f"!{name}" for name in sorted(excluded_modules))
                 props.append(f"-pl {module_clause}")
                 props = self._ensure_flag(props, "-am")
                 recovery_params["properties"] = props
 
         if failed_tests:
-            excluded_tests: Set[str] = self.successful_states.setdefault(
-                "excluded_tests", set()
-            )
+            excluded_tests: Set[str] = self.successful_states.setdefault("excluded_tests", set())
             added_test = False
             for test_name in failed_tests:
                 if test_name and test_name not in excluded_tests:
@@ -369,16 +339,12 @@ class ToolRecoveryHandler:
             result = self.tools["maven"].safe_execute(**recovery_params)
             return self._attempted(
                 strategy="maven_exclude_modules_or_tests",
-                message=(
-                    "Recovered by excluding failing modules/tests and rerunning Maven"
-                ),
+                message=("Recovered by excluding failing modules/tests and rerunning Maven"),
                 result=result,
                 recovery_params=recovery_params,
             )
 
-        return self._no_strategy(
-            "maven_no_strategy", "No Maven recovery strategy applicable"
-        )
+        return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
     def _maven_timeout_guidance(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -424,8 +390,7 @@ class ToolRecoveryHandler:
         return self._guidance_only(
             strategy="maven_timeout_guidance",
             message=(
-                "Maven timeout handled gracefully - provided guidance for "
-                "alternative approaches"
+                "Maven timeout handled gracefully - provided guidance for " "alternative approaches"
             ),
             result=result,
             params=params,
@@ -444,9 +409,7 @@ class ToolRecoveryHandler:
         if self._is_gradle_working_directory_error(error_code, error_msg):
             if self.successful_states.get("working_directory"):
                 recovery_params = dict(params)
-                recovery_params["working_directory"] = self.successful_states[
-                    "working_directory"
-                ]
+                recovery_params["working_directory"] = self.successful_states["working_directory"]
                 result = self.tools["gradle"].safe_execute(**recovery_params)
                 return self._attempted(
                     strategy="gradle_known_working_directory",
@@ -472,9 +435,7 @@ class ToolRecoveryHandler:
                 recovery_params=recovery_params,
             )
 
-        return self._no_strategy(
-            "gradle_no_strategy", "No Gradle recovery strategy applicable"
-        )
+        return self._no_strategy("gradle_no_strategy", "No Gradle recovery strategy applicable")
 
     def _recover_bash_error(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -499,9 +460,7 @@ class ToolRecoveryHandler:
 
         if self.successful_states.get("working_directory"):
             recovery_params = dict(params)
-            recovery_params["working_directory"] = self.successful_states[
-                "working_directory"
-            ]
+            recovery_params["working_directory"] = self.successful_states["working_directory"]
             result = self.tools["bash"].safe_execute(**recovery_params)
             return self._attempted(
                 strategy="bash_known_working_directory",
@@ -513,9 +472,7 @@ class ToolRecoveryHandler:
                 recovery_params=recovery_params,
             )
 
-        return self._no_strategy(
-            "bash_no_strategy", "No bash recovery strategy applicable"
-        )
+        return self._no_strategy("bash_no_strategy", "No bash recovery strategy applicable")
 
     def _bash_timeout_guidance(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -574,16 +531,13 @@ class ToolRecoveryHandler:
         return self._guidance_only(
             strategy="bash_timeout_guidance",
             message=(
-                "Timeout handled gracefully - provided guidance for alternative "
-                "approaches"
+                "Timeout handled gracefully - provided guidance for alternative " "approaches"
             ),
             result=result,
             params=params,
         )
 
-    def _recover_bash_workspace_recreation(
-        self, params: Dict[str, Any]
-    ) -> RecoveryDecision:
+    def _recover_bash_workspace_recreation(self, params: Dict[str, Any]) -> RecoveryDecision:
         recovery_steps = [
             ("mkdir -p /workspace", "Create workspace directory"),
             ("chmod 755 /workspace", "Set workspace permissions"),
@@ -646,9 +600,7 @@ class ToolRecoveryHandler:
 
         bash_tool = self.tools.get("bash")
         if bash_tool:
-            bash_result = bash_tool.safe_execute(
-                command=command, working_directory="/"
-            )
+            bash_result = bash_tool.safe_execute(command=command, working_directory="/")
             return {
                 "success": bash_result.success,
                 "output": bash_result.output,
@@ -669,9 +621,7 @@ class ToolRecoveryHandler:
         if action == "read" and "not found" in (failed_result.error or "").lower():
             if self.successful_states.get("working_directory") and not path.startswith("/"):
                 recovery_params = dict(params)
-                recovery_params["path"] = (
-                    f"{self.successful_states['working_directory']}/{path}"
-                )
+                recovery_params["path"] = f"{self.successful_states['working_directory']}/{path}"
                 result = self.tools["file_io"].safe_execute(**recovery_params)
                 return self._attempted(
                     strategy="file_io_known_working_directory",
@@ -680,9 +630,7 @@ class ToolRecoveryHandler:
                     recovery_params=recovery_params,
                 )
 
-        return self._no_strategy(
-            "file_io_no_strategy", "No file I/O recovery strategy applicable"
-        )
+        return self._no_strategy("file_io_no_strategy", "No file I/O recovery strategy applicable")
 
     def _gradle_timeout_guidance(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -739,9 +687,7 @@ class ToolRecoveryHandler:
     def _recover_generic_error(
         self, tool_name: str, params: Dict[str, Any], failed_result: ToolResult
     ) -> RecoveryDecision:
-        return self._no_strategy(
-            "generic_no_strategy", "No generic recovery strategy available"
-        )
+        return self._no_strategy("generic_no_strategy", "No generic recovery strategy available")
 
     def _is_maven_missing_project(
         self, error_code: str, error_msg: str, analysis: Dict[str, Any]
@@ -764,9 +710,7 @@ class ToolRecoveryHandler:
             or "no such file" in error_lower
         )
 
-    def _is_gradle_working_directory_error(
-        self, error_code: str, error_msg: str
-    ) -> bool:
+    def _is_gradle_working_directory_error(self, error_code: str, error_msg: str) -> bool:
         error_lower = error_msg.lower()
         return (
             error_code == "BUILD_FILE_NOT_FOUND"
@@ -808,9 +752,7 @@ class ToolRecoveryHandler:
             metadata=recovery_metadata,
         )
 
-    def _no_strategy(
-        self, strategy: Optional[str], message: str
-    ) -> RecoveryDecision:
+    def _no_strategy(self, strategy: Optional[str], message: str) -> RecoveryDecision:
         return RecoveryDecision(
             should_recover=False,
             strategy=strategy,

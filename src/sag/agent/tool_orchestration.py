@@ -140,9 +140,7 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
             formatted += f"\n\n{result.output}"
 
         if result.suggestions:
-            formatted += f"\n\nSuggestions:\n" + "\n".join(
-                f"• {s}" for s in result.suggestions[:3]
-            )
+            formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])
 
         if result.error_code:
             formatted += f"\nError code: {result.error_code}"
@@ -337,9 +335,7 @@ class ToolOrchestrator:
             }
 
             if repetition_level >= 3:
-                if self._is_java_configuration_loop(
-                    call.name, validated_params, recent_executions
-                ):
+                if self._is_java_configuration_loop(call.name, validated_params, recent_executions):
                     execution = self._attempt_java_configuration_auto_fix(
                         call,
                         signature,
@@ -497,9 +493,7 @@ class ToolOrchestrator:
                             else None
                         ),
                         "recovery_params": recovery_params,
-                        "parameter_diff": self._parameter_diff(
-                            validated_params, recovery_params
-                        ),
+                        "parameter_diff": self._parameter_diff(validated_params, recovery_params),
                     },
                 )
 
@@ -528,9 +522,7 @@ class ToolOrchestrator:
                 repetition_metadata["recent_execution_count"],
                 repetition_metadata["failure_count"],
             )
-            result.output = (
-                f"{warning}\n\n{result.output}" if result.output else warning
-            )
+            result.output = f"{warning}\n\n{result.output}" if result.output else warning
 
         duration_ms = self._duration_since(started_at)
         observation_text = format_tool_result(call.name, result)
@@ -785,9 +777,7 @@ class ToolOrchestrator:
                     return True
             command_contexts.append(str(recent_params.get("command", "")))
 
-        return any(
-            self._has_java_alternatives_marker(context) for context in command_contexts
-        )
+        return any(self._has_java_alternatives_marker(context) for context in command_contexts)
 
     def _params_from_signature(self, signature: str) -> Dict[str, Any]:
         _, _, params_repr = signature.partition(":")
@@ -969,14 +959,10 @@ class ToolOrchestrator:
             return self._apply_basic_parameter_fixes(tool_name, params, fixes)
 
         # Validate and fix parameters
-        validated_params = self._fix_parameters_against_schema(
-            params, schema, tool_name, fixes
-        )
+        validated_params = self._fix_parameters_against_schema(params, schema, tool_name, fixes)
 
         # Apply additional tool-specific fixes
-        validated_params = self._apply_tool_specific_fixes(
-            tool_name, validated_params, fixes
-        )
+        validated_params = self._apply_tool_specific_fixes(tool_name, validated_params, fixes)
 
         # Check for unexpected parameters and provide warnings
         expected_params = set(schema.get("properties", {}).keys())
@@ -984,9 +970,7 @@ class ToolOrchestrator:
         unexpected_params = actual_params - expected_params
 
         if unexpected_params:
-            self.logger.warning(
-                f"🚨 Unexpected parameters for {tool_name}: {unexpected_params}"
-            )
+            self.logger.warning(f"🚨 Unexpected parameters for {tool_name}: {unexpected_params}")
             self.logger.warning(f"Expected parameters: {expected_params}")
 
             # Only remove parameters that are clearly invalid, keep potentially useful ones
@@ -1090,9 +1074,7 @@ class ToolOrchestrator:
                         )
 
         # Handle common parameter naming issues
-        fixed_params = self._fix_parameter_names(
-            fixed_params, properties, tool_name, fixes
-        )
+        fixed_params = self._fix_parameter_names(fixed_params, properties, tool_name, fixes)
 
         return fixed_params
 
@@ -1239,7 +1221,9 @@ class ToolOrchestrator:
                     return value  # Return list of dicts as-is
                 return value if isinstance(value, dict) else {"value": value}
         except Exception as e:
-            self.logger.warning(f"Failed to convert parameter '{param_name}' to {expected_type}: {e}")
+            self.logger.warning(
+                f"Failed to convert parameter '{param_name}' to {expected_type}: {e}"
+            )
             return value
 
         return value
@@ -1649,7 +1633,9 @@ class ToolOrchestrator:
                                 reason="Injected fallback clone target from current working directory",
                                 source="state_injection",
                             )
-                            self.logger.error(f"🚨 Setting fallback clone target: {fallback_target}")
+                            self.logger.error(
+                                f"🚨 Setting fallback clone target: {fallback_target}"
+                            )
                         else:
                             # Use fallback directory as-is
                             fixed_params["target_directory"] = current_workdir
@@ -1661,7 +1647,9 @@ class ToolOrchestrator:
                                 reason="Injected fallback clone target from current working directory",
                                 source="state_injection",
                             )
-                            self.logger.error(f"🚨 Using fallback directory directly: {current_workdir}")
+                            self.logger.error(
+                                f"🚨 Using fallback directory directly: {current_workdir}"
+                            )
                 else:
                     # Normal case - workspace is available
                     self.logger.info("✅ CLONE IN WORKSPACE: Standard workspace cloning")
@@ -1739,9 +1727,7 @@ class ToolOrchestrator:
             if "working_directory" not in fixed_params:
                 if self.successful_states.get("working_directory"):
                     before = fixed_params.get("working_directory")
-                    fixed_params["working_directory"] = self.successful_states[
-                        "working_directory"
-                    ]
+                    fixed_params["working_directory"] = self.successful_states["working_directory"]
                     self._add_parameter_fix(
                         fixes,
                         field="working_directory",
@@ -1807,9 +1793,7 @@ class ToolOrchestrator:
             if "working_directory" not in fixed_params:
                 before = fixed_params.get("working_directory")
                 if self.successful_states.get("working_directory"):
-                    fixed_params["working_directory"] = self.successful_states[
-                        "working_directory"
-                    ]
+                    fixed_params["working_directory"] = self.successful_states["working_directory"]
                     self._add_parameter_fix(
                         fixes,
                         field="working_directory",
@@ -1913,7 +1897,9 @@ class ToolOrchestrator:
                         f"🚨 FILE_IO FALLBACK PATH: {relative_path} → {absolute_path} (not in workspace)"
                     )
                 else:
-                    self.logger.info(f"✅ FILE_IO WORKSPACE PATH: {relative_path} → {absolute_path}")
+                    self.logger.info(
+                        f"✅ FILE_IO WORKSPACE PATH: {relative_path} → {absolute_path}"
+                    )
 
             # PRIORITY CHECK: If path points to /workspace but we're in fallback mode, this is concerning
             elif fixed_params.get("path") and fixed_params["path"].startswith("/workspace"):

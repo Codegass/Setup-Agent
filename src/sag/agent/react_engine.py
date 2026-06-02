@@ -25,8 +25,8 @@ from .tool_orchestration import (
     ToolExecution,
     ToolLifecycleEvent,
     ToolOrchestrator,
-    format_tool_result as format_orchestrated_tool_result,
 )
+from .tool_orchestration import format_tool_result as format_orchestrated_tool_result
 
 
 class StepType(str, Enum):

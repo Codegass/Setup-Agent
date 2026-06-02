@@ -155,9 +155,7 @@ class MavenTool(BaseTool):
 
         # Handle ignore_test_failures by adding to properties
         if ignore_test_failures:
-            properties = self._append_maven_property(
-                properties, "maven.test.failure.ignore=true"
-            )
+            properties = self._append_maven_property(properties, "maven.test.failure.ignore=true")
 
         # CRITICAL FIX: Make fail_at_end work correctly for test commands
         # Maven's --fail-at-end doesn't continue after test failures, only compilation failures
@@ -165,9 +163,7 @@ class MavenTool(BaseTool):
         if fail_at_end and command in ["test", "verify", "integration-test"]:
             logger.info("📝 Enabling test failure ignore for fail_at_end with test command")
             logger.info("   (Maven's --fail-at-end doesn't continue after test failures)")
-            properties = self._append_maven_property(
-                properties, "maven.test.failure.ignore=true"
-            )
+            properties = self._append_maven_property(properties, "maven.test.failure.ignore=true")
 
         # Validate that pom.xml exists in the working directory
         pom_validation = self._validate_pom_exists(working_directory, pom_file)
@@ -513,8 +509,7 @@ class MavenTool(BaseTool):
         return ToolResult(
             success=False,
             output=(
-                f"Maven command timed out due to {reason} after "
-                f"{execution_time_display:.1f}s."
+                f"Maven command timed out due to {reason} after " f"{execution_time_display:.1f}s."
             ),
             error=f"Maven command timed out ({reason})",
             error_code=error_code,

@@ -439,8 +439,7 @@ class GradleTool(BaseTool):
         return ToolResult(
             success=False,
             output=(
-                f"Gradle task timed out due to {reason} after "
-                f"{execution_time_display:.1f}s."
+                f"Gradle task timed out due to {reason} after " f"{execution_time_display:.1f}s."
             ),
             error=f"Gradle task timed out ({reason})",
             error_code=error_code,
