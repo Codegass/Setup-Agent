@@ -2,6 +2,7 @@ import pytest
 
 from sag.agent.react_engine import ReActEngine
 from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
+from sag.agent.tool_parameters import ToolParameterNormalizer
 from sag.tools.base import BaseTool, ToolResult
 
 
@@ -101,6 +102,45 @@ def test_parameter_alias_default_and_state_injection_are_recorded():
     assert len(state_updates) == 1
 
 
+def test_parameter_normalizer_owns_alias_default_and_state_injection():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={
+            "working_directory": "/workspace/project",
+            "maven_success": False,
+            "cloned_repos": set(),
+        },
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix("bash", {"cmd": "echo hi"}, fixes)
+
+    assert params == {
+        "command": "echo hi",
+        "timeout": 60,
+        "working_directory": "/workspace/project",
+    }
+    recorded_fixes = {
+        (fix.source, fix.field, fix.before, fix.after)
+        for fix in fixes
+    }
+    assert ("schema_alias", "command", "help", "echo hi") in recorded_fixes
+    assert ("default", "timeout", None, 60) in recorded_fixes
+    assert (
+        "state_injection",
+        "working_directory",
+        None,
+        "/workspace/project",
+    ) in recorded_fixes
+
+
+def test_tool_orchestrator_no_longer_owns_parameter_strategy_helpers():
+    assert not hasattr(ToolOrchestrator, "_apply_tool_specific_fixes")
+    assert not hasattr(ToolOrchestrator, "_fix_parameter_names")
+    assert not hasattr(ToolOrchestrator, "_get_smart_default")
+
+
 def test_validation_failed_status_when_fixing_raises(monkeypatch):
     execution_attempts = []
 
@@ -119,12 +159,7 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
     def raise_validation(tool_name, params, parameter_fixes=None):
         raise RuntimeError("schema broke")
 
-    monkeypatch.setattr(
-        orchestrator,
-        "_validate_and_fix_parameters",
-        raise_validation,
-        raising=False,
-    )
+    monkeypatch.setattr(orchestrator.parameter_normalizer, "validate_and_fix", raise_validation)
 
     execution = orchestrator.execute(ToolCall(name="echo", raw_params={"command": "run"}))
 
