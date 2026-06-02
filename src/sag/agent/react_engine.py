@@ -21,6 +21,7 @@ from .context_manager import BranchContext, BranchContextHistory, ContextManager
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
 from .token_tracker import TokenTracker
+from .tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent, ToolOrchestrator
 
 
 class StepType(str, Enum):
@@ -1295,6 +1296,49 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
             )
 
         return steps
+
+    def _get_tool_orchestrator(self) -> ToolOrchestrator:
+        """Build the temporary orchestration adapter without changing production routing."""
+        return ToolOrchestrator(
+            tools=self.tools,
+            context_manager=self.context_manager,
+            recent_tool_executions=self.recent_tool_executions,
+            successful_states=self.successful_states,
+            repository_url=self.repository_url,
+            track_tool_execution=self._track_tool_execution,
+            update_successful_states=self._update_successful_states,
+            add_system_guidance=self._add_system_guidance,
+            get_timestamp=self._get_timestamp,
+            event_sink=self._handle_tool_lifecycle_event,
+            logger=logger,
+        )
+
+    def _handle_tool_lifecycle_event(self, event: ToolLifecycleEvent) -> None:
+        """Temporary lifecycle sink; detailed event mapping is handled in a later task."""
+        return None
+
+    def _build_tool_call_from_step(self, step: ReActStep) -> ToolCall:
+        """Translate a parsed ReAct action step into an orchestration tool call."""
+        return ToolCall(
+            name=step.tool_name or "",
+            raw_params=step.tool_params or {},
+            raw_action_text=step.content,
+            source_step_index=self.current_iteration,
+            model_used=step.model_used,
+        )
+
+    def _apply_tool_execution_loop_effects(self, execution: ToolExecution) -> None:
+        """Apply loop-level side effects requested by orchestration metadata."""
+        metadata = execution.metadata or {}
+
+        if metadata.get("force_thinking_next"):
+            self._force_thinking_next = True
+
+        if metadata.get("invalidate_trunk_cache"):
+            self._invalidate_trunk_cache()
+
+        if metadata.get("force_next_task") and hasattr(self.context_manager, "force_next_task"):
+            self.context_manager.force_next_task()
 
     def _execute_steps(self, steps: List[ReActStep]) -> bool:
         """Execute a list of ReAct steps."""
