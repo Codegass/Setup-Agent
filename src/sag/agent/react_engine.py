@@ -2016,123 +2016,20 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         return formatted
 
     def _get_repetition_level(self, tool_signature: str) -> int:
-        """
-        Get the level of repetition for graduated response.
-        Returns:
-            0: No repetition concern
-            1: Warning level (3 repetitions)
-            2: Guidance level (4 repetitions)
-            3: Force break level (5+ repetitions)
-        """
-        # Count exact matches
-        exact_match_count = sum(
-            1
-            for exec_info in self.recent_tool_executions
-            if exec_info["signature"] == tool_signature
-        )
-
-        # Extract tool name
-        tool_name = tool_signature.split(":")[0]
-
-        # Special handling for manage_context
-        if tool_name == "manage_context":
-            if "start_task" in tool_signature or "get_info" in tool_signature:
-                return 0  # Never block these
-            if "complete_with_results" in tool_signature:
-                if exact_match_count >= 6:
-                    return 3
-                elif exact_match_count >= 5:
-                    return 2
-                elif exact_match_count >= 4:
-                    return 1
-                return 0
-
-        # Count tool executions
-        tool_executions = [
-            exec_info
-            for exec_info in self.recent_tool_executions
-            if exec_info["signature"].startswith(tool_name + ":")
-        ]
-        tool_count = len(tool_executions)
-
-        # Determine level based on counts
-        if exact_match_count >= 5 or tool_count >= 8:
-            return 3  # Force break
-        elif exact_match_count >= 4 or tool_count >= 6:
-            return 2  # Guidance
-        elif exact_match_count >= 3 or tool_count >= 5:
-            return 1  # Warning
-
-        return 0  # No concern
+        """Delegate graduated repetition checks to the orchestrator."""
+        return self._get_tool_orchestrator()._get_repetition_level(tool_signature)
 
     def _generate_alternative_suggestions(
         self, tool_name: str, params: Dict, recent_executions: List
     ) -> str:
-        """Generate context-aware alternative suggestions."""
-        suggestions = []
-
-        if tool_name == "bash":
-            # Check for common bash issues
-            if any("update-alternatives" in str(e) for e in recent_executions):
-                suggestions.append(
-                    "Use system tool's install_java action instead of manual update-alternatives"
-                )
-            if any("java" in str(e) for e in recent_executions):
-                suggestions.append(
-                    "Try: system(action='verify_java') to check current Java version"
-                )
-            suggestions.append("Use file_io tool to examine files before executing commands")
-
-        elif tool_name == "maven":
-            suggestions.append("Try: bash(command='mvn --version') to verify Maven installation")
-            suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
-            suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
-
-        elif tool_name == "system":
-            if params.get("action") == "install_java":
-                suggestions.append(
-                    "Java might already be installed - verify with: system(action='verify_java')"
-                )
-                suggestions.append(
-                    "Check available Java versions: bash(command='ls /usr/lib/jvm/')"
-                )
-
-        return "\n• ".join(suggestions) if suggestions else "Try a different tool or approach"
+        """Delegate alternative repetition guidance to the orchestrator."""
+        return self._get_tool_orchestrator()._generate_alternative_suggestions(
+            tool_name, params, recent_executions
+        )
 
     def _auto_fix_java_configuration(self) -> ToolResult:
-        """Automatically fix Java configuration issues."""
-        logger.info("Attempting automatic Java configuration fix")
-
-        # Use the system tool which now has proper architecture detection
-        if "system" in self.tools:
-            # First verify what Java is needed
-            verify_result = self.tools["system"].safe_execute(action="verify_java")
-
-            # Check if Java 17 is needed (common for Tika)
-            if "17" in str(self.context_manager.get_current_context()):
-                logger.info(
-                    "Detected Java 17 requirement, using system tool for proper installation"
-                )
-                install_result = self.tools["system"].safe_execute(
-                    action="install_java", java_version="17"
-                )
-
-                if install_result.success:
-                    return ToolResult(
-                        success=True,
-                        output="✅ Auto-fixed Java configuration using enhanced system tool\n"
-                        + install_result.output,
-                        metadata={"auto_fixed": True, "java_version": "17"},
-                    )
-
-        # Fallback response
-        return ToolResult(
-            success=False,
-            output="Could not auto-fix Java configuration. Skipping to next task.",
-            error="Auto-fix failed",
-            error_code="AUTO_FIX_FAILED",
-            suggestions=["Manual intervention may be required", "Check Java installation logs"],
-        )
+        """Delegate Java configuration recovery to the orchestrator."""
+        return self._get_tool_orchestrator()._auto_fix_java_configuration()
 
     def _is_repetitive_execution(self, tool_signature: str) -> bool:
         """Check if this tool execution is repetitive."""

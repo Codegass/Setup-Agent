@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import re
 from dataclasses import dataclass, field
 from difflib import get_close_matches
 from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
@@ -281,6 +283,78 @@ class ToolOrchestrator:
                 },
             )
 
+        repetition_level = self._get_repetition_level(signature)
+        repetition_metadata: Dict[str, Any] = {}
+        if repetition_level > 0:
+            recent_executions = self._recent_executions_for_tool(call.name)
+            failure_count = sum(
+                1 for execution in recent_executions if not self._execution_success(execution)
+            )
+            repetition_metadata = {
+                "repetition_level": repetition_level,
+                "recent_execution_count": len(recent_executions),
+                "failure_count": failure_count,
+            }
+
+            if repetition_level >= 3:
+                if self._is_java_configuration_loop(
+                    call.name, validated_params, recent_executions
+                ):
+                    return self._attempt_java_configuration_auto_fix(
+                        call,
+                        signature,
+                        validated_params,
+                        repetition_metadata,
+                    )
+
+                result = ToolResult(
+                    success=False,
+                    output=(
+                        f"INFINITE LOOP BROKEN: {call.name} was called "
+                        f"{len(recent_executions)} times without progress.\n"
+                        f"Failures: {failure_count}/{len(recent_executions)}\n"
+                        "Moving to next task to prevent resource waste."
+                    ),
+                    error="Infinite loop detected and broken",
+                    error_code="INFINITE_LOOP_BROKEN",
+                    suggestions=[
+                        "Task has been marked as incomplete",
+                        "Proceeding with next task",
+                        "Review logs for root cause analysis",
+                    ],
+                )
+                self._track_tool_execution(signature, False)
+                observation_text = format_tool_result(call.name, result)
+                metadata = {
+                    "execution_signature": signature,
+                    "force_next_task": True,
+                    **repetition_metadata,
+                }
+                execution = ToolExecution(
+                    call=call,
+                    result=result,
+                    status="repetition_blocked",
+                    raw_params=call.raw_params,
+                    validated_params=validated_params,
+                    executed_params=None,
+                    observation_text=observation_text,
+                    attempted_execution=False,
+                    parameter_fixes=call.parameter_fixes,
+                    metadata=metadata,
+                )
+                self._emit(
+                    "tool_error",
+                    call,
+                    message=observation_text,
+                    level="error",
+                    metadata={
+                        "status": execution.status,
+                        "error_code": result.error_code,
+                        **metadata,
+                    },
+                )
+                return execution
+
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
         except Exception as exc:
@@ -303,7 +377,7 @@ class ToolOrchestrator:
                 observation_text=observation_text,
                 attempted_execution=True,
                 parameter_fixes=call.parameter_fixes,
-                metadata={"execution_signature": signature},
+                metadata={"execution_signature": signature, **repetition_metadata},
             )
             self._emit(
                 "tool_error",
@@ -318,8 +392,24 @@ class ToolOrchestrator:
         if result.success:
             self._update_successful_states(call.name, validated_params, result)
 
+        if repetition_level in {1, 2}:
+            warning = self._build_repetition_warning(
+                call.name,
+                validated_params,
+                repetition_level,
+                repetition_metadata["recent_execution_count"],
+                repetition_metadata["failure_count"],
+            )
+            result.output = (
+                f"{warning}\n\n{result.output}" if result.output else warning
+            )
+
         observation_text = format_tool_result(call.name, result)
         status: ToolExecutionStatus = "success" if result.success else "failure"
+        execution_metadata = {"execution_signature": signature, **repetition_metadata}
+        if repetition_level == 2:
+            execution_metadata["force_thinking_next"] = True
+
         execution = ToolExecution(
             call=call,
             result=result,
@@ -330,7 +420,7 @@ class ToolOrchestrator:
             observation_text=observation_text,
             attempted_execution=True,
             parameter_fixes=call.parameter_fixes,
-            metadata={"execution_signature": signature},
+            metadata=execution_metadata,
         )
         if result.success and call.name == "manage_context":
             action = validated_params.get("action", "")
@@ -346,8 +436,234 @@ class ToolOrchestrator:
             }:
                 execution.metadata["invalidate_trunk_cache"] = True
 
+        event_metadata = {
+            "status": execution.status,
+            "result_success": result.success,
+            "error_code": result.error_code,
+            "executed_params": validated_params,
+            "recovery_applied": False,
+            "execution_signature": signature,
+        }
+        event_metadata.update(repetition_metadata)
+        if execution.metadata.get("force_thinking_next"):
+            event_metadata["force_thinking_next"] = True
+        if execution.metadata.get("invalidate_trunk_cache"):
+            event_metadata["invalidate_trunk_cache"] = True
+
         self._emit(
             "tool_result",
+            call,
+            message=observation_text,
+            level="success" if result.success else "error",
+            metadata=event_metadata,
+        )
+        return execution
+
+    def _recent_signature(self, execution: dict[str, Any] | ToolExecutionRecord) -> str:
+        if isinstance(execution, ToolExecutionRecord):
+            return execution.signature
+        return str(execution.get("signature", ""))
+
+    def _execution_success(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
+        if isinstance(execution, ToolExecutionRecord):
+            return execution.success
+        return bool(execution.get("success", False))
+
+    def _recent_executions_for_tool(
+        self, tool_name: str
+    ) -> list[dict[str, Any] | ToolExecutionRecord]:
+        return [
+            execution
+            for execution in self.recent_tool_executions
+            if self._recent_signature(execution).startswith(tool_name + ":")
+        ]
+
+    def _get_repetition_level(self, tool_signature: str) -> int:
+        """
+        Get the level of repetition for graduated response.
+        Returns:
+            0: No repetition concern
+            1: Warning level (3 repetitions)
+            2: Guidance level (4 repetitions)
+            3: Force break level (5+ repetitions)
+        """
+        exact_match_count = sum(
+            1
+            for execution in self.recent_tool_executions
+            if self._recent_signature(execution) == tool_signature
+        )
+
+        tool_name = tool_signature.split(":")[0]
+
+        if tool_name == "manage_context":
+            if "start_task" in tool_signature or "get_info" in tool_signature:
+                return 0
+            if "complete_with_results" in tool_signature:
+                if exact_match_count >= 6:
+                    return 3
+                if exact_match_count >= 5:
+                    return 2
+                if exact_match_count >= 4:
+                    return 1
+                return 0
+
+        tool_count = len(self._recent_executions_for_tool(tool_name))
+
+        if exact_match_count >= 5 or tool_count >= 8:
+            return 3
+        if exact_match_count >= 4 or tool_count >= 6:
+            return 2
+        if exact_match_count >= 3 or tool_count >= 5:
+            return 1
+
+        return 0
+
+    def _build_repetition_warning(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        repetition_level: int,
+        recent_execution_count: int,
+        failure_count: int,
+    ) -> str:
+        lines = [
+            (
+                f"REPETITIVE EXECUTION WARNING: {tool_name} has been called "
+                f"{recent_execution_count} times."
+            ),
+            f"Failures: {failure_count}/{recent_execution_count}.",
+        ]
+        if repetition_level >= 2:
+            suggestions = self._generate_alternative_suggestions(
+                tool_name, params, self._recent_executions_for_tool(tool_name)
+            )
+            lines.extend(
+                [
+                    "Consider alternative approaches:",
+                    f"• {suggestions}",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _generate_alternative_suggestions(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        recent_executions: list[dict[str, Any] | ToolExecutionRecord],
+    ) -> str:
+        """Generate context-aware alternative suggestions."""
+        suggestions = []
+
+        if tool_name == "bash":
+            if any("update-alternatives" in str(execution) for execution in recent_executions):
+                suggestions.append(
+                    "Use system tool's install_java action instead of manual update-alternatives"
+                )
+            if any("java" in str(execution) for execution in recent_executions):
+                suggestions.append(
+                    "Try: system(action='verify_java') to check current Java version"
+                )
+            suggestions.append("Use file_io tool to examine files before executing commands")
+
+        elif tool_name == "maven":
+            suggestions.append("Try: bash(command='mvn --version') to verify Maven installation")
+            suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
+            suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
+
+        elif tool_name == "system":
+            if params.get("action") == "install_java":
+                suggestions.append(
+                    "Java might already be installed - verify with: system(action='verify_java')"
+                )
+                suggestions.append(
+                    "Check available Java versions: bash(command='ls /usr/lib/jvm/')"
+                )
+
+        return "\n• ".join(suggestions) if suggestions else "Try a different tool or approach"
+
+    def _is_java_configuration_loop(
+        self,
+        tool_name: str,
+        validated_params: Dict[str, Any],
+        recent_executions: list[dict[str, Any] | ToolExecutionRecord],
+    ) -> bool:
+        action = str(validated_params.get("action", "")).lower()
+        if tool_name == "system" and action in {"install_java", "verify_java"}:
+            return True
+
+        command_contexts = [str(validated_params.get("command", ""))]
+        for execution in recent_executions:
+            signature = self._recent_signature(execution)
+            recent_tool_name, _, _ = signature.partition(":")
+            recent_params = self._params_from_signature(signature)
+            if recent_tool_name == "system":
+                recent_action = str(recent_params.get("action", "")).lower()
+                if recent_action in {"install_java", "verify_java"}:
+                    return True
+            command_contexts.append(str(recent_params.get("command", "")))
+
+        return any(
+            self._has_java_alternatives_marker(context) for context in command_contexts
+        )
+
+    def _params_from_signature(self, signature: str) -> Dict[str, Any]:
+        _, _, params_repr = signature.partition(":")
+        try:
+            return dict(ast.literal_eval(params_repr))
+        except (TypeError, ValueError, SyntaxError):
+            return {}
+
+    def _has_java_alternatives_marker(self, value: str) -> bool:
+        context = value.lower()
+        if "update-java-alternatives" in context:
+            return True
+        if re.search(r"\bupdate-alternatives\b[^\n;]*\bjava(?:c)?\b", context):
+            return True
+        return bool(re.search(r"\balternatives\s+--config\s+java(?:c)?\b", context))
+
+    def _attempt_java_configuration_auto_fix(
+        self,
+        call: ToolCall,
+        signature: str,
+        validated_params: Dict[str, Any],
+        repetition_metadata: Dict[str, Any],
+    ) -> ToolExecution:
+        recovery_strategy = "java_configuration_auto_fix"
+        try:
+            result = self._auto_fix_java_configuration()
+        except Exception as exc:
+            result = ToolResult(
+                success=False,
+                output="Could not auto-fix Java configuration. Skipping to next task.",
+                error=f"Auto-fix failed: {exc}",
+                error_code="JAVA_AUTO_FIX_EXCEPTION",
+                metadata={"exception_type": type(exc).__name__},
+            )
+
+        self._track_tool_execution(signature, result.success)
+        status: ToolExecutionStatus = "recovered" if result.success else "recovery_failed"
+        observation_text = format_tool_result(call.name, result)
+        metadata = {
+            "execution_signature": signature,
+            "recovery_strategy": recovery_strategy,
+            **repetition_metadata,
+        }
+        execution = ToolExecution(
+            call=call,
+            result=result,
+            status=status,
+            raw_params=call.raw_params,
+            validated_params=validated_params,
+            executed_params=None,
+            observation_text=observation_text,
+            recovery_applied=True,
+            recovery_strategy=recovery_strategy,
+            attempted_execution=False,
+            parameter_fixes=call.parameter_fixes,
+            metadata=metadata,
+        )
+        self._emit(
+            "tool_recovery",
             call,
             message=observation_text,
             level="success" if result.success else "error",
@@ -355,12 +671,50 @@ class ToolOrchestrator:
                 "status": execution.status,
                 "result_success": result.success,
                 "error_code": result.error_code,
-                "executed_params": validated_params,
-                "recovery_applied": False,
-                "execution_signature": signature,
+                **metadata,
             },
         )
         return execution
+
+    def _auto_fix_java_configuration(self) -> ToolResult:
+        """Automatically fix Java configuration issues."""
+        self.logger.info("Attempting automatic Java configuration fix")
+
+        if "system" in self.tools:
+            self.tools["system"].safe_execute(action="verify_java")
+
+            current_context = ""
+            if self.context_manager and hasattr(self.context_manager, "get_current_context"):
+                try:
+                    current_context = str(self.context_manager.get_current_context())
+                except Exception as exc:
+                    self.logger.warning(f"Failed to inspect current context for Java fix: {exc}")
+
+            if "17" in current_context:
+                self.logger.info(
+                    "Detected Java 17 requirement, using system tool for proper installation"
+                )
+                install_result = self.tools["system"].safe_execute(
+                    action="install_java", java_version="17"
+                )
+
+                if install_result.success:
+                    return ToolResult(
+                        success=True,
+                        output=(
+                            "Auto-fixed Java configuration using enhanced system tool\n"
+                            + install_result.output
+                        ),
+                        metadata={"auto_fixed": True, "java_version": "17"},
+                    )
+
+        return ToolResult(
+            success=False,
+            output="Could not auto-fix Java configuration. Skipping to next task.",
+            error="Auto-fix failed",
+            error_code="AUTO_FIX_FAILED",
+            suggestions=["Manual intervention may be required", "Check Java installation logs"],
+        )
 
     def _add_parameter_fix(
         self,
