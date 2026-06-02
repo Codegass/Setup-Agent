@@ -173,6 +173,8 @@ class ToolOrchestrator:
         event_sink: Optional[Callable[[ToolLifecycleEvent], None]] = None,
         logger: Any = None,
     ):
+        from sag.agent.tool_recovery import ToolRecoveryHandler
+
         self.tools = tools
         self.context_manager = context_manager
         self.recent_tool_executions = recent_tool_executions
@@ -184,6 +186,12 @@ class ToolOrchestrator:
         self.get_timestamp = get_timestamp
         self.event_sink = event_sink
         self.logger = logger or default_logger
+        self.recovery_handler = ToolRecoveryHandler(
+            tools=self.tools,
+            context_manager=self.context_manager,
+            repository_url=self.repository_url,
+            logger=self.logger,
+        )
 
     def execute(self, call: ToolCall) -> ToolExecution:
         self._emit(
@@ -388,9 +396,58 @@ class ToolOrchestrator:
             )
             return execution
 
+        executed_params = validated_params
+        recovery_applied = False
+        recovery_strategy: Optional[str] = None
+        recovery_metadata: Optional[Dict[str, Any]] = None
+        status: ToolExecutionStatus = "success" if result.success else "failure"
+
+        if not result.success:
+            decision = self.recovery_handler.recover(call.name, validated_params, result)
+            recovery_metadata = dict(decision.metadata)
+            recovery_metadata.setdefault("attempted", decision.should_recover)
+            recovery_metadata.setdefault("success", False)
+            recovery_metadata.setdefault("message", decision.guidance)
+            recovery_metadata.setdefault("strategy", decision.strategy)
+
+            if decision.should_recover:
+                replacement_success = (
+                    decision.replacement_result.success
+                    if decision.replacement_result is not None
+                    else False
+                )
+                self._emit(
+                    "tool_recovery",
+                    call,
+                    message=decision.guidance or "Tool recovery attempted",
+                    level="success" if replacement_success else "error",
+                    metadata={
+                        "recovery_strategy": decision.strategy,
+                        "attempted": True,
+                        "success": replacement_success,
+                        "guidance": decision.guidance,
+                        "replacement_result_success": (
+                            decision.replacement_result.success
+                            if decision.replacement_result is not None
+                            else None
+                        ),
+                        "recovery_params": decision.replacement_params or validated_params,
+                    },
+                )
+
+                recovery_strategy = decision.strategy
+                if decision.replacement_result is not None:
+                    result = decision.replacement_result
+                    executed_params = decision.replacement_params or validated_params
+                    status = "recovered" if result.success else "recovery_failed"
+                    recovery_applied = True
+                    recovery_metadata["success"] = result.success
+                else:
+                    status = "recovery_attempted"
+
         self._track_tool_execution(signature, result.success)
         if result.success:
-            self._update_successful_states(call.name, validated_params, result)
+            self._update_successful_states(call.name, executed_params, result)
 
         if repetition_level in {1, 2}:
             warning = self._build_repetition_warning(
@@ -405,10 +462,13 @@ class ToolOrchestrator:
             )
 
         observation_text = format_tool_result(call.name, result)
-        status: ToolExecutionStatus = "success" if result.success else "failure"
         execution_metadata = {"execution_signature": signature, **repetition_metadata}
         if repetition_level == 2:
             execution_metadata["force_thinking_next"] = True
+        if recovery_metadata is not None:
+            execution_metadata["recovery"] = recovery_metadata
+        if recovery_strategy:
+            execution_metadata["recovery_strategy"] = recovery_strategy
 
         execution = ToolExecution(
             call=call,
@@ -416,14 +476,16 @@ class ToolOrchestrator:
             status=status,
             raw_params=call.raw_params,
             validated_params=validated_params,
-            executed_params=validated_params,
+            executed_params=executed_params,
             observation_text=observation_text,
+            recovery_applied=recovery_applied,
+            recovery_strategy=recovery_strategy,
             attempted_execution=True,
             parameter_fixes=call.parameter_fixes,
             metadata=execution_metadata,
         )
         if result.success and call.name == "manage_context":
-            action = validated_params.get("action", "")
+            action = executed_params.get("action", "")
             if action in {
                 "start_task",
                 "complete_task",
@@ -440,10 +502,14 @@ class ToolOrchestrator:
             "status": execution.status,
             "result_success": result.success,
             "error_code": result.error_code,
-            "executed_params": validated_params,
-            "recovery_applied": False,
+            "executed_params": executed_params,
+            "recovery_applied": recovery_applied,
             "execution_signature": signature,
         }
+        if recovery_strategy:
+            event_metadata["recovery_strategy"] = recovery_strategy
+        if recovery_metadata is not None:
+            event_metadata["recovery"] = recovery_metadata
         event_metadata.update(repetition_metadata)
         if execution.metadata.get("force_thinking_next"):
             event_metadata["force_thinking_next"] = True
