@@ -17,6 +17,8 @@ from sag.ui.components import (
     create_error_panel,
     create_evidence_panel,
     create_final_diagnosis_panel,
+    create_live_error_panel,
+    create_live_warning_panel,
     create_phase_timeline,
     create_phase_tree,
     create_recent_timeline_panel,
@@ -610,12 +612,15 @@ class UIManager:
         if state.latest_error:
             elements.append("")
             elements.append(
-                create_error_panel(state.latest_error.message, details=state.latest_error.details)
+                create_live_error_panel(
+                    state.latest_error.message,
+                    details=state.latest_error.details,
+                )
             )
         elif state.latest_warning:
             elements.append("")
             elements.append(
-                create_warning_panel(
+                create_live_warning_panel(
                     state.latest_warning.message, details=state.latest_warning.details
                 )
             )

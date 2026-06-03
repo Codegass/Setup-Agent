@@ -290,3 +290,57 @@ def test_render_display_bounds_long_timeline_operation_and_evidence_text():
     assert "compiler detail" in output
     assert "Captured maven output" in output
     assert "maven.log" in output
+
+
+def test_render_display_bounds_long_phase_step_details():
+    manager = make_manager()
+    long_step_details = "phase detail prefix " + "phase-middle " * 40 + "PHASE_DETAIL_TAIL"
+
+    manager.handle_event(
+        UIEvent(
+            EventType.STEP_START,
+            "Compile sources",
+            phase=PhaseType.BUILD,
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.STEP_COMPLETE,
+            "Compile sources",
+            phase=PhaseType.BUILD,
+            details=long_step_details,
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert long_step_details not in output
+    assert "PHASE_DETAIL_TAIL" not in output
+    assert "phase detail prefix" in output
+
+
+def test_render_display_bounds_latest_error_and_warning_text():
+    for event_type, useful_prefix, tail in (
+        (EventType.ERROR, "error prefix", "ERROR_LIVE_TAIL"),
+        (EventType.WARNING, "warning prefix", "WARNING_LIVE_TAIL"),
+    ):
+        manager = make_manager()
+        long_message = f"{useful_prefix} " + "message-middle " * 40 + tail
+        long_details = f"{useful_prefix} details " + "details-middle " * 40 + tail
+
+        manager.handle_event(
+            UIEvent(
+                event_type,
+                long_message,
+                details=long_details,
+                level="warning" if event_type == EventType.WARNING else "error",
+            )
+        )
+
+        output = render_display_text(manager)
+
+        assert long_message not in output
+        assert long_details not in output
+        assert tail not in output
+        assert useful_prefix in output
+        assert f"{useful_prefix} details" in output

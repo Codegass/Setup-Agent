@@ -173,7 +173,7 @@ def create_phase_timeline(state: UIRunState) -> Tree:
             step_node = node.add(Text(f"{step_icon} {step_name}", style=_status_style(step_status)))
             details = step.get("details")
             if details and step_status in {"success", "error"}:
-                step_node.add(Text(str(details), style="dim"))
+                step_node.add(Text(_clip(details, TEXT_LIMIT), style="dim"))
 
     return tree
 
@@ -226,6 +226,16 @@ def create_recovery_panel(state: UIRunState) -> Panel | None:
         lines.append(f"[cyan]Risk:[/cyan] {_clip(recovery.unresolved_risk, TEXT_LIMIT)}")
 
     return Panel("\n".join(lines), title="Recovery", border_style="yellow", padding=(1, 2))
+
+
+def create_live_error_panel(error_message: str, details: Optional[str] = None) -> Panel:
+    """Create a bounded live error panel."""
+    return create_error_panel(_clip(error_message, TEXT_LIMIT), _optional_clip(details))
+
+
+def create_live_warning_panel(warning_message: str, details: Optional[str] = None) -> Panel:
+    """Create a bounded live warning panel."""
+    return create_warning_panel(_clip(warning_message, TEXT_LIMIT), _optional_clip(details))
 
 
 def create_evidence_panel(state: UIRunState, limit: int = 5) -> Panel | None:
@@ -416,3 +426,9 @@ def _clip(value: object, limit: int, preserve_tail: bool = False) -> str:
         return f"{text[:head_len]}...{text[-tail_len:]}"
 
     return f"{text[: limit - 3]}..."
+
+
+def _optional_clip(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    return _clip(value, TEXT_LIMIT)
