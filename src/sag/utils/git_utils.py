@@ -18,6 +18,11 @@ def extract_project_name_from_url(repo_url: str) -> str:
 
     url = repo_url.strip()
 
+    if "\\" in url:
+        parts = [p for p in url.replace("\\", "/").split("/") if p]
+        if parts:
+            return parts[-1].removesuffix(".git")
+
     # SSH URLs: git@host:user/repo.git
     ssh_match = re.match(r"^git@[^:]+:(.+)$", url)
     if ssh_match:

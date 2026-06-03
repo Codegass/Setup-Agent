@@ -22,8 +22,8 @@ from sag.config import (
     set_config,
     suppress_console_logging,
 )
-from sag.config.git_utils import extract_project_name_from_url
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.utils.git_utils import extract_project_name_from_url
 
 console = Console()
 
