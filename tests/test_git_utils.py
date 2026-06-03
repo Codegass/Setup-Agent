@@ -1,5 +1,6 @@
 import pytest
 
+from sag.config.git_utils import extract_project_name_from_url as legacy_extract_project_name
 from sag.utils.git_utils import extract_project_name_from_url
 
 
@@ -20,3 +21,7 @@ def test_extract_project_name_from_url(repo_url, expected):
 def test_extract_project_name_rejects_empty_url():
     with pytest.raises(ValueError, match="cannot be empty"):
         extract_project_name_from_url("")
+
+
+def test_legacy_config_git_utils_import_still_works():
+    assert legacy_extract_project_name("https://github.com/org/repo.git") == "repo"

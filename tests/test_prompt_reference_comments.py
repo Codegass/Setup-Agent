@@ -8,6 +8,9 @@ REACT_ENGINE_PATH = REPO_ROOT / "src/sag/agent/react_engine.py"
 PROMPT_REF_RE = re.compile(
     r"# Prompt: (?P<path>src/sag/config/prompts/react_engine\.yaml):(?P<line>\d+) (?P<key>[\w.]+)"
 )
+PROMPT_LOOKUP_RE = re.compile(
+    r"self\.prompts\.(?:get|format)\(\s*[\"'](?P<key>[\w.]+)[\"']", re.DOTALL
+)
 
 
 def test_react_engine_prompt_reference_comments_resolve():
@@ -16,6 +19,10 @@ def test_react_engine_prompt_reference_comments_resolve():
     assert refs
 
     prompts = load_react_engine_prompts()
+    referenced_keys = {ref.group("key") for ref in refs}
+    lookup_keys = {match.group("key") for match in PROMPT_LOOKUP_RE.finditer(source)}
+
+    assert lookup_keys <= referenced_keys
 
     for ref in refs:
         prompt_path = REPO_ROOT / ref.group("path")
@@ -27,5 +34,4 @@ def test_react_engine_prompt_reference_comments_resolve():
 
         lines = prompt_path.read_text().splitlines()
         assert 1 <= line_number <= len(lines)
-        nearby = "\n".join(lines[max(0, line_number - 4) : min(len(lines), line_number + 3)])
-        assert key.split(".")[-1] in nearby
+        assert lines[line_number - 1].lstrip().startswith(f"{key.split('.')[-1]}:")
