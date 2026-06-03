@@ -897,19 +897,19 @@ class ReActEngine(UIEventEmitter):
         context_info = self.context_manager.get_current_context_info()
         parts = []
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.identity
+        # Prompt: src/sag/config/prompts/react_engine.yaml:2 initial_system.identity
         parts.append(self.prompts.get("initial_system.identity"))
 
         # Add repository URL at the very beginning if available
         if self.repository_url:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.repository_url_notice
+            # Prompt: src/sag/config/prompts/react_engine.yaml:9 initial_system.repository_url_notice
             parts.append(
                 self.prompts.format(
                     "initial_system.repository_url_notice", repository_url=self.repository_url
                 )
             )
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.context_management
+        # Prompt: src/sag/config/prompts/react_engine.yaml:14 initial_system.context_management
         parts.append(self.prompts.get("initial_system.context_management"))
 
         # Add tool descriptions with usage examples
@@ -922,13 +922,13 @@ class ReActEngine(UIEventEmitter):
             parts.append("\n".join(tool_lines))
 
         # Add explicit tool name clarification
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.tool_clarification
+        # Prompt: src/sag/config/prompts/react_engine.yaml:33 initial_system.tool_clarification
         parts.append(self.prompts.get("initial_system.tool_clarification"))
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.intelligent_setup_workflow
+        # Prompt: src/sag/config/prompts/react_engine.yaml:61 initial_system.intelligent_setup_workflow
         parts.append(self.prompts.get("initial_system.intelligent_setup_workflow"))
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.maven_pom_recovery
+        # Prompt: src/sag/config/prompts/react_engine.yaml:89 initial_system.maven_pom_recovery
         parts.append(self.prompts.get("initial_system.maven_pom_recovery"))
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.maven_multimodule_testing
+        # Prompt: src/sag/config/prompts/react_engine.yaml:124 initial_system.maven_multimodule_testing
         parts.append(self.prompts.get("initial_system.maven_multimodule_testing"))
 
         context_part = f"""
@@ -953,22 +953,22 @@ Current Focus: {context_info.get('focus', 'Not specified')}
 
         # Add different instructions based on function calling support
         if self.supports_function_calling:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.function_calling_response_format
+            # Prompt: src/sag/config/prompts/react_engine.yaml:166 initial_system.function_calling_response_format
             parts.append(self.prompts.get("initial_system.function_calling_response_format"))
         else:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.prompt_based_response_format
+            # Prompt: src/sag/config/prompts/react_engine.yaml:205 initial_system.prompt_based_response_format
             parts.append(self.prompts.get("initial_system.prompt_based_response_format"))
 
         # Add repository URL reminder if available
         if self.repository_url:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.repository_url_reminder
+            # Prompt: src/sag/config/prompts/react_engine.yaml:239 initial_system.repository_url_reminder
             parts.append(
                 self.prompts.format(
                     "initial_system.repository_url_reminder", repository_url=self.repository_url
                 )
             )
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.continuous_cycle_reminder
+        # Prompt: src/sag/config/prompts/react_engine.yaml:242 initial_system.continuous_cycle_reminder
         parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
 
         return "\n\n".join(part.rstrip() for part in parts if part).rstrip() + "\n"
@@ -1709,7 +1709,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
 
     def _build_next_prompt(self) -> str:
         """Build the prompt for the next iteration."""
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.conversation_header
+        # Prompt: src/sag/config/prompts/react_engine.yaml:248 next_prompt.conversation_header
         prompt = self.prompts.get("next_prompt.conversation_header").rstrip() + "\n\n"
 
         # Limit recent steps to avoid context window overflow
@@ -1720,7 +1720,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if len(self.steps) > max_steps * 2:
             # Take first 2 steps (usually context and first action) and last max_steps
             recent_steps = self.steps[:2] + self.steps[-max_steps:]
-            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.omitted_steps_notice
+            # Prompt: src/sag/config/prompts/react_engine.yaml:250 next_prompt.omitted_steps_notice
             prompt += self.prompts.get("next_prompt.omitted_steps_notice").rstrip() + "\n\n"
         elif len(self.steps) > max_steps:
             # Just take the most recent steps
@@ -1755,23 +1755,23 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if thoughts_without_actions >= 3:
             # Model seems stuck in thinking without acting
             if self.supports_function_calling:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.stuck_function_calling_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:252 next_prompt.stuck_function_calling_guidance
                 prompt += self.prompts.get("next_prompt.stuck_function_calling_guidance").rstrip()
                 prompt += "\n\n"
                 # Add specific guidance based on repository URL
                 if self.repository_url:
-                    # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.stuck_repository_url_guidance
+                    # Prompt: src/sag/config/prompts/react_engine.yaml:262 next_prompt.stuck_repository_url_guidance
                     prompt += self.prompts.format(
                         "next_prompt.stuck_repository_url_guidance",
                         repository_url=self.repository_url,
                     ).rstrip()
                     prompt += "\n"
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.stuck_prompt_based_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:286 next_prompt.stuck_prompt_based_guidance
                 prompt += self.prompts.get("next_prompt.stuck_prompt_based_guidance").rstrip()
                 prompt += "\n\n"
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.continuation
+        # Prompt: src/sag/config/prompts/react_engine.yaml:295 next_prompt.continuation
         prompt += self.prompts.get("next_prompt.continuation").rstrip() + "\n\n"
 
         # Apply memory protection to prevent critical info loss due to context pollution
@@ -2302,7 +2302,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         Build specialized prompt for thinking model.
         Thinking model should ONLY reason and analyze, never call tools.
         """
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> mode_prompts.thinking
+        # Prompt: src/sag/config/prompts/react_engine.yaml:298 mode_prompts.thinking
         return self.prompts.get("mode_prompts.thinking").rstrip() + "\n" + base_prompt
 
     def _build_action_model_prompt(self, base_prompt: str) -> str:
@@ -2310,7 +2310,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         Build specialized prompt for action model.
         Action model should execute tools based on reasoning.
         """
-        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> mode_prompts.action
+        # Prompt: src/sag/config/prompts/react_engine.yaml:341 mode_prompts.action
         return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
 
     def _export_token_usage_csv(self):
