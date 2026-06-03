@@ -64,6 +64,35 @@ def test_failure_diagnosis_includes_error_recovery_and_next_action():
     assert diagnosis.next_actions
 
 
+def test_diagnosis_surfaces_tool_recovery_fallback_decision():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(
+        UIEvent(
+            EventType.TOOL_RECOVERY,
+            "Retrying maven in discovered project directory",
+            level="warning",
+            metadata={
+                "recovery_strategy": "maven_known_working_directory",
+                "guidance": "Retrying in discovered project directory",
+                "recovery_params": {
+                    "goal": "compile",
+                    "working_directory": "/workspace/app",
+                },
+                "parameter_diff": {"working_directory": [None, "/workspace/app"]},
+                "recovery": {"attempted": True, "success": True},
+            },
+        )
+    )
+    state = aggregator.handle(UIEvent(EventType.FAILURE, "Project setup incomplete"))
+
+    diagnosis = build_final_diagnosis(state)
+
+    assert any("maven_known_working_directory" in item for item in diagnosis.recovery)
+    assert any("/workspace/app" in item for item in diagnosis.recovery)
+    assert any("working_directory" in item for item in diagnosis.recovery)
+    assert any("success" in item for item in diagnosis.recovery)
+
+
 def test_complete_state_without_final_status_is_unknown_with_next_action():
     state = replace(
         initial_run_state("commons-cli", fixed_now()),

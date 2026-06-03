@@ -1319,20 +1319,29 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         )
 
     def _handle_tool_lifecycle_event(self, event: ToolLifecycleEvent) -> None:
-        """Map orchestration lifecycle events into existing UI events."""
-        if event.event_type == "tool_error":
-            self.emit(EventType.ERROR, message=event.message, level="error", **event.metadata)
-        elif event.event_type == "tool_recovery":
-            self.emit(
-                EventType.WARNING,
-                message=event.message,
-                level=event.level,
-                **event.metadata,
-            )
-        elif event.event_type == "tool_result":
-            # The ReAct observation step owns user-visible observation UI
-            # emission; tool_result lifecycle events remain telemetry-only here.
+        """Map orchestration lifecycle events into typed UI events."""
+        lifecycle_event_map = {
+            "tool_start": EventType.TOOL_START,
+            "tool_parameters_fixed": EventType.TOOL_PARAMETERS_FIXED,
+            "tool_result": EventType.TOOL_RESULT,
+            "tool_recovery": EventType.TOOL_RECOVERY,
+            "tool_error": EventType.TOOL_ERROR,
+        }
+        event_type = lifecycle_event_map.get(event.event_type)
+        if event_type is None:
             return None
+
+        metadata = dict(event.metadata)
+        metadata.setdefault("tool_name", event.call.name)
+        metadata.setdefault("tool_params", event.call.validated_params or event.call.raw_params)
+        metadata.setdefault("tool_message", event.message)
+
+        self.emit(
+            event_type,
+            message=event.message,
+            level=event.level,
+            **metadata,
+        )
 
     def _build_tool_call_from_step(self, step: ReActStep) -> ToolCall:
         """Translate a parsed ReAct action step into an orchestration tool call."""

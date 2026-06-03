@@ -42,6 +42,16 @@ class EventType(str, Enum):
     AGENT_ACTION = "agent_action"
     AGENT_OBSERVATION = "agent_observation"
 
+    # Tool lifecycle events
+    TOOL_START = "tool_start"
+    TOOL_PARAMETERS_FIXED = "tool_parameters_fixed"
+    TOOL_RESULT = "tool_result"
+    TOOL_RECOVERY = "tool_recovery"
+    TOOL_ERROR = "tool_error"
+
+    # Evidence events
+    EVIDENCE_RECORDED = "evidence_recorded"
+
     # Docker events
     DOCKER_INIT = "docker_init"
     DOCKER_CONTAINER_CREATE = "docker_container_create"

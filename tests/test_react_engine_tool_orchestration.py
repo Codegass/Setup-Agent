@@ -104,10 +104,7 @@ def test_get_tool_orchestrator_wires_engine_dependencies():
     assert orchestrator.track_tool_execution.__self__ is engine
     assert orchestrator.track_tool_execution.__func__ is ReActEngine._track_tool_execution
     assert orchestrator.update_successful_states.__self__ is engine
-    assert (
-        orchestrator.update_successful_states.__func__
-        is ReActEngine._update_successful_states
-    )
+    assert orchestrator.update_successful_states.__func__ is ReActEngine._update_successful_states
     assert orchestrator.add_system_guidance.__self__ is engine
     assert orchestrator.add_system_guidance.__func__ is ReActEngine._add_system_guidance
     assert orchestrator.get_timestamp.__self__ is engine
@@ -149,18 +146,64 @@ def test_format_tool_result_delegates_to_orchestrator_formatter(monkeypatch):
     assert engine._format_tool_result("bash", result) == "delegated observation"
 
 
-def test_handle_tool_lifecycle_event_is_temporary_no_op():
+def test_react_engine_maps_tool_lifecycle_events_to_ui_events():
     engine = _engine_with_context()
-    event = ToolLifecycleEvent(
-        event_type="tool_start",
-        call=ToolCall(name="bash", raw_params={"command": "pwd"}),
-        message="Starting bash",
+    emitted = []
+    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+
+    call = ToolCall(name="maven", raw_params={"goal": "compile"})
+    engine._handle_tool_lifecycle_event(
+        ToolLifecycleEvent(
+            event_type="tool_start",
+            call=call,
+            message="Starting maven",
+            metadata={"tool_name": "maven", "tool_params": {"goal": "compile"}},
+        )
     )
 
-    assert engine._handle_tool_lifecycle_event(event) is None
+    assert emitted[0][0][0] == EventType.TOOL_START
 
 
-def test_react_engine_tool_event_adapter_emits_existing_ui_events():
+def test_react_engine_preserves_real_tool_result_lifecycle_metadata():
+    engine = _engine_with_context()
+    emitted = []
+    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+
+    call = ToolCall(
+        name="maven",
+        raw_params={"goal": "compile"},
+        validated_params={"goal": "compile", "working_directory": "/workspace/app"},
+    )
+    engine._handle_tool_lifecycle_event(
+        ToolLifecycleEvent(
+            event_type="tool_result",
+            call=call,
+            message="maven compile completed",
+            level="success",
+            metadata={
+                "status": "success",
+                "duration_ms": 125.0,
+                "result_success": True,
+                "error_code": None,
+                "executed_params": {
+                    "goal": "compile",
+                    "working_directory": "/workspace/app",
+                },
+                "recovery_applied": False,
+                "execution_signature": "maven:[('goal', 'compile')]",
+            },
+        )
+    )
+
+    event_type = emitted[0][0][0]
+    metadata = emitted[0][1]
+    assert event_type == EventType.TOOL_RESULT
+    assert metadata["tool_name"] == "maven"
+    assert metadata["tool_params"]["goal"] == "compile"
+    assert metadata["executed_params"]["working_directory"] == "/workspace/app"
+
+
+def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
     engine = _engine_with_context()
     emitted = []
     engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
@@ -184,20 +227,47 @@ def test_react_engine_tool_event_adapter_emits_existing_ui_events():
         message="echo failed",
         metadata={"error_code": "FAIL"},
     )
+    fixed_event = ToolLifecycleEvent(
+        event_type="tool_parameters_fixed",
+        call=ToolCall(name="echo", raw_params={"command": "pwd"}),
+        message="echo params normalized",
+        level="warning",
+        metadata={"field": "working_directory"},
+    )
 
     engine._handle_tool_lifecycle_event(result_event)
     engine._handle_tool_lifecycle_event(recovery_event)
     engine._handle_tool_lifecycle_event(error_event)
+    engine._handle_tool_lifecycle_event(fixed_event)
 
-    assert len(emitted) == 2
-    assert emitted[0][0][0] == EventType.WARNING
-    assert emitted[0][1]["message"] == "echo recovered"
-    assert emitted[0][1]["level"] == "warning"
-    assert emitted[0][1]["recovery_strategy"] == "retry"
-    assert emitted[1][0][0] == EventType.ERROR
-    assert emitted[1][1]["message"] == "echo failed"
-    assert emitted[1][1]["level"] == "error"
-    assert emitted[1][1]["error_code"] == "FAIL"
+    assert len(emitted) == 4
+    assert emitted[0][0][0] == EventType.TOOL_RESULT
+    assert emitted[0][1]["message"] == "echo finished"
+    assert emitted[0][1]["level"] == "info"
+    assert emitted[0][1]["tool_name"] == "echo"
+    assert emitted[0][1]["tool_params"] == {"command": "pwd"}
+    assert emitted[0][1]["tool_message"] == "echo finished"
+    assert emitted[1][0][0] == EventType.TOOL_RECOVERY
+    assert emitted[1][1]["message"] == "echo recovered"
+    assert emitted[1][1]["level"] == "warning"
+    assert emitted[1][1]["recovery_strategy"] == "retry"
+    assert emitted[1][1]["tool_name"] == "echo"
+    assert emitted[1][1]["tool_params"] == {"command": "pwd"}
+    assert emitted[1][1]["tool_message"] == "echo recovered"
+    assert emitted[2][0][0] == EventType.TOOL_ERROR
+    assert emitted[2][1]["message"] == "echo failed"
+    assert emitted[2][1]["level"] == "info"
+    assert emitted[2][1]["error_code"] == "FAIL"
+    assert emitted[2][1]["tool_name"] == "echo"
+    assert emitted[2][1]["tool_params"] == {"command": "pwd"}
+    assert emitted[2][1]["tool_message"] == "echo failed"
+    assert emitted[3][0][0] == EventType.TOOL_PARAMETERS_FIXED
+    assert emitted[3][1]["message"] == "echo params normalized"
+    assert emitted[3][1]["level"] == "warning"
+    assert emitted[3][1]["field"] == "working_directory"
+    assert emitted[3][1]["tool_name"] == "echo"
+    assert emitted[3][1]["tool_params"] == {"command": "pwd"}
+    assert emitted[3][1]["tool_message"] == "echo params normalized"
 
 
 def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypatch):
@@ -257,9 +327,7 @@ def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator(
 
     assert engine._execute_steps([step]) is True
 
-    observation_events = [
-        event for event in emitted if event[0][0] == EventType.AGENT_OBSERVATION
-    ]
+    observation_events = [event for event in emitted if event[0][0] == EventType.AGENT_OBSERVATION]
     assert len(observation_events) == 1
     assert "echo executed successfully" in observation_events[0][1]["message"]
 

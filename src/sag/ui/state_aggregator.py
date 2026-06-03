@@ -11,6 +11,7 @@ from sag.ui.events import EventType, PhaseType, UIEvent
 from sag.ui.state import (
     ActiveOperation,
     PhaseSnapshot,
+    RecoverySnapshot,
     UIEvidenceRecord,
     UIRunState,
     UITimelineEntry,
@@ -51,6 +52,12 @@ class UIStateAggregator:
             EventType.AGENT_THOUGHT: self._handle_agent_thought,
             EventType.AGENT_ACTION: self._handle_agent_action,
             EventType.AGENT_OBSERVATION: self._handle_agent_observation,
+            EventType.TOOL_START: self._handle_tool_start,
+            EventType.TOOL_PARAMETERS_FIXED: self._handle_tool_parameters_fixed,
+            EventType.TOOL_RESULT: self._handle_tool_result,
+            EventType.TOOL_RECOVERY: self._handle_tool_recovery,
+            EventType.TOOL_ERROR: self._handle_tool_error,
+            EventType.EVIDENCE_RECORDED: self._handle_evidence_recorded,
             EventType.VALIDATION_START: self._handle_validation_event,
             EventType.VALIDATION_CHECK: self._handle_validation_event,
             EventType.VALIDATION_COMPLETE: self._handle_validation_event,
@@ -269,6 +276,120 @@ class UIStateAggregator:
             current_status=summary,
         )
         self._state = self._append_timeline(event, kind="observation", message=summary)
+
+    def _handle_tool_start(self, event: UIEvent) -> None:
+        tool_name, tool_params = self._tool_identity(event)
+        action = self._format_tool_params(tool_name, tool_params)
+        visible_params = f"({action})" if action else ""
+        operation = ActiveOperation(
+            tool_name=tool_name,
+            action=action,
+            workdir=self._extract_workdir(tool_params),
+            visible_params=visible_params,
+            started_at=self._clock(),
+            detail=event.message,
+        )
+        self._state = replace(
+            self._state,
+            active_operation=operation,
+            current_status=event.message,
+        )
+        self._state = self._append_timeline(event, kind="tool")
+
+    def _handle_tool_parameters_fixed(self, event: UIEvent) -> None:
+        entry = self._build_timeline(
+            event,
+            kind="warning",
+            level=event.level,
+            failure_classification="parameter_normalization",
+        )
+        self._state = replace(
+            self._state,
+            latest_warning=entry,
+            timeline=self._state.timeline + (entry,),
+        )
+
+    def _handle_tool_result(self, event: UIEvent) -> None:
+        metadata = self._command_evidence_metadata(event)
+        summary = str(metadata.get("summary") or self._summarize_tool_result(metadata))
+        path = metadata.get("path")
+        self._state = self._append_evidence(
+            "command",
+            summary,
+            details=event.details,
+            path=str(path) if path else None,
+            metadata=metadata,
+        )
+        timeline_event = UIEvent(
+            event.event_type,
+            event.message,
+            phase=event.phase,
+            details=event.details,
+            level=event.level,
+            metadata=metadata,
+        )
+        self._state = self._append_timeline(timeline_event, kind="observation")
+
+    def _handle_tool_recovery(self, event: UIEvent) -> None:
+        retry_count = event.metadata.get("retry_count", 0)
+        try:
+            retry_count = int(retry_count)
+        except (TypeError, ValueError):
+            retry_count = 0
+
+        recovery = RecoverySnapshot(
+            active=True,
+            strategy=(
+                str(event.metadata["recovery_strategy"])
+                if event.metadata.get("recovery_strategy") is not None
+                else None
+            ),
+            retry_count=retry_count,
+            message=event.message,
+        )
+        entry = self._build_timeline(
+            event,
+            kind="recovery",
+            level=event.level,
+            failure_classification="recovery_attempt",
+        )
+        self._state = replace(
+            self._state,
+            recovery=recovery,
+            timeline=self._state.timeline + (entry,),
+        )
+        if event.level == "warning":
+            self._state = replace(self._state, latest_warning=entry)
+        elif event.level == "error":
+            self._state = replace(self._state, latest_error=entry)
+
+    def _handle_tool_error(self, event: UIEvent) -> None:
+        entry = self._build_timeline(
+            event,
+            kind="error",
+            level="error",
+            failure_classification=self._classify_failure(event),
+        )
+        self._state = replace(
+            self._state,
+            latest_error=entry,
+            timeline=self._state.timeline + (entry,),
+        )
+
+    def _handle_evidence_recorded(self, event: UIEvent) -> None:
+        metadata = self._copy_metadata(event.metadata)
+        kind = str(metadata.get("kind") or "validation")
+        summary = str(metadata.get("summary") or event.message)
+        details = metadata.get("details", event.details)
+        path = metadata.get("path")
+        self._state = self._append_evidence(
+            kind,
+            summary,
+            details=str(details) if details else None,
+            path=str(path) if path else None,
+            metadata=metadata,
+        )
+        self._state = self._append_timeline(event, kind="evidence")
 
     def _handle_validation_event(self, event: UIEvent) -> None:
         summary = event.metadata.get("summary") or event.metadata.get("result")
@@ -532,6 +653,46 @@ class UIStateAggregator:
             formatted_parts.append(f"{param}='{value_str}'")
 
         return ", ".join(formatted_parts)
+
+    def _tool_identity(self, event: UIEvent) -> tuple[str, dict[str, Any]]:
+        tool_name = str(event.metadata.get("tool_name", "unknown"))
+        tool_params = self._copy_metadata(event.metadata.get("tool_params", {}))
+        if not isinstance(tool_params, dict):
+            tool_params = {}
+        return tool_name, tool_params
+
+    def _command_evidence_metadata(self, event: UIEvent) -> dict[str, Any]:
+        metadata = self._copy_metadata(event.metadata)
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        tool_name = str(metadata.get("tool_name", "unknown"))
+        tool_params = metadata.get("tool_params", {})
+        if not isinstance(tool_params, dict):
+            tool_params = {}
+        executed_params = metadata.get("executed_params")
+        if executed_params is not None and not isinstance(executed_params, dict):
+            executed_params = {}
+
+        metadata["tool_name"] = tool_name
+        metadata["tool_params"] = tool_params
+        if executed_params is not None:
+            metadata["executed_params"] = executed_params
+        metadata.setdefault("status", "completed")
+        metadata.setdefault("tool_message", event.message)
+        return metadata
+
+    def _summarize_tool_result(self, metadata: dict[str, Any]) -> str:
+        tool_name = str(metadata.get("tool_name", "unknown"))
+        tool_params = metadata.get("tool_params", {})
+        executed_params = metadata.get("executed_params")
+        action_params = tool_params if isinstance(tool_params, dict) and tool_params else {}
+        if not action_params and isinstance(executed_params, dict):
+            action_params = executed_params
+        action = self._format_tool_params(tool_name, action_params)
+        status = str(metadata.get("status", "completed"))
+        action_text = f" {action}" if action else ""
+        return f"{tool_name}{action_text} -> {status}"
 
     def _detect_phase_from_action(
         self, tool_name: str, params: dict[str, Any]

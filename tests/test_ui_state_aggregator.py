@@ -210,6 +210,106 @@ def test_agent_observation_updates_active_operation_detail_current_status_and_ti
     assert state.timeline[-1].kind == "observation"
 
 
+def test_aggregator_tracks_tool_lifecycle_and_evidence_events():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    start_state = aggregator.handle(
+        UIEvent(
+            EventType.TOOL_START,
+            "Starting maven",
+            metadata={"tool_name": "maven", "tool_params": {"goal": "compile"}},
+        )
+    )
+    assert start_state.active_operation.tool_name == "maven"
+    assert start_state.timeline[-1].kind == "tool"
+
+    recovery_state = aggregator.handle(
+        UIEvent(
+            EventType.TOOL_RECOVERY,
+            "Retrying maven with known working directory",
+            level="warning",
+            metadata={
+                "recovery_strategy": "maven_known_working_directory",
+                "retry_count": 1,
+                "recovery_params": {
+                    "goal": "compile",
+                    "working_directory": "/workspace/app",
+                },
+                "parameter_diff": {"working_directory": [None, "/workspace/app"]},
+                "guidance": "Retrying in discovered project directory",
+                "recovery": {"attempted": True, "success": True},
+            },
+        )
+    )
+    assert recovery_state.recovery.active is True
+    assert recovery_state.recovery.strategy == "maven_known_working_directory"
+    assert recovery_state.timeline[-1].failure_classification == "recovery_attempt"
+    recovery_metadata = recovery_state.timeline[-1].metadata
+    assert recovery_metadata["recovery_params"]["working_directory"] == "/workspace/app"
+    assert recovery_metadata["parameter_diff"]
+    assert recovery_metadata["recovery"]["success"] is True
+
+    result_state = aggregator.handle(
+        UIEvent(
+            EventType.TOOL_RESULT,
+            "maven compile completed",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+                "executed_params": {
+                    "goal": "compile",
+                    "working_directory": "/workspace/app",
+                },
+                "status": "success",
+                "duration_ms": 125.0,
+            },
+        )
+    )
+    assert result_state.evidence[-1].kind == "command"
+    assert "maven" in result_state.evidence[-1].summary
+    assert "compile" in result_state.evidence[-1].summary
+    assert result_state.evidence[-1].metadata["status"] == "success"
+    assert result_state.evidence[-1].metadata["tool_message"] == "maven compile completed"
+
+    evidence_state = aggregator.handle(
+        UIEvent(
+            EventType.EVIDENCE_RECORDED,
+            "review checkpoint completed",
+            metadata={
+                "kind": "review_checkpoint",
+                "summary": "review agent approved implementation",
+                "path": "reviews/goodall.md",
+            },
+        )
+    )
+    assert evidence_state.evidence[-1].kind == "review_checkpoint"
+    assert evidence_state.evidence[-1].path == "reviews/goodall.md"
+
+
+def test_aggregator_classifies_timeout_and_parameter_normalization_events():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    fixed_state = aggregator.handle(
+        UIEvent(
+            EventType.TOOL_PARAMETERS_FIXED,
+            "Normalized maven parameters",
+            level="warning",
+            metadata={"tool_name": "maven", "field": "goal"},
+        )
+    )
+    assert fixed_state.timeline[-1].failure_classification == "parameter_normalization"
+
+    timeout_state = aggregator.handle(
+        UIEvent(
+            EventType.TOOL_ERROR,
+            "maven command timeout",
+            level="error",
+            metadata={"tool_name": "maven", "error_code": "TIMEOUT"},
+        )
+    )
+    assert timeout_state.latest_error.failure_classification == "command_timeout"
+
+
 def test_aggregator_records_errors_warnings_completion_and_reports():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
 
