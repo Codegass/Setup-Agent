@@ -6,7 +6,6 @@ an interactive, auto-updating CLI interface.
 """
 
 import time
-from datetime import datetime
 from typing import Optional
 
 from rich.console import Console, Group
@@ -23,7 +22,10 @@ from sag.ui.components import (
     create_warning_panel,
     format_duration,
 )
+from sag.ui.diagnosis import FinalDiagnosis, build_final_diagnosis
 from sag.ui.events import EventType, PhaseType, UIEvent
+from sag.ui.state import UIRunState
+from sag.ui.state_aggregator import UIStateAggregator
 
 
 class UIManager:
@@ -44,6 +46,7 @@ class UIManager:
         """
         self.project_name = project_name
         self.console = console or Console()
+        self._aggregator = UIStateAggregator(project_name)
 
         # Timing
         self.start_time = time.time()
@@ -78,6 +81,7 @@ class UIManager:
         # Guards display_final_summary so callers (including cleanup paths)
         # can invoke it unconditionally without producing a duplicate panel.
         self._summary_shown = False
+        self._summary_record_segments: Optional[list] = None
 
         # Report information
         self.report_data: Optional[dict] = None  # Report metadata (path, status, metrics)
@@ -89,12 +93,25 @@ class UIManager:
         self.agent_steps: list[dict] = []
         self.current_agent_step: Optional[dict] = None
 
+    def snapshot(self) -> UIRunState:
+        """Return the current typed UI run state."""
+        return self._aggregator.snapshot()
+
     def start(self):
         """Start the live display"""
-        self.live = Live(
-            self._render_display(), console=self.console, refresh_per_second=4, transient=False
-        )
-        self.live.start()
+        try:
+            initial_render = self._render_display()
+            live = Live(initial_render, console=self.console, refresh_per_second=4, transient=False)
+            live.start()
+        except Exception as exc:
+            self.live = None
+            self._record_ui_warning(
+                "Initial render failed; continuing without live UI.",
+                details=str(exc),
+            )
+            return
+
+        self.live = live
 
     def stop(self):
         """Stop the live display"""
@@ -333,6 +350,21 @@ class UIManager:
         Args:
             event: The UI event to handle
         """
+        try:
+            self._aggregator.handle(event)
+        except Exception as exc:
+            self._record_ui_warning(
+                "UI state aggregation failed; continuing with last known state.",
+                details=str(exc),
+            )
+
+        if isinstance(event, UIEvent) and isinstance(event.event_type, EventType):
+            self._handle_legacy_event(event)
+
+        self._safe_update_display()
+
+    def _handle_legacy_event(self, event: UIEvent):
+        """Update legacy mutable fields for the current render path."""
         # Handle based on event type
         if event.event_type == EventType.PHASE_START:
             self._handle_phase_start(event)
@@ -364,9 +396,6 @@ class UIManager:
             EventType.AGENT_OBSERVATION,
         ]:
             self._handle_agent_event(event)
-
-        # Update the display
-        self._update_display()
 
     def _handle_phase_start(self, event: UIEvent):
         """Handle phase start event"""
@@ -618,8 +647,33 @@ class UIManager:
 
     def _update_display(self):
         """Update the live display"""
+        renderable = self._render_display()
         if self.live:
-            self.live.update(self._render_display())
+            self.live.update(renderable)
+
+    def _safe_update_display(self):
+        """Update Rich display without allowing render failures to abort the run."""
+        try:
+            self._update_display()
+        except Exception as exc:
+            self._record_ui_warning(
+                "UI render failed; continuing without updating the live display.",
+                details=str(exc),
+            )
+
+    def _record_ui_warning(self, message: str, details: Optional[str] = None) -> None:
+        """Record an internal UI warning in typed state and legacy fields."""
+        warning = UIEvent(
+            EventType.WARNING,
+            message,
+            details=details,
+            level="warning",
+        )
+        try:
+            self._aggregator.handle(warning)
+        except Exception:
+            pass
+        self.warnings.append(warning)
 
     def abort_running_phases(self, reason: str = "Phase aborted") -> None:
         """Mark any still-running phase as errored.
@@ -646,7 +700,9 @@ class UIManager:
         this unconditionally without risking duplicate panels.
         """
         if self._summary_shown:
+            self._restore_summary_record_segments()
             return
+        record_start = self._record_buffer_length()
         self._summary_shown = True
         self.stop()
 
@@ -657,24 +713,26 @@ class UIManager:
 
         elapsed = time.time() - self.start_time
         elapsed_str = format_duration(elapsed)
+        diagnosis = build_final_diagnosis(self.snapshot())
 
-        if self.final_status == "success":
+        if diagnosis.status == "success":
             success_panel = create_success_panel(
-                self.current_status,
+                diagnosis.outcome,
                 summary_items=[
                     ("Total time", elapsed_str),
                     (
                         "Phases completed",
-                        f"{sum(1 for p in self.phases_data.values() if p['status'] == 'success')}/4",
+                        f"{len(diagnosis.completed_phases)}/4",
                     ),
                 ],
             )
             self.console.print(success_panel)
-        elif self.final_status == "failure":
-            if self.errors:
-                latest_error = self.errors[-1]
-                error_panel = create_error_panel(latest_error.message, details=latest_error.details)
-                self.console.print(error_panel)
+        else:
+            error_panel = create_error_panel(
+                diagnosis.outcome,
+                details=self._format_diagnosis_details(diagnosis),
+            )
+            self.console.print(error_panel)
 
         # Print report information if available
         if self.report_data:
@@ -700,3 +758,62 @@ class UIManager:
         self.console.print()
         self.console.print("=" * 60)
         self.console.print()
+        self._cache_summary_record_segments(record_start)
+
+    def _format_diagnosis_details(self, diagnosis: FinalDiagnosis) -> Optional[str]:
+        """Format concise diagnosis details for the final summary panel."""
+        details = []
+        if diagnosis.failures:
+            details.append(f"Latest failure: {diagnosis.failures[-1]}")
+        elif self.errors:
+            latest_error = self.errors[-1]
+            failure = latest_error.message
+            if latest_error.details:
+                failure = f"{failure}: {latest_error.details}"
+            details.append(f"Latest failure: {failure}")
+
+        if diagnosis.next_actions:
+            details.append(f"Next action: {diagnosis.next_actions[0]}")
+
+        return "\n".join(details) if details else None
+
+    def _record_buffer_length(self) -> Optional[int]:
+        """Return current Rich record buffer length when recording is enabled."""
+        if not getattr(self.console, "record", False):
+            return None
+        buffer = getattr(self.console, "_record_buffer", None)
+        if buffer is None:
+            return None
+        lock = getattr(self.console, "_record_buffer_lock", None)
+        if lock is None:
+            return len(buffer)
+        with lock:
+            return len(buffer)
+
+    def _cache_summary_record_segments(self, start_index: Optional[int]) -> None:
+        """Cache recorded summary segments so repeated export_text calls are stable."""
+        if start_index is None or not getattr(self.console, "record", False):
+            return
+        buffer = getattr(self.console, "_record_buffer", None)
+        if buffer is None:
+            return
+        lock = getattr(self.console, "_record_buffer_lock", None)
+        if lock is None:
+            self._summary_record_segments = list(buffer[start_index:])
+            return
+        with lock:
+            self._summary_record_segments = list(buffer[start_index:])
+
+    def _restore_summary_record_segments(self) -> None:
+        """Restore cached summary segments to Rich's record buffer without printing."""
+        if not self._summary_record_segments or not getattr(self.console, "record", False):
+            return
+        buffer = getattr(self.console, "_record_buffer", None)
+        if buffer is None:
+            return
+        lock = getattr(self.console, "_record_buffer_lock", None)
+        if lock is None:
+            buffer.extend(self._summary_record_segments)
+            return
+        with lock:
+            buffer.extend(self._summary_record_segments)
