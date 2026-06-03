@@ -657,30 +657,61 @@ class UIStateAggregator:
     def _copy_steps(self, steps: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
         return tuple(self._copy_metadata(step) for step in steps)
 
-    def _copy_metadata(self, metadata: Any) -> Any:
+    def _copy_metadata(self, metadata: Any, memo: Optional[dict[int, Any]] = None) -> Any:
+        memo = memo if memo is not None else {}
         if isinstance(metadata, dict):
-            return {
-                self._copy_metadata_key(key): self._copy_metadata(value)
+            metadata_id = id(metadata)
+            if metadata_id in memo:
+                return "<cycle dict>"
+            memo[metadata_id] = "<cycle dict>"
+            result = {
+                self._copy_metadata_key(key, memo): self._copy_metadata(value, memo)
                 for key, value in metadata.items()
             }
+            memo.pop(metadata_id, None)
+            return result
         if isinstance(metadata, list):
-            return [self._copy_metadata(item) for item in metadata]
+            metadata_id = id(metadata)
+            if metadata_id in memo:
+                return "<cycle list>"
+            memo[metadata_id] = "<cycle list>"
+            result = [self._copy_metadata(item, memo) for item in metadata]
+            memo.pop(metadata_id, None)
+            return result
         if isinstance(metadata, tuple):
-            return tuple(self._copy_metadata(item) for item in metadata)
+            metadata_id = id(metadata)
+            if metadata_id in memo:
+                return "<cycle tuple>"
+            memo[metadata_id] = "<cycle tuple>"
+            result = tuple(self._copy_metadata(item, memo) for item in metadata)
+            memo.pop(metadata_id, None)
+            return result
         if isinstance(metadata, set):
-            return {self._copy_metadata_key(item) for item in metadata}
+            metadata_id = id(metadata)
+            if metadata_id in memo:
+                return "<cycle set>"
+            memo[metadata_id] = "<cycle set>"
+            result = {self._copy_metadata_key(item, memo) for item in metadata}
+            memo.pop(metadata_id, None)
+            return result
         try:
             return deepcopy(metadata)
         except Exception:
-            return repr(metadata)
+            return self._safe_repr(metadata)
 
-    def _copy_metadata_key(self, value: Any) -> Any:
-        copied = self._copy_metadata(value)
+    def _copy_metadata_key(self, value: Any, memo: dict[int, Any]) -> Any:
+        copied = self._copy_metadata(value, memo)
         try:
             hash(copied)
         except TypeError:
-            return repr(copied)
+            return self._safe_repr(copied)
         return copied
+
+    def _safe_repr(self, value: Any) -> str:
+        try:
+            return repr(value)
+        except Exception:
+            return f"<unrepresentable {type(value).__name__}>"
 
     def _truncate(self, text: str, limit: int) -> str:
         return text[: limit - 3] + "..." if len(text) > limit else text

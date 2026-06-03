@@ -473,6 +473,49 @@ def test_uncopyable_metadata_values_are_stringified():
     assert all(isinstance(item, str) for item in metadata["nested"]["set"])
 
 
+def test_cyclic_metadata_values_are_stringified_without_crashing():
+    cyclic_dict = {}
+    cyclic_dict["self"] = cyclic_dict
+    cyclic_list = []
+    cyclic_list.append(cyclic_list)
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(
+        UIEvent(
+            EventType.ERROR,
+            "Cyclic metadata failed",
+            level="error",
+            metadata={"dict": cyclic_dict, "list": cyclic_list},
+        )
+    )
+
+    metadata = state.latest_error.metadata
+    assert metadata["dict"]["self"] == "<cycle dict>"
+    assert metadata["list"][0] == "<cycle list>"
+
+
+def test_unrepresentable_metadata_values_are_stringified_without_crashing():
+    class Unrepresentable:
+        def __deepcopy__(self, memo):
+            raise TypeError("no copy")
+
+        def __repr__(self):
+            raise RuntimeError("no repr")
+
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(
+        UIEvent(
+            EventType.ERROR,
+            "Unrepresentable metadata failed",
+            level="error",
+            metadata={"value": Unrepresentable()},
+        )
+    )
+
+    assert state.latest_error.metadata["value"] == "<unrepresentable Unrepresentable>"
+
+
 def test_aggregator_degrades_unknown_event_to_warning_timeline_entry():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
     event = UIEvent(EventType.STATUS_UPDATE, "Known status")
