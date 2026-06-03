@@ -331,6 +331,7 @@ class BashTool(BaseTool):
     def execute(
         self,
         command: str = None,
+        timeout: int = 60,
         working_directory: str = "/workspace",
         environment: Optional[Dict[str, str]] = None,
         **kwargs,
@@ -340,6 +341,7 @@ class BashTool(BaseTool):
 
         Args:
             command: The bash command to execute
+            timeout: Maximum total execution time in seconds
             working_directory: Working directory (default: /workspace)
             environment: Additional environment variables to set
         """
@@ -353,10 +355,11 @@ class BashTool(BaseTool):
                     f"❌ Invalid parameters for bash tool: {invalid_params}\n\n"
                     f"✅ Valid parameters:\n"
                     f"  - command (required): The bash command to execute\n"
+                    f"  - timeout (optional): Maximum total execution time in seconds (default: 60)\n"
                     f"  - working_directory (optional): Working directory (default: /workspace)\n"
                     f"  - environment (optional): Additional environment variables\n\n"
-                    f"Example: bash(command='mvn clean test', working_directory='/workspace/project')\n"
-                    f"Example: bash(command='ls -la')"
+                    f"Example: bash(command='mvn clean test', timeout=3600, working_directory='/workspace/project')\n"
+                    f"Example: bash(command='ls -la', timeout=30)"
                 ),
                 error=f"Invalid parameters: {invalid_params}",
                 raw_output="",
@@ -369,10 +372,27 @@ class BashTool(BaseTool):
                 output=(
                     "❌ Missing required parameter: 'command'\n\n"
                     "The bash tool requires a 'command' parameter.\n"
-                    "Example: bash(command='ls -la')\n"
-                    "Example: bash(command='mvn clean test')"
+                    "Example: bash(command='ls -la', timeout=30)\n"
+                    "Example: bash(command='mvn clean test', timeout=3600)"
                 ),
                 error="Missing required parameter: command",
+                raw_output="",
+            )
+
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            return ToolResult(
+                success=False,
+                output="❌ Invalid timeout for bash tool: timeout must be a positive integer.",
+                error="Invalid timeout: must be a positive integer",
+                raw_output="",
+            )
+        if timeout <= 0:
+            return ToolResult(
+                success=False,
+                output="❌ Invalid timeout for bash tool: timeout must be greater than 0.",
+                error="Invalid timeout: must be greater than 0",
                 raw_output="",
             )
 
@@ -460,6 +480,8 @@ class BashTool(BaseTool):
             if is_long_running_command:
                 # Get dynamic timeouts based on command type
                 silent_timeout, absolute_timeout = self._get_command_timeout(command)
+                absolute_timeout = timeout
+                silent_timeout = min(silent_timeout, max(1, timeout // 2))
                 logger.info(
                     f"🔍 Using enhanced monitoring for long-running command (silent: {silent_timeout}s, total: {absolute_timeout}s)"
                 )
@@ -477,7 +499,11 @@ class BashTool(BaseTool):
             else:
                 # Use regular execution for normal commands
                 result = self.docker_orchestrator.execute_command(
-                    command, workdir=workdir, capture_stderr=True, environment=env_vars
+                    command,
+                    workdir=workdir,
+                    capture_stderr=True,
+                    environment=env_vars,
+                    timeout=timeout,
                 )
 
             # Handle timeout terminations
@@ -485,6 +511,8 @@ class BashTool(BaseTool):
                 # Get the timeouts that were used
                 if is_long_running_command:
                     silent_timeout, absolute_timeout = self._get_command_timeout(command)
+                    absolute_timeout = timeout
+                    silent_timeout = min(silent_timeout, max(1, timeout // 2))
                     error_messages = {
                         "absolute_timeout": f"Command exceeded maximum execution time ({absolute_timeout/60:.0f} minutes)",
                         "silent_timeout": f"Command was silent for too long ({silent_timeout/60:.0f} minutes)",
@@ -524,6 +552,7 @@ class BashTool(BaseTool):
                     error_code=f"TIMEOUT_{termination_reason.upper()}",
                     metadata={
                         "termination_reason": termination_reason,
+                        "timeout": timeout,
                         "monitoring_info": monitoring_info,
                     },
                 )
@@ -561,6 +590,7 @@ class BashTool(BaseTool):
                         "signal": result.get("signal"),
                         "execution_directory": workdir,
                         "environment_vars": env_vars,
+                        "timeout": timeout,
                         "monitoring_info": result.get("monitoring_info"),
                         "is_long_running": is_long_running_command,
                         "completion_signals": completion_signals,
@@ -592,6 +622,7 @@ class BashTool(BaseTool):
                         "signal": result.get("signal"),
                         "execution_directory": workdir,
                         "environment_vars": env_vars,
+                        "timeout": timeout,
                         "monitoring_info": result.get("monitoring_info"),
                         "error_analysis": error_analysis,
                         "recovery_commands": self._get_recovery_commands(error_analysis),
@@ -1488,7 +1519,10 @@ GREP INVESTIGATION EXAMPLES:
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default: 60)",
+                    "description": (
+                        "Maximum total execution time in seconds (default: 60). "
+                        "Use a larger value for long-running commands such as installs, builds, or tests."
+                    ),
                     "default": 60,
                 },
                 "working_directory": {
@@ -1646,8 +1680,9 @@ GREP INVESTIGATION EXAMPLES:
 {self.name}(command="grep -rn 'def process_data' . --include='*.py'")  # Find function definitions
 {self.name}(command="grep -rni 'error|exception' . --include='*.py' -C 2")  # Find error handling with context
 {self.name}(command="grep -rn 'import pandas' .")  # Find specific imports
-{self.name}(command="ls -la", working_directory="/workspace")  # Standard file operations
-{self.name}(command="git status", working_directory="/workspace/project")  # Git operations
+{self.name}(command="ls -la", timeout=30, working_directory="/workspace")  # Standard file operations
+{self.name}(command="npm install", timeout=900, working_directory="/workspace/project")  # Long-running command
+{self.name}(command="git status", timeout=30, working_directory="/workspace/project")  # Git operations
 
 💡 For comprehensive grep patterns, use: get_grep_examples()
         """

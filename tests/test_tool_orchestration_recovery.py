@@ -97,9 +97,7 @@ def _orchestrator(
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
-        add_system_guidance=lambda message, priority=5: guidance.append(
-            (message, priority)
-        ),
+        add_system_guidance=lambda message, priority=5: guidance.append((message, priority)),
         get_timestamp=lambda: "ts",
         event_sink=events.append,
     )
@@ -221,8 +219,7 @@ def test_recovery_and_error_events_include_required_metadata():
     assert recovery_event.metadata["guidance"]
     assert recovery_event.metadata["replacement_result_success"] is True
     assert (
-        recovery_event.metadata["recovery_params"]["repository_url"]
-        == "https://example/repo.git"
+        recovery_event.metadata["recovery_params"]["repository_url"] == "https://example/repo.git"
     )
     assert recovery_event.metadata["parameter_diff"]["repository_url"]["before"] is None
     assert (
@@ -394,10 +391,7 @@ def test_generic_recovery_returns_failure_without_silent_success():
     assert execution.metadata["recovery"]["attempted"] is False
     assert execution.metadata["recovery"]["success"] is False
     assert execution.metadata["recovery"]["strategy"] == "generic_no_strategy"
-    assert (
-        execution.metadata["recovery"]["message"]
-        == "No generic recovery strategy available"
-    )
+    assert execution.metadata["recovery"]["message"] == "No generic recovery strategy available"
 
 
 def test_maven_java_version_recovery_installs_and_retries():
@@ -622,9 +616,7 @@ def test_maven_pom_discovery_recovery_targets_detected_pom():
     assert execution.status == "recovered"
     assert execution.recovery_strategy == "maven_pom_discovery"
     assert execution.executed_params == expected_params
-    assert build_orchestrator.commands == [
-        "find /workspace -maxdepth 4 -name pom.xml | head -20"
-    ]
+    assert build_orchestrator.commands == ["find /workspace -maxdepth 4 -name pom.xml | head -20"]
     assert maven.calls == [{"command": "test"}, expected_params]
     assert execution.metadata["recovery"]["recovery_params"] == expected_params
 
@@ -1048,8 +1040,8 @@ def test_bash_timeout_guidance_adds_system_guidance():
     execution = orchestrator.execute(
         ToolCall(
             name="bash",
-            raw_params={"command": "mvn test"},
-            validated_params={"command": "mvn test"},
+            raw_params={"command": "mvn test", "timeout": 120},
+            validated_params={"command": "mvn test", "timeout": 120},
         )
     )
 
@@ -1058,16 +1050,18 @@ def test_bash_timeout_guidance_adds_system_guidance():
     assert execution.result.error_code == "TIMEOUT_HANDLED"
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "bash_timeout_guidance"
-    assert execution.executed_params == {"command": "mvn test"}
-    assert bash.calls == [{"command": "mvn test"}]
+    assert execution.executed_params == {"command": "mvn test", "timeout": 120}
+    assert bash.calls == [{"command": "mvn test", "timeout": 120}]
     assert len(guidance) == 1
     assert guidance[0][1] == "high"
     assert "TIMEOUT HANDLED" in guidance[0][0]
     assert any(
-        "Maven command timed out" in suggestion
-        for suggestion in execution.result.suggestions
+        "Maven command timed out" in suggestion for suggestion in execution.result.suggestions
     )
-    assert execution.metadata["recovery"]["recovery_params"] == {"command": "mvn test"}
+    assert execution.metadata["recovery"]["recovery_params"] == {
+        "command": "mvn test",
+        "timeout": 120,
+    }
 
 
 def test_bash_workspace_recreation_retries_original_command():

@@ -1,6 +1,7 @@
 """Docker Orchestrator for managing containers and volumes."""
 
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -438,6 +439,7 @@ class DockerOrchestrator:
         workdir: Optional[str] = None,
         capture_stderr: bool = True,
         environment: Optional[Dict[str, str]] = None,
+        timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Execute a command in the container.
@@ -447,6 +449,7 @@ class DockerOrchestrator:
             workdir: The working directory to execute the command in.
             capture_stderr: Whether to capture stderr separately.
             environment: Additional environment variables.
+            timeout: Optional maximum total execution time in seconds.
 
         Returns:
             A dictionary with the result of the command execution.
@@ -473,6 +476,12 @@ class DockerOrchestrator:
         else:
             # No working directory specified, use default behavior
             wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+        timeout_seconds = int(timeout) if timeout is not None else None
+        if timeout_seconds is not None and timeout_seconds > 0:
+            escaped_command = shlex.quote(wrapped_command)
+            wrapped_command = (
+                f"timeout --preserve-status {timeout_seconds} bash -c {escaped_command}"
+            )
         exec_command = ["/bin/bash", "-c", wrapped_command]
 
         logger.info(f"Executing command in container: {command}")
@@ -584,8 +593,17 @@ class DockerOrchestrator:
                     build_failed = True
                     logger.warning("NPM error detected despite exit code")
 
+            timeout_exit_codes = {124, 137, 143}
+            timeout_terminated = (
+                timeout_seconds is not None
+                and timeout_seconds > 0
+                and exit_code in timeout_exit_codes
+            )
+            termination_reason = "absolute_timeout" if timeout_terminated else None
+            monitoring_info = {"execution_time": timeout_seconds} if timeout_terminated else None
+
             # Determine final success status
-            success = (exit_code == 0) and not build_failed
+            success = (exit_code == 0) and not build_failed and not timeout_terminated
 
             return {
                 "success": success,
@@ -595,6 +613,9 @@ class DockerOrchestrator:
                 "stderr": stderr_str,
                 "signal": None,  # Docker doesn't directly provide signal info
                 "build_failed": build_failed,  # Additional flag for build failures
+                "termination_reason": termination_reason,
+                "monitoring_info": monitoring_info,
+                "timeout": timeout_seconds if timeout_seconds and timeout_seconds > 0 else None,
             }
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")

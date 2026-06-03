@@ -516,7 +516,7 @@ class PhysicalValidator:
             # Execute the command
             full_command = f"cd {working_dir} && {command}"
             result = self.docker_orchestrator.execute_command(
-                full_command, timeout=300000
+                full_command, timeout=300
             )  # 5 min timeout
 
             exit_code = result.get("exit_code", 1)
@@ -566,7 +566,7 @@ class PhysicalValidator:
             try:
                 full_command = f"cd {working_dir} && {command}"
                 result = self.docker_orchestrator.execute_command(
-                    full_command, timeout=600000
+                    full_command, timeout=600
                 )  # 10 min timeout
 
                 output = result.get("output", "")

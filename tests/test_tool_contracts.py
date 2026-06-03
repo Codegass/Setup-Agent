@@ -1,5 +1,6 @@
 from sag.agent.react_engine import ReActEngine
 from sag.tools.base import BaseTool, ToolResult
+from sag.tools.bash import BashTool
 from sag.tools.report_tool import ReportTool
 
 
@@ -43,6 +44,27 @@ def test_real_tool_custom_schema_is_preserved():
     assert schema["properties"]["action"]["enum"] == ["generate"]
     assert "status" in schema["properties"]
     assert "details" in schema["properties"]
+
+
+def test_bash_tool_schema_exposes_timeout_for_agent_use():
+    schema = BashTool().get_parameter_schema()
+
+    assert schema["properties"]["timeout"]["type"] == "integer"
+    assert schema["properties"]["timeout"]["default"] == 60
+    assert "maximum total execution time" in schema["properties"]["timeout"]["description"].lower()
+
+
+def test_react_engine_preserves_bash_timeout_in_tool_schema():
+    tool = BashTool()
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.tools = {"bash": tool}
+    engine.is_claude_model = False
+
+    schema = ReActEngine._build_tools_schema(engine)
+
+    timeout_schema = schema[0]["function"]["parameters"]["properties"]["timeout"]
+    assert timeout_schema["type"] == "integer"
+    assert timeout_schema["default"] == 60
 
 
 def test_inherited_custom_schema_is_preserved():
