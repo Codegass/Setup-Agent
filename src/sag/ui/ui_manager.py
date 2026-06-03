@@ -14,7 +14,6 @@ from rich.panel import Panel
 
 from sag.ui.components import (
     create_active_operation_panel,
-    create_error_panel,
     create_evidence_panel,
     create_final_diagnosis_panel,
     create_live_error_panel,
@@ -25,7 +24,6 @@ from sag.ui.components import (
     create_recovery_panel,
     create_status_header,
     create_success_panel,
-    create_warning_panel,
     format_duration,
 )
 from sag.ui.diagnosis import build_final_diagnosis
