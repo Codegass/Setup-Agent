@@ -26,19 +26,19 @@ class UIStateAggregator:
         self._state = initial_run_state(project_name, self._clock())
 
     def snapshot(self) -> UIRunState:
-        return self._state
+        return self._copy_state()
 
     def handle(self, event: Any) -> UIRunState:
         event = self._normalize_event(event)
         if event is None:
-            return self._state
+            return self.snapshot()
 
         if not isinstance(event.event_type, EventType):
             self._state = self._append_warning(
                 f"Unknown UI event ignored: {event.event_type}: {event.message}",
                 details=event.details,
             )
-            return self._state
+            return self.snapshot()
 
         handler = {
             EventType.PHASE_START: self._handle_phase_start,
@@ -66,10 +66,25 @@ class UIStateAggregator:
                 f"Unhandled UI event ignored: {event.event_type.value}: {event.message}",
                 details=event.details,
             )
-            return self._state
+            return self.snapshot()
 
         handler(event)
-        return self._state
+        return self.snapshot()
+
+    def _copy_state(self) -> UIRunState:
+        return replace(
+            self._state,
+            phases=tuple(self._copy_phase_snapshot(phase) for phase in self._state.phases),
+            timeline=tuple(self._copy_timeline_entry(entry) for entry in self._state.timeline),
+            evidence=tuple(self._copy_evidence_record(item) for item in self._state.evidence),
+            latest_error=self._copy_timeline_entry(self._state.latest_error),
+            latest_warning=self._copy_timeline_entry(self._state.latest_warning),
+            report_data=(
+                self._copy_metadata(self._state.report_data)
+                if self._state.report_data is not None
+                else None
+            ),
+        )
 
     def _normalize_event(self, event: Any) -> UIEvent | None:
         if not isinstance(event, UIEvent):
@@ -628,11 +643,44 @@ class UIStateAggregator:
                 return snapshot
         raise ValueError(f"Unknown phase: {phase}")
 
+    def _copy_phase_snapshot(self, snapshot: PhaseSnapshot) -> PhaseSnapshot:
+        return replace(snapshot, steps=self._copy_steps(snapshot.steps))
+
+    def _copy_timeline_entry(self, entry: UITimelineEntry | None) -> UITimelineEntry | None:
+        if entry is None:
+            return None
+        return replace(entry, metadata=self._copy_metadata(entry.metadata))
+
+    def _copy_evidence_record(self, record: UIEvidenceRecord) -> UIEvidenceRecord:
+        return replace(record, metadata=self._copy_metadata(record.metadata))
+
     def _copy_steps(self, steps: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
         return tuple(self._copy_metadata(step) for step in steps)
 
     def _copy_metadata(self, metadata: Any) -> Any:
-        return deepcopy(metadata)
+        if isinstance(metadata, dict):
+            return {
+                self._copy_metadata_key(key): self._copy_metadata(value)
+                for key, value in metadata.items()
+            }
+        if isinstance(metadata, list):
+            return [self._copy_metadata(item) for item in metadata]
+        if isinstance(metadata, tuple):
+            return tuple(self._copy_metadata(item) for item in metadata)
+        if isinstance(metadata, set):
+            return {self._copy_metadata_key(item) for item in metadata}
+        try:
+            return deepcopy(metadata)
+        except Exception:
+            return repr(metadata)
+
+    def _copy_metadata_key(self, value: Any) -> Any:
+        copied = self._copy_metadata(value)
+        try:
+            hash(copied)
+        except TypeError:
+            return repr(copied)
+        return copied
 
     def _truncate(self, text: str, limit: int) -> str:
         return text[: limit - 3] + "..." if len(text) > limit else text

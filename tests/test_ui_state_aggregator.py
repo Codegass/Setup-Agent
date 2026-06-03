@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from threading import Lock
 
 from sag.ui.events import EventType, PhaseType, UIEvent
 from sag.ui.state_aggregator import UIStateAggregator
@@ -387,6 +388,89 @@ def test_report_data_and_evidence_metadata_are_defensive_copies():
     assert state.report_data["nested"]["result"] == "stable"
     assert state.evidence[-1].metadata["report_path"] == "reports/setup.md"
     assert state.evidence[-1].metadata["nested"]["result"] == "stable"
+
+
+def build_aggregator_with_nested_state():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(
+        UIEvent(
+            EventType.STEP_START,
+            "Create container",
+            phase=PhaseType.SETUP,
+            details="docker",
+        )
+    )
+    state = aggregator.handle(
+        UIEvent(
+            EventType.REPORT_GENERATED,
+            "Report generated",
+            metadata={
+                "report_path": "reports/setup.md",
+                "nested": {"result": "stable"},
+            },
+        )
+    )
+    return aggregator, state
+
+
+def mutate_nested_state(state):
+    setup_phase = next(phase for phase in state.phases if phase.phase == PhaseType.SETUP)
+    setup_phase.steps[0]["status"] = "mutated"
+    state.report_data["nested"]["result"] = "mutated"
+    state.timeline[-1].metadata["nested"]["result"] = "mutated"
+    state.evidence[-1].metadata["nested"]["result"] = "mutated"
+
+
+def assert_nested_state_is_stable(state):
+    setup_phase = next(phase for phase in state.phases if phase.phase == PhaseType.SETUP)
+    assert setup_phase.steps[0]["status"] == "running"
+    assert state.report_data["nested"]["result"] == "stable"
+    assert state.timeline[-1].metadata["nested"]["result"] == "stable"
+    assert state.evidence[-1].metadata["nested"]["result"] == "stable"
+
+
+def test_handle_returns_recursive_defensive_snapshot():
+    aggregator, state = build_aggregator_with_nested_state()
+
+    mutate_nested_state(state)
+
+    assert_nested_state_is_stable(aggregator.snapshot())
+
+
+def test_snapshot_returns_recursive_defensive_snapshot():
+    aggregator, _ = build_aggregator_with_nested_state()
+    state = aggregator.snapshot()
+
+    mutate_nested_state(state)
+
+    assert_nested_state_is_stable(aggregator.snapshot())
+
+
+def test_uncopyable_metadata_values_are_stringified():
+    lock = Lock()
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(
+        UIEvent(
+            EventType.ERROR,
+            "Lock failed",
+            level="error",
+            metadata={
+                "lock": lock,
+                "nested": {
+                    "items": [lock],
+                    "tuple": (lock,),
+                    "set": {lock},
+                },
+            },
+        )
+    )
+
+    metadata = state.latest_error.metadata
+    assert isinstance(metadata["lock"], str)
+    assert isinstance(metadata["nested"]["items"][0], str)
+    assert isinstance(metadata["nested"]["tuple"][0], str)
+    assert all(isinstance(item, str) for item in metadata["nested"]["set"])
 
 
 def test_aggregator_degrades_unknown_event_to_warning_timeline_entry():
