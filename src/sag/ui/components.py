@@ -409,10 +409,15 @@ def _has_completed_active_operation(state: UIRunState) -> bool:
     if last_tool_index is None:
         return False
 
-    return any(
-        entry.kind in {"observation", "completion", "error"}
-        for entry in state.timeline[last_tool_index + 1 :]
-    )
+    for entry in state.timeline[last_tool_index + 1 :]:
+        if entry.kind in {"observation", "completion", "error"}:
+            return True
+        if entry.kind == "evidence" and (
+            entry.metadata.get("tool_message") or entry.metadata.get("tool_name")
+        ):
+            return True
+
+    return False
 
 
 def _clip(value: object, limit: int, preserve_tail: bool = False) -> str:

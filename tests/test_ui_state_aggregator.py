@@ -288,7 +288,7 @@ def test_aggregator_tracks_tool_lifecycle_and_evidence_events():
     assert failed_result_state.evidence[-1].kind == "command"
     assert failed_result_state.evidence[-1].metadata["status"] == "failure"
     assert failed_result_state.latest_error == failed_result_state.timeline[-1]
-    assert failed_result_state.latest_error.kind == "observation"
+    assert failed_result_state.latest_error.kind == "error"
     assert failed_result_state.latest_error.level == "error"
     assert failed_result_state.latest_error.message == "maven compile failed"
 
@@ -305,6 +305,47 @@ def test_aggregator_tracks_tool_lifecycle_and_evidence_events():
     )
     assert evidence_state.evidence[-1].kind == "review_checkpoint"
     assert evidence_state.evidence[-1].path == "reviews/goodall.md"
+
+
+def test_tool_result_sequence_keeps_single_observation_timeline_entry():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven",
+            metadata={"tool_name": "maven", "tool_params": {"goal": "compile"}},
+        )
+    )
+    aggregator.handle(
+        UIEvent(
+            EventType.TOOL_START,
+            "Starting maven compile",
+            metadata={"tool_name": "maven", "tool_params": {"goal": "compile"}},
+        )
+    )
+    aggregator.handle(
+        UIEvent(
+            EventType.TOOL_RESULT,
+            "maven compile completed",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+                "status": "success",
+            },
+        )
+    )
+    state = aggregator.handle(
+        UIEvent(
+            EventType.AGENT_OBSERVATION,
+            "maven compile completed successfully",
+        )
+    )
+
+    observations = [entry for entry in state.timeline if entry.kind == "observation"]
+    assert len(observations) == 1
+    assert observations[0].message == "maven compile completed successfully"
+    assert state.evidence[-1].kind == "command"
 
 
 def test_aggregator_classifies_timeout_and_parameter_normalization_events():
