@@ -535,8 +535,10 @@ class UIManager:
 
         elif event.event_type == EventType.AGENT_ACTION and self.current_agent_step:
             self.agent_current_action = "acting"
-            tool_name = event.metadata.get("tool_name", "unknown")
+            tool_name = str(event.metadata.get("tool_name", "unknown"))
             tool_params = event.metadata.get("tool_params", {})
+            if not isinstance(tool_params, dict):
+                tool_params = {}
 
             self.agent_current_tool = tool_name
             self.agent_tool_params = tool_params
@@ -662,9 +664,10 @@ class UIManager:
 
     def _update_display(self):
         """Update the live display"""
+        if not self.live:
+            return
         renderable = self._render_display()
-        if self.live:
-            self.live.update(renderable)
+        self.live.update(renderable)
 
     def _safe_update_display(self):
         """Update Rich display without allowing render failures to abort the run."""

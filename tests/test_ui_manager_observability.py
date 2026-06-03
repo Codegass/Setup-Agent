@@ -49,19 +49,61 @@ def test_ui_manager_handles_invalid_phase_without_polluting_legacy_state():
     assert manager.current_status == "Initializing"
 
 
-def test_ui_manager_render_failure_does_not_abort_event_handling(monkeypatch):
+def test_ui_manager_live_update_failure_does_not_abort_event_handling():
     manager = make_manager()
 
-    def broken_render():
-        raise RuntimeError("render exploded")
+    class FakeLive:
+        def update(self, renderable):
+            raise RuntimeError("live update exploded")
 
-    monkeypatch.setattr(manager, "_render_display", broken_render)
+    manager.live = FakeLive()
 
     manager.handle_event(UIEvent(EventType.STATUS_UPDATE, "Still running"))
 
     assert manager.snapshot().current_status == "Still running"
     assert manager.snapshot().latest_warning is not None
     assert "render" in manager.snapshot().latest_warning.message.lower()
+
+
+def test_ui_manager_does_not_render_when_live_display_is_not_started(monkeypatch):
+    manager = make_manager()
+    render_calls = 0
+
+    def broken_render():
+        nonlocal render_calls
+        render_calls += 1
+        raise RuntimeError("render should not run")
+
+    monkeypatch.setattr(manager, "_render_display", broken_render)
+
+    manager.handle_event(UIEvent(EventType.STATUS_UPDATE, "Still running"))
+    manager.handle_event(UIEvent(EventType.STATUS_UPDATE, "Still running again"))
+
+    assert render_calls == 0
+    assert manager.snapshot().current_status == "Still running again"
+    assert manager.snapshot().latest_warning is None
+
+
+def test_ui_manager_handles_malformed_agent_tool_params_without_crashing_legacy_path():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_THOUGHT,
+            "I need to compile the project.",
+            metadata={"step_num": 1},
+        )
+    )
+
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven",
+            metadata={"tool_name": "maven", "tool_params": "not-dict"},
+        )
+    )
+
+    assert manager.snapshot().active_operation.tool_name == "maven"
+    assert manager.current_status == "Using maven"
 
 
 def test_ui_manager_start_render_failure_does_not_abort_ui_mode(monkeypatch):
