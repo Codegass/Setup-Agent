@@ -81,7 +81,6 @@ class UIManager:
         # Guards display_final_summary so callers (including cleanup paths)
         # can invoke it unconditionally without producing a duplicate panel.
         self._summary_shown = False
-        self._summary_record_segments: Optional[list] = None
 
         # Report information
         self.report_data: Optional[dict] = None  # Report metadata (path, status, metrics)
@@ -358,10 +357,26 @@ class UIManager:
                 details=str(exc),
             )
 
-        if isinstance(event, UIEvent) and isinstance(event.event_type, EventType):
+        if self._is_legacy_safe_event(event):
             self._handle_legacy_event(event)
 
         self._safe_update_display()
+
+    def _is_legacy_safe_event(self, event: UIEvent) -> bool:
+        """Return whether a raw event is safe for legacy mutable handlers."""
+        if not isinstance(event, UIEvent):
+            return False
+        if not isinstance(event.event_type, EventType):
+            return False
+        if not isinstance(event.message, str):
+            return False
+        if event.phase is not None and not isinstance(event.phase, PhaseType):
+            return False
+        if event.details is not None and not isinstance(event.details, str):
+            return False
+        if not isinstance(event.level, str):
+            return False
+        return isinstance(event.metadata, dict)
 
     def _handle_legacy_event(self, event: UIEvent):
         """Update legacy mutable fields for the current render path."""
@@ -700,9 +715,7 @@ class UIManager:
         this unconditionally without risking duplicate panels.
         """
         if self._summary_shown:
-            self._restore_summary_record_segments()
             return
-        record_start = self._record_buffer_length()
         self._summary_shown = True
         self.stop()
 
@@ -758,7 +771,6 @@ class UIManager:
         self.console.print()
         self.console.print("=" * 60)
         self.console.print()
-        self._cache_summary_record_segments(record_start)
 
     def _format_diagnosis_details(self, diagnosis: FinalDiagnosis) -> Optional[str]:
         """Format concise diagnosis details for the final summary panel."""
@@ -776,44 +788,3 @@ class UIManager:
             details.append(f"Next action: {diagnosis.next_actions[0]}")
 
         return "\n".join(details) if details else None
-
-    def _record_buffer_length(self) -> Optional[int]:
-        """Return current Rich record buffer length when recording is enabled."""
-        if not getattr(self.console, "record", False):
-            return None
-        buffer = getattr(self.console, "_record_buffer", None)
-        if buffer is None:
-            return None
-        lock = getattr(self.console, "_record_buffer_lock", None)
-        if lock is None:
-            return len(buffer)
-        with lock:
-            return len(buffer)
-
-    def _cache_summary_record_segments(self, start_index: Optional[int]) -> None:
-        """Cache recorded summary segments so repeated export_text calls are stable."""
-        if start_index is None or not getattr(self.console, "record", False):
-            return
-        buffer = getattr(self.console, "_record_buffer", None)
-        if buffer is None:
-            return
-        lock = getattr(self.console, "_record_buffer_lock", None)
-        if lock is None:
-            self._summary_record_segments = list(buffer[start_index:])
-            return
-        with lock:
-            self._summary_record_segments = list(buffer[start_index:])
-
-    def _restore_summary_record_segments(self) -> None:
-        """Restore cached summary segments to Rich's record buffer without printing."""
-        if not self._summary_record_segments or not getattr(self.console, "record", False):
-            return
-        buffer = getattr(self.console, "_record_buffer", None)
-        if buffer is None:
-            return
-        lock = getattr(self.console, "_record_buffer_lock", None)
-        if lock is None:
-            buffer.extend(self._summary_record_segments)
-            return
-        with lock:
-            buffer.extend(self._summary_record_segments)

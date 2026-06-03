@@ -36,6 +36,19 @@ def test_ui_manager_handles_unknown_event_without_crashing():
     assert manager.snapshot().latest_warning is not None
 
 
+def test_ui_manager_handles_invalid_phase_without_polluting_legacy_state():
+    manager = make_manager()
+
+    event = UIEvent(EventType.PHASE_START, "bad")
+    event.phase = "not-a-phase"
+
+    manager.handle_event(event)
+
+    assert manager.snapshot().latest_warning is not None
+    assert manager.current_phase is None
+    assert manager.current_status == "Initializing"
+
+
 def test_ui_manager_render_failure_does_not_abort_event_handling(monkeypatch):
     manager = make_manager()
 
@@ -66,16 +79,15 @@ def test_ui_manager_start_render_failure_does_not_abort_ui_mode(monkeypatch):
     assert "initial render" in manager.snapshot().latest_warning.message.lower()
 
 
-def test_display_final_summary_is_idempotent_with_snapshot_diagnosis():
+def test_display_final_summary_is_idempotent_no_op_with_snapshot_diagnosis():
     manager = make_manager()
     manager.handle_event(UIEvent(EventType.PHASE_START, "Building", phase=PhaseType.BUILD))
     manager.handle_event(UIEvent(EventType.PHASE_ERROR, "Build failed", phase=PhaseType.BUILD))
     manager.handle_event(UIEvent(EventType.FAILURE, "Project setup incomplete"))
 
     manager.display_final_summary()
-    first = manager.console.export_text()
     manager.display_final_summary()
-    second = manager.console.export_text()
+    output = manager.console.export_text()
 
-    assert first == second
-    assert "Project setup incomplete" in first or "did not complete" in first
+    assert output.count("Detailed Execution Log") == 1
+    assert output.count("Project setup incomplete") == 1
