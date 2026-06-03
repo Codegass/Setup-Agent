@@ -3,7 +3,6 @@ from pathlib import Path
 
 from sag.config.prompt_loader import load_react_engine_prompts
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 REACT_ENGINE_PATH = REPO_ROOT / "src/sag/agent/react_engine.py"
 PROMPT_REF_RE = re.compile(

@@ -7,7 +7,6 @@ from typing import Any, Mapping
 
 import yaml
 
-
 REACT_ENGINE_REQUIRED_PROMPT_KEYS = (
     "initial_system.identity",
     "initial_system.repository_url_notice",
