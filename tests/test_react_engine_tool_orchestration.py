@@ -149,7 +149,7 @@ def test_format_tool_result_delegates_to_orchestrator_formatter(monkeypatch):
 def test_react_engine_maps_tool_lifecycle_events_to_ui_events():
     engine = _engine_with_context()
     emitted = []
-    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+    engine.emit_event = lambda event: emitted.append(event)
 
     call = ToolCall(name="maven", raw_params={"goal": "compile"})
     engine._handle_tool_lifecycle_event(
@@ -161,13 +161,13 @@ def test_react_engine_maps_tool_lifecycle_events_to_ui_events():
         )
     )
 
-    assert emitted[0][0][0] == EventType.TOOL_START
+    assert emitted[0].event_type == EventType.TOOL_START
 
 
 def test_react_engine_preserves_real_tool_result_lifecycle_metadata():
     engine = _engine_with_context()
     emitted = []
-    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+    engine.emit_event = lambda event: emitted.append(event)
 
     call = ToolCall(
         name="maven",
@@ -195,18 +195,52 @@ def test_react_engine_preserves_real_tool_result_lifecycle_metadata():
         )
     )
 
-    event_type = emitted[0][0][0]
-    metadata = emitted[0][1]
-    assert event_type == EventType.TOOL_RESULT
+    emitted_event = emitted[0]
+    metadata = emitted_event.metadata
+    assert emitted_event.event_type == EventType.TOOL_RESULT
     assert metadata["tool_name"] == "maven"
     assert metadata["tool_params"]["goal"] == "compile"
     assert metadata["executed_params"]["working_directory"] == "/workspace/app"
 
 
+def test_react_engine_lifecycle_metadata_preserves_reserved_ui_event_keys():
+    engine = _engine_with_context()
+    emitted = []
+    engine.emit_event = lambda event: emitted.append(event)
+
+    call = ToolCall(name="maven", raw_params={"goal": "compile"})
+    engine._handle_tool_lifecycle_event(
+        ToolLifecycleEvent(
+            event_type="tool_result",
+            call=call,
+            message="outer message",
+            level="error",
+            metadata={
+                "message": "inner message",
+                "level": "inner-level",
+                "phase": "inner-phase",
+                "details": "inner details",
+            },
+        )
+    )
+
+    emitted_event = emitted[0]
+    assert emitted_event.event_type == EventType.TOOL_RESULT
+    assert emitted_event.message == "outer message"
+    assert emitted_event.level == "error"
+    assert emitted_event.metadata["message"] == "inner message"
+    assert emitted_event.metadata["level"] == "inner-level"
+    assert emitted_event.metadata["phase"] == "inner-phase"
+    assert emitted_event.metadata["details"] == "inner details"
+    assert emitted_event.metadata["tool_name"] == "maven"
+    assert emitted_event.metadata["tool_params"] == {"goal": "compile"}
+    assert emitted_event.metadata["tool_message"] == "outer message"
+
+
 def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
     engine = _engine_with_context()
     emitted = []
-    engine.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+    engine.emit_event = lambda event: emitted.append(event)
 
     result_event = ToolLifecycleEvent(
         event_type="tool_result",
@@ -241,33 +275,34 @@ def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
     engine._handle_tool_lifecycle_event(fixed_event)
 
     assert len(emitted) == 4
-    assert emitted[0][0][0] == EventType.TOOL_RESULT
-    assert emitted[0][1]["message"] == "echo finished"
-    assert emitted[0][1]["level"] == "info"
-    assert emitted[0][1]["tool_name"] == "echo"
-    assert emitted[0][1]["tool_params"] == {"command": "pwd"}
-    assert emitted[0][1]["tool_message"] == "echo finished"
-    assert emitted[1][0][0] == EventType.TOOL_RECOVERY
-    assert emitted[1][1]["message"] == "echo recovered"
-    assert emitted[1][1]["level"] == "warning"
-    assert emitted[1][1]["recovery_strategy"] == "retry"
-    assert emitted[1][1]["tool_name"] == "echo"
-    assert emitted[1][1]["tool_params"] == {"command": "pwd"}
-    assert emitted[1][1]["tool_message"] == "echo recovered"
-    assert emitted[2][0][0] == EventType.TOOL_ERROR
-    assert emitted[2][1]["message"] == "echo failed"
-    assert emitted[2][1]["level"] == "info"
-    assert emitted[2][1]["error_code"] == "FAIL"
-    assert emitted[2][1]["tool_name"] == "echo"
-    assert emitted[2][1]["tool_params"] == {"command": "pwd"}
-    assert emitted[2][1]["tool_message"] == "echo failed"
-    assert emitted[3][0][0] == EventType.TOOL_PARAMETERS_FIXED
-    assert emitted[3][1]["message"] == "echo params normalized"
-    assert emitted[3][1]["level"] == "warning"
-    assert emitted[3][1]["field"] == "working_directory"
-    assert emitted[3][1]["tool_name"] == "echo"
-    assert emitted[3][1]["tool_params"] == {"command": "pwd"}
-    assert emitted[3][1]["tool_message"] == "echo params normalized"
+    assert emitted[0].event_type == EventType.TOOL_RESULT
+    assert emitted[0].message == "echo finished"
+    assert emitted[0].level == "info"
+    assert emitted[0].metadata["status"] == "success"
+    assert emitted[0].metadata["tool_name"] == "echo"
+    assert emitted[0].metadata["tool_params"] == {"command": "pwd"}
+    assert emitted[0].metadata["tool_message"] == "echo finished"
+    assert emitted[1].event_type == EventType.TOOL_RECOVERY
+    assert emitted[1].message == "echo recovered"
+    assert emitted[1].level == "warning"
+    assert emitted[1].metadata["recovery_strategy"] == "retry"
+    assert emitted[1].metadata["tool_name"] == "echo"
+    assert emitted[1].metadata["tool_params"] == {"command": "pwd"}
+    assert emitted[1].metadata["tool_message"] == "echo recovered"
+    assert emitted[2].event_type == EventType.TOOL_ERROR
+    assert emitted[2].message == "echo failed"
+    assert emitted[2].level == "info"
+    assert emitted[2].metadata["error_code"] == "FAIL"
+    assert emitted[2].metadata["tool_name"] == "echo"
+    assert emitted[2].metadata["tool_params"] == {"command": "pwd"}
+    assert emitted[2].metadata["tool_message"] == "echo failed"
+    assert emitted[3].event_type == EventType.TOOL_PARAMETERS_FIXED
+    assert emitted[3].message == "echo params normalized"
+    assert emitted[3].level == "warning"
+    assert emitted[3].metadata["field"] == "working_directory"
+    assert emitted[3].metadata["tool_name"] == "echo"
+    assert emitted[3].metadata["tool_params"] == {"command": "pwd"}
+    assert emitted[3].metadata["tool_message"] == "echo params normalized"
 
 
 def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypatch):

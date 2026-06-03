@@ -329,6 +329,8 @@ class UIStateAggregator:
             metadata=metadata,
         )
         self._state = self._append_timeline(timeline_event, kind="observation")
+        if self._state.timeline[-1].level == "error":
+            self._state = replace(self._state, latest_error=self._state.timeline[-1])
 
     def _handle_tool_recovery(self, event: UIEvent) -> None:
         retry_count = event.metadata.get("retry_count", 0)

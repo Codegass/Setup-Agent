@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
-from sag.ui.events import EventType, PhaseType, UIEventEmitter
+from sag.ui.events import EventType, PhaseType, UIEvent, UIEventEmitter
 
 from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
 from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
@@ -1336,11 +1336,13 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         metadata.setdefault("tool_params", event.call.validated_params or event.call.raw_params)
         metadata.setdefault("tool_message", event.message)
 
-        self.emit(
-            event_type,
-            message=event.message,
-            level=event.level,
-            **metadata,
+        self.emit_event(
+            UIEvent(
+                event_type,
+                event.message,
+                level=event.level,
+                metadata=metadata,
+            )
         )
 
     def _build_tool_call_from_step(self, step: ReActStep) -> ToolCall:

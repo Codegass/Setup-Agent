@@ -271,6 +271,27 @@ def test_aggregator_tracks_tool_lifecycle_and_evidence_events():
     assert result_state.evidence[-1].metadata["status"] == "success"
     assert result_state.evidence[-1].metadata["tool_message"] == "maven compile completed"
 
+    failed_result_state = aggregator.handle(
+        UIEvent(
+            EventType.TOOL_RESULT,
+            "maven compile failed",
+            level="error",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+                "status": "failure",
+                "result_success": False,
+                "error_code": "MAVEN_FAILURE",
+            },
+        )
+    )
+    assert failed_result_state.evidence[-1].kind == "command"
+    assert failed_result_state.evidence[-1].metadata["status"] == "failure"
+    assert failed_result_state.latest_error == failed_result_state.timeline[-1]
+    assert failed_result_state.latest_error.kind == "observation"
+    assert failed_result_state.latest_error.level == "error"
+    assert failed_result_state.latest_error.message == "maven compile failed"
+
     evidence_state = aggregator.handle(
         UIEvent(
             EventType.EVIDENCE_RECORDED,
