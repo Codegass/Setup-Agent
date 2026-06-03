@@ -296,6 +296,7 @@ SAG provides a clean and powerful set of CLI commands.
 | `--log-level [DEBUG\|INFO\|WARNING\|ERROR]` | Overrides the log level set in the `.env` file. |
 | `--log-file <path>` | Specifies a custom path for the log file. |
 | `--verbose` | Enable verbose debugging output with detailed logs. |
+| `--ui` | Enable the Rich live progress display for supported `project` and `run` executions. Cannot be combined with `--verbose`. |
 
 ### Command-Specific Options
 
