@@ -85,12 +85,27 @@ class UIStateAggregator:
                 self._malformed_event_message(event, "missing required fields")
             )
             return None
+        event_type_label = (
+            event_type.value if isinstance(event_type, EventType) else str(event_type)
+        )
+        if not isinstance(message, str):
+            self._state = self._append_warning(
+                f"Malformed UI event ignored: {event_type_label}: non-string message {message!r}"
+            )
+            return None
 
         details = getattr(event, "details", None)
+        if details is not None and not isinstance(details, str):
+            self._state = self._append_warning(
+                f"Malformed UI event ignored: {event_type_label}: "
+                f"non-string details {details!r}: {message}"
+            )
+            return None
+
         phase = getattr(event, "phase", None)
         if phase is not None and not isinstance(phase, PhaseType):
             self._state = self._append_warning(
-                f"Malformed UI event ignored: {event_type}: invalid phase {phase}: {message}",
+                f"Malformed UI event ignored: {event_type_label}: invalid phase {phase}: {message}",
                 details=details,
             )
             return None

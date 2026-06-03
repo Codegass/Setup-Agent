@@ -451,3 +451,37 @@ def test_invalid_phase_records_warning_and_preserves_state():
     assert all(
         step.get("name") != "Bogus step" for phase in step_state.phases for step in phase.steps
     )
+
+
+def test_non_string_message_records_warning_and_preserves_state():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(UIEvent(EventType.PHASE_START, "Setting up", phase=PhaseType.SETUP))
+
+    state = aggregator.handle(UIEvent(EventType.AGENT_THOUGHT, ["bad"]))
+
+    assert state.latest_warning is not None
+    assert state.timeline[-1].kind == "warning"
+    assert EventType.AGENT_THOUGHT.value in state.latest_warning.message
+    assert "non-string message" in state.latest_warning.message
+    assert "['bad']" in state.latest_warning.message
+    assert state.current_phase == PhaseType.SETUP
+    assert state.current_status == "Setting up"
+
+
+def test_non_string_details_records_warning_and_preserves_state():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(UIEvent(EventType.PHASE_START, "Setting up", phase=PhaseType.SETUP))
+
+    state = aggregator.handle(
+        UIEvent(EventType.ERROR, "Bad error", details={"x": 1}, level="error")
+    )
+
+    assert state.latest_warning is not None
+    assert state.latest_error is None
+    assert state.timeline[-1].kind == "warning"
+    assert EventType.ERROR.value in state.latest_warning.message
+    assert "Bad error" in state.latest_warning.message
+    assert "non-string details" in state.latest_warning.message
+    assert "{'x': 1}" in state.latest_warning.message
+    assert state.current_phase == PhaseType.SETUP
+    assert state.current_status == "Setting up"
