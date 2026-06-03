@@ -17,6 +17,8 @@ from sag.ui.state import (
     initial_run_state,
 )
 
+_MISSING = object()
+
 
 class UIStateAggregator:
     def __init__(self, project_name: str, clock: Callable[[], datetime] | None = None):
@@ -26,10 +28,15 @@ class UIStateAggregator:
     def snapshot(self) -> UIRunState:
         return self._state
 
-    def handle(self, event: UIEvent) -> UIRunState:
+    def handle(self, event: Any) -> UIRunState:
+        event = self._normalize_event(event)
+        if event is None:
+            return self._state
+
         if not isinstance(event.event_type, EventType):
             self._state = self._append_warning(
-                f"Unknown UI event ignored: {event.event_type}", details=event.details
+                f"Unknown UI event ignored: {event.event_type}: {event.message}",
+                details=event.details,
             )
             return self._state
 
@@ -63,6 +70,53 @@ class UIStateAggregator:
 
         handler(event)
         return self._state
+
+    def _normalize_event(self, event: Any) -> UIEvent | None:
+        if not isinstance(event, UIEvent):
+            self._state = self._append_warning(
+                self._malformed_event_message(event, "not a UIEvent")
+            )
+            return None
+
+        event_type = getattr(event, "event_type", _MISSING)
+        message = getattr(event, "message", _MISSING)
+        if event_type is _MISSING or message is _MISSING or message is None:
+            self._state = self._append_warning(
+                self._malformed_event_message(event, "missing required fields")
+            )
+            return None
+
+        details = getattr(event, "details", None)
+        phase = getattr(event, "phase", None)
+        if phase is not None and not isinstance(phase, PhaseType):
+            self._state = self._append_warning(
+                f"Malformed UI event ignored: {event_type}: invalid phase {phase}: {message}",
+                details=details,
+            )
+            return None
+
+        metadata = getattr(event, "metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        return UIEvent(
+            event_type=event_type,
+            message=message,
+            phase=phase,
+            details=details,
+            level=getattr(event, "level", "info") or "info",
+            metadata=metadata,
+        )
+
+    def _malformed_event_message(self, event: Any, reason: str) -> str:
+        parts = [f"Malformed UI event ignored: {type(event).__name__}", reason]
+        event_type = getattr(event, "event_type", None)
+        message = getattr(event, "message", None)
+        if event_type is not None:
+            parts.append(f"event_type={event_type}")
+        if message is not None:
+            parts.append(f"message={message}")
+        return "; ".join(parts)
 
     def _handle_phase_start(self, event: UIEvent) -> None:
         if event.phase:

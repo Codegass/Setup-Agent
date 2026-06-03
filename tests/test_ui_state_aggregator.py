@@ -368,3 +368,86 @@ def test_aggregator_degrades_unknown_event_to_warning_timeline_entry():
     assert state.latest_warning is not None
     assert "unknown_event" in state.latest_warning.message
     assert state.current_status == "Initializing"
+
+
+def test_malformed_non_ui_event_records_warning_and_preserves_state():
+    class MissingEventType:
+        message = "Malformed status"
+
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(UIEvent(EventType.PHASE_START, "Setting up", phase=PhaseType.SETUP))
+
+    state = aggregator.handle(MissingEventType())
+
+    assert state.latest_warning is not None
+    assert state.timeline[-1].kind == "warning"
+    assert "MissingEventType" in state.latest_warning.message
+    assert "Malformed status" in state.latest_warning.message
+    assert state.current_phase == PhaseType.SETUP
+    assert state.current_status == "Setting up"
+
+
+def test_unknown_event_missing_optional_fields_records_warning_and_preserves_state():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(UIEvent(EventType.STATUS_UPDATE, "Known status"))
+    event = UIEvent(EventType.STATUS_UPDATE, "Unknown status")
+    event.event_type = "unknown_event"
+    del event.details
+
+    state = aggregator.handle(event)
+
+    assert state.latest_warning is not None
+    assert "unknown_event" in state.latest_warning.message
+    assert "Unknown status" in state.latest_warning.message
+    assert state.current_status == "Known status"
+
+
+def test_non_dict_metadata_is_treated_as_empty_dict():
+    for malformed_metadata in (None, [], "bad metadata"):
+        aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+        action_state = aggregator.handle(
+            UIEvent(
+                EventType.AGENT_ACTION,
+                "Using malformed metadata",
+                metadata=malformed_metadata,
+            )
+        )
+
+        assert action_state.active_operation.tool_name == "unknown"
+        assert action_state.timeline[-1].metadata == {}
+
+        error_state = aggregator.handle(
+            UIEvent(
+                EventType.ERROR,
+                "Command timeout",
+                level="error",
+                metadata=malformed_metadata,
+            )
+        )
+
+        assert error_state.latest_error.failure_classification == "command_timeout"
+        assert error_state.timeline[-1].metadata == {}
+
+
+def test_invalid_phase_records_warning_and_preserves_state():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(UIEvent(EventType.PHASE_START, "Setting up", phase=PhaseType.SETUP))
+
+    phase_state = aggregator.handle(
+        UIEvent(EventType.PHASE_START, "Bogus phase", phase="bogus_phase")
+    )
+    assert phase_state.latest_warning is not None
+    assert phase_state.timeline[-1].kind == "warning"
+    assert "bogus_phase" in phase_state.latest_warning.message
+    assert "Bogus phase" in phase_state.latest_warning.message
+    assert phase_state.current_phase == PhaseType.SETUP
+    assert phase_state.current_status == "Setting up"
+
+    step_state = aggregator.handle(UIEvent(EventType.STEP_START, "Bogus step", phase="bogus_phase"))
+    assert step_state.latest_warning is not None
+    assert "Bogus step" in step_state.latest_warning.message
+    assert step_state.current_phase == PhaseType.SETUP
+    assert step_state.current_status == "Setting up"
+    assert all(
+        step.get("name") != "Bogus step" for phase in step_state.phases for step in phase.steps
+    )
