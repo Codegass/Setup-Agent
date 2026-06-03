@@ -102,6 +102,14 @@ class UIStateAggregator:
             )
             return None
 
+        level = getattr(event, "level", "info") or "info"
+        if not isinstance(level, str):
+            self._state = self._append_warning(
+                f"Malformed UI event ignored: {event_type_label}: "
+                f"non-string level {level!r}: {message}"
+            )
+            return None
+
         phase = getattr(event, "phase", None)
         if phase is not None and not isinstance(phase, PhaseType):
             self._state = self._append_warning(
@@ -119,7 +127,7 @@ class UIStateAggregator:
             message=message,
             phase=phase,
             details=details,
-            level=getattr(event, "level", "info") or "info",
+            level=level,
             metadata=metadata,
         )
 

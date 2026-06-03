@@ -516,3 +516,19 @@ def test_non_string_details_records_warning_and_preserves_state():
     assert "{'x': 1}" in state.latest_warning.message
     assert state.current_phase == PhaseType.SETUP
     assert state.current_status == "Setting up"
+
+
+def test_non_string_level_records_warning_and_preserves_state():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+    aggregator.handle(UIEvent(EventType.PHASE_START, "Setting up", phase=PhaseType.SETUP))
+
+    state = aggregator.handle(UIEvent(EventType.STATUS_UPDATE, "Ready", level=["bad"]))
+
+    assert state.latest_warning is not None
+    assert state.timeline[-1].kind == "warning"
+    assert EventType.STATUS_UPDATE.value in state.latest_warning.message
+    assert "Ready" in state.latest_warning.message
+    assert "non-string level" in state.latest_warning.message
+    assert "['bad']" in state.latest_warning.message
+    assert state.current_phase == PhaseType.SETUP
+    assert state.current_status == "Setting up"
