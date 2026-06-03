@@ -102,7 +102,9 @@ class UIStateAggregator:
             )
             return None
 
-        level = getattr(event, "level", "info") or "info"
+        level = getattr(event, "level", _MISSING)
+        if level is _MISSING:
+            level = "info"
         if not isinstance(level, str):
             self._state = self._append_warning(
                 f"Malformed UI event ignored: {event_type_label}: "
