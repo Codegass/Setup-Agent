@@ -162,6 +162,56 @@ def test_render_display_includes_live_timeline_and_active_operation():
     assert "compile" in output
 
 
+def test_render_display_hides_active_operation_after_agent_observation():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven for build",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+    manager.handle_event(UIEvent(EventType.AGENT_OBSERVATION, "maven compile succeeded"))
+
+    output = render_display_text(manager)
+
+    assert "Active Operation" not in output
+    assert "maven compile succeeded" in output
+
+
+def test_render_display_hides_active_operation_after_tool_result():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_START,
+            "Running maven compile",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_RESULT,
+            "maven compile completed",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+                "status": "completed",
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert "Active Operation" not in output
+    assert "maven compile completed" in output
+
+
 def test_render_display_includes_recovery_and_evidence_panels():
     manager = make_manager()
     manager.handle_event(
@@ -192,3 +242,51 @@ def test_render_display_includes_recovery_and_evidence_panels():
     assert "Recovery" in output
     assert "Evidence" in output
     assert "logs/maven.log" in output
+
+
+def test_render_display_bounds_long_timeline_operation_and_evidence_text():
+    manager = make_manager()
+    long_command = "mvn " + "compile " * 40
+    long_detail = "compiler detail " * 40
+    long_summary = "Captured maven output " + "line " * 40
+    long_path = "logs/" + "nested-directory/" * 20 + "maven.log"
+
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_START,
+            long_command,
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.STATUS_UPDATE,
+            "Inspecting compiler output",
+            details=long_detail,
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.EVIDENCE_RECORDED,
+            "Captured maven log",
+            metadata={
+                "kind": "command",
+                "summary": long_summary,
+                "path": long_path,
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert long_command not in output
+    assert long_detail not in output
+    assert long_summary not in output
+    assert long_path not in output
+    assert "mvn compile" in output
+    assert "compiler detail" in output
+    assert "Captured maven output" in output
+    assert "maven.log" in output

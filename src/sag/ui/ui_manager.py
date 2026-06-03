@@ -26,7 +26,7 @@ from sag.ui.components import (
     create_warning_panel,
     format_duration,
 )
-from sag.ui.diagnosis import FinalDiagnosis, build_final_diagnosis
+from sag.ui.diagnosis import build_final_diagnosis
 from sag.ui.events import EventType, PhaseType, UIEvent
 from sag.ui.state import UIRunState
 from sag.ui.state_aggregator import UIStateAggregator
@@ -730,20 +730,3 @@ class UIManager:
         self.console.print()
         self.console.print("=" * 60)
         self.console.print()
-
-    def _format_diagnosis_details(self, diagnosis: FinalDiagnosis) -> Optional[str]:
-        """Format concise diagnosis details for the final summary panel."""
-        details = []
-        if diagnosis.failures:
-            details.append(f"Latest failure: {diagnosis.failures[-1]}")
-        elif self.errors:
-            latest_error = self.errors[-1]
-            failure = latest_error.message
-            if latest_error.details:
-                failure = f"{failure}: {latest_error.details}"
-            details.append(f"Latest failure: {failure}")
-
-        if diagnosis.next_actions:
-            details.append(f"Next action: {diagnosis.next_actions[0]}")
-
-        return "\n".join(details) if details else None

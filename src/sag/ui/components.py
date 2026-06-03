@@ -7,10 +7,7 @@ progress indicators, and status displays.
 
 from typing import Optional
 
-from rich.console import Group
-from rich.padding import Padding
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
@@ -35,6 +32,9 @@ PHASE_ICONS = {
     PhaseType.TEST: "🧪",
     PhaseType.VERIFICATION: "✓",
 }
+
+TEXT_LIMIT = 96
+PATH_LIMIT = 72
 
 
 def create_status_panel(
@@ -146,9 +146,10 @@ def create_phase_tree(phases_data: dict) -> Tree:
 def create_status_header(state: UIRunState, elapsed_time: str) -> Panel:
     """Create the snapshot-based status header."""
     phase_text = state.current_phase.value.title() if state.current_phase else "Initializing"
+    status = _clip(state.current_status, TEXT_LIMIT)
     content = (
         f"[bold cyan]SAG[/bold cyan] │ {state.project_name} │ "
-        f"{phase_text} │ {state.current_status} │ {elapsed_time}"
+        f"{phase_text} │ {status} │ {elapsed_time}"
     )
     return Panel(content, border_style="cyan", padding=(0, 1), width=80)
 
@@ -180,18 +181,20 @@ def create_phase_timeline(state: UIRunState) -> Tree:
 def create_active_operation_panel(state: UIRunState) -> Panel | None:
     """Create a concise active-operation panel when a tool is in flight."""
     operation = state.active_operation
-    if not operation.tool_name:
+    if not operation.tool_name or _has_completed_active_operation(state):
         return None
 
     lines = [f"[cyan]Tool:[/cyan] {operation.tool_name}"]
     if operation.visible_params:
-        lines.append(f"[cyan]Params:[/cyan] {operation.visible_params}")
+        lines.append(f"[cyan]Params:[/cyan] {_clip(operation.visible_params, TEXT_LIMIT)}")
     elif operation.action:
-        lines.append(f"[cyan]Action:[/cyan] {operation.action}")
+        lines.append(f"[cyan]Action:[/cyan] {_clip(operation.action, TEXT_LIMIT)}")
     if operation.workdir:
-        lines.append(f"[cyan]Workdir:[/cyan] {operation.workdir}")
+        lines.append(
+            f"[cyan]Workdir:[/cyan] {_clip(operation.workdir, PATH_LIMIT, preserve_tail=True)}"
+        )
     if operation.detail:
-        lines.append(f"[cyan]Detail:[/cyan] {operation.detail}")
+        lines.append(f"[cyan]Detail:[/cyan] {_clip(operation.detail, TEXT_LIMIT)}")
 
     return Panel("\n".join(lines), title="Active Operation", border_style="blue", padding=(1, 2))
 
@@ -214,13 +217,13 @@ def create_recovery_panel(state: UIRunState) -> Panel | None:
 
     lines = []
     if recovery.message:
-        lines.append(recovery.message)
+        lines.append(_clip(recovery.message, TEXT_LIMIT))
     if recovery.strategy:
-        lines.append(f"[cyan]Strategy:[/cyan] {recovery.strategy}")
+        lines.append(f"[cyan]Strategy:[/cyan] {_clip(recovery.strategy, TEXT_LIMIT)}")
     if recovery.retry_count:
         lines.append(f"[cyan]Retries:[/cyan] {recovery.retry_count}")
     if recovery.unresolved_risk:
-        lines.append(f"[cyan]Risk:[/cyan] {recovery.unresolved_risk}")
+        lines.append(f"[cyan]Risk:[/cyan] {_clip(recovery.unresolved_risk, TEXT_LIMIT)}")
 
     return Panel("\n".join(lines), title="Recovery", border_style="yellow", padding=(1, 2))
 
@@ -231,16 +234,14 @@ def create_evidence_panel(state: UIRunState, limit: int = 5) -> Panel | None:
     if not records:
         return None
 
-    table = Table.grid(padding=(0, 2))
-    table.add_column(style="cyan")
-    table.add_column()
-    table.add_column(style="dim")
-
+    lines = []
     for record in records:
-        path = record.path or ""
-        table.add_row(record.kind, record.summary, path)
+        path = _clip(record.path or "", PATH_LIMIT, preserve_tail=True)
+        lines.append(f"[cyan]{record.kind}:[/cyan] {_clip(record.summary, TEXT_LIMIT)}")
+        if path:
+            lines.append(f"[dim]path:[/dim] {path}")
 
-    return Panel(table, title="Evidence", border_style="green", padding=(1, 2))
+    return Panel("\n".join(lines), title="Evidence", border_style="green", padding=(1, 2))
 
 
 def create_final_diagnosis_panel(diagnosis: FinalDiagnosis) -> Panel:
@@ -383,7 +384,35 @@ def _status_style(status: str) -> str:
 def _format_timeline_line(entry: UITimelineEntry) -> str:
     timestamp = entry.timestamp.strftime("%H:%M:%S")
     kind = str(entry.kind).replace("_", " ").title()
-    line = f"[dim]{timestamp}[/dim] [cyan]{kind}[/cyan] {entry.message}"
+    line = f"[dim]{timestamp}[/dim] [cyan]{kind}[/cyan] {_clip(entry.message, TEXT_LIMIT)}"
     if entry.details:
-        line = f"{line} [dim]{entry.details}[/dim]"
+        line = f"{line} [dim]{_clip(entry.details, TEXT_LIMIT)}[/dim]"
     return line
+
+
+def _has_completed_active_operation(state: UIRunState) -> bool:
+    last_tool_index = None
+    for index, entry in enumerate(state.timeline):
+        if entry.kind == "tool":
+            last_tool_index = index
+
+    if last_tool_index is None:
+        return False
+
+    return any(
+        entry.kind in {"observation", "completion", "error"}
+        for entry in state.timeline[last_tool_index + 1 :]
+    )
+
+
+def _clip(value: object, limit: int, preserve_tail: bool = False) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+
+    if preserve_tail and limit > 12:
+        head_len = max(8, limit // 2 - 2)
+        tail_len = limit - head_len - 3
+        return f"{text[:head_len]}...{text[-tail_len:]}"
+
+    return f"{text[: limit - 3]}..."
