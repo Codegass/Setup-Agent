@@ -7,6 +7,17 @@ from typing import Any
 
 from sag.ui.state import UIEvidenceRecord, UIRunState, UITimelineEntry
 
+_RECOVERY_METADATA_KEYS = (
+    "recovery_strategy",
+    "strategy",
+    "recovery_params",
+    "parameter_diff",
+    "recovery",
+    "recovery_attempted",
+    "fallback",
+    "retry",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class FinalDiagnosis:
@@ -24,7 +35,7 @@ class FinalDiagnosis:
 
 
 def build_final_diagnosis(state: UIRunState) -> FinalDiagnosis:
-    status = state.final_status or ("success" if state.is_complete else "unknown")
+    status = state.final_status or "unknown"
     completed_phases = _phase_names_by_status(state, "success")
     failed_phases = _phase_names_by_status(state, "error")
     skipped_phases = _phase_names_by_status(state, "skipped")
@@ -40,10 +51,8 @@ def build_final_diagnosis(state: UIRunState) -> FinalDiagnosis:
         if entry.kind == "warning" or entry.level == "warning"
     )
     recovery = tuple(
-        _format_recovery_entry(entry) for entry in state.timeline if entry.kind == "recovery"
+        _format_recovery_entry(entry) for entry in state.timeline if _is_recovery_entry(entry)
     )
-    if not recovery:
-        recovery = warnings
 
     evidence = tuple(_format_evidence_record(item) for item in state.evidence)
     failure_classifications = _failure_classifications(state.timeline)
@@ -130,6 +139,19 @@ def _failure_classifications(
         seen.add(classification)
         classifications.append(classification)
     return tuple(classifications)
+
+
+def _is_recovery_entry(entry: UITimelineEntry) -> bool:
+    if entry.kind == "recovery":
+        return True
+    if entry.failure_classification == "recovery_attempt":
+        return True
+    return any(_has_recovery_metadata(entry.metadata, key) for key in _RECOVERY_METADATA_KEYS)
+
+
+def _has_recovery_metadata(metadata: dict[str, Any], key: str) -> bool:
+    value = metadata.get(key)
+    return value not in (None, False, "", (), [], {})
 
 
 def _format_recovery_entry(entry: UITimelineEntry) -> str:
