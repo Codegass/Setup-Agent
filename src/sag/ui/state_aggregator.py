@@ -383,6 +383,7 @@ class UIStateAggregator:
         )
         if (
             event.metadata.get("parameter_fix")
+            or event.metadata.get("parameter_fixes")
             or event.metadata.get("parameter_normalization")
             or has_parameter_normalization_text
         ):
@@ -393,6 +394,8 @@ class UIStateAggregator:
         if (
             event.metadata.get("recovery_attempted")
             or event.metadata.get("recovery_strategy")
+            or event.metadata.get("fallback")
+            or event.metadata.get("retry")
             or has_recovery_attempt_text
         ):
             return "recovery_attempt"

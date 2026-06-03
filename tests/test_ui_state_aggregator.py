@@ -285,6 +285,21 @@ def test_generic_error_classifies_parameter_normalization_from_text():
     assert state.latest_error.failure_classification == "parameter_normalization"
 
 
+def test_generic_error_classifies_parameter_normalization_from_parameter_fixes_metadata():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(
+        UIEvent(
+            EventType.ERROR,
+            "Tool failed",
+            level="error",
+            metadata={"parameter_fixes": {"working_directory": "/workspace/app"}},
+        )
+    )
+
+    assert state.latest_error.failure_classification == "parameter_normalization"
+
+
 def test_generic_error_classifies_recovery_attempt_from_text():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
 
@@ -298,6 +313,22 @@ def test_generic_error_classifies_recovery_attempt_from_text():
     )
 
     assert state.latest_error.failure_classification == "recovery_attempt"
+
+
+def test_generic_error_classifies_recovery_attempt_from_fallback_retry_metadata():
+    for metadata in ({"fallback": "retry bash"}, {"retry": True}):
+        aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+        state = aggregator.handle(
+            UIEvent(
+                EventType.ERROR,
+                "Tool failed",
+                level="error",
+                metadata=metadata,
+            )
+        )
+
+        assert state.latest_error.failure_classification == "recovery_attempt"
 
 
 def test_aggregator_records_validation_evidence_and_failure_classification():
