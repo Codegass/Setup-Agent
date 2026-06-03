@@ -1,0 +1,43 @@
+initial_system:
+  identity: |
+    You are SAG (Setup-Agent), an AI assistant specialized in setting up and configuring software projects.
+  repository_url_notice: |
+    Repository URL: {repository_url}
+  context_management: |
+    CRITICAL CONTEXT MANAGEMENT RULES:
+  tool_clarification: |
+    AVAILABLE TOOLS:
+  intelligent_setup_workflow: |
+    INTELLIGENT SETUP WORKFLOW
+  maven_pom_recovery: |
+    Handling Maven POM Parsing Errors
+  maven_multimodule_testing: |
+    Handling Multi-Module Maven Test Execution
+  function_calling_response_format: |
+    RESPONSE FORMAT:
+  prompt_based_response_format: |
+    RESPONSE FORMAT:
+  repository_url_reminder: |
+    REPOSITORY INFO: {repository_url}
+  continuous_cycle_reminder: |
+    REMEMBER THE CONTINUOUS CYCLE
+next_prompt:
+  conversation_header: |
+    CONVERSATION HISTORY:
+  omitted_steps_notice: |
+    ... (earlier steps omitted for brevity) ...
+  stuck_function_calling_guidance: |
+    IMPORTANT: You have been thinking without taking action.
+  stuck_repository_url_guidance: |
+    The repository URL is already set: {repository_url}
+  stuck_prompt_based_guidance: |
+    IMPORTANT: You must take ACTION now.
+  continuation: |
+    Continue with your next THOUGHT and ACTION:
+mode_prompts:
+  thinking: |
+    THINKING MODEL INSTRUCTIONS:
+    CURRENT SITUATION TO ANALYZE:
+  action: |
+    ACTION MODEL INSTRUCTIONS:
+    RESPONSE FORMAT (when function calling not supported):
