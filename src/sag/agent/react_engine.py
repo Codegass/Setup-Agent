@@ -11,6 +11,7 @@ from loguru import logger
 from pydantic import BaseModel
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
+from sag.config.prompt_loader import load_react_engine_prompts
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType, PhaseType, UIEvent, UIEventEmitter
@@ -60,6 +61,7 @@ class ReActEngine(UIEventEmitter):
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
+        self.prompts = load_react_engine_prompts()
         self.repository_url = repository_url
 
         # ReAct state
@@ -893,189 +895,43 @@ class ReActEngine(UIEventEmitter):
 
         # Get current context info
         context_info = self.context_manager.get_current_context_info()
+        parts = []
 
-        prompt = """You are SAG (Setup-Agent), an AI assistant specialized in setting up and configuring software projects.
-
-Your workflow follows the ReAct (Reasoning and Acting) pattern:
-1. THOUGHT: Think deeply about what you need to do next
-2. ACTION: Use a tool to take action
-3. OBSERVATION: Observe the results and plan next steps
-
-"""
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.identity
+        parts.append(self.prompts.get("initial_system.identity"))
 
         # Add repository URL at the very beginning if available
         if self.repository_url:
-            prompt += f"""🚨 IMPORTANT PROJECT INFORMATION 🚨
-Repository URL: {self.repository_url}
-This URL is ALREADY PROVIDED - DO NOT ASK FOR IT AGAIN!
-Your first action should be to clone this repository using the project_setup tool.
+            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.repository_url_notice
+            parts.append(
+                self.prompts.format(
+                    "initial_system.repository_url_notice", repository_url=self.repository_url
+                )
+            )
 
-"""
-
-        prompt += """CRITICAL CONTEXT MANAGEMENT RULES:
-- You work with TWO types of contexts: TRUNK (main) and BRANCH (task-specific)
-- TRUNK context: Contains the overall goal and TODO list of tasks
-- BRANCH context: For focused work on ONE specific task from the TODO list
-- COMPLETE WORKFLOW CYCLE:
-  1. manage_context(action="get_info") → Check current state and TODO list
-  2. manage_context(action="start_task", task_id="...") → Start next pending task
-  3. [Do the actual work for the task]
-  4. manage_context(action="complete_with_results", summary="...", key_results="...") → Complete task
-  5. REPEAT FROM STEP 1 → Check for next task
-- CRITICAL: After completing ANY task, IMMEDIATELY call manage_context(action="get_info") to see next tasks!
-- The system will show you the next pending task after completion - FOLLOW THAT GUIDANCE!
-- This prevents "ghost states" where work is done but not officially recorded
-- NO need for 'branch_start', 'branch_end', 'create_branch' - the system handles context switching!
-- Context switching is AUTOMATIC - you only specify which task to work on
-- The key_results from completed tasks will guide your next actions
-
-AVAILABLE TOOLS:
-"""
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.context_management
+        parts.append(self.prompts.get("initial_system.context_management"))
 
         # Add tool descriptions with usage examples
+        tool_lines = []
         for tool in self.tools.values():
-            prompt += f"\n- {tool.name}: {tool.description}"
+            tool_lines.append(f"- {tool.name}: {tool.description}")
             if hasattr(tool, "get_usage_example"):
-                prompt += f"\n  Usage: {tool.get_usage_example()}"
+                tool_lines.append(f"  Usage: {tool.get_usage_example()}")
+        if tool_lines:
+            parts.append("\n".join(tool_lines))
 
         # Add explicit tool name clarification
-        prompt += """
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.tool_clarification
+        parts.append(self.prompts.get("initial_system.tool_clarification"))
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.intelligent_setup_workflow
+        parts.append(self.prompts.get("initial_system.intelligent_setup_workflow"))
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.maven_pom_recovery
+        parts.append(self.prompts.get("initial_system.maven_pom_recovery"))
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.maven_multimodule_testing
+        parts.append(self.prompts.get("initial_system.maven_multimodule_testing"))
 
-AVAILABLE TOOLS:
-- bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
-  • ⚠️ For Maven projects: DO NOT use bash to run 'mvn' commands - use maven tool instead!
-- file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
-- web_search: Search the web for information
-- manage_context: Manage task workflow and context (NOT context or complete_with_results)
-  • Valid actions: get_info, start_task, complete_task, complete_with_results, add_context, get_full_context
-  • start_task: Begin work on a specific task ID from TODO list
-  • complete_with_results: RECOMMENDED action - Finish current task with key results (ATOMIC operation)
-  • complete_task: Basic task completion (use action="complete_with_results" instead)
-  • get_info: Check current context and available tasks
-  • CRITICAL: complete_with_results is an ACTION, not a separate tool!
-  • Example: manage_context(action="complete_with_results", summary="Task completed successfully", key_results="Built project, all tests pass")
-- maven: 🔥 PREFERRED for Maven projects - Execute Maven commands (NOT mvn)
-  • ✅ USE THIS for: compile, test, package, install, clean, verify
-  • ✅ Multi-module support: maven(command='test', fail_at_end=True) tests ALL modules
-  • ❌ DO NOT use bash(command='mvn ...') - use maven tool instead!
-- project_setup: Clone repositories and setup projects (NOT git_clone or clone)
-- project_analyzer: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
-  • 🔥 TRIGGER: Automatically call this tool after ANY project_setup clone success
-  • 🔥 MANDATORY: Do not skip this step - prevents build failures and generates optimal plans
-  • Analyzes Maven (pom.xml), Gradle (build.gradle/build.gradle.kts), Node.js (package.json), Python configs
-  • Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), reads README instructions
-  • Intelligently replaces your generic TODO tasks with project-specific optimized task sequences
-  • Example: project_setup success → project_analyzer(action="analyze", project_path="/workspace/project-name")
-  • Result: Generic tasks → Smart tasks like "Setup Java 17", "Maven clean install", "Run JUnit tests"
-- system: Install system packages and dependencies
-
-🧠 INTELLIGENT SETUP WORKFLOW (MANDATORY AND AUTOMATIC):
-1. 📥 Clone repository with project_setup tool
-2. 🔍 IMMEDIATELY and AUTOMATICALLY use project_analyzer tool after ANY successful clone
-   ⚠️  CRITICAL: This is NOT optional - project_analyzer MUST be called after every clone success
-   ⚠️  Do NOT attempt any build/test commands before project analysis
-   ⚠️  Do NOT skip this step - it prevents failed executions and generates optimal plans
-3. 📋 The analyzer will automatically replace your generic tasks with intelligent, project-specific tasks
-4. ✅ Execute the generated optimized task plan
-5. 📊 Generate final report
-
-AUTOMATIC TRIGGER RULE:
-✅ project_setup(action="clone") → SUCCESS → 🔍 project_analyzer(action="analyze") [MANDATORY]
-
-Why this automation is critical:
-• Detects project type (Maven, Gradle, Node.js, Python, etc.) and Java versions
-• Reads README files and build configurations for specific instructions  
-• Generates optimized task sequences instead of generic build attempts
-• Prevents the "wrong directory" and "unknown project type" failures
-• Replaces your TODO list with intelligent, project-specific tasks
-
-EXAMPLE FLOW:
-1. project_setup(action="clone", repository_url="...", target_directory="my-project")
-2. ✅ Clone successful → IMMEDIATELY call project_analyzer(action="analyze", project_path="/workspace/my-project") 
-3. 📋 Your generic tasks get replaced with smart tasks like "Setup Maven Java 17 environment", "Build with Maven", etc.
-4. Execute the intelligent plan
-
-Use these tools as needed to complete your tasks.
-"""
-
-        prompt += """## Handling Maven POM Parsing Errors
-
-When encountering Maven POM parsing errors during test execution, follow this decision tree:
-
-### 1. Identify POM Parsing Errors
-Look for these specific error patterns:
-- [FATAL] Non-parseable POM /path/to/pom.xml: Unrecognised tag: 'tagname' (position: START_TAG seen ...@line:column)
-- [ERROR] The build could not read 1 project
-
-### 2. Attempt Automatic Recovery (for POM errors ONLY)
-For POM parsing errors, try these fixes in order:
-1. Analyze the error location: bash(command='sed -n "LINE-5,LINE+5p" pom.xml')
-2. Common XML fixes:
-   - Orphaned tags outside dependency blocks: Remove or move inside proper parent
-   - Missing closing tags: Add the appropriate closing tag
-   - Misplaced tags: Move to correct location within parent element
-3. Verify fix: bash(command='xmllint --noout pom.xml')
-4. Test the fix: maven(command='validate', working_directory='/path/to/module')
-
-### 3. When Recovery Fails
-If automatic fix attempts fail after 2 tries:
-- Use maven(command='test', properties='pl=!module-name') to exclude ONLY the unparseable module
-- Document the issue in the context for the report
-- Continue testing other modules to maximize test coverage
-
-### 4. Important Distinctions
-DO NOT skip modules for: Test failures, compilation errors, missing dependencies, timeouts
-ONLY skip modules for: Unfixable POM parsing errors after attempted recovery
-
-### 5. Validation Requirements
-Before marking any test task as complete:
-- Check for test reports: bash(command='find . -name "TEST-*.xml" -o -path "*/surefire-reports"')
-- If no reports exist, the tests didn't run - investigate why
-- Document the number of tests run vs skipped in task results
-
-## Handling Multi-Module Maven Test Execution
-
-When running tests in multi-module Maven projects:
-
-### 1. DEFAULT BEHAVIOR WARNING
-Maven stops at the first module with test failures by default. This means:
-- If module A has test failures, modules B, C, D won't be tested
-- You'll miss potentially thousands of tests
-- Physical validation will show incomplete test coverage
-
-### 2. COMPREHENSIVE TESTING STRATEGIES
-For multi-module projects, use these approaches:
-
-**Option 1 - Fail at End (RECOMMENDED):**
-```
-maven(command="test", fail_at_end=True)
-```
-- Runs tests for ALL modules
-- Reports failures at the end
-- Build fails if any module has test failures
-- Best for getting complete test coverage
-
-**Option 2 - Ignore Test Failures:**
-```
-maven(command="test", ignore_test_failures=True)
-```
-- Continues build even if tests fail
-- Useful for getting a full picture of all failures
-- Build succeeds even with test failures
-
-### 3. DETECTION AND RESPONSE
-When you detect a multi-module project (contains <modules> in pom.xml):
-1. Always use fail_at_end=True for initial test run
-2. Check physical validation for modules without test reports
-3. If some modules lack reports, investigate why (compilation failures, etc.)
-
-### 4. VALIDATION
-After running tests in multi-module projects:
-- Verify ALL modules have surefire-reports directories
-- Check total test count matches expected (hundreds/thousands, not just dozens)
-- Report any modules that didn't run tests"""
-
-        prompt += f"""
+        context_part = f"""
 
 CURRENT CONTEXT:
 Context Type: {context_info.get('context_type', 'unknown')}
@@ -1083,113 +939,39 @@ Context ID: {context_info.get('context_id', 'unknown')}
 """
 
         if context_info.get("context_type") == "trunk":
-            prompt += f"""
+            context_part += f"""
 Goal: {context_info.get('goal', 'Not specified')}
 Progress: {context_info.get('progress', 'Not available')}
 Next Task: {context_info.get('next_task', 'No pending tasks')}
 """
         elif context_info.get("context_type") == "branch":
-            prompt += f"""
+            context_part += f"""
 Current Task: {context_info.get('task', 'Not specified')}
 Current Focus: {context_info.get('focus', 'Not specified')}
 """
+        parts.append(context_part.strip())
 
         # Add different instructions based on function calling support
         if self.supports_function_calling:
-            prompt += """
-
-RESPONSE FORMAT:
-You have access to function calling capabilities. Use the tools directly - they will be executed automatically.
-
-IMPORTANT GUIDELINES:
-1. USE THE TOOLS! Don't just think about using them - actually call them!
-2. Use the available tools through function calling to execute actions
-3. You can provide reasoning in your response content before or after tool calls
-4. Use manage_context tool correctly:
-   • NEVER use "switch" action - use "switch_to_trunk" instead
-   • For create_branch: ALWAYS provide task_id parameter
-   • For get_info: No additional parameters needed
-5. In TRUNK context: analyze TODO list and create branch contexts for tasks
-6. In BRANCH context: focus on the specific task, use detailed logging
-7. Always provide summaries when returning to trunk context
-8. Use bash tool for system operations, file_io for file operations
-9. Use web_search when you encounter unknown errors or need documentation
-10. When encountering errors, think carefully about the root cause before retrying
-
-MANDATORY WORKFLOW FOR PROJECT SETUP:
-🔄 CORRECT TASK MANAGEMENT FLOW:
-1. ALWAYS start with: manage_context(action="get_info") - check current status
-2. If you see TODO tasks, MUST start first task: manage_context(action="start_task", task_id="task_1")
-3. IN TASK CONTEXT: Execute the actual work:
-   • project_setup(action="clone", repository_url="...") 
-   • 🔥 IMMEDIATELY after clone success: project_analyzer(action="analyze")
-   • Follow the intelligent plan generated by analyzer
-4. When task work is done: manage_context(action="complete_with_results", summary="Brief task summary", key_results="Specific achievements and findings")
-5. System automatically moves to next task - repeat from step 2
-
-⚠️ CRITICAL RULE: NEVER try to complete_task without first doing start_task!
-⚠️ ALL project work must happen INSIDE a task context (after start_task)
-
-REQUIRED SEQUENCE: 
-1. manage_context(action="get_info") - See TODO list
-2. manage_context(action="start_task", task_id="...") - Start task
-3. [do actual work] - Execute task
-4. manage_context(action="complete_with_results", summary="...", key_results="...") - Complete task
-5. GO BACK TO SEQUENCE STEP 1 - Check for next task (DON'T SKIP THIS!)"""
+            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.function_calling_response_format
+            parts.append(self.prompts.get("initial_system.function_calling_response_format"))
         else:
-            prompt += """
-
-RESPONSE FORMAT:
-Always respond in this exact format:
-
-THOUGHT: [Your deep reasoning about what to do next, analyze the situation thoroughly]
-
-ACTION: [tool_name]
-PARAMETERS: [JSON object with parameters]
-
-Wait for OBSERVATION, then continue with next THOUGHT/ACTION cycle.
-
-IMPORTANT GUIDELINES:
-1. Always start with THOUGHT to explain your reasoning
-2. Use manage_context tool correctly:
-   • NEVER use "switch" action - use "switch_to_trunk" instead
-   • For create_branch: ALWAYS provide task_id parameter
-   • For get_info: No additional parameters needed
-3. In TRUNK context: analyze TODO list and create branch contexts for tasks
-4. In BRANCH context: focus on the specific task, use detailed logging
-5. Always provide summaries when returning to trunk context
-6. Use bash tool for system operations, file_io for file operations
-7. Use web_search when you encounter unknown errors or need documentation
-8. Be methodical and thorough in your approach
-9. When encountering errors, think carefully about the root cause before retrying
-
-MANDATORY WORKFLOW FOR PROJECT SETUP:
-🔄 CORRECT TASK MANAGEMENT FLOW:
-1. ALWAYS start with: manage_context(action="get_info") - check current status  
-2. If you see TODO tasks, MUST start first task: manage_context(action="start_task", task_id="task_1")
-3. IN TASK CONTEXT: Execute the actual work (project_setup, project_analyzer, etc.)
-4. When done: manage_context(action="complete_with_results", summary="...", key_results="...")
-5. System automatically moves to next task - repeat from step 2
-
-⚠️ CRITICAL: NEVER try to complete_task without first doing start_task!"""
+            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.prompt_based_response_format
+            parts.append(self.prompts.get("initial_system.prompt_based_response_format"))
 
         # Add repository URL reminder if available
         if self.repository_url:
-            prompt += f"""
+            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.repository_url_reminder
+            parts.append(
+                self.prompts.format(
+                    "initial_system.repository_url_reminder", repository_url=self.repository_url
+                )
+            )
 
-📂 REPOSITORY INFO: The target repository is {self.repository_url}
-🔧 Use this URL when cloning: project_setup(action="clone", repository_url="{self.repository_url}")"""
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> initial_system.continuous_cycle_reminder
+        parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
 
-        prompt += """
-
-🔄 REMEMBER THE CONTINUOUS CYCLE: 
-   manage_context(action="get_info") → manage_context(action="start_task") → [do work] → manage_context(action="complete_with_results") → BACK TO get_info → start next task → [repeat]
-   
-⚠️ AFTER COMPLETING EACH TASK: Always call manage_context(action="get_info") to see the next task!
-
-"""
-
-        return prompt
+        return "\n\n".join(part.rstrip() for part in parts if part).rstrip() + "\n"
 
     def _parse_llm_response(self, response: str, was_thinking_model: bool) -> List[ReActStep]:
         """Parse LLM response into ReAct steps."""
@@ -1927,7 +1709,8 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
 
     def _build_next_prompt(self) -> str:
         """Build the prompt for the next iteration."""
-        prompt = "CONVERSATION HISTORY:\n\n"
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.conversation_header
+        prompt = self.prompts.get("next_prompt.conversation_header").rstrip() + "\n\n"
 
         # Limit recent steps to avoid context window overflow
         # Keep the most recent steps, but cap the total length
@@ -1937,7 +1720,8 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         if len(self.steps) > max_steps * 2:
             # Take first 2 steps (usually context and first action) and last max_steps
             recent_steps = self.steps[:2] + self.steps[-max_steps:]
-            prompt += "... (earlier steps omitted for brevity) ...\n\n"
+            # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.omitted_steps_notice
+            prompt += self.prompts.get("next_prompt.omitted_steps_notice").rstrip() + "\n\n"
         elif len(self.steps) > max_steps:
             # Just take the most recent steps
             recent_steps = self.steps[-max_steps:]
@@ -1971,58 +1755,24 @@ MANDATORY WORKFLOW FOR PROJECT SETUP:
         if thoughts_without_actions >= 3:
             # Model seems stuck in thinking without acting
             if self.supports_function_calling:
-                prompt += """
-IMPORTANT: You have been thinking without taking action. Please use the available tools to make progress. 
-Use function calling to execute actions. Here's a reminder of available tools:
-- project_setup: Clone repositories and setup projects
-- manage_context: Manage context switching
-- bash: Execute shell commands
-- file_io: Read and write files
-- maven: Execute Maven commands
-- web_search: Search the web for information
-- system: Install system packages
-
-"""
+                # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.stuck_function_calling_guidance
+                prompt += self.prompts.get("next_prompt.stuck_function_calling_guidance").rstrip()
+                prompt += "\n\n"
                 # Add specific guidance based on repository URL
                 if self.repository_url:
-                    prompt += f"""The repository URL is already set: {self.repository_url}
-
-USE CORRECT TASK MANAGEMENT FLOW:
-1. FIRST check context status:
-   Call manage_context with action="get_info"
-   
-2. THEN start the first task:
-   Call manage_context with action="start_task" and task_id="task_1"
-   
-3. IN TASK CONTEXT, clone the repository:
-   Call project_setup with action="clone" and repository_url="{self.repository_url}"
-   
-4. IMMEDIATELY after clone success:
-   Call project_analyzer with action="analyze"
-
-🔄 CORRECT CONTINUOUS FLOW: 
-1. manage_context(action="get_info") - Check TODO list
-2. manage_context(action="start_task", task_id="...") - Start task  
-3. [Do the work: project_setup, project_analyzer, maven, etc.]
-4. manage_context(action="complete_with_results", summary="...", key_results="...") - Complete task
-5. GO BACK TO SEQUENCE STEP 1 - Don't skip this! Check for next task
-
-⚠️ CRITICAL: After completing ANY task, ALWAYS go back to sequence step 1 (get_info) before doing more work!
-"""
+                    # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.stuck_repository_url_guidance
+                    prompt += self.prompts.format(
+                        "next_prompt.stuck_repository_url_guidance",
+                        repository_url=self.repository_url,
+                    ).rstrip()
+                    prompt += "\n"
             else:
-                prompt += """
-IMPORTANT: You must take ACTION now. Use this format:
+                # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.stuck_prompt_based_guidance
+                prompt += self.prompts.get("next_prompt.stuck_prompt_based_guidance").rstrip()
+                prompt += "\n\n"
 
-ACTION: [tool_name]
-PARAMETERS: {"param1": "value1", "param2": "value2"}
-
-For example:
-ACTION: project_setup
-PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspace"}
-
-"""
-
-        prompt += "Continue with your next THOUGHT and ACTION:\n\n"
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> next_prompt.continuation
+        prompt += self.prompts.get("next_prompt.continuation").rstrip() + "\n\n"
 
         # Apply memory protection to prevent critical info loss due to context pollution
         prompt = self._inject_memory_protection(prompt)
@@ -2552,105 +2302,16 @@ PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspac
         Build specialized prompt for thinking model.
         Thinking model should ONLY reason and analyze, never call tools.
         """
-        thinking_instructions = """
-🧠 THINKING MODEL INSTRUCTIONS:
-You are in THINKING MODE. Your role is to analyze, reason, and plan - NOT to take actions.
-
-CRITICAL RULES FOR REACT ARCHITECTURE:
-1. ✅ OUTPUT ONLY THOUGHTS - Never attempt tool calls or function invocations
-2. ✅ Your job is ANALYSIS and PLANNING - not execution
-3. ✅ End your response with what ACTION should be taken next
-4. ✅ The ACTION MODEL will handle tool execution based on your analysis
-5. ✅ Do NOT format ACTION/PARAMETERS - that's the action model's job
-
-YOUR OUTPUT FORMAT:
-Provide pure reasoning and analysis. Always end with a clear recommendation:
-"Based on this analysis, the next action should be: [describe what tool should be used and why]"
-
-NEVER INCLUDE:
-- Function calls or tool invocations  
-- ACTION: statements
-- PARAMETERS: blocks
-- JSON formatting
-- Any executable commands
-
-REACT FLOW: THINKING → [hand off to ACTION MODEL] → OBSERVATION → [back to THINKING]
-
-EXAMPLE OF CORRECT THINKING OUTPUT:
-"I need to analyze the current project state. Looking at the context, I can see that task_1 requires cloning the repository. The repository URL is already provided: https://github.com/apache/commons-cli.git. 
-
-The agent needs to start by cloning the repository to establish the workspace, then immediately read the project documentation to understand the proper setup process.
-
-The logical sequence should be:
-1. Clone the repository to /workspace
-2. Read README.md to understand setup requirements  
-3. Look for build instructions and dependencies
-4. Follow the project's own setup instructions
-5. Execute build and test commands as recommended in documentation
-
-Based on this analysis, the next action should be: Use the project_setup tool with action='clone' to download the repository, since this is the foundational step that enables all subsequent work."
-
-Remember: You are the THINKING brain, not the ACTING hands. Analyze and recommend, don't execute.
-
----
-
-CURRENT SITUATION TO ANALYZE:
-"""
-
-        return thinking_instructions + base_prompt
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> mode_prompts.thinking
+        return self.prompts.get("mode_prompts.thinking").rstrip() + "\n" + base_prompt
 
     def _build_action_model_prompt(self, base_prompt: str) -> str:
         """
         Build specialized prompt for action model.
         Action model should execute tools based on reasoning.
         """
-        action_instructions = """
-🔧 ACTION MODEL INSTRUCTIONS:
-You are in ACTION MODE. Your role is to execute specific actions based on thinking model analysis.
-
-CRITICAL RULES FOR REACT ARCHITECTURE:
-1. ✅ EXECUTE the action recommended by the thinking model
-2. ✅ Use proper tool calling format (ACTION: tool_name, PARAMETERS: {...})
-3. ✅ Don't re-analyze - the thinking model already did that
-4. ✅ Focus on precise tool execution, not deep reasoning
-5. ✅ Your job is DOING, not thinking
-
-REACT FLOW: [THINKING complete] → ACTION (you) → OBSERVATION → [back to THINKING]
-
-RESPONSE FORMAT (when function calling is supported):
-Use function calling directly to execute the recommended tool. Minimal reasoning needed.
-
-RESPONSE FORMAT (when function calling not supported):
-ACTION: [tool_name]
-PARAMETERS: [JSON object with required parameters]
-
-CRITICAL: If the thinking model recommended a specific tool and action, execute it precisely.
-
-AVAILABLE TOOLS AND THEIR PURPOSE:
-- project_setup: Clone repositories and detect project types
-- bash: Execute shell commands for system operations (NOT for mvn commands!)
-- maven: 🔥 PREFERRED for Maven - Run Maven build commands
-  • ✅ USE for multi-module projects: maven(command='test', fail_at_end=True)
-  • ❌ DO NOT use bash for mvn commands!
-- file_io: Read and write files
-- manage_context: Manage task workflow and completion
-
-📖 PROJECT SETUP ACTION PRIORITIES:
-1. After cloning, IMMEDIATELY read project documentation:
-   • file_io(action="read", file_path="README.md") 
-   • Look for setup instructions, build commands, dependencies
-   • Check for testing procedures and environment requirements
-2. Follow the project's own instructions rather than making assumptions
-3. Use the exact commands recommended in the documentation
-
-Remember: You are the ACTING hands, not the thinking brain. Execute the planned actions efficiently.
-
----
-
-EXECUTE ACTIONS FOR:
-"""
-
-        return action_instructions + base_prompt
+        # Prompt: src/sag/config/prompts/react_engine.yaml:<line> mode_prompts.action
+        return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
 
     def _export_token_usage_csv(self):
         """Export token usage to CSV file when ReAct loop completes."""
