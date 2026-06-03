@@ -55,7 +55,10 @@ class UIStateAggregator:
         }.get(event.event_type)
 
         if handler is None:
-            self._state = self._append_timeline(event, kind="status")
+            self._state = self._append_warning(
+                f"Unhandled UI event ignored: {event.event_type.value}: {event.message}",
+                details=event.details,
+            )
             return self._state
 
         handler(event)
@@ -298,6 +301,7 @@ class UIStateAggregator:
             else str(event.event_type)
         ).lower()
         searchable_parts = [
+            event_name,
             event.message,
             event.details or "",
             str(event.metadata.get("error_code", "")),
@@ -305,16 +309,22 @@ class UIStateAggregator:
         searchable = " ".join(searchable_parts).lower()
         if "timeout" in searchable:
             return "command_timeout"
+        has_parameter_normalization_text = "parameter" in searchable and any(
+            token in searchable for token in ("fix", "normal", "normalize", "normalization")
+        )
         if (
             event.metadata.get("parameter_fix")
             or event.metadata.get("parameter_normalization")
-            or ("parameter" in event_name and ("fix" in event_name or "normal" in event_name))
+            or has_parameter_normalization_text
         ):
             return "parameter_normalization"
+        has_recovery_attempt_text = any(
+            token in searchable for token in ("recovery", "recover", "fallback", "retry")
+        )
         if (
             event.metadata.get("recovery_attempted")
             or event.metadata.get("recovery_strategy")
-            or "recovery" in event_name
+            or has_recovery_attempt_text
         ):
             return "recovery_attempt"
         if (
@@ -379,18 +389,24 @@ class UIStateAggregator:
         details: Optional[str],
     ) -> UIRunState:
         snapshot = self._phase_snapshot(phase)
-        updated_steps = []
-        updated = False
-        for step in snapshot.steps:
-            step_copy = self._copy_metadata(step)
-            if not updated and (
-                step_copy.get("name") == name or step_copy.get("status") == "running"
-            ):
-                step_copy["status"] = status
-                if details:
-                    step_copy["details"] = details
-                updated = True
-            updated_steps.append(step_copy)
+        updated_steps = [self._copy_metadata(step) for step in snapshot.steps]
+        target_index = next(
+            (index for index, step in enumerate(updated_steps) if step.get("name") == name),
+            None,
+        )
+        if target_index is None:
+            target_index = next(
+                (
+                    index
+                    for index, step in enumerate(updated_steps)
+                    if step.get("status") == "running"
+                ),
+                None,
+            )
+        if target_index is not None:
+            updated_steps[target_index]["status"] = status
+            if details:
+                updated_steps[target_index]["details"] = details
         return self._replace_phase(phase, steps=tuple(updated_steps))
 
     def _format_tool_params(self, tool_name: str, params: dict[str, Any]) -> str:

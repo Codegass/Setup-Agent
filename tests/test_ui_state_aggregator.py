@@ -95,6 +95,40 @@ def test_step_error_marks_running_step_and_records_latest_error():
     assert state.timeline[-1].kind == "error"
 
 
+def test_step_complete_prefers_named_step_before_first_running_step():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(UIEvent(EventType.STEP_START, "Clone repository", phase=PhaseType.SETUP))
+    aggregator.handle(UIEvent(EventType.STEP_START, "Create container", phase=PhaseType.SETUP))
+    state = aggregator.handle(
+        UIEvent(EventType.STEP_COMPLETE, "Create container", phase=PhaseType.SETUP)
+    )
+
+    setup_phase = next(phase for phase in state.phases if phase.phase == PhaseType.SETUP)
+    assert setup_phase.steps[0]["status"] == "running"
+    assert setup_phase.steps[1]["status"] == "success"
+
+
+def test_step_error_prefers_named_step_before_first_running_step():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(UIEvent(EventType.STEP_START, "Clone repository", phase=PhaseType.SETUP))
+    aggregator.handle(UIEvent(EventType.STEP_START, "Create container", phase=PhaseType.SETUP))
+    state = aggregator.handle(
+        UIEvent(
+            EventType.STEP_ERROR,
+            "Create container",
+            phase=PhaseType.SETUP,
+            details="docker failed",
+            level="error",
+        )
+    )
+
+    setup_phase = next(phase for phase in state.phases if phase.phase == PhaseType.SETUP)
+    assert setup_phase.steps[0]["status"] == "running"
+    assert setup_phase.steps[1]["status"] == "error"
+
+
 def test_status_update_updates_current_status_and_timeline():
     aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
 
@@ -103,6 +137,19 @@ def test_status_update_updates_current_status_and_timeline():
     assert state.current_status == "Waiting for container"
     assert state.timeline[-1].kind == "status"
     assert state.timeline[-1].message == "Waiting for container"
+
+
+def test_unhandled_existing_event_type_records_warning_and_preserves_status():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    aggregator.handle(UIEvent(EventType.STATUS_UPDATE, "Known status"))
+    state = aggregator.handle(UIEvent(EventType.PROJECT_ANALYSIS, "Analyzing repository"))
+
+    assert state.latest_warning is not None
+    assert state.timeline[-1].kind == "warning"
+    assert EventType.PROJECT_ANALYSIS.value in state.latest_warning.message
+    assert "Analyzing repository" in state.latest_warning.message
+    assert state.current_status == "Known status"
 
 
 def test_aggregator_tracks_agent_action_as_active_operation():
@@ -221,6 +268,36 @@ def test_warning_and_failure_use_fixed_classification_over_conflicting_metadata(
         )
     )
     assert failure_state.timeline[-1].failure_classification == "final_failure"
+
+
+def test_generic_error_classifies_parameter_normalization_from_text():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(
+        UIEvent(
+            EventType.ERROR,
+            "Parameter fix failed",
+            details="Could not normalize tool parameters",
+            level="error",
+        )
+    )
+
+    assert state.latest_error.failure_classification == "parameter_normalization"
+
+
+def test_generic_error_classifies_recovery_attempt_from_text():
+    aggregator = UIStateAggregator("commons-cli", clock=fixed_now)
+
+    state = aggregator.handle(
+        UIEvent(
+            EventType.ERROR,
+            "Fallback retry failed",
+            details="Recovery could not recover the command",
+            level="error",
+        )
+    )
+
+    assert state.latest_error.failure_classification == "recovery_attempt"
 
 
 def test_aggregator_records_validation_evidence_and_failure_classification():
