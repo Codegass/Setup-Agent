@@ -11,13 +11,17 @@ from typing import Optional
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.spinner import Spinner
-from rich.text import Text
 
 from sag.ui.components import (
+    create_active_operation_panel,
     create_error_panel,
+    create_evidence_panel,
+    create_final_diagnosis_panel,
+    create_phase_timeline,
     create_phase_tree,
-    create_status_panel,
+    create_recent_timeline_panel,
+    create_recovery_panel,
+    create_status_header,
     create_success_panel,
     create_warning_panel,
     format_duration,
@@ -51,6 +55,8 @@ class UIManager:
         # Timing
         self.start_time = time.time()
 
+        # Legacy mutable fields remain as compatibility shims for final summary
+        # details and existing callers; live rendering now reads typed snapshots.
         # Phase tracking
         self.current_phase: Optional[PhaseType] = None
         self.phases_data = {
@@ -582,83 +588,37 @@ class UIManager:
 
     def _render_display(self):
         """Render the current display"""
+        state = self.snapshot()
         elapsed = time.time() - self.start_time
         elapsed_str = format_duration(elapsed)
 
-        # Build the display elements
         elements = []
+        elements.append(create_status_header(state, elapsed_str))
+        elements.append("")
+        elements.append(create_phase_timeline(state))
 
-        # Determine if we should show spinner
-        # Show spinner for: agent working OR setup steps in progress
-        show_spinner = False
-        if not self.is_complete:
-            # Agent is working
-            if self.agent_current_action:
-                show_spinner = True
-            # OR setup phase has running steps
-            elif self.current_phase == PhaseType.SETUP:
-                setup_phase = self.phases_data.get(PhaseType.SETUP, {})
-                if setup_phase.get("status") == "running":
-                    show_spinner = True
+        for panel in (
+            create_active_operation_panel(state),
+            create_recovery_panel(state),
+            create_evidence_panel(state),
+            create_recent_timeline_panel(state),
+        ):
+            if panel:
+                elements.append("")
+                elements.append(panel)
 
-        # 1. Status panel at the top (clean, single line) with spinner if working
-        if show_spinner:
-            # Show spinner when actively working
-            spinner = Spinner("dots", text=self.current_status, style="cyan")
-            status_line = Text()
-            status_line.append("SAG", style="bold cyan")
-            status_line.append(" │ ", style="dim")
-            status_line.append(self.project_name)
-            status_line.append(" │ ", style="dim")
-            if self.current_phase:
-                status_line.append(self.current_phase.value.title())
-                status_line.append(" │ ", style="dim")
-
-            # Show agent detail if available, otherwise current status
-            if self.agent_detail:
-                status_line.append(self.agent_detail, style="yellow")
-            else:
-                status_line.append(self.current_status, style="yellow")
-
-            status_line.append(" │ ", style="dim")
-            status_line.append(elapsed_str, style="blue")
-
-            status_panel = Panel(
-                Group(spinner, status_line), border_style="cyan", padding=(0, 1), width=80
+        if state.latest_error:
+            elements.append("")
+            elements.append(
+                create_error_panel(state.latest_error.message, details=state.latest_error.details)
             )
-        else:
-            # Regular status panel without spinner
-            status_panel = create_status_panel(
-                project_name=self.project_name,
-                current_phase=self.current_phase,
-                status=self.current_status,
-                elapsed_time=elapsed_str,
+        elif state.latest_warning:
+            elements.append("")
+            elements.append(
+                create_warning_panel(
+                    state.latest_warning.message, details=state.latest_warning.details
+                )
             )
-        elements.append(status_panel)
-        elements.append("")  # Spacing
-
-        # 2. Phase tree
-        phase_tree = create_phase_tree(self.phases_data)
-        elements.append(phase_tree)
-
-        # 3. Show errors if any
-        if self.errors:
-            elements.append("")  # Spacing
-            latest_error = self.errors[-1]
-            error_panel = create_error_panel(latest_error.message, details=latest_error.details)
-            elements.append(error_panel)
-
-        # 4. Show warnings if any
-        if self.warnings and not self.errors:  # Only show if no errors
-            elements.append("")  # Spacing
-            latest_warning = self.warnings[-1]
-            warning_panel = create_warning_panel(
-                latest_warning.message, details=latest_warning.details
-            )
-            elements.append(warning_panel)
-
-        # Note: Final success panel is NOT shown here to avoid duplication
-        # It will be shown in display_final_summary() instead
 
         return Group(*elements)
 
@@ -744,11 +704,7 @@ class UIManager:
             )
             self.console.print(success_panel)
         else:
-            error_panel = create_error_panel(
-                diagnosis.outcome,
-                details=self._format_diagnosis_details(diagnosis),
-            )
-            self.console.print(error_panel)
+            self.console.print(create_final_diagnosis_panel(diagnosis))
 
         # Print report information if available
         if self.report_data:

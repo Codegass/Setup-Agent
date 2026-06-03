@@ -14,7 +14,9 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
+from sag.ui.diagnosis import FinalDiagnosis
 from sag.ui.events import PhaseType
+from sag.ui.state import UIRunState, UITimelineEntry
 
 # Status icons
 ICONS = {
@@ -141,6 +143,126 @@ def create_phase_tree(phases_data: dict) -> Tree:
     return tree
 
 
+def create_status_header(state: UIRunState, elapsed_time: str) -> Panel:
+    """Create the snapshot-based status header."""
+    phase_text = state.current_phase.value.title() if state.current_phase else "Initializing"
+    content = (
+        f"[bold cyan]SAG[/bold cyan] │ {state.project_name} │ "
+        f"{phase_text} │ {state.current_status} │ {elapsed_time}"
+    )
+    return Panel(content, border_style="cyan", padding=(0, 1), width=80)
+
+
+def create_phase_timeline(state: UIRunState) -> Tree:
+    """Create a snapshot-based phase timeline tree."""
+    tree = Tree("[bold]Phase Timeline[/bold]")
+
+    for phase in state.phases:
+        icon = PHASE_ICONS.get(phase.phase, "•")
+        status_icon = ICONS.get(phase.status, "")
+        label = f"{icon} {phase.phase.value.title()}"
+        if phase.status != "pending" and status_icon:
+            label = f"{label} {status_icon}"
+        node = tree.add(Text(label, style=_status_style(phase.status)))
+
+        for step in phase.steps:
+            step_status = str(step.get("status", "pending"))
+            step_icon = ICONS.get(step_status, "•")
+            step_name = str(step.get("name", "Unknown"))
+            step_node = node.add(Text(f"{step_icon} {step_name}", style=_status_style(step_status)))
+            details = step.get("details")
+            if details and step_status in {"success", "error"}:
+                step_node.add(Text(str(details), style="dim"))
+
+    return tree
+
+
+def create_active_operation_panel(state: UIRunState) -> Panel | None:
+    """Create a concise active-operation panel when a tool is in flight."""
+    operation = state.active_operation
+    if not operation.tool_name:
+        return None
+
+    lines = [f"[cyan]Tool:[/cyan] {operation.tool_name}"]
+    if operation.visible_params:
+        lines.append(f"[cyan]Params:[/cyan] {operation.visible_params}")
+    elif operation.action:
+        lines.append(f"[cyan]Action:[/cyan] {operation.action}")
+    if operation.workdir:
+        lines.append(f"[cyan]Workdir:[/cyan] {operation.workdir}")
+    if operation.detail:
+        lines.append(f"[cyan]Detail:[/cyan] {operation.detail}")
+
+    return Panel("\n".join(lines), title="Active Operation", border_style="blue", padding=(1, 2))
+
+
+def create_recent_timeline_panel(state: UIRunState, limit: int = 6) -> Panel | None:
+    """Create a compact recent timeline panel."""
+    entries = state.timeline[-limit:]
+    if not entries:
+        return None
+
+    content = "\n".join(_format_timeline_line(entry) for entry in entries)
+    return Panel(content, title="Timeline", border_style="cyan", padding=(1, 2))
+
+
+def create_recovery_panel(state: UIRunState) -> Panel | None:
+    """Create a recovery panel when recovery state is present."""
+    recovery = state.recovery
+    if not recovery.active:
+        return None
+
+    lines = []
+    if recovery.message:
+        lines.append(recovery.message)
+    if recovery.strategy:
+        lines.append(f"[cyan]Strategy:[/cyan] {recovery.strategy}")
+    if recovery.retry_count:
+        lines.append(f"[cyan]Retries:[/cyan] {recovery.retry_count}")
+    if recovery.unresolved_risk:
+        lines.append(f"[cyan]Risk:[/cyan] {recovery.unresolved_risk}")
+
+    return Panel("\n".join(lines), title="Recovery", border_style="yellow", padding=(1, 2))
+
+
+def create_evidence_panel(state: UIRunState, limit: int = 5) -> Panel | None:
+    """Create a compact evidence panel."""
+    records = state.evidence[-limit:]
+    if not records:
+        return None
+
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="cyan")
+    table.add_column()
+    table.add_column(style="dim")
+
+    for record in records:
+        path = record.path or ""
+        table.add_row(record.kind, record.summary, path)
+
+    return Panel(table, title="Evidence", border_style="green", padding=(1, 2))
+
+
+def create_final_diagnosis_panel(diagnosis: FinalDiagnosis) -> Panel:
+    """Create a final diagnosis panel from the typed diagnosis result."""
+    border_style = "green" if diagnosis.status == "success" else "red"
+    title = "Final Diagnosis" if diagnosis.status != "success" else "Success"
+    lines = [diagnosis.outcome]
+
+    if diagnosis.failures:
+        lines.append(f"[red]Latest failure:[/red] {diagnosis.failures[-1]}")
+    if diagnosis.warnings:
+        lines.append(f"[yellow]Latest warning:[/yellow] {diagnosis.warnings[-1]}")
+    if diagnosis.recovery:
+        lines.append(f"[cyan]Recovery:[/cyan] {diagnosis.recovery[-1]}")
+    if diagnosis.evidence:
+        lines.append(f"[cyan]Evidence:[/cyan] {diagnosis.evidence[-1]}")
+    if diagnosis.next_actions:
+        lines.append(f"[cyan]Next action:[/cyan] {diagnosis.next_actions[0]}")
+
+    return Panel("\n".join(lines), title=title, border_style=border_style, padding=(1, 2))
+
+
 def create_error_panel(error_message: str, details: Optional[str] = None) -> Panel:
     """
     Create an error panel
@@ -246,3 +368,22 @@ def format_duration(seconds: float) -> str:
     remaining_minutes = int(minutes % 60)
 
     return f"{hours}h {remaining_minutes}m {remaining_seconds}s"
+
+
+def _status_style(status: str) -> str:
+    if status == "success":
+        return "green"
+    if status == "running":
+        return "yellow"
+    if status == "error":
+        return "red"
+    return "dim"
+
+
+def _format_timeline_line(entry: UITimelineEntry) -> str:
+    timestamp = entry.timestamp.strftime("%H:%M:%S")
+    kind = str(entry.kind).replace("_", " ").title()
+    line = f"[dim]{timestamp}[/dim] [cyan]{kind}[/cyan] {entry.message}"
+    if entry.details:
+        line = f"{line} [dim]{entry.details}[/dim]"
+    return line

@@ -9,6 +9,11 @@ def make_manager():
     return UIManager(project_name="commons-cli", console=console)
 
 
+def render_display_text(manager):
+    manager.console.print(manager._render_display())
+    return manager.console.export_text()
+
+
 def test_ui_manager_updates_snapshot_when_handling_events():
     manager = make_manager()
 
@@ -133,3 +138,57 @@ def test_display_final_summary_is_idempotent_no_op_with_snapshot_diagnosis():
 
     assert output.count("Detailed Execution Log") == 1
     assert output.count("Project setup incomplete") == 1
+
+
+def test_render_display_includes_live_timeline_and_active_operation():
+    manager = make_manager()
+    manager.handle_event(UIEvent(EventType.PHASE_START, "Building", phase=PhaseType.BUILD))
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven for build",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert "Timeline" in output
+    assert "Active Operation" in output
+    assert "maven" in output
+    assert "compile" in output
+
+
+def test_render_display_includes_recovery_and_evidence_panels():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_RECOVERY,
+            "Retrying maven compile with normalized parameters",
+            level="warning",
+            metadata={
+                "recovery_strategy": "parameter normalization",
+                "retry_count": 1,
+            },
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.EVIDENCE_RECORDED,
+            "Captured maven log",
+            metadata={
+                "kind": "command",
+                "summary": "Captured maven compile output",
+                "path": "logs/maven.log",
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert "Recovery" in output
+    assert "Evidence" in output
+    assert "logs/maven.log" in output
