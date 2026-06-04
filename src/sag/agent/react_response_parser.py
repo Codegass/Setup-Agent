@@ -97,6 +97,8 @@ class ReActResponseParser:
             if skipping_observation:
                 if stripped.startswith("THOUGHT:") or stripped.startswith("ACTION:"):
                     skipping_observation = False
+                    if trusted_lines and trusted_lines[-1] != "":
+                        trusted_lines.append("")
                 else:
                     continue
 
@@ -111,9 +113,6 @@ class ReActResponseParser:
         model_used: str,
     ) -> None:
         action_lines = section.split("\n")
-        if len(action_lines) < 2:
-            return
-
         tool_name = action_lines[0][7:].strip()
 
         if not tool_name or tool_name.lower() in ["none", "null", ""]:
@@ -126,6 +125,9 @@ class ReActResponseParser:
                     model_used=model_used,
                 )
             )
+            return
+
+        if len(action_lines) < 2:
             return
 
         params = {}
