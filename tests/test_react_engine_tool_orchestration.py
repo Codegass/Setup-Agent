@@ -1,5 +1,7 @@
 from sag.agent.react_engine import ReActEngine, ReActStep, StepType
+from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
+from sag.config.prompt_loader import load_react_engine_prompts
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType
 
@@ -51,6 +53,12 @@ def _engine_with_context(context=None):
     engine = object.__new__(ReActEngine)
     engine.tools = {"bash": object()}
     engine.context_manager = context
+    engine.prompts = load_react_engine_prompts()
+    engine.prompt_builder = ReActPromptBuilder(
+        prompts=engine.prompts,
+        context_manager=engine.context_manager,
+        tools=engine.tools,
+    )
     engine.recent_tool_executions = []
     engine.successful_states = {"working_directory": None}
     engine.repository_url = "https://example.test/repo.git"
@@ -63,8 +71,8 @@ def _engine_with_context(context=None):
     engine.emit = lambda *args, **kwargs: None
     engine._force_thinking_next = False
     engine._force_thinking_after_success = False
-    engine._cached_trunk_context = "cached"
-    engine._trunk_context_cache_timestamp = 123
+    engine.prompt_builder._cached_trunk_context = "cached"
+    engine.prompt_builder._trunk_context_cache_timestamp = 123
     return engine
 
 
@@ -385,8 +393,8 @@ def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
     engine._apply_tool_execution_loop_effects(execution)
 
     assert engine._force_thinking_next is True
-    assert engine._cached_trunk_context is None
-    assert engine._trunk_context_cache_timestamp is None
+    assert engine.prompt_builder._cached_trunk_context is None
+    assert engine.prompt_builder._trunk_context_cache_timestamp is None
     assert context.force_next_task_calls == 1
 
 

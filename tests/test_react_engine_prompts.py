@@ -1,4 +1,6 @@
-from sag.agent.react_engine import ReActEngine, ReActStep, StepType
+from sag.agent.react_engine import ReActEngine
+from sag.agent.react_prompt_builder import ReActPromptBuilder
+from sag.agent.react_types import ReactModelMode, ReActStep, StepType
 from sag.config.prompt_loader import PromptConfig, load_react_engine_prompts
 from sag.tools.base import BaseTool, ToolResult
 
@@ -15,6 +17,9 @@ class DummyContextManager:
             "progress": "0/1",
             "next_task": "task_1",
         }
+
+    def load_trunk_context(self):
+        return None
 
 
 class DummyTool(BaseTool):
@@ -35,6 +40,11 @@ def make_engine(repository_url=None, supports_function_calling=True):
     engine.repository_url = repository_url
     engine.supports_function_calling = supports_function_calling
     engine.prompts = load_react_engine_prompts()
+    engine.prompt_builder = ReActPromptBuilder(
+        prompts=engine.prompts,
+        context_manager=engine.context_manager,
+        tools=engine.tools,
+    )
     engine.steps = []
     engine.successful_states = {
         "working_directory": None,
@@ -45,7 +55,6 @@ def make_engine(repository_url=None, supports_function_calling=True):
         "excluded_tests": set(),
         "report_snapshot": None,
     }
-    engine.context_manager = DummyContextManager()
     return engine
 
 
@@ -56,12 +65,16 @@ def test_react_engine_initialization_loads_prompt_config(monkeypatch):
     engine = ReActEngine(DummyContextManager(), [])
 
     assert isinstance(engine.prompts, PromptConfig)
+    assert isinstance(engine.prompt_builder, ReActPromptBuilder)
 
 
 def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     engine = make_engine(repository_url="https://example.test/repo.git")
 
-    prompt = ReActEngine._build_initial_system_prompt(engine)
+    prompt = engine.prompt_builder.build_initial_system_prompt(
+        repository_url=engine.repository_url,
+        tool_calling_enabled=engine.supports_function_calling,
+    )
 
     assert "You are SAG (Setup-Agent)" in prompt
     assert "https://example.test/repo.git" in prompt
@@ -78,7 +91,10 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
 def test_initial_system_prompt_uses_prompt_based_branch_when_function_calling_disabled():
     engine = make_engine(supports_function_calling=False)
 
-    prompt = ReActEngine._build_initial_system_prompt(engine)
+    prompt = engine.prompt_builder.build_initial_system_prompt(
+        repository_url=engine.repository_url,
+        tool_calling_enabled=engine.supports_function_calling,
+    )
 
     assert "Always respond in this exact format" in prompt
     assert "ACTION: [tool_name]" in prompt
@@ -92,7 +108,12 @@ def test_next_prompt_preserves_history_and_stuck_guidance():
         ReActStep(step_type=StepType.THOUGHT, content="thought 3", timestamp="t3"),
     ]
 
-    prompt = ReActEngine._build_next_prompt(engine)
+    prompt = engine.prompt_builder.build_next_prompt(
+        steps=engine.steps,
+        repository_url=engine.repository_url,
+        tool_calling_enabled=engine.supports_function_calling,
+        successful_states=engine.successful_states,
+    )
 
     assert "CONVERSATION HISTORY" in prompt
     assert "THOUGHT: thought 1" in prompt
@@ -104,8 +125,10 @@ def test_next_prompt_preserves_history_and_stuck_guidance():
 def test_mode_prompts_preserve_markers_and_base_prompt():
     engine = make_engine()
 
-    thinking_prompt = ReActEngine._build_thinking_model_prompt(engine, "base prompt")
-    action_prompt = ReActEngine._build_action_model_prompt(engine, "base prompt")
+    thinking_prompt = engine.prompt_builder.build_mode_prompt(
+        "base prompt", ReactModelMode.THINKING
+    )
+    action_prompt = engine.prompt_builder.build_mode_prompt("base prompt", ReactModelMode.ACTION)
 
     assert "THINKING MODEL INSTRUCTIONS" in thinking_prompt
     assert "CURRENT SITUATION TO ANALYZE" in thinking_prompt

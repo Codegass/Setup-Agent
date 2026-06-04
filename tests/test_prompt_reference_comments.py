@@ -4,7 +4,10 @@ from pathlib import Path
 from sag.config.prompt_loader import load_react_engine_prompts
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-REACT_ENGINE_PATH = REPO_ROOT / "src/sag/agent/react_engine.py"
+REACT_PROMPT_SOURCE_PATHS = (
+    REPO_ROOT / "src/sag/agent/react_engine.py",
+    REPO_ROOT / "src/sag/agent/react_prompt_builder.py",
+)
 PROMPT_REF_RE = re.compile(
     r"# Prompt: (?P<path>src/sag/config/prompts/react_engine\.yaml):(?P<line>\d+) (?P<key>[\w.]+)"
 )
@@ -14,17 +17,27 @@ PROMPT_LOOKUP_RE = re.compile(
 
 
 def test_react_engine_prompt_reference_comments_resolve():
-    source = REACT_ENGINE_PATH.read_text()
-    refs = list(PROMPT_REF_RE.finditer(source))
+    sources = {path: path.read_text() for path in REACT_PROMPT_SOURCE_PATHS}
+    refs = [
+        (path, ref) for path, source in sources.items() for ref in PROMPT_REF_RE.finditer(source)
+    ]
     assert refs
 
     prompts = load_react_engine_prompts()
-    referenced_keys = {ref.group("key") for ref in refs}
-    lookup_keys = {match.group("key") for match in PROMPT_LOOKUP_RE.finditer(source)}
+    for path, source in sources.items():
+        lines = source.splitlines()
+        for lookup in PROMPT_LOOKUP_RE.finditer(source):
+            key = lookup.group("key")
+            lookup_line = source[: lookup.start()].count("\n")
+            nearby_source = "\n".join(lines[max(0, lookup_line - 3) : lookup_line + 1])
+            nearby_refs = list(PROMPT_REF_RE.finditer(nearby_source))
 
-    assert lookup_keys <= referenced_keys
+            assert any(ref.group("key") == key for ref in nearby_refs), (
+                f"{path.relative_to(REPO_ROOT)} lookup for {key} is missing a nearby "
+                "# Prompt: reference"
+            )
 
-    for ref in refs:
+    for _, ref in refs:
         prompt_path = REPO_ROOT / ref.group("path")
         line_number = int(ref.group("line"))
         key = ref.group("key")

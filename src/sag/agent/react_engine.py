@@ -17,8 +17,9 @@ from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, Agen
 from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
+from .react_prompt_builder import ReActPromptBuilder
 from .react_response_parser import ReActResponseParser
-from .react_types import ReActStep, StepType
+from .react_types import ReactModelMode, ReActStep, StepType
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ToolCall,
@@ -41,6 +42,11 @@ class ReActEngine(UIEventEmitter):
         self.config = get_config()
         self.prompts = load_react_engine_prompts()
         self.repository_url = repository_url
+        self.prompt_builder = ReActPromptBuilder(
+            prompts=self.prompts,
+            context_manager=self.context_manager,
+            tools=self.tools,
+        )
 
         # ReAct state
         self.steps: List[ReActStep] = []
@@ -78,10 +84,6 @@ class ReActEngine(UIEventEmitter):
 
         # Check function calling support
         self._check_function_calling_support()
-
-        # PERFORMANCE: Cache trunk context to avoid frequent file I/O
-        self._cached_trunk_context = None
-        self._trunk_context_cache_timestamp = None
 
         # Initialize the centralized state evaluator (will be updated with physical validator after initialization)
         self.state_evaluator = AgentStateEvaluator(self.context_manager)
@@ -298,11 +300,17 @@ class ReActEngine(UIEventEmitter):
         self.current_iteration = 0
 
         # PERFORMANCE: Initialize trunk context cache at start
-        self._invalidate_trunk_cache()  # Ensure fresh start
-        self._get_cached_trunk_context()  # Load initial cache
+        self.prompt_builder.invalidate_trunk_cache()  # Ensure fresh start
 
         # Start with initial thought using thinking model
-        current_prompt = self._build_initial_system_prompt() + "\n\n" + initial_prompt
+        current_prompt = (
+            self.prompt_builder.build_initial_system_prompt(
+                repository_url=self.repository_url,
+                tool_calling_enabled=self.supports_function_calling,
+            )
+            + "\n\n"
+            + initial_prompt
+        )
 
         try:
             while self.current_iteration < max_iter:
@@ -372,7 +380,12 @@ class ReActEngine(UIEventEmitter):
                 #     self._add_action_guidance()
 
                 # Build prompt for next iteration
-                current_prompt = self._build_next_prompt()
+                current_prompt = self.prompt_builder.build_next_prompt(
+                    steps=self.steps,
+                    repository_url=self.repository_url,
+                    tool_calling_enabled=self.supports_function_calling,
+                    successful_states=self.successful_states,
+                )
 
                 # Step count is now automatically managed by branch history updates
                 # No manual step increment needed in new design
@@ -459,7 +472,12 @@ class ReActEngine(UIEventEmitter):
                     request_params = {
                         "model": model,
                         "messages": [
-                            {"role": "user", "content": self._build_thinking_model_prompt(prompt)}
+                            {
+                                "role": "user",
+                                "content": self.prompt_builder.build_mode_prompt(
+                                    prompt, ReactModelMode.THINKING
+                                ),
+                            }
                         ],
                         "reasoning_effort": self.config.gpt5_reasoning_effort,
                         "drop_params": True,  # Safely ignore unsupported parameters
@@ -485,7 +503,12 @@ class ReActEngine(UIEventEmitter):
                     request_params = {
                         "model": model,
                         "messages": [
-                            {"role": "user", "content": self._build_thinking_model_prompt(prompt)}
+                            {
+                                "role": "user",
+                                "content": self.prompt_builder.build_mode_prompt(
+                                    prompt, ReactModelMode.THINKING
+                                ),
+                            }
                         ],
                         "temperature": temperature,
                         "max_tokens": max_tokens,
@@ -511,7 +534,9 @@ class ReActEngine(UIEventEmitter):
                             "messages": [
                                 {
                                     "role": "user",
-                                    "content": self._build_thinking_model_prompt(prompt),
+                                    "content": self.prompt_builder.build_mode_prompt(
+                                        prompt, ReactModelMode.THINKING
+                                    ),
                                 }
                             ],
                             "temperature": self.config.thinking_temperature,
@@ -532,7 +557,12 @@ class ReActEngine(UIEventEmitter):
                     request_params = {
                         "model": model,
                         "messages": [
-                            {"role": "user", "content": self._build_action_model_prompt(prompt)}
+                            {
+                                "role": "user",
+                                "content": self.prompt_builder.build_mode_prompt(
+                                    prompt, ReactModelMode.ACTION
+                                ),
+                            }
                         ],
                         "reasoning_effort": self.config.gpt5_reasoning_effort,
                         "drop_params": True,  # Safely ignore unsupported parameters
@@ -556,7 +586,12 @@ class ReActEngine(UIEventEmitter):
                     request_params = {
                         "model": model,
                         "messages": [
-                            {"role": "user", "content": self._build_action_model_prompt(prompt)}
+                            {
+                                "role": "user",
+                                "content": self.prompt_builder.build_mode_prompt(
+                                    prompt, ReactModelMode.ACTION
+                                ),
+                            }
                         ],
                         "temperature": temperature,
                         "max_tokens": max_tokens,
@@ -605,7 +640,12 @@ class ReActEngine(UIEventEmitter):
                         fallback_params = {
                             "model": model,
                             "messages": [
-                                {"role": "user", "content": self._build_action_model_prompt(prompt)}
+                                {
+                                    "role": "user",
+                                    "content": self.prompt_builder.build_mode_prompt(
+                                        prompt, ReactModelMode.ACTION
+                                    ),
+                                }
                             ],
                             "temperature": self.config.action_temperature,
                             "max_tokens": self.config.action_max_tokens,
@@ -876,89 +916,6 @@ class ReActEngine(UIEventEmitter):
 
         return None
 
-    def _build_initial_system_prompt(self) -> str:
-        """Build the initial system prompt with context and tool information."""
-
-        # Get current context info
-        context_info = self.context_manager.get_current_context_info()
-        parts = []
-
-        # Prompt: src/sag/config/prompts/react_engine.yaml:2 initial_system.identity
-        parts.append(self.prompts.get("initial_system.identity"))
-
-        # Add repository URL at the very beginning if available
-        if self.repository_url:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:9 initial_system.repository_url_notice
-            parts.append(
-                self.prompts.format(
-                    "initial_system.repository_url_notice", repository_url=self.repository_url
-                )
-            )
-
-        # Prompt: src/sag/config/prompts/react_engine.yaml:14 initial_system.context_management
-        parts.append(self.prompts.get("initial_system.context_management"))
-
-        # Add tool descriptions with usage examples
-        tool_lines = []
-        for tool in self.tools.values():
-            tool_lines.append(f"- {tool.name}: {tool.description}")
-            if hasattr(tool, "get_usage_example"):
-                tool_lines.append(f"  Usage: {tool.get_usage_example()}")
-        if tool_lines:
-            parts.append("\n".join(tool_lines))
-
-        # Add explicit tool name clarification
-        # Prompt: src/sag/config/prompts/react_engine.yaml:33 initial_system.tool_clarification
-        parts.append(self.prompts.get("initial_system.tool_clarification"))
-        # Prompt: src/sag/config/prompts/react_engine.yaml:61 initial_system.intelligent_setup_workflow
-        parts.append(self.prompts.get("initial_system.intelligent_setup_workflow"))
-        # Prompt: src/sag/config/prompts/react_engine.yaml:89 initial_system.maven_pom_recovery
-        parts.append(self.prompts.get("initial_system.maven_pom_recovery"))
-        # Prompt: src/sag/config/prompts/react_engine.yaml:124 initial_system.maven_multimodule_testing
-        parts.append(self.prompts.get("initial_system.maven_multimodule_testing"))
-
-        context_part = f"""
-
-CURRENT CONTEXT:
-Context Type: {context_info.get('context_type', 'unknown')}
-Context ID: {context_info.get('context_id', 'unknown')}
-"""
-
-        if context_info.get("context_type") == "trunk":
-            context_part += f"""
-Goal: {context_info.get('goal', 'Not specified')}
-Progress: {context_info.get('progress', 'Not available')}
-Next Task: {context_info.get('next_task', 'No pending tasks')}
-"""
-        elif context_info.get("context_type") == "branch":
-            context_part += f"""
-Current Task: {context_info.get('task', 'Not specified')}
-Current Focus: {context_info.get('focus', 'Not specified')}
-"""
-        parts.append(context_part.strip())
-
-        # Add different instructions based on function calling support
-        if self.supports_function_calling:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:166 initial_system.function_calling_response_format
-            parts.append(self.prompts.get("initial_system.function_calling_response_format"))
-        else:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:205 initial_system.prompt_based_response_format
-            parts.append(self.prompts.get("initial_system.prompt_based_response_format"))
-
-        # Add repository URL reminder if available
-        if self.repository_url:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:239 initial_system.repository_url_reminder
-            parts.append(
-                self.prompts.format(
-                    "initial_system.repository_url_reminder", repository_url=self.repository_url
-                )
-            )
-
-        # Prompt: src/sag/config/prompts/react_engine.yaml:242 initial_system.continuous_cycle_reminder
-        parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
-
-        return "\n\n".join(part.rstrip() for part in parts if part).rstrip() + "\n"
-
     def _get_tool_orchestrator(self) -> ToolOrchestrator:
         """Build the orchestration adapter for delegated tool execution."""
         return ToolOrchestrator(
@@ -1020,7 +977,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             self._force_thinking_next = True
 
         if metadata.get("invalidate_trunk_cache"):
-            self._invalidate_trunk_cache()
+            self.prompt_builder.invalidate_trunk_cache()
 
         if metadata.get("force_next_task") and hasattr(self.context_manager, "force_next_task"):
             self.context_manager.force_next_task()
@@ -1582,78 +1539,6 @@ Current Focus: {context_info.get('focus', 'Not specified')}
                 return True
         return False
 
-    def _build_next_prompt(self) -> str:
-        """Build the prompt for the next iteration."""
-        # Prompt: src/sag/config/prompts/react_engine.yaml:248 next_prompt.conversation_header
-        prompt = self.prompts.get("next_prompt.conversation_header").rstrip() + "\n\n"
-
-        # Limit recent steps to avoid context window overflow
-        # Keep the most recent steps, but cap the total length
-        max_steps = 7  # Start with fewer steps to stay within context window
-
-        # If we have more steps, take the first few and the most recent ones
-        if len(self.steps) > max_steps * 2:
-            # Take first 2 steps (usually context and first action) and last max_steps
-            recent_steps = self.steps[:2] + self.steps[-max_steps:]
-            # Prompt: src/sag/config/prompts/react_engine.yaml:250 next_prompt.omitted_steps_notice
-            prompt += self.prompts.get("next_prompt.omitted_steps_notice").rstrip() + "\n\n"
-        elif len(self.steps) > max_steps:
-            # Just take the most recent steps
-            recent_steps = self.steps[-max_steps:]
-        else:
-            recent_steps = self.steps
-
-        for step in recent_steps:
-            if step.step_type == StepType.THOUGHT:
-                # Truncate very long thoughts to keep context manageable
-                content = step.content[:5000] + "..." if len(step.content) > 5000 else step.content
-                prompt += f"THOUGHT: {content}\n\n"
-            elif step.step_type == StepType.ACTION:
-                prompt += f"ACTION: {step.tool_name}\n"
-                if step.tool_params:
-                    prompt += f"PARAMETERS: {json.dumps(step.tool_params)}\n\n"
-            elif step.step_type == StepType.OBSERVATION:
-                # Truncate very long observations to keep context manageable
-                content = step.content[:5000] + "..." if len(step.content) > 5000 else step.content
-                prompt += f"OBSERVATION: {content}\n\n"
-            elif step.step_type == StepType.SYSTEM_GUIDANCE:
-                prompt += f"SYSTEM GUIDANCE: {step.content}\n\n"
-
-        # Check if we need to provide format guidance
-        thoughts_without_actions = 0
-        for step in reversed(recent_steps):
-            if step.step_type == StepType.THOUGHT:
-                thoughts_without_actions += 1
-            elif step.step_type == StepType.ACTION:
-                break
-
-        if thoughts_without_actions >= 3:
-            # Model seems stuck in thinking without acting
-            if self.supports_function_calling:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:252 next_prompt.stuck_function_calling_guidance
-                prompt += self.prompts.get("next_prompt.stuck_function_calling_guidance").rstrip()
-                prompt += "\n\n"
-                # Add specific guidance based on repository URL
-                if self.repository_url:
-                    # Prompt: src/sag/config/prompts/react_engine.yaml:262 next_prompt.stuck_repository_url_guidance
-                    prompt += self.prompts.format(
-                        "next_prompt.stuck_repository_url_guidance",
-                        repository_url=self.repository_url,
-                    ).rstrip()
-                    prompt += "\n"
-            else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:286 next_prompt.stuck_prompt_based_guidance
-                prompt += self.prompts.get("next_prompt.stuck_prompt_based_guidance").rstrip()
-                prompt += "\n\n"
-
-        # Prompt: src/sag/config/prompts/react_engine.yaml:295 next_prompt.continuation
-        prompt += self.prompts.get("next_prompt.continuation").rstrip() + "\n\n"
-
-        # Apply memory protection to prevent critical info loss due to context pollution
-        prompt = self._inject_memory_protection(prompt)
-
-        return prompt
-
     def _get_timestamp(self) -> str:
         """Get current timestamp string."""
         from datetime import datetime
@@ -1932,173 +1817,6 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             ),
         }
 
-    def _preserve_critical_info(self) -> str:
-        """
-        Preserve critical information that should not be forgotten due to context pollution.
-        This acts as a 'short-term memory' protection mechanism.
-        """
-        critical_info = []
-
-        # Always preserve repository URL if we have it
-        if self.repository_url:
-            critical_info.append(f"🔗 Repository URL: {self.repository_url}")
-
-        # ENHANCED: Preserve dynamic project state information
-        if self.successful_states.get("working_directory"):
-            workdir = self.successful_states["working_directory"]
-            critical_info.append(f"📁 Working Directory: {workdir}")
-            # Add explicit reminder for Maven/Gradle projects
-            if workdir != "/workspace" and self.successful_states.get("project_type") in [
-                "maven",
-                "gradle",
-            ]:
-                critical_info.append(
-                    f"⚠️ IMPORTANT: All Maven/Gradle commands must run in: {workdir}"
-                )
-
-        # Preserve project structure awareness
-        if self.successful_states.get("project_name"):
-            critical_info.append(f"📦 Project Name: {self.successful_states['project_name']}")
-
-        # Preserve build system information with more details
-        build_system = self.successful_states.get("build_system")
-        if build_system:
-            status_indicator = " (working)" if self.successful_states.get("maven_success") else ""
-            critical_info.append(f"🔧 Build System: {build_system}{status_indicator}")
-
-        # Preserve critical project structure findings
-        if self.successful_states.get("has_pom_xml"):
-            critical_info.append("📄 Found: pom.xml (Maven project confirmed)")
-
-        if self.successful_states.get("repository_cloned"):
-            critical_info.append("✅ Repository: Successfully cloned")
-
-        # Preserve successful tool states
-        successful_tools = []
-        for tool, success in [
-            ("project_setup", "project_setup" in self.successful_states.get("tools_used", [])),
-            ("maven", self.successful_states.get("maven_success", False)),
-            ("git", "git" in self.successful_states.get("tools_used", [])),
-        ]:
-            if success:
-                successful_tools.append(tool)
-
-        if successful_tools:
-            critical_info.append(f"✅ Working Tools: {', '.join(successful_tools)}")
-
-        # CRITICAL: Preserve task plan to prevent context pollution from causing hallucinated task IDs
-        try:
-            # Use cached trunk context to avoid frequent file I/O
-            trunk_context = self._get_cached_trunk_context()
-            if trunk_context and trunk_context.todo_list:
-                current_task = None
-                next_task = None
-                completed_count = 0
-
-                for task in trunk_context.todo_list:
-                    if task.status.value == "completed":
-                        completed_count += 1
-                    elif task.status.value == "in_progress":
-                        current_task = task
-                    elif task.status.value == "pending" and not next_task:
-                        next_task = task
-
-                plan_summary = [
-                    f"📋 TASK PLAN ({completed_count}/{len(trunk_context.todo_list)} completed):"
-                ]
-
-                if current_task:
-                    plan_summary.append(
-                        f"  🔄 CURRENT: {current_task.id} - {current_task.description}"
-                    )
-
-                if next_task:
-                    plan_summary.append(f"  ⏭️ NEXT: {next_task.id} - {next_task.description}")
-
-                # Show available task IDs to prevent hallucinations
-                all_task_ids = [task.id for task in trunk_context.todo_list]
-                plan_summary.append(f"  📝 VALID IDs: {', '.join(all_task_ids)}")
-
-                # CRITICAL: Add previous task's key results as context for next task
-                previous_task_results = []
-                for task in trunk_context.todo_list:
-                    if task.status.value == "completed" and task.key_results:
-                        previous_task_results.append(f"    - {task.id}: {task.key_results}")
-
-                if previous_task_results:
-                    plan_summary.append("  🔑 PREVIOUS_TASK_RESULTS:")
-                    plan_summary.extend(previous_task_results)
-
-                # CRITICAL: Add clear workflow guidance to prevent mental model confusion
-                plan_summary.append(
-                    '  💡 WORKFLOW: manage_context(action="start_task", task_id="...") → [work on task] → manage_context(action="complete_with_results", summary="...", key_results="...")'
-                )
-                plan_summary.append(
-                    '  ⚠️ USE manage_context(action="complete_with_results", summary="...", key_results="...") - NOT a separate tool!'
-                )
-                plan_summary.append(
-                    "  ⚠️ NO 'branch_start' or 'branch_end' - context switching is automatic!"
-                )
-
-                critical_info.extend(plan_summary)
-
-        except Exception as e:
-            # Don't let context loading errors break the memory protection
-            critical_info.append("⚠️ Task plan unavailable - use manage_context(action='get_info')")
-
-        if critical_info:
-            return (
-                "\n🧠 CRITICAL MEMORY (preserved to prevent context pollution losses):\n"
-                + "\n".join(critical_info)
-                + "\n"
-            )
-        return ""
-
-    def _inject_memory_protection(self, prompt: str) -> str:
-        """
-        Inject critical information preservation into prompts to combat context pollution.
-        """
-        critical_memory = self._preserve_critical_info()
-        if critical_memory:
-            # Insert critical memory after the initial system prompt but before the current situation
-            insertion_point = prompt.find("Current situation:")
-            if insertion_point != -1:
-                return prompt[:insertion_point] + critical_memory + "\n" + prompt[insertion_point:]
-            else:
-                # Fallback: add at the beginning
-                return critical_memory + "\n" + prompt
-        return prompt
-
-    def _get_cached_trunk_context(self):
-        """
-        Get trunk context with intelligent caching to avoid frequent file I/O.
-        Only reloads when necessary (every 5 steps or after context changes).
-        """
-        current_step = len(self.steps)
-
-        # Cache for 5 steps or if cache is empty
-        if (
-            self._cached_trunk_context is None
-            or self._trunk_context_cache_timestamp is None
-            or current_step - self._trunk_context_cache_timestamp >= 5
-        ):
-
-            try:
-                self._cached_trunk_context = self.context_manager.load_trunk_context()
-                self._trunk_context_cache_timestamp = current_step
-                logger.debug(f"Refreshed trunk context cache at step {current_step}")
-            except Exception as e:
-                logger.warning(f"Failed to refresh trunk context cache: {e}")
-                # Keep using old cache if refresh fails
-
-        return self._cached_trunk_context
-
-    def _invalidate_trunk_cache(self):
-        """Invalidate trunk context cache when we know it has changed."""
-        self._cached_trunk_context = None
-        self._trunk_context_cache_timestamp = None
-        logger.debug("Trunk context cache invalidated")
-
     @staticmethod
     def _normalize_guidance_priority(priority: Any) -> int:
         """Convert guidance priority labels to the numeric scale used for display."""
@@ -2171,22 +1889,6 @@ Current Focus: {context_info.get('focus', 'Not specified')}
 
         logger.info(f"State analysis: {analysis.status}, needs_guidance: {analysis.needs_guidance}")
         return analysis
-
-    def _build_thinking_model_prompt(self, base_prompt: str) -> str:
-        """
-        Build specialized prompt for thinking model.
-        Thinking model should ONLY reason and analyze, never call tools.
-        """
-        # Prompt: src/sag/config/prompts/react_engine.yaml:298 mode_prompts.thinking
-        return self.prompts.get("mode_prompts.thinking").rstrip() + "\n" + base_prompt
-
-    def _build_action_model_prompt(self, base_prompt: str) -> str:
-        """
-        Build specialized prompt for action model.
-        Action model should execute tools based on reasoning.
-        """
-        # Prompt: src/sag/config/prompts/react_engine.yaml:341 mode_prompts.action
-        return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
 
     def _export_token_usage_csv(self):
         """Export token usage to CSV file when ReAct loop completes."""
