@@ -27,7 +27,9 @@ class ReActResponseParser:
 
         logger.debug(f"Parsing LLM response: {repr(response)}")
 
-        sections = re.split(r"\n\n(?=THOUGHT:|ACTION:|OBSERVATION:)", response.strip())
+        trusted_response = self._strip_model_observations(response)
+
+        sections = re.split(r"\n\n(?=THOUGHT:|ACTION:|OBSERVATION:)", trusted_response.strip())
 
         logger.debug(f"Split response into {len(sections)} sections")
         for i, section in enumerate(sections):
@@ -53,8 +55,8 @@ class ReActResponseParser:
             elif section.startswith("OBSERVATION:"):
                 logger.debug("Ignoring model-generated OBSERVATION section")
 
-        if not steps and response.strip():
-            content = response.strip()
+        if not steps and trusted_response.strip():
+            content = trusted_response.strip()
             logger.info("Parsing failed, treating entire response as thought")
             logger.info(f"Full response content: {content}")
 
@@ -79,6 +81,28 @@ class ReActResponseParser:
             )
 
         return steps
+
+    def _strip_model_observations(self, response: str) -> str:
+        trusted_lines = []
+        skipping_observation = False
+
+        for line in response.splitlines():
+            stripped = line.strip()
+
+            if stripped.startswith("OBSERVATION:"):
+                skipping_observation = True
+                logger.debug("Stripping model-generated OBSERVATION content")
+                continue
+
+            if skipping_observation:
+                if stripped.startswith("THOUGHT:") or stripped.startswith("ACTION:"):
+                    skipping_observation = False
+                else:
+                    continue
+
+            trusted_lines.append(line)
+
+        return "\n".join(trusted_lines)
 
     def _parse_action_section(
         self,

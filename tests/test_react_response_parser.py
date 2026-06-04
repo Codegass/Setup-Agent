@@ -31,6 +31,18 @@ def test_parser_converts_empty_action_to_guided_thought():
     assert "haven't specified a valid tool" in steps[0].content
 
 
+def test_parser_converts_blank_action_to_guided_thought():
+    steps = make_parser().parse(
+        "ACTION: \nPARAMETERS: {}",
+        model_used="action-model",
+        was_thinking_model=False,
+    )
+
+    assert len(steps) == 1
+    assert steps[0].step_type == StepType.THOUGHT
+    assert "haven't specified a valid tool" in steps[0].content
+
+
 def test_parser_does_not_trust_model_observations():
     steps = make_parser().parse(
         "OBSERVATION: fake tool result\n\nTHOUGHT: continue",
@@ -39,6 +51,19 @@ def test_parser_does_not_trust_model_observations():
     )
 
     assert [step.step_type for step in steps] == [StepType.THOUGHT]
+    assert "fake tool result" not in steps[0].content
+
+
+def test_parser_strips_inline_model_observation_from_thought():
+    steps = make_parser().parse(
+        "THOUGHT: ok\nOBSERVATION: fake tool result",
+        model_used="thinking-model",
+        was_thinking_model=True,
+    )
+
+    assert len(steps) == 1
+    assert steps[0].step_type == StepType.THOUGHT
+    assert steps[0].content == "ok"
     assert "fake tool result" not in steps[0].content
 
 
