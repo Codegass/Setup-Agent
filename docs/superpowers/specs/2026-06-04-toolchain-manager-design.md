@@ -68,7 +68,7 @@ class ToolchainSpec:
 
 
 @dataclass(frozen=True)
-class ToolchainCandidate:
+class ToolExecutableCandidate:
     name: str
     executable: str
     path: str
@@ -76,19 +76,33 @@ class ToolchainCandidate:
     source: Literal["wrapper", "registered", "standalone", "path", "system"]
 
 
+@dataclass(frozen=True)
+class ResolvedToolExecutable:
+    candidate: ToolExecutableCandidate
+    reason: str
+
+
 class ToolchainManager:
-    def resolve(self, spec: ToolchainSpec, working_directory: str = "/workspace") -> ToolchainCandidate | None:
+    def resolve(self, spec: ToolchainSpec, working_directory: str = "/workspace") -> ResolvedToolExecutable | None:
         ...
 
-    def register(self, candidate: ToolchainCandidate) -> None:
+    def register(self, candidate: ToolExecutableCandidate) -> None:
         ...
 
-    def discover(self, spec: ToolchainSpec, working_directory: str = "/workspace") -> list[ToolchainCandidate]:
+    def discover(self, spec: ToolchainSpec, working_directory: str = "/workspace") -> list[ToolExecutableCandidate]:
         ...
 
-    def ensure_path(self, candidate: ToolchainCandidate) -> None:
+    def ensure_path(self, candidate: ToolExecutableCandidate) -> None:
         ...
 ```
+
+`ToolExecutableCandidate` is intentionally not a whole toolchain. It is one
+possible executable for one tool command, such as `./mvnw`,
+`/tmp/apache-maven-3.9.6/bin/mvn`, or `/usr/bin/mvn`.
+
+`ResolvedToolExecutable` is the manager's decision. It wraps the selected
+candidate and records a short reason for logs, tool metadata, and future
+debugging.
 
 The manager persists registered candidates in:
 
@@ -100,7 +114,48 @@ This file is container-local and copied with other setup artifacts. It should
 contain only non-secret runtime facts: tool name, executable path, version,
 source, timestamps, and optional metadata.
 
-## Resolution Order
+## Resolve Logic
+
+`resolve()` is a deterministic selection pipeline:
+
+1. Build the effective requirement from `ToolchainSpec`.
+   - `name` identifies the toolchain family, such as `maven`.
+   - `executable` identifies the command name, such as `mvn`.
+   - `min_version` is optional. If present, incompatible lower-version
+     candidates are not selected.
+   - `prefer_wrapper` controls whether project-local wrappers outrank other
+     candidates when they satisfy the requirement.
+2. Call `discover()` to collect candidates from project wrappers, persisted
+   registrations, common standalone install locations, and PATH.
+3. Verify each candidate before ranking it.
+   - The path must exist and be executable.
+   - Version probing must use the candidate path directly, not PATH.
+   - Candidates that cannot be probed may stay in the list only when the tool
+     family has a valid no-version fallback rule. Maven candidates without a
+     parseable version are lower priority than parseable Maven candidates.
+4. Filter by requirement.
+   - If `min_version` is set, remove candidates with a known version below it.
+   - If every candidate is below the minimum, return `None` with enough
+     metadata for the caller to explain the unmet requirement.
+5. Rank compatible candidates.
+   - Executable wrapper in the project directory wins when `prefer_wrapper` is
+     true and the wrapper satisfies `min_version`.
+   - Registered candidates come next because they represent verified runtime
+     facts from prior tool actions.
+   - Standalone candidates are ranked by version, highest first.
+   - PATH/system candidates are the fallback, also ranked by version when
+     available.
+6. Return `ResolvedToolExecutable` with the selected candidate and reason.
+7. Do not install inside `resolve()`. Installation is a separate caller action.
+   The caller may install or download a new tool, register it, then call
+   `resolve()` again.
+
+This keeps `resolve()` pure enough to test and reason about: it can inspect the
+container and persisted registry, but it should not mutate the environment
+except for optional diagnostics-free cache refreshes that do not change PATH or
+install packages.
+
+## Maven Resolution Order
 
 For Maven in the first implementation phase:
 
@@ -126,15 +181,15 @@ that do not affect ordering for the common Maven format.
 Before building a Maven command, it should call:
 
 ```python
-candidate = toolchain_manager.resolve(
+resolved = toolchain_manager.resolve(
     ToolchainSpec(name="maven", executable="mvn", min_version=required_version),
     working_directory=working_directory,
 )
 ```
 
-Then `_build_maven_command()` should use `candidate.path` rather than hardcoded
-`mvn`. If no candidate is found, `_install_maven()` may run and then register
-the resulting candidate.
+Then `_build_maven_command()` should use `resolved.candidate.path` rather than
+hardcoded `mvn`. If no executable is resolved, `_install_maven()` may run and
+then register the resulting candidate.
 
 `MavenTool` should infer `required_version` from reliable evidence:
 
