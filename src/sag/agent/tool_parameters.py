@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+import shlex
 from typing import Any, Dict, Optional
 
 from loguru import logger as default_logger
@@ -46,6 +48,65 @@ class ToolParameterNormalizer:
                     source=source,
                 )
             )
+
+    def _append_maven_fail_at_end_if_needed(self, command: str) -> tuple[str, bool]:
+        """Append Maven fail-at-end only when a shell segment invokes Maven directly."""
+        if not command:
+            return command, False
+
+        # Piped or redirected commands are often inspection commands containing "mvn".
+        # Leave those untouched rather than rewriting shell syntax we do not fully parse.
+        if any(operator in command for operator in ("|", ">", "<")):
+            return command, False
+
+        parts = re.split(r"(\s*(?:&&|;)\s*)", command)
+        changed = False
+        rewritten_parts = []
+
+        for part in parts:
+            if re.fullmatch(r"\s*(?:&&|;)\s*", part):
+                rewritten_parts.append(part)
+                continue
+
+            tokens = self._split_shell_segment(part)
+            if not self._is_maven_command_tokens(tokens):
+                rewritten_parts.append(part)
+                continue
+
+            if "--fail-at-end" in tokens or "-fae" in tokens:
+                rewritten_parts.append(part)
+                continue
+
+            rewritten_parts.append(f"{part.rstrip()} --fail-at-end")
+            changed = True
+
+        return "".join(rewritten_parts), changed
+
+    def _split_shell_segment(self, segment: str) -> list[str]:
+        try:
+            return shlex.split(segment)
+        except ValueError:
+            return []
+
+    def _is_maven_command_tokens(self, tokens: list[str]) -> bool:
+        if not tokens:
+            return False
+
+        command_index = 0
+        while command_index < len(tokens) and self._is_shell_assignment(tokens[command_index]):
+            command_index += 1
+
+        if command_index >= len(tokens):
+            return False
+
+        executable = tokens[command_index].rsplit("/", 1)[-1]
+        return executable in {"mvn", "mvnw"}
+
+    def _is_shell_assignment(self, token: str) -> bool:
+        if "=" not in token:
+            return False
+        name = token.split("=", 1)[0]
+        return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
 
     def validate_and_fix(
         self,
@@ -933,9 +994,12 @@ class ToolParameterNormalizer:
                     )
 
             command_str = fixed_params.get("command", "")
-            if command_str and "mvn" in command_str and "--fail-at-end" not in command_str:
+            rewritten_command, added_fail_at_end = self._append_maven_fail_at_end_if_needed(
+                command_str
+            )
+            if added_fail_at_end:
                 before = command_str
-                fixed_params["command"] = f"{command_str} --fail-at-end"
+                fixed_params["command"] = rewritten_command
                 self._add_parameter_fix(
                     fixes,
                     field="command",

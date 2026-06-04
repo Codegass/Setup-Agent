@@ -10,9 +10,7 @@ class BashLikeTool(BaseTool):
     def __init__(self):
         super().__init__("bash", "Bash-like test tool")
 
-    def execute(
-        self, command: str, timeout: int, working_directory: str = ""
-    ) -> ToolResult:
+    def execute(self, command: str, timeout: int, working_directory: str = "") -> ToolResult:
         return ToolResult(
             success=True,
             output=f"{working_directory}: {command} ({timeout})",
@@ -42,9 +40,7 @@ def _orchestrator(**overrides):
             },
         ),
         repository_url=overrides.pop("repository_url", None),
-        track_tool_execution=lambda signature, success: tracking_calls.append(
-            (signature, success)
-        ),
+        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -80,10 +76,7 @@ def test_parameter_alias_default_and_state_injection_are_recorded():
     assert fixed_event.metadata["parameter_fixes"] == execution.parameter_fixes
     assert fixed_event.metadata["params_changed"] is True
 
-    fixes = {
-        (fix.source, fix.field, fix.before, fix.after)
-        for fix in execution.parameter_fixes
-    }
+    fixes = {(fix.source, fix.field, fix.before, fix.after) for fix in execution.parameter_fixes}
     assert ("schema_alias", "command", "help", "echo hi") in fixes
     assert ("default", "timeout", None, 60) in fixes
     assert (
@@ -121,10 +114,7 @@ def test_parameter_normalizer_owns_alias_default_and_state_injection():
         "timeout": 60,
         "working_directory": "/workspace/project",
     }
-    recorded_fixes = {
-        (fix.source, fix.field, fix.before, fix.after)
-        for fix in fixes
-    }
+    recorded_fixes = {(fix.source, fix.field, fix.before, fix.after) for fix in fixes}
     assert ("schema_alias", "command", "help", "echo hi") in recorded_fixes
     assert ("default", "timeout", None, 60) in recorded_fixes
     assert (
@@ -133,6 +123,59 @@ def test_parameter_normalizer_owns_alias_default_and_state_injection():
         None,
         "/workspace/project",
     ) in recorded_fixes
+
+
+def test_bash_parameter_normalizer_does_not_append_fail_at_end_to_non_maven_commands():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "bash",
+        {"command": "find /workspace -name 'mvnw' | tail -5"},
+        fixes,
+    )
+
+    assert params["command"] == "find /workspace -name 'mvnw' | tail -5"
+
+
+def test_bash_parameter_normalizer_appends_fail_at_end_to_simple_maven_command():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix("bash", {"command": "mvn test"}, fixes)
+
+    assert params["command"] == "mvn test --fail-at-end"
+    assert (
+        "safety_fix",
+        "command",
+        "mvn test",
+        "mvn test --fail-at-end",
+    ) in {(fix.source, fix.field, fix.before, fix.after) for fix in fixes}
+
+
+def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "bash",
+        {"command": "cd /workspace/project && mvn test"},
+        fixes,
+    )
+
+    assert params["command"] == "cd /workspace/project && mvn test --fail-at-end"
 
 
 def test_tool_orchestrator_no_longer_owns_parameter_strategy_helpers():
@@ -152,9 +195,7 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
             execution_attempts.append(command)
             return ToolResult(success=True, output=command)
 
-    orchestrator, events, tracking_calls, state_updates = _orchestrator(
-        tools={"echo": EchoTool()}
-    )
+    orchestrator, events, tracking_calls, state_updates = _orchestrator(tools={"echo": EchoTool()})
 
     def raise_validation(tool_name, params, parameter_fixes=None):
         raise RuntimeError("schema broke")

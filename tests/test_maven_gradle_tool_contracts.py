@@ -1,5 +1,9 @@
 from sag.tools.gradle_tool import GradleTool
 from sag.tools.maven_tool import MavenTool
+from sag.tools.toolchain_manager import (
+    ResolvedToolExecutable,
+    ToolExecutableCandidate,
+)
 
 
 class FakeBuildToolOrchestrator:
@@ -35,6 +39,36 @@ class FakeBuildToolOrchestrator:
     def execute_command_with_monitoring(self, command, **kwargs):
         self.monitored_commands.append((command, kwargs))
         return dict(self.monitored_result)
+
+
+class FakeToolchainManager:
+    def __init__(self, path="/tmp/apache-maven-3.9.6/bin/mvn"):
+        self.path = path
+        self.seen_spec = None
+        self.seen_working_directory = None
+
+    def resolve(self, spec, working_directory="/workspace"):
+        self.seen_spec = spec
+        self.seen_working_directory = working_directory
+        return ResolvedToolExecutable(
+            candidate=ToolExecutableCandidate(
+                name=spec.name,
+                executable=spec.executable,
+                path=self.path,
+                version="3.9.6",
+                source="registered",
+            ),
+            reason="test resolver",
+        )
+
+
+class EmptyToolchainManager:
+    def __init__(self):
+        self.seen_spec = None
+
+    def resolve(self, spec, working_directory="/workspace"):
+        self.seen_spec = spec
+        return None
 
 
 def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
@@ -102,3 +136,96 @@ def test_maven_tool_preserves_list_properties_when_fail_at_end_adds_ignore():
     assert "-Dmaven.test.failure.ignore=true" in command
     assert " -D, " not in command
     assert " -Dm " not in command
+
+
+def test_maven_tool_uses_resolved_toolchain_executable():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = FakeToolchainManager("/tmp/apache-maven-3.9.6/bin/mvn")
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    tool._record_test_summary = lambda *args, **kwargs: None
+    tool._validate_build_artifacts_in_container = lambda *args, **kwargs: {
+        "artifacts_exist": True,
+        "found_artifacts": [],
+    }
+
+    result = tool.execute(command="compile", working_directory="/workspace/project")
+
+    assert result.success is True
+    assert orchestrator.monitored_commands[0][0].startswith("/tmp/apache-maven-3.9.6/bin/mvn ")
+    assert toolchain_manager.seen_working_directory == "/workspace/project"
+
+
+def test_maven_tool_schema_exposes_maven_version_requirement():
+    schema = MavenTool(FakeBuildToolOrchestrator()).get_parameter_schema()
+
+    assert "maven_version_requirement" in schema["properties"]
+    assert schema["properties"]["maven_version_requirement"]["type"] == "string"
+
+
+def test_maven_tool_turns_explicit_version_parameter_into_requirement():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = FakeToolchainManager()
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert result.success is True
+    assert toolchain_manager.seen_spec.version_requirement.raw == "[3.9,4.0)"
+    assert toolchain_manager.seen_spec.version_requirement.source == "tool_parameter"
+    assert toolchain_manager.seen_spec.version_requirement.kind == "range"
+
+
+def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = EmptyToolchainManager()
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+        maven_version_requirement="3.9.6",
+    )
+
+    assert result.success is False
+    assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
+    assert orchestrator.monitored_commands == []
+    assert toolchain_manager.seen_spec.version_requirement.raw == "3.9.6"
+
+
+def test_maven_tool_extracts_version_requirement_from_enforcer_output():
+    requirement = MavenTool.extract_version_requirement_from_output(
+        "Detected Maven Version: 3.6.3 is not in the allowed range [3.9,)."
+    )
+
+    assert requirement is not None
+    assert requirement.raw == "[3.9,)"
+    assert requirement.source == "build_error"
+    assert requirement.kind == "range"
+
+
+def test_maven_tool_failed_result_metadata_includes_detected_maven_requirement():
+    orchestrator = FakeBuildToolOrchestrator(
+        {
+            "output": (
+                "[ERROR] BUILD FAILURE\n"
+                "Detected Maven Version: 3.6.3 is not in the allowed range [3.9,)."
+            ),
+            "exit_code": 1,
+        }
+    )
+    tool = MavenTool(orchestrator, toolchain_manager=FakeToolchainManager())
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(command="test", working_directory="/workspace/project")
+
+    assert result.success is False
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "[3.9,)",
+        "source": "build_error",
+        "kind": "range",
+    }

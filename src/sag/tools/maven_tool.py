@@ -13,12 +13,18 @@ from sag.agent.output_storage import OutputStorageManager
 
 from .base import BaseTool, ToolError, ToolResult
 from .command_tracker import CommandTracker
+from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
 
 class MavenTool(BaseTool):
     """Maven build tool with enhanced error handling and raw output access."""
 
-    def __init__(self, orchestrator, command_tracker: CommandTracker = None):
+    def __init__(
+        self,
+        orchestrator,
+        command_tracker: CommandTracker = None,
+        toolchain_manager: ToolchainManager = None,
+    ):
         super().__init__(
             name="maven",
             description="Execute Maven commands for building and testing Java projects. "
@@ -29,6 +35,7 @@ class MavenTool(BaseTool):
         )
         self.orchestrator = orchestrator
         self.command_tracker = command_tracker
+        self.toolchain_manager = toolchain_manager or ToolchainManager(orchestrator)
         self.output_storage = None  # Will be initialized when needed
 
     def _extract_key_info(self, output: str, tool_name: str) -> str:
@@ -51,6 +58,7 @@ class MavenTool(BaseTool):
         ignore_test_failures: bool = False,
         use_wrapper: bool = False,
         extra_args: str = None,
+        maven_version_requirement: str = None,
     ) -> ToolResult:
         """
         Execute Maven commands with comprehensive error handling.
@@ -147,11 +155,37 @@ class MavenTool(BaseTool):
         except Exception as _e:
             logger.debug(f"Working directory fallback skipped: {_e}")
 
+        required_version = ToolVersionRequirement.from_raw(
+            maven_version_requirement, source="tool_parameter"
+        )
+        resolved_maven = self._resolve_maven_executable(
+            working_directory=working_directory,
+            version_requirement=required_version,
+            prefer_wrapper=use_wrapper,
+        )
+
         # Check if Maven is installed, install if not
-        if not self._is_maven_installed():
+        if not resolved_maven and not self._is_maven_installed():
             install_result = self._install_maven()
             if not install_result.success:
                 return install_result
+            resolved_maven = self._resolve_maven_executable(
+                working_directory=working_directory,
+                version_requirement=required_version,
+                prefer_wrapper=use_wrapper,
+            )
+
+        if required_version and not resolved_maven:
+            return self._maven_version_not_resolved_result(
+                required_version=required_version,
+                working_directory=working_directory,
+            )
+
+        maven_executable = (
+            resolved_maven.candidate.path
+            if resolved_maven
+            else ("./mvnw" if use_wrapper else "mvn")
+        )
 
         # Handle ignore_test_failures by adding to properties
         if ignore_test_failures:
@@ -189,6 +223,7 @@ class MavenTool(BaseTool):
             fail_at_end,
             use_wrapper=use_wrapper,
             extra_args=extra_args,
+            maven_executable=maven_executable,
         )
 
         # Check if this is a multi-module project running tests without fail handling
@@ -395,11 +430,14 @@ class MavenTool(BaseTool):
         fail_at_end: bool = False,
         use_wrapper: bool = False,
         extra_args: str = None,
+        maven_executable: str = "mvn",
     ) -> str:
         """Build the complete Maven command."""
         cmd_parts = []
 
-        if use_wrapper:
+        if maven_executable and maven_executable != "mvn":
+            cmd_parts.append(maven_executable)
+        elif use_wrapper:
             wrapper_path = "./mvnw"
             if self.orchestrator:
                 check = self.orchestrator.execute_command(
@@ -459,6 +497,62 @@ class MavenTool(BaseTool):
                 cmd_parts.extend(shlex.split(extra_args))
 
         return " ".join(cmd_parts)
+
+    def _resolve_maven_executable(
+        self,
+        working_directory: str,
+        version_requirement: ToolVersionRequirement = None,
+        prefer_wrapper: bool = False,
+    ):
+        if not self.toolchain_manager:
+            return None
+        return self.toolchain_manager.resolve(
+            ToolchainSpec(
+                name="maven",
+                executable="mvn",
+                version_requirement=version_requirement,
+                prefer_wrapper=prefer_wrapper,
+            ),
+            working_directory=working_directory,
+        )
+
+    def _maven_version_not_resolved_result(
+        self,
+        required_version: ToolVersionRequirement,
+        working_directory: str,
+    ) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output="",
+            error=f"No Maven executable satisfies requested version {required_version.raw}",
+            error_code="MAVEN_VERSION_NOT_RESOLVED",
+            suggestions=[
+                (
+                    "Install or register a Maven executable that satisfies "
+                    f"{required_version.raw}, then retry with the same maven_version_requirement."
+                ),
+                (
+                    "Use bash to inspect candidates: "
+                    "find /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
+                ),
+                "If the project can use system Maven, omit maven_version_requirement on the next call.",
+            ],
+            metadata={
+                "working_directory": working_directory,
+                "maven_version_requirement": {
+                    "raw": required_version.raw,
+                    "source": required_version.source,
+                    "kind": required_version.kind,
+                },
+            },
+        )
+
+    @staticmethod
+    def extract_version_requirement_from_output(output: str) -> ToolVersionRequirement | None:
+        match = re.search(r"allowed range\s+([\[\(][^\]\)]+[\]\)])", output or "")
+        if not match:
+            return None
+        return ToolVersionRequirement(raw=match.group(1), source="build_error", kind="range")
 
     def _append_maven_property(self, properties: Any, prop: str) -> Any:
         prop_name = prop.split("=", 1)[0]
@@ -820,6 +914,14 @@ class MavenTool(BaseTool):
             "skipped_modules": [],
             "reactor_summary": [],
         }
+
+        maven_version_requirement = self.extract_version_requirement_from_output(output)
+        if maven_version_requirement:
+            analysis["maven_version_requirement"] = {
+                "raw": maven_version_requirement.raw,
+                "source": maven_version_requirement.source,
+                "kind": maven_version_requirement.kind,
+            }
 
         lines = output.split("\n")
 
@@ -1413,6 +1515,18 @@ class MavenTool(BaseTool):
         # Extract key error lines for immediate visibility
         error_output = self._extract_key_error_lines(output)
 
+        metadata = {
+            "command": command,
+            "exit_code": exit_code,
+            "analysis": analysis,
+            "key_errors_extracted": True,
+            "error_type": error_code,
+            "recovery_actions": self._generate_recovery_actions(error_code, analysis),
+            "diagnostic_commands": self._get_diagnostic_commands(error_code),
+        }
+        if analysis.get("maven_version_requirement"):
+            metadata["maven_version_requirement"] = analysis["maven_version_requirement"]
+
         return ToolResult(
             success=False,
             output=error_output,  # Show key error lines immediately
@@ -1421,15 +1535,7 @@ class MavenTool(BaseTool):
             suggestions=error_suggestions,
             documentation_links=documentation_links,
             raw_output=output,
-            metadata={
-                "command": command,
-                "exit_code": exit_code,
-                "analysis": analysis,
-                "key_errors_extracted": True,
-                "error_type": error_code,
-                "recovery_actions": self._generate_recovery_actions(error_code, analysis),
-                "diagnostic_commands": self._get_diagnostic_commands(error_code),
-            },
+            metadata=metadata,
         )
 
     def _record_test_summary(
@@ -1963,6 +2069,15 @@ Maven Tool Usage Examples:
                     "type": ["string", "array"],
                     "description": "Additional CLI arguments appended verbatim after the command",
                     "items": {"type": "string"},
+                    "default": None,
+                },
+                "maven_version_requirement": {
+                    "type": "string",
+                    "description": (
+                        "Optional Maven version constraint, such as '3.9.6', '[3.9,4.0)', "
+                        "'>=3.9', '>=3.9,<4.0', or '<=3.8.8'. Use only when project "
+                        "files, build errors, or user instructions specify a Maven version."
+                    ),
                     "default": None,
                 },
             },
