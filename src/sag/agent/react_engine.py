@@ -1,7 +1,6 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
 import json
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -10,10 +9,10 @@ from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
-from sag.ui.events import EventType, PhaseType, UIEvent, UIEventEmitter
+from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
-from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
-from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
+from .agent_state_evaluator import AgentStateEvaluator
+from .context_manager import ContextManager
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
