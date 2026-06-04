@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import litellm
 from loguru import logger
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
@@ -17,6 +16,7 @@ from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, Agen
 from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
+from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_response_parser import ReActResponseParser
 from .react_types import ReactModelMode, ReActStep, StepType
@@ -79,12 +79,6 @@ class ReActEngine(UIEventEmitter):
         # Agent logger for detailed traces
         self.agent_logger = create_agent_logger("react_engine")
 
-        # Configure LiteLLM
-        self._setup_litellm()
-
-        # Check function calling support
-        self._check_function_calling_support()
-
         # Initialize the centralized state evaluator (will be updated with physical validator after initialization)
         self.state_evaluator = AgentStateEvaluator(self.context_manager)
 
@@ -112,8 +106,14 @@ class ReActEngine(UIEventEmitter):
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
-        # Initialize token tracker for monitoring LLM usage
+        # Initialize token tracker and LLM client for monitoring model usage
         self.token_tracker = TokenTracker()
+        self.llm_client = ReactLLMClient(
+            config=self.config,
+            tools=self.tools,
+            token_tracker=self.token_tracker,
+        )
+        self.llm_client.setup()
         self.response_parser = ReActResponseParser(timestamp_factory=self._get_timestamp)
 
         logger.info(
@@ -128,166 +128,6 @@ class ReActEngine(UIEventEmitter):
         """Set the repository URL for the current project."""
         self.repository_url = repository_url
         logger.info(f"Repository URL set: {repository_url}")
-
-    def _setup_litellm(self):
-        """Setup LiteLLM configuration."""
-        # Set LiteLLM to not cache responses for debugging
-        litellm.cache = None
-
-        # Enable detailed logging for debugging
-        if self.config.log_level.value == "DEBUG":
-            litellm.set_verbose = True
-
-        logger.info("LiteLLM configured")
-
-    def _check_function_calling_support(self):
-        """Check if the configured models support function calling."""
-        action_model = self.config.get_litellm_model_name("action")
-        thinking_model = self.config.get_litellm_model_name("thinking")
-
-        # Check action model function calling support
-        self.supports_function_calling = litellm.supports_function_calling(action_model)
-
-        # Determine if this is a Claude model
-        self.is_claude_model = (
-            "claude" in action_model.lower() or "anthropic" in action_model.lower()
-        )
-
-        if self.supports_function_calling:
-            model_type = "Claude" if self.is_claude_model else "OpenAI"
-            logger.info(f"Action model {action_model} supports {model_type} function calling")
-        else:
-            logger.warning(
-                f"Action model {action_model} does not support function calling, falling back to prompt-based approach"
-            )
-            # Enable fallback for models without function calling support
-            litellm.add_function_to_prompt = True
-
-        # Check parallel function calling support
-        self.supports_parallel_function_calling = litellm.supports_parallel_function_calling(
-            action_model
-        )
-        if self.supports_parallel_function_calling:
-            logger.info(f"Action model {action_model} supports parallel function calling")
-        else:
-            logger.info(f"Action model {action_model} does not support parallel function calling")
-
-    def _build_tools_schema(self) -> List[Dict[str, Any]]:
-        """Build function calling schema from tools (supports both OpenAI and Claude formats)."""
-        tools_schema = []
-
-        for tool in self.tools.values():
-            schema = tool.get_parameter_schema()
-
-            if self.is_claude_model:
-                # Claude format - direct tool definition
-                tool_def = {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": schema,
-                }
-            else:
-                # OpenAI format - nested function definition
-                tool_def = {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": schema,
-                    },
-                }
-
-            tools_schema.append(tool_def)
-
-        return tools_schema
-
-    def _handle_function_calling_response(self, response, model: str) -> str:
-        """Handle function calling response and convert to ReAct format (supports both OpenAI and Claude formats)."""
-        try:
-            message = response.choices[0].message
-
-            # Extract thinking content if available
-            content_parts = []
-            if message.content:
-                content_parts.append(f"THOUGHT: {message.content}")
-
-            # Handle both OpenAI and Claude function calling formats
-            if self.is_claude_model:
-                # Claude format - tool_calls may be in different structure
-                if hasattr(message, "tool_calls") and message.tool_calls:
-                    for tool_call in message.tool_calls:
-                        function_name = tool_call.get("name") or tool_call.get("function", {}).get(
-                            "name"
-                        )
-                        function_args = tool_call.get("input") or tool_call.get("function", {}).get(
-                            "arguments"
-                        )
-
-                        # Parse function arguments if they're a string
-                        if isinstance(function_args, str):
-                            try:
-                                function_args = json.loads(function_args)
-                            except json.JSONDecodeError:
-                                logger.warning(
-                                    f"Failed to parse Claude function arguments: {function_args}"
-                                )
-                                function_args = {}
-
-                        if function_name:
-                            # Format as ReAct ACTION
-                            content_parts.append(f"ACTION: {function_name}")
-                            content_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                            logger.debug(
-                                f"Claude function call: {function_name} with args: {function_args}"
-                            )
-
-            else:
-                # OpenAI format - standard tool_calls structure
-                if hasattr(message, "tool_calls") and message.tool_calls:
-                    for tool_call in message.tool_calls:
-                        function_name = tool_call.function.name
-
-                        # Strip OpenAI namespace prefix if present
-                        if function_name.startswith("functions."):
-                            function_name = function_name[10:]  # Remove "functions." prefix
-
-                        # Parse function arguments
-                        try:
-                            function_args = json.loads(tool_call.function.arguments)
-                        except json.JSONDecodeError:
-                            logger.warning(
-                                f"Failed to parse OpenAI function arguments: {tool_call.function.arguments}"
-                            )
-                            function_args = {}
-
-                        # Format as ReAct ACTION
-                        content_parts.append(f"ACTION: {function_name}")
-                        content_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                        logger.debug(
-                            f"OpenAI function call: {function_name} with args: {function_args}"
-                        )
-
-            result = "\n\n".join(content_parts)
-
-            # Log function calling usage
-            if self.config.verbose:
-                tool_count = (
-                    len(message.tool_calls)
-                    if hasattr(message, "tool_calls") and message.tool_calls
-                    else 0
-                )
-                model_type = "Claude" if self.is_claude_model else "OpenAI"
-                logger.info(
-                    f"{model_type} function calling response from {model}: {tool_count} tool calls"
-                )
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Failed to handle function calling response: {e}")
-            # Fallback to regular content
-            content = response.choices[0].message.content
-            return content if content is not None else ""
 
     def run_react_loop(self, initial_prompt: str, max_iterations: Optional[int] = None) -> bool:
         """Run the main ReAct loop."""
@@ -306,7 +146,9 @@ class ReActEngine(UIEventEmitter):
         current_prompt = (
             self.prompt_builder.build_initial_system_prompt(
                 repository_url=self.repository_url,
-                tool_calling_enabled=self.supports_function_calling,
+                tool_calling_enabled=self.llm_client.capabilities_for(
+                    ReactModelMode.ACTION
+                ).supports_function_calling,
             )
             + "\n\n"
             + initial_prompt
@@ -322,9 +164,11 @@ class ReActEngine(UIEventEmitter):
 
                 # Determine if this should be a thinking step or action step
                 is_thinking_step = self._should_use_thinking_model()
+                mode = ReactModelMode.THINKING if is_thinking_step else ReactModelMode.ACTION
 
                 # Get LLM response
-                response = self._get_llm_response(current_prompt, is_thinking_step)
+                wrapped_prompt = self.prompt_builder.build_mode_prompt(current_prompt, mode)
+                response = self.llm_client.get_response(wrapped_prompt, mode)
 
                 if not response:
                     logger.error("Failed to get LLM response")
@@ -333,9 +177,7 @@ class ReActEngine(UIEventEmitter):
                     return False
 
                 # Parse the response
-                model_used = self.config.get_litellm_model_name(
-                    "thinking" if is_thinking_step else "action"
-                )
+                model_used = self.llm_client.capabilities_for(mode).model
                 parsed_steps = self.response_parser.parse(
                     response,
                     model_used=model_used,
@@ -383,7 +225,9 @@ class ReActEngine(UIEventEmitter):
                 current_prompt = self.prompt_builder.build_next_prompt(
                     steps=self.steps,
                     repository_url=self.repository_url,
-                    tool_calling_enabled=self.supports_function_calling,
+                    tool_calling_enabled=self.llm_client.capabilities_for(
+                        ReactModelMode.ACTION
+                    ).supports_function_calling,
                     successful_states=self.successful_states,
                 )
 
@@ -459,462 +303,6 @@ class ReActEngine(UIEventEmitter):
 
         # Default to action model for execution
         return False
-
-    def _get_llm_response(self, prompt: str, use_thinking_model: bool = False) -> Optional[str]:
-        """Get response from the appropriate LLM model."""
-        try:
-            if use_thinking_model:
-                model = self.config.get_litellm_model_name("thinking")
-
-                # Check if this is a GPT-5 model and adjust parameters accordingly
-                if self.config.is_gpt5_model("thinking"):
-                    # GPT-5 models use reasoning_effort instead of temperature and max_tokens
-                    request_params = {
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": self.prompt_builder.build_mode_prompt(
-                                    prompt, ReactModelMode.THINKING
-                                ),
-                            }
-                        ],
-                        "reasoning_effort": self.config.gpt5_reasoning_effort,
-                        "drop_params": True,  # Safely ignore unsupported parameters
-                    }
-                    logger.info(
-                        f"Using GPT-5 parameters for thinking model: reasoning_effort={self.config.gpt5_reasoning_effort}"
-                    )
-                else:
-                    # Traditional models use temperature and max_tokens
-                    temperature = self.config.thinking_temperature
-                    max_tokens = self.config.thinking_max_tokens
-
-                    # Special handling for O-series models (only support temperature=1)
-                    if (
-                        "o4" in self.config.thinking_model.lower()
-                        or "o1" in self.config.thinking_model.lower()
-                    ):
-                        temperature = 1.0
-
-                    # Get thinking configuration based on provider
-                    thinking_config = self.config.get_thinking_config()
-
-                    request_params = {
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": self.prompt_builder.build_mode_prompt(
-                                    prompt, ReactModelMode.THINKING
-                                ),
-                            }
-                        ],
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        **thinking_config,
-                    }
-
-                # Log detailed request in verbose mode
-                if self.config.verbose:
-                    logger.debug(f"Thinking model request params: {request_params}")
-
-                # Make the API call with error handling for GPT-5 models
-                try:
-                    response = litellm.completion(**request_params)
-                    # Track token usage for thinking model
-                    self.token_tracker.track_token_usage(response, model, "thought")
-                except Exception as e:
-                    # If GPT-5 parameters fail, try falling back to traditional parameters
-                    if self.config.is_gpt5_model("thinking"):
-                        logger.warning(f"GPT-5 thinking model call failed: {e}")
-                        logger.info("Falling back to traditional parameters for thinking model")
-                        fallback_params = {
-                            "model": model,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": self.prompt_builder.build_mode_prompt(
-                                        prompt, ReactModelMode.THINKING
-                                    ),
-                                }
-                            ],
-                            "temperature": self.config.thinking_temperature,
-                            "max_tokens": self.config.thinking_max_tokens,
-                            "drop_params": True,  # Safely ignore unsupported parameters
-                        }
-                        response = litellm.completion(**fallback_params)
-                        # Track token usage for thinking model fallback
-                        self.token_tracker.track_token_usage(response, model, "thought")
-                    else:
-                        raise
-            else:
-                model = self.config.get_litellm_model_name("action")
-
-                # Check if this is a GPT-5 model and adjust parameters accordingly
-                if self.config.is_gpt5_model("action"):
-                    # GPT-5 models use reasoning_effort instead of temperature and max_tokens
-                    request_params = {
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": self.prompt_builder.build_mode_prompt(
-                                    prompt, ReactModelMode.ACTION
-                                ),
-                            }
-                        ],
-                        "reasoning_effort": self.config.gpt5_reasoning_effort,
-                        "drop_params": True,  # Safely ignore unsupported parameters
-                    }
-                    logger.info(
-                        f"Using GPT-5 parameters for action model: reasoning_effort={self.config.gpt5_reasoning_effort}"
-                    )
-                else:
-                    # Traditional models use temperature and max_tokens
-                    temperature = self.config.action_temperature
-                    max_tokens = self.config.action_max_tokens
-
-                    # Special handling for O-series models (only support temperature=1)
-                    if (
-                        "o4" in self.config.action_model.lower()
-                        or "o1" in self.config.action_model.lower()
-                    ):
-                        temperature = 1.0
-
-                    # Build parameters for the request
-                    request_params = {
-                        "model": model,
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": self.prompt_builder.build_mode_prompt(
-                                    prompt, ReactModelMode.ACTION
-                                ),
-                            }
-                        ],
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                    }
-
-                # Log detailed request in verbose mode
-                if self.config.verbose:
-                    logger.debug(f"Action model request params: {request_params}")
-
-                # Add function calling support if available
-                # For o4-mini and other supported models, use function calling for all steps
-                if self.supports_function_calling:
-                    tools_schema = self._build_tools_schema()
-                    if tools_schema:
-                        request_params["tools"] = tools_schema
-
-                        # Different tool_choice format for Claude vs OpenAI
-                        if self.is_claude_model:
-                            request_params["tool_choice"] = {"type": "auto"}
-                        else:
-                            request_params["tool_choice"] = "auto"
-
-                        model_type = "Claude" if self.is_claude_model else "OpenAI"
-                        logger.debug(
-                            f"Using {model_type} function calling with {len(tools_schema)} tools"
-                        )
-
-                        # Log first tool schema for debugging
-                        if tools_schema and self.config.verbose:
-                            logger.debug(
-                                f"First tool schema: {json.dumps(tools_schema[0], indent=2)}"
-                            )
-
-                # Make the API call with error handling for GPT-5 models
-                try:
-                    response = litellm.completion(**request_params)
-                    # Track token usage for action model
-                    self.token_tracker.track_token_usage(response, model, "action")
-                except Exception as e:
-                    # If GPT-5 parameters fail, try falling back to traditional parameters
-                    if self.config.is_gpt5_model("action"):
-                        logger.warning(f"GPT-5 action model call failed: {e}")
-                        logger.info("Falling back to traditional parameters for action model")
-
-                        # Build fallback parameters with traditional settings
-                        fallback_params = {
-                            "model": model,
-                            "messages": [
-                                {
-                                    "role": "user",
-                                    "content": self.prompt_builder.build_mode_prompt(
-                                        prompt, ReactModelMode.ACTION
-                                    ),
-                                }
-                            ],
-                            "temperature": self.config.action_temperature,
-                            "max_tokens": self.config.action_max_tokens,
-                            "drop_params": True,  # Safely ignore unsupported parameters
-                        }
-
-                        # Add function calling support to fallback if it was in the original request
-                        if "tools" in request_params:
-                            fallback_params["tools"] = request_params["tools"]
-                        if "tool_choice" in request_params:
-                            fallback_params["tool_choice"] = request_params["tool_choice"]
-
-                        response = litellm.completion(**fallback_params)
-                        # Track token usage for action model fallback
-                        self.token_tracker.track_token_usage(response, model, "action")
-                    else:
-                        raise
-
-            # Debug logging for function calling response
-            message = response.choices[0].message
-            logger.debug(f"Response message attributes: {dir(message)}")
-            logger.debug(f"Has tool_calls: {hasattr(message, 'tool_calls')}")
-            if hasattr(message, "tool_calls"):
-                logger.debug(f"Tool calls value: {message.tool_calls}")
-
-            # Handle function calling response
-            if (
-                hasattr(response.choices[0].message, "tool_calls")
-                and response.choices[0].message.tool_calls
-            ):
-                logger.debug("Using function calling response handler")
-                return self._handle_function_calling_response(response, model)
-
-            content = response.choices[0].message.content
-
-            # Log detailed response in verbose mode
-            if self.config.verbose:
-                self._log_llm_response(model, content, response)
-
-            content_str = content if content is not None else ""
-            self.agent_logger.info(f"LLM Response from {model}: {len(content_str)} chars")
-
-            # Always log the full response content
-            logger.info(f"Full LLM Response from {model}:")
-            logger.info(content_str)
-            logger.debug(f"Model used: {model}, Response length: {len(content_str)}")
-
-            # Fallback: Try to parse JSON function calls in content if function calling was expected
-            if self.supports_function_calling and content_str.strip():
-                parsed_content = self._try_parse_json_function_calls(content_str)
-                if parsed_content:
-                    logger.debug("Successfully parsed JSON function calls from content")
-                    return parsed_content
-
-            return content_str
-
-        except Exception as e:
-            logger.error(f"LLM request failed: {e}")
-            if self.config.verbose:
-                self._log_llm_error(e)
-            return None
-
-    def _try_parse_json_function_calls(self, content: str) -> Optional[str]:
-        """Try to parse JSON function calls from content when function calling format is not used."""
-        try:
-            # Look for JSON patterns that might be function calls
-            lines = content.strip().split("\n")
-            parsed_parts = []
-            i = 0
-
-            while i < len(lines):
-                stripped = lines[i].strip()
-
-                # Check if this line contains a JSON object with various formats
-                if stripped.startswith("{") and stripped.endswith("}"):
-                    try:
-                        json_obj = json.loads(stripped)
-                        function_name = None
-                        function_args = {}
-
-                        # Format 1: {"tool": "tool_name", "action": "action_name", ...}
-                        if "tool" in json_obj:
-                            function_name = json_obj["tool"]
-                            # Convert all other fields to arguments, with special handling for common patterns
-                            function_args = {k: v for k, v in json_obj.items() if k != "tool"}
-
-                            # If there's only an action, it might be a parameter
-                            if len(function_args) == 1 and "action" in function_args:
-                                function_args = {"action": function_args["action"]}
-
-                        # Format 2: Standard format: {"name": "tool_name", "arguments": {...}}
-                        elif "name" in json_obj and "arguments" in json_obj:
-                            function_name = json_obj["name"]
-                            function_args = json_obj["arguments"]
-
-                        # Format 2.5: Model thinking format: {"thought": "...", "action": "tool_name", "action_args": {...}}
-                        elif "action" in json_obj and "action_args" in json_obj:
-                            function_name = json_obj["action"]
-                            function_args = json_obj["action_args"]
-                            # Also include the thought as a separate line if present
-                            if "thought" in json_obj:
-                                parsed_parts.append(f"THOUGHT: {json_obj['thought']}")
-
-                        # Format 2.6: Alternative args format: {"action": "tool_name", "args": {...}}
-                        elif "action" in json_obj and "args" in json_obj:
-                            function_name = json_obj["action"]
-                            function_args = json_obj["args"]
-
-                        # Format 3: Single tool name format: {"manage_context": {...}}
-                        elif len(json_obj) == 1:
-                            tool_name = list(json_obj.keys())[0]
-                            if tool_name in self.tools:
-                                function_name = tool_name
-                                function_args = (
-                                    json_obj[tool_name]
-                                    if isinstance(json_obj[tool_name], dict)
-                                    else {}
-                                )
-
-                        # Format 4: Simple parameter object (assume it's for the last mentioned tool)
-                        elif not function_name and any(
-                            key in json_obj for key in ["action", "command", "path", "query"]
-                        ):
-                            # Try to infer tool based on parameters
-                            if "action" in json_obj:
-                                if json_obj.get("action") in ["read", "write", "append"]:
-                                    function_name = "file_io"
-                                elif json_obj.get("action") in [
-                                    "get_info",
-                                    "switch_to_trunk",
-                                    "create_branch",
-                                ]:
-                                    function_name = "manage_context"
-                                elif json_obj.get("action") in ["clone", "detect_project_type"]:
-                                    function_name = "project_setup"
-                                function_args = json_obj
-                            elif "command" in json_obj:
-                                # Check if it's a maven command or bash command
-                                command = json_obj.get("command", "").lower()
-                                if any(
-                                    cmd in command
-                                    for cmd in ["compile", "test", "package", "clean", "install"]
-                                ):
-                                    function_name = "maven"
-                                else:
-                                    function_name = "bash"
-                                function_args = json_obj
-                            elif "query" in json_obj:
-                                function_name = "web_search"
-                                function_args = json_obj
-
-                        if function_name:
-                            # Format as ReAct ACTION
-                            parsed_parts.append(f"ACTION: {function_name}")
-                            parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                            logger.debug(
-                                f"Parsed JSON function call: {function_name} with args: {function_args}"
-                            )
-                            i += 1
-                            continue
-
-                    except json.JSONDecodeError:
-                        # Not valid JSON, treat as regular content
-                        pass
-
-                # Check for "ACTION:" followed by JSON on the next line
-                if stripped == "ACTION:" and i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if next_line.startswith("{") and next_line.endswith("}"):
-                        try:
-                            json_obj = json.loads(next_line)
-                            function_name = None
-                            function_args = {}
-
-                            # Try different JSON formats (same logic as above)
-                            if "name" in json_obj and "arguments" in json_obj:
-                                function_name = json_obj["name"]
-                                function_args = json_obj["arguments"]
-                            elif "tool" in json_obj:
-                                function_name = json_obj["tool"]
-                                function_args = {k: v for k, v in json_obj.items() if k != "tool"}
-
-                            if function_name:
-                                parsed_parts.append(f"ACTION: {function_name}")
-                                parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                                logger.debug(
-                                    f"Parsed ACTION JSON: {function_name} with args: {function_args}"
-                                )
-                                i += 2  # Skip both lines
-                                continue
-                        except json.JSONDecodeError:
-                            pass
-
-                # Check for patterns like "ACTION: {json}"
-                if stripped.startswith("ACTION:"):
-                    action_part = stripped[7:].strip()
-                    if action_part.startswith("{") and action_part.endswith("}"):
-                        try:
-                            json_obj = json.loads(action_part)
-                            function_name = None
-                            function_args = {}
-
-                            # Try different JSON formats
-                            if "name" in json_obj and "arguments" in json_obj:
-                                function_name = json_obj["name"]
-                                function_args = json_obj["arguments"]
-                            elif "tool" in json_obj:
-                                function_name = json_obj["tool"]
-                                function_args = {k: v for k, v in json_obj.items() if k != "tool"}
-
-                            if function_name:
-                                parsed_parts.append(f"ACTION: {function_name}")
-                                parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                                logger.debug(
-                                    f"Parsed ACTION JSON: {function_name} with args: {function_args}"
-                                )
-                                i += 1
-                                continue
-                        except json.JSONDecodeError:
-                            pass
-
-                # Check for markdown code blocks with JSON
-                if stripped.startswith("```json") and i + 1 < len(lines):
-                    # Find the end of the code block
-                    json_lines = []
-                    j = i + 1
-                    while j < len(lines) and not lines[j].strip().startswith("```"):
-                        json_lines.append(lines[j])
-                        j += 1
-
-                    if json_lines:
-                        try:
-                            json_content = "\n".join(json_lines).strip()
-                            json_obj = json.loads(json_content)
-                            function_name = None
-                            function_args = {}
-
-                            # Try different JSON formats
-                            if "name" in json_obj and "arguments" in json_obj:
-                                function_name = json_obj["name"]
-                                function_args = json_obj["arguments"]
-                            elif "tool" in json_obj:
-                                function_name = json_obj["tool"]
-                                function_args = {k: v for k, v in json_obj.items() if k != "tool"}
-
-                            if function_name:
-                                parsed_parts.append(f"ACTION: {function_name}")
-                                parsed_parts.append(f"PARAMETERS: {json.dumps(function_args)}")
-                                logger.debug(
-                                    f"Parsed JSON code block: {function_name} with args: {function_args}"
-                                )
-                                i = j + 1  # Skip past the closing ```
-                                continue
-                        except json.JSONDecodeError:
-                            pass
-
-                # Keep non-JSON lines as-is (thoughts, etc.)
-                if stripped and not stripped.startswith("```"):
-                    parsed_parts.append(stripped)
-
-                i += 1
-
-            if parsed_parts:
-                return "\n".join(parsed_parts)
-
-        except Exception as e:
-            logger.warning(f"Failed to parse JSON function calls: {e}")
-
-        return None
 
     def _get_tool_orchestrator(self) -> ToolOrchestrator:
         """Build the orchestration adapter for delegated tool execution."""
@@ -1544,86 +932,6 @@ class ReActEngine(UIEventEmitter):
         from datetime import datetime
 
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def _log_llm_request(
-        self, model: str, prompt: str, temperature: float, max_tokens: int, is_thinking: bool
-    ):
-        """Log detailed LLM request in verbose mode."""
-
-        verbose_logger = create_verbose_logger("react_llm")
-
-        log_entry = {
-            "event": "llm_request",
-            "model": model,
-            "model_type": "thinking" if is_thinking else "action",
-            "iteration": self.current_iteration,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "prompt_length": len(prompt),
-            "full_prompt": prompt,  # Show full prompt instead of preview
-            "timestamp": self._get_timestamp(),
-        }
-
-        verbose_logger.info(f"🤖 LLM REQUEST: {json.dumps(log_entry, indent=2)}")
-
-        # Also save full prompt to container file if we have access
-        if hasattr(self.context_manager, "orchestrator") and self.context_manager.orchestrator:
-            prompt_file = (
-                f"/workspace/.setup_agent/llm_traces/iteration_{self.current_iteration}_request.txt"
-            )
-            escaped_prompt = prompt.replace("'", "'\"'\"'")
-            self.context_manager.orchestrator.execute_command(
-                f"mkdir -p /workspace/.setup_agent/llm_traces && echo '{escaped_prompt}' > {prompt_file}"
-            )
-
-    def _log_llm_response(self, model: str, content: str, response):
-        """Log detailed LLM response in verbose mode."""
-
-        verbose_logger = create_verbose_logger("react_llm")
-
-        # Extract usage information if available
-        usage_info = {}
-        if hasattr(response, "usage") and response.usage:
-            usage_info = {
-                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(response.usage, "completion_tokens", 0),
-                "total_tokens": getattr(response.usage, "total_tokens", 0),
-            }
-
-        log_entry = {
-            "event": "llm_response",
-            "model": model,
-            "iteration": self.current_iteration,
-            "response_length": len(content),
-            "full_response": content,  # Show full response instead of preview
-            "usage": usage_info,
-            "timestamp": self._get_timestamp(),
-        }
-
-        verbose_logger.info(f"🤖 LLM RESPONSE: {json.dumps(log_entry, indent=2)}")
-
-        # Also save full response to container file if we have access
-        if hasattr(self.context_manager, "orchestrator") and self.context_manager.orchestrator:
-            response_file = f"/workspace/.setup_agent/llm_traces/iteration_{self.current_iteration}_response.txt"
-            escaped_content = content.replace("'", "'\"'\"'")
-            self.context_manager.orchestrator.execute_command(
-                f"echo '{escaped_content}' > {response_file}"
-            )
-
-    def _log_llm_error(self, error: Exception):
-        """Log LLM errors in verbose mode."""
-
-        verbose_logger = create_verbose_logger("react_llm")
-
-        error_entry = {
-            "event": "llm_error",
-            "iteration": self.current_iteration,
-            "error_type": type(error).__name__,
-            "error_message": str(error),
-            "timestamp": self._get_timestamp(),
-        }
-
-        verbose_logger.error(f"🚨 LLM ERROR: {json.dumps(error_entry, indent=2)}")
 
     def _log_react_step_verbose(self, step: ReActStep):
         """Log detailed ReAct step information in verbose mode."""

@@ -1,4 +1,7 @@
-from sag.agent.react_engine import ReActEngine
+from sag.agent.react_llm import ReactLLMClient
+from sag.agent.react_types import ReactModelMode
+from sag.config.models import LogLevel
+from sag.config.settings import Config
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
 from sag.tools.report_tool import ReportTool
@@ -16,6 +19,24 @@ class DerivedReportTool(ReportTool):
     pass
 
 
+class FakeTokenTracker:
+    def track_token_usage(self, response, model, step_type):
+        pass
+
+
+def make_llm_client(tools):
+    config = Config(
+        action_model="gpt-4o",
+        action_provider="openai",
+        log_level=LogLevel.INFO,
+    )
+    return ReactLLMClient(
+        config=config,
+        tools={tool.name: tool for tool in tools},
+        token_tracker=FakeTokenTracker(),
+    )
+
+
 def test_base_tool_exposes_public_parameter_schema():
     tool = ExampleTool()
     schema = tool.get_parameter_schema()
@@ -25,13 +46,10 @@ def test_base_tool_exposes_public_parameter_schema():
     assert schema["required"] == ["command"]
 
 
-def test_react_engine_uses_public_tool_schema_without_empty_fallback():
-    tool = ExampleTool()
-    engine = ReActEngine.__new__(ReActEngine)
-    engine.tools = {"example": tool}
-    engine.is_claude_model = False
+def test_react_llm_client_uses_public_tool_schema_without_empty_fallback():
+    client = make_llm_client([ExampleTool()])
 
-    schema = ReActEngine._build_tools_schema(engine)
+    schema = client.build_tools_schema(ReactModelMode.ACTION)
 
     assert schema[0]["function"]["name"] == "example"
     assert "command" in schema[0]["function"]["parameters"]["properties"]
@@ -54,13 +72,10 @@ def test_bash_tool_schema_exposes_timeout_for_agent_use():
     assert "maximum total execution time" in schema["properties"]["timeout"]["description"].lower()
 
 
-def test_react_engine_preserves_bash_timeout_in_tool_schema():
-    tool = BashTool()
-    engine = ReActEngine.__new__(ReActEngine)
-    engine.tools = {"bash": tool}
-    engine.is_claude_model = False
+def test_react_llm_client_preserves_bash_timeout_in_tool_schema():
+    client = make_llm_client([BashTool()])
 
-    schema = ReActEngine._build_tools_schema(engine)
+    schema = client.build_tools_schema(ReactModelMode.ACTION)
 
     timeout_schema = schema[0]["function"]["parameters"]["properties"]["timeout"]
     assert timeout_schema["type"] == "integer"

@@ -1,4 +1,5 @@
 from sag.agent.react_engine import ReActEngine
+from sag.agent.react_llm import ReactLLMClient
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.react_types import ReactModelMode, ReActStep, StepType
 from sag.config.prompt_loader import PromptConfig, load_react_engine_prompts
@@ -59,13 +60,13 @@ def make_engine(repository_url=None, supports_function_calling=True):
 
 
 def test_react_engine_initialization_loads_prompt_config(monkeypatch):
-    monkeypatch.setattr(ReActEngine, "_setup_litellm", lambda self: None)
-    monkeypatch.setattr(ReActEngine, "_check_function_calling_support", lambda self: None)
+    monkeypatch.setattr(ReactLLMClient, "setup", lambda self: None)
 
     engine = ReActEngine(DummyContextManager(), [])
 
     assert isinstance(engine.prompts, PromptConfig)
     assert isinstance(engine.prompt_builder, ReActPromptBuilder)
+    assert isinstance(engine.llm_client, ReactLLMClient)
 
 
 def test_initial_system_prompt_preserves_core_markers_with_repository_url():
