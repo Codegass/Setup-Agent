@@ -27,7 +27,6 @@ from .tool_orchestration import (
     ToolLifecycleEvent,
     ToolOrchestrator,
 )
-from .tool_orchestration import format_tool_result as format_orchestrated_tool_result
 
 
 class ReActEngine(UIEventEmitter):
@@ -693,10 +692,6 @@ class ReActEngine(UIEventEmitter):
         except Exception as e:
             logger.error(f"Failed to propagate working directory change: {e}")
 
-    def _format_tool_result(self, tool_name: str, result: ToolResult) -> str:
-        """Delegate tool result formatting to the orchestration layer."""
-        return format_orchestrated_tool_result(tool_name, result)
-
     def _track_tool_execution(self, tool_signature: str, success: bool):
         """Track tool execution to detect repetitive patterns."""
         execution_info = {
@@ -958,23 +953,6 @@ class ReActEngine(UIEventEmitter):
 
         verbose_logger.info(f"📝 REACT STEP: {json.dumps(step_entry, indent=2, default=str)}")
 
-    def _log_tool_execution_verbose(self, tool_name: str, params: dict):
-        """Log detailed tool execution information in verbose mode."""
-
-        verbose_logger = create_verbose_logger("react_tools")
-
-        execution_entry = {
-            "event": "tool_execution_start",
-            "tool_name": tool_name,
-            "iteration": self.current_iteration,
-            "parameters": params,
-            "timestamp": self._get_timestamp(),
-        }
-
-        verbose_logger.info(
-            f"🔧 TOOL EXECUTION: {json.dumps(execution_entry, indent=2, default=str)}"
-        )
-
     def _get_physical_validation_state(self, observation: str) -> Optional[Dict[str, any]]:
         """
         Get physical validation state for build/test related observations.
@@ -1172,36 +1150,6 @@ class ReActEngine(UIEventEmitter):
 
         self.agent_logger.info(f"{prefix}: {guidance_message[:100]}...")
         logger.info(f"{prefix} added with priority {priority}")
-
-    def test_state_evaluator_integration(self):
-        """Test method to verify state evaluator is working correctly."""
-        logger.info("Testing state evaluator integration...")
-
-        # Simulate some steps
-        test_steps = [
-            ReActStep(
-                step_type=StepType.THOUGHT, content="Test thought", timestamp=self._get_timestamp()
-            ),
-            ReActStep(
-                step_type=StepType.ACTION, content="Test action", timestamp=self._get_timestamp()
-            ),
-            ReActStep(
-                step_type=StepType.OBSERVATION,
-                content="BUILD SUCCESS",
-                timestamp=self._get_timestamp(),
-            ),
-        ]
-
-        # Test evaluation
-        analysis = self.state_evaluator.evaluate(
-            steps=test_steps,
-            current_iteration=1,
-            recent_tool_executions=[],
-            steps_since_context_switch=5,
-        )
-
-        logger.info(f"State analysis: {analysis.status}, needs_guidance: {analysis.needs_guidance}")
-        return analysis
 
     def _export_token_usage_csv(self):
         """Export token usage to CSV file when ReAct loop completes."""

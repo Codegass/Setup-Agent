@@ -137,23 +137,6 @@ def test_add_system_guidance_accepts_string_priority():
     assert engine.agent_logger.messages
 
 
-def test_format_tool_result_delegates_to_orchestrator_formatter(monkeypatch):
-    engine = _engine_with_context()
-    result = ToolResult(success=True, output="ok")
-
-    def fake_formatter(tool_name, tool_result):
-        assert tool_name == "bash"
-        assert tool_result is result
-        return "delegated observation"
-
-    monkeypatch.setattr(
-        "sag.agent.react_engine.format_orchestrated_tool_result",
-        fake_formatter,
-    )
-
-    assert engine._format_tool_result("bash", result) == "delegated observation"
-
-
 def test_react_engine_maps_tool_lifecycle_events_to_ui_events():
     engine = _engine_with_context()
     emitted = []
