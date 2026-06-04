@@ -125,10 +125,12 @@ Add a `ReactLLMClient` responsible for provider and model-call details.
 Primary responsibilities:
 
 - Configure LiteLLM cache and debug verbosity.
-- Detect action model function-calling support.
-- Track whether the action model is Claude-like.
-- Track parallel function-calling support.
-- Build tool schemas for OpenAI and Claude formats.
+- Resolve capabilities for each configured role/model, including thinking and
+  action roles.
+- Track function-calling support, parallel function-calling support, and tool
+  call schema format per role/model rather than through one global
+  provider-format flag.
+- Build tool schemas for OpenAI and Anthropic/Claude formats.
 - Build thinking/action request parameters from SAG config.
 - Handle GPT-5 reasoning-parameter fallback without leaking that logic into
   `ReActEngine`.
@@ -143,6 +145,15 @@ Primary responsibilities:
 Suggested interface:
 
 ```python
+@dataclass(frozen=True)
+class ReactModelCapabilities:
+    mode: ReactModelMode
+    model: str
+    supports_function_calling: bool
+    supports_parallel_function_calling: bool
+    tool_call_format: Literal["openai", "anthropic", "prompt"]
+
+
 class ReactLLMClient:
     def __init__(
         self,
@@ -154,16 +165,7 @@ class ReactLLMClient:
     ) -> None:
         ...
 
-    @property
-    def supports_function_calling(self) -> bool:
-        ...
-
-    @property
-    def supports_parallel_function_calling(self) -> bool:
-        ...
-
-    @property
-    def is_claude_model(self) -> bool:
+    def capabilities_for(self, mode: ReactModelMode) -> ReactModelCapabilities:
         ...
 
     def setup(self) -> None:
@@ -179,11 +181,21 @@ again. The implementation plan should include a characterization test that a
 thinking/action mode prompt marker appears exactly once in the final message
 sent to `litellm.completion()`.
 
+Thinking and action are roles, not provider assumptions. Either role may be
+configured with GPT-5, Claude 4.6, or another LiteLLM-supported model. The
+client should prioritize first-class support for GPT-5 and Claude 4.6 by using
+model/provider capabilities for the selected mode instead of assuming a fixed
+provider-to-role mapping. Tool schemas are attached only when the request mode
+should execute tools, but the schema format must come from that mode's
+configured model.
+
 Behavior preservation details:
 
 - Return `None` on request failure, matching current `_get_llm_response()`.
-- Keep GPT-5 fallback behavior for thinking and action models.
+- Keep GPT-5 fallback behavior for thinking and action roles.
 - Keep the current `temperature=1.0` special case for `o1` / `o4` model names.
+- Keep Anthropic/Claude tool schema handling available to whichever role/model
+  is executing tool calls.
 - Keep current function-call normalization output:
 
 ```text
@@ -228,8 +240,8 @@ Responsibilities:
 - Parse action tool names and JSON parameters.
 - Convert invalid empty action names into a thought with current guidance.
 - Preserve the fallback that treats unparseable content as a thought.
-- Preserve the extra guidance currently appended when a thinking model or
-  action model returns unstructured content.
+- Preserve the extra guidance currently appended when a thinking-role or
+  action-role model returns unstructured content.
 
 This parser should not know about LiteLLM, tools, context manager, UI events, or
 prompt YAML.
@@ -265,7 +277,7 @@ class ReActPromptBuilder:
         self,
         *,
         repository_url: Optional[str],
-        supports_function_calling: bool,
+        tool_calling_enabled: bool,
     ) -> str:
         ...
 
@@ -274,7 +286,7 @@ class ReActPromptBuilder:
         *,
         steps: Sequence[ReActStep],
         repository_url: Optional[str],
-        supports_function_calling: bool,
+        tool_calling_enabled: bool,
         successful_states: Mapping[str, Any],
     ) -> str:
         ...
@@ -323,8 +335,13 @@ Behavior preservation details:
 `ReActEngine` delegates:
 
 ```python
-self.prompt_builder.build_initial_system_prompt(...)
-self.prompt_builder.build_next_prompt(...)
+action_capabilities = self.llm_client.capabilities_for(ReactModelMode.ACTION)
+self.prompt_builder.build_initial_system_prompt(
+    ..., tool_calling_enabled=action_capabilities.supports_function_calling
+)
+self.prompt_builder.build_next_prompt(
+    ..., tool_calling_enabled=action_capabilities.supports_function_calling
+)
 self.prompt_builder.build_mode_prompt(...)
 self.llm_client.get_response(...)
 self.response_parser.parse(...)
@@ -387,7 +404,8 @@ Add and migrate focused tests before removing old engine methods:
   - Parses action parameters.
   - Handles invalid empty action names.
   - Does not turn model-generated `OBSERVATION:` text into observation steps.
-  - Preserves unstructured response fallback for thinking and action models.
+  - Preserves unstructured response fallback for thinking-role and action-role
+    models.
 
 - `tests/test_react_prompt_builder.py`
   - Covers initial prompt behavior currently tested through private
@@ -402,6 +420,9 @@ Add and migrate focused tests before removing old engine methods:
   - JSON fallback parser preserves currently supported formats.
   - GPT-5 fallback parameter behavior is characterized with mocked
     `litellm.completion`.
+  - GPT-5 and Claude 4.6 can be assigned to either thinking or action roles;
+    capabilities are resolved per mode instead of through a global provider
+    flag.
   - Thinking/action prompt wrappers are not applied inside the LLM client.
 
 Keep or adjust existing orchestration tests so they continue to exercise
