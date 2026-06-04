@@ -97,6 +97,38 @@ def test_reverse_roles_do_not_hardcode_provider_to_role(monkeypatch):
     assert action.supports_function_calling is True
 
 
+def test_setup_caches_capabilities_for_both_modes(monkeypatch):
+    function_calling_checks = []
+    parallel_checks = []
+
+    def fake_supports_function_calling(model):
+        function_calling_checks.append(model)
+        return "claude" in model
+
+    def fake_supports_parallel_function_calling(model):
+        parallel_checks.append(model)
+        return "gpt" in model
+
+    monkeypatch.setattr("litellm.supports_function_calling", fake_supports_function_calling)
+    monkeypatch.setattr(
+        "litellm.supports_parallel_function_calling",
+        fake_supports_parallel_function_calling,
+    )
+    client = make_client()
+
+    client.setup()
+
+    for _ in range(3):
+        assert client.capabilities_for(ReactModelMode.THINKING).model == "gpt-5"
+        assert (
+            client.capabilities_for(ReactModelMode.ACTION).model
+            == "anthropic/claude-sonnet-4-6"
+        )
+
+    assert function_calling_checks == ["gpt-5", "anthropic/claude-sonnet-4-6"]
+    assert parallel_checks == ["gpt-5", "anthropic/claude-sonnet-4-6"]
+
+
 def test_build_tools_schema_action_uses_action_model_format(monkeypatch):
     monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
     monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)

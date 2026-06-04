@@ -29,6 +29,7 @@ class ReactLLMClient:
         self.tools = tools
         self.token_tracker = token_tracker
         self.logger = logger
+        self._capability_cache: dict[ReactModelMode, ReactModelCapabilities] = {}
 
     def setup(self) -> None:
         """Setup LiteLLM configuration."""
@@ -36,6 +37,9 @@ class ReactLLMClient:
 
         if self.config.log_level.value == "DEBUG":
             litellm.set_verbose = True
+
+        for mode in ReactModelMode:
+            self._capability_cache[mode] = self._resolve_capabilities(mode)
 
         action_capabilities = self.capabilities_for(ReactModelMode.ACTION)
         if action_capabilities.supports_function_calling:
@@ -63,6 +67,13 @@ class ReactLLMClient:
 
     def capabilities_for(self, mode: ReactModelMode) -> ReactModelCapabilities:
         """Resolve model capabilities for a ReAct model mode."""
+        if mode not in self._capability_cache:
+            self._capability_cache[mode] = self._resolve_capabilities(mode)
+
+        return self._capability_cache[mode]
+
+    def _resolve_capabilities(self, mode: ReactModelMode) -> ReactModelCapabilities:
+        """Compute model capabilities for a ReAct model mode."""
         model_type = self._model_type_for(mode)
         model = self.config.get_litellm_model_name(model_type)
         tool_call_format = self._tool_call_format_for_model(model)
