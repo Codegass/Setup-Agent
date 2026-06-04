@@ -14,8 +14,8 @@ class Config(BaseModel):
     """Main configuration class."""
 
     # Model configuration - separate thinking and action models
-    thinking_model: str = Field(default="claude-sonnet-4-20250514")
-    thinking_provider: str = Field(default="anthropic")
+    thinking_model: str = Field(default="gpt-5.4-mini")
+    thinking_provider: str = Field(default="openai")
     thinking_temperature: float = Field(default=0.1)
     thinking_max_tokens: int = Field(default=16000)
     reasoning_effort: str = Field(default="medium")  # for o1 models and claude thinking
@@ -68,8 +68,8 @@ class Config(BaseModel):
 
         return cls(
             # Thinking model config
-            thinking_model=os.getenv("SAG_THINKING_MODEL", "claude-sonnet-4-20250514"),
-            thinking_provider=os.getenv("SAG_THINKING_PROVIDER", "anthropic"),
+            thinking_model=os.getenv("SAG_THINKING_MODEL", "gpt-5.4-mini"),
+            thinking_provider=os.getenv("SAG_THINKING_PROVIDER", "openai"),
             thinking_temperature=float(os.getenv("SAG_THINKING_TEMPERATURE", "0.1")),
             thinking_max_tokens=int(os.getenv("SAG_MAX_THINKING_TOKENS", "16000")),
             reasoning_effort=os.getenv("SAG_REASONING_EFFORT", "medium"),

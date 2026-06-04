@@ -243,7 +243,17 @@ class ReactLLMClient:
             "messages": [{"role": "user", "content": prompt}],
         }
 
-        if self.config.is_gpt5_model(model_type):
+        tools_schema: list[dict[str, Any]] = []
+        if mode == ReactModelMode.ACTION and capabilities.supports_function_calling:
+            tools_schema = self.build_tools_schema(ReactModelMode.ACTION)
+
+        use_traditional_tool_params = (
+            mode == ReactModelMode.ACTION
+            and self.config.is_gpt5_model(model_type)
+            and bool(tools_schema)
+        )
+
+        if self.config.is_gpt5_model(model_type) and not use_traditional_tool_params:
             params["reasoning_effort"] = self.config.gpt5_reasoning_effort
             params["drop_params"] = True
             self.logger.info(
@@ -253,24 +263,25 @@ class ReactLLMClient:
         else:
             params["temperature"] = self._temperature_for(mode)
             params["max_tokens"] = self._max_tokens_for(mode)
+            if use_traditional_tool_params:
+                params["drop_params"] = True
+                self.logger.info("Using GPT-5 action tool-call parameters without reasoning_effort")
             if mode == ReactModelMode.THINKING:
                 params.update(self._thinking_config_for_mode())
 
         self._add_ollama_api_base(params, capabilities.model)
 
-        if mode == ReactModelMode.ACTION and capabilities.supports_function_calling:
-            tools_schema = self.build_tools_schema(ReactModelMode.ACTION)
-            if tools_schema:
-                params["tools"] = tools_schema
-                params["tool_choice"] = (
-                    {"type": "auto"} if capabilities.tool_call_format == "anthropic" else "auto"
-                )
-                self.logger.debug(
-                    f"Using {capabilities.tool_call_format} function calling with "
-                    f"{len(tools_schema)} tools"
-                )
-                if self.config.verbose:
-                    self.logger.debug(f"First tool schema: {json.dumps(tools_schema[0], indent=2)}")
+        if tools_schema:
+            params["tools"] = tools_schema
+            params["tool_choice"] = (
+                {"type": "auto"} if capabilities.tool_call_format == "anthropic" else "auto"
+            )
+            self.logger.debug(
+                f"Using {capabilities.tool_call_format} function calling with "
+                f"{len(tools_schema)} tools"
+            )
+            if self.config.verbose:
+                self.logger.debug(f"First tool schema: {json.dumps(tools_schema[0], indent=2)}")
 
         if self.config.verbose:
             self.logger.debug(f"{mode.value.title()} model request params: {params}")

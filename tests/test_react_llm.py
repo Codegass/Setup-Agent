@@ -285,6 +285,37 @@ def test_openai_tool_call_response_normalizes_to_react_and_strips_functions_pref
     assert response == 'THOUGHT: run command\n\nACTION: example\n\nPARAMETERS: {"command": "pwd"}'
 
 
+def test_gpt5_action_tool_call_request_omits_reasoning_effort(monkeypatch):
+    captured = {}
+
+    def fake_completion(**params):
+        captured.update(params)
+        return make_response("ACTION: example\nPARAMETERS: {\"command\": \"pwd\"}")
+
+    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
+    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    client = make_client(
+        make_config(
+            action_model="gpt-5.4-mini",
+            action_provider="openai",
+            action_temperature=1.0,
+            action_max_tokens=10000,
+        )
+    )
+
+    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
+
+    assert response == "ACTION: example\nPARAMETERS: {\"command\": \"pwd\"}"
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["temperature"] == pytest.approx(1.0)
+    assert captured["max_tokens"] == 10000
+    assert captured["drop_params"] is True
+    assert "reasoning_effort" not in captured
+    assert "tools" in captured
+    assert captured["tool_choice"] == "auto"
+
+
 def test_claude_tool_call_response_normalizes_to_react_text(monkeypatch):
     monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
     monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
