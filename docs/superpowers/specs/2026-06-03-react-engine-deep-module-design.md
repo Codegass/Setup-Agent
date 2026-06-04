@@ -189,6 +189,16 @@ provider-to-role mapping. Tool schemas are attached only when the request mode
 should execute tools, but the schema format must come from that mode's
 configured model.
 
+The role/model capability design should also stay compatible with future
+DeepSeek and Ollama usage. LiteLLM's official provider docs require DeepSeek
+models to use the `deepseek/` prefix, and DeepSeek reasoner thinking should use
+`thinking={"type": "enabled"}` or `reasoning_effort` rather than Anthropic
+`budget_tokens`. Ollama chat/tool-calling support should allow
+`ollama_chat/<model>` and should pass the configured `api_base` when available.
+Use LiteLLM capability helpers such as `supports_function_calling()` and
+`get_supported_openai_params()` where useful instead of maintaining a broad
+provider matrix in SAG.
+
 Behavior preservation details:
 
 - Return `None` on request failure, matching current `_get_llm_response()`.
