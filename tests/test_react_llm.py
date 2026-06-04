@@ -325,6 +325,35 @@ def test_gpt5_request_falls_back_to_traditional_params_with_drop_params(monkeypa
     assert calls[1]["drop_params"] is True
 
 
+def test_claude_46_thinking_uses_reasoning_effort_not_top_level_budget(monkeypatch):
+    captured = {}
+
+    def fake_completion(**params):
+        captured.update(params)
+        return make_response("THOUGHT: ok")
+
+    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
+    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    client = make_client(
+        make_config(
+            thinking_provider="anthropic",
+            thinking_model="claude-sonnet-4-6",
+            reasoning_effort="high",
+            thinking_budget_tokens=5000,
+        )
+    )
+
+    response = client.get_response("wrapped prompt", ReactModelMode.THINKING)
+
+    assert response == "THOUGHT: ok"
+    assert captured["model"] == "anthropic/claude-sonnet-4-6"
+    assert captured["reasoning_effort"] == "high"
+    assert "thinking" not in captured
+    assert "type" not in captured
+    assert "budget_tokens" not in captured
+
+
 def test_ollama_action_request_includes_api_base(monkeypatch):
     captured = {}
 

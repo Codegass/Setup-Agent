@@ -141,10 +141,12 @@ class Config(BaseModel):
     def get_thinking_config(self) -> dict:
         """Get thinking configuration based on provider."""
         if self.thinking_provider == "anthropic":
-            # Map reasoning_effort to budget_tokens for Claude
+            if self._uses_anthropic_adaptive_thinking():
+                return {"reasoning_effort": self.reasoning_effort}
+
             effort_mapping = {"low": 1024, "medium": 2048, "high": 4096}
             budget_tokens = effort_mapping.get(self.reasoning_effort, self.thinking_budget_tokens)
-            return {"type": "enabled", "budget_tokens": budget_tokens}
+            return {"thinking": {"type": "enabled", "budget_tokens": budget_tokens}}
         elif self.thinking_provider == "openai" and "o1" in self.thinking_model:
             # For OpenAI o1 models, use reasoning_effort
             return {"reasoning_effort": self.reasoning_effort}
@@ -154,6 +156,19 @@ class Config(BaseModel):
         else:
             # For other models, no special thinking config
             return {}
+
+    def _uses_anthropic_adaptive_thinking(self) -> bool:
+        """Return True for Anthropic models where LiteLLM maps reasoning_effort."""
+        model = self.thinking_model.lower()
+        adaptive_markers = (
+            "4-6",
+            "4.6",
+            "4-7",
+            "4.7",
+            "opus-4-5",
+            "opus-4.5",
+        )
+        return any(marker in model for marker in adaptive_markers)
 
 
 def setup_litellm_environment(config: Config) -> None:
