@@ -112,6 +112,11 @@ class ReActEngine(UIEventEmitter):
             config=self.config,
             tools=self.tools,
             token_tracker=self.token_tracker,
+            trace_context=lambda: {
+                "iteration": self.current_iteration,
+                "timestamp": self._get_timestamp(),
+                "agent_logger": self.agent_logger,
+            },
         )
         self.llm_client.setup()
         self.response_parser = ReActResponseParser(timestamp_factory=self._get_timestamp)

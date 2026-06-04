@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import litellm
 from loguru import logger
@@ -24,11 +24,13 @@ class ReactLLMClient:
         tools: dict[str, BaseTool],
         token_tracker: Any,
         logger=logger,
+        trace_context: Optional[Callable[[], dict[str, Any]]] = None,
     ):
         self.config = config
         self.tools = tools
         self.token_tracker = token_tracker
         self.logger = logger
+        self.trace_context = trace_context
         self._capability_cache: dict[ReactModelMode, ReactModelCapabilities] = {}
 
     def setup(self) -> None:
@@ -77,12 +79,20 @@ class ReactLLMClient:
         model_type = self._model_type_for(mode)
         model = self.config.get_litellm_model_name(model_type)
         tool_call_format = self._tool_call_format_for_model(model)
+        supports_function_calling = (
+            False if tool_call_format == "prompt" else self._supports_function_calling(model)
+        )
+        supports_parallel_function_calling = (
+            False
+            if tool_call_format == "prompt"
+            else self._supports_parallel_function_calling(model)
+        )
 
         return ReactModelCapabilities(
             mode=mode,
             model=model,
-            supports_function_calling=self._supports_function_calling(model),
-            supports_parallel_function_calling=self._supports_parallel_function_calling(model),
+            supports_function_calling=supports_function_calling,
+            supports_parallel_function_calling=supports_parallel_function_calling,
             tool_call_format=tool_call_format,
         )
 
@@ -142,6 +152,7 @@ class ReactLLMClient:
             if self.config.verbose:
                 self._log_llm_response(capabilities.model, content_str, response)
 
+            self._log_agent_response_length(capabilities.model, content_str)
             self.logger.info(f"Full LLM Response from {capabilities.model}:")
             self.logger.info(content_str)
             self.logger.debug(
@@ -168,6 +179,23 @@ class ReactLLMClient:
 
     def _model_type_for(self, mode: ReactModelMode) -> str:
         return "thinking" if mode == ReactModelMode.THINKING else "action"
+
+    def _get_trace_context(self) -> dict[str, Any]:
+        if self.trace_context is None:
+            return {}
+
+        try:
+            return self.trace_context() or {}
+        except Exception as exc:  # pragma: no cover - defensive observability path
+            self.logger.debug(f"Could not read LLM trace context: {exc}")
+            return {}
+
+    def _log_agent_response_length(self, model: str, content: str) -> None:
+        agent_logger = self._get_trace_context().get("agent_logger")
+        if agent_logger is None:
+            return
+
+        agent_logger.info(f"LLM Response from {model}: {len(content)} chars")
 
     def _supports_function_calling(self, model: str) -> bool:
         try:
@@ -512,6 +540,7 @@ class ReactLLMClient:
 
     def _log_llm_response(self, model: str, content: str, response: Any) -> None:
         verbose_logger = create_verbose_logger("react_llm")
+        trace_context = self._get_trace_context()
         usage_info = {}
         if hasattr(response, "usage") and response.usage:
             usage_info = {
@@ -523,18 +552,23 @@ class ReactLLMClient:
         log_entry = {
             "event": "llm_response",
             "model": model,
+            "iteration": trace_context.get("iteration"),
             "response_length": len(content),
             "full_response": content,
             "usage": usage_info,
+            "timestamp": trace_context.get("timestamp"),
         }
 
         verbose_logger.info(f"LLM RESPONSE: {json.dumps(log_entry, indent=2)}")
 
     def _log_llm_error(self, error: Exception) -> None:
         verbose_logger = create_verbose_logger("react_llm")
+        trace_context = self._get_trace_context()
         error_entry = {
             "event": "llm_error",
+            "iteration": trace_context.get("iteration"),
             "error_type": type(error).__name__,
             "error_message": str(error),
+            "timestamp": trace_context.get("timestamp"),
         }
         verbose_logger.error(f"LLM ERROR: {json.dumps(error_entry, indent=2)}")

@@ -24,6 +24,26 @@ class FakeTokenTracker:
         self.calls.append((response, model, step_type))
 
 
+class FakeAgentLogger:
+    def __init__(self):
+        self.messages = []
+
+    def info(self, message):
+        self.messages.append(message)
+
+
+class FakeVerboseLogger:
+    def __init__(self):
+        self.info_messages = []
+        self.error_messages = []
+
+    def info(self, message):
+        self.info_messages.append(message)
+
+    def error(self, message):
+        self.error_messages.append(message)
+
+
 def make_config(**overrides):
     values = {
         "thinking_model": "gpt-5",
@@ -120,10 +140,7 @@ def test_setup_caches_capabilities_for_both_modes(monkeypatch):
 
     for _ in range(3):
         assert client.capabilities_for(ReactModelMode.THINKING).model == "gpt-5"
-        assert (
-            client.capabilities_for(ReactModelMode.ACTION).model
-            == "anthropic/claude-sonnet-4-6"
-        )
+        assert client.capabilities_for(ReactModelMode.ACTION).model == "anthropic/claude-sonnet-4-6"
 
     assert function_calling_checks == ["gpt-5", "anthropic/claude-sonnet-4-6"]
     assert parallel_checks == ["gpt-5", "anthropic/claude-sonnet-4-6"]
@@ -169,6 +186,43 @@ def test_get_response_does_not_wrap_mode_prompt_again(monkeypatch):
     assert captured["messages"][0]["content"].count("ACTION MODEL INSTRUCTIONS") == 1
 
 
+def test_get_response_logs_trace_context_and_agent_response_length(monkeypatch):
+    captured_verbose_logger = FakeVerboseLogger()
+    agent_logger = FakeAgentLogger()
+
+    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
+    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
+    monkeypatch.setattr("litellm.completion", lambda **params: make_response("THOUGHT: ok"))
+    monkeypatch.setattr(
+        "sag.agent.react_llm.create_verbose_logger",
+        lambda name: captured_verbose_logger,
+    )
+
+    from sag.agent.react_llm import ReactLLMClient
+
+    client = ReactLLMClient(
+        config=make_config(
+            action_model="gpt-4o",
+            action_provider="openai",
+            verbose=True,
+        ),
+        tools={"example": ExampleTool()},
+        token_tracker=FakeTokenTracker(),
+        trace_context=lambda: {
+            "iteration": 7,
+            "timestamp": "2026-06-03 22:15:00",
+            "agent_logger": agent_logger,
+        },
+    )
+
+    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
+
+    assert response == "THOUGHT: ok"
+    assert agent_logger.messages == ["LLM Response from gpt-4o: 11 chars"]
+    assert '"iteration": 7' in captured_verbose_logger.info_messages[0]
+    assert '"timestamp": "2026-06-03 22:15:00"' in captured_verbose_logger.info_messages[0]
+
+
 def test_json_function_call_content_fallback_preserves_tool_command_format(monkeypatch):
     monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
     monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
@@ -181,6 +235,33 @@ def test_json_function_call_content_fallback_preserves_tool_command_format(monke
     response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
 
     assert response == 'ACTION: example\nPARAMETERS: {"command": "pwd"}'
+
+
+def test_prompt_tool_call_format_does_not_attach_native_tools(monkeypatch):
+    captured = {}
+
+    def fake_completion(**params):
+        captured.update(params)
+        return make_response('{"tool":"example","command":"pwd"}')
+
+    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
+    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: True)
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    client = make_client(
+        make_config(
+            action_provider="unknown",
+            action_model="opaque-model",
+        )
+    )
+
+    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
+    capabilities = client.capabilities_for(ReactModelMode.ACTION)
+
+    assert capabilities.tool_call_format == "prompt"
+    assert capabilities.supports_function_calling is False
+    assert "tools" not in captured
+    assert "tool_choice" not in captured
+    assert response == '{"tool":"example","command":"pwd"}'
 
 
 def test_openai_tool_call_response_normalizes_to_react_and_strips_functions_prefix(
