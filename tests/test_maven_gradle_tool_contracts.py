@@ -71,6 +71,16 @@ class EmptyToolchainManager:
         return None
 
 
+class VersionCommandOrchestrator(FakeBuildToolOrchestrator):
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append((command, workdir, timeout))
+        if "pom.xml" in command:
+            raise AssertionError("Maven version diagnostics must not require pom.xml")
+        if command.endswith("mvn -version"):
+            return {"success": True, "output": "Apache Maven 3.9.6", "exit_code": 0}
+        return {"success": True, "output": "", "exit_code": 0}
+
+
 def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
     orchestrator = FakeBuildToolOrchestrator(
         {
@@ -229,3 +239,27 @@ def test_maven_tool_failed_result_metadata_includes_detected_maven_requirement()
         "source": "build_error",
         "kind": "range",
     }
+
+
+def test_maven_tool_runs_version_command_as_diagnostic_without_pom_validation():
+    orchestrator = VersionCommandOrchestrator()
+    tool = MavenTool(orchestrator, toolchain_manager=FakeToolchainManager("/usr/bin/mvn"))
+
+    result = tool.execute(command="-version", working_directory="/workspace/project")
+
+    assert result.success is True
+    assert result.output == "Apache Maven 3.9.6"
+    assert orchestrator.monitored_commands == []
+    assert ("/usr/bin/mvn -version", "/workspace/project", None) in orchestrator.commands
+
+
+def test_maven_tool_runs_prefixed_version_command_as_diagnostic():
+    orchestrator = VersionCommandOrchestrator()
+    tool = MavenTool(orchestrator, toolchain_manager=FakeToolchainManager("/usr/bin/mvn"))
+
+    result = tool.execute(command="mvn -version", working_directory="/workspace/project")
+
+    assert result.success is True
+    assert result.output == "Apache Maven 3.9.6"
+    assert orchestrator.monitored_commands == []
+    assert ("/usr/bin/mvn -version", "/workspace/project", None) in orchestrator.commands

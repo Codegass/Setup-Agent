@@ -558,24 +558,8 @@ class SetupAgent:
                 level="success",
             )
 
-            # Step 3: Add the specific task
-            trunk_context.add_task(task_description)
-
-            # Step 4: Create task-specific prompt
-            task_prompt = f"""
-I need to work on the project '{project_name}' and complete the following task:
-
-TASK: {task_description}
-
-I should:
-1. First check my current context using manage_context tool
-2. Understand the current state of the project
-3. Plan the approach for completing this task
-4. Execute the necessary steps
-5. Verify the task is completed successfully
-
-Please start by checking the current context and then proceed with the task.
-"""
+            # Step 3: Create task-specific prompt
+            task_prompt = self._build_run_task_prompt(project_name, task_description)
 
             # Step 5: Execute task
             if self.config.ui_mode:
@@ -585,7 +569,9 @@ Please start by checking the current context and then proceed with the task.
 
             # Run the task execution loop
             success = self.react_engine.run_react_loop(
-                initial_prompt=task_prompt, max_iterations=self.max_iterations
+                initial_prompt=task_prompt,
+                max_iterations=self.max_iterations,
+                completion_mode="ad_hoc",
             )
 
             # Step 6: Update last comment in container and handle completion
@@ -658,6 +644,28 @@ Please start by checking the current context and then proceed with the task.
                     session_logger.cleanup_command_logger(cmd_logger_id)
                 except Exception as e:
                     logger.warning(f"cleanup_command_logger failed: {e}")
+
+    def _build_run_task_prompt(self, project_name: str, task_description: str) -> str:
+        """Build the prompt for a one-off CLI task on an existing project."""
+        return f"""
+I need to work on the project '{project_name}' and complete this ad-hoc CLI task:
+
+TASK: {task_description}
+
+This run is not the project setup workflow. The TASK above is the active objective for
+this command. Existing setup TODO items may be useful context, but do not start,
+complete, or continue existing setup TODO tasks unless the TASK explicitly requires it.
+
+I should:
+1. Use manage_context only if I need project state or prior findings
+2. Inspect the project only as needed for this TASK
+3. Execute the requested command or verification directly
+4. Verify the requested TASK with tool output
+5. After the TASK is satisfied, write a thought starting with:
+   TASK COMPLETE: <brief evidence-backed summary>
+
+Do not generate a final setup report unless the TASK explicitly asks for one.
+"""
 
     def _setup_docker_environment(self, project_name: str) -> bool:
         """Setup the Docker environment for the project."""

@@ -50,10 +50,14 @@ class AgentStateEvaluator:
     """
 
     def __init__(
-        self, context_manager: ContextManager, physical_validator: PhysicalValidator = None
+        self,
+        context_manager: ContextManager,
+        physical_validator: PhysicalValidator = None,
+        completion_mode: str = "setup",
     ):
         self.context_manager = context_manager
         self.physical_validator = physical_validator
+        self.completion_mode = completion_mode
 
         # Completion signal patterns - used for task completion detection
         # IMPORTANT: Patterns must be unique to their signal type to avoid false positives
@@ -129,6 +133,20 @@ class AgentStateEvaluator:
         repetition_analysis = self._check_repetitive_execution(recent_tool_executions)
         if repetition_analysis.needs_guidance:
             return repetition_analysis
+
+        if self.completion_mode == "ad_hoc":
+            if self._is_ad_hoc_task_complete(steps):
+                return AgentStateAnalysis(
+                    status=AgentStatus.PROCEEDING,
+                    is_task_complete=True,
+                    detected_signals=["ad_hoc_task_complete"],
+                )
+
+            idle_analysis = self._check_idle_thinking(steps)
+            if idle_analysis.needs_guidance:
+                return idle_analysis
+
+            return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
         # 2. Check if working outside task context (ghost state prevention)
         ghost_state_analysis = self._check_ghost_state(steps)
@@ -573,6 +591,57 @@ class AgentStateEvaluator:
                         return True
 
         return False
+
+    def _is_ad_hoc_task_complete(self, steps: List[Any]) -> bool:
+        """Check completion for one-off CLI tasks that are not part of setup TODO."""
+        completion_step_index = None
+        for index in range(len(steps) - 1, -1, -1):
+            step = steps[index]
+            if getattr(step, "step_type", None) != StepType.THOUGHT:
+                continue
+            if self._is_ad_hoc_completion_marker(getattr(step, "content", "")):
+                completion_step_index = index
+                break
+
+        if completion_step_index is None:
+            return False
+
+        for step in steps[:completion_step_index]:
+            if getattr(step, "step_type", None) != StepType.ACTION:
+                continue
+            if getattr(step, "tool_name", None) == "manage_context":
+                continue
+            result = getattr(step, "tool_result", None)
+            if result and result.success:
+                logger.info("Ad-hoc task completion detected after successful tool action")
+                return True
+
+        return False
+
+    def _is_ad_hoc_completion_marker(self, content: str) -> bool:
+        normalized = " ".join(str(content or "").strip().lower().split())
+        if not normalized:
+            return False
+
+        if normalized.startswith(("task complete", "task completed")):
+            return True
+
+        negated_markers = [
+            "not task complete",
+            "task complete condition is not",
+            "not verified successfully",
+            "is not verified successfully",
+            "was not verified successfully",
+        ]
+        if any(marker in normalized for marker in negated_markers):
+            return False
+
+        verified = "verified successfully" in normalized
+        no_more_action = (
+            "no further terminal action is needed" in normalized
+            or "no further action is needed" in normalized
+        )
+        return verified and no_more_action
 
     def get_completion_signals_for_task(self, task_description: str) -> List[str]:
         """Get relevant completion signals based on task description."""

@@ -23,6 +23,32 @@ class DummyContextManager:
         return None
 
 
+class DummyTask:
+    def __init__(self, task_id, description, status, key_results=""):
+        self.id = task_id
+        self.description = description
+        self.status = status
+        self.key_results = key_results
+
+
+class DummyStatus:
+    def __init__(self, value):
+        self.value = value
+
+
+class DummyTrunkContext:
+    def __init__(self):
+        self.todo_list = [
+            DummyTask("task_1", "Clone repository", DummyStatus("completed"), "cloned"),
+            DummyTask("task_2", "Compile project", DummyStatus("in_progress")),
+        ]
+
+
+class DummyContextManagerWithTodo(DummyContextManager):
+    def load_trunk_context(self):
+        return DummyTrunkContext()
+
+
 class DummyTool(BaseTool):
     def __init__(self):
         super().__init__("dummy", "Dummy tool for prompt tests")
@@ -59,6 +85,15 @@ def make_engine(repository_url=None, supports_function_calling=True):
     return engine
 
 
+def make_prompt_builder_with_todo():
+    prompts = load_react_engine_prompts()
+    return ReActPromptBuilder(
+        prompts=prompts,
+        context_manager=DummyContextManagerWithTodo(),
+        tools={"dummy": DummyTool()},
+    )
+
+
 def test_react_engine_initialization_loads_prompt_config(monkeypatch):
     monkeypatch.setattr(ReactLLMClient, "setup", lambda self: None)
 
@@ -87,6 +122,23 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "Handling Multi-Module Maven Test Execution" in prompt
     assert "RESPONSE FORMAT" in prompt
     assert "REMEMBER THE CONTINUOUS CYCLE" in prompt
+
+
+def test_initial_system_prompt_uses_ad_hoc_contract_without_setup_workflow():
+    engine = make_engine(repository_url="https://example.test/repo.git")
+
+    prompt = engine.prompt_builder.build_initial_system_prompt(
+        repository_url=engine.repository_url,
+        tool_calling_enabled=True,
+        workflow_mode="ad_hoc",
+    )
+
+    assert "AD-HOC TASK MODE" in prompt
+    assert "TASK COMPLETE:" in prompt
+    assert "INTELLIGENT SETUP WORKFLOW" not in prompt
+    assert "MANDATORY WORKFLOW FOR PROJECT SETUP" not in prompt
+    assert "REMEMBER THE CONTINUOUS CYCLE" not in prompt
+    assert "first action should be to clone" not in prompt
 
 
 def test_initial_system_prompt_uses_prompt_based_branch_when_function_calling_disabled():
@@ -123,6 +175,44 @@ def test_next_prompt_preserves_history_and_stuck_guidance():
     assert "Continue with your next THOUGHT and ACTION" in prompt
 
 
+def test_next_prompt_omits_setup_task_plan_in_ad_hoc_mode():
+    prompt_builder = make_prompt_builder_with_todo()
+
+    prompt = prompt_builder.build_next_prompt(
+        steps=[],
+        repository_url=None,
+        tool_calling_enabled=True,
+        successful_states={"working_directory": "/workspace/project"},
+        workflow_mode="ad_hoc",
+    )
+
+    assert "Working Directory: /workspace/project" in prompt
+    assert "TASK PLAN" not in prompt
+    assert 'manage_context(action="start_task"' not in prompt
+
+
+def test_next_prompt_uses_ad_hoc_stuck_guidance_without_setup_sequence():
+    engine = make_engine(repository_url="https://example.test/repo.git")
+    engine.steps = [
+        ReActStep(step_type=StepType.THOUGHT, content="thought 1", timestamp="t1"),
+        ReActStep(step_type=StepType.THOUGHT, content="thought 2", timestamp="t2"),
+        ReActStep(step_type=StepType.THOUGHT, content="thought 3", timestamp="t3"),
+    ]
+
+    prompt = engine.prompt_builder.build_next_prompt(
+        steps=engine.steps,
+        repository_url=engine.repository_url,
+        tool_calling_enabled=True,
+        successful_states=engine.successful_states,
+        workflow_mode="ad_hoc",
+    )
+
+    assert "AD-HOC TASK STILL NEEDS ACTION" in prompt
+    assert "The repository URL is already set" not in prompt
+    assert "task_1" not in prompt
+    assert "start_task" not in prompt
+
+
 def test_mode_prompts_preserve_markers_and_base_prompt():
     engine = make_engine()
 
@@ -137,3 +227,19 @@ def test_mode_prompts_preserve_markers_and_base_prompt():
     assert "ACTION MODEL INSTRUCTIONS" in action_prompt
     assert "RESPONSE FORMAT (when function calling not supported)" in action_prompt
     assert action_prompt.endswith("base prompt")
+
+
+def test_mode_prompts_use_ad_hoc_variants():
+    engine = make_engine()
+
+    thinking_prompt = engine.prompt_builder.build_mode_prompt(
+        "base prompt", ReactModelMode.THINKING, workflow_mode="ad_hoc"
+    )
+    action_prompt = engine.prompt_builder.build_mode_prompt(
+        "base prompt", ReactModelMode.ACTION, workflow_mode="ad_hoc"
+    )
+
+    assert "AD-HOC THINKING MODE" in thinking_prompt
+    assert "output only TASK COMPLETE and never include ACTION" in thinking_prompt
+    assert "AD-HOC ACTION MODE" in action_prompt
+    assert "Do not start or complete setup TODO tasks" in action_prompt

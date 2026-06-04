@@ -187,6 +187,35 @@ class MavenTool(BaseTool):
             else ("./mvnw" if use_wrapper else "mvn")
         )
 
+        version_command = self._normalize_maven_version_command(command)
+        if version_command:
+            maven_cmd = self._build_maven_command(
+                version_command,
+                goals,
+                profiles,
+                properties,
+                pom_file,
+                fail_at_end,
+                use_wrapper=use_wrapper,
+                extra_args=extra_args,
+                maven_executable=maven_executable,
+            )
+            result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+            return ToolResult(
+                success=result.get("exit_code") == 0,
+                output=result.get("output", ""),
+                raw_output=result.get("output", ""),
+                error=None if result.get("exit_code") == 0 else result.get("output", ""),
+                error_code=None if result.get("exit_code") == 0 else "MAVEN_VERSION_FAILED",
+                metadata={
+                    "command": maven_cmd,
+                    "requested_command": command,
+                    "exit_code": result.get("exit_code"),
+                    "tool_type": "maven",
+                    "diagnostic": "version",
+                },
+            )
+
         # Handle ignore_test_failures by adding to properties
         if ignore_test_failures:
             properties = self._append_maven_property(properties, "maven.test.failure.ignore=true")
@@ -515,6 +544,22 @@ class MavenTool(BaseTool):
             ),
             working_directory=working_directory,
         )
+
+    def _normalize_maven_version_command(self, command: Any) -> Optional[str]:
+        if isinstance(command, list):
+            command = " ".join(command)
+        try:
+            tokens = shlex.split(str(command or ""))
+        except ValueError:
+            return None
+
+        version_flags = {"-version", "--version", "-v"}
+        if len(tokens) == 1 and tokens[0] in version_flags:
+            return tokens[0]
+        if len(tokens) == 2 and tokens[0].rsplit("/", 1)[-1] in {"mvn", "mvnw"}:
+            if tokens[1] in version_flags:
+                return tokens[1]
+        return None
 
     def _maven_version_not_resolved_result(
         self,

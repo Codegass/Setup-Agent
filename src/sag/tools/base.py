@@ -3,7 +3,7 @@
 import inspect
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -133,13 +133,21 @@ class BaseTool(ABC):
 
             # Try to infer type from annotation
             if param.annotation != inspect.Parameter.empty:
-                if param.annotation == int:
+                annotation = param.annotation
+                origin = get_origin(annotation)
+                if origin is Union:
+                    non_none_args = [arg for arg in get_args(annotation) if arg is not type(None)]
+                    if len(non_none_args) == 1:
+                        annotation = non_none_args[0]
+                        origin = get_origin(annotation)
+
+                if annotation == int:
                     param_info["type"] = "integer"
-                elif param.annotation == float:
+                elif annotation == float:
                     param_info["type"] = "number"
-                elif param.annotation == bool:
+                elif annotation == bool:
                     param_info["type"] = "boolean"
-                elif param.annotation == list:
+                elif annotation == list or origin is list:
                     param_info["type"] = "array"
 
             schema["properties"][param_name] = param_info

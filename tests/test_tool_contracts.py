@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sag.agent.react_llm import ReactLLMClient
 from sag.agent.react_types import ReactModelMode
 from sag.config.models import LogLevel
@@ -13,6 +15,14 @@ class ExampleTool(BaseTool):
 
     def execute(self, command: str) -> ToolResult:
         return ToolResult(success=True, output=command)
+
+
+class OptionalIntTool(BaseTool):
+    def __init__(self):
+        super().__init__("optional_int", "Optional integer tool")
+
+    def execute(self, end_line: Optional[int] = None) -> ToolResult:
+        return ToolResult(success=True, output=str(end_line))
 
 
 class DerivedReportTool(ReportTool):
@@ -44,6 +54,13 @@ def test_base_tool_exposes_public_parameter_schema():
     assert schema["type"] == "object"
     assert "command" in schema["properties"]
     assert schema["required"] == ["command"]
+
+
+def test_base_tool_infers_optional_integer_schema():
+    schema = OptionalIntTool().get_parameter_schema()
+
+    assert schema["properties"]["end_line"]["type"] == "integer"
+    assert schema["properties"]["end_line"]["default"] is None
 
 
 def test_react_llm_client_uses_public_tool_schema_without_empty_fallback():

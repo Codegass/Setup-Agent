@@ -30,6 +30,14 @@ initial_system:
     - The key_results from completed tasks will guide your next actions
 
     AVAILABLE TOOLS:
+  ad_hoc_context_management: |
+    AD-HOC TASK MODE:
+    - The user-provided TASK is the active objective for this run.
+    - Existing setup TODO items are background context only.
+    - Do not start or complete setup TODO tasks unless the TASK explicitly asks for that.
+    - Use manage_context only when project state or prior findings are directly needed.
+    - After tool output proves the requested TASK is done, write a thought starting with:
+      TASK COMPLETE: <brief evidence-backed summary>
   tool_clarification: |
     AVAILABLE TOOLS:
     - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
@@ -202,6 +210,17 @@ initial_system:
     3. [do actual work] - Execute task
     4. manage_context(action="complete_with_results", summary="...", key_results="...") - Complete task
     5. GO BACK TO SEQUENCE STEP 1 - Check for next task (DON'T SKIP THIS!)
+  ad_hoc_function_calling_response_format: |
+    RESPONSE FORMAT:
+    You have access to function calling capabilities. Use the tools directly.
+
+    AD-HOC TASK RULES:
+    1. Execute only the tools needed for the requested TASK.
+    2. Do not start, continue, or complete setup TODO tasks.
+    3. Do not generate a final setup report unless the TASK explicitly asks for one.
+    4. If the TASK asks for a diagnostic command, run that diagnostic command exactly.
+    5. After successful tool evidence satisfies the TASK, write:
+       TASK COMPLETE: <brief evidence-backed summary>
   prompt_based_response_format: |
     RESPONSE FORMAT:
     Always respond in this exact format:
@@ -236,6 +255,22 @@ initial_system:
     5. System automatically moves to next task - repeat from step 2
 
     ⚠️ CRITICAL: NEVER try to complete_task without first doing start_task!
+  ad_hoc_prompt_based_response_format: |
+    RESPONSE FORMAT:
+    Always respond in this exact format until the requested TASK is proven complete:
+
+    THOUGHT: [Brief reasoning about the next direct action for the user's TASK]
+
+    ACTION: [tool_name]
+    PARAMETERS: [JSON object with parameters]
+
+    After OBSERVATION proves the TASK is done, respond with:
+    THOUGHT: TASK COMPLETE: <brief evidence-backed summary>
+
+    AD-HOC TASK RULES:
+    - Do not start or complete setup TODO tasks.
+    - Do not generate a final setup report unless explicitly requested.
+    - Prefer direct verification over broad project setup workflow.
   repository_url_reminder: |
     📂 REPOSITORY INFO: The target repository is {repository_url}
     🔧 Use this URL when cloning: project_setup(action="clone", repository_url="{repository_url}")
@@ -244,6 +279,10 @@ initial_system:
        manage_context(action="get_info") → manage_context(action="start_task") → [do work] → manage_context(action="complete_with_results") → BACK TO get_info → start next task → [repeat]
 
     ⚠️ AFTER COMPLETING EACH TASK: Always call manage_context(action="get_info") to see the next task!
+  ad_hoc_completion_reminder: |
+    AD-HOC COMPLETION:
+    Finish this run only after tool output directly satisfies the requested TASK.
+    Then write only: TASK COMPLETE: <brief evidence-backed summary>
 next_prompt:
   conversation_header: |
     CONVERSATION HISTORY:
@@ -259,6 +298,11 @@ next_prompt:
     - maven: Execute Maven commands
     - web_search: Search the web for information
     - system: Install system packages
+  ad_hoc_stuck_function_calling_guidance: |
+    AD-HOC TASK STILL NEEDS ACTION:
+    Use the smallest direct tool call needed for the requested TASK.
+    Do not start setup TODO tasks, clone repositories, or switch into setup workflow unless the TASK explicitly asks for that.
+    For diagnostics, run the exact diagnostic command requested and stop after verified tool output.
   stuck_repository_url_guidance: |
     The repository URL is already set: {repository_url}
 
@@ -338,6 +382,21 @@ mode_prompts:
     ---
 
     CURRENT SITUATION TO ANALYZE:
+  ad_hoc_thinking: |
+    🧠 AD-HOC THINKING MODE:
+    You are planning a one-off user task, not the full project setup workflow.
+
+    CRITICAL RULES:
+    1. Recommend the next direct action needed for the requested TASK.
+    2. Do not recommend starting or completing setup TODO tasks.
+    3. After a successful tool observation proves the TASK, output only TASK COMPLETE and never include ACTION.
+    4. For diagnostic commands, preserve the exact requested diagnostic intent.
+
+    End with a clear recommendation for the action model.
+
+    ---
+
+    CURRENT SITUATION TO ANALYZE:
   action: |
     🔧 ACTION MODEL INSTRUCTIONS:
     You are in ACTION MODE. Your role is to execute specific actions based on thinking model analysis.
@@ -378,6 +437,26 @@ mode_prompts:
     3. Use the exact commands recommended in the documentation
 
     Remember: You are the ACTING hands, not the thinking brain. Execute the planned actions efficiently.
+
+    ---
+
+    EXECUTE ACTIONS FOR:
+  ad_hoc_action: |
+    🔧 AD-HOC ACTION MODE:
+    Execute the specific action needed for the user's one-off TASK.
+
+    CRITICAL RULES:
+    1. Execute the direct tool call recommended by the thinking step.
+    2. Do not start or complete setup TODO tasks.
+    3. Do not convert diagnostics into build/test workflow.
+    4. If asked to run a diagnostic command, preserve that command.
+
+    RESPONSE FORMAT (when function calling is supported):
+    Use function calling directly to execute the needed tool.
+
+    RESPONSE FORMAT (when function calling is not supported):
+    ACTION: [tool_name]
+    PARAMETERS: [JSON object with required parameters]
 
     ---
 

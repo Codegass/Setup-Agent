@@ -132,7 +132,12 @@ class ReActEngine(UIEventEmitter):
         self.repository_url = repository_url
         logger.info(f"Repository URL set: {repository_url}")
 
-    def run_react_loop(self, initial_prompt: str, max_iterations: Optional[int] = None) -> bool:
+    def run_react_loop(
+        self,
+        initial_prompt: str,
+        max_iterations: Optional[int] = None,
+        completion_mode: str = "setup",
+    ) -> bool:
         """Run the main ReAct loop."""
         max_iter = max_iterations or self.max_iterations
 
@@ -152,10 +157,14 @@ class ReActEngine(UIEventEmitter):
                 tool_calling_enabled=self.llm_client.capabilities_for(
                     ReactModelMode.ACTION
                 ).supports_function_calling,
+                workflow_mode=completion_mode,
             )
             + "\n\n"
             + initial_prompt
         )
+
+        previous_completion_mode = self.state_evaluator.completion_mode
+        self.state_evaluator.completion_mode = completion_mode
 
         try:
             while self.current_iteration < max_iter:
@@ -170,7 +179,9 @@ class ReActEngine(UIEventEmitter):
                 mode = ReactModelMode.THINKING if is_thinking_step else ReactModelMode.ACTION
 
                 # Get LLM response
-                wrapped_prompt = self.prompt_builder.build_mode_prompt(current_prompt, mode)
+                wrapped_prompt = self.prompt_builder.build_mode_prompt(
+                    current_prompt, mode, workflow_mode=completion_mode
+                )
                 response = self.llm_client.get_response(wrapped_prompt, mode)
 
                 if not response:
@@ -193,7 +204,7 @@ class ReActEngine(UIEventEmitter):
                     continue
 
                 # Execute the steps
-                success = self._execute_steps(parsed_steps)
+                self._execute_steps(parsed_steps)
 
                 # CENTRALIZED STATE EVALUATION: Replace all scattered checks
                 state_analysis = self.state_evaluator.evaluate(
@@ -232,6 +243,7 @@ class ReActEngine(UIEventEmitter):
                         ReactModelMode.ACTION
                     ).supports_function_calling,
                     successful_states=self.successful_states,
+                    workflow_mode=completion_mode,
                 )
 
                 # Step count is now automatically managed by branch history updates
@@ -255,6 +267,8 @@ class ReActEngine(UIEventEmitter):
             # Export token usage before exception completion
             self._export_token_usage_csv()
             return False
+        finally:
+            self.state_evaluator.completion_mode = previous_completion_mode
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""

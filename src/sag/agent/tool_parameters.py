@@ -69,7 +69,7 @@ class ToolParameterNormalizer:
                 continue
 
             tokens = self._split_shell_segment(part)
-            if not self._is_maven_command_tokens(tokens):
+            if not self._should_append_maven_fail_at_end(tokens):
                 rewritten_parts.append(part)
                 continue
 
@@ -88,19 +88,59 @@ class ToolParameterNormalizer:
         except ValueError:
             return []
 
-    def _is_maven_command_tokens(self, tokens: list[str]) -> bool:
-        if not tokens:
+    def _should_append_maven_fail_at_end(self, tokens: list[str]) -> bool:
+        command_index = self._maven_command_index(tokens)
+        if command_index is None:
             return False
+
+        args = tokens[command_index + 1 :]
+        if any(arg in {"-v", "--version", "-version"} for arg in args):
+            return False
+
+        lifecycle_phases = {
+            "validate",
+            "initialize",
+            "generate-sources",
+            "process-sources",
+            "generate-resources",
+            "process-resources",
+            "compile",
+            "process-classes",
+            "generate-test-sources",
+            "process-test-sources",
+            "generate-test-resources",
+            "process-test-resources",
+            "test-compile",
+            "process-test-classes",
+            "test",
+            "prepare-package",
+            "package",
+            "pre-integration-test",
+            "integration-test",
+            "post-integration-test",
+            "verify",
+            "install",
+            "deploy",
+            "clean",
+            "site",
+        }
+        return any(arg in lifecycle_phases for arg in args)
+
+    def _maven_command_index(self, tokens: list[str]) -> Optional[int]:
+        if not tokens:
+            return None
 
         command_index = 0
         while command_index < len(tokens) and self._is_shell_assignment(tokens[command_index]):
             command_index += 1
 
         if command_index >= len(tokens):
-            return False
+            return None
 
         executable = tokens[command_index].rsplit("/", 1)[-1]
-        return executable in {"mvn", "mvnw"}
+        if executable not in {"mvn", "mvnw"}:
+            return None
+        return command_index
 
     def _is_shell_assignment(self, token: str) -> bool:
         if "=" not in token:

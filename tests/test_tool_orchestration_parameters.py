@@ -161,6 +161,59 @@ def test_bash_parameter_normalizer_appends_fail_at_end_to_simple_maven_command()
     ) in {(fix.source, fix.field, fix.before, fix.after) for fix in fixes}
 
 
+def test_bash_parameter_normalizer_does_not_append_fail_at_end_to_maven_version_command():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix("bash", {"command": "mvn -version"}, fixes)
+
+    assert params["command"] == "mvn -version"
+    assert not any(fix.reason == "Appended Maven fail-at-end flag to bash command" for fix in fixes)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mvn --version",
+        "mvn help:effective-pom",
+        "mvn dependency:tree",
+    ],
+)
+def test_bash_parameter_normalizer_does_not_append_fail_at_end_to_maven_diagnostics(command):
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix("bash", {"command": command}, fixes)
+
+    assert params["command"] == command
+    assert not any(fix.reason == "Appended Maven fail-at-end flag to bash command" for fix in fixes)
+
+
+def test_bash_parameter_normalizer_does_not_append_fail_at_end_to_compound_maven_version():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"bash": BashLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "bash",
+        {"command": "cd /workspace/project && mvn -version"},
+        fixes,
+    )
+
+    assert params["command"] == "cd /workspace/project && mvn -version"
+
+
 def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():
     fixes = []
     normalizer = ToolParameterNormalizer(
