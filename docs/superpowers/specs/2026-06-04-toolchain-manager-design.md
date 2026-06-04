@@ -187,7 +187,8 @@ the evidence is visible.
 Requirement source precedence:
 
 1. Explicit tool parameter from the agent or user-facing tool call, such as
-   `maven_version="3.9.6"` or `version_requirement="[3.9,4.0)"`.
+   `maven_version_requirement="3.9.6"` or
+   `maven_version_requirement="[3.9,4.0)"`.
 2. Project metadata, such as a Maven Enforcer `requireMavenVersion` rule or a
    wrapper configuration.
 3. Build error evidence, such as `Detected Maven Version: 3.6.3 is not in the
@@ -200,6 +201,56 @@ Conversation-derived requirements must be converted into a structured
 `ToolVersionRequirement` before calling `resolve()`. This keeps
 `ToolchainManager` deterministic and testable while still allowing the agent to
 use prior context when the project version is not discoverable from files.
+
+## Agent-Facing Tool Parameter
+
+The agent should get an explicit Maven tool parameter for version constraints.
+The public tool schema should expose:
+
+```python
+maven_version_requirement: str | None = None
+```
+
+This is the single agent-facing parameter for Maven version selection. It
+accepts exact versions and common constraint forms:
+
+```text
+3.9.6
+[3.9,4.0)
+>=3.9
+>=3.9,<4.0
+<=3.8.8
+```
+
+When this parameter is present, `MavenTool` converts it to:
+
+```python
+ToolVersionRequirement(
+    raw=maven_version_requirement,
+    source="tool_parameter",
+    kind=parsed_kind,
+)
+```
+
+`source="tool_parameter"` has the highest precedence. It represents a concrete
+choice made by the agent from current evidence or by the user through the agent.
+
+Do not expose `ToolVersionRequirement.source` or `kind` as separate tool
+parameters. Those are internal normalization details. The agent should supply
+one readable constraint string, and SAG should parse it.
+
+If `maven_version_requirement` is omitted, SAG may still derive a requirement
+from project metadata, Maven build errors, or current task/conversation history.
+That derived requirement should flow through the same `ToolVersionRequirement`
+object before calling `ToolchainManager.resolve()`.
+
+The tool schema description should tell the agent when to use the parameter:
+
+- Use it when project files, build errors, or user instructions specify a Maven
+  version or version range.
+- Leave it unset when the project does not specify a Maven version.
+- Do not use it to request "latest"; unconstrained resolution has its own
+  fallback order.
 
 ## Maven Resolution Order
 
@@ -245,10 +296,9 @@ then register the resulting candidate.
 
 `MavenTool` should infer `required_version` from reliable evidence:
 
+- `maven_version_requirement` supplied in the tool call.
 - Maven Enforcer output such as `allowed range [3.9,)`.
 - POM metadata when a simple `requireMavenVersion` rule is visible.
-- Explicit Maven version or version requirement parameters supplied by the
-  agent.
 - Current task or conversation history when it contains a concrete Maven
   requirement.
 - No requirement when the evidence is insufficient.
@@ -312,6 +362,11 @@ Add tests before implementation:
   `mvn`.
 - `MavenTool` can infer a structured version requirement from Enforcer output
   and resolve a satisfying candidate on the next run.
+- `MavenTool` exposes `maven_version_requirement` in its tool schema and turns
+  it into `ToolVersionRequirement(source="tool_parameter")`.
+- An explicit `maven_version_requirement` overrides looser derived requirements
+  but does not silently select a candidate that violates the explicit
+  constraint.
 - Bash parameter normalization does not append `--fail-at-end` to non-Maven
   commands containing Maven text, `find`, `tail`, or `curl`.
 - Existing Maven timeout and property behavior remains unchanged.
