@@ -1,7 +1,6 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -18,6 +17,7 @@ from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, Agen
 from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
+from .react_response_parser import ReActResponseParser
 from .react_types import ReActStep, StepType
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
@@ -112,6 +112,7 @@ class ReActEngine(UIEventEmitter):
 
         # Initialize token tracker for monitoring LLM usage
         self.token_tracker = TokenTracker()
+        self.response_parser = ReActResponseParser(timestamp_factory=self._get_timestamp)
 
         logger.info(
             "ReAct Engine initialized with dual model support, physical validation, and token tracking"
@@ -324,7 +325,14 @@ class ReActEngine(UIEventEmitter):
                     return False
 
                 # Parse the response
-                parsed_steps = self._parse_llm_response(response, is_thinking_step)
+                model_used = self.config.get_litellm_model_name(
+                    "thinking" if is_thinking_step else "action"
+                )
+                parsed_steps = self.response_parser.parse(
+                    response,
+                    model_used=model_used,
+                    was_thinking_model=is_thinking_step,
+                )
 
                 if not parsed_steps:
                     logger.warning("No valid steps parsed from LLM response")
@@ -950,117 +958,6 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
 
         return "\n\n".join(part.rstrip() for part in parts if part).rstrip() + "\n"
-
-    def _parse_llm_response(self, response: str, was_thinking_model: bool) -> List[ReActStep]:
-        """Parse LLM response into ReAct steps."""
-        steps = []
-        model_used = self.config.get_litellm_model_name(
-            "thinking" if was_thinking_model else "action"
-        )
-
-        # Log the raw response for debugging
-        logger.debug(f"Parsing LLM response: {repr(response)}")
-
-        # Split response into sections
-        sections = re.split(r"\n\n(?=THOUGHT:|ACTION:|OBSERVATION:)", response.strip())
-
-        logger.debug(f"Split response into {len(sections)} sections")
-        for i, section in enumerate(sections):
-            logger.debug(f"Section {i+1}: {section}")
-
-        for section in sections:
-            section = section.strip()
-            if not section:
-                continue
-
-            # Parse THOUGHT
-            if section.startswith("THOUGHT:"):
-                thought_content = section[8:].strip()
-                steps.append(
-                    ReActStep(
-                        step_type=StepType.THOUGHT,
-                        content=thought_content,
-                        timestamp=self._get_timestamp(),
-                        model_used=model_used,
-                    )
-                )
-
-            # Parse ACTION
-            elif section.startswith("ACTION:"):
-                action_lines = section.split("\n")
-                if len(action_lines) < 2:
-                    continue
-
-                tool_name = action_lines[0][7:].strip()
-
-                # Check for invalid tool names
-                if not tool_name or tool_name.lower() in ["none", "null", ""]:
-                    # Convert to a thought with guidance
-                    thought_content = "I need to take action but haven't specified a valid tool."
-                    steps.append(
-                        ReActStep(
-                            step_type=StepType.THOUGHT,
-                            content=thought_content,
-                            timestamp=self._get_timestamp(),
-                            model_used=model_used,
-                        )
-                    )
-                    continue
-
-                # Look for PARAMETERS line
-                params = {}
-                for line in action_lines[1:]:
-                    if line.startswith("PARAMETERS:"):
-                        try:
-                            params_str = line[11:].strip()
-                            if params_str:
-                                params = json.loads(params_str)
-                        except json.JSONDecodeError:
-                            logger.warning(f"Failed to parse parameters: {params_str}")
-                        break
-
-                steps.append(
-                    ReActStep(
-                        step_type=StepType.ACTION,
-                        content=f"Using tool: {tool_name}",
-                        tool_name=tool_name,
-                        tool_params=params,
-                        timestamp=self._get_timestamp(),
-                        model_used=model_used,
-                    )
-                )
-
-        # If no steps were parsed, try to extract at least a thought
-        if not steps and response.strip():
-            content = response.strip()
-            logger.info(f"Parsing failed, treating entire response as thought")
-            logger.info(f"Full response content: {content}")
-
-            # CRITICAL: Maintain ReAct structure - thinking should lead to action in next iteration
-            # Add system guidance to ensure proper model role separation
-            if was_thinking_model:
-                # Thinking model should not attempt actions - guide towards pure analysis
-                enhanced_content = (
-                    content
-                    + "\n\n[SYSTEM: This was pure analysis. Next step should be action execution by action model.]"
-                )
-            else:
-                # Action model failed to format properly - provide formatting guidance
-                enhanced_content = (
-                    content
-                    + "\n\n[SYSTEM: Action model must use proper tool call format: ACTION: tool_name, PARAMETERS: {...}]"
-                )
-
-            steps.append(
-                ReActStep(
-                    step_type=StepType.THOUGHT,
-                    content=enhanced_content,
-                    timestamp=self._get_timestamp(),
-                    model_used=model_used,
-                )
-            )
-
-        return steps
 
     def _get_tool_orchestrator(self) -> ToolOrchestrator:
         """Build the orchestration adapter for delegated tool execution."""
