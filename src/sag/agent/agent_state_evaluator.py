@@ -8,15 +8,7 @@ from loguru import logger
 
 from .context_manager import ContextManager
 from .physical_validator import PhysicalValidator
-
-
-class StepType(str, Enum):
-    """Types of steps in the ReAct loop (local definition to avoid circular import)."""
-
-    THOUGHT = "thought"
-    ACTION = "action"
-    OBSERVATION = "observation"
-    SYSTEM_GUIDANCE = "system_guidance"
+from .react_types import StepType
 
 
 class AgentStatus(str, Enum):

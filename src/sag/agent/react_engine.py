@@ -2,13 +2,11 @@
 
 import json
 import re
-from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import litellm
 from loguru import logger
-from pydantic import BaseModel
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
@@ -20,6 +18,7 @@ from .agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, Agen
 from .context_manager import BranchContext, BranchContextHistory, ContextManager, TrunkContext
 from .output_storage import OutputStorageManager
 from .physical_validator import PhysicalValidator
+from .react_types import ReActStep, StepType
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ToolCall,
@@ -28,27 +27,6 @@ from .tool_orchestration import (
     ToolOrchestrator,
 )
 from .tool_orchestration import format_tool_result as format_orchestrated_tool_result
-
-
-class StepType(str, Enum):
-    """Types of steps in the ReAct loop."""
-
-    THOUGHT = "thought"
-    ACTION = "action"
-    OBSERVATION = "observation"
-    SYSTEM_GUIDANCE = "system_guidance"
-
-
-class ReActStep(BaseModel):
-    """A single step in the ReAct process."""
-
-    step_type: StepType
-    content: str
-    tool_name: Optional[str] = None
-    tool_params: Optional[Dict[str, Any]] = None
-    tool_result: Optional[ToolResult] = None
-    timestamp: str
-    model_used: Optional[str] = None
 
 
 class ReActEngine(UIEventEmitter):
