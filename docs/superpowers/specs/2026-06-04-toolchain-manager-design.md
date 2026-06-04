@@ -45,8 +45,8 @@ and SAG spent the remaining loop iterations repeating the same invalid build.
   disappears between tool calls or `sag continue`.
 - Prefer project-local wrappers when explicitly requested or when they exist
   and are executable.
-- Prefer verified higher-version standalone tools over older system defaults
-  when the project or previous failure evidence requires it.
+- Prefer verified tools that satisfy the active requirement over system defaults
+  that violate it.
 - Keep installation separate from resolution. Resolution should discover and
   choose; installation should add candidates and then register them.
 - Make command rewriting precise. Build-tool behavior should inspect command
@@ -63,8 +63,21 @@ The manager owns a small API:
 class ToolchainSpec:
     name: str
     executable: str
-    min_version: str | None = None
+    version_requirement: ToolVersionRequirement | None = None
     prefer_wrapper: bool = True
+
+
+@dataclass(frozen=True)
+class ToolVersionRequirement:
+    raw: str
+    source: Literal[
+        "tool_parameter",
+        "project_metadata",
+        "build_error",
+        "conversation",
+        "registered_state",
+    ]
+    kind: Literal["exact", "range", "minimum", "maximum", "preferred"]
 
 
 @dataclass(frozen=True)
@@ -116,13 +129,14 @@ source, timestamps, and optional metadata.
 
 ## Resolve Logic
 
-`resolve()` is a deterministic selection pipeline:
+`resolve()` is a deterministic constraint-satisfaction pipeline. It is not a
+"pick the newest version" helper.
 
 1. Build the effective requirement from `ToolchainSpec`.
    - `name` identifies the toolchain family, such as `maven`.
    - `executable` identifies the command name, such as `mvn`.
-   - `min_version` is optional. If present, incompatible lower-version
-     candidates are not selected.
+   - `version_requirement` is optional and may express an exact version, a
+     range, a minimum, a maximum, or a preferred version.
    - `prefer_wrapper` controls whether project-local wrappers outrank other
      candidates when they satisfy the requirement.
 2. Call `discover()` to collect candidates from project wrappers, persisted
@@ -134,17 +148,26 @@ source, timestamps, and optional metadata.
      family has a valid no-version fallback rule. Maven candidates without a
      parseable version are lower priority than parseable Maven candidates.
 4. Filter by requirement.
-   - If `min_version` is set, remove candidates with a known version below it.
-   - If every candidate is below the minimum, return `None` with enough
+   - `exact`: keep only candidates matching that version.
+   - `range`: keep only candidates inside the declared range.
+   - `minimum`: keep only candidates at or above the minimum.
+   - `maximum`: keep only candidates at or below the maximum.
+   - `preferred`: prefer that version when present, but allow a fallback when
+     no exact preferred candidate exists.
+   - If every candidate violates a hard requirement, return `None` with enough
      metadata for the caller to explain the unmet requirement.
 5. Rank compatible candidates.
    - Executable wrapper in the project directory wins when `prefer_wrapper` is
-     true and the wrapper satisfies `min_version`.
+     true and the wrapper satisfies the version requirement.
    - Registered candidates come next because they represent verified runtime
      facts from prior tool actions.
-   - Standalone candidates are ranked by version, highest first.
-   - PATH/system candidates are the fallback, also ranked by version when
-     available.
+   - PATH/system candidates are the normal fallback for unconstrained
+     resolution.
+   - Standalone candidates that were not registered are used only when they
+     satisfy a requirement or no PATH/system candidate exists.
+   - Version ordering is only a tie-breaker among candidates that already
+     satisfy the same requirement and source priority. It must not override an
+     exact project requirement or user-provided parameter.
 6. Return `ResolvedToolExecutable` with the selected candidate and reason.
 7. Do not install inside `resolve()`. Installation is a separate caller action.
    The caller may install or download a new tool, register it, then call
@@ -154,6 +177,29 @@ This keeps `resolve()` pure enough to test and reason about: it can inspect the
 container and persisted registry, but it should not mutate the environment
 except for optional diagnostics-free cache refreshes that do not change PATH or
 install packages.
+
+## Requirement Sources
+
+The manager should receive version requirements; it should not scrape prompts or
+chat logs directly. Requirement extraction belongs at the caller boundary where
+the evidence is visible.
+
+Requirement source precedence:
+
+1. Explicit tool parameter from the agent or user-facing tool call, such as
+   `maven_version="3.9.6"` or `version_requirement="[3.9,4.0)"`.
+2. Project metadata, such as a Maven Enforcer `requireMavenVersion` rule or a
+   wrapper configuration.
+3. Build error evidence, such as `Detected Maven Version: 3.6.3 is not in the
+   allowed range [3.9,)`.
+4. Conversation or task history when the current setup context already records
+   a concrete requirement from the user or the agent's prior analysis.
+5. Registered state from previous verified tool actions.
+
+Conversation-derived requirements must be converted into a structured
+`ToolVersionRequirement` before calling `resolve()`. This keeps
+`ToolchainManager` deterministic and testable while still allowing the agent to
+use prior context when the project version is not discoverable from files.
 
 ## Maven Resolution Order
 
@@ -167,12 +213,14 @@ For Maven in the first implementation phase:
    `/usr/local/apache-maven-*/bin/mvn`.
 4. Resolve the current PATH executable with `command -v mvn`.
 5. Verify candidate versions with `<path> -version`.
-6. Choose the highest compatible candidate when `min_version` is known.
-7. If no `min_version` is known, prefer wrappers, then registered candidates,
-   then higher-version standalone candidates, then PATH/system candidates.
+6. Choose a candidate satisfying the version requirement when one is known.
+7. If no version requirement is known, prefer wrappers, then registered
+   candidates, then PATH/system candidates, with unregistered standalone
+   candidates used only when no normal executable exists.
 
 Version comparison should parse semantic numeric segments and ignore suffixes
-that do not affect ordering for the common Maven format.
+that do not affect ordering for the common Maven format. Version comparison is
+used to satisfy constraints and break ties; it is not the primary policy.
 
 ## Maven Integration
 
@@ -182,7 +230,11 @@ Before building a Maven command, it should call:
 
 ```python
 resolved = toolchain_manager.resolve(
-    ToolchainSpec(name="maven", executable="mvn", min_version=required_version),
+    ToolchainSpec(
+        name="maven",
+        executable="mvn",
+        version_requirement=required_version,
+    ),
     working_directory=working_directory,
 )
 ```
@@ -195,7 +247,11 @@ then register the resulting candidate.
 
 - Maven Enforcer output such as `allowed range [3.9,)`.
 - POM metadata when a simple `requireMavenVersion` rule is visible.
-- No requirement when the evidence is ambiguous.
+- Explicit Maven version or version requirement parameters supplied by the
+  agent.
+- Current task or conversation history when it contains a concrete Maven
+  requirement.
+- No requirement when the evidence is insufficient.
 
 This requirement should be passed to the manager. The manager should not know
 about Maven Enforcer messages; parsing build output stays in `MavenTool`.
@@ -243,14 +299,19 @@ Maven behavior.
 
 Add tests before implementation:
 
-- `ToolchainManager` discovers multiple Maven candidates and chooses the
-  highest compatible candidate for `min_version="3.9"`.
+- `ToolchainManager` discovers multiple Maven candidates and chooses a
+  candidate satisfying an exact version requirement without upgrading to a
+  newer incompatible version.
+- `ToolchainManager` chooses a compatible candidate for a range requirement
+  such as `[3.9,4.0)`.
+- `ToolchainManager` uses version ordering only as a tie-breaker among
+  compatible candidates.
 - Registered candidates are persisted and loaded from
   `.setup_agent/toolchains.json`.
 - `MavenTool` uses the resolved absolute Maven path instead of hardcoded
   `mvn`.
-- `MavenTool` can infer `min_version="3.9"` from Enforcer output and resolve a
-  newer candidate on the next run.
+- `MavenTool` can infer a structured version requirement from Enforcer output
+  and resolve a satisfying candidate on the next run.
 - Bash parameter normalization does not append `--fail-at-end` to non-Maven
   commands containing Maven text, `find`, `tail`, or `curl`.
 - Existing Maven timeout and property behavior remains unchanged.
