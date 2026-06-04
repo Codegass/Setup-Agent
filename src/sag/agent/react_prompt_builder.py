@@ -41,13 +41,13 @@ class ReActPromptBuilder:
         # Get current context info
         context_info = self.context_manager.get_current_context_info()
         parts = []
-        is_ad_hoc = workflow_mode == "ad_hoc"
+        is_run_task = workflow_mode == "run_task"
 
         # Prompt: src/sag/config/prompts/react_engine.yaml:2 initial_system.identity
         parts.append(self.prompts.get("initial_system.identity"))
 
         # Add repository URL at the very beginning if available
-        if repository_url and not is_ad_hoc:
+        if repository_url and not is_run_task:
             # Prompt: src/sag/config/prompts/react_engine.yaml:9 initial_system.repository_url_notice
             parts.append(
                 self.prompts.format(
@@ -55,9 +55,9 @@ class ReActPromptBuilder:
                 )
             )
 
-        if is_ad_hoc:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:33 initial_system.ad_hoc_context_management
-            parts.append(self.prompts.get("initial_system.ad_hoc_context_management"))
+        if is_run_task:
+            # Prompt: src/sag/config/prompts/react_engine.yaml:33 initial_system.run_task_context_management
+            parts.append(self.prompts.get("initial_system.run_task_context_management"))
         else:
             # Prompt: src/sag/config/prompts/react_engine.yaml:14 initial_system.context_management
             parts.append(self.prompts.get("initial_system.context_management"))
@@ -72,14 +72,14 @@ class ReActPromptBuilder:
             parts.append("\n".join(tool_lines))
 
         # Add explicit tool name clarification
-        # Prompt: src/sag/config/prompts/react_engine.yaml:41 initial_system.tool_clarification
+        # Prompt: src/sag/config/prompts/react_engine.yaml:42 initial_system.tool_clarification
         parts.append(self.prompts.get("initial_system.tool_clarification"))
-        if not is_ad_hoc:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:69 initial_system.intelligent_setup_workflow
+        if not is_run_task:
+            # Prompt: src/sag/config/prompts/react_engine.yaml:70 initial_system.intelligent_setup_workflow
             parts.append(self.prompts.get("initial_system.intelligent_setup_workflow"))
-            # Prompt: src/sag/config/prompts/react_engine.yaml:97 initial_system.maven_pom_recovery
+            # Prompt: src/sag/config/prompts/react_engine.yaml:98 initial_system.maven_pom_recovery
             parts.append(self.prompts.get("initial_system.maven_pom_recovery"))
-            # Prompt: src/sag/config/prompts/react_engine.yaml:132 initial_system.maven_multimodule_testing
+            # Prompt: src/sag/config/prompts/react_engine.yaml:133 initial_system.maven_multimodule_testing
             parts.append(self.prompts.get("initial_system.maven_multimodule_testing"))
 
         context_part = f"""
@@ -89,13 +89,13 @@ Context Type: {context_info.get('context_type', 'unknown')}
 Context ID: {context_info.get('context_id', 'unknown')}
 """
 
-        if context_info.get("context_type") == "trunk" and not is_ad_hoc:
+        if context_info.get("context_type") == "trunk" and not is_run_task:
             context_part += f"""
 Goal: {context_info.get('goal', 'Not specified')}
 Progress: {context_info.get('progress', 'Not available')}
 Next Task: {context_info.get('next_task', 'No pending tasks')}
 """
-        elif context_info.get("context_type") == "branch" and not is_ad_hoc:
+        elif context_info.get("context_type") == "branch" and not is_run_task:
             context_part += f"""
 Current Task: {context_info.get('task', 'Not specified')}
 Current Focus: {context_info.get('focus', 'Not specified')}
@@ -104,36 +104,38 @@ Current Focus: {context_info.get('focus', 'Not specified')}
 
         # Add different instructions based on function calling support
         if tool_calling_enabled:
-            if is_ad_hoc:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:213 initial_system.ad_hoc_function_calling_response_format
+            if is_run_task:
+                # Prompt: src/sag/config/prompts/react_engine.yaml:214 initial_system.run_task_function_calling_response_format
                 parts.append(
-                    self.prompts.get("initial_system.ad_hoc_function_calling_response_format")
+                    self.prompts.get("initial_system.run_task_function_calling_response_format")
                 )
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:174 initial_system.function_calling_response_format
+                # Prompt: src/sag/config/prompts/react_engine.yaml:175 initial_system.function_calling_response_format
                 parts.append(self.prompts.get("initial_system.function_calling_response_format"))
         else:
-            if is_ad_hoc:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:258 initial_system.ad_hoc_prompt_based_response_format
-                parts.append(self.prompts.get("initial_system.ad_hoc_prompt_based_response_format"))
+            if is_run_task:
+                # Prompt: src/sag/config/prompts/react_engine.yaml:259 initial_system.run_task_prompt_based_response_format
+                parts.append(
+                    self.prompts.get("initial_system.run_task_prompt_based_response_format")
+                )
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:224 initial_system.prompt_based_response_format
+                # Prompt: src/sag/config/prompts/react_engine.yaml:225 initial_system.prompt_based_response_format
                 parts.append(self.prompts.get("initial_system.prompt_based_response_format"))
 
         # Add repository URL reminder if available
-        if repository_url and not is_ad_hoc:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:274 initial_system.repository_url_reminder
+        if repository_url and not is_run_task:
+            # Prompt: src/sag/config/prompts/react_engine.yaml:275 initial_system.repository_url_reminder
             parts.append(
                 self.prompts.format(
                     "initial_system.repository_url_reminder", repository_url=repository_url
                 )
             )
 
-        if is_ad_hoc:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:282 initial_system.ad_hoc_completion_reminder
-            parts.append(self.prompts.get("initial_system.ad_hoc_completion_reminder"))
+        if is_run_task:
+            # Prompt: src/sag/config/prompts/react_engine.yaml:283 initial_system.run_task_completion_reminder
+            parts.append(self.prompts.get("initial_system.run_task_completion_reminder"))
         else:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:277 initial_system.continuous_cycle_reminder
+            # Prompt: src/sag/config/prompts/react_engine.yaml:278 initial_system.continuous_cycle_reminder
             parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
 
         return "\n\n".join(part.rstrip() for part in parts if part).rstrip() + "\n"
@@ -148,9 +150,9 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         workflow_mode: str = "setup",
     ) -> str:
         """Build the prompt for the next iteration."""
-        is_ad_hoc = workflow_mode == "ad_hoc"
+        is_run_task = workflow_mode == "run_task"
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:287 next_prompt.conversation_header
+        # Prompt: src/sag/config/prompts/react_engine.yaml:288 next_prompt.conversation_header
         prompt = self.prompts.get("next_prompt.conversation_header").rstrip() + "\n\n"
 
         # Limit recent steps to avoid context window overflow
@@ -161,7 +163,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if len(steps) > max_steps * 2:
             # Take first 2 steps (usually context and first action) and last max_steps
             recent_steps = steps[:2] + steps[-max_steps:]
-            # Prompt: src/sag/config/prompts/react_engine.yaml:289 next_prompt.omitted_steps_notice
+            # Prompt: src/sag/config/prompts/react_engine.yaml:290 next_prompt.omitted_steps_notice
             prompt += self.prompts.get("next_prompt.omitted_steps_notice").rstrip() + "\n\n"
         elif len(steps) > max_steps:
             # Just take the most recent steps
@@ -195,30 +197,30 @@ Current Focus: {context_info.get('focus', 'Not specified')}
 
         if thoughts_without_actions >= 3:
             # Model seems stuck in thinking without acting
-            if is_ad_hoc:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:301 next_prompt.ad_hoc_stuck_function_calling_guidance
+            if is_run_task:
+                # Prompt: src/sag/config/prompts/react_engine.yaml:302 next_prompt.run_task_stuck_function_calling_guidance
                 prompt += self.prompts.get(
-                    "next_prompt.ad_hoc_stuck_function_calling_guidance"
+                    "next_prompt.run_task_stuck_function_calling_guidance"
                 ).rstrip()
                 prompt += "\n\n"
             elif tool_calling_enabled:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:291 next_prompt.stuck_function_calling_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:292 next_prompt.stuck_function_calling_guidance
                 prompt += self.prompts.get("next_prompt.stuck_function_calling_guidance").rstrip()
                 prompt += "\n\n"
                 # Add specific guidance based on repository URL
                 if repository_url:
-                    # Prompt: src/sag/config/prompts/react_engine.yaml:306 next_prompt.stuck_repository_url_guidance
+                    # Prompt: src/sag/config/prompts/react_engine.yaml:307 next_prompt.stuck_repository_url_guidance
                     prompt += self.prompts.format(
                         "next_prompt.stuck_repository_url_guidance",
                         repository_url=repository_url,
                     ).rstrip()
                     prompt += "\n"
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:330 next_prompt.stuck_prompt_based_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:331 next_prompt.stuck_prompt_based_guidance
                 prompt += self.prompts.get("next_prompt.stuck_prompt_based_guidance").rstrip()
                 prompt += "\n\n"
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:339 next_prompt.continuation
+        # Prompt: src/sag/config/prompts/react_engine.yaml:340 next_prompt.continuation
         prompt += self.prompts.get("next_prompt.continuation").rstrip() + "\n\n"
 
         # Apply memory protection to prevent critical info loss due to context pollution
@@ -239,21 +241,23 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         workflow_mode: str = "setup",
     ) -> str:
         """Build specialized prompt for a model mode."""
-        is_ad_hoc = workflow_mode == "ad_hoc"
+        is_run_task = workflow_mode == "run_task"
         if mode == ReactModelMode.THINKING:
-            if is_ad_hoc:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:385 mode_prompts.ad_hoc_thinking
+            if is_run_task:
+                # Prompt: src/sag/config/prompts/react_engine.yaml:386 mode_prompts.run_task_thinking
                 return (
-                    self.prompts.get("mode_prompts.ad_hoc_thinking").rstrip() + "\n" + base_prompt
+                    self.prompts.get("mode_prompts.run_task_thinking").rstrip() + "\n" + base_prompt
                 )
-            # Prompt: src/sag/config/prompts/react_engine.yaml:342 mode_prompts.thinking
+            # Prompt: src/sag/config/prompts/react_engine.yaml:343 mode_prompts.thinking
             return self.prompts.get("mode_prompts.thinking").rstrip() + "\n" + base_prompt
 
         if mode == ReactModelMode.ACTION:
-            if is_ad_hoc:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:444 mode_prompts.ad_hoc_action
-                return self.prompts.get("mode_prompts.ad_hoc_action").rstrip() + "\n" + base_prompt
-            # Prompt: src/sag/config/prompts/react_engine.yaml:400 mode_prompts.action
+            if is_run_task:
+                # Prompt: src/sag/config/prompts/react_engine.yaml:445 mode_prompts.run_task_action
+                return (
+                    self.prompts.get("mode_prompts.run_task_action").rstrip() + "\n" + base_prompt
+                )
+            # Prompt: src/sag/config/prompts/react_engine.yaml:401 mode_prompts.action
             return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
 
         raise ValueError(f"Unsupported React model mode: {mode}")
@@ -325,7 +329,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if successful_tools:
             critical_info.append(f"✅ Working Tools: {', '.join(successful_tools)}")
 
-        if workflow_mode != "ad_hoc":
+        if workflow_mode != "run_task":
             # CRITICAL: Preserve task plan to prevent context pollution from causing hallucinated task IDs
             try:
                 # Use cached trunk context to avoid frequent file I/O

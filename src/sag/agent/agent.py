@@ -571,7 +571,7 @@ class SetupAgent:
             success = self.react_engine.run_react_loop(
                 initial_prompt=task_prompt,
                 max_iterations=self.max_iterations,
-                completion_mode="ad_hoc",
+                completion_mode="run_task",
             )
 
             # Step 6: Update last comment in container and handle completion
@@ -648,7 +648,7 @@ class SetupAgent:
     def _build_run_task_prompt(self, project_name: str, task_description: str) -> str:
         """Build the prompt for a one-off CLI task on an existing project."""
         return f"""
-I need to work on the project '{project_name}' and complete this ad-hoc CLI task:
+I need to work on the project '{project_name}' and complete this sag run --task request:
 
 TASK: {task_description}
 

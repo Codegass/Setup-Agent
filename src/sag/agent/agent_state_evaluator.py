@@ -134,12 +134,12 @@ class AgentStateEvaluator:
         if repetition_analysis.needs_guidance:
             return repetition_analysis
 
-        if self.completion_mode == "ad_hoc":
-            if self._is_ad_hoc_task_complete(steps):
+        if self.completion_mode == "run_task":
+            if self._is_run_task_complete(steps):
                 return AgentStateAnalysis(
                     status=AgentStatus.PROCEEDING,
                     is_task_complete=True,
-                    detected_signals=["ad_hoc_task_complete"],
+                    detected_signals=["run_task_complete"],
                 )
 
             idle_analysis = self._check_idle_thinking(steps)
@@ -592,14 +592,14 @@ class AgentStateEvaluator:
 
         return False
 
-    def _is_ad_hoc_task_complete(self, steps: List[Any]) -> bool:
-        """Check completion for one-off CLI tasks that are not part of setup TODO."""
+    def _is_run_task_complete(self, steps: List[Any]) -> bool:
+        """Check completion for sag run --task requests that are not setup TODO work."""
         completion_step_index = None
         for index in range(len(steps) - 1, -1, -1):
             step = steps[index]
             if getattr(step, "step_type", None) != StepType.THOUGHT:
                 continue
-            if self._is_ad_hoc_completion_marker(getattr(step, "content", "")):
+            if self._is_run_task_completion_marker(getattr(step, "content", "")):
                 completion_step_index = index
                 break
 
@@ -613,12 +613,12 @@ class AgentStateEvaluator:
                 continue
             result = getattr(step, "tool_result", None)
             if result and result.success:
-                logger.info("Ad-hoc task completion detected after successful tool action")
+                logger.info("Run task completion detected after successful tool action")
                 return True
 
         return False
 
-    def _is_ad_hoc_completion_marker(self, content: str) -> bool:
+    def _is_run_task_completion_marker(self, content: str) -> bool:
         normalized = " ".join(str(content or "").strip().lower().split())
         if not normalized:
             return False

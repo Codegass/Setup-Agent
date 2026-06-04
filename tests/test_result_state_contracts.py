@@ -91,7 +91,7 @@ class FakeRunTaskContextManager:
 
 class FakeTrunkContext:
     def add_task(self, description):
-        raise AssertionError("run_task must not append ad-hoc CLI tasks to setup TODO")
+        raise AssertionError("run_task must not append sag run --task requests to setup TODO")
 
 
 class FakeReActEngine:
@@ -103,7 +103,7 @@ class FakeReActEngine:
         return True
 
 
-def test_run_task_uses_ad_hoc_completion_without_appending_setup_todo(monkeypatch):
+def test_run_task_uses_run_task_completion_without_appending_setup_todo(monkeypatch):
     monkeypatch.setattr(
         agent_module,
         "create_command_logger",
@@ -135,13 +135,13 @@ def test_run_task_uses_ad_hoc_completion_without_appending_setup_todo(monkeypatc
     assert agent.orchestrator.last_comments == [
         "Task completed: Smoke test only: inspect /workspace/commons-cli and run mvn -version."
     ]
-    assert agent.react_engine.calls[0]["completion_mode"] == "ad_hoc"
+    assert agent.react_engine.calls[0]["completion_mode"] == "run_task"
     assert "TASK COMPLETE:" in agent.react_engine.calls[0]["initial_prompt"]
     assert "existing setup TODO" in agent.react_engine.calls[0]["initial_prompt"]
 
 
-def test_agent_state_evaluator_ad_hoc_completion_ignores_setup_todo_workflow():
-    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="ad_hoc")
+def test_agent_state_evaluator_run_task_completion_ignores_setup_todo_workflow():
+    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="run_task")
     steps = [
         SimpleNamespace(
             step_type=StepType.ACTION,
@@ -165,8 +165,8 @@ def test_agent_state_evaluator_ad_hoc_completion_ignores_setup_todo_workflow():
     assert analysis.needs_guidance is False
 
 
-def test_agent_state_evaluator_ad_hoc_completion_accepts_verified_no_more_action():
-    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="ad_hoc")
+def test_agent_state_evaluator_run_task_completion_accepts_verified_no_more_action():
+    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="run_task")
     steps = [
         SimpleNamespace(
             step_type=StepType.ACTION,
@@ -193,8 +193,8 @@ def test_agent_state_evaluator_ad_hoc_completion_accepts_verified_no_more_action
     assert analysis.needs_guidance is False
 
 
-def test_agent_state_evaluator_ad_hoc_completion_accepts_bare_task_complete():
-    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="ad_hoc")
+def test_agent_state_evaluator_run_task_completion_accepts_bare_task_complete():
+    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="run_task")
     steps = [
         SimpleNamespace(
             step_type=StepType.ACTION,
@@ -214,8 +214,8 @@ def test_agent_state_evaluator_ad_hoc_completion_accepts_bare_task_complete():
     assert analysis.is_task_complete is True
 
 
-def test_agent_state_evaluator_ad_hoc_completion_rejects_negated_task_complete():
-    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="ad_hoc")
+def test_agent_state_evaluator_run_task_completion_rejects_negated_task_complete():
+    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="run_task")
     steps = [
         SimpleNamespace(
             step_type=StepType.ACTION,
@@ -238,8 +238,8 @@ def test_agent_state_evaluator_ad_hoc_completion_rejects_negated_task_complete()
     assert analysis.is_task_complete is False
 
 
-def test_agent_state_evaluator_ad_hoc_completion_rejects_negated_verification():
-    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="ad_hoc")
+def test_agent_state_evaluator_run_task_completion_rejects_negated_verification():
+    evaluator = AgentStateEvaluator(FakeContextManager(), completion_mode="run_task")
     steps = [
         SimpleNamespace(
             step_type=StepType.ACTION,

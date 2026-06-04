@@ -124,16 +124,16 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "REMEMBER THE CONTINUOUS CYCLE" in prompt
 
 
-def test_initial_system_prompt_uses_ad_hoc_contract_without_setup_workflow():
+def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():
     engine = make_engine(repository_url="https://example.test/repo.git")
 
     prompt = engine.prompt_builder.build_initial_system_prompt(
         repository_url=engine.repository_url,
         tool_calling_enabled=True,
-        workflow_mode="ad_hoc",
+        workflow_mode="run_task",
     )
 
-    assert "AD-HOC TASK MODE" in prompt
+    assert "RUN TASK MODE" in prompt
     assert "TASK COMPLETE:" in prompt
     assert "INTELLIGENT SETUP WORKFLOW" not in prompt
     assert "MANDATORY WORKFLOW FOR PROJECT SETUP" not in prompt
@@ -175,7 +175,7 @@ def test_next_prompt_preserves_history_and_stuck_guidance():
     assert "Continue with your next THOUGHT and ACTION" in prompt
 
 
-def test_next_prompt_omits_setup_task_plan_in_ad_hoc_mode():
+def test_next_prompt_omits_setup_task_plan_in_run_task_mode():
     prompt_builder = make_prompt_builder_with_todo()
 
     prompt = prompt_builder.build_next_prompt(
@@ -183,7 +183,7 @@ def test_next_prompt_omits_setup_task_plan_in_ad_hoc_mode():
         repository_url=None,
         tool_calling_enabled=True,
         successful_states={"working_directory": "/workspace/project"},
-        workflow_mode="ad_hoc",
+        workflow_mode="run_task",
     )
 
     assert "Working Directory: /workspace/project" in prompt
@@ -191,7 +191,7 @@ def test_next_prompt_omits_setup_task_plan_in_ad_hoc_mode():
     assert 'manage_context(action="start_task"' not in prompt
 
 
-def test_next_prompt_uses_ad_hoc_stuck_guidance_without_setup_sequence():
+def test_next_prompt_uses_run_task_stuck_guidance_without_setup_sequence():
     engine = make_engine(repository_url="https://example.test/repo.git")
     engine.steps = [
         ReActStep(step_type=StepType.THOUGHT, content="thought 1", timestamp="t1"),
@@ -204,10 +204,10 @@ def test_next_prompt_uses_ad_hoc_stuck_guidance_without_setup_sequence():
         repository_url=engine.repository_url,
         tool_calling_enabled=True,
         successful_states=engine.successful_states,
-        workflow_mode="ad_hoc",
+        workflow_mode="run_task",
     )
 
-    assert "AD-HOC TASK STILL NEEDS ACTION" in prompt
+    assert "RUN TASK STILL NEEDS ACTION" in prompt
     assert "The repository URL is already set" not in prompt
     assert "task_1" not in prompt
     assert "start_task" not in prompt
@@ -229,17 +229,17 @@ def test_mode_prompts_preserve_markers_and_base_prompt():
     assert action_prompt.endswith("base prompt")
 
 
-def test_mode_prompts_use_ad_hoc_variants():
+def test_mode_prompts_use_run_task_variants():
     engine = make_engine()
 
     thinking_prompt = engine.prompt_builder.build_mode_prompt(
-        "base prompt", ReactModelMode.THINKING, workflow_mode="ad_hoc"
+        "base prompt", ReactModelMode.THINKING, workflow_mode="run_task"
     )
     action_prompt = engine.prompt_builder.build_mode_prompt(
-        "base prompt", ReactModelMode.ACTION, workflow_mode="ad_hoc"
+        "base prompt", ReactModelMode.ACTION, workflow_mode="run_task"
     )
 
-    assert "AD-HOC THINKING MODE" in thinking_prompt
+    assert "RUN TASK THINKING MODE" in thinking_prompt
     assert "output only TASK COMPLETE and never include ACTION" in thinking_prompt
-    assert "AD-HOC ACTION MODE" in action_prompt
+    assert "RUN TASK ACTION MODE" in action_prompt
     assert "Do not start or complete setup TODO tasks" in action_prompt
