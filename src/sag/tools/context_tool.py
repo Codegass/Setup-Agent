@@ -1,5 +1,6 @@
 """Context management tool for the agent."""
 
+import re
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -1147,6 +1148,48 @@ IMPORTANT:
                 "recommendations": ["Try restarting context management or recreating context"],
             }
 
+    def _is_build_or_test_task_description(self, task_description: str) -> bool:
+        build_terms = ["compile", "build", "package", "install"]
+        test_terms = ["test", "tests", "verify"]
+        tool_terms = ["maven", "gradle", "npm", "yarn", "pnpm", "pytest"]
+        return (
+            any(term in task_description for term in build_terms + test_terms)
+            and any(term in task_description for term in tool_terms)
+        )
+
+    def _has_unresolved_failure_signal(self, text: str) -> bool:
+        resolved_phrases = [
+            "no errors",
+            "no error",
+            "no failures",
+            "no failure",
+            "0 failed",
+            "0 failures",
+            "0 errors",
+            "failures: 0",
+            "errors: 0",
+            "error resolved",
+            "errors resolved",
+            "fixed the error",
+            "error was fixed",
+            "failure resolved",
+        ]
+        normalized = " ".join(text.lower().split())
+        for phrase in resolved_phrases:
+            normalized = normalized.replace(phrase, "")
+
+        failure_signals = [
+            "blocked",
+            "failed",
+            "failure",
+            "no artifacts",
+            "not in the allowed range",
+            "cannot compile",
+        ]
+        if any(signal in normalized for signal in failure_signals):
+            return True
+        return re.search(r"(^|\W)errors?(:|\W|$)", normalized) is not None
+
     def _validate_task_completion(
         self, task: Any, summary: str, key_results: str
     ) -> Dict[str, Any]:
@@ -1163,6 +1206,23 @@ IMPORTANT:
             logger.info(f"🔍 Validating completion of {task_id}: {task.description}")
 
             validation_result = {"valid": True, "reason": "", "suggestions": []}
+
+            combined_results = f"{summary_lower}\n{key_results_lower}"
+            if self._is_build_or_test_task_description(
+                task_description
+            ) and self._has_unresolved_failure_signal(combined_results):
+                validation_result.update(
+                    {
+                        "valid": False,
+                        "reason": "Build/test task indicates unresolved failure and cannot be marked completed",
+                        "suggestions": [
+                            "Resolve the build/test blocker before completing this task",
+                            "Only complete build/test tasks after successful execution evidence is available",
+                            "Use force=True only when intentionally recording a manually verified exception",
+                        ],
+                    }
+                )
+                return validation_result
 
             # Task-specific validation rules
             if "project_analyzer" in task_description or "analyze project" in task_description:
