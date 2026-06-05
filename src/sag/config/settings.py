@@ -51,7 +51,7 @@ class Config(BaseModel):
     log_retention: str = Field(default="30 days")  # Log file retention period
 
     # Docker configuration
-    docker_base_image: str = Field(default="ubuntu:22.04")
+    docker_base_image: str = Field(default="ubuntu:24.04")
     workspace_path: str = Field(default="/workspace")
 
     # Agent configuration
@@ -99,7 +99,7 @@ class Config(BaseModel):
             ui_mode=os.getenv("SAG_UI_MODE", "false").lower() in ("true", "1", "yes"),
             log_rotation=os.getenv("SAG_LOG_ROTATION", "50 MB"),
             log_retention=os.getenv("SAG_LOG_RETENTION", "30 days"),
-            docker_base_image=os.getenv("SAG_DOCKER_BASE_IMAGE", "ubuntu:22.04"),
+            docker_base_image=os.getenv("SAG_DOCKER_BASE_IMAGE", "ubuntu:24.04"),
             workspace_path=os.getenv("SAG_WORKSPACE_PATH", "/workspace"),
             max_iterations=int(os.getenv("SAG_MAX_ITERATIONS", "50")),
             context_switch_threshold=int(os.getenv("SAG_CONTEXT_SWITCH_THRESHOLD", "20")),
