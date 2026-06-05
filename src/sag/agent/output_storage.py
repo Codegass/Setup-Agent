@@ -118,21 +118,33 @@ class OutputStorageManager:
         """Save the current index to disk."""
         try:
             if self.orchestrator:
-                # Save to container using container path
-                index_json = (
-                    json.dumps(self.current_index, indent=2).replace('"', '\\"').replace("$", "\\$")
-                )
-                save_cmd = f'echo "{index_json}" > {self.container_index_file}'
-                save_result = self.orchestrator.execute_command(save_cmd)
-
-                if save_result.get("exit_code") != 0:
-                    logger.error(f"Failed to save index to container: {save_result.get('output')}")
+                index_json = json.dumps(self.current_index, indent=2)
+                if not self._write_container_text(self.container_index_file, index_json):
+                    logger.error("Failed to save index to container")
             else:
                 # Local filesystem fallback
                 with open(self.index_file, "w") as f:
                     json.dump(self.current_index, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to save output index: {e}")
+
+    def _heredoc_delimiter(self, content: str) -> str:
+        digest = hashlib.md5(content.encode()).hexdigest()[:12]
+        delimiter = f"SAG_OUTPUT_EOF_{digest}"
+        while f"\n{delimiter}\n" in f"\n{content}\n":
+            digest = hashlib.md5(f"{content}{delimiter}".encode()).hexdigest()[:12]
+            delimiter = f"SAG_OUTPUT_EOF_{digest}"
+        return delimiter
+
+    def _write_container_text(self, path: str, content: str, *, append: bool = False) -> bool:
+        delimiter = self._heredoc_delimiter(content)
+        operator = ">>" if append else ">"
+        command = f"cat {operator} {path} <<'{delimiter}'\n{content}\n{delimiter}"
+        result = self.orchestrator.execute_command(command)
+        if result.get("exit_code") == 0 or result.get("success"):
+            return True
+        logger.error(f"Failed to write container file {path}: {result.get('output')}")
+        return False
 
     def store_output(
         self,
@@ -177,17 +189,12 @@ class OutputStorageManager:
         try:
             # Store in container if orchestrator is available
             if self.orchestrator:
-                # Write to container using echo command with container path
-                json_line = json.dumps(record).replace('"', '\\"').replace("$", "\\$")
-                write_cmd = f'echo "{json_line}" >> {self.container_storage_file}'
-                write_result = self.orchestrator.execute_command(write_cmd)
-
-                if write_result.get("exit_code") == 0:
+                json_line = json.dumps(record)
+                if self._write_container_text(self.container_storage_file, json_line, append=True):
                     logger.debug(
                         f"Stored output in container: ref_id={ref_id}, task={task_id}, tool={tool_name}, length={len(output)}"
                     )
                 else:
-                    logger.error(f"Failed to write to container file: {write_result.get('output')}")
                     return ""
             else:
                 # Fallback to local filesystem (for testing)
