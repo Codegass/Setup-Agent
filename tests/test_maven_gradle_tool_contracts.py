@@ -42,8 +42,15 @@ class FakeBuildToolOrchestrator:
 
 
 class FakeToolchainManager:
-    def __init__(self, path="/tmp/apache-maven-3.9.6/bin/mvn"):
+    def __init__(
+        self,
+        path="/tmp/apache-maven-3.9.6/bin/mvn",
+        version="3.9.6",
+        source="registered",
+    ):
         self.path = path
+        self.version = version
+        self.source = source
         self.seen_spec = None
         self.seen_working_directory = None
 
@@ -55,8 +62,8 @@ class FakeToolchainManager:
                 name=spec.name,
                 executable=spec.executable,
                 path=self.path,
-                version="3.9.6",
-                source="registered",
+                version=self.version,
+                source=self.source,
             ),
             reason="test resolver",
         )
@@ -238,6 +245,37 @@ def test_maven_tool_failed_result_metadata_includes_detected_maven_requirement()
         "raw": "[3.9,)",
         "source": "build_error",
         "kind": "range",
+    }
+
+
+def test_maven_failed_result_metadata_includes_runtime_facts_for_version_error():
+    orchestrator = FakeBuildToolOrchestrator(
+        {
+            "output": (
+                "[ERROR] BUILD FAILURE\n"
+                "Detected Maven Version: 3.6.3 is not in the allowed range [3.9,)."
+            ),
+            "exit_code": 1,
+        }
+    )
+    tool = MavenTool(
+        orchestrator,
+        toolchain_manager=FakeToolchainManager(
+            path="/usr/bin/mvn",
+            version="3.6.3",
+            source="system",
+        ),
+    )
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(command="compile", working_directory="/workspace/project")
+
+    assert result.success is False
+    assert result.metadata["maven_version_requirement"]["raw"] == "[3.9,)"
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/usr/bin/mvn",
+        "version": "3.6.3",
+        "source": "system",
     }
 
 

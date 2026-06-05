@@ -100,6 +100,37 @@ class ToolLifecycleEvent:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+def _format_maven_version_contract(result: ToolResult) -> str:
+    metadata = result.metadata or {}
+    requirement = metadata.get("maven_version_requirement")
+    if not requirement:
+        return ""
+
+    lines = [
+        "",
+        "Maven version contract:",
+        f"Maven version requirement: {requirement.get('raw')} (source: {requirement.get('source', 'unknown')})",
+    ]
+
+    runtime = metadata.get("maven_runtime") or {}
+    if runtime.get("executable"):
+        lines.append(f"Current Maven executable: {runtime['executable']}")
+    if runtime.get("version"):
+        lines.append(f"Current Maven version: {runtime['version']}")
+
+    if metadata.get("compatible_maven_candidate") is None:
+        lines.append("Compatible Maven candidate: none")
+
+    raw_requirement = requirement.get("raw")
+    if raw_requirement:
+        lines.append(
+            "Next action: provide or register a Maven executable that satisfies "
+            f'{raw_requirement}, then retry maven(..., maven_version_requirement="{raw_requirement}")'
+        )
+
+    return "\n".join(lines)
+
+
 def format_tool_result(tool_name: str, result: ToolResult) -> str:
     """Format tool result for observation. Output truncation is now handled in BaseTool."""
     if result.success:
@@ -138,6 +169,9 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         # Show extracted error details from output (especially important for maven tool)
         if result.output and result.output.strip():
             formatted += f"\n\n{result.output}"
+
+        if tool_name == "maven":
+            formatted += _format_maven_version_contract(result)
 
         if result.suggestions:
             formatted += f"\n\nSuggestions:\n" + "\n".join(f"• {s}" for s in result.suggestions[:3])

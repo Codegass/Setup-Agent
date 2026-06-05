@@ -1,4 +1,4 @@
-from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
+from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator, format_tool_result
 from sag.tools.base import BaseTool, ToolError, ToolResult
 
 
@@ -17,6 +17,36 @@ class ManageContextTool(BaseTool):
 
     def execute(self, action: str, summary: str = "") -> ToolResult:
         return ToolResult(success=self.success, output=f"{action} result")
+
+
+def test_format_tool_result_surfaces_maven_version_contract():
+    result = ToolResult(
+        success=False,
+        output="[ERROR] Detected Maven Version: 3.6.3 is not in the allowed range [3.9,).",
+        error="Maven build failed",
+        error_code="MAVEN_BUILD_FAILED",
+        metadata={
+            "maven_version_requirement": {
+                "raw": "[3.9,)",
+                "source": "build_error",
+                "kind": "range",
+            },
+            "maven_runtime": {
+                "executable": "/usr/bin/mvn",
+                "version": "3.6.3",
+                "source": "system",
+            },
+            "compatible_maven_candidate": None,
+        },
+    )
+
+    formatted = format_tool_result("maven", result)
+
+    assert "Maven version requirement: [3.9,) (source: build_error)" in formatted
+    assert "Current Maven executable: /usr/bin/mvn" in formatted
+    assert "Current Maven version: 3.6.3" in formatted
+    assert "Compatible Maven candidate: none" in formatted
+    assert 'retry maven(..., maven_version_requirement="[3.9,)")' in formatted
 
 
 def test_orchestrator_executes_successful_tool_and_emits_events():

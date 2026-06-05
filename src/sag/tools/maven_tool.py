@@ -186,6 +186,7 @@ class MavenTool(BaseTool):
             if resolved_maven
             else ("./mvnw" if use_wrapper else "mvn")
         )
+        maven_runtime = self._maven_runtime_metadata(resolved_maven, maven_executable)
 
         version_command = self._normalize_maven_version_command(command)
         if version_command:
@@ -408,7 +409,11 @@ class MavenTool(BaseTool):
                                 "missing_artifacts", []
                             )
                             return self._handle_maven_error(
-                                result["output"], result["exit_code"], maven_cmd, analysis
+                                result["output"],
+                                result["exit_code"],
+                                maven_cmd,
+                                analysis,
+                                maven_runtime,
                             )
                     except Exception as e:
                         logger.warning(f"Could not validate build artifacts: {e}")
@@ -432,7 +437,11 @@ class MavenTool(BaseTool):
                     )
                 # Build failed - use error handler even if exit code was 0
                 return self._handle_maven_error(
-                    result["output"], result["exit_code"], maven_cmd, analysis
+                    result["output"],
+                    result["exit_code"],
+                    maven_cmd,
+                    analysis,
+                    maven_runtime,
                 )
 
         except Exception as e:
@@ -544,6 +553,20 @@ class MavenTool(BaseTool):
             ),
             working_directory=working_directory,
         )
+
+    def _maven_runtime_metadata(self, resolved_maven, maven_executable: str) -> Dict[str, Any]:
+        if resolved_maven:
+            candidate = resolved_maven.candidate
+            return {
+                "executable": candidate.path,
+                "version": candidate.version,
+                "source": candidate.source,
+            }
+        return {
+            "executable": maven_executable,
+            "version": None,
+            "source": "wrapper" if maven_executable == "./mvnw" else "path",
+        }
 
     def _normalize_maven_version_command(self, command: Any) -> Optional[str]:
         if isinstance(command, list):
@@ -1264,7 +1287,12 @@ class MavenTool(BaseTool):
         return output
 
     def _handle_maven_error(
-        self, output: str, exit_code: int, command: str, analysis: Dict[str, Any]
+        self,
+        output: str,
+        exit_code: int,
+        command: str,
+        analysis: Dict[str, Any],
+        maven_runtime: Dict[str, Any] | None = None,
     ) -> ToolResult:
         """Enhanced error handling with specific suggestions based on error type."""
         """Handle Maven build errors with detailed analysis."""
@@ -1569,8 +1597,11 @@ class MavenTool(BaseTool):
             "recovery_actions": self._generate_recovery_actions(error_code, analysis),
             "diagnostic_commands": self._get_diagnostic_commands(error_code),
         }
+        if maven_runtime:
+            metadata["maven_runtime"] = maven_runtime
         if analysis.get("maven_version_requirement"):
             metadata["maven_version_requirement"] = analysis["maven_version_requirement"]
+            metadata["compatible_maven_candidate"] = None
 
         return ToolResult(
             success=False,
