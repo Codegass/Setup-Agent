@@ -414,6 +414,9 @@ def project(ctx, repo_url, name, goal, record, ui):
                 console.print(f"[dim]Check logs for details. You can retry with:[/dim]")
                 console.print(f'  sag run {docker_name} --task "continue setup"')
 
+        if not success:
+            sys.exit(1)
+
     except Exception as e:
         logger.error(f"Project setup failed: {e}")
         # Always show critical errors, even in UI mode
