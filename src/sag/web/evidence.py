@@ -18,9 +18,14 @@ _STATUS_SEVERITY = {
     "failure": 3,
 }
 _STATUS_ALIASES = {
+    "complete": "success",
+    "completed": "success",
     "fail": "failure",
     "failed": "failure",
     "error": "failure",
+    "ok": "success",
+    "pass": "success",
+    "passed": "success",
 }
 
 
@@ -87,7 +92,7 @@ def _source(record: UIEvidenceRecord, metadata: dict[str, Any]) -> str:
 
 
 def _status(metadata: dict[str, Any]) -> str:
-    return _text(metadata.get("status"), fallback="info").lower()
+    return _status_for_severity(_text(metadata.get("status"), fallback="info").lower())
 
 
 def _merge_status(left: str, right: str) -> str:

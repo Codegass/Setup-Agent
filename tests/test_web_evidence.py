@@ -75,6 +75,23 @@ def test_evidence_index_preserves_source_order_and_merges_status_severity():
     assert groups[0].records[1].detail == "gradle test failed"
 
 
+def test_evidence_index_normalizes_completed_command_status_to_success():
+    records = [
+        UIEvidenceRecord(
+            timestamp=datetime(2026, 6, 6, 2, 13, tzinfo=timezone.utc),
+            kind="command",
+            summary="maven test completed",
+            metadata={"tool_name": "maven", "status": "completed"},
+        ),
+    ]
+
+    groups = EvidenceIndex().from_ui_records(records)
+
+    assert groups[0].source == "Build tool · Maven"
+    assert groups[0].status == "success"
+    assert groups[0].records[0].status == "success"
+
+
 def test_evidence_index_handles_empty_or_unexpected_metadata():
     records = [
         UIEvidenceRecord(
