@@ -190,7 +190,7 @@ export function Dashboard({
       </div>
 
       <p className="mt-3 px-1 font-mono text-[10px] text-slate-400">
-        GET /api/workspaces · streaming via /api/stream/dashboard
+        GET /api/workspaces · manual refresh
       </p>
     </div>
   )
@@ -234,6 +234,10 @@ function WorkspaceRow({
 }) {
   const openWorkspace = () => onOpenWorkspace(workspace.id)
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) {
+      return
+    }
+
     if (event.key === "Enter" || event.key === " ") {
       event.preventDefault()
       openWorkspace()
@@ -280,6 +284,10 @@ function WorkspaceCard({
       className="cursor-pointer p-4 hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30"
       onClick={() => onOpenWorkspace(workspace.id)}
       onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) {
+          return
+        }
+
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault()
           onOpenWorkspace(workspace.id)
@@ -492,6 +500,7 @@ function RowActions({
             event.stopPropagation()
             onOpenSession(workspace.id, workspace.latestSession as string, "report")
           }}
+          onKeyDown={(event) => event.stopPropagation()}
           type="button"
         >
           <FileText size={15} />
@@ -504,6 +513,7 @@ function RowActions({
           event.stopPropagation()
           onOpenWorkspace(workspace.id)
         }}
+        onKeyDown={(event) => event.stopPropagation()}
         type="button"
       >
         <ArrowRight size={15} />

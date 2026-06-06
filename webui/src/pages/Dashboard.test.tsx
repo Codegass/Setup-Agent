@@ -82,4 +82,49 @@ describe("Dashboard", () => {
     expect(onOpenSession).toHaveBeenCalledWith("sag-commons-cli", "CC-3", "report")
     expect(onOpenWorkspace).not.toHaveBeenCalled()
   })
+
+  it("keeps report action keyboard events from opening the workspace row", () => {
+    const onOpenWorkspace = vi.fn()
+    const onOpenSession = vi.fn()
+
+    render(
+      <Dashboard
+        data={dashboard}
+        onOpenWorkspace={onOpenWorkspace}
+        onOpenSession={onOpenSession}
+      />,
+    )
+
+    const reportButton = screen.getAllByRole("button", {
+      name: /open latest report for apache\/commons-cli/i,
+    })[0]
+
+    fireEvent.keyDown(reportButton, { key: "Enter" })
+    fireEvent.click(reportButton)
+
+    expect(onOpenSession).toHaveBeenCalledWith("sag-commons-cli", "CC-3", "report")
+    expect(onOpenWorkspace).not.toHaveBeenCalled()
+  })
+
+  it("keeps details action keyboard events from also opening the parent row", () => {
+    const onOpenWorkspace = vi.fn()
+
+    render(
+      <Dashboard
+        data={dashboard}
+        onOpenWorkspace={onOpenWorkspace}
+        onOpenSession={() => {}}
+      />,
+    )
+
+    const detailsButton = screen.getAllByRole("button", {
+      name: /open workspace details for apache\/commons-cli/i,
+    })[0]
+
+    fireEvent.keyDown(detailsButton, { key: " " })
+    fireEvent.click(detailsButton)
+
+    expect(onOpenWorkspace).toHaveBeenCalledTimes(1)
+    expect(onOpenWorkspace).toHaveBeenCalledWith("sag-commons-cli")
+  })
 })

@@ -94,7 +94,7 @@ export function App() {
         </main>
       ) : null}
 
-      {!loading && error ? (
+      {!dashboard && !loading && error ? (
         <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
           <Card className="max-w-xl p-5">
             <div className="text-[15px] font-semibold text-slate-900">Dashboard unavailable</div>
@@ -106,7 +106,21 @@ export function App() {
         </main>
       ) : null}
 
-      {!error && dashboard && route.view === "dashboard" ? (
+      {dashboard && error ? (
+        <div className="mx-auto max-w-[1180px] px-4 pt-5 sm:px-6 lg:px-8">
+          <Card className="flex flex-col gap-3 border-red-100 bg-red-50/50 px-4 py-3 text-[13px] sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <div className="font-semibold text-red-700">Refresh failed</div>
+              <div className="mt-0.5 font-mono text-[12px] text-red-600">{error}</div>
+            </div>
+            <Button onClick={loadDashboard} type="button" variant="outline">
+              Retry
+            </Button>
+          </Card>
+        </div>
+      ) : null}
+
+      {dashboard && route.view === "dashboard" ? (
         <Dashboard
           data={dashboard}
           onOpenSession={openSession}
@@ -116,7 +130,7 @@ export function App() {
         />
       ) : null}
 
-      {!error && dashboard && route.view === "workspace" ? (
+      {dashboard && route.view === "workspace" ? (
         <PlaceholderView
           label="workspace"
           title={route.workspaceId}
@@ -124,7 +138,7 @@ export function App() {
         />
       ) : null}
 
-      {!error && dashboard && route.view === "session" ? (
+      {dashboard && route.view === "session" ? (
         <PlaceholderView
           label={route.tab ?? "session"}
           title={route.sessionId}

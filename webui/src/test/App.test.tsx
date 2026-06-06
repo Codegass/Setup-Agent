@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { App } from "../App"
@@ -53,5 +53,22 @@ describe("App", () => {
 
     expect(await screen.findByText("Dashboard unavailable")).toBeInTheDocument()
     expect(screen.getByText("Error: network down")).toBeInTheDocument()
+  })
+
+  it("keeps stale dashboard data visible when refresh fails", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(jsonResponse(dashboard))
+      .mockRejectedValueOnce(new Error("refresh down"))
+
+    render(<App />)
+
+    expect(await screen.findAllByText("apache/commons-cli")).not.toHaveLength(0)
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh dashboard" }))
+
+    expect(await screen.findByText("Refresh failed")).toBeInTheDocument()
+    expect(screen.getByText("Error: refresh down")).toBeInTheDocument()
+    expect(screen.getAllByText("apache/commons-cli")).not.toHaveLength(0)
+    expect(screen.queryByText("Dashboard unavailable")).not.toBeInTheDocument()
   })
 })
