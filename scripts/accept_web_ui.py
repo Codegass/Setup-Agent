@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Code-based acceptance gate for the SAG Workbench implementation."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+BACKEND_FILES = [
+    "src/sag/web/__init__.py",
+    "src/sag/web/paths.py",
+    "src/sag/web/models.py",
+    "src/sag/web/status.py",
+    "src/sag/web/workspace_registry.py",
+    "src/sag/web/session_registry.py",
+    "src/sag/web/read_model.py",
+    "src/sag/web/evidence.py",
+    "src/sag/web/context_map.py",
+    "src/sag/web/file_tracker.py",
+    "src/sag/web/task_runner.py",
+    "src/sag/web/terminal.py",
+    "src/sag/web/app.py",
+    "src/sag/web/server.py",
+]
+
+
+FRONTEND_FILES = [
+    "webui/package.json",
+    "webui/vite.config.ts",
+    "webui/src/App.tsx",
+    "webui/src/pages/Dashboard.tsx",
+    "webui/src/pages/Workspace.tsx",
+    "webui/src/pages/SessionDetail.tsx",
+    "webui/src/components/session/EvidenceTimeline.tsx",
+    "webui/src/components/session/ContextMap.tsx",
+    "webui/src/components/session/FilesDigest.tsx",
+    "webui/src/components/terminal/TerminalPanel.tsx",
+]
+
+
+PRODUCT_BOUNDARY_PATTERNS = {
+    "workspace task route": ("src/sag/web/app.py", "/api/workspaces/{workspace_id}/tasks"),
+    "terminal websocket route": ("src/sag/web/app.py", "/api/workspaces/{workspace_id}/terminal"),
+    "xterm import": ("webui/src/components/terminal/TerminalPanel.tsx", "@xterm/xterm"),
+    "session detail tabs": ("webui/src/pages/SessionDetail.tsx", "Evidence"),
+    "context map trunk": ("webui/src/components/session/ContextMap.tsx", "Trunk"),
+    "file digest snapshot": ("webui/src/components/session/FilesDigest.tsx", "snapshot"),
+}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--phase",
+        choices=["skeleton", "backend", "frontend", "final"],
+        required=True,
+    )
+    parser.add_argument(
+        "--skip-commands",
+        action="store_true",
+        help="Only run structural checks; used by unit tests for this script.",
+    )
+    args = parser.parse_args()
+
+    failures: list[str] = []
+    print(f"accept_web_ui phase={args.phase}")
+
+    if args.phase in {"backend", "frontend", "final"}:
+        require_files(BACKEND_FILES, failures)
+    if args.phase in {"frontend", "final"}:
+        require_files(FRONTEND_FILES, failures)
+    if args.phase == "final":
+        require_files(["src/sag/web/static/index.html"], failures)
+        require_patterns(PRODUCT_BOUNDARY_PATTERNS, failures)
+
+    if not args.skip_commands:
+        if args.phase in {"backend", "final"}:
+            run(["uv", "run", "pytest", "tests/test_web_*.py", "-v"], failures)
+        if args.phase in {"frontend", "final"} and (ROOT / "webui/package.json").exists():
+            run(["npm", "test"], failures, cwd=ROOT / "webui")
+            run(["npm", "run", "build"], failures, cwd=ROOT / "webui")
+
+    if failures:
+        print("ACCEPTANCE FAIL")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
+
+    print("ACCEPTANCE PASS")
+    return 0
+
+
+def require_files(paths: list[str], failures: list[str]) -> None:
+    for path in paths:
+        if not (ROOT / path).exists():
+            failures.append(f"missing required file: {path}")
+
+
+def require_patterns(patterns: dict[str, tuple[str, str]], failures: list[str]) -> None:
+    for label, (path, pattern) in patterns.items():
+        target = ROOT / path
+        if not target.exists():
+            failures.append(f"missing file for pattern check {label}: {path}")
+            continue
+        text = target.read_text(encoding="utf-8")
+        if pattern not in text:
+            failures.append(f"missing product-boundary pattern {label}: {pattern}")
+
+
+def run(command: list[str], failures: list[str], cwd: Path | None = None) -> None:
+    print("+ " + " ".join(command))
+    result = subprocess.run(command, cwd=cwd or ROOT, text=True, check=False)
+    if result.returncode != 0:
+        failures.append(f"command failed ({result.returncode}): {' '.join(command)}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
