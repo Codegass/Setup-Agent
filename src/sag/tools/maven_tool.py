@@ -320,7 +320,13 @@ class MavenTool(BaseTool):
                 result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
 
             if result.get("termination_reason"):
-                return self._timeout_result_from_command(result, maven_cmd, command)
+                return self._timeout_result_from_command(
+                    result,
+                    maven_cmd,
+                    command,
+                    maven_runtime=maven_runtime,
+                    maven_version_requirement=requested_requirement_metadata,
+                )
 
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
@@ -689,7 +695,12 @@ class MavenTool(BaseTool):
         return cleaned.split("=", 1)[0]
 
     def _timeout_result_from_command(
-        self, result: Dict[str, Any], maven_cmd: str, command: str
+        self,
+        result: Dict[str, Any],
+        maven_cmd: str,
+        command: str,
+        maven_runtime: Optional[Dict[str, Any]] = None,
+        maven_version_requirement: Optional[Dict[str, str]] = None,
     ) -> ToolResult:
         reason = str(result.get("termination_reason") or "unknown")
         sanitized_reason = re.sub(r"[^A-Za-z0-9]+", "_", reason).strip("_").upper()
@@ -704,6 +715,19 @@ class MavenTool(BaseTool):
             "Run dependency resolution before the full build",
             "Retry with a narrower module or test selection",
         ]
+        metadata = {
+            "termination_reason": reason,
+            "execution_time": execution_time,
+            "command": maven_cmd,
+            "requested_command": command,
+            "exit_code": result.get("exit_code"),
+            "tool_type": "maven",
+        }
+        if maven_runtime:
+            metadata["maven_runtime"] = maven_runtime
+        if maven_version_requirement:
+            metadata["maven_version_requirement"] = maven_version_requirement
+
         return ToolResult(
             success=False,
             output=(
@@ -713,14 +737,7 @@ class MavenTool(BaseTool):
             error_code=error_code,
             suggestions=suggestions,
             raw_output=result.get("output"),
-            metadata={
-                "termination_reason": reason,
-                "execution_time": execution_time,
-                "command": maven_cmd,
-                "requested_command": command,
-                "exit_code": result.get("exit_code"),
-                "tool_type": "maven",
-            },
+            metadata=metadata,
         )
 
     def _ensure_maven_in_path(self):

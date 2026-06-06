@@ -1,3 +1,4 @@
+from sag.tools.base import ToolResult
 from sag.tools.gradle_tool import GradleTool
 from sag.tools.maven_tool import MavenTool
 from sag.tools.toolchain_manager import (
@@ -23,6 +24,18 @@ class FakeBuildToolOrchestrator:
             return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
         if command == "which gradle":
             return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
+        if command == "command -v mvn":
+            return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
+        if command == "command -v gradle":
+            return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
+        if command.startswith("test -x /usr/bin/mvn"):
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if command.startswith("test -x /usr/bin/gradle"):
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if command == "/usr/bin/mvn -version":
+            return {"success": True, "output": "Apache Maven 3.9.6", "exit_code": 0}
+        if command == "/usr/bin/gradle -version":
+            return {"success": True, "output": "Gradle 8.5", "exit_code": 0}
         if "pom.xml && echo 'EXISTS'" in command:
             return {"success": True, "output": "EXISTS", "exit_code": 0}
         if "build.gradle" in command and command.startswith("test -f"):
@@ -120,6 +133,42 @@ def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
     assert result.metadata["command"] == orchestrator.monitored_commands[0][0]
 
 
+def test_maven_timeout_result_preserves_env_overlay_runtime_and_requested_version():
+    orchestrator = FakeBuildToolOrchestrator(
+        {
+            "output": "[INFO] downloading dependencies",
+            "exit_code": 0,
+            "termination_reason": "silent_timeout",
+            "execution_time": 1200.0,
+        }
+    )
+    toolchain_manager = FakeToolchainManager(
+        path="/opt/apache-maven-3.9.8/bin/mvn",
+        version="3.9.8",
+        source="env_overlay",
+    )
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert result.success is False
+    assert result.metadata["termination_reason"] == "silent_timeout"
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/opt/apache-maven-3.9.8/bin/mvn",
+        "version": "3.9.8",
+        "source": "env_overlay",
+    }
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "[3.9,4.0)",
+        "source": "tool_parameter",
+        "kind": "range",
+    }
+
+
 def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
     orchestrator = FakeBuildToolOrchestrator(
         {
@@ -143,6 +192,29 @@ def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
     assert result.metadata["execution_time"] == 1200.0
     assert result.metadata["tool_type"] == "gradle"
     assert result.metadata["task"] == "test"
+
+
+def test_gradle_does_not_run_path_gradle_when_manager_cannot_resolve():
+    orchestrator = FakeBuildToolOrchestrator()
+    tool = GradleTool(orchestrator, toolchain_manager=EmptyToolchainManager())
+    tool._install_gradle = lambda working_directory: ToolResult(
+        success=False,
+        output="",
+        error="Gradle unavailable",
+        error_code="GRADLE_INSTALLATION_FAILED",
+    )
+
+    result = tool.execute(
+        tasks="build",
+        working_directory="/workspace/project",
+        use_wrapper=False,
+    )
+
+    assert result.success is False
+    assert result.error_code == "GRADLE_INSTALLATION_FAILED"
+    assert all(
+        not command.startswith("gradle ") for command, _kwargs in orchestrator.monitored_commands
+    )
 
 
 def test_maven_tool_preserves_list_properties_when_fail_at_end_adds_ignore():

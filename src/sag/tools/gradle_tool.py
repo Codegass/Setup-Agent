@@ -116,6 +116,19 @@ class GradleTool(BaseTool):
                 use_wrapper,
                 resolved_gradle=resolved_gradle,
             )
+            if not gradle_executable:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error="No Gradle executable could be resolved after installation",
+                    error_code="GRADLE_EXECUTABLE_NOT_RESOLVED",
+                    suggestions=[
+                        "Register a Gradle executable with the toolchain manager",
+                        "Commit and use the project Gradle wrapper",
+                        "Check whether the active environment overlay blocks the available Gradle executable",
+                    ],
+                    metadata={"working_directory": working_directory},
+                )
 
         # Validate that build.gradle or build.gradle.kts exists
         build_validation = self._validate_build_file_exists(working_directory, build_file)
@@ -300,6 +313,9 @@ class GradleTool(BaseTool):
 
         if resolved_gradle:
             return resolved_gradle.candidate.path
+
+        if self.toolchain_manager:
+            return None
 
         # Check for system Gradle
         gradle_check = self.orchestrator.execute_command("which gradle")
