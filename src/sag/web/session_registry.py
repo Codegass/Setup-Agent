@@ -44,12 +44,12 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
     return ExecutionSessionSummary(
         id=_text(item.get("id"), default="unknown"),
         workspace=_text(item.get("workspace"), default=workspace_id),
-        title=_text(item.get("title"), default=""),
+        title=_text(item.get("title"), default="Untitled task"),
         status=_text(item.get("status"), default="unknown"),
-        entry=_text(item.get("entry"), default="unknown"),
-        start=_text(item.get("start"), default=""),
+        entry=_text(item.get("entry"), default="external"),
+        start=_text(item.get("start"), default="—"),
         finish=_optional_text(item.get("finish")),
-        duration=_text(item.get("duration"), default=""),
+        duration=_text(item.get("duration"), default="—"),
         build=_text(item.get("build"), default="none"),
         test=TestSummary(
             state=_text(test.get("state"), default="none"),

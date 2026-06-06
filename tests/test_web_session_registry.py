@@ -92,7 +92,11 @@ def test_session_registry_skips_bad_rows_and_defaults_bad_numbers(tmp_path: Path
     assert len(rows) == 1
     assert rows[0].id == "unknown"
     assert rows[0].workspace == "sag-commons-cli"
+    assert rows[0].title == "Untitled task"
+    assert rows[0].entry == "external"
+    assert rows[0].start == "—"
     assert rows[0].finish == "17"
+    assert rows[0].duration == "—"
     assert rows[0].test.pass_count == 0
     assert rows[0].test.fail_count == 0
     assert rows[0].test.skip_count == 0
