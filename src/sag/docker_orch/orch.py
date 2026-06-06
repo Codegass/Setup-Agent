@@ -15,6 +15,9 @@ from loguru import logger
 from sag.config import get_config
 
 
+ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
+
+
 class DockerOrchestrator:
     """Orchestrates Docker containers for project setup."""
 
@@ -236,6 +239,14 @@ class DockerOrchestrator:
         except Exception as e:
             logger.error(f"Failed to connect to container: {e}")
             raise
+
+    def _runtime_profile_prefix(self) -> str:
+        """Return shell sources needed before running commands in the container."""
+        return (
+            f"source {ENV_OVERLAY_SCRIPT_PATH} 2>/dev/null || true; "
+            "source /etc/profile 2>/dev/null || true; "
+            "source ~/.bashrc 2>/dev/null || true"
+        )
 
     def _is_json_content(self, output: str, command: str) -> bool:
         """
@@ -470,12 +481,13 @@ class DockerOrchestrator:
         # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
         # CRITICAL FIX: Source environment files BEFORE changing directory
         # This prevents the source commands from resetting the working directory
+        runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             # Source environment first, THEN change to the specified working directory
-            wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; cd '{workdir}' && {command}"
+            wrapped_command = f"{runtime_profile_prefix}; cd '{workdir}' && {command}"
         else:
             # No working directory specified, use default behavior
-            wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            wrapped_command = f"{runtime_profile_prefix}; {command}"
         timeout_seconds = int(timeout) if timeout is not None else None
         if timeout_seconds is not None and timeout_seconds > 0:
             escaped_command = shlex.quote(wrapped_command)
@@ -668,13 +680,14 @@ class DockerOrchestrator:
         # Build the command with proper working directory handling
         # CRITICAL FIX: Source environment files BEFORE changing directory
         # This prevents the source commands from resetting the working directory
+        runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             # Source environment first, THEN change to the specified working directory
             # No quotes needed for workdir since it's used after proper environment setup
-            base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; cd {workdir} && {command}"
+            base_cmd = f"{runtime_profile_prefix}; cd {workdir} && {command}"
         else:
             # No working directory specified, use default
-            base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            base_cmd = f"{runtime_profile_prefix}; {command}"
 
         # Wrap with GNU timeout if requested
         if use_timeout_wrapper:
