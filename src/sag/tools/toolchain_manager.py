@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from loguru import logger
 
+from sag.runtime.env_overlay import EnvOverlayStore
+
 RequirementSource = Literal[
     "tool_parameter",
     "project_metadata",
@@ -17,7 +19,14 @@ RequirementSource = Literal[
     "registered_state",
 ]
 RequirementKind = Literal["exact", "range", "minimum", "maximum", "preferred"]
-CandidateSource = Literal["wrapper", "registered", "standalone", "path", "system"]
+CandidateSource = Literal[
+    "env_overlay",
+    "wrapper",
+    "registered",
+    "standalone",
+    "path",
+    "system",
+]
 
 
 @dataclass(frozen=True)
@@ -84,6 +93,7 @@ class ToolchainManager:
 
     def __init__(self, orchestrator):
         self.orchestrator = orchestrator
+        self.env_overlay = EnvOverlayStore(orchestrator) if orchestrator is not None else None
 
     def resolve(
         self, spec: ToolchainSpec, working_directory: str = "/workspace"
@@ -130,6 +140,10 @@ class ToolchainManager:
     ) -> List[ToolExecutableCandidate]:
         candidates: List[ToolExecutableCandidate] = []
 
+        overlay_candidate = self._env_overlay_candidate(spec)
+        if overlay_candidate:
+            candidates.append(overlay_candidate)
+
         if spec.prefer_wrapper:
             wrapper = f"{working_directory.rstrip('/')}/mvnw"
             if spec.executable == "mvn" and self._is_executable(wrapper):
@@ -144,7 +158,7 @@ class ToolchainManager:
         if path_candidate:
             candidates.append(path_candidate)
 
-        return self._dedupe_candidates(candidates)
+        return self._filter_blocked_candidates(self._dedupe_candidates(candidates), spec)
 
     def ensure_path(self, candidate: ToolExecutableCandidate) -> None:
         directory = candidate.path.rsplit("/", 1)[0]
@@ -179,6 +193,25 @@ class ToolchainManager:
                 )
             )
         return candidates
+
+    def _env_overlay_candidate(
+        self, spec: ToolchainSpec
+    ) -> Optional[ToolExecutableCandidate]:
+        if self.env_overlay is None:
+            return None
+        active = self.env_overlay.active_candidate(spec.name)
+        if not active:
+            return None
+        path = active.get("executable")
+        if not path or not self._is_executable(path):
+            return None
+        return ToolExecutableCandidate(
+            name=spec.name,
+            executable=spec.executable,
+            path=path,
+            version=active.get("version") or self._probe_version(path),
+            source="env_overlay",
+        )
 
     def _discover_standalone_maven(self, spec: ToolchainSpec) -> List[ToolExecutableCandidate]:
         result = self.orchestrator.execute_command(
@@ -259,6 +292,53 @@ class ToolchainManager:
                 deduped[candidate.path] = candidate
         return list(deduped.values())
 
+    def _filter_blocked_candidates(
+        self, candidates: List[ToolExecutableCandidate], spec: ToolchainSpec
+    ) -> List[ToolExecutableCandidate]:
+        if self.env_overlay is None:
+            return candidates
+
+        filtered = []
+        for candidate in candidates:
+            if self._is_blocked_by_overlay(candidate, spec):
+                logger.debug(
+                    "Excluding %s candidate %s from %s due to env overlay blocker",
+                    candidate.name,
+                    candidate.path,
+                    candidate.source,
+                )
+                continue
+            filtered.append(candidate)
+        return filtered
+
+    def _is_blocked_by_overlay(
+        self, candidate: ToolExecutableCandidate, spec: ToolchainSpec
+    ) -> bool:
+        if self.env_overlay is None:
+            return False
+
+        requirement = spec.version_requirement.raw if spec.version_requirement else None
+        has_evidence = False
+        if candidate.version is not None:
+            has_evidence = True
+            if self.env_overlay.is_blocked(
+                spec.name,
+                candidate.path,
+                version=candidate.version,
+            ):
+                return True
+        if requirement is not None:
+            has_evidence = True
+            if self.env_overlay.is_blocked(
+                spec.name,
+                candidate.path,
+                requirement=requirement,
+            ):
+                return True
+        if not has_evidence:
+            return self.env_overlay.is_blocked(spec.name, candidate.path)
+        return False
+
     def _rank_candidate(
         self, candidate: ToolExecutableCandidate, spec: ToolchainSpec
     ) -> Tuple[int, int, Tuple[int, ...], str]:
@@ -275,11 +355,12 @@ class ToolchainManager:
 
     def _source_priority(self, source: CandidateSource) -> int:
         priorities = {
-            "wrapper": 0,
-            "registered": 1,
-            "path": 2,
-            "system": 2,
-            "standalone": 3,
+            "env_overlay": 0,
+            "wrapper": 1,
+            "registered": 2,
+            "path": 3,
+            "standalone": 4,
+            "system": 5,
         }
         return priorities[source]
 
