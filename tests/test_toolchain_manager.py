@@ -15,6 +15,16 @@ class FakeToolchainOrchestrator:
         self.path_executable = path_executable
         self.files = {}
         self.commands = []
+        self.reads = []
+
+    def read_file(self, path):
+        self.reads.append(path)
+        if path not in self.files:
+            return {"success": False, "content": "", "exit_code": 1}
+        return {"success": True, "content": self.files[path], "exit_code": 0}
+
+    def read_count(self, path):
+        return sum(1 for read_path in self.reads if read_path == path)
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
@@ -250,6 +260,57 @@ def test_env_overlay_blocker_excludes_exact_path_only():
     assert "/opt/apache-maven-3.9.9/bin/mvn" in discovered_paths
     assert resolved is not None
     assert resolved.candidate.path == "/opt/apache-maven-3.9.9/bin/mvn"
+
+
+def test_env_overlay_resolution_reads_overlay_json_once_for_multiple_candidates():
+    orchestrator = FakeToolchainOrchestrator(
+        {
+            "/opt/apache-maven-3.9.9/bin/mvn": "Apache Maven 3.9.9",
+            "/tmp/apache-maven-3.8.8/bin/mvn": "Apache Maven 3.8.8",
+            "/tmp/apache-maven-3.9.6/bin/mvn": "Apache Maven 3.9.6",
+            "/usr/bin/mvn": "Apache Maven 3.6.3",
+        },
+        path_executable="/usr/bin/mvn",
+    )
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+        {
+            "version": 1,
+            "tools": {
+                "maven": {
+                    "active": "/opt/apache-maven-3.9.9/bin/mvn",
+                    "candidates": {
+                        "/opt/apache-maven-3.9.9/bin/mvn": {
+                            "version": "3.9.9",
+                            "source": "agent_registered",
+                        }
+                    },
+                    "blocked": [
+                        {
+                            "executable": "/tmp/apache-maven-3.8.8/bin/mvn",
+                            "version": "3.8.8",
+                            "requirement": None,
+                            "reason": "Prefer Maven 3.9+",
+                            "source": "build_error",
+                        },
+                        {
+                            "executable": "/usr/bin/mvn",
+                            "version": "3.6.3",
+                            "requirement": None,
+                            "reason": "System Maven is too old",
+                            "source": "build_error",
+                        },
+                    ],
+                }
+            },
+        }
+    )
+    manager = ToolchainManager(orchestrator)
+
+    resolved = manager.resolve(ToolchainSpec(name="maven", executable="mvn"))
+
+    assert resolved is not None
+    assert resolved.candidate.path == "/opt/apache-maven-3.9.9/bin/mvn"
+    assert orchestrator.read_count(DEFAULT_OVERLAY_JSON) <= 1
 
 
 def test_registered_candidate_persists_and_is_loaded_for_resolution():

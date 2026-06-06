@@ -139,8 +139,9 @@ class ToolchainManager:
         self, spec: ToolchainSpec, working_directory: str = "/workspace"
     ) -> List[ToolExecutableCandidate]:
         candidates: List[ToolExecutableCandidate] = []
+        overlay = self._env_overlay_snapshot()
 
-        overlay_candidate = self._env_overlay_candidate(spec)
+        overlay_candidate = self._env_overlay_candidate(spec, overlay)
         if overlay_candidate:
             candidates.append(overlay_candidate)
 
@@ -158,7 +159,7 @@ class ToolchainManager:
         if path_candidate:
             candidates.append(path_candidate)
 
-        return self._filter_blocked_candidates(self._dedupe_candidates(candidates), spec)
+        return self._filter_blocked_candidates(self._dedupe_candidates(candidates), spec, overlay)
 
     def ensure_path(self, candidate: ToolExecutableCandidate) -> None:
         directory = candidate.path.rsplit("/", 1)[0]
@@ -194,15 +195,26 @@ class ToolchainManager:
             )
         return candidates
 
-    def _env_overlay_candidate(
-        self, spec: ToolchainSpec
-    ) -> Optional[ToolExecutableCandidate]:
+    def _env_overlay_snapshot(self) -> Optional[Dict[str, Any]]:
         if self.env_overlay is None:
             return None
-        active = self.env_overlay.active_candidate(spec.name)
+        overlay, _warnings = self.env_overlay._load_overlay()
+        return overlay
+
+    def _env_overlay_candidate(
+        self, spec: ToolchainSpec, overlay: Optional[Dict[str, Any]]
+    ) -> Optional[ToolExecutableCandidate]:
+        if self.env_overlay is None or overlay is None:
+            return None
+        tool_name = self.env_overlay._normalize_tool(spec.name)
+        entry = overlay.get("tools", {}).get(tool_name, {})
+        active_path = entry.get("active")
+        if not active_path:
+            return None
+        active = entry.get("candidates", {}).get(active_path)
         if not active:
             return None
-        path = active.get("executable")
+        path = active_path
         if not path or not self._is_executable(path):
             return None
         return ToolExecutableCandidate(
@@ -293,14 +305,17 @@ class ToolchainManager:
         return list(deduped.values())
 
     def _filter_blocked_candidates(
-        self, candidates: List[ToolExecutableCandidate], spec: ToolchainSpec
+        self,
+        candidates: List[ToolExecutableCandidate],
+        spec: ToolchainSpec,
+        overlay: Optional[Dict[str, Any]],
     ) -> List[ToolExecutableCandidate]:
-        if self.env_overlay is None:
+        if self.env_overlay is None or overlay is None:
             return candidates
 
         filtered = []
         for candidate in candidates:
-            if self._is_blocked_by_overlay(candidate, spec):
+            if self._is_blocked_by_overlay(candidate, spec, overlay):
                 logger.debug(
                     "Excluding %s candidate %s from %s due to env overlay blocker",
                     candidate.name,
@@ -312,31 +327,38 @@ class ToolchainManager:
         return filtered
 
     def _is_blocked_by_overlay(
-        self, candidate: ToolExecutableCandidate, spec: ToolchainSpec
+        self,
+        candidate: ToolExecutableCandidate,
+        spec: ToolchainSpec,
+        overlay: Optional[Dict[str, Any]],
     ) -> bool:
-        if self.env_overlay is None:
+        if self.env_overlay is None or overlay is None:
             return False
 
+        tool_name = self.env_overlay._normalize_tool(spec.name)
+        executable = self.env_overlay._normalize_executable(candidate.path)
         requirement = spec.version_requirement.raw if spec.version_requirement else None
         has_evidence = False
         if candidate.version is not None:
             has_evidence = True
-            if self.env_overlay.is_blocked(
-                spec.name,
-                candidate.path,
+            if self.env_overlay._is_blocked_in_overlay(
+                overlay,
+                tool_name,
+                executable,
                 version=candidate.version,
             ):
                 return True
         if requirement is not None:
             has_evidence = True
-            if self.env_overlay.is_blocked(
-                spec.name,
-                candidate.path,
+            if self.env_overlay._is_blocked_in_overlay(
+                overlay,
+                tool_name,
+                executable,
                 requirement=requirement,
             ):
                 return True
         if not has_evidence:
-            return self.env_overlay.is_blocked(spec.name, candidate.path)
+            return self.env_overlay._is_blocked_in_overlay(overlay, tool_name, executable)
         return False
 
     def _rank_candidate(
