@@ -45,3 +45,40 @@ def test_file_tracker_ignores_heavy_and_hidden_generated_dirs(tmp_path: Path):
     assert "src.py" in snap.files
     assert ".git/index" not in snap.files
     assert "target/app.jar" not in snap.files
+
+
+def test_file_tracker_prunes_ignored_subtrees_before_descending(tmp_path: Path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "index.js").write_text(
+        "ignored",
+        encoding="utf-8",
+    )
+    (root / "src.py").write_text("tracked", encoding="utf-8")
+
+    visited: list[str] = []
+
+    class RecordingTracker(FileChangeTracker):
+        def _ignored(self, path: Path) -> bool:
+            visited.append(path.relative_to(self.root).as_posix())
+            return super()._ignored(path)
+
+    tracker = RecordingTracker(root)
+    snap = tracker.snapshot("base")
+
+    assert "src.py" in snap.files
+    assert "node_modules" not in snap.files
+    assert "node_modules/pkg/index.js" not in snap.files
+    assert "node_modules/pkg/index.js" not in visited
+
+
+def test_file_tracker_records_broken_symlink_as_other(tmp_path: Path):
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "broken-link").symlink_to(root / "missing-target")
+
+    tracker = FileChangeTracker(root)
+    snap = tracker.snapshot("base")
+
+    assert snap.files["broken-link"].type == "other"

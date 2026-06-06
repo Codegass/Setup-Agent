@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -47,26 +49,24 @@ class FileChangeTracker:
 
     def snapshot(self, snapshot_id: str) -> FileSnapshot:
         files: dict[str, FileMeta] = {}
-        for path in sorted(self.root.rglob("*")):
-            if self._ignored(path):
-                continue
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dir_path = Path(dirpath)
+            kept_dirnames: list[str] = []
 
-            rel = path.relative_to(self.root).as_posix()
-            stat = path.stat()
-            kind: Literal["file", "dir", "other"]
-            if path.is_dir():
-                kind = "dir"
-            elif path.is_file():
-                kind = "file"
-            else:
-                kind = "other"
+            for dirname in sorted(dirnames):
+                path = dir_path / dirname
+                if self._ignored(path):
+                    continue
+                kept_dirnames.append(dirname)
+                self._add_path(files, path)
 
-            files[rel] = FileMeta(
-                path=rel,
-                type=kind,
-                size=stat.st_size,
-                mtime_ns=stat.st_mtime_ns,
-            )
+            dirnames[:] = kept_dirnames
+
+            for filename in sorted(filenames):
+                path = dir_path / filename
+                if self._ignored(path):
+                    continue
+                self._add_path(files, path)
 
         return FileSnapshot(id=snapshot_id, root=self.root, mode="metadata", files=files)
 
@@ -105,6 +105,29 @@ class FileChangeTracker:
     def _ignored(self, path: Path) -> bool:
         rel_parts = path.relative_to(self.root).parts
         return any(part in self.ignore_dirs for part in rel_parts)
+
+    def _add_path(self, files: dict[str, FileMeta], path: Path) -> None:
+        rel = path.relative_to(self.root).as_posix()
+        try:
+            path_stat = path.lstat()
+        except OSError:
+            return
+
+        mode = path_stat.st_mode
+        kind: Literal["file", "dir", "other"]
+        if stat.S_ISDIR(mode):
+            kind = "dir"
+        elif stat.S_ISREG(mode):
+            kind = "file"
+        else:
+            kind = "other"
+
+        files[rel] = FileMeta(
+            path=rel,
+            type=kind,
+            size=path_stat.st_size,
+            mtime_ns=path_stat.st_mtime_ns,
+        )
 
     def _item(
         self,
