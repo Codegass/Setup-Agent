@@ -164,6 +164,12 @@ class MavenTool(BaseTool):
             prefer_wrapper=use_wrapper,
         )
 
+        if required_version and not resolved_maven:
+            return self._maven_version_not_resolved_result(
+                required_version=required_version,
+                working_directory=working_directory,
+            )
+
         # Check if Maven is installed, install if not
         if not resolved_maven and not self._is_maven_installed():
             install_result = self._install_maven()
@@ -175,18 +181,15 @@ class MavenTool(BaseTool):
                 prefer_wrapper=use_wrapper,
             )
 
-        if required_version and not resolved_maven:
-            return self._maven_version_not_resolved_result(
-                required_version=required_version,
-                working_directory=working_directory,
-            )
-
         maven_executable = (
             resolved_maven.candidate.path
             if resolved_maven
             else ("./mvnw" if use_wrapper else "mvn")
         )
         maven_runtime = self._maven_runtime_metadata(resolved_maven, maven_executable)
+        requested_requirement_metadata = self._maven_version_requirement_metadata(
+            required_version
+        )
 
         version_command = self._normalize_maven_version_command(command)
         if version_command:
@@ -214,6 +217,12 @@ class MavenTool(BaseTool):
                     "exit_code": result.get("exit_code"),
                     "tool_type": "maven",
                     "diagnostic": "version",
+                    "maven_runtime": maven_runtime,
+                    **(
+                        {"maven_version_requirement": requested_requirement_metadata}
+                        if requested_requirement_metadata
+                        else {}
+                    ),
                 },
             )
 
@@ -315,6 +324,10 @@ class MavenTool(BaseTool):
 
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
+            if requested_requirement_metadata and not analysis.get(
+                "maven_version_requirement"
+            ):
+                analysis["maven_version_requirement"] = requested_requirement_metadata
 
             # Store full output if large
             full_output = result["output"]
@@ -370,6 +383,12 @@ class MavenTool(BaseTool):
                         "command": maven_cmd,
                         "exit_code": result["exit_code"],
                         "analysis": analysis,
+                        "maven_runtime": maven_runtime,
+                        **(
+                            {"maven_version_requirement": requested_requirement_metadata}
+                            if requested_requirement_metadata
+                            else {}
+                        ),
                     },
                 )
 
@@ -428,6 +447,12 @@ class MavenTool(BaseTool):
                         "analysis": analysis,
                         "validation": validation_result,
                         "output_ref_id": ref_id,
+                        "maven_runtime": maven_runtime,
+                        **(
+                            {"maven_version_requirement": requested_requirement_metadata}
+                            if requested_requirement_metadata
+                            else {}
+                        ),
                     },
                 )
             else:
@@ -566,6 +591,17 @@ class MavenTool(BaseTool):
             "executable": maven_executable,
             "version": None,
             "source": "wrapper" if maven_executable == "./mvnw" else "path",
+        }
+
+    def _maven_version_requirement_metadata(
+        self, requirement: ToolVersionRequirement | None
+    ) -> Optional[Dict[str, str]]:
+        if not requirement:
+            return None
+        return {
+            "raw": requirement.raw,
+            "source": requirement.source,
+            "kind": requirement.kind,
         }
 
     def _normalize_maven_version_command(self, command: Any) -> Optional[str]:
