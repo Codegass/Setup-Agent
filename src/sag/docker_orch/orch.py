@@ -484,7 +484,8 @@ class DockerOrchestrator:
         runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             # Source environment first, THEN change to the specified working directory
-            wrapped_command = f"{runtime_profile_prefix}; cd '{workdir}' && {command}"
+            quoted_workdir = shlex.quote(workdir)
+            wrapped_command = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
         else:
             # No working directory specified, use default behavior
             wrapped_command = f"{runtime_profile_prefix}; {command}"
@@ -683,8 +684,8 @@ class DockerOrchestrator:
         runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             # Source environment first, THEN change to the specified working directory
-            # No quotes needed for workdir since it's used after proper environment setup
-            base_cmd = f"{runtime_profile_prefix}; cd {workdir} && {command}"
+            quoted_workdir = shlex.quote(workdir)
+            base_cmd = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
         else:
             # No working directory specified, use default
             base_cmd = f"{runtime_profile_prefix}; {command}"

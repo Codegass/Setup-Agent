@@ -1,3 +1,5 @@
+import shlex
+
 from sag.docker_orch import orch
 from sag.docker_orch.orch import DockerOrchestrator
 
@@ -61,8 +63,9 @@ def test_runtime_profile_prefix_sources_env_overlay_before_shell_profiles():
 def test_execute_command_sources_env_overlay_before_cd_and_command():
     container = FakeContainer()
     orchestrator = build_orchestrator(container)
+    workdir = "/workspace/project"
 
-    result = orchestrator.execute_command("echo hi", workdir="/workspace/project")
+    result = orchestrator.execute_command("echo hi", workdir=workdir)
 
     assert result["success"] is True
     wrapped_command = container.exec_calls[-1]["exec_command"][2]
@@ -70,17 +73,31 @@ def test_execute_command_sources_env_overlay_before_cd_and_command():
         "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true; "
         "source /etc/profile 2>/dev/null || true; "
         "source ~/.bashrc 2>/dev/null || true; "
-        "cd '/workspace/project' && echo hi"
+        f"cd {shlex.quote(workdir)} && echo hi"
     )
+
+
+def test_execute_command_shell_quotes_workdir_with_space_and_single_quote():
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+    workdir = "/workspace/project with ' quote"
+
+    result = orchestrator.execute_command("echo hi", workdir=workdir)
+
+    assert result["success"] is True
+    wrapped_command = container.exec_calls[-1]["exec_command"][2]
+    assert f"cd {shlex.quote(workdir)} && echo hi" in wrapped_command
+    assert "cd /workspace/project with" not in wrapped_command
 
 
 def test_execute_command_with_monitoring_sources_env_overlay_before_cd_and_command():
     container = FakeContainer(FakeStreamingExecResult())
     orchestrator = build_orchestrator(container)
+    workdir = "/workspace/project"
 
     result = orchestrator.execute_command_with_monitoring(
         "echo hi",
-        workdir="/workspace/project",
+        workdir=workdir,
         use_timeout_wrapper=False,
         enable_cpu_monitoring=False,
     )
@@ -91,5 +108,25 @@ def test_execute_command_with_monitoring_sources_env_overlay_before_cd_and_comma
         "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true; "
         "source /etc/profile 2>/dev/null || true; "
         "source ~/.bashrc 2>/dev/null || true; "
-        "cd /workspace/project && echo hi"
+        f"cd {shlex.quote(workdir)} && echo hi"
     )
+
+
+def test_execute_command_with_monitoring_preserves_quoted_workdir_in_timeout_wrapper():
+    container = FakeContainer(FakeStreamingExecResult())
+    orchestrator = build_orchestrator(container)
+    workdir = "/workspace/project with ' quote"
+
+    result = orchestrator.execute_command_with_monitoring(
+        "echo hi",
+        workdir=workdir,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is True
+    final_command = container.exec_calls[-1]["exec_command"][2]
+    timeout_args = shlex.split(final_command)
+    assert timeout_args[:5] == ["timeout", "--preserve-status", "2400", "bash", "-c"]
+    base_command = timeout_args[5]
+    assert f"cd {shlex.quote(workdir)} && echo hi" in base_command
+    assert "cd /workspace/project with" not in base_command
