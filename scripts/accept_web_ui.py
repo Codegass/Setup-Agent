@@ -81,7 +81,9 @@ def main() -> int:
 
     if not args.skip_commands:
         if args.phase in {"backend", "final"}:
-            run(["uv", "run", "pytest", "tests/test_web_*.py", "-v"], failures)
+            backend_tests = backend_web_test_paths(failures)
+            if backend_tests:
+                run(["uv", "run", "pytest", *backend_tests, "-v"], failures)
         if args.phase in {"frontend", "final"} and (ROOT / "webui/package.json").exists():
             run(["npm", "test"], failures, cwd=ROOT / "webui")
             run(["npm", "run", "build"], failures, cwd=ROOT / "webui")
@@ -111,6 +113,13 @@ def require_patterns(patterns: dict[str, tuple[str, str]], failures: list[str]) 
         text = target.read_text(encoding="utf-8")
         if pattern not in text:
             failures.append(f"missing product-boundary pattern {label}: {pattern}")
+
+
+def backend_web_test_paths(failures: list[str]) -> list[str]:
+    paths = sorted(ROOT.glob("tests/test_web_*.py"))
+    if not paths:
+        failures.append("missing backend web tests: tests/test_web_*.py")
+    return [str(path.relative_to(ROOT)) for path in paths]
 
 
 def run(command: list[str], failures: list[str], cwd: Path | None = None) -> None:

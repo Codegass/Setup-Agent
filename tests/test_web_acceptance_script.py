@@ -1,5 +1,17 @@
+import importlib.util
 import subprocess
 import sys
+from pathlib import Path
+
+
+def load_acceptance_module():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "accept_web_ui.py"
+    spec = importlib.util.spec_from_file_location("accept_web_ui", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_acceptance_script_skeleton_phase_passes_after_task_zero():
@@ -24,3 +36,33 @@ def test_acceptance_script_rejects_unknown_phase():
 
     assert result.returncode != 0
     assert "invalid choice" in result.stderr
+
+
+def test_backend_web_tests_are_expanded_to_concrete_paths(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    later = tests_dir / "test_web_zeta.py"
+    earlier = tests_dir / "test_web_alpha.py"
+    later.write_text("def test_zeta():\n    pass\n", encoding="utf-8")
+    earlier.write_text("def test_alpha():\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    failures: list[str] = []
+
+    assert module.backend_web_test_paths(failures) == [
+        "tests/test_web_alpha.py",
+        "tests/test_web_zeta.py",
+    ]
+    assert failures == []
+
+
+def test_backend_web_tests_report_clear_failure_when_missing(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    (tmp_path / "tests").mkdir()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    failures: list[str] = []
+
+    assert module.backend_web_test_paths(failures) == []
+    assert failures == ["missing backend web tests: tests/test_web_*.py"]
