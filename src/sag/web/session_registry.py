@@ -68,14 +68,22 @@ def _text(value: Any, default: str) -> str:
     if value is None:
         return default
 
-    return str(value)
+    text = str(value).strip()
+    if not text:
+        return default
+
+    return text
 
 
 def _optional_text(value: Any) -> str | None:
     if value is None:
         return None
 
-    return str(value)
+    text = str(value).strip()
+    if not text:
+        return None
+
+    return text
 
 
 def _to_int(value: Any) -> int:

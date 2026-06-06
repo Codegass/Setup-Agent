@@ -103,3 +103,41 @@ def test_session_registry_skips_bad_rows_and_defaults_bad_numbers(tmp_path: Path
     assert rows[0].test.total == 0
     assert rows[0].files == 0
     assert rows[0].evidence == 0
+
+
+def test_session_registry_strips_text_and_defaults_blank_optional_fields(tmp_path: Path):
+    setup_agent = tmp_path / ".setup_agent" / "sessions"
+    setup_agent.mkdir(parents=True)
+    (setup_agent / "index.json").write_text(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "  CC-4  ",
+                        "workspace": "  sag-commons-cli  ",
+                        "title": "   ",
+                        "entry": "",
+                        "start": "\t",
+                        "finish": "   ",
+                        "duration": "\n",
+                        "build": " success ",
+                        "test": {},
+                        "report": " ready ",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = SessionRegistry().read_index(tmp_path, "sag-commons-cli")
+
+    assert rows[0].id == "CC-4"
+    assert rows[0].workspace == "sag-commons-cli"
+    assert rows[0].title == "Untitled task"
+    assert rows[0].entry == "external"
+    assert rows[0].start == "—"
+    assert rows[0].finish is None
+    assert rows[0].duration == "—"
+    assert rows[0].build == "success"
+    assert rows[0].report == "ready"
