@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from loguru import logger
 
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
+from sag.runtime.env_overlay import EnvOverlayStore
 from sag.ui.events import EventType, UIEventEmitter
 
 from .base import BaseTool, ToolResult
@@ -2820,6 +2821,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         if exec_details_section:
             report_lines.extend(exec_details_section)
 
+        # Runtime overlay evidence is reported separately from project metadata.
+        env_overlay_section = self._render_runtime_env_overlay_evidence()
+        if env_overlay_section:
+            report_lines.extend(env_overlay_section)
+
         # Add error analysis section
         error_section = self._generate_error_reporting_section(actual_accomplishments)
         if error_section:
@@ -2841,6 +2847,115 @@ class ReportTool(BaseTool, UIEventEmitter):
         )
 
         return "\n".join(report_lines)
+
+    def _render_runtime_env_overlay_evidence(self) -> List[str]:
+        """Render runtime-only environment overlay evidence when present."""
+        if not self.docker_orchestrator:
+            return []
+
+        try:
+            overlay = EnvOverlayStore(self.docker_orchestrator).inspect()
+        except Exception as exc:
+            logger.debug(f"Could not inspect runtime env overlay for report: {exc}")
+            return []
+
+        tools = overlay.get("tools", {}) or {}
+        warnings = overlay.get("warnings", []) or []
+        has_tool_state = any(
+            entry.get("active") or entry.get("candidates") or entry.get("blocked")
+            for entry in tools.values()
+            if isinstance(entry, dict)
+        )
+        if not has_tool_state and not warnings:
+            return []
+
+        lines = [
+            "## Runtime Environment Overlay Evidence",
+            "",
+            "This is runtime command evidence, not project source configuration.",
+            "",
+        ]
+
+        active_rows = []
+        blocked_rows = []
+        for tool_name, entry in sorted(tools.items()):
+            if not isinstance(entry, dict):
+                continue
+
+            active = entry.get("active")
+            if active:
+                candidate = (entry.get("candidates") or {}).get(active, {}) or {}
+                active_rows.append(
+                    [
+                        tool_name,
+                        f"`{active}`",
+                        candidate.get("version"),
+                        candidate.get("source"),
+                    ]
+                )
+
+            for blocked in entry.get("blocked", []) or []:
+                if not isinstance(blocked, dict):
+                    continue
+                blocked_rows.append(
+                    [
+                        tool_name,
+                        f"`{blocked.get('executable', '')}`",
+                        blocked.get("version"),
+                        blocked.get("requirement"),
+                        blocked.get("reason"),
+                        blocked.get("source"),
+                    ]
+                )
+
+        lines.extend(["### Active Tool Executables", ""])
+        if active_rows:
+            lines.extend(
+                [
+                    "| Tool | Executable | Version | Source |",
+                    "|------|------------|---------|--------|",
+                ]
+            )
+            for row in active_rows:
+                lines.append(self._markdown_table_row(row))
+        else:
+            lines.append("- No active overlay executables recorded.")
+        lines.append("")
+
+        lines.extend(["### Blocked Candidates", ""])
+        if blocked_rows:
+            lines.extend(
+                [
+                    "| Tool | Executable | Version | Requirement | Reason | Source |",
+                    "|------|------------|---------|-------------|--------|--------|",
+                ]
+            )
+            for row in blocked_rows:
+                lines.append(self._markdown_table_row(row))
+        else:
+            lines.append("- No blocked overlay candidates recorded.")
+        lines.append("")
+
+        if warnings:
+            lines.extend(["### Overlay Warnings", ""])
+            for warning in warnings[:5]:
+                lines.append(f"- {warning}")
+            if len(warnings) > 5:
+                lines.append(f"- ... (+{len(warnings) - 5} more)")
+            lines.append("")
+
+        return lines
+
+    @staticmethod
+    def _markdown_table_row(values: Iterable[Any]) -> str:
+        cells = []
+        for value in values:
+            if value is None:
+                cell = ""
+            else:
+                cell = str(value).replace("\n", " ").replace("|", "\\|")
+            cells.append(cell)
+        return f"| {' | '.join(cells)} |"
 
     def _render_conclusion_section(self, snapshot: Dict[str, Any]) -> List[str]:
         status = snapshot.get("status", {})
