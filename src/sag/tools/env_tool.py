@@ -33,7 +33,7 @@ class EnvTool(BaseTool):
         tool: Optional[str] = None,
         executable: Optional[str] = None,
         version: Optional[str] = None,
-        source: str = "agent_registered",
+        source: Optional[str] = None,
         env: Optional[dict[str, Any]] = None,
         path_prepend: Optional[list[str] | str] = None,
         activate: bool = False,
@@ -192,16 +192,20 @@ class EnvTool(BaseTool):
                 },
                 "source": {
                     "type": "string",
-                    "description": "Evidence source for the overlay entry.",
-                    "default": "agent_registered",
+                    "description": (
+                        "Evidence source for the overlay entry. Defaults to "
+                        "agent_registered for register and build_error for block."
+                    ),
                 },
                 "env": {
                     "type": "object",
                     "description": "Environment variables to export when this candidate is active.",
                 },
                 "path_prepend": {
-                    "type": "array",
-                    "items": {"type": "string"},
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
                     "description": "PATH entries to prepend when this candidate is active.",
                 },
                 "activate": {

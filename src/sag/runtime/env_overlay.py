@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import posixpath
 import re
@@ -75,7 +76,7 @@ class EnvOverlayStore:
 
         entry.setdefault("blocked", [])
         if activate:
-            entry["active"] = executable_path
+            self._activate_in_overlay(overlay, tool_name, executable_path)
         return self._write_overlay(overlay)
 
     def activate(self, tool: str, executable: str) -> dict[str, Any]:
@@ -83,13 +84,7 @@ class EnvOverlayStore:
         overlay, _warnings = self._load_overlay()
         tool_name = self._normalize_tool(tool)
         executable_path = self._normalize_executable(executable)
-        entry = overlay.get("tools", {}).get(tool_name)
-        if not entry or executable_path not in entry.get("candidates", {}):
-            raise ValueError(f"{executable_path} is not registered for {tool_name}")
-        if self._is_blocked_in_overlay(overlay, tool_name, executable_path):
-            raise ValueError(f"{executable_path} is blocked for {tool_name}")
-
-        entry["active"] = executable_path
+        self._activate_in_overlay(overlay, tool_name, executable_path)
         return self._write_overlay(overlay)
 
     def block(
@@ -188,7 +183,14 @@ class EnvOverlayStore:
                 f"Ignored invalid env overlay JSON at {self.overlay_json}: expected object"
             ]
 
-        return self._normalize_overlay(loaded), []
+        warnings: list[str] = []
+        try:
+            normalized = self._normalize_overlay(loaded, tolerant=True, warnings=warnings)
+        except ValueError as exc:
+            return self._empty_overlay(), [
+                f"Ignored invalid env overlay data at {self.overlay_json}: {exc}"
+            ]
+        return normalized, warnings
 
     def _write_overlay(self, overlay: dict[str, Any]) -> dict[str, Any]:
         normalized = self._normalize_overlay(overlay)
@@ -253,8 +255,8 @@ class EnvOverlayStore:
                 raise RuntimeError(f"Failed to write {path}: {result.get('output', '')}")
             return
 
-        delimiter = "SAG_ENV_OVERLAY_EOF"
-        command = f"cat > {shlex.quote(path)} << '{delimiter}'\n" f"{content}\n" f"{delimiter}"
+        payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        command = f"printf %s {shlex.quote(payload)} | base64 -d > {shlex.quote(path)}"
         result = self.orchestrator.execute_command(command)
         if result.get("exit_code", 0) != 0:
             raise RuntimeError(f"Failed to write {path}: {result.get('output', '')}")
@@ -265,7 +267,13 @@ class EnvOverlayStore:
         if result.get("exit_code", 0) != 0:
             raise RuntimeError(f"Failed to create {directory}: {result.get('output', '')}")
 
-    def _normalize_overlay(self, overlay: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_overlay(
+        self,
+        overlay: dict[str, Any],
+        *,
+        tolerant: bool = False,
+        warnings: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
         normalized = self._empty_overlay()
         tools = overlay.get("tools", {})
         if not isinstance(tools, dict):
@@ -274,29 +282,53 @@ class EnvOverlayStore:
         for raw_tool_name, raw_entry in tools.items():
             if not isinstance(raw_tool_name, str) or not isinstance(raw_entry, dict):
                 continue
-            tool_name = self._normalize_tool(raw_tool_name)
+            try:
+                tool_name = self._normalize_tool(raw_tool_name)
+            except ValueError as exc:
+                if tolerant:
+                    self._append_warning(
+                        warnings,
+                        f"Ignored invalid env overlay tool entry: {exc}",
+                    )
+                    continue
+                raise
             entry: dict[str, Any] = {"candidates": {}, "blocked": []}
 
             candidates = raw_entry.get("candidates", {})
             if isinstance(candidates, dict):
                 for raw_executable, raw_candidate in candidates.items():
-                    if not isinstance(raw_executable, str) or not raw_executable.strip():
-                        continue
-                    candidate = raw_candidate if isinstance(raw_candidate, dict) else {}
-                    executable = self._normalize_executable(raw_executable)
-                    entry["candidates"][executable] = {
-                        "version": (
-                            str(candidate.get("version"))
-                            if candidate.get("version") is not None
-                            else None
-                        ),
-                        "source": str(candidate.get("source") or "agent_registered"),
-                        "env": self._normalize_env(candidate.get("env") or {}),
-                        "path_prepend": self._normalize_path_prepend(
-                            candidate.get("path_prepend"),
-                            executable,
-                        ),
-                    }
+                    try:
+                        if not isinstance(raw_executable, str) or not raw_executable.strip():
+                            continue
+                        candidate = raw_candidate if isinstance(raw_candidate, dict) else {}
+                        executable = self._normalize_executable(raw_executable)
+                        raw_env = (
+                            candidate.get("env") if candidate.get("env") is not None else {}
+                        )
+                        entry["candidates"][executable] = {
+                            "version": (
+                                str(candidate.get("version"))
+                                if candidate.get("version") is not None
+                                else None
+                            ),
+                            "source": str(candidate.get("source") or "agent_registered"),
+                            "env": self._normalize_env(raw_env),
+                            "path_prepend": self._normalize_path_prepend(
+                                candidate.get("path_prepend"),
+                                executable,
+                            ),
+                        }
+                    except ValueError as exc:
+                        if tolerant:
+                            self._append_warning(
+                                warnings,
+                                (
+                                    "Ignored invalid env overlay candidate for "
+                                    f"{tool_name}: {exc}"
+                                ),
+                            )
+                            continue
+                        raise
 
             active = raw_entry.get("active")
             if isinstance(active, str) and active in entry["candidates"]:
@@ -307,23 +339,38 @@ class EnvOverlayStore:
                 for raw_block in blocked:
                     if not isinstance(raw_block, dict) or not raw_block.get("executable"):
                         continue
-                    entry["blocked"].append(
-                        {
-                            "executable": self._normalize_executable(raw_block["executable"]),
-                            "version": (
-                                str(raw_block.get("version"))
-                                if raw_block.get("version") is not None
-                                else None
-                            ),
-                            "requirement": raw_block.get("requirement"),
-                            "reason": raw_block.get("reason"),
-                            "source": str(raw_block.get("source") or "build_error"),
-                        }
-                    )
+                    try:
+                        entry["blocked"].append(
+                            {
+                                "executable": self._normalize_executable(
+                                    raw_block["executable"]
+                                ),
+                                "version": (
+                                    str(raw_block.get("version"))
+                                    if raw_block.get("version") is not None
+                                    else None
+                                ),
+                                "requirement": raw_block.get("requirement"),
+                                "reason": raw_block.get("reason"),
+                                "source": str(raw_block.get("source") or "build_error"),
+                            }
+                        )
+                    except ValueError as exc:
+                        if tolerant:
+                            self._append_warning(
+                                warnings,
+                                f"Ignored invalid env overlay block for {tool_name}: {exc}",
+                            )
+                            continue
+                        raise
 
             normalized["tools"][tool_name] = entry
 
         return normalized
+
+    def _append_warning(self, warnings: Optional[list[str]], message: str) -> None:
+        if warnings is not None:
+            warnings.append(message)
 
     def _empty_overlay(self) -> dict[str, Any]:
         return {"version": 1, "tools": {}}
@@ -352,6 +399,19 @@ class EnvOverlayStore:
                 continue
             return True
         return False
+
+    def _activate_in_overlay(
+        self,
+        overlay: dict[str, Any],
+        tool: str,
+        executable: str,
+    ) -> None:
+        entry = overlay.get("tools", {}).get(tool)
+        if not entry or executable not in entry.get("candidates", {}):
+            raise ValueError(f"{executable} is not registered for {tool}")
+        if self._is_blocked_in_overlay(overlay, tool, executable):
+            raise ValueError(f"{executable} is blocked for {tool}")
+        entry["active"] = executable
 
     def _normalize_tool(self, tool: str) -> str:
         if not isinstance(tool, str) or not tool.strip():
