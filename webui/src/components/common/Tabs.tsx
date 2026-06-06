@@ -28,7 +28,7 @@ function tabLabel(tab: TabItem): React.ReactNode {
 export function Tabs({ tabs, value, onChange, className, ...props }: TabsProps) {
   return (
     <div
-      className={cn("flex items-center gap-1 border-b border-slate-200", className)}
+      className={cn("flex flex-wrap items-center gap-1 border-b border-slate-200", className)}
       {...props}
     >
       {tabs.map((tab) => {
