@@ -65,4 +65,18 @@ def test_backend_web_tests_report_clear_failure_when_missing(tmp_path, monkeypat
     failures: list[str] = []
 
     assert module.backend_web_test_paths(failures) == []
-    assert failures == ["missing backend web tests: tests/test_web_*.py"]
+    assert failures == ["no backend web tests found"]
+
+
+def test_backend_web_tests_exclude_acceptance_script(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    acceptance_script = tests_dir / "test_web_acceptance_script.py"
+    acceptance_script.write_text("def test_acceptance():\n    pass\n", encoding="utf-8")
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    failures: list[str] = []
+
+    assert module.backend_web_test_paths(failures) == []
+    assert failures == ["no backend web tests found"]

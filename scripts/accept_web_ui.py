@@ -10,6 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+ACCEPTANCE_SCRIPT_TEST = Path("tests/test_web_acceptance_script.py")
 
 
 BACKEND_FILES = [
@@ -116,9 +117,13 @@ def require_patterns(patterns: dict[str, tuple[str, str]], failures: list[str]) 
 
 
 def backend_web_test_paths(failures: list[str]) -> list[str]:
-    paths = sorted(ROOT.glob("tests/test_web_*.py"))
+    paths = [
+        path
+        for path in sorted(ROOT.glob("tests/test_web_*.py"))
+        if path.relative_to(ROOT) != ACCEPTANCE_SCRIPT_TEST
+    ]
     if not paths:
-        failures.append("missing backend web tests: tests/test_web_*.py")
+        failures.append("no backend web tests found")
     return [str(path.relative_to(ROOT)) for path in paths]
 
 
