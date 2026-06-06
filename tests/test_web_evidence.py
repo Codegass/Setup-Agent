@@ -28,8 +28,14 @@ def test_evidence_index_groups_runtime_records_by_source():
 
     assert groups[0].source == "Build tool · Maven"
     assert groups[0].status == "success"
+    assert groups[0].records[0].ref == "logs/maven.log"
+    assert groups[0].records[0].title == "Command"
+    assert groups[0].records[0].detail == "maven clean package passed"
     assert groups[1].source == "Test validator"
+    assert groups[1].status == "partial"
     assert groups[1].records[0].ref == "target/surefire-reports"
+    assert groups[1].records[0].title == "Validation"
+    assert groups[1].records[0].detail == "312/320 tests passed"
 
 
 def test_evidence_index_preserves_source_order_and_merges_status_severity():
@@ -62,9 +68,11 @@ def test_evidence_index_preserves_source_order_and_merges_status_severity():
     assert groups[0].status == "failure"
     assert groups[0].counts == "2 records"
     assert groups[0].time == "02:14"
-    assert groups[0].summary == "3 tests failed"
+    assert groups[0].summary == "gradle test failed"
     assert groups[0].records[0].ref == "logs/gradle.log"
+    assert groups[0].records[0].detail == "gradle test started"
     assert groups[0].records[1].ref == "runtime"
+    assert groups[0].records[1].detail == "gradle test failed"
 
 
 def test_evidence_index_handles_empty_or_unexpected_metadata():

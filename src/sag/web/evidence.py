@@ -40,7 +40,7 @@ class EvidenceIndex:
             evidence_record = EvidenceRecord(
                 time=_time(record.timestamp),
                 status=status,
-                title=_text(record.summary, fallback=source),
+                title=_title(record),
                 detail=detail,
                 ref=_ref(metadata),
             )
@@ -105,9 +105,12 @@ def _status_for_severity(status: str) -> str:
     return "info"
 
 
+def _title(record: UIEvidenceRecord) -> str:
+    return _text(record.kind, fallback="Evidence").title()
+
+
 def _detail(record: UIEvidenceRecord) -> str:
-    title = _text(record.summary, fallback="Evidence")
-    return _text(record.details, fallback=title)
+    return _text(record.summary, fallback="Evidence")
 
 
 def _ref(metadata: dict[str, Any]) -> str:
