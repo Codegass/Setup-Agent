@@ -1,4 +1,8 @@
-import type { DashboardResponse, ExecutionSessionDetail } from "./types"
+import type {
+  DashboardResponse,
+  ExecutionSessionDetail,
+  SubmitTaskResponse,
+} from "./types"
 
 async function readJson<T>(response: Response): Promise<T> {
   if (!response.ok) {
@@ -17,16 +21,18 @@ export function fetchDashboard(): Promise<DashboardResponse> {
 }
 
 export function fetchSession(sessionId: string): Promise<ExecutionSessionDetail> {
-  return getJson<ExecutionSessionDetail>(`/api/sessions/${sessionId}`)
+  return getJson<ExecutionSessionDetail>(
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+  )
 }
 
 export async function submitTask(
   workspaceId: string,
   task: string,
   sourceSession?: string,
-): Promise<{ workspace_id: string; session_id: string; status: string }> {
+): Promise<SubmitTaskResponse> {
   return readJson(
-    await fetch(`/api/workspaces/${workspaceId}/tasks`, {
+    await fetch(`/api/workspaces/${encodeURIComponent(workspaceId)}/tasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ task, source_session: sourceSession ?? null }),

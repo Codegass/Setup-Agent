@@ -1,7 +1,8 @@
-import { render, screen } from "@testing-library/react"
-import { describe, expect, it } from "vitest"
+import { fireEvent, render, screen } from "@testing-library/react"
+import { describe, expect, it, vi } from "vitest"
 
 import { StatusBadge } from "./Badge"
+import { Tabs } from "./Tabs"
 import { TestBar } from "./TestBar"
 
 describe("common components", () => {
@@ -23,5 +24,27 @@ describe("common components", () => {
     expect(screen.getByText("7")).toBeInTheDocument()
     expect(screen.getByText("/ 2")).toBeInTheDocument()
     expect(screen.getByText("· 10")).toBeInTheDocument()
+  })
+
+  it("renders tabs as plain buttons without tab ARIA semantics", () => {
+    const onChange = vi.fn()
+
+    render(
+      <Tabs
+        tabs={[
+          { id: "active", label: "Active" },
+          { id: "blocked", label: "Blocked", count: 1, disabled: true },
+        ]}
+        value="active"
+        onChange={onChange}
+      />,
+    )
+
+    expect(screen.queryByRole("tablist")).not.toBeInTheDocument()
+    expect(screen.queryByRole("tab", { name: /active/i })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /blocked/i }))
+
+    expect(onChange).not.toHaveBeenCalled()
   })
 })

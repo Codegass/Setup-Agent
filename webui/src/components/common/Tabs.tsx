@@ -29,7 +29,6 @@ export function Tabs({ tabs, value, onChange, className, ...props }: TabsProps) 
   return (
     <div
       className={cn("flex items-center gap-1 border-b border-slate-200", className)}
-      role="tablist"
       {...props}
     >
       {tabs.map((tab) => {
@@ -41,16 +40,18 @@ export function Tabs({ tabs, value, onChange, className, ...props }: TabsProps) 
         return (
           <button
             key={id}
-            aria-selected={active}
             className={cn(
               "relative -mb-px flex items-center gap-1.5 px-3 py-2 text-[13px] font-medium transition-colors",
               active ? "text-primary" : "text-slate-500 hover:text-slate-800",
               disabled && "cursor-not-allowed opacity-50 hover:text-slate-500",
             )}
             disabled={disabled}
-            role="tab"
             type="button"
-            onClick={() => onChange(id)}
+            onClick={() => {
+              if (!disabled) {
+                onChange(id)
+              }
+            }}
           >
             {tabLabel(tab)}
             {count != null ? (

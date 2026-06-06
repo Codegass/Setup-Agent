@@ -103,7 +103,7 @@ export interface ContextMap {
   trunk: {
     goal: string
     state: string
-    progress: { done: number; total: number }
+    progress: Record<string, number>
     summary: string
   }
   tasks: Array<{
@@ -118,10 +118,17 @@ export interface ContextMap {
     task: string
     why: string
     memory: string[]
-    lastRefs: Array<{ label: string; ref: string }>
+    lastRefs: Array<Record<string, string>>
     pressure: number
   }
   debug: Record<string, unknown>
+}
+
+export interface SubmitTaskResponse {
+  workspace_id: string
+  session_id: string
+  source_session: string | null
+  status: string
 }
 
 export interface ReportDocument {
