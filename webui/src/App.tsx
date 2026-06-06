@@ -1,32 +1,43 @@
 import { useCallback, useEffect, useState } from "react"
 
-import { fetchDashboard } from "@/api/client"
-import type { DashboardResponse } from "@/api/types"
+import { fetchDashboard, fetchSession, submitTask } from "@/api/client"
+import type {
+  BuildSummary,
+  DashboardResponse,
+  ExecutionSessionDetail,
+  SubmitTaskResponse,
+  WorkspaceSummary,
+} from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
 import { Dashboard } from "@/pages/Dashboard"
+import { SessionDetail } from "@/pages/SessionDetail"
+import { Workspace, type WorkspaceSessionRow } from "@/pages/Workspace"
 
 type Route =
   | { view: "dashboard" }
-  | { view: "workspace"; workspaceId: string }
+  | { view: "workspace"; workspaceId: string; newTaskSourceSession?: string | null }
   | { view: "session"; workspaceId: string; sessionId: string; tab?: string }
 
 export function App() {
   const [route, setRoute] = useState<Route>({ view: "dashboard" })
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [dashboardError, setDashboardError] = useState<string | null>(null)
+  const [routeError, setRouteError] = useState<string | null>(null)
+  const [sessionDetails, setSessionDetails] = useState<Record<string, ExecutionSessionDetail>>({})
+  const [sessionLoading, setSessionLoading] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   const loadDashboard = useCallback(async () => {
     setLoading(true)
-    setError(null)
+    setDashboardError(null)
 
     try {
       const nextDashboard = await fetchDashboard()
       setDashboard(nextDashboard)
     } catch (err) {
-      setError(String(err))
+      setDashboardError(String(err))
     } finally {
       setLoading(false)
     }
@@ -36,10 +47,61 @@ export function App() {
     void loadDashboard()
   }, [loadDashboard])
 
-  const openDashboard = () => setRoute({ view: "dashboard" })
-  const openWorkspace = (workspaceId: string) => setRoute({ view: "workspace", workspaceId })
+  const ensureSessionDetail = useCallback(async (sessionId: string) => {
+    setSessionLoading(sessionId)
+    setRouteError(null)
+
+    try {
+      const detail = await fetchSession(sessionId)
+      setSessionDetails((current) => ({ ...current, [sessionId]: detail }))
+    } catch (err) {
+      setRouteError(String(err))
+    } finally {
+      setSessionLoading((current) => (current === sessionId ? null : current))
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!dashboard) {
+      return
+    }
+
+    if (route.view === "session") {
+      void ensureSessionDetail(route.sessionId)
+      return
+    }
+
+    if (route.view === "workspace") {
+      const workspace = dashboard.workspaces.find((candidate) => candidate.id === route.workspaceId)
+      if (workspace?.latestSession) {
+        void ensureSessionDetail(workspace.latestSession)
+      }
+    }
+  }, [dashboard, ensureSessionDetail, route])
+
+  const openDashboard = () => {
+    setRouteError(null)
+    setRoute({ view: "dashboard" })
+  }
+  const openWorkspace = (workspaceId: string) => {
+    setRouteError(null)
+    setRoute({ view: "workspace", workspaceId })
+  }
   const openSession = (workspaceId: string, sessionId: string, tab?: string) =>
     setRoute({ view: "session", workspaceId, sessionId, tab })
+  const openTaskFromSession = (workspaceId: string, sourceSession: string) => {
+    setRouteError(null)
+    setRoute({ view: "workspace", workspaceId, newTaskSourceSession: sourceSession })
+  }
+
+  const submitWorkspaceTask = async (
+    workspaceId: string,
+    task: string,
+    sourceSession?: string,
+  ): Promise<SubmitTaskResponse> => {
+    setRouteError(null)
+    return submitTask(workspaceId, task, sourceSession)
+  }
 
   return (
     <div className="min-h-screen bg-[#fbfbfc] text-slate-900">
@@ -94,11 +156,11 @@ export function App() {
         </main>
       ) : null}
 
-      {!dashboard && !loading && error ? (
+      {!dashboard && !loading && dashboardError ? (
         <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
           <Card className="max-w-xl p-5">
             <div className="text-[15px] font-semibold text-slate-900">Dashboard unavailable</div>
-            <div className="mt-2 font-mono text-[12px] text-red-600">{error}</div>
+            <div className="mt-2 font-mono text-[12px] text-red-600">{dashboardError}</div>
             <Button className="mt-4" onClick={loadDashboard} type="button" variant="outline">
               Retry
             </Button>
@@ -106,16 +168,25 @@ export function App() {
         </main>
       ) : null}
 
-      {dashboard && error ? (
+      {dashboard && dashboardError ? (
         <div className="mx-auto max-w-[1180px] px-4 pt-5 sm:px-6 lg:px-8">
           <Card className="flex flex-col gap-3 border-red-100 bg-red-50/50 px-4 py-3 text-[13px] sm:flex-row sm:items-center sm:justify-between">
             <div>
               <div className="font-semibold text-red-700">Refresh failed</div>
-              <div className="mt-0.5 font-mono text-[12px] text-red-600">{error}</div>
+              <div className="mt-0.5 font-mono text-[12px] text-red-600">{dashboardError}</div>
             </div>
             <Button onClick={loadDashboard} type="button" variant="outline">
               Retry
             </Button>
+          </Card>
+        </div>
+      ) : null}
+
+      {dashboard && routeError ? (
+        <div className="mx-auto max-w-[1180px] px-4 pt-5 sm:px-6 lg:px-8">
+          <Card className="border-amber-100 bg-amber-50/50 px-4 py-3 text-[13px]">
+            <div className="font-semibold text-amber-700">Workspace data unavailable</div>
+            <div className="mt-0.5 font-mono text-[12px] text-amber-700">{routeError}</div>
           </Card>
         </div>
       ) : null}
@@ -131,22 +202,159 @@ export function App() {
       ) : null}
 
       {dashboard && route.view === "workspace" ? (
-        <PlaceholderView
-          label="workspace"
-          title={route.workspaceId}
-          detail="Workspace shell"
+        <WorkspaceRoute
+          dashboard={dashboard}
+          initialTaskSourceSession={route.newTaskSourceSession}
+          onBack={openDashboard}
+          onOpenSession={(sessionId, tab) => openSession(route.workspaceId, sessionId, tab)}
+          onSubmitTask={submitWorkspaceTask}
+          route={route}
+          sessionDetails={sessionDetails}
         />
       ) : null}
 
       {dashboard && route.view === "session" ? (
-        <PlaceholderView
-          label={route.tab ?? "session"}
-          title={route.sessionId}
-          detail={route.workspaceId}
+        <SessionRoute
+          detail={sessionDetails[route.sessionId]}
+          loading={sessionLoading === route.sessionId}
+          onBack={() => openWorkspace(route.workspaceId)}
+          onNewTask={(sourceSession) => openTaskFromSession(route.workspaceId, sourceSession)}
+          route={route}
         />
       ) : null}
     </div>
   )
+}
+
+function WorkspaceRoute({
+  dashboard,
+  route,
+  sessionDetails,
+  initialTaskSourceSession,
+  onBack,
+  onOpenSession,
+  onSubmitTask,
+}: {
+  dashboard: DashboardResponse
+  route: Extract<Route, { view: "workspace" }>
+  sessionDetails: Record<string, ExecutionSessionDetail>
+  initialTaskSourceSession?: string | null
+  onBack: () => void
+  onOpenSession: (sessionId: string, tab?: string) => void
+  onSubmitTask: (
+    workspaceId: string,
+    task: string,
+    sourceSession?: string,
+  ) => Promise<SubmitTaskResponse>
+}) {
+  const workspace = dashboard.workspaces.find((candidate) => candidate.id === route.workspaceId)
+
+  if (!workspace) {
+    return (
+      <PlaceholderView
+        detail="Workspace was not returned by /api/workspaces."
+        label="workspace"
+        title={route.workspaceId}
+      />
+    )
+  }
+
+  const latest = workspace.latestSession ? sessionDetails[workspace.latestSession] : null
+  const sessions = sessionRows(workspace, sessionDetails)
+
+  return (
+    <Workspace
+      initialTaskSourceSession={initialTaskSourceSession}
+      latest={latest}
+      onBack={onBack}
+      onOpenSession={onOpenSession}
+      onSubmitTask={onSubmitTask}
+      sessions={sessions}
+      workspace={workspace}
+    />
+  )
+}
+
+function SessionRoute({
+  route,
+  detail,
+  loading,
+  onBack,
+  onNewTask,
+}: {
+  route: Extract<Route, { view: "session" }>
+  detail?: ExecutionSessionDetail
+  loading: boolean
+  onBack: () => void
+  onNewTask: (sourceSession: string) => void
+}) {
+  if (!detail) {
+    return (
+      <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+        <Card className="inline-flex px-3 py-2 text-[13px] text-slate-500">
+          {loading ? `Loading session ${route.sessionId}...` : `Session ${route.sessionId} unavailable`}
+        </Card>
+      </main>
+    )
+  }
+
+  return (
+    <SessionDetail
+      detail={detail}
+      initialTab={route.tab}
+      onBack={onBack}
+      onNewTask={onNewTask}
+    />
+  )
+}
+
+function sessionRows(
+  workspace: WorkspaceSummary,
+  sessionDetails: Record<string, ExecutionSessionDetail>,
+): WorkspaceSessionRow[] {
+  const ids = [workspace.activeSession, workspace.latestSession].filter(
+    (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
+  )
+
+  return ids.map((id) => {
+    const detail = sessionDetails[id]
+
+    if (detail) {
+      return {
+        id,
+        title: detail.title,
+        status: detail.status,
+        entry: detail.entry,
+        start: detail.start,
+        duration: detail.duration,
+        build: detail.build,
+        test: detail.test,
+        evidenceCount: detail.evidence.length,
+        filesCount: detail.files?.items.length ?? null,
+      }
+    }
+
+    return {
+      id,
+      title: workspace.task,
+      status: workspace.activeSession === id ? "active" : "latest",
+      entry: "SAG",
+      start: workspace.updated,
+      duration: "unknown",
+      build: normalizeWorkspaceBuild(workspace.build),
+      test: workspace.test,
+      evidenceCount: null,
+      filesCount: workspace.changed,
+    }
+  })
+}
+
+function normalizeWorkspaceBuild(build: WorkspaceSummary["build"]): BuildSummary {
+  if (typeof build === "string") {
+    return { state: build, tool: "", time: "", note: "" }
+  }
+
+  return build
 }
 
 function Breadcrumb({
