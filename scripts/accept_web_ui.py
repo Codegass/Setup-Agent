@@ -74,6 +74,23 @@ PRODUCT_BOUNDARY_PATTERNS = {
     "file digest snapshot": ("webui/src/components/session/FilesDigest.tsx", "snapshot"),
 }
 
+WORKSPACE_SESSION_PATTERNS = {
+    "session status tab": ("webui/src/pages/SessionDetail.tsx", "Status"),
+    "session evidence tab": ("webui/src/pages/SessionDetail.tsx", "Evidence"),
+    "session context tab": ("webui/src/pages/SessionDetail.tsx", "Context"),
+    "session files tab": ("webui/src/pages/SessionDetail.tsx", "Files"),
+    "session report tab": ("webui/src/pages/SessionDetail.tsx", "Report"),
+    "session logs tab": ("webui/src/pages/SessionDetail.tsx", "Logs"),
+    "session starts new task": ("webui/src/pages/SessionDetail.tsx", "New task from this"),
+    "workspace overview tab": ("webui/src/pages/Workspace.tsx", "Overview"),
+    "workspace sessions tab": ("webui/src/pages/Workspace.tsx", "Sessions"),
+    "workspace terminal tab": ("webui/src/pages/Workspace.tsx", "Terminal"),
+    "workspace settings tab": ("webui/src/pages/Workspace.tsx", "Settings"),
+    "workspace creates tasks": ("webui/src/pages/Workspace.tsx", "New task"),
+    "app fetches session detail": ("webui/src/App.tsx", "fetchSession"),
+    "app submits workspace tasks": ("webui/src/App.tsx", "submitTask"),
+}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -93,6 +110,7 @@ def main() -> int:
     print(f"accept_web_ui phase={args.phase}")
 
     check_phase_files(args.phase, failures)
+    check_phase_patterns(args.phase, failures)
     if args.phase == "final":
         require_patterns(PRODUCT_BOUNDARY_PATTERNS, failures)
 
@@ -130,6 +148,11 @@ def check_phase_files(phase: str, failures: list[str]) -> None:
         require_files(FRONTEND_FILES, failures)
     if phase == "final":
         require_files(["src/sag/web/static/index.html"], failures)
+
+
+def check_phase_patterns(phase: str, failures: list[str]) -> None:
+    if phase == "workspace-session":
+        require_patterns(WORKSPACE_SESSION_PATTERNS, failures)
 
 
 def require_patterns(patterns: dict[str, tuple[str, str]], failures: list[str]) -> None:

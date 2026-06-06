@@ -72,6 +72,40 @@ def test_workspace_session_phase_reports_missing_session_components(tmp_path, mo
     assert not any("TerminalPanel.tsx" in failure for failure in failures)
 
 
+def test_workspace_session_phase_checks_task_fifteen_patterns(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    for path in module.FRONTEND_SESSION_FILES:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+
+    for _label, (path, pattern) in module.WORKSPACE_SESSION_PATTERNS.items():
+        target = tmp_path / path
+        target.write_text(target.read_text(encoding="utf-8") + f"\n{pattern}\n", encoding="utf-8")
+
+    failures: list[str] = []
+
+    module.check_phase_patterns("workspace-session", failures)
+
+    assert failures == []
+
+
+def test_workspace_session_phase_reports_missing_task_fifteen_patterns(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    target = tmp_path / "webui/src/App.tsx"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("fetchSession\n", encoding="utf-8")
+
+    failures: list[str] = []
+
+    module.check_phase_patterns("workspace-session", failures)
+
+    assert "missing product-boundary pattern app submits workspace tasks: submitTask" in failures
+
+
 def test_backend_web_tests_are_expanded_to_concrete_paths(tmp_path, monkeypatch):
     module = load_acceptance_module()
     tests_dir = tmp_path / "tests"
