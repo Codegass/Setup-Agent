@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 
 from sag.web.read_model import ReadModelBuilder
+from sag.web.task_runner import TaskRequest, TaskRunner
 
 
 def _single_snapshot(payload: dict) -> Iterator[str]:
@@ -16,13 +17,21 @@ def _single_snapshot(payload: dict) -> Iterator[str]:
     yield f"data: {json.dumps(payload)}\n\n"
 
 
-def create_app(read_model: ReadModelBuilder | None = None) -> FastAPI:
+def create_app(
+    read_model: ReadModelBuilder | None = None,
+    task_runner: TaskRunner | None = None,
+) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
+    runner = task_runner if task_runner is not None else TaskRunner()
     app = FastAPI(title="SAG Workbench", version="0.1.0")
 
     @app.get("/api/workspaces")
     def get_workspaces() -> dict:
         return builder.dashboard().model_dump(mode="json", by_alias=True)
+
+    @app.post("/api/workspaces/{workspace_id}/tasks", status_code=202)
+    def submit_task(workspace_id: str, request: TaskRequest) -> dict:
+        return runner.submit(workspace_id, request)
 
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict:

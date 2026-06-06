@@ -8,6 +8,20 @@ from sag.web.demo_data import build_demo_dashboard, get_demo_session
 from sag.web.read_model import ReadModelBuilder
 
 
+class FakeTaskRunner:
+    def __init__(self):
+        self.calls = []
+
+    def submit(self, workspace_id, request):
+        self.calls.append((workspace_id, request))
+        return {
+            "workspace_id": workspace_id,
+            "session_id": "RUN-1",
+            "source_session": request.source_session,
+            "status": "queued",
+        }
+
+
 def test_dashboard_endpoint_returns_workspaces():
     app = create_app(ReadModelBuilder(demo_mode=True))
     client = TestClient(app)
@@ -16,6 +30,35 @@ def test_dashboard_endpoint_returns_workspaces():
 
     assert response.status_code == 200
     assert response.json()["workspaces"][0]["id"] == "sag-commons-cli"
+
+
+def test_submit_task_is_workspace_scoped():
+    task_runner = FakeTaskRunner()
+    app = create_app(ReadModelBuilder(demo_mode=True), task_runner=task_runner)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspaces/sag-commons-cli/tasks",
+        json={"task": "Run formatter tests", "source_session": "CC-3"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["workspace_id"] == "sag-commons-cli"
+    assert response.json()["source_session"] == "CC-3"
+    assert task_runner.calls[0][0] == "sag-commons-cli"
+    assert task_runner.calls[0][1].task == "Run formatter tests"
+
+
+def test_submit_task_rejects_blank_task():
+    app = create_app(ReadModelBuilder(demo_mode=True), task_runner=FakeTaskRunner())
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspaces/sag-commons-cli/tasks",
+        json={"task": ""},
+    )
+
+    assert response.status_code == 422
 
 
 def test_session_endpoint_returns_session_detail():
