@@ -122,6 +122,7 @@ class SetupAgent:
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.context_tool import ContextTool
+        from sag.tools.env_tool import EnvTool
         from sag.tools.file_io import FileIOTool
         from sag.tools.gradle_tool import GradleTool
         from sag.tools.maven_tool import MavenTool
@@ -156,6 +157,7 @@ class SetupAgent:
             GradleTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
+            EnvTool(self.orchestrator),
             ProjectAnalyzerTool(self.orchestrator, self.context_manager),
             OutputSearchTool(
                 orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir
