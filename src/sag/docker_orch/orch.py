@@ -16,6 +16,19 @@ from sag.config import get_config
 
 
 ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
+UNKNOWN_EXIT_FAILURE_MARKERS = (
+    "BUILD FAILURE",
+    "BUILD FAILED",
+    "Could not resolve",
+    "Compilation failure",
+    "not in the allowed range",
+)
+
+
+def _has_unknown_exit_failure_marker(output: str) -> bool:
+    """Return True when unknown-exit output contains an explicit terminal failure marker."""
+    normalized_output = output.casefold()
+    return any(marker.casefold() in normalized_output for marker in UNKNOWN_EXIT_FAILURE_MARKERS)
 
 
 class DockerOrchestrator:
@@ -917,16 +930,19 @@ class DockerOrchestrator:
                     last_chunk_time = current_time
                     monitoring_state["last_output_time"] = current_time
 
+            # Combine all output
+            full_output = "".join(output_buffer)
+
             # Get final execution result
             exit_code = exec_result.exit_code
 
-            # For streaming execution, exit_code might be None until stream is fully consumed
+            # For streaming execution, Docker can leave exit_code unknown after the stream ends.
             if exit_code is None:
-                # If we got output without errors, assume success
-                exit_code = 0
-
-            # Combine all output
-            full_output = "".join(output_buffer)
+                if _has_unknown_exit_failure_marker(full_output):
+                    logger.warning("Command failure inferred from unknown-exit output")
+                    exit_code = 1
+                else:
+                    exit_code = 0
 
             # Apply truncation if needed
             if len(full_output) > 10000:

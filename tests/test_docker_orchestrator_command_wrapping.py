@@ -11,8 +11,9 @@ class FakeExecResult:
 
 
 class FakeStreamingExecResult:
-    exit_code = 0
-    output = iter(())
+    def __init__(self, exit_code=0, output=()):
+        self.exit_code = exit_code
+        self.output = iter(output)
 
 
 class FakeContainer:
@@ -110,6 +111,41 @@ def test_execute_command_with_monitoring_sources_env_overlay_before_cd_and_comma
         "source ~/.bashrc 2>/dev/null || true; "
         f"cd {shlex.quote(workdir)} && echo hi"
     )
+
+
+def test_execute_command_with_monitoring_treats_unknown_exit_build_failure_as_failure():
+    container = FakeContainer(
+        FakeStreamingExecResult(
+            exit_code=None,
+            output=[(b"[ERROR] BUILD FAILURE\nCould not resolve dependency\n", b"")],
+        )
+    )
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command_with_monitoring(
+        "mvn test",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is False
+    assert result["exit_code"] == 1
+
+
+def test_execute_command_with_monitoring_treats_unknown_exit_ordinary_output_as_success():
+    container = FakeContainer(
+        FakeStreamingExecResult(exit_code=None, output=[(b"[INFO] BUILD SUCCESS\n", b"")])
+    )
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command_with_monitoring(
+        "mvn test",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is True
+    assert result["exit_code"] == 0
 
 
 def test_execute_command_with_monitoring_preserves_quoted_workdir_in_timeout_wrapper():
