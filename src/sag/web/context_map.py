@@ -20,7 +20,7 @@ class ContextMapBuilder:
         trunk_data = self._read_json(trunk_path)
         raw_tasks = trunk_data.get("todo_list") or trunk_data.get("tasks") or []
         tasks = [self._task(item, index) for index, item in enumerate(raw_tasks, start=1)]
-        active = next((task for task in tasks if task.status == "active"), None)
+        active = next((task for task in tasks if self._is_active_status(task.status)), None)
         active_branch = self._active_branch(active.id if active else None)
         done = sum(1 for task in tasks if task.status == "completed")
 
@@ -53,12 +53,20 @@ class ContextMapBuilder:
         task_id = str(item.get("id") or item.get("task_id") or f"T{index}")
         return ContextTask(
             id=task_id,
-            title=str(item.get("task") or item.get("title") or "Untitled task"),
+            title=str(
+                item.get("task")
+                or item.get("title")
+                or item.get("description")
+                or "Untitled task"
+            ),
             status=str(item.get("status") or "pending"),
             summary=str(item.get("summary") or ""),
             refs=[str(ref) for ref in item.get("refs", [])],
             recovered=bool(item.get("recovered", False)),
         )
+
+    def _is_active_status(self, status: str) -> bool:
+        return status in {"active", "in_progress"}
 
     def _active_branch(self, task_id: str | None) -> ActiveBranchSummary:
         if task_id is None:

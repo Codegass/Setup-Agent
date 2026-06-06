@@ -51,3 +51,47 @@ def test_context_map_builder_creates_trunk_branch_abstraction(tmp_path: Path):
     assert ctx.tasks[1].status == "active"
     assert ctx.active_branch.task == "Run tests"
     assert ctx.debug["trunk"].endswith("trunk_commons.json")
+
+
+def test_context_map_builder_uses_real_sag_in_progress_description_fields(tmp_path: Path):
+    contexts = tmp_path / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    (contexts / "trunk_commons.json").write_text(
+        json.dumps(
+            {
+                "project_goal": "Set up pytest plugin",
+                "state": "running",
+                "tasks": [
+                    {
+                        "id": "T1",
+                        "description": "Prepare repository",
+                        "status": "completed",
+                    },
+                    {
+                        "id": "T2",
+                        "description": "Run integration tests",
+                        "status": "in_progress",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (contexts / "task_T2.json").write_text(
+        json.dumps(
+            {
+                "task": "Run integration tests",
+                "why": "Validate setup against the real project.",
+                "memory": ["uv run pytest tests/integration"],
+                "last_refs": [{"label": "integration.log", "ref": "logs/integration.log"}],
+                "pressure": 0.7,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = ContextMapBuilder(contexts).build()
+
+    assert ctx.tasks[1].status == "in_progress"
+    assert ctx.tasks[1].title == "Run integration tests"
+    assert ctx.active_branch.task == "Run integration tests"
