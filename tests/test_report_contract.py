@@ -1,3 +1,5 @@
+import json
+
 from sag.tools.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool
 
@@ -15,11 +17,53 @@ class FakeReplayOrchestrator:
 
 
 class FakeReportOverlayOrchestrator:
-    def __init__(self, files=None):
+    def __init__(self, files=None, unreadable_paths=None):
         self.files = files or {}
+        self.unreadable_paths = set(unreadable_paths or [])
 
     def read_file(self, path):
+        if path in self.unreadable_paths:
+            return {"success": False, "content": "", "exit_code": 1}
         return {"success": True, "content": self.files.get(path, ""), "exit_code": 0}
+
+
+def _generate_report_with_overlay(overlay_json=None, unreadable_paths=None):
+    files = {}
+    if overlay_json is not None:
+        files["/workspace/.setup_agent/env_overlay.json"] = overlay_json
+    tool = ReportTool(
+        docker_orchestrator=FakeReportOverlayOrchestrator(
+            files,
+            unreadable_paths=unreadable_paths,
+        )
+    )
+
+    return tool._generate_markdown_report(
+        "done",
+        "success",
+        None,
+        "2026-06-06 12:00:00",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+        {
+            "repository_cloned": True,
+            "build_success": True,
+            "test_success": True,
+            "physical_validation": {
+                "test_analysis": {
+                    "total_tests": 1,
+                    "passed_tests": 1,
+                    "pass_rate": 100,
+                }
+            },
+        },
+        {},
+        {
+            "status": {"overall": "success", "tests_total": 1, "tests_passed": 1},
+            "phases": {"clone": True, "build": True, "test": True},
+            "physical_evidence": {},
+            "attention": {"raw": []},
+        },
+    )
 
 
 def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
@@ -105,44 +149,106 @@ def test_markdown_report_includes_runtime_env_overlay_evidence():
       }
     }
     """
-    tool = ReportTool(
-        docker_orchestrator=FakeReportOverlayOrchestrator(
-            {"/workspace/.setup_agent/env_overlay.json": overlay_json}
-        )
-    )
-
-    report = tool._generate_markdown_report(
-        "done",
-        "success",
-        None,
-        "2026-06-06 12:00:00",
-        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
-        {
-            "repository_cloned": True,
-            "build_success": True,
-            "test_success": True,
-            "physical_validation": {
-                "test_analysis": {
-                    "total_tests": 1,
-                    "passed_tests": 1,
-                    "pass_rate": 100,
-                }
-            },
-        },
-        {},
-        {
-            "status": {"overall": "success", "tests_total": 1, "tests_passed": 1},
-            "phases": {"clone": True, "build": True, "test": True},
-            "physical_evidence": {},
-            "attention": {"raw": []},
-        },
-    )
+    report = _generate_report_with_overlay(overlay_json)
 
     assert "## Runtime Environment Overlay Evidence" in report
     assert "runtime command evidence, not project source configuration" in report
     assert "| maven | `/opt/apache-maven-3.9.9/bin/mvn` | 3.9.9 | agent_registered |" in report
     assert "| maven | `/usr/bin/mvn` | 3.6.3 | [3.9,) | Project requires Maven 3.9+ | build_error |" in report
     assert "| gradle | `/usr/bin/gradle` | 7.4 | >=8 | Wrapper requires Gradle 8+ | build_error |" in report
+
+
+def test_markdown_report_skips_inactive_only_runtime_env_overlay_evidence():
+    overlay_json = """
+    {
+      "version": 1,
+      "tools": {
+        "maven": {
+          "candidates": {
+            "/opt/apache-maven-3.9.9/bin/mvn": {
+              "version": "3.9.9",
+              "source": "agent_registered",
+              "env": {},
+              "path_prepend": ["/opt/apache-maven-3.9.9/bin"]
+            }
+          },
+          "blocked": []
+        }
+      }
+    }
+    """
+
+    report = _generate_report_with_overlay(overlay_json)
+
+    assert "## Runtime Environment Overlay Evidence" not in report
+    assert "No active overlay executables recorded" not in report
+
+
+def test_markdown_report_caps_blocked_runtime_env_overlay_candidates():
+    blocked = []
+    for index in range(7):
+        blocked.append(
+            {
+                "executable": f"/usr/bin/mvn-{index}",
+                "version": f"3.6.{index}",
+                "requirement": "[3.9,)",
+                "reason": f"Project requires Maven 3.9+ reason-{index}",
+                "source": "build_error",
+            }
+        )
+    overlay_json = {
+        "version": 1,
+        "tools": {
+            "maven": {
+                "candidates": {},
+                "blocked": blocked,
+            }
+        },
+    }
+
+    report = _generate_report_with_overlay(json.dumps(overlay_json))
+
+    assert "Project requires Maven 3.9+ reason-0" in report
+    assert "Project requires Maven 3.9+ reason-4" in report
+    assert "Project requires Maven 3.9+ reason-5" not in report
+    assert "Project requires Maven 3.9+ reason-6" not in report
+    assert "+2 more" in report
+
+
+def test_markdown_report_truncates_long_blocked_runtime_env_overlay_reasons():
+    long_reason = "Project requires Maven 3.9+ " + ("because " * 40)
+    overlay_json = {
+        "version": 1,
+        "tools": {
+            "maven": {
+                "candidates": {},
+                "blocked": [
+                    {
+                        "executable": "/usr/bin/mvn",
+                        "version": "3.6.3",
+                        "requirement": "[3.9,)",
+                        "reason": long_reason,
+                        "source": "build_error",
+                    }
+                ],
+            }
+        },
+    }
+
+    report = _generate_report_with_overlay(json.dumps(overlay_json))
+
+    assert "Project requires Maven 3.9+" in report
+    assert long_reason not in report
+    assert "..." in report
+
+
+def test_markdown_report_skips_unreadable_runtime_env_overlay():
+    report = _generate_report_with_overlay(
+        unreadable_paths={"/workspace/.setup_agent/env_overlay.json"}
+    )
+
+    assert "## Runtime Environment Overlay Evidence" not in report
+    assert "**Task completed. Setup Agent has finished.**" in report
 
 
 def test_replay_delegates_environment_handling_to_docker_orchestrator():

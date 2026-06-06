@@ -13,6 +13,10 @@ from sag.ui.events import EventType, UIEventEmitter
 from .base import BaseTool, ToolResult
 
 
+MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS = 5
+MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
+
+
 class ReportTool(BaseTool, UIEventEmitter):
     """
     Tool for generating comprehensive project setup reports and marking task completion.
@@ -2861,21 +2865,6 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         tools = overlay.get("tools", {}) or {}
         warnings = overlay.get("warnings", []) or []
-        has_tool_state = any(
-            entry.get("active") or entry.get("candidates") or entry.get("blocked")
-            for entry in tools.values()
-            if isinstance(entry, dict)
-        )
-        if not has_tool_state and not warnings:
-            return []
-
-        lines = [
-            "## Runtime Environment Overlay Evidence",
-            "",
-            "This is runtime command evidence, not project source configuration.",
-            "",
-        ]
-
         active_rows = []
         blocked_rows = []
         for tool_name, entry in sorted(tools.items()):
@@ -2903,10 +2892,20 @@ class ReportTool(BaseTool, UIEventEmitter):
                         f"`{blocked.get('executable', '')}`",
                         blocked.get("version"),
                         blocked.get("requirement"),
-                        blocked.get("reason"),
+                        self._truncate_overlay_reason(blocked.get("reason")),
                         blocked.get("source"),
                     ]
                 )
+
+        if not active_rows and not blocked_rows and not warnings:
+            return []
+
+        lines = [
+            "## Runtime Environment Overlay Evidence",
+            "",
+            "This is runtime command evidence, not project source configuration.",
+            "",
+        ]
 
         lines.extend(["### Active Tool Executables", ""])
         if active_rows:
@@ -2930,8 +2929,12 @@ class ReportTool(BaseTool, UIEventEmitter):
                     "|------|------------|---------|-------------|--------|--------|",
                 ]
             )
-            for row in blocked_rows:
+            visible_blocked_rows = blocked_rows[:MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS]
+            for row in visible_blocked_rows:
                 lines.append(self._markdown_table_row(row))
+            omitted_count = len(blocked_rows) - len(visible_blocked_rows)
+            if omitted_count > 0:
+                lines.append(f"- ... (+{omitted_count} more blocked candidates)")
         else:
             lines.append("- No blocked overlay candidates recorded.")
         lines.append("")
@@ -2945,6 +2948,17 @@ class ReportTool(BaseTool, UIEventEmitter):
             lines.append("")
 
         return lines
+
+    @staticmethod
+    def _truncate_overlay_reason(value: Any) -> Any:
+        if value is None:
+            return None
+
+        reason = str(value).replace("\n", " ").strip()
+        if len(reason) <= MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS:
+            return reason
+
+        return f"{reason[: MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS - 3].rstrip()}..."
 
     @staticmethod
     def _markdown_table_row(values: Iterable[Any]) -> str:
