@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.runtime import EnvOverlayStore
+
 from .base import BaseTool, ToolError, ToolResult
 
 
@@ -611,6 +613,7 @@ class SystemTool(BaseTool):
         )
 
         if verify_result["exit_code"] == 0:
+            self._register_java_runtime_overlay(java_home, java_version)
             return ToolResult(
                 success=True,
                 output=f"Successfully installed and configured Java {java_version}\n\n"
@@ -635,6 +638,23 @@ class SystemTool(BaseTool):
                     "Restart the shell or container to apply changes",
                 ],
             )
+
+    def _register_java_runtime_overlay(self, java_home: str, java_version: str) -> None:
+        """Register the Java runtime selected by a successful install."""
+        java_home = java_home.rstrip("/")
+        java_bin = f"{java_home}/bin/java"
+        try:
+            EnvOverlayStore(self.docker_orchestrator).register(
+                "java",
+                java_bin,
+                version=java_version,
+                source="system_install",
+                env={"JAVA_HOME": java_home},
+                path_prepend=[f"{java_home}/bin"],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register Java env overlay: {exc}")
 
     def _smart_install_commands(self, commands: List[str]) -> ToolResult:
         """
