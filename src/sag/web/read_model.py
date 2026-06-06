@@ -17,12 +17,8 @@ class ReadModelBuilder:
         session_registry: SessionRegistry | None = None,
         demo_mode: bool = False,
     ):
-        self.workspace_registry = (
-            workspace_registry if workspace_registry is not None else WorkspaceRegistry()
-        )
-        self.session_registry = (
-            session_registry if session_registry is not None else SessionRegistry()
-        )
+        self.workspace_registry: WorkspaceRegistry | None = workspace_registry
+        self.session_registry: SessionRegistry | None = session_registry
         self.demo_mode = demo_mode
 
     def dashboard(self) -> DashboardResponse:
@@ -30,6 +26,9 @@ class ReadModelBuilder:
             return build_demo_dashboard()
 
         try:
+            if self.workspace_registry is None:
+                self.workspace_registry = WorkspaceRegistry()
+
             workspaces = self.workspace_registry.list_workspaces()
         except Exception:
             logger.exception("Failed to build SAG Workbench dashboard")

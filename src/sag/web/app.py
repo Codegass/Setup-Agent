@@ -17,7 +17,7 @@ def _single_snapshot(payload: dict) -> Iterator[str]:
 
 
 def create_app(read_model: ReadModelBuilder | None = None) -> FastAPI:
-    builder = read_model or ReadModelBuilder()
+    builder = read_model if read_model is not None else ReadModelBuilder()
     app = FastAPI(title="SAG Workbench", version="0.1.0")
 
     @app.get("/api/workspaces")
