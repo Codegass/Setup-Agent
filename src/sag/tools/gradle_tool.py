@@ -326,22 +326,8 @@ class GradleTool(BaseTool):
         return None
 
     def _install_gradle(self, working_directory: str) -> ToolResult:
-        """Install Gradle or create wrapper."""
+        """Install Gradle."""
         logger.info("Installing Gradle...")
-
-        # First try to create a Gradle wrapper if we have a build file
-        build_file_exists = self._validate_build_file_exists(working_directory, None)
-        if build_file_exists["exists"]:
-            # Try to generate wrapper using system gradle
-            wrapper_cmd = (
-                "apt-get update && apt-get install -y gradle && "
-                "gradle wrapper --gradle-version=7.6"
-            )
-            result = self.orchestrator.execute_command(
-                wrapper_cmd, workdir=working_directory, timeout=300
-            )
-            if result.get("exit_code") == 0:
-                return ToolResult(success=True, output="✅ Gradle wrapper created successfully")
 
         # Install system Gradle
         install_cmd = "apt-get update && " "apt-get install -y gradle"

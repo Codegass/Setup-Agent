@@ -169,6 +169,8 @@ class MavenTool(BaseTool):
                 required_version=required_version,
                 working_directory=working_directory,
             )
+        if self.toolchain_manager and not resolved_maven:
+            return self._maven_executable_not_resolved_result(working_directory)
 
         # Check if Maven is installed, install if not
         if not resolved_maven and not self._is_maven_installed():
@@ -655,6 +657,20 @@ class MavenTool(BaseTool):
                     "kind": required_version.kind,
                 },
             },
+        )
+
+    def _maven_executable_not_resolved_result(self, working_directory: str) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output="",
+            error="No Maven executable could be resolved by the toolchain manager",
+            error_code="MAVEN_EXECUTABLE_NOT_RESOLVED",
+            suggestions=[
+                "Register a Maven executable with the toolchain manager",
+                "Commit and use the project Maven wrapper",
+                "Check whether the active environment overlay blocks the available Maven executable",
+            ],
+            metadata={"working_directory": working_directory},
         )
 
     @staticmethod

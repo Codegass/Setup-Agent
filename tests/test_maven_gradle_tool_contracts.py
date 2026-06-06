@@ -217,6 +217,31 @@ def test_gradle_does_not_run_path_gradle_when_manager_cannot_resolve():
     )
 
 
+def test_gradle_real_install_path_does_not_generate_wrapper_with_unresolved_manager():
+    orchestrator = FakeBuildToolOrchestrator()
+    tool = GradleTool(orchestrator, toolchain_manager=EmptyToolchainManager())
+
+    result = tool.execute(
+        tasks="build",
+        working_directory="/workspace/project",
+        use_wrapper=False,
+    )
+
+    assert result.success is False
+    assert result.error_code == "GRADLE_EXECUTABLE_NOT_RESOLVED"
+    assert any(
+        "apt-get install -y gradle" in command
+        for command, _workdir, _timeout in orchestrator.commands
+    )
+    assert all(
+        "gradle wrapper" not in command
+        for command, _workdir, _timeout in orchestrator.commands
+    )
+    assert all(
+        not command.startswith("gradle ") for command, _kwargs in orchestrator.monitored_commands
+    )
+
+
 def test_maven_tool_preserves_list_properties_when_fail_at_end_adds_ignore():
     orchestrator = FakeBuildToolOrchestrator()
     tool = MavenTool(orchestrator)
@@ -337,6 +362,25 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
         "source": "tool_parameter",
         "kind": "exact",
     }
+
+
+def test_maven_tool_does_not_use_raw_path_when_manager_cannot_resolve_default_version():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = EmptyToolchainManager()
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is False
+    assert result.error_code == "MAVEN_EXECUTABLE_NOT_RESOLVED"
+    assert orchestrator.monitored_commands == []
+    assert all(
+        command != "which mvn" for command, _workdir, _timeout in orchestrator.commands
+    )
+    assert toolchain_manager.seen_spec.version_requirement is None
 
 
 def test_gradle_uses_active_env_overlay_candidate():
