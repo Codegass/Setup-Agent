@@ -38,6 +38,40 @@ def test_acceptance_script_rejects_unknown_phase():
     assert "invalid choice" in result.stderr
 
 
+def test_workspace_session_phase_checks_task_fifteen_files_without_terminal(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    for path in module.BACKEND_FILES + module.FRONTEND_SESSION_FILES:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+
+    failures: list[str] = []
+
+    module.check_phase_files("workspace-session", failures)
+
+    assert failures == []
+
+
+def test_workspace_session_phase_reports_missing_session_components(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    for path in module.BACKEND_FILES:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+
+    failures: list[str] = []
+
+    module.check_phase_files("workspace-session", failures)
+
+    assert "missing required file: webui/src/pages/Workspace.tsx" in failures
+    assert "missing required file: webui/src/pages/SessionDetail.tsx" in failures
+    assert not any("TerminalPanel.tsx" in failure for failure in failures)
+
+
 def test_backend_web_tests_are_expanded_to_concrete_paths(tmp_path, monkeypatch):
     module = load_acceptance_module()
     tests_dir = tmp_path / "tests"

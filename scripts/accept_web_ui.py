@@ -38,10 +38,30 @@ FRONTEND_FILES = [
     "webui/src/pages/Dashboard.tsx",
     "webui/src/pages/Workspace.tsx",
     "webui/src/pages/SessionDetail.tsx",
+    "webui/src/components/session/BuildCard.tsx",
+    "webui/src/components/session/TestCard.tsx",
     "webui/src/components/session/EvidenceTimeline.tsx",
     "webui/src/components/session/ContextMap.tsx",
     "webui/src/components/session/FilesDigest.tsx",
+    "webui/src/components/session/ReportDoc.tsx",
+    "webui/src/components/session/LogsView.tsx",
     "webui/src/components/terminal/TerminalPanel.tsx",
+]
+
+FRONTEND_SESSION_FILES = [
+    "webui/package.json",
+    "webui/vite.config.ts",
+    "webui/src/App.tsx",
+    "webui/src/pages/Dashboard.tsx",
+    "webui/src/pages/Workspace.tsx",
+    "webui/src/pages/SessionDetail.tsx",
+    "webui/src/components/session/BuildCard.tsx",
+    "webui/src/components/session/TestCard.tsx",
+    "webui/src/components/session/EvidenceTimeline.tsx",
+    "webui/src/components/session/ContextMap.tsx",
+    "webui/src/components/session/FilesDigest.tsx",
+    "webui/src/components/session/ReportDoc.tsx",
+    "webui/src/components/session/LogsView.tsx",
 ]
 
 
@@ -59,7 +79,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--phase",
-        choices=["skeleton", "backend", "frontend", "final"],
+        choices=["skeleton", "backend", "workspace-session", "frontend", "final"],
         required=True,
     )
     parser.add_argument(
@@ -72,12 +92,8 @@ def main() -> int:
     failures: list[str] = []
     print(f"accept_web_ui phase={args.phase}")
 
-    if args.phase in {"backend", "frontend", "final"}:
-        require_files(BACKEND_FILES, failures)
-    if args.phase in {"frontend", "final"}:
-        require_files(FRONTEND_FILES, failures)
+    check_phase_files(args.phase, failures)
     if args.phase == "final":
-        require_files(["src/sag/web/static/index.html"], failures)
         require_patterns(PRODUCT_BOUNDARY_PATTERNS, failures)
 
     if not args.skip_commands:
@@ -103,6 +119,17 @@ def require_files(paths: list[str], failures: list[str]) -> None:
     for path in paths:
         if not (ROOT / path).exists():
             failures.append(f"missing required file: {path}")
+
+
+def check_phase_files(phase: str, failures: list[str]) -> None:
+    if phase in {"backend", "frontend", "final"}:
+        require_files(BACKEND_FILES, failures)
+    if phase == "workspace-session":
+        require_files(FRONTEND_SESSION_FILES, failures)
+    if phase in {"frontend", "final"}:
+        require_files(FRONTEND_FILES, failures)
+    if phase == "final":
+        require_files(["src/sag/web/static/index.html"], failures)
 
 
 def require_patterns(patterns: dict[str, tuple[str, str]], failures: list[str]) -> None:
