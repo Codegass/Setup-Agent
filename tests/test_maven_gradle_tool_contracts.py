@@ -101,6 +101,34 @@ class EmptyToolchainManager:
         return None
 
 
+class SequencedToolchainManager:
+    def __init__(self, resolutions):
+        self.resolutions = list(resolutions)
+        self.seen_specs = []
+        self.seen_working_directories = []
+
+    def resolve(self, spec, working_directory="/workspace"):
+        self.seen_specs.append(spec)
+        self.seen_working_directories.append(working_directory)
+        if not self.resolutions:
+            return None
+
+        resolution = self.resolutions.pop(0)
+        if resolution is None:
+            return None
+
+        return ResolvedToolExecutable(
+            candidate=ToolExecutableCandidate(
+                name=spec.name,
+                executable=spec.executable,
+                path=resolution["path"],
+                version=resolution["version"],
+                source=resolution["source"],
+            ),
+            reason="test resolver",
+        )
+
+
 class VersionCommandOrchestrator(FakeBuildToolOrchestrator):
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
@@ -364,10 +392,58 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
     }
 
 
-def test_maven_tool_does_not_use_raw_path_when_manager_cannot_resolve_default_version():
+def test_maven_tool_installs_then_uses_resolved_default_executable():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = SequencedToolchainManager(
+        [
+            None,
+            {
+                "path": "/opt/apache-maven-3.9.9/bin/mvn",
+                "version": "3.9.9",
+                "source": "env_overlay",
+            },
+        ]
+    )
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    install_calls = []
+    tool._install_maven = lambda: install_calls.append(True) or ToolResult(
+        success=True,
+        output="Maven installed",
+    )
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is True
+    assert install_calls == [True]
+    assert len(toolchain_manager.seen_specs) == 2
+    assert toolchain_manager.seen_working_directories == [
+        "/workspace/project",
+        "/workspace/project",
+    ]
+    assert orchestrator.monitored_commands[0][0].startswith(
+        "/opt/apache-maven-3.9.9/bin/mvn "
+    )
+    assert not orchestrator.monitored_commands[0][0].startswith("mvn ")
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+        "version": "3.9.9",
+        "source": "env_overlay",
+    }
+
+
+def test_maven_tool_does_not_use_raw_path_after_install_when_manager_cannot_resolve_default_version():
     orchestrator = FakeBuildToolOrchestrator()
     toolchain_manager = EmptyToolchainManager()
     tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    install_calls = []
+    tool._install_maven = lambda: install_calls.append(True) or ToolResult(
+        success=True,
+        output="Maven installed",
+    )
 
     result = tool.execute(
         command="test",
@@ -376,10 +452,8 @@ def test_maven_tool_does_not_use_raw_path_when_manager_cannot_resolve_default_ve
 
     assert result.success is False
     assert result.error_code == "MAVEN_EXECUTABLE_NOT_RESOLVED"
+    assert install_calls == [True]
     assert orchestrator.monitored_commands == []
-    assert all(
-        command != "which mvn" for command, _workdir, _timeout in orchestrator.commands
-    )
     assert toolchain_manager.seen_spec.version_requirement is None
 
 

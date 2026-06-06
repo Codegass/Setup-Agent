@@ -169,19 +169,24 @@ class MavenTool(BaseTool):
                 required_version=required_version,
                 working_directory=working_directory,
             )
-        if self.toolchain_manager and not resolved_maven:
-            return self._maven_executable_not_resolved_result(working_directory)
 
-        # Check if Maven is installed, install if not
-        if not resolved_maven and not self._is_maven_installed():
-            install_result = self._install_maven()
-            if not install_result.success:
-                return install_result
-            resolved_maven = self._resolve_maven_executable(
-                working_directory=working_directory,
-                version_requirement=required_version,
-                prefer_wrapper=use_wrapper,
-            )
+        # Default Maven fallback installs once, then requires the manager to resolve a path.
+        if not resolved_maven:
+            if self.toolchain_manager:
+                install_result = self._install_maven()
+                if not install_result.success:
+                    return install_result
+                resolved_maven = self._resolve_maven_executable(
+                    working_directory=working_directory,
+                    version_requirement=required_version,
+                    prefer_wrapper=use_wrapper,
+                )
+                if not resolved_maven:
+                    return self._maven_executable_not_resolved_result(working_directory)
+            elif not self._is_maven_installed():
+                install_result = self._install_maven()
+                if not install_result.success:
+                    return install_result
 
         maven_executable = (
             resolved_maven.candidate.path
