@@ -24,6 +24,7 @@ from sag.config import (
 )
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.utils.git_utils import extract_project_name_from_url
+from sag.web.server import run_web_server
 
 console = Console()
 
@@ -609,6 +610,18 @@ def remove(docker_name, force):
     except Exception as e:
         logger.error(f"Remove project failed: {e}")
         console.print(f"[bold red]❌ Remove failed: {e}[/bold red]")
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host for the local web UI")
+@click.option("--port", default=0, show_default=True, type=int, help="Port for the local web UI")
+@click.option("--demo", is_flag=True, help="Use deterministic demo data instead of Docker discovery")
+def ui(host, port, demo):
+    """Start the local SAG Workbench web UI."""
+    console.print(
+        f"[bold blue]Starting SAG Workbench[/bold blue] on {host}:{port or 'auto'}"
+    )
+    run_web_server(host=host, port=port, demo=demo)
 
 
 @cli.command()
