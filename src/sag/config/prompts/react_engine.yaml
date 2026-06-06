@@ -43,6 +43,7 @@ initial_system:
     AVAILABLE TOOLS:
     - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
       • ⚠️ For Maven projects: DO NOT use bash to run 'mvn' commands - use maven tool instead!
+      • Use bash to install missing runtimes or unpack downloaded tool distributions.
     - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
     - web_search: Search the web for information
     - manage_context: Manage task workflow and context (NOT context or complete_with_results)
@@ -57,6 +58,11 @@ initial_system:
       • ✅ USE THIS for: compile, test, package, install, clean, verify
       • ✅ Multi-module support: maven(command='test', fail_at_end=True) tests ALL modules
       • ❌ DO NOT use bash(command='mvn ...') - use maven tool instead!
+    - env: Manage runtime overlay entries after installing or proving toolchain executables
+      • After installation, use env register and env activate for the installed executable.
+      • Activation lets maven, gradle, bash, validation, and report flows share the same runtime path.
+      • If a concrete executable is proven incompatible, use env block for that exact executable/version before retrying another runtime.
+      • Do not use env to rewrite project build configuration; follow project build files as source of truth.
     - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
     - project_analyzer: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
       • 🔥 TRIGGER: Automatically call this tool after ANY project_setup clone success
@@ -130,6 +136,13 @@ initial_system:
     - Check for test reports: bash(command='find . -name "TEST-*.xml" -o -path "*/surefire-reports"')
     - If no reports exist, the tests didn't run - investigate why
     - Document the number of tests run vs skipped in task results
+
+    ### 6. Runtime Recovery Guardrails
+    When Maven or Gradle cannot run because a runtime is missing or incompatible:
+    - Use bash to install missing runtimes or unpack a compatible runtime distribution.
+    - After installation, use env register and env activate so maven, gradle, bash, validation, and report flows share the same runtime path.
+    - If a concrete executable is proven incompatible, use env block for that exact executable/version before retrying with another runtime.
+    - Do not use env to rewrite project build configuration; env only records runtime paths and related environment.
   maven_multimodule_testing: |
     ## Handling Multi-Module Maven Test Execution
 
@@ -297,6 +310,8 @@ next_prompt:
     - bash: Execute shell commands
     - file_io: Read and write files
     - maven: Execute Maven commands
+    - gradle: Execute Gradle commands
+    - env: Register, activate, inspect, or block runtime overlay entries
     - web_search: Search the web for information
     - system: Install system packages
   run_task_stuck_function_calling_guidance: |
@@ -426,6 +441,8 @@ mode_prompts:
     - maven: 🔥 PREFERRED for Maven - Run Maven build commands
       • ✅ USE for multi-module projects: maven(command='test', fail_at_end=True)
       • ❌ DO NOT use bash for mvn commands!
+    - gradle: PREFERRED for Gradle - Run Gradle build commands
+    - env: Register and activate installed runtime paths; block exact incompatible executable/version evidence; never rewrite project build configuration
     - file_io: Read and write files
     - manage_context: Manage task workflow and completion
 
