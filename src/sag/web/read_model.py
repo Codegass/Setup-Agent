@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loguru import logger
+
 from sag.web.demo_data import build_demo_dashboard, get_demo_session
 from sag.web.models import DashboardResponse, DockerSummary, ExecutionSessionDetail
 from sag.web.session_registry import SessionRegistry
@@ -29,9 +31,10 @@ class ReadModelBuilder:
 
         try:
             workspaces = self.workspace_registry.list_workspaces()
-        except Exception as exc:
+        except Exception:
+            logger.exception("Failed to build SAG Workbench dashboard")
             return DashboardResponse(
-                docker=DockerSummary(status="unavailable", image=str(exc)),
+                docker=DockerSummary(status="unavailable"),
                 workspaces=[],
             )
 

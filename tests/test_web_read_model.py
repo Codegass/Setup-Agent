@@ -56,7 +56,7 @@ def test_read_model_builder_marks_docker_unavailable_when_registry_raises():
     dashboard = builder.dashboard()
 
     assert dashboard.docker.status == "unavailable"
-    assert dashboard.docker.image == "docker socket unavailable"
+    assert dashboard.docker.image is None
     assert dashboard.workspaces == []
 
 
