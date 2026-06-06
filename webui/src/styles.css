@@ -1,0 +1,17 @@
+@import "tailwindcss";
+
+:root {
+  --primary: 217 91% 53%;
+  --ring: 217 91% 53%;
+  --radius: 0.5rem;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
