@@ -61,6 +61,18 @@ def test_submit_task_rejects_blank_task():
     assert response.status_code == 422
 
 
+def test_submit_task_rejects_whitespace_only_task():
+    app = create_app(ReadModelBuilder(demo_mode=True), task_runner=FakeTaskRunner())
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/workspaces/sag-commons-cli/tasks",
+        json={"task": "   "},
+    )
+
+    assert response.status_code == 422
+
+
 def test_session_endpoint_returns_session_detail():
     app = create_app(ReadModelBuilder(demo_mode=True))
     client = TestClient(app)

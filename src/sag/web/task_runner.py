@@ -5,23 +5,24 @@ from __future__ import annotations
 import json
 import uuid
 from threading import Thread
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, StringConstraints
 
 
 class TaskRequest(BaseModel):
-    task: str = Field(min_length=1)
+    task: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     source_session: str | None = None
 
 
 class AgentTaskLauncher:
     def run(self, workspace_id: str, task: str, source_session: str | None) -> str:
-        session_id = str(uuid.uuid4())
+        session_id = f"UI-{uuid.uuid4().hex[:8]}"
         thread = Thread(
             target=self._run_agent,
             args=(session_id, workspace_id, task, source_session),
             daemon=True,
+            name=f"sag-ui-task-{session_id}",
         )
         thread.start()
         return session_id
@@ -71,10 +72,17 @@ class AgentTaskLauncher:
             logger.warning("Failed to read project metadata from workspace")
             return fallback
 
+        if not isinstance(result, dict):
+            return fallback
+
         if result.get("exit_code") != 0:
             return fallback
 
-        output = result.get("output", "").strip()
+        output = result.get("output", "")
+        if not isinstance(output, str):
+            return fallback
+
+        output = output.strip()
         if not output:
             return fallback
 
@@ -84,8 +92,15 @@ class AgentTaskLauncher:
             logger.warning("Failed to parse workspace project metadata")
             return fallback
 
+        if not isinstance(metadata, dict):
+            return fallback
+
         project_name = metadata.get("project_name")
-        if isinstance(project_name, str) and project_name:
+        if not isinstance(project_name, str):
+            return fallback
+
+        project_name = project_name.strip()
+        if project_name:
             return project_name
         return fallback
 
