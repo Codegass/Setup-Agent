@@ -148,6 +148,54 @@ def test_execute_command_with_monitoring_treats_unknown_exit_ordinary_output_as_
     assert result["exit_code"] == 0
 
 
+def test_execute_command_with_monitoring_keeps_unknown_exit_could_not_resolve_narrative_success():
+    container = FakeContainer(
+        FakeStreamingExecResult(
+            exit_code=None,
+            output=[
+                (
+                    b"Diagnostic note: Could not resolve whether optional docs are installed.\n",
+                    b"",
+                )
+            ],
+        )
+    )
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command_with_monitoring(
+        "bash -lc 'printf diagnostics'",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is True
+    assert result["exit_code"] == 0
+
+
+def test_execute_command_with_monitoring_keeps_unknown_exit_allowed_range_narrative_success():
+    container = FakeContainer(
+        FakeStreamingExecResult(
+            exit_code=None,
+            output=[
+                (
+                    b"Release note: values not in the allowed range are normalized later.\n",
+                    b"",
+                )
+            ],
+        )
+    )
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command_with_monitoring(
+        "bash -lc 'printf diagnostics'",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is True
+    assert result["exit_code"] == 0
+
+
 def test_execute_command_with_monitoring_preserves_quoted_workdir_in_timeout_wrapper():
     container = FakeContainer(FakeStreamingExecResult())
     orchestrator = build_orchestrator(container)

@@ -19,16 +19,25 @@ ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
 UNKNOWN_EXIT_FAILURE_MARKERS = (
     "BUILD FAILURE",
     "BUILD FAILED",
-    "Could not resolve",
     "Compilation failure",
-    "not in the allowed range",
+    "[ERROR] Could not resolve",
+)
+MAVEN_ENFORCER_VERSION_RANGE_MARKERS = (
+    "Detected Maven Version:",
+    "is not in the allowed range",
 )
 
 
 def _has_unknown_exit_failure_marker(output: str) -> bool:
     """Return True when unknown-exit output contains an explicit terminal failure marker."""
     normalized_output = output.casefold()
-    return any(marker.casefold() in normalized_output for marker in UNKNOWN_EXIT_FAILURE_MARKERS)
+    if any(marker.casefold() in normalized_output for marker in UNKNOWN_EXIT_FAILURE_MARKERS):
+        return True
+
+    return all(
+        marker.casefold() in normalized_output
+        for marker in MAVEN_ENFORCER_VERSION_RANGE_MARKERS
+    )
 
 
 class DockerOrchestrator:
