@@ -276,3 +276,37 @@ def test_mark_running_does_not_resurrect_finished_item(tmp_path):
     batch = store.list_batches()[0]
     assert batch["items"][0]["status"] == "failed"
     assert batch["status"] == "failed"
+
+
+def test_concurrent_claims_never_double_claim_or_exceed_caps(tmp_path):
+    import threading
+
+    store = make_store(tmp_path)
+    items = [
+        make_item(f"LAUNCH-{index:08d}", row_index=index, workspace_id=f"sag-{index}")
+        for index in range(20)
+    ]
+    store.enqueue_batch(make_batch(concurrency=5, total=20, accepted=20), items)
+
+    claimed: list[str] = []
+    lock = threading.Lock()
+
+    def claim_all():
+        while True:
+            item = store.claim_next(global_cap=4, now=LATER)
+            if item is None:
+                return
+            with lock:
+                claimed.append(item.id)
+
+    threads = [threading.Thread(target=claim_all) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    # Exactly the global cap of items is claimable while none finish.
+    assert len(claimed) == 4
+    assert len(set(claimed)) == 4
+    statuses = {item["id"]: item["status"] for item in store.list_batches()[0]["items"]}
+    assert sum(1 for status in statuses.values() if status == "launching") == 4
