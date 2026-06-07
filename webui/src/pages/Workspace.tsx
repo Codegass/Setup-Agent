@@ -29,6 +29,7 @@ import { ContextMap } from "@/components/session/ContextMap"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { TestCard } from "@/components/session/TestCard"
+import { TerminalPanel } from "@/components/terminal/TerminalPanel"
 import {
   Dialog,
   DialogContent,
@@ -424,33 +425,14 @@ function TerminalTab({ workspace }: { workspace: WorkspaceSummary }) {
     <Card className="overflow-hidden">
       <CardHead
         icon={<Terminal size={16} className="text-slate-400" />}
-        right={<StatusBadge status={running ? "pending" : workspace.docker.status} />}
-        sub="Static placeholder until Task 16"
+        right={<StatusBadge status={workspace.docker.status} />}
+        sub={running ? "WebSocket exec bridge" : "Container is not running"}
         title="Independent workspace shell"
       />
       <div className="p-5">
-        <div className="rounded-lg border border-slate-800 bg-[#0d1117]">
-          <div className="flex items-center gap-2 border-b border-slate-800 px-3 py-2">
-            <div className="flex gap-1.5">
-              <span className="h-2.5 w-2.5 rounded-full bg-red-400/80" />
-              <span className="h-2.5 w-2.5 rounded-full bg-amber-400/80" />
-              <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/80" />
-            </div>
-            <span className="ml-2 font-mono text-[11px] text-slate-400">
-              {workspace.container} - shell inactive
-            </span>
-          </div>
-          <div className="px-4 py-6 font-mono text-[12.5px] leading-relaxed text-slate-300">
-            <div>$ sag workspace shell</div>
-            <div className="text-slate-500">Terminal is not connected in Task 15.</div>
-            <div className="text-slate-500">
-              This workspace shell is isolated from session state and does not continue any session
-              as chat.
-            </div>
-          </div>
-        </div>
+        <TerminalPanel workspaceId={workspace.id} />
         <p className="mt-3 text-[12px] leading-relaxed text-slate-400">
-          Terminal commands will be an independent workspace operation when Task 16 wires the shell.
+          Terminal commands run as an independent workspace operation.
           Session details above remain read-only execution records.
         </p>
       </div>

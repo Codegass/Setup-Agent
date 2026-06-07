@@ -5,6 +5,12 @@ import type { ExecutionSessionDetail } from "@/api/types"
 
 import { App } from "../App"
 
+vi.mock("@/components/terminal/TerminalPanel", () => ({
+  TerminalPanel: ({ workspaceId }: { workspaceId: string }) => (
+    <div aria-label="Workspace terminal">Terminal for {workspaceId}</div>
+  ),
+}))
+
 const dashboard = {
   docker: { status: "connected", version: "27.1.1" },
   workspaces: [
