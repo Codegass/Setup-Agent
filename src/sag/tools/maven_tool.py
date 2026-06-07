@@ -164,22 +164,29 @@ class MavenTool(BaseTool):
             prefer_wrapper=use_wrapper,
         )
 
-        # Check if Maven is installed, install if not
-        if not resolved_maven and not self._is_maven_installed():
-            install_result = self._install_maven()
-            if not install_result.success:
-                return install_result
-            resolved_maven = self._resolve_maven_executable(
-                working_directory=working_directory,
-                version_requirement=required_version,
-                prefer_wrapper=use_wrapper,
-            )
-
         if required_version and not resolved_maven:
             return self._maven_version_not_resolved_result(
                 required_version=required_version,
                 working_directory=working_directory,
             )
+
+        # Default Maven fallback installs once, then requires the manager to resolve a path.
+        if not resolved_maven:
+            if self.toolchain_manager:
+                install_result = self._install_maven()
+                if not install_result.success:
+                    return install_result
+                resolved_maven = self._resolve_maven_executable(
+                    working_directory=working_directory,
+                    version_requirement=required_version,
+                    prefer_wrapper=use_wrapper,
+                )
+                if not resolved_maven:
+                    return self._maven_executable_not_resolved_result(working_directory)
+            elif not self._is_maven_installed():
+                install_result = self._install_maven()
+                if not install_result.success:
+                    return install_result
 
         maven_executable = (
             resolved_maven.candidate.path
@@ -187,6 +194,9 @@ class MavenTool(BaseTool):
             else ("./mvnw" if use_wrapper else "mvn")
         )
         maven_runtime = self._maven_runtime_metadata(resolved_maven, maven_executable)
+        requested_requirement_metadata = self._maven_version_requirement_metadata(
+            required_version
+        )
 
         version_command = self._normalize_maven_version_command(command)
         if version_command:
@@ -214,6 +224,12 @@ class MavenTool(BaseTool):
                     "exit_code": result.get("exit_code"),
                     "tool_type": "maven",
                     "diagnostic": "version",
+                    "maven_runtime": maven_runtime,
+                    **(
+                        {"maven_version_requirement": requested_requirement_metadata}
+                        if requested_requirement_metadata
+                        else {}
+                    ),
                 },
             )
 
@@ -311,10 +327,20 @@ class MavenTool(BaseTool):
                 result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
 
             if result.get("termination_reason"):
-                return self._timeout_result_from_command(result, maven_cmd, command)
+                return self._timeout_result_from_command(
+                    result,
+                    maven_cmd,
+                    command,
+                    maven_runtime=maven_runtime,
+                    maven_version_requirement=requested_requirement_metadata,
+                )
 
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
+            if requested_requirement_metadata and not analysis.get(
+                "maven_version_requirement"
+            ):
+                analysis["maven_version_requirement"] = requested_requirement_metadata
 
             # Store full output if large
             full_output = result["output"]
@@ -362,16 +388,37 @@ class MavenTool(BaseTool):
                 logger.debug(f"Tracked Maven command: {maven_cmd[:100]}...")
 
             if raw_output:
-                return ToolResult(
-                    success=analysis["build_success"],  # Use analyzed build success, not exit code
-                    output=result["output"],
-                    raw_output=result["output"],
-                    metadata={
-                        "command": maven_cmd,
-                        "exit_code": result["exit_code"],
-                        "analysis": analysis,
-                    },
+                if analysis["build_success"]:
+                    return ToolResult(
+                        success=True,
+                        output=result["output"],
+                        raw_output=result["output"],
+                        metadata={
+                            "command": maven_cmd,
+                            "exit_code": result["exit_code"],
+                            "analysis": analysis,
+                            "maven_runtime": maven_runtime,
+                            "output_ref_id": ref_id,
+                            **(
+                                {"maven_version_requirement": requested_requirement_metadata}
+                                if requested_requirement_metadata
+                                else {}
+                            ),
+                        },
+                    )
+
+                error_result = self._handle_maven_error(
+                    result["output"],
+                    result["exit_code"],
+                    maven_cmd,
+                    analysis,
+                    maven_runtime,
                 )
+                error_result.output = result["output"]
+                error_result.raw_output = result["output"]
+                if ref_id:
+                    error_result.metadata["output_ref_id"] = ref_id
+                return error_result
 
             # Use analysis result to determine success, not just exit code
             if analysis["build_success"]:
@@ -428,6 +475,12 @@ class MavenTool(BaseTool):
                         "analysis": analysis,
                         "validation": validation_result,
                         "output_ref_id": ref_id,
+                        "maven_runtime": maven_runtime,
+                        **(
+                            {"maven_version_requirement": requested_requirement_metadata}
+                            if requested_requirement_metadata
+                            else {}
+                        ),
                     },
                 )
             else:
@@ -568,6 +621,17 @@ class MavenTool(BaseTool):
             "source": "wrapper" if maven_executable == "./mvnw" else "path",
         }
 
+    def _maven_version_requirement_metadata(
+        self, requirement: ToolVersionRequirement | None
+    ) -> Optional[Dict[str, str]]:
+        if not requirement:
+            return None
+        return {
+            "raw": requirement.raw,
+            "source": requirement.source,
+            "kind": requirement.kind,
+        }
+
     def _normalize_maven_version_command(self, command: Any) -> Optional[str]:
         if isinstance(command, list):
             command = " ".join(command)
@@ -601,7 +665,7 @@ class MavenTool(BaseTool):
                 ),
                 (
                     "Use bash to inspect candidates: "
-                    "find /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
+                    "find /workspace /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
                 ),
                 "If the project can use system Maven, omit maven_version_requirement on the next call.",
             ],
@@ -613,6 +677,20 @@ class MavenTool(BaseTool):
                     "kind": required_version.kind,
                 },
             },
+        )
+
+    def _maven_executable_not_resolved_result(self, working_directory: str) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output="",
+            error="No Maven executable could be resolved by the toolchain manager",
+            error_code="MAVEN_EXECUTABLE_NOT_RESOLVED",
+            suggestions=[
+                "Register a Maven executable with the toolchain manager",
+                "Commit and use the project Maven wrapper",
+                "Check whether the active environment overlay blocks the available Maven executable",
+            ],
+            metadata={"working_directory": working_directory},
         )
 
     @staticmethod
@@ -653,7 +731,12 @@ class MavenTool(BaseTool):
         return cleaned.split("=", 1)[0]
 
     def _timeout_result_from_command(
-        self, result: Dict[str, Any], maven_cmd: str, command: str
+        self,
+        result: Dict[str, Any],
+        maven_cmd: str,
+        command: str,
+        maven_runtime: Optional[Dict[str, Any]] = None,
+        maven_version_requirement: Optional[Dict[str, str]] = None,
     ) -> ToolResult:
         reason = str(result.get("termination_reason") or "unknown")
         sanitized_reason = re.sub(r"[^A-Za-z0-9]+", "_", reason).strip("_").upper()
@@ -668,6 +751,19 @@ class MavenTool(BaseTool):
             "Run dependency resolution before the full build",
             "Retry with a narrower module or test selection",
         ]
+        metadata = {
+            "termination_reason": reason,
+            "execution_time": execution_time,
+            "command": maven_cmd,
+            "requested_command": command,
+            "exit_code": result.get("exit_code"),
+            "tool_type": "maven",
+        }
+        if maven_runtime:
+            metadata["maven_runtime"] = maven_runtime
+        if maven_version_requirement:
+            metadata["maven_version_requirement"] = maven_version_requirement
+
         return ToolResult(
             success=False,
             output=(
@@ -677,14 +773,7 @@ class MavenTool(BaseTool):
             error_code=error_code,
             suggestions=suggestions,
             raw_output=result.get("output"),
-            metadata={
-                "termination_reason": reason,
-                "execution_time": execution_time,
-                "command": maven_cmd,
-                "requested_command": command,
-                "exit_code": result.get("exit_code"),
-                "tool_type": "maven",
-            },
+            metadata=metadata,
         )
 
     def _ensure_maven_in_path(self):
@@ -1461,6 +1550,39 @@ class MavenTool(BaseTool):
             documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
 
         # Check for Java version issues (including Maven Enforcer plugin)
+        if analysis.get("maven_version_requirement"):
+            requirement = analysis["maven_version_requirement"]
+            raw_requirement = requirement.get("raw", "the required range")
+            runtime_executable = (maven_runtime or {}).get("executable", "the current mvn")
+            runtime_version = (maven_runtime or {}).get("version", "unknown")
+            error_code = "MAVEN_VERSION_ERROR"
+            error_suggestions.extend(
+                [
+                    (
+                        f"Maven version requirement detected: {raw_requirement}; "
+                        f"current {runtime_executable} reports {runtime_version}"
+                    ),
+                    (
+                        "Use bash to download or unpack a Maven distribution that satisfies "
+                        f"{raw_requirement}; apt may only provide an older distro package"
+                    ),
+                    (
+                        "Use env register/activate for the new executable, e.g. "
+                        "env(action='register', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
+                        "version='<version>', path_prepend=['/workspace/apache-maven-<version>/bin'], activate=True)"
+                    ),
+                    (
+                        f"Retry with maven(command='{command}', "
+                        f"maven_version_requirement='{raw_requirement}')"
+                    ),
+                    (
+                        "If an exact Maven executable is proven incompatible, record it with "
+                        "env(action='block', tool='maven', executable='<path>', version='<version>')"
+                    ),
+                ]
+            )
+            documentation_links.append("https://maven.apache.org/download.cgi")
+
         if (
             "Unsupported major.minor version" in output
             or "java.lang.UnsupportedClassVersionError" in output

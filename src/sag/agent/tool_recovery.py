@@ -146,16 +146,24 @@ class ToolRecoveryHandler:
         """Recover from Maven tool failures."""
         error_msg = failed_result.error or ""
         error_code = failed_result.error_code or ""
+        metadata = failed_result.metadata or {}
+        analysis = metadata.get("analysis", {})
 
         if error_code.startswith("TIMEOUT_"):
             return self._maven_timeout_guidance(params, failed_result)
+
+        maven_version_requirement = metadata.get("maven_version_requirement") or analysis.get(
+            "maven_version_requirement"
+        )
+        if maven_version_requirement:
+            return self._maven_version_contract_guidance(
+                params, failed_result, maven_version_requirement
+            )
 
         if error_code == "JAVA_VERSION_MISMATCH":
             decision = self._recover_maven_java_version(params, failed_result)
             if decision.should_recover:
                 return decision
-
-        analysis = failed_result.metadata.get("analysis", {})
 
         if self._is_maven_missing_project(error_code, error_msg, analysis):
             decision = self._recover_maven_pom_discovery(params)
@@ -197,6 +205,35 @@ class ToolRecoveryHandler:
                 return decision
 
         return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
+
+    def _maven_version_contract_guidance(
+        self,
+        params: Dict[str, Any],
+        failed_result: ToolResult,
+        requirement: Dict[str, Any],
+    ) -> RecoveryDecision:
+        raw_requirement = requirement.get("raw", "the project-required range")
+        runtime = (failed_result.metadata or {}).get("maven_runtime", {})
+        executable = runtime.get("executable", "the current Maven executable")
+        version = runtime.get("version", "unknown")
+        command = params.get("command", "compile")
+        guidance = (
+            "MAVEN VERSION REQUIREMENT: The current Maven runtime does not satisfy "
+            f"{raw_requirement}. Current executable: {executable}; version: {version}. "
+            "Do not retry the same Maven executable. Use bash to download or unpack a "
+            "compatible Maven distribution, then use env register/activate for its bin/mvn, "
+            f"and retry maven(command='{command}', "
+            f"maven_version_requirement='{raw_requirement}')."
+        )
+
+        self.add_system_guidance(guidance, priority="high")
+
+        return self._guidance_only(
+            strategy="maven_version_contract_guidance",
+            message=guidance,
+            result=failed_result,
+            params=params,
+        )
 
     def _recover_maven_java_version(
         self, params: Dict[str, Any], failed_result: ToolResult

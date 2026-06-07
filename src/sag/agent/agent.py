@@ -122,6 +122,7 @@ class SetupAgent:
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.context_tool import ContextTool
+        from sag.tools.env_tool import EnvTool
         from sag.tools.file_io import FileIOTool
         from sag.tools.gradle_tool import GradleTool
         from sag.tools.maven_tool import MavenTool
@@ -156,6 +157,7 @@ class SetupAgent:
             GradleTool(self.orchestrator),
             ProjectSetupTool(self.orchestrator),
             SystemTool(self.orchestrator),
+            EnvTool(self.orchestrator),
             ProjectAnalyzerTool(self.orchestrator, self.context_manager),
             OutputSearchTool(
                 orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir
@@ -893,27 +895,63 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
         # Get BUILD status (primary concern)
         build_status = self.physical_validator.validate_build_status(project_name)
 
-        # Get TEST status (secondary, informational)
+        # Get TEST status separately so known test suites cannot disappear behind build artifacts.
         test_status = self.physical_validator.validate_test_status(project_name)
+        analysis_status = {}
+        try:
+            analysis_status = self.physical_validator.validate_project_analysis_status(
+                project_name
+            )
+        except Exception as exc:
+            logger.warning(f"Could not validate project analysis status: {exc}")
+
+        tests_expected = False
+        static_test_count = analysis_status.get("static_test_count")
+        if isinstance(static_test_count, int) and static_test_count > 0:
+            tests_expected = True
+        elif test_status.get("total_tests", 0) > 0:
+            tests_expected = True
+
+        if not react_engine_success:
+            logger.warning(
+                "ReAct loop did not report success; final status will depend on physical validation"
+            )
 
         # Log comprehensive status
         if build_status["success"]:
             logger.info(f"✅ Build validation: SUCCESS - {build_status['reason']}")
 
-            # Report test status for information
+            # Report test status and fail when a known test suite was not successfully verified.
             if test_status["has_test_reports"]:
+                failed_or_error_tests = test_status.get("failed_tests", 0) + test_status.get(
+                    "error_tests", 0
+                )
                 if test_status["pass_rate"] == 100.0:
                     logger.info(
                         f"✅ Test validation: ALL PASSED - {test_status['total_tests']} tests (100% pass rate)"
+                    )
+                elif failed_or_error_tests == 0:
+                    logger.info(
+                        "⚠️ Test validation: PASSED WITH SKIPS - "
+                        f"{test_status['passed_tests']}/{test_status['total_tests']} tests passed, "
+                        f"{test_status.get('skipped_tests', 0)} skipped "
+                        f"({test_status['pass_rate']:.1f}% pass rate)"
                     )
                 elif test_status["pass_rate"] > 0:
                     logger.info(
                         f"⚠️ Test validation: PARTIAL - {test_status['passed_tests']}/{test_status['total_tests']} tests passed ({test_status['pass_rate']:.1f}% pass rate)"
                     )
+                    logger.error(
+                        "❌ Test validation failed: "
+                        f"{test_status.get('failed_tests', 0)} failed, "
+                        f"{test_status.get('error_tests', 0)} errors"
+                    )
+                    return False
                 else:
                     logger.warning(
                         f"❌ Test validation: ALL FAILED - 0/{test_status['total_tests']} tests passed (0% pass rate)"
                     )
+                    return False
 
                 # Log test exclusions if detected
                 if test_status["test_exclusions"]:
@@ -928,9 +966,13 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                         f"📊 {module_count} modules not tested: {', '.join(test_status['modules_without_tests'][:3])}"
                     )
             else:
+                if tests_expected:
+                    logger.error(
+                        "❌ Test validation: No test reports found despite detected tests"
+                    )
+                    return False
                 logger.info("⚠️ Test validation: No test reports found")
 
-            # Build success is the primary goal - return True
             return True
         else:
             logger.error(f"❌ Build validation: FAILED - {build_status['reason']}")

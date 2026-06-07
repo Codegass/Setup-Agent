@@ -10,12 +10,13 @@ from loguru import logger
 from sag.agent.output_storage import OutputStorageManager
 
 from .base import BaseTool, ToolError, ToolResult
+from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 
 class GradleTool(BaseTool):
     """Gradle build tool with enhanced error handling and Gradle-specific features."""
 
-    def __init__(self, orchestrator):
+    def __init__(self, orchestrator, toolchain_manager: ToolchainManager = None):
         super().__init__(
             name="gradle",
             description="Execute Gradle commands with comprehensive error analysis and raw output access. "
@@ -23,6 +24,7 @@ class GradleTool(BaseTool):
             "Automatically uses gradlew wrapper if present, installs Gradle if needed.",
         )
         self.orchestrator = orchestrator
+        self.toolchain_manager = toolchain_manager or ToolchainManager(orchestrator)
         self.output_storage = None  # Will be initialized when needed
 
     def _extract_key_info(self, output: str, tool_name: str) -> str:
@@ -92,13 +94,41 @@ class GradleTool(BaseTool):
         except Exception as _e:
             logger.debug(f"Gradle working directory fallback skipped: {_e}")
 
-        # Check for Gradle wrapper or system Gradle
-        gradle_executable = self._determine_gradle_executable(working_directory, use_wrapper)
+        resolved_gradle = self._resolve_gradle_executable(
+            working_directory=working_directory,
+            prefer_wrapper=use_wrapper,
+        )
+        gradle_executable = self._determine_gradle_executable(
+            working_directory,
+            use_wrapper,
+            resolved_gradle=resolved_gradle,
+        )
         if not gradle_executable:
             install_result = self._install_gradle(working_directory)
             if not install_result.success:
                 return install_result
-            gradle_executable = self._determine_gradle_executable(working_directory, use_wrapper)
+            resolved_gradle = self._resolve_gradle_executable(
+                working_directory=working_directory,
+                prefer_wrapper=use_wrapper,
+            )
+            gradle_executable = self._determine_gradle_executable(
+                working_directory,
+                use_wrapper,
+                resolved_gradle=resolved_gradle,
+            )
+            if not gradle_executable:
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error="No Gradle executable could be resolved after installation",
+                    error_code="GRADLE_EXECUTABLE_NOT_RESOLVED",
+                    suggestions=[
+                        "Register a Gradle executable with the toolchain manager",
+                        "Commit and use the project Gradle wrapper",
+                        "Check whether the active environment overlay blocks the available Gradle executable",
+                    ],
+                    metadata={"working_directory": working_directory},
+                )
 
         # Validate that build.gradle or build.gradle.kts exists
         build_validation = self._validate_build_file_exists(working_directory, build_file)
@@ -249,10 +279,25 @@ class GradleTool(BaseTool):
                 error_code="GRADLE_EXECUTION_ERROR",
             )
 
+    def _resolve_gradle_executable(self, working_directory: str, prefer_wrapper: bool = True):
+        if not self.toolchain_manager:
+            return None
+        return self.toolchain_manager.resolve(
+            ToolchainSpec(
+                name="gradle",
+                executable="gradle",
+                prefer_wrapper=prefer_wrapper,
+            ),
+            working_directory=working_directory,
+        )
+
     def _determine_gradle_executable(
-        self, working_directory: str, use_wrapper: bool
+        self, working_directory: str, use_wrapper: bool, resolved_gradle=None
     ) -> Optional[str]:
         """Determine which Gradle executable to use."""
+        if resolved_gradle and resolved_gradle.candidate.source == "env_overlay":
+            return resolved_gradle.candidate.path
+
         if use_wrapper:
             # Check for gradlew wrapper
             wrapper_check = self.orchestrator.execute_command(
@@ -266,6 +311,12 @@ class GradleTool(BaseTool):
                 )
                 return "./gradlew"
 
+        if resolved_gradle:
+            return resolved_gradle.candidate.path
+
+        if self.toolchain_manager:
+            return None
+
         # Check for system Gradle
         gradle_check = self.orchestrator.execute_command("which gradle")
         if gradle_check.get("exit_code") == 0:
@@ -275,22 +326,8 @@ class GradleTool(BaseTool):
         return None
 
     def _install_gradle(self, working_directory: str) -> ToolResult:
-        """Install Gradle or create wrapper."""
+        """Install Gradle."""
         logger.info("Installing Gradle...")
-
-        # First try to create a Gradle wrapper if we have a build file
-        build_file_exists = self._validate_build_file_exists(working_directory, None)
-        if build_file_exists["exists"]:
-            # Try to generate wrapper using system gradle
-            wrapper_cmd = (
-                "apt-get update && apt-get install -y gradle && "
-                "gradle wrapper --gradle-version=7.6"
-            )
-            result = self.orchestrator.execute_command(
-                wrapper_cmd, workdir=working_directory, timeout=300
-            )
-            if result.get("exit_code") == 0:
-                return ToolResult(success=True, output="✅ Gradle wrapper created successfully")
 
         # Install system Gradle
         install_cmd = "apt-get update && " "apt-get install -y gradle"

@@ -15,6 +15,31 @@ from loguru import logger
 from sag.config import get_config
 
 
+ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
+UNKNOWN_EXIT_FAILURE_MARKERS = (
+    "BUILD FAILURE",
+    "BUILD FAILED",
+    "Compilation failure",
+    "[ERROR] Could not resolve",
+)
+MAVEN_ENFORCER_VERSION_RANGE_MARKERS = (
+    "Detected Maven Version:",
+    "is not in the allowed range",
+)
+
+
+def _has_unknown_exit_failure_marker(output: str) -> bool:
+    """Return True when unknown-exit output contains an explicit terminal failure marker."""
+    normalized_output = output.casefold()
+    if any(marker.casefold() in normalized_output for marker in UNKNOWN_EXIT_FAILURE_MARKERS):
+        return True
+
+    return all(
+        marker.casefold() in normalized_output
+        for marker in MAVEN_ENFORCER_VERSION_RANGE_MARKERS
+    )
+
+
 class DockerOrchestrator:
     """Orchestrates Docker containers for project setup."""
 
@@ -236,6 +261,14 @@ class DockerOrchestrator:
         except Exception as e:
             logger.error(f"Failed to connect to container: {e}")
             raise
+
+    def _runtime_profile_prefix(self) -> str:
+        """Return shell sources needed before running commands in the container."""
+        return (
+            f"source {ENV_OVERLAY_SCRIPT_PATH} 2>/dev/null || true; "
+            "source /etc/profile 2>/dev/null || true; "
+            "source ~/.bashrc 2>/dev/null || true"
+        )
 
     def _is_json_content(self, output: str, command: str) -> bool:
         """
@@ -470,12 +503,14 @@ class DockerOrchestrator:
         # Source profile to ensure all environment variables (JAVA_HOME, M2_HOME, PATH) are loaded
         # CRITICAL FIX: Source environment files BEFORE changing directory
         # This prevents the source commands from resetting the working directory
+        runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             # Source environment first, THEN change to the specified working directory
-            wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; cd '{workdir}' && {command}"
+            quoted_workdir = shlex.quote(workdir)
+            wrapped_command = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
         else:
             # No working directory specified, use default behavior
-            wrapped_command = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            wrapped_command = f"{runtime_profile_prefix}; {command}"
         timeout_seconds = int(timeout) if timeout is not None else None
         if timeout_seconds is not None and timeout_seconds > 0:
             escaped_command = shlex.quote(wrapped_command)
@@ -668,13 +703,14 @@ class DockerOrchestrator:
         # Build the command with proper working directory handling
         # CRITICAL FIX: Source environment files BEFORE changing directory
         # This prevents the source commands from resetting the working directory
+        runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
             # Source environment first, THEN change to the specified working directory
-            # No quotes needed for workdir since it's used after proper environment setup
-            base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; cd {workdir} && {command}"
+            quoted_workdir = shlex.quote(workdir)
+            base_cmd = f"{runtime_profile_prefix}; cd {quoted_workdir} && {command}"
         else:
             # No working directory specified, use default
-            base_cmd = f"source /etc/profile 2>/dev/null || true; source ~/.bashrc 2>/dev/null || true; {command}"
+            base_cmd = f"{runtime_profile_prefix}; {command}"
 
         # Wrap with GNU timeout if requested
         if use_timeout_wrapper:
@@ -903,16 +939,19 @@ class DockerOrchestrator:
                     last_chunk_time = current_time
                     monitoring_state["last_output_time"] = current_time
 
+            # Combine all output
+            full_output = "".join(output_buffer)
+
             # Get final execution result
             exit_code = exec_result.exit_code
 
-            # For streaming execution, exit_code might be None until stream is fully consumed
+            # For streaming execution, Docker can leave exit_code unknown after the stream ends.
             if exit_code is None:
-                # If we got output without errors, assume success
-                exit_code = 0
-
-            # Combine all output
-            full_output = "".join(output_buffer)
+                if _has_unknown_exit_failure_marker(full_output):
+                    logger.warning("Command failure inferred from unknown-exit output")
+                    exit_code = 1
+                else:
+                    exit_code = 0
 
             # Apply truncation if needed
             if len(full_output) > 10000:

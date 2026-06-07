@@ -6,6 +6,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.runtime import EnvOverlayStore
+
 from .base import BaseTool, ToolError, ToolResult
 
 
@@ -708,6 +710,9 @@ class ProjectSetupTool(BaseTool):
             if result["success"]:
                 # Setup Java environment after installation
                 java_home = self._setup_java_environment(java_version)
+                if java_home:
+                    self._register_java_runtime_overlay(java_home, java_version)
+                self._register_maven_runtime_overlay()
 
                 installed_description = (
                     f"Java JDK {java_version or 'default'} and Maven with environment setup"
@@ -739,6 +744,12 @@ class ProjectSetupTool(BaseTool):
                             java_home = self._setup_java_environment(
                                 java_version if alt_package != "default-jdk" else None
                             )
+                            if java_home:
+                                self._register_java_runtime_overlay(
+                                    java_home,
+                                    java_version if alt_package != "default-jdk" else None,
+                                )
+                            self._register_maven_runtime_overlay()
                             return {
                                 "success": True,
                                 "installed": f"{alt_package} and Maven with environment setup",
@@ -761,6 +772,45 @@ class ProjectSetupTool(BaseTool):
             "success": False,
             "error": f"Auto-installation not implemented for project type: {project_type['type']}",
         }
+
+    def _register_java_runtime_overlay(self, java_home: str, java_version: Optional[str]) -> None:
+        """Register the Java runtime selected by setup without changing install semantics."""
+        java_home = java_home.rstrip("/")
+        java_bin = f"{java_home}/bin/java"
+        try:
+            EnvOverlayStore(self.orchestrator).register(
+                "java",
+                java_bin,
+                version=java_version,
+                source="project_setup_install",
+                env={"JAVA_HOME": java_home},
+                path_prepend=[f"{java_home}/bin"],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register Java env overlay: {exc}")
+
+    def _register_maven_runtime_overlay(self) -> None:
+        """Register Maven from PATH after package installation."""
+        try:
+            result = self.orchestrator.execute_command("command -v mvn")
+            if result.get("exit_code") != 0:
+                return
+
+            output = result.get("output", "")
+            mvn_bin = output.strip().splitlines()[0].strip() if output.strip() else ""
+            if not mvn_bin:
+                return
+
+            EnvOverlayStore(self.orchestrator).register(
+                "maven",
+                mvn_bin,
+                source="project_setup_install",
+                path_prepend=[os.path.dirname(mvn_bin)],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register Maven env overlay: {exc}")
 
     def _setup_java_environment(self, java_version: Optional[str] = None):
         """Setup JAVA_HOME environment variable and alternatives for specific Java version."""
@@ -854,13 +904,13 @@ class ProjectSetupTool(BaseTool):
             if verify_result["exit_code"] == 0:
                 logger.info(f"Java environment setup completed successfully")
                 logger.info(f"Verification output: {verify_result['output'][:200]}...")
+                logger.info(f"Set JAVA_HOME to {java_home}")
+                return java_home
             else:
                 logger.warning(
                     f"Java environment verification failed: {verify_result.get('output', '')}"
                 )
-
-            logger.info(f"Set JAVA_HOME to {java_home}")
-            return java_home
+                return None
 
         except Exception as e:
             logger.warning(f"Failed to setup Java environment: {e}")

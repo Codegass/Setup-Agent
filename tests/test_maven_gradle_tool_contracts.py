@@ -1,3 +1,4 @@
+from sag.tools.base import ToolResult
 from sag.tools.gradle_tool import GradleTool
 from sag.tools.maven_tool import MavenTool
 from sag.tools.toolchain_manager import (
@@ -23,6 +24,18 @@ class FakeBuildToolOrchestrator:
             return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
         if command == "which gradle":
             return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
+        if command == "command -v mvn":
+            return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
+        if command == "command -v gradle":
+            return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
+        if command.startswith("test -x /usr/bin/mvn"):
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if command.startswith("test -x /usr/bin/gradle"):
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if command == "/usr/bin/mvn -version":
+            return {"success": True, "output": "Apache Maven 3.9.6", "exit_code": 0}
+        if command == "/usr/bin/gradle -version":
+            return {"success": True, "output": "Gradle 8.5", "exit_code": 0}
         if "pom.xml && echo 'EXISTS'" in command:
             return {"success": True, "output": "EXISTS", "exit_code": 0}
         if "build.gradle" in command and command.startswith("test -f"):
@@ -69,6 +82,16 @@ class FakeToolchainManager:
         )
 
 
+class WrapperBuildToolOrchestrator(FakeBuildToolOrchestrator):
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append((command, workdir, timeout))
+        if "gradlew" in command and command.startswith("test -f"):
+            return {"success": True, "output": "exists", "exit_code": 0}
+        if command.startswith("chmod +x"):
+            return {"success": True, "output": "", "exit_code": 0}
+        return super().execute_command(command, workdir=workdir, timeout=timeout)
+
+
 class EmptyToolchainManager:
     def __init__(self):
         self.seen_spec = None
@@ -76,6 +99,34 @@ class EmptyToolchainManager:
     def resolve(self, spec, working_directory="/workspace"):
         self.seen_spec = spec
         return None
+
+
+class SequencedToolchainManager:
+    def __init__(self, resolutions):
+        self.resolutions = list(resolutions)
+        self.seen_specs = []
+        self.seen_working_directories = []
+
+    def resolve(self, spec, working_directory="/workspace"):
+        self.seen_specs.append(spec)
+        self.seen_working_directories.append(working_directory)
+        if not self.resolutions:
+            return None
+
+        resolution = self.resolutions.pop(0)
+        if resolution is None:
+            return None
+
+        return ResolvedToolExecutable(
+            candidate=ToolExecutableCandidate(
+                name=spec.name,
+                executable=spec.executable,
+                path=resolution["path"],
+                version=resolution["version"],
+                source=resolution["source"],
+            ),
+            reason="test resolver",
+        )
 
 
 class VersionCommandOrchestrator(FakeBuildToolOrchestrator):
@@ -110,6 +161,42 @@ def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
     assert result.metadata["command"] == orchestrator.monitored_commands[0][0]
 
 
+def test_maven_timeout_result_preserves_env_overlay_runtime_and_requested_version():
+    orchestrator = FakeBuildToolOrchestrator(
+        {
+            "output": "[INFO] downloading dependencies",
+            "exit_code": 0,
+            "termination_reason": "silent_timeout",
+            "execution_time": 1200.0,
+        }
+    )
+    toolchain_manager = FakeToolchainManager(
+        path="/opt/apache-maven-3.9.8/bin/mvn",
+        version="3.9.8",
+        source="env_overlay",
+    )
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert result.success is False
+    assert result.metadata["termination_reason"] == "silent_timeout"
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/opt/apache-maven-3.9.8/bin/mvn",
+        "version": "3.9.8",
+        "source": "env_overlay",
+    }
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "[3.9,4.0)",
+        "source": "tool_parameter",
+        "kind": "range",
+    }
+
+
 def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
     orchestrator = FakeBuildToolOrchestrator(
         {
@@ -133,6 +220,54 @@ def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
     assert result.metadata["execution_time"] == 1200.0
     assert result.metadata["tool_type"] == "gradle"
     assert result.metadata["task"] == "test"
+
+
+def test_gradle_does_not_run_path_gradle_when_manager_cannot_resolve():
+    orchestrator = FakeBuildToolOrchestrator()
+    tool = GradleTool(orchestrator, toolchain_manager=EmptyToolchainManager())
+    tool._install_gradle = lambda working_directory: ToolResult(
+        success=False,
+        output="",
+        error="Gradle unavailable",
+        error_code="GRADLE_INSTALLATION_FAILED",
+    )
+
+    result = tool.execute(
+        tasks="build",
+        working_directory="/workspace/project",
+        use_wrapper=False,
+    )
+
+    assert result.success is False
+    assert result.error_code == "GRADLE_INSTALLATION_FAILED"
+    assert all(
+        not command.startswith("gradle ") for command, _kwargs in orchestrator.monitored_commands
+    )
+
+
+def test_gradle_real_install_path_does_not_generate_wrapper_with_unresolved_manager():
+    orchestrator = FakeBuildToolOrchestrator()
+    tool = GradleTool(orchestrator, toolchain_manager=EmptyToolchainManager())
+
+    result = tool.execute(
+        tasks="build",
+        working_directory="/workspace/project",
+        use_wrapper=False,
+    )
+
+    assert result.success is False
+    assert result.error_code == "GRADLE_EXECUTABLE_NOT_RESOLVED"
+    assert any(
+        "apt-get install -y gradle" in command
+        for command, _workdir, _timeout in orchestrator.commands
+    )
+    assert all(
+        "gradle wrapper" not in command
+        for command, _workdir, _timeout in orchestrator.commands
+    )
+    assert all(
+        not command.startswith("gradle ") for command, _kwargs in orchestrator.monitored_commands
+    )
 
 
 def test_maven_tool_preserves_list_properties_when_fail_at_end_adds_ignore():
@@ -170,6 +305,43 @@ def test_maven_tool_uses_resolved_toolchain_executable():
     assert result.success is True
     assert orchestrator.monitored_commands[0][0].startswith("/tmp/apache-maven-3.9.6/bin/mvn ")
     assert toolchain_manager.seen_working_directory == "/workspace/project"
+
+
+def test_maven_tool_uses_active_env_overlay_candidate():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = FakeToolchainManager(
+        path="/opt/apache-maven-3.9.8/bin/mvn",
+        version="3.9.8",
+        source="env_overlay",
+    )
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    tool._record_test_summary = lambda *args, **kwargs: None
+    tool._validate_build_artifacts_in_container = lambda *args, **kwargs: {
+        "artifacts_exist": True,
+        "found_artifacts": [],
+    }
+
+    result = tool.execute(
+        command="compile",
+        working_directory="/workspace/project",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert result.success is True
+    assert orchestrator.monitored_commands[0][0].startswith(
+        "/opt/apache-maven-3.9.8/bin/mvn "
+    )
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/opt/apache-maven-3.9.8/bin/mvn",
+        "version": "3.9.8",
+        "source": "env_overlay",
+    }
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "[3.9,4.0)",
+        "source": "tool_parameter",
+        "kind": "range",
+    }
+    assert toolchain_manager.seen_spec.version_requirement.raw == "[3.9,4.0)"
 
 
 def test_maven_tool_schema_exposes_maven_version_requirement():
@@ -211,7 +383,120 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
     assert result.success is False
     assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
     assert orchestrator.monitored_commands == []
+    assert orchestrator.commands == []
     assert toolchain_manager.seen_spec.version_requirement.raw == "3.9.6"
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "3.9.6",
+        "source": "tool_parameter",
+        "kind": "exact",
+    }
+
+
+def test_maven_tool_installs_then_uses_resolved_default_executable():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = SequencedToolchainManager(
+        [
+            None,
+            {
+                "path": "/opt/apache-maven-3.9.9/bin/mvn",
+                "version": "3.9.9",
+                "source": "env_overlay",
+            },
+        ]
+    )
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    install_calls = []
+    tool._install_maven = lambda: install_calls.append(True) or ToolResult(
+        success=True,
+        output="Maven installed",
+    )
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is True
+    assert install_calls == [True]
+    assert len(toolchain_manager.seen_specs) == 2
+    assert toolchain_manager.seen_working_directories == [
+        "/workspace/project",
+        "/workspace/project",
+    ]
+    assert orchestrator.monitored_commands[0][0].startswith(
+        "/opt/apache-maven-3.9.9/bin/mvn "
+    )
+    assert not orchestrator.monitored_commands[0][0].startswith("mvn ")
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/opt/apache-maven-3.9.9/bin/mvn",
+        "version": "3.9.9",
+        "source": "env_overlay",
+    }
+
+
+def test_maven_tool_does_not_use_raw_path_after_install_when_manager_cannot_resolve_default_version():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = EmptyToolchainManager()
+    tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
+    install_calls = []
+    tool._install_maven = lambda: install_calls.append(True) or ToolResult(
+        success=True,
+        output="Maven installed",
+    )
+
+    result = tool.execute(
+        command="test",
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is False
+    assert result.error_code == "MAVEN_EXECUTABLE_NOT_RESOLVED"
+    assert install_calls == [True]
+    assert orchestrator.monitored_commands == []
+    assert toolchain_manager.seen_spec.version_requirement is None
+
+
+def test_gradle_uses_active_env_overlay_candidate():
+    orchestrator = FakeBuildToolOrchestrator()
+    toolchain_manager = FakeToolchainManager(
+        path="/opt/gradle-8.7/bin/gradle",
+        version="8.7",
+        source="env_overlay",
+    )
+    tool = GradleTool(orchestrator, toolchain_manager=toolchain_manager)
+
+    result = tool.execute(
+        tasks="build",
+        working_directory="/workspace/project",
+        use_wrapper=True,
+    )
+
+    assert result.success is True
+    assert orchestrator.monitored_commands[0][0].startswith("/opt/gradle-8.7/bin/gradle ")
+    assert toolchain_manager.seen_spec.name == "gradle"
+    assert toolchain_manager.seen_spec.executable == "gradle"
+    assert toolchain_manager.seen_spec.prefer_wrapper is True
+
+
+def test_gradle_wrapper_keeps_priority_over_non_overlay_manager_candidate():
+    orchestrator = WrapperBuildToolOrchestrator()
+    toolchain_manager = FakeToolchainManager(
+        path="/usr/local/bin/gradle",
+        version="8.5",
+        source="registered",
+    )
+    tool = GradleTool(orchestrator, toolchain_manager=toolchain_manager)
+
+    result = tool.execute(
+        tasks="build",
+        working_directory="/workspace/project",
+        use_wrapper=True,
+    )
+
+    assert result.success is True
+    assert orchestrator.monitored_commands[0][0].startswith("./gradlew ")
+    assert toolchain_manager.seen_spec.name == "gradle"
 
 
 def test_maven_tool_extracts_version_requirement_from_enforcer_output():
@@ -277,6 +562,47 @@ def test_maven_failed_result_metadata_includes_runtime_facts_for_version_error()
         "version": "3.6.3",
         "source": "system",
     }
+
+
+def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidance():
+    output = (
+        "[ERROR] BUILD FAILURE\n"
+        "Rule 0: org.apache.maven.enforcer.rules.version.RequireMavenVersion failed\n"
+        "Detected Maven Version: 3.8.7 is not in the allowed range [3.9,)."
+    )
+    orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 1})
+    tool = MavenTool(
+        orchestrator,
+        toolchain_manager=FakeToolchainManager(
+            path="/usr/bin/mvn",
+            version="3.8.7",
+            source="system",
+        ),
+    )
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="compile",
+        working_directory="/workspace/project",
+        raw_output=True,
+    )
+
+    assert result.success is False
+    assert result.output == output
+    assert result.raw_output == output
+    assert result.error_code == "MAVEN_VERSION_ERROR"
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "[3.9,)",
+        "source": "build_error",
+        "kind": "range",
+    }
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/usr/bin/mvn",
+        "version": "3.8.7",
+        "source": "system",
+    }
+    assert any("env register" in suggestion for suggestion in result.suggestions)
+    assert any("bash" in suggestion and "download" in suggestion for suggestion in result.suggestions)
 
 
 def test_maven_tool_runs_version_command_as_diagnostic_without_pom_validation():
