@@ -171,7 +171,7 @@ cp .env.example .env
 nano .env  # Fill in your API keys and other settings
 ```
 
-### 3. Basic Usage
+### 3. Create or Attach to a Workspace
 
 ```bash
 # Start setting up a new project
@@ -179,6 +179,52 @@ uv run sag project https://github.com/fastapi/fastapi.git
 
 # List all managed projects and their status
 uv run sag list
+```
+
+SAG creates Docker containers named `sag-<project>` by default. The Web UI reads
+those managed containers and shows their latest setup state, sessions, evidence,
+reports, and follow-up task entry points.
+
+### 4. Start the Web UI
+
+```bash
+# Start the local SAG Workbench on a stable browser URL
+uv run sag ui --port 8765
+
+# Then open:
+# http://127.0.0.1:8765
+```
+
+The Web UI is the recommended way to inspect SAG-managed workspaces after setup.
+It provides:
+
+- A dashboard of all SAG Docker workspaces and their current container state.
+- Workspace detail pages with current status, latest evidence, reports, build/test
+  summaries, context snapshots, and changed files.
+- Session detail pages for setup results and later task runs.
+- A workspace terminal tab for running an interactive shell inside a running SAG
+  container.
+- A task form for assigning follow-up work to an existing workspace.
+
+Useful launch options:
+
+```bash
+# Use an automatically assigned local port; uvicorn prints the selected URL
+uv run sag ui
+
+# Bind to a specific host and port
+uv run sag ui --host 127.0.0.1 --port 8765
+
+# Preview the UI with deterministic demo data instead of Docker discovery
+uv run sag ui --demo --port 8765
+```
+
+Keep Docker running when using live data. The terminal tab only connects to
+workspaces whose containers are currently running.
+
+### 5. Common CLI Operations
+
+```bash
 
 # Run a new task on an existing project
 uv run sag run sag-fastapi --task "add a new endpoint to handle /healthz"
@@ -190,7 +236,7 @@ uv run sag shell sag-fastapi
 uv run sag remove sag-fastapi
 ```
 
-### 4. Debugging & Troubleshooting
+### 6. Debugging & Troubleshooting
 
 When a setup fails or you want to understand what the agent did, SAG provides several debugging tools:
 
@@ -285,6 +331,7 @@ SAG provides a clean and powerful set of CLI commands.
 | `sag list` | Lists all projects managed by SAG, showing their container name, status, and last comment. | `sag list` |
 | `sag run <name>` | Runs a specified task on an existing project. | `sag run sag-flask --task "add unit tests for the application factory"` |
 | `sag shell <name>` | Connects to an interactive shell inside the specified project's container. | `sag shell sag-flask` |
+| `sag ui` | Starts the local SAG Workbench web UI. | `sag ui --port 8765` |
 | `sag remove <name>` | Permanently deletes a project, including its container and data volume. | `sag remove sag-flask --force` |
 | `sag version` | Displays SAG's version information. | `sag version` |
 | `sag --help` | Shows the help message. | `sag --help` |
@@ -332,6 +379,14 @@ sag project https://github.com/apache/commons-cli.git --name cli-test
 | Option | Description |
 |---|---|
 | `--shell <path>` | Shell to use in the container (default: `/bin/bash`). |
+
+#### `sag ui`
+
+| Option | Description |
+|---|---|
+| `--host <host>` | Host for the local Web UI (default: `127.0.0.1`). |
+| `--port <port>` | Port for the local Web UI. Use `0` for an automatically assigned port. |
+| `--demo` | Use deterministic demo data instead of discovering live Docker workspaces. |
 
 #### `sag remove <name>`
 
