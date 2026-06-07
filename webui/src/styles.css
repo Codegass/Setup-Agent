@@ -90,3 +90,36 @@
     @apply bg-background text-foreground;
   }
 }
+
+/* Centered pop for dialogs: tw-animate-css enter/exit keyframes replace the
+   translate(-50%, -50%) centering transform mid-animation, which made dialogs
+   drift in from off-center. These keyframes keep the centering in every frame. */
+@keyframes dialog-pop-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes dialog-pop-out {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.95);
+  }
+}
+
+.dialog-pop[data-state="open"] {
+  animation: dialog-pop-in 0.2s ease-out;
+}
+
+.dialog-pop[data-state="closed"] {
+  animation: dialog-pop-out 0.15s ease-in forwards;
+}
