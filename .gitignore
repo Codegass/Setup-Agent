@@ -176,3 +176,7 @@ plan/
 docs/
 
 website/node_modules
+
+# SAG web UI frontend
+webui/node_modules/
+webui/dist/
