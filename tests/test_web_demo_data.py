@@ -7,6 +7,7 @@ def test_demo_dashboard_matches_local_ui_demo_shape():
 
     assert dashboard.docker.status == "connected"
     assert workspace.id == "sag-commons-cli"
+    assert workspace.docker.status == "running"
     assert workspace.latest_session == "CC-3"
     assert workspace.test.pass_count == 312
     assert "1.6.0" in f"{workspace.release} {workspace.tag}"

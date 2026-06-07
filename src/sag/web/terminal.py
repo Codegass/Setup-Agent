@@ -32,6 +32,13 @@ class TerminalAdapter:
         exec_id = exec_ref["Id"] if isinstance(exec_ref, dict) else exec_ref
         return self.docker_client.api.exec_start(exec_id, tty=True, socket=True)
 
+    def close(self) -> None:
+        client = self._docker_client
+        self._docker_client = None
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
+
 
 def _socket_target(socket: Any) -> Any:
     return getattr(socket, "_sock", socket)

@@ -28,7 +28,21 @@ def create_app(
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
     runner = task_runner if task_runner is not None else TaskRunner()
-    app = FastAPI(title="SAG Workbench", version="0.1.0")
+    terminal_bridge = terminal_adapter if terminal_adapter is not None else TerminalAdapter()
+    owns_terminal_bridge = terminal_adapter is None
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        try:
+            yield
+        finally:
+            if owns_terminal_bridge:
+                close = getattr(terminal_bridge, "close", None)
+                if close is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.to_thread(close)
+
+    app = FastAPI(title="SAG Workbench", version="0.1.0", lifespan=lifespan)
 
     @app.get("/api/workspaces")
     def get_workspaces() -> dict:
@@ -63,12 +77,14 @@ def create_app(
         await websocket.accept()
         socket: Any | None = None
         output_task: asyncio.Task[None] | None = None
-        adapter = terminal_adapter
 
         try:
-            if adapter is None:
-                adapter = TerminalAdapter()
-            socket = await asyncio.to_thread(adapter.open_socket, workspace_id)
+            container = await asyncio.to_thread(
+                _resolve_terminal_container,
+                builder,
+                workspace_id,
+            )
+            socket = await asyncio.to_thread(terminal_bridge.open_socket, container)
             output_task = asyncio.create_task(_pump_terminal_output(websocket, socket))
             input_task = asyncio.create_task(_pump_websocket_input(websocket, socket))
             done, pending = await asyncio.wait(
@@ -95,6 +111,18 @@ def create_app(
                 await close_socket(socket)
 
     return app
+
+
+def _resolve_terminal_container(builder: ReadModelBuilder, workspace_id: str) -> str:
+    dashboard = builder.dashboard()
+    for workspace in dashboard.workspaces:
+        if workspace.id != workspace_id:
+            continue
+        if workspace.docker.status.strip().lower() != "running":
+            raise ValueError(f"Workspace is not running: {workspace_id}")
+        return workspace.container
+
+    raise ValueError(f"Unknown workspace: {workspace_id}")
 
 
 async def _pump_terminal_output(websocket: WebSocket, socket: Any) -> None:

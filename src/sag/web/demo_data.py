@@ -196,6 +196,12 @@ def build_demo_dashboard() -> DashboardResponse:
         version="26.06",
         endpoint="unix:///var/run/docker.sock",
     )
+    workspace_docker = DockerSummary(
+        status="running",
+        image=docker.image,
+        version=docker.version,
+        endpoint=docker.endpoint,
+    )
     workspace = WorkspaceSummary(
         id=_COMMONS_WORKSPACE_ID,
         project="apache/commons-cli",
@@ -204,7 +210,7 @@ def build_demo_dashboard() -> DashboardResponse:
         tag="rel/commons-cli-1.6.0",
         release="1.6.0",
         commit="rel/commons-cli-1.6.0",
-        docker=docker,
+        docker=workspace_docker,
         task="Run full test suite and summarize HelpFormatter failures",
         build=_commons_build_summary(),
         test=_commons_test_summary(),

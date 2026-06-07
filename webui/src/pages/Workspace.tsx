@@ -430,7 +430,18 @@ function TerminalTab({ workspace }: { workspace: WorkspaceSummary }) {
         title="Independent workspace shell"
       />
       <div className="p-5">
-        <TerminalPanel workspaceId={workspace.id} />
+        {running ? (
+          <TerminalPanel workspaceId={workspace.id} />
+        ) : (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-6">
+            <div className="text-[13px] font-medium text-slate-700">
+              Container is not running
+            </div>
+            <div className="mt-1 text-[12px] leading-relaxed text-slate-500">
+              Start the workspace container before opening an interactive shell.
+            </div>
+          </div>
+        )}
         <p className="mt-3 text-[12px] leading-relaxed text-slate-400">
           Terminal commands run as an independent workspace operation.
           Session details above remain read-only execution records.

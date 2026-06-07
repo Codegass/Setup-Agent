@@ -180,4 +180,31 @@ describe("App", () => {
 
     expect(screen.getByText("Project builds.")).toBeInTheDocument()
   })
+
+  it("does not mount the terminal panel when the workspace container is not running", async () => {
+    const stoppedDashboard = {
+      ...dashboard,
+      workspaces: [
+        {
+          ...dashboard.workspaces[0],
+          docker: { status: "exited" },
+        },
+      ],
+    }
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(stoppedDashboard))
+
+    render(<App />)
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", {
+        name: /open workspace apache\/commons-cli/i,
+      }))[0],
+    )
+    fireEvent.click(screen.getByRole("button", { name: "Shell" }))
+
+    expect(
+      screen.getByText("Start the workspace container before opening an interactive shell."),
+    ).toBeInTheDocument()
+    expect(screen.queryByLabelText("Workspace terminal")).not.toBeInTheDocument()
+  })
 })
