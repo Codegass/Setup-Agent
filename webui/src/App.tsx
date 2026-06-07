@@ -100,7 +100,9 @@ export function App() {
     sourceSession?: string,
   ): Promise<SubmitTaskResponse> => {
     setRouteError(null)
-    return submitTask(workspaceId, task, sourceSession)
+    const response = await submitTask(workspaceId, task, sourceSession)
+    void loadDashboard()
+    return response
   }
 
   return (

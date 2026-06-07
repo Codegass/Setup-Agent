@@ -2,6 +2,12 @@ import pytest
 
 import sag.web.read_model as read_model_module
 from sag.web.demo_data import build_demo_dashboard, get_demo_session
+from sag.web.models import (
+    BuildSummary,
+    ExecutionSessionDetail,
+    ExecutionSessionSummary,
+    TestSummary,
+)
 from sag.web.read_model import ReadModelBuilder
 
 
@@ -11,8 +17,54 @@ class FakeWorkspaceRegistry:
 
 
 class FakeSessionRegistry:
-    def read_index(self, workspace_root, workspace_id):
+    def list_workspace_sessions(self, workspace):
         return []
+
+
+class FakeLiveSessionRegistry:
+    def __init__(self):
+        self.summary = ExecutionSessionSummary(
+            id="UI-12345678",
+            workspace="sag-commons-cli",
+            title="Give me a report of all tests",
+            status="completed",
+            entry="Web UI",
+            start="2026-06-06T21:13:38",
+            finish="2026-06-06T21:14:09",
+            duration="31s",
+            build="none",
+            test=TestSummary(state="none"),
+            report="none",
+            files=0,
+            evidence=1,
+        )
+        self.detail = ExecutionSessionDetail(
+            id=self.summary.id,
+            workspace=self.summary.workspace,
+            title=self.summary.title,
+            status=self.summary.status,
+            entry=self.summary.entry,
+            start=self.summary.start,
+            duration=self.summary.duration,
+            outcome="Task completed: give me a report of all the test in the workspace",
+            build=BuildSummary(state="none"),
+            test=self.summary.test,
+            report="none",
+            evidence=[],
+            files=None,
+            context=None,
+            logs=[],
+        )
+
+    def list_workspace_sessions(self, workspace):
+        if workspace.id == "sag-commons-cli":
+            return [self.summary]
+        return []
+
+    def get_session_detail(self, session_id):
+        if session_id != self.summary.id:
+            raise KeyError(session_id)
+        return self.detail
 
 
 class RaisingWorkspaceRegistry:
@@ -32,7 +84,7 @@ def test_demo_read_model_does_not_construct_registries_without_injection(monkeyp
             constructed["session"] += 1
 
     monkeypatch.setattr(read_model_module, "WorkspaceRegistry", CountingWorkspaceRegistry)
-    monkeypatch.setattr(read_model_module, "SessionRegistry", CountingSessionRegistry)
+    monkeypatch.setattr(read_model_module, "ContainerSessionRegistry", CountingSessionRegistry)
 
     builder = ReadModelBuilder(demo_mode=True)
     dashboard = builder.dashboard()
@@ -70,6 +122,39 @@ def test_read_model_builder_uses_workspace_registry_when_not_demo():
     assert dashboard.docker.status == "connected"
 
 
+def test_read_model_builder_enriches_workspaces_from_live_sessions():
+    builder = ReadModelBuilder(
+        workspace_registry=FakeWorkspaceRegistry(),
+        session_registry=FakeLiveSessionRegistry(),
+        demo_mode=False,
+    )
+
+    dashboard = builder.dashboard()
+    workspace = dashboard.workspaces[0]
+
+    assert workspace.latest_session == "UI-12345678"
+    assert workspace.active_session is None
+    assert workspace.task == "Give me a report of all tests"
+    assert workspace.updated == "2026-06-06T21:14:09"
+
+
+def test_read_model_builder_marks_running_live_session_active():
+    registry = FakeLiveSessionRegistry()
+    registry.summary.status = "running"
+    registry.summary.finish = None
+    registry.summary.duration = "running"
+    builder = ReadModelBuilder(
+        workspace_registry=FakeWorkspaceRegistry(),
+        session_registry=registry,
+        demo_mode=False,
+    )
+
+    workspace = builder.dashboard().workspaces[0]
+
+    assert workspace.active_session == "UI-12345678"
+    assert workspace.latest_session == "UI-12345678"
+
+
 def test_read_model_builder_marks_docker_unavailable_when_registry_raises():
     builder = ReadModelBuilder(
         workspace_registry=RaisingWorkspaceRegistry(),
@@ -84,7 +169,7 @@ def test_read_model_builder_marks_docker_unavailable_when_registry_raises():
     assert dashboard.workspaces == []
 
 
-def test_non_demo_session_detail_does_not_construct_registries(monkeypatch):
+def test_non_demo_session_detail_uses_session_registry_without_workspace_registry(monkeypatch):
     constructed = {"workspace": 0, "session": 0}
 
     class CountingWorkspaceRegistry:
@@ -96,14 +181,14 @@ def test_non_demo_session_detail_does_not_construct_registries(monkeypatch):
             constructed["session"] += 1
 
     monkeypatch.setattr(read_model_module, "WorkspaceRegistry", CountingWorkspaceRegistry)
-    monkeypatch.setattr(read_model_module, "SessionRegistry", CountingSessionRegistry)
+    monkeypatch.setattr(read_model_module, "ContainerSessionRegistry", CountingSessionRegistry)
 
     builder = ReadModelBuilder(demo_mode=False)
 
     with pytest.raises(KeyError, match="Session detail is not available yet for x"):
         builder.session_detail("x")
 
-    assert constructed == {"workspace": 0, "session": 0}
+    assert constructed == {"workspace": 0, "session": 1}
 
 
 def test_read_model_builder_session_detail_is_not_available_when_not_demo():
@@ -115,3 +200,17 @@ def test_read_model_builder_session_detail_is_not_available_when_not_demo():
 
     with pytest.raises(KeyError, match="Session detail is not available yet for x"):
         builder.session_detail("x")
+
+
+def test_read_model_builder_returns_live_session_detail_when_available():
+    registry = FakeLiveSessionRegistry()
+    builder = ReadModelBuilder(
+        workspace_registry=FakeWorkspaceRegistry(),
+        session_registry=registry,
+        demo_mode=False,
+    )
+
+    detail = builder.session_detail("UI-12345678")
+
+    assert detail.id == "UI-12345678"
+    assert detail.outcome.startswith("Task completed")

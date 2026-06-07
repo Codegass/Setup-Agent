@@ -9,6 +9,8 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, StringConstraints
 
+from sag.web.session_registry import ContainerSessionStore
+
 
 class TaskRequest(BaseModel):
     task: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -16,8 +18,17 @@ class TaskRequest(BaseModel):
 
 
 class AgentTaskLauncher:
+    def __init__(self, session_store: ContainerSessionStore | None = None):
+        self.session_store = session_store if session_store is not None else ContainerSessionStore()
+
     def run(self, workspace_id: str, task: str, source_session: str | None) -> str:
         session_id = f"UI-{uuid.uuid4().hex[:8]}"
+        self.session_store.mark_started(
+            workspace_id=workspace_id,
+            session_id=session_id,
+            task=task,
+            source_session=source_session,
+        )
         thread = Thread(
             target=self._run_agent,
             args=(session_id, workspace_id, task, source_session),
@@ -36,6 +47,8 @@ class AgentTaskLauncher:
     ) -> None:
         from loguru import logger
 
+        success = False
+        outcome = f"Task failed: {task}"
         try:
             from sag.agent.agent import SetupAgent
             from sag.config import get_config
@@ -53,13 +66,29 @@ class AgentTaskLauncher:
             project_name = self._read_project_name(orchestrator, fallback=docker_label)
             task_text = self._task_with_source_session(task, source_session)
             agent = SetupAgent(config=get_config(), orchestrator=orchestrator)
-            agent.run_task(project_name=project_name, task_description=task_text)
+            success = agent.run_task(project_name=project_name, task_description=task_text)
+            outcome = f"Task completed: {task}" if success else f"Task incomplete: {task}"
         except Exception:
+            outcome = f"Task failed: {task}"
             logger.exception(
                 "Failed to run workspace task {} for session {}",
                 workspace_id,
                 session_id,
             )
+        finally:
+            try:
+                self.session_store.mark_finished(
+                    workspace_id=workspace_id,
+                    session_id=session_id,
+                    success=success,
+                    outcome=outcome,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to update workspace task session {} for {}",
+                    session_id,
+                    workspace_id,
+                )
 
     def _read_project_name(self, orchestrator: Any, fallback: str) -> str:
         from loguru import logger

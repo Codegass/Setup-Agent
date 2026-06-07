@@ -1,7 +1,31 @@
 import json
 from pathlib import Path
 
-from sag.web.session_registry import SessionRegistry
+from sag.web.models import DockerSummary, WorkspaceSummary
+from sag.web.session_registry import ContainerSessionRegistry, SessionRegistry
+
+
+class FakeOrchestrator:
+    def __init__(self, files: dict[str, str]):
+        self.files = files
+
+    def execute_command(self, command, **kwargs):
+        if command.startswith("cat "):
+            path = command.removeprefix("cat ").split(" ", 1)[0].strip("'")
+            if path in self.files:
+                return {"exit_code": 0, "output": self.files[path]}
+            return {"exit_code": 1, "output": ""}
+
+        return {"exit_code": 0, "output": ""}
+
+
+def workspace_summary() -> WorkspaceSummary:
+    return WorkspaceSummary(
+        id="sag-commons-cli",
+        project="commons-cli",
+        container="sag-commons-cli",
+        docker=DockerSummary(status="running"),
+    )
 
 
 def test_session_registry_reads_local_session_index(tmp_path: Path):
@@ -141,3 +165,50 @@ def test_session_registry_strips_text_and_defaults_blank_optional_fields(tmp_pat
     assert rows[0].duration == "—"
     assert rows[0].build == "success"
     assert rows[0].report == "ready"
+
+
+def test_container_session_registry_falls_back_to_last_comment_without_index():
+    files = {
+        "/workspace/.sag_last_comment.json": json.dumps(
+            {
+                "comment": "Task completed: give me a report of all the test in the workspace",
+                "timestamp": "2026-06-06T21:14:09.715549",
+                "project": "commons-cli",
+            }
+        )
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+
+    assert rows[0].id == "LEGACY-20260606-211409"
+    assert rows[0].title == "give me a report of all the test in the workspace"
+    assert rows[0].status == "completed"
+    assert rows[0].finish == "2026-06-06T21:14:09.715549"
+
+
+def test_container_session_registry_returns_legacy_last_comment_detail():
+    files = {
+        "/workspace/.sag_last_comment.json": json.dumps(
+            {
+                "comment": "Task completed: give me a report of all the test in the workspace",
+                "timestamp": "2026-06-06T21:14:09.715549",
+                "project": "commons-cli",
+            }
+        )
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(
+        workspace_summary(),
+        "LEGACY-20260606-211409",
+    )
+
+    assert detail is not None
+    assert detail.id == "LEGACY-20260606-211409"
+    assert detail.outcome.startswith("Task completed")
+    assert detail.evidence[0].source == "SAG session"

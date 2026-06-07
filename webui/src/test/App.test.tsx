@@ -181,6 +181,100 @@ describe("App", () => {
     expect(screen.getByText("Project builds.")).toBeInTheDocument()
   })
 
+  it("refreshes dashboard after submitting a workspace task", async () => {
+    const initialDashboard = {
+      ...dashboard,
+      workspaces: [
+        {
+          ...dashboard.workspaces[0],
+          task: "No current task",
+          activeSession: null,
+          latestSession: null,
+        },
+      ],
+    }
+    const refreshedDashboard = {
+      ...dashboard,
+      workspaces: [
+        {
+          ...dashboard.workspaces[0],
+          task: "Give me a report of all tests",
+          activeSession: "UI-12345678",
+          latestSession: "UI-12345678",
+          updated: "2026-06-06T21:13:38",
+        },
+      ],
+    }
+    const uiSessionDetail: ExecutionSessionDetail = {
+      ...sessionDetail,
+      id: "UI-12345678",
+      title: "Give me a report of all tests",
+      status: "running",
+      entry: "Web UI",
+      outcome: "Task is running.",
+    }
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+
+      if (url === "/api/workspaces") {
+        const workspaceCalls = fetchSpy.mock.calls.filter(
+          ([calledInput]) => String(calledInput) === "/api/workspaces",
+        )
+        return Promise.resolve(
+          jsonResponse(workspaceCalls.length === 1 ? initialDashboard : refreshedDashboard),
+        )
+      }
+
+      if (url === "/api/workspaces/sag-commons-cli/tasks") {
+        return Promise.resolve(
+          jsonResponse({
+            workspace_id: "sag-commons-cli",
+            session_id: "UI-12345678",
+            source_session: null,
+            status: "queued",
+          }),
+        )
+      }
+
+      if (url === "/api/sessions/UI-12345678") {
+        return Promise.resolve(jsonResponse(uiSessionDetail))
+      }
+
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    render(<App />)
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", {
+        name: /open workspace apache\/commons-cli/i,
+      }))[0],
+    )
+    fireEvent.click(screen.getByRole("button", { name: /^new task$/i }))
+    fireEvent.change(screen.getByLabelText("Task description"), {
+      target: { value: "Give me a report of all tests" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: /submit task/i }))
+
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/workspaces/sag-commons-cli/tasks",
+        expect.objectContaining({ method: "POST" }),
+      )
+    })
+    await waitFor(() => {
+      const dashboardFetches = fetchSpy.mock.calls.filter(
+        ([input]) => String(input) === "/api/workspaces",
+      )
+      expect(dashboardFetches).toHaveLength(2)
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: /sessions/i }))
+
+    expect((await screen.findAllByText("UI-12345678")).length).toBeGreaterThan(0)
+    expect(screen.getByText("Give me a report of all tests")).toBeInTheDocument()
+  })
+
   it("does not mount the terminal panel when the workspace container is not running", async () => {
     const stoppedDashboard = {
       ...dashboard,

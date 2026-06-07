@@ -14,6 +14,32 @@ class FakeLauncher:
         return "RUN-1"
 
 
+class FakeSessionStore:
+    def __init__(self):
+        self.started = []
+        self.finished = []
+
+    def mark_started(self, *, workspace_id, session_id, task, source_session):
+        self.started.append(
+            {
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "task": task,
+                "source_session": source_session,
+            }
+        )
+
+    def mark_finished(self, *, workspace_id, session_id, success, outcome):
+        self.finished.append(
+            {
+                "workspace_id": workspace_id,
+                "session_id": session_id,
+                "success": success,
+                "outcome": outcome,
+            }
+        )
+
+
 def test_task_runner_creates_new_session_from_workspace_task():
     launcher = FakeLauncher()
     runner = TaskRunner(launcher=launcher)
@@ -134,6 +160,88 @@ def test_agent_task_launcher_starts_daemon_thread_with_generated_session(monkeyp
         "Run formatter tests",
         "CC-3",
     )
+
+
+def test_agent_task_launcher_records_session_before_starting_thread(monkeypatch):
+    starts = []
+    store = FakeSessionStore()
+
+    class FakeUuid:
+        hex = "1234567890abcdef"
+
+    class FakeThread:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            starts.append(True)
+
+    monkeypatch.setattr(task_runner_module.uuid, "uuid4", lambda: FakeUuid())
+    monkeypatch.setattr(task_runner_module, "Thread", FakeThread)
+    launcher = AgentTaskLauncher(session_store=store)
+    monkeypatch.setattr(launcher, "_run_agent", lambda *args: None)
+
+    session_id = launcher.run("sag-commons-cli", "Run formatter tests", "CC-3")
+
+    assert session_id == "UI-12345678"
+    assert starts == [True]
+    assert store.started == [
+        {
+            "workspace_id": "sag-commons-cli",
+            "session_id": "UI-12345678",
+            "task": "Run formatter tests",
+            "source_session": "CC-3",
+        }
+    ]
+
+
+def test_agent_task_launcher_marks_session_finished_after_agent_run(monkeypatch):
+    store = FakeSessionStore()
+    calls = {}
+
+    class FakeDockerOrchestrator:
+        def __init__(self, project_name):
+            calls["project_name"] = project_name
+
+        def container_exists(self):
+            return True
+
+        def is_container_running(self):
+            return True
+
+        def execute_command(self, command):
+            return {
+                "exit_code": 0,
+                "output": '{"project_name": "commons-cli"}',
+            }
+
+    class FakeSetupAgent:
+        def __init__(self, *, config, orchestrator):
+            calls["agent_config"] = config
+            calls["agent_orchestrator"] = orchestrator
+
+        def run_task(self, *, project_name, task_description):
+            calls["run_task"] = (project_name, task_description)
+            return True
+
+    monkeypatch.setattr("sag.docker_orch.orch.DockerOrchestrator", FakeDockerOrchestrator)
+    monkeypatch.setattr("sag.agent.agent.SetupAgent", FakeSetupAgent)
+    monkeypatch.setattr("sag.config.get_config", lambda: "config")
+
+    launcher = AgentTaskLauncher(session_store=store)
+
+    launcher._run_agent("UI-12345678", "sag-commons-cli", "Run formatter tests", None)
+
+    assert calls["project_name"] == "commons-cli"
+    assert calls["run_task"] == ("commons-cli", "Run formatter tests")
+    assert store.finished == [
+        {
+            "workspace_id": "sag-commons-cli",
+            "session_id": "UI-12345678",
+            "success": True,
+            "outcome": "Task completed: Run formatter tests",
+        }
+    ]
 
 
 def test_agent_task_launcher_project_name_falls_back_on_bad_metadata():
