@@ -32,6 +32,12 @@ export function ContextMap({
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [debugOpen, setDebugOpen] = useState(false)
   const progressEntries = Object.entries(ctx.trunk.progress)
+  const hasActiveBranch =
+    Boolean(ctx.activeBranch.task.trim()) ||
+    Boolean(ctx.activeBranch.why.trim()) ||
+    ctx.activeBranch.memory.length > 0 ||
+    ctx.activeBranch.lastRefs.length > 0 ||
+    ctx.activeBranch.pressure > 0
 
   return (
     <div className="space-y-4">
@@ -64,7 +70,7 @@ export function ContextMap({
               ))}
             </div>
           ) : null}
-          {!preview ? (
+          {!preview && ctx.trunk.summary.trim() ? (
             <p className="mt-3 rounded-md bg-white p-2.5 text-[12px] leading-relaxed text-slate-500">
               {ctx.trunk.summary}
             </p>
@@ -75,12 +81,20 @@ export function ContextMap({
           {ctx.tasks.map((task) => {
             const isOpen = expanded[task.id] ?? false
             const active = task.status.trim().toLowerCase() === "active"
+            const hasDetails = Boolean(task.summary.trim()) || task.refs.length > 0
 
             return (
               <div key={task.id} className={cn("rounded-md", active && "bg-blue-50/50 ring-1 ring-blue-100")}>
                 <button
-                  className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left hover:bg-slate-50"
-                  onClick={() => setExpanded((current) => ({ ...current, [task.id]: !isOpen }))}
+                  className={cn(
+                    "flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left",
+                    hasDetails && "hover:bg-slate-50",
+                  )}
+                  onClick={() => {
+                    if (hasDetails) {
+                      setExpanded((current) => ({ ...current, [task.id]: !isOpen }))
+                    }
+                  }}
                   type="button"
                 >
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white">
@@ -97,12 +111,14 @@ export function ContextMap({
                   </span>
                   {task.recovered ? <Badge tone="amber">recovered</Badge> : null}
                   {active ? <Badge tone="blue">active branch</Badge> : null}
-                  <ChevronDown
-                    className={cn("ml-auto shrink-0 text-slate-300 transition-transform", isOpen && "rotate-180")}
-                    size={13}
-                  />
+                  {hasDetails ? (
+                    <ChevronDown
+                      className={cn("ml-auto shrink-0 text-slate-300 transition-transform", isOpen && "rotate-180")}
+                      size={13}
+                    />
+                  ) : null}
                 </button>
-                {isOpen ? (
+                {isOpen && hasDetails ? (
                   <div className="px-2.5 pb-2.5 pl-9">
                     <div className="rounded-md border border-slate-200 bg-white p-2.5 text-[12px] text-slate-500">
                       {task.summary}
@@ -129,7 +145,8 @@ export function ContextMap({
 
       {!preview ? (
         <>
-          <Card className="p-4">
+          {hasActiveBranch ? (
+            <Card className="p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex min-w-0 items-center gap-2">
                 <Activity size={14} className="text-blue-600" />
@@ -189,7 +206,8 @@ export function ContextMap({
                 </div>
               </>
             ) : null}
-          </Card>
+            </Card>
+          ) : null}
 
           <Card className="overflow-hidden">
             <button

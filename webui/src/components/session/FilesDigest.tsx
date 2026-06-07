@@ -23,7 +23,7 @@ export function FilesDigest({
   if (!digest) {
     return (
       <div className="px-4 py-6 text-center text-[13px] text-slate-400">
-        File snapshot unavailable for this execution.
+        No file snapshot was captured for this execution.
       </div>
     )
   }

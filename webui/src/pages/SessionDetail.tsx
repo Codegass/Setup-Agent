@@ -142,7 +142,9 @@ function StatusTab({ detail }: { detail: ExecutionSessionDetail }) {
             title="Latest report"
           />
           <div className="px-4 py-3 text-[13px] leading-relaxed text-slate-500">
-            {firstParagraph(detail.reportDoc.blocks) ?? "Report is ready."}
+            {reportPreview(detail.reportDoc.blocks).map((line) => (
+              <div key={line}>{line}</div>
+            ))}
           </div>
         </Card>
       ) : null}
@@ -188,8 +190,20 @@ function FilesTab({ detail }: { detail: ExecutionSessionDetail }) {
   )
 }
 
-function firstParagraph(blocks: Array<Record<string, unknown>>): string | null {
-  const block = blocks.find((candidate) => candidate.type === "p" && typeof candidate.text === "string")
+function reportPreview(blocks: Array<Record<string, unknown>>): string[] {
+  const lines = blocks
+    .map((block) => {
+      if (typeof block.text === "string" && ["status", "p", "meta"].includes(String(block.type))) {
+        return block.text
+      }
+      if (Array.isArray(block.rows)) {
+        const row = block.rows.find((candidate) => Array.isArray(candidate) && candidate.length >= 2)
+        return Array.isArray(row) ? row.map(String).join(": ") : null
+      }
+      return null
+    })
+    .filter((line): line is string => Boolean(line))
+    .slice(0, 3)
 
-  return typeof block?.text === "string" ? block.text : null
+  return lines.length ? lines : ["Report is ready."]
 }

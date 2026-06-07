@@ -25,8 +25,14 @@ class ContextMapBuilder:
 
         return ContextMap(
             trunk=TrunkSummary(
-                goal=str(trunk_data.get("goal") or trunk_data.get("project_goal") or "Unknown goal"),
-                state=str(trunk_data.get("overall_status") or trunk_data.get("state") or "Unknown"),
+                goal=str(
+                    trunk_data.get("goal") or trunk_data.get("project_goal") or "Unknown goal"
+                ),
+                state=str(
+                    trunk_data.get("overall_status")
+                    or trunk_data.get("state")
+                    or self._derived_state(tasks)
+                ),
                 progress={"done": done, "total": len(tasks)},
                 summary=str(trunk_data.get("summary") or trunk_data.get("latest_summary") or ""),
             ),
@@ -71,10 +77,7 @@ class ContextMapBuilder:
         return ContextTask(
             id=task_id,
             title=str(
-                item.get("task")
-                or item.get("title")
-                or item.get("description")
-                or "Untitled task"
+                item.get("task") or item.get("title") or item.get("description") or "Untitled task"
             ),
             status=str(item.get("status") or "pending"),
             summary=str(item.get("summary") or ""),
@@ -83,7 +86,21 @@ class ContextMapBuilder:
         )
 
     def _is_active_status(self, status: str) -> bool:
-        return status in {"active", "in_progress"}
+        return status.strip().lower() in {"active", "running", "in_progress"}
+
+    def _derived_state(self, tasks: list[ContextTask]) -> str:
+        statuses = {task.status.strip().lower() for task in tasks}
+        if not statuses:
+            return "unknown"
+        if statuses & {"failed", "error"}:
+            return "failed"
+        if statuses & {"active", "running", "in_progress"}:
+            return "running"
+        if statuses <= {"completed"}:
+            return "completed"
+        if "completed" in statuses:
+            return "partial"
+        return "pending"
 
     def _memory(self, value: Any) -> list[str]:
         if not isinstance(value, (list, tuple)):
@@ -109,7 +126,8 @@ class ContextMapBuilder:
     def _active_branch(self, task_id: str | None) -> ActiveBranchSummary:
         if task_id is None:
             return ActiveBranchSummary()
-        branch_path = self.contexts_dir / f"task_{task_id}.json"
+        filename = f"{task_id}.json" if task_id.startswith("task_") else f"task_{task_id}.json"
+        branch_path = self.contexts_dir / filename
         data = self._read_json(branch_path)
         return ActiveBranchSummary(
             task=str(data.get("task") or ""),

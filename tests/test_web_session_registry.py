@@ -370,8 +370,10 @@ def test_container_session_registry_returns_setup_artifact_detail():
         ),
         "/workspace/setup-report-20260606-213509.md": (
             "# Project Setup Report\n\n"
+            "**Commons-Cli** | Maven Java Project | Maven\n"
             "**Generated:** 2026-06-06 21:35:09\n"
             "**Result:** SUCCESS\n"
+            "\u2502 Build \u2502 115 classes, 0 JARs \u2502\n"
         ),
     }
     registry = ContainerSessionRegistry(
@@ -388,5 +390,51 @@ def test_container_session_registry_returns_setup_artifact_detail():
     assert detail.report == "ready"
     assert detail.report_doc is not None
     assert detail.report_doc.title == "setup-report-20260606-213509.md"
+    assert [block["type"] for block in detail.report_doc.blocks[:4]] == [
+        "h1",
+        "p",
+        "meta",
+        "status",
+    ]
+    assert detail.build.state == "success"
+    assert detail.build.tool == "Maven"
+    assert detail.build.note == "115 classes, 0 JARs"
     assert detail.context is not None
     assert detail.context.trunk.progress == {"done": 1, "total": 1}
+
+
+def test_container_session_registry_recovers_setup_logs_from_host_session(tmp_path: Path):
+    session_dir = tmp_path / "session_20260606_213207"
+    session_dir.mkdir()
+    (session_dir / "command_project_commons-cli.log").write_text(
+        "2026-06-06 21:32:07 | Starting project setup: commons-cli\n",
+        encoding="utf-8",
+    )
+    (session_dir / "agent_execution.log").write_text(
+        "first line\nsecond line\n",
+        encoding="utf-8",
+    )
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "goal": "Setup commons-cli",
+                "project_name": "commons-cli",
+                "todo_list": [],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": "**Result:** SUCCESS\n",
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files),
+        logs_root=tmp_path,
+    )
+
+    detail = registry.get_workspace_session_detail(
+        workspace_summary(),
+        "SETUP-20260606-213241",
+    )
+
+    assert detail is not None
+    assert detail.logs == ["first line", "second line"]

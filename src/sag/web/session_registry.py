@@ -46,9 +46,11 @@ class ContainerSessionRegistry:
         self,
         orchestrator_factory: Callable[[str], Any] | None = None,
         workspace_registry_factory: Callable[[], Any] | None = None,
+        logs_root: Path | None = None,
     ):
         self.orchestrator_factory = orchestrator_factory
         self.workspace_registry_factory = workspace_registry_factory
+        self.logs_root = logs_root if logs_root is not None else Path("logs")
 
     def list_workspace_sessions(self, workspace: WorkspaceSummary) -> list[ExecutionSessionSummary]:
         orchestrator = self._orchestrator(workspace.id)
@@ -56,7 +58,7 @@ class ContainerSessionRegistry:
         rows = parse_session_index(raw, workspace.id) if raw is not None else []
         return _merge_session_summaries(
             [
-                *_setup_artifact_summaries(orchestrator, workspace.id),
+                *_setup_artifact_summaries(orchestrator, workspace.id, self.logs_root),
                 *_legacy_session_summaries(orchestrator, workspace.id),
                 *rows,
             ]
@@ -85,7 +87,7 @@ class ContainerSessionRegistry:
                 item = None
 
         if item is None:
-            item = _setup_artifact_item(orchestrator, workspace.id)
+            item = _setup_artifact_item(orchestrator, workspace.id, self.logs_root)
             if item is None or item.get("id") != session_id:
                 return None
 
@@ -241,7 +243,7 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
         start=_text(item.get("start"), default="—"),
         finish=_optional_text(item.get("finish")),
         duration=_text(item.get("duration"), default="—"),
-        build=_text(item.get("build"), default="none"),
+        build=_build_state_value(item.get("build")),
         test=TestSummary(
             state=_text(test.get("state"), default="none"),
             pass_count=_to_int(test.get("pass")),
@@ -281,7 +283,7 @@ def _session_detail(
         evidence=_evidence(item, outcome),
         files=None,
         context=context,
-        logs=[],
+        logs=_log_lines(item.get("logs")),
         partial=False,
     )
 
@@ -366,8 +368,9 @@ def _legacy_title(comment: str) -> str:
 def _setup_artifact_summaries(
     orchestrator: Any,
     workspace_id: str,
+    logs_root: Path | None = None,
 ) -> list[ExecutionSessionSummary]:
-    item = _setup_artifact_item(orchestrator, workspace_id)
+    item = _setup_artifact_item(orchestrator, workspace_id, logs_root)
     if item is None:
         return []
     return [_session_summary(item, workspace_id)]
@@ -387,7 +390,11 @@ def _session_sort_key(row: ExecutionSessionSummary) -> tuple[str, str]:
     return (timestamp or row.finish or row.start or "", row.id)
 
 
-def _setup_artifact_item(orchestrator: Any, workspace_id: str) -> dict[str, Any] | None:
+def _setup_artifact_item(
+    orchestrator: Any,
+    workspace_id: str,
+    logs_root: Path | None = None,
+) -> dict[str, Any] | None:
     trunk = _read_latest_trunk(orchestrator)
     if trunk is None:
         return None
@@ -402,6 +409,10 @@ def _setup_artifact_item(orchestrator: Any, workspace_id: str) -> dict[str, Any]
     status = _setup_status(tasks, report_path)
     test = _test_payload_from_report(report_raw)
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
+    project_name = _text(
+        trunk_data.get("project_name"),
+        default=workspace_id.removeprefix("sag-"),
+    )
 
     return {
         "id": _setup_session_id(context_id, created),
@@ -415,7 +426,7 @@ def _setup_artifact_item(orchestrator: Any, workspace_id: str) -> dict[str, Any]
             _normalize_timestamp(created) or created,
             _normalize_timestamp(finish) or finish,
         ),
-        "build": _build_state_from_report(report_raw),
+        "build": _build_payload_from_report(report_raw),
         "test": test,
         "report": "ready" if report_path else "none",
         "files": len(tasks),
@@ -424,6 +435,7 @@ def _setup_artifact_item(orchestrator: Any, workspace_id: str) -> dict[str, Any]
         "updated": _normalize_timestamp(finish) or finish or "unknown",
         "report_path": report_path,
         "report_raw": report_raw,
+        "logs": _setup_logs(logs_root or Path("logs"), project_name, created),
     }
 
 
@@ -619,6 +631,43 @@ def _build_state_from_report(report_raw: str | None) -> str:
     return "unknown"
 
 
+def _build_payload_from_report(report_raw: str | None) -> dict[str, Any]:
+    state = _build_state_from_report(report_raw)
+    if not report_raw:
+        return {"state": state}
+
+    return {
+        "state": state,
+        "tool": _build_tool_from_report(report_raw),
+        "time": "—",
+        "note": _build_note_from_report(report_raw),
+    }
+
+
+def _build_tool_from_report(report_raw: str) -> str:
+    for line in report_raw.splitlines():
+        text = line.strip()
+        if not text or text.startswith("|"):
+            continue
+        parts = [_strip_markdown_cell(part) for part in text.split("|")]
+        if len(parts) >= 3 and parts[-1]:
+            return parts[-1]
+    return "—"
+
+
+def _build_note_from_report(report_raw: str) -> str:
+    for row in _report_rows(report_raw):
+        if len(row) >= 2 and row[0].strip().lower() == "build":
+            return row[1]
+    return ""
+
+
+def _build_state_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return _text(value.get("state"), default="none")
+    return _text(value, default="none")
+
+
 def _report_generated_at(report_raw: str | None) -> str:
     if not report_raw:
         return ""
@@ -667,17 +716,86 @@ def _report_document(item: dict[str, Any]) -> ReportDocument | None:
 
 def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
-    for line in report_raw.splitlines():
+    lines = report_raw.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         text = line.strip()
         if not text:
+            index += 1
             continue
+
         if text.startswith("#"):
-            blocks.append({"type": "h", "text": text.lstrip("#").strip()})
-        elif not text.startswith("|") and not text.startswith("```"):
+            level = min(len(text) - len(text.lstrip("#")), 2)
+            blocks.append({"type": f"h{level}", "text": text.lstrip("#").strip()})
+        elif text.lower().startswith("**generated:**"):
+            blocks.append({"type": "meta", "text": text.strip("*")})
+        elif text.lower().startswith("**result:**"):
+            result = text.removeprefix("**Result:**").strip()
+            blocks.append(
+                {
+                    "type": "status",
+                    "text": result,
+                    "ok": "success" in result.lower() or "passed" in result.lower(),
+                }
+            )
+        elif text.startswith("|") or text.startswith("\u2502"):
+            table_lines: list[str] = []
+            while index < len(lines) and (
+                lines[index].strip().startswith("|")
+                or lines[index].strip().startswith("\u2502")
+            ):
+                table_lines.append(lines[index])
+                index += 1
+            rows = _report_rows("\n".join(table_lines))
+            if rows:
+                blocks.append({"type": "table", "rows": rows})
+            continue
+        elif not text.startswith("```"):
             blocks.append({"type": "p", "text": text})
+
         if len(blocks) >= 12:
             break
+        index += 1
     return blocks
+
+
+def _markdown_table_rows(markdown: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in markdown.splitlines():
+        text = line.strip()
+        if not text.startswith("|"):
+            continue
+        cells = [_strip_markdown_cell(cell) for cell in text.strip("|").split("|")]
+        if not cells or all(_is_table_separator(cell) for cell in cells):
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _box_table_rows(markdown: str) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in markdown.splitlines():
+        text = line.strip()
+        if not text.startswith("\u2502"):
+            continue
+        cells = [_strip_markdown_cell(cell) for cell in text.strip("\u2502").split("\u2502")]
+        if cells:
+            rows.append(cells)
+    return rows
+
+
+def _report_rows(markdown: str) -> list[list[str]]:
+    return [*_markdown_table_rows(markdown), *_box_table_rows(markdown)]
+
+
+def _strip_markdown_cell(value: str) -> str:
+    return value.strip().strip("*").strip()
+
+
+def _is_table_separator(value: str) -> bool:
+    stripped = value.replace(" ", "")
+    return bool(stripped) and set(stripped) <= {"-", ":"}
 
 
 def _normalize_timestamp(value: str) -> str:
@@ -693,6 +811,66 @@ def _normalize_timestamp(value: str) -> str:
         return datetime.fromisoformat(text).isoformat()
     except ValueError:
         return text
+
+
+def _setup_logs(logs_root: Path, project_name: str, created: str) -> list[str]:
+    session_dir = _matching_log_session_dir(logs_root, project_name, created)
+    if session_dir is None:
+        return []
+    return _read_log_file(session_dir / "agent_execution.log", max_lines=500)
+
+
+def _matching_log_session_dir(
+    logs_root: Path,
+    project_name: str,
+    created: str,
+) -> Path | None:
+    if not logs_root.exists():
+        return None
+
+    setup_time = _timestamp_for_match(created)
+    candidates: list[tuple[float, Path]] = []
+    for session_dir in sorted(logs_root.glob("session_*")):
+        if not session_dir.is_dir():
+            continue
+        command_log = session_dir / f"command_project_{project_name}.log"
+        if not command_log.exists():
+            continue
+        session_time = _timestamp_for_match(session_dir.name.removeprefix("session_"))
+        if setup_time is not None and session_time is not None and session_time > setup_time:
+            continue
+        candidates.append((session_time or 0.0, session_dir))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def _timestamp_for_match(value: str) -> float | None:
+    normalized = _normalize_timestamp(value.replace("_", "T", 1))
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        pass
+
+    try:
+        return datetime.strptime(value, "%Y%m%d_%H%M%S").timestamp()
+    except ValueError:
+        return None
+
+
+def _read_log_file(path: Path, max_lines: int) -> list[str]:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    return lines[-max_lines:]
+
+
+def _log_lines(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(line) for line in value]
 
 
 def _build_summary(value: Any) -> BuildSummary:

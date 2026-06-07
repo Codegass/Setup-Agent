@@ -118,6 +118,82 @@ describe("SessionDetail", () => {
     expect(screen.queryByRole("link", { name: /open raw/i })).not.toBeInTheDocument()
   })
 
+  it("renders recovered setup report blocks without raw JSON fallbacks", () => {
+    render(
+      <SessionDetail
+        detail={{
+          ...detail,
+          reportDoc: {
+            title: "setup-report.md",
+            generated: "now",
+            blocks: [
+              { type: "h1", text: "Project Setup Report" },
+              { type: "meta", text: "Generated: 2026-06-06 21:35:09" },
+              { type: "status", text: "SUCCESS (Build Passed, 97.7% Tests Pass)", ok: true },
+              {
+                type: "table",
+                rows: [
+                  ["Repository", "Cloned successfully"],
+                  ["Build", "115 classes, 0 JARs"],
+                ],
+              },
+            ],
+          },
+        }}
+        initialTab="Report"
+        onBack={() => {}}
+        onNewTask={() => {}}
+      />,
+    )
+
+    expect(screen.getByRole("heading", { name: "Project Setup Report" })).toBeInTheDocument()
+    expect(screen.getByText("SUCCESS (Build Passed, 97.7% Tests Pass)")).toBeInTheDocument()
+    expect(screen.getByText("115 classes, 0 JARs")).toBeInTheDocument()
+    expect(screen.queryByText(/"type":/)).not.toBeInTheDocument()
+  })
+
+  it("hides empty active branch focus in completed setup context", () => {
+    render(
+      <SessionDetail
+        detail={{
+          ...detail,
+          context: {
+            trunk: {
+              goal: "Setup commons-cli",
+              state: "completed",
+              progress: { done: 1, total: 1 },
+              summary: "",
+            },
+            tasks: [
+              {
+                id: "task_1",
+                title: "Clone repository",
+                status: "completed",
+                summary: "",
+                refs: [],
+                recovered: false,
+              },
+            ],
+            activeBranch: {
+              task: "",
+              why: "",
+              memory: [],
+              lastRefs: [],
+              pressure: 0,
+            },
+            debug: {},
+          },
+        }}
+        initialTab="Context"
+        onBack={() => {}}
+        onNewTask={() => {}}
+      />,
+    )
+
+    expect(screen.getByText("Trunk - Command Center")).toBeInTheDocument()
+    expect(screen.queryByText("Active Branch Focus")).not.toBeInTheDocument()
+  })
+
   it("starts a new task from the current session id", () => {
     const onNewTask = vi.fn()
 

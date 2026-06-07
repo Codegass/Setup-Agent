@@ -104,6 +104,35 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
     )
   }
 
+  if (type === "table" && Array.isArray(block.rows)) {
+    const rows = block.rows.filter((row): row is unknown[] => Array.isArray(row))
+
+    return (
+      <div className="overflow-hidden rounded-md border border-slate-200">
+        <table className="w-full border-collapse text-[13px]">
+          <tbody className="divide-y divide-slate-100">
+            {rows.map((row, index) => (
+              <tr key={index} className="bg-white">
+                {row.map((cell, cellIndex) => (
+                  <td
+                    key={`${index}-${cellIndex}`}
+                    className={
+                      cellIndex === 0
+                        ? "w-40 bg-slate-50 px-3 py-2 font-medium text-slate-600"
+                        : "px-3 py-2 text-slate-600"
+                    }
+                  >
+                    {String(cell)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    )
+  }
+
   return (
     <pre className="overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] leading-relaxed text-slate-500">
       {JSON.stringify(block, null, 2)}
