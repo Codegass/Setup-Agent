@@ -180,7 +180,7 @@ describe("Dashboard", () => {
     )
 
     const rows = screen.getAllByLabelText(/open workspace/i)
-    const highlighted = rows.filter((row) => row.className.includes("bg-blue-50"))
+    const highlighted = rows.filter((row) => row.className.includes("bg-blue-50/60"))
     expect(highlighted.length).toBeGreaterThan(0)
   })
 })
