@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { fetchDashboard, fetchSession, submitTask } from "./client"
+import {
+  fetchDashboard,
+  fetchLaunchQueue,
+  fetchSession,
+  submitProjectBatch,
+  submitTask,
+} from "./client"
 
 const jsonResponse = (payload: unknown, init?: ResponseInit) =>
   new Response(JSON.stringify(payload), {
@@ -98,5 +104,90 @@ describe("api client", () => {
     )
 
     await expect(fetchDashboard()).rejects.toThrow("503 Service Unavailable")
+  })
+
+  it("submits a project batch and returns the body with http status", async () => {
+    const body = {
+      batch_id: "BATCH-20260607-abcdef",
+      concurrency: 2,
+      accepted: [
+        {
+          launch_id: "LAUNCH-12345678",
+          row_index: 0,
+          workspace_id: "sag-commons-cli",
+          status: "queued",
+        },
+      ],
+      rejected: [],
+    }
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(body, { status: 202 }))
+
+    const result = await submitProjectBatch({
+      concurrency: 2,
+      projects: [{ repo_url: "https://github.com/apache/commons-cli.git" }],
+    })
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/project-launches/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        concurrency: 2,
+        projects: [{ repo_url: "https://github.com/apache/commons-cli.git" }],
+      }),
+    })
+    expect(result).toEqual({ status: 202, ...body })
+  })
+
+  it("returns conflict batch responses instead of throwing on 409", async () => {
+    const body = {
+      batch_id: null,
+      concurrency: 2,
+      accepted: [],
+      rejected: [
+        {
+          row_index: 0,
+          workspace_id: "sag-existing",
+          status: "conflict",
+          message: "Workspace already exists: sag-existing",
+        },
+      ],
+    }
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(body, { status: 409 }),
+    )
+
+    const result = await submitProjectBatch({
+      projects: [{ repo_url: "https://github.com/x/existing.git" }],
+    })
+
+    expect(result.status).toBe(409)
+    expect(result.rejected[0].message).toContain("already exists")
+  })
+
+  it("throws on unexpected batch submit failures", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("boom", { status: 500, statusText: "Internal Server Error" }),
+    )
+
+    await expect(
+      submitProjectBatch({ projects: [{ repo_url: "x" }] }),
+    ).rejects.toThrow("500")
+  })
+
+  it("fetches the launch queue", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        default_concurrency: 4,
+        summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },
+        batches: [],
+      }),
+    )
+
+    const queue = await fetchLaunchQueue()
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/project-launches")
+    expect(queue.default_concurrency).toBe(4)
   })
 })

@@ -165,3 +165,76 @@ export interface ReportDocument {
   generated: string
   blocks: Array<Record<string, unknown>>
 }
+
+export interface LaunchProjectRowInput {
+  repo_url: string
+  name?: string | null
+  ref?: string | null
+  goal?: string | null
+  record?: boolean
+}
+
+export interface LaunchBatchRequestBody {
+  concurrency?: number | null
+  projects: LaunchProjectRowInput[]
+}
+
+export interface LaunchAcceptedRow {
+  launch_id: string
+  row_index: number
+  workspace_id: string
+  status: string
+}
+
+export interface LaunchRejectedRow {
+  row_index: number
+  workspace_id: string | null
+  status: string
+  message: string
+}
+
+export interface LaunchBatchResponse {
+  batch_id: string | null
+  concurrency: number
+  accepted: LaunchAcceptedRow[]
+  rejected: LaunchRejectedRow[]
+}
+
+export interface LaunchBatchResult extends LaunchBatchResponse {
+  status: number
+}
+
+export interface LaunchQueueSummary {
+  queued: number
+  launching: number
+  running: number
+  completed: number
+  failed: number
+}
+
+export interface LaunchQueueItem {
+  id: string
+  row_index: number
+  repo_url: string
+  workspace_id: string
+  ref: string | null
+  status: string
+  pid: number | null
+  exit_code: number | null
+  error: string | null
+  process_log: string
+}
+
+export interface LaunchQueueBatch {
+  id: string
+  status: string
+  concurrency: number
+  created: string
+  items: LaunchQueueItem[]
+}
+
+export interface LaunchQueueState {
+  default_concurrency: number
+  summary: LaunchQueueSummary
+  batches: LaunchQueueBatch[]
+}

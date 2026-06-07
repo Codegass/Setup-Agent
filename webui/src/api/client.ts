@@ -1,6 +1,10 @@
 import type {
   DashboardResponse,
   ExecutionSessionDetail,
+  LaunchBatchRequestBody,
+  LaunchBatchResponse,
+  LaunchBatchResult,
+  LaunchQueueState,
   SubmitTaskResponse,
 } from "./types"
 
@@ -38,4 +42,25 @@ export async function submitTask(
       body: JSON.stringify({ task, source_session: sourceSession ?? null }),
     }),
   )
+}
+
+export function fetchLaunchQueue(): Promise<LaunchQueueState> {
+  return getJson<LaunchQueueState>("/api/project-launches")
+}
+
+export async function submitProjectBatch(
+  payload: LaunchBatchRequestBody,
+): Promise<LaunchBatchResult> {
+  const response = await fetch("/api/project-launches/batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  })
+
+  if (response.status === 202 || response.status === 409) {
+    const body = (await response.json()) as LaunchBatchResponse
+    return { status: response.status, ...body }
+  }
+
+  throw new Error(`${response.status} ${response.statusText}`)
 }
