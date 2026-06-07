@@ -357,6 +357,50 @@ describe("App", () => {
     expect(screen.getByText("Run formatter tests")).toBeInTheDocument()
   })
 
+  it("polls open running session details and renders fresh status", async () => {
+    const updatedSessionDetail: ExecutionSessionDetail = {
+      ...sessionDetail,
+      status: "completed",
+      duration: "2m 45s",
+      outcome: "Setup completed after polling.",
+      test: { state: "success", pass: 430, fail: 0, skip: 0, total: 430 },
+    }
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+
+      if (url === "/api/workspaces") {
+        return Promise.resolve(jsonResponse(dashboard))
+      }
+
+      if (url === "/api/sessions/CC-3") {
+        const sessionFetches = fetchSpy.mock.calls.filter(
+          ([calledInput]) => String(calledInput) === "/api/sessions/CC-3",
+        )
+        return Promise.resolve(
+          jsonResponse(sessionFetches.length <= 2 ? sessionDetail : updatedSessionDetail),
+        )
+      }
+
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    render(<App />)
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", {
+        name: /open workspace apache\/commons-cli/i,
+      }))[0],
+    )
+    fireEvent.click(screen.getByRole("button", { name: /open session detail/i }))
+
+    expect(await screen.findByText("Build succeeds and tests are partial.")).toBeInTheDocument()
+
+    await new Promise((resolve) => setTimeout(resolve, 3200))
+
+    expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
+    expect(screen.getByText("430")).toBeInTheDocument()
+  }, 8000)
+
   it("does not mount the terminal panel when the workspace container is not running", async () => {
     const stoppedDashboard = {
       ...dashboard,

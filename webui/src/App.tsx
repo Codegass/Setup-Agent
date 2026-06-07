@@ -16,6 +16,9 @@ import { Dashboard } from "@/pages/Dashboard"
 import { SessionDetail } from "@/pages/SessionDetail"
 import { Workspace, type WorkspaceSessionRow } from "@/pages/Workspace"
 
+const DASHBOARD_POLL_MS = 5000
+const SESSION_DETAIL_POLL_MS = 3000
+
 type Route =
   | { view: "dashboard" }
   | { view: "workspace"; workspaceId: string; newTaskSourceSession?: string | null }
@@ -30,8 +33,10 @@ export function App() {
   const [sessionLoading, setSessionLoading] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
-  const loadDashboard = useCallback(async () => {
-    setLoading(true)
+  const loadDashboard = useCallback(async (options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setLoading(true)
+    }
     setDashboardError(null)
 
     try {
@@ -40,7 +45,9 @@ export function App() {
     } catch (err) {
       setDashboardError(String(err))
     } finally {
-      setLoading(false)
+      if (!options?.silent) {
+        setLoading(false)
+      }
     }
   }, [])
 
@@ -48,8 +55,18 @@ export function App() {
     void loadDashboard()
   }, [loadDashboard])
 
-  const ensureSessionDetail = useCallback(async (sessionId: string) => {
-    setSessionLoading(sessionId)
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      void loadDashboard({ silent: true })
+    }, DASHBOARD_POLL_MS)
+
+    return () => window.clearInterval(interval)
+  }, [loadDashboard])
+
+  const ensureSessionDetail = useCallback(async (sessionId: string, options?: { silent?: boolean }) => {
+    if (!options?.silent) {
+      setSessionLoading(sessionId)
+    }
     setRouteError(null)
 
     try {
@@ -58,7 +75,9 @@ export function App() {
     } catch (err) {
       setRouteError(String(err))
     } finally {
-      setSessionLoading((current) => (current === sessionId ? null : current))
+      if (!options?.silent) {
+        setSessionLoading((current) => (current === sessionId ? null : current))
+      }
     }
   }, [])
 
@@ -79,6 +98,23 @@ export function App() {
       }
     }
   }, [dashboard, ensureSessionDetail, route])
+
+  useEffect(() => {
+    if (route.view !== "session") {
+      return
+    }
+
+    const detail = sessionDetails[route.sessionId]
+    if (detail && !isLiveSessionStatus(detail.status)) {
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      void ensureSessionDetail(route.sessionId, { silent: true })
+    }, SESSION_DETAIL_POLL_MS)
+
+    return () => window.clearInterval(interval)
+  }, [ensureSessionDetail, route, sessionDetails])
 
   const openDashboard = () => {
     setRouteError(null)
@@ -164,7 +200,12 @@ export function App() {
           <Card className="max-w-xl p-5">
             <div className="text-[15px] font-semibold text-slate-900">Dashboard unavailable</div>
             <div className="mt-2 font-mono text-[12px] text-red-600">{dashboardError}</div>
-            <Button className="mt-4" onClick={loadDashboard} type="button" variant="outline">
+            <Button
+              className="mt-4"
+              onClick={() => void loadDashboard()}
+              type="button"
+              variant="outline"
+            >
               Retry
             </Button>
           </Card>
@@ -178,7 +219,7 @@ export function App() {
               <div className="font-semibold text-red-700">Refresh failed</div>
               <div className="mt-0.5 font-mono text-[12px] text-red-600">{dashboardError}</div>
             </div>
-            <Button onClick={loadDashboard} type="button" variant="outline">
+            <Button onClick={() => void loadDashboard()} type="button" variant="outline">
               Retry
             </Button>
           </Card>
@@ -199,7 +240,7 @@ export function App() {
           data={dashboard}
           onOpenSession={openSession}
           onOpenWorkspace={openWorkspace}
-          onRefresh={loadDashboard}
+          onRefresh={() => void loadDashboard()}
           refreshing={loading}
         />
       ) : null}
@@ -384,6 +425,12 @@ function normalizeWorkspaceBuild(build: WorkspaceSummary["build"]): BuildSummary
   }
 
   return build
+}
+
+function isLiveSessionStatus(status: string): boolean {
+  return ["active", "pending", "queued", "running", "in_progress"].includes(
+    status.trim().toLowerCase(),
+  )
 }
 
 function Breadcrumb({
