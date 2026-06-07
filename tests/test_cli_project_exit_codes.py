@@ -20,6 +20,18 @@ class FailingSetupAgent:
         return False
 
 
+class RecordingSetupAgent:
+    calls = []
+
+    def __init__(self, config, orchestrator):
+        self.config = config
+        self.orchestrator = orchestrator
+
+    def setup_project(self, **kwargs):
+        self.calls.append(kwargs)
+        return True
+
+
 def test_project_command_returns_nonzero_when_setup_fails(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_module, "DockerOrchestrator", FakeProjectOrchestrator)
@@ -45,3 +57,23 @@ def test_project_command_returns_nonzero_when_ui_setup_fails(monkeypatch, tmp_pa
     )
 
     assert result.exit_code == 1
+
+
+def test_project_command_passes_ref_to_setup_agent(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module, "DockerOrchestrator", FakeProjectOrchestrator)
+    monkeypatch.setattr(main_module, "SetupAgent", RecordingSetupAgent)
+    RecordingSetupAgent.calls = []
+
+    result = CliRunner().invoke(
+        main_module.cli,
+        [
+            "project",
+            "https://github.com/apache/commons-cli.git",
+            "--ref",
+            "rel/commons-cli-1.11.0",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert RecordingSetupAgent.calls[0]["project_ref"] == "rel/commons-cli-1.11.0"

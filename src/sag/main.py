@@ -328,8 +328,13 @@ def list():
     "--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs"
 )
 @click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
+@click.option(
+    "--ref",
+    "project_ref",
+    help="Git ref to set up, such as a branch, tag, release tag, short commit, or full commit.",
+)
 @click.pass_context
-def project(ctx, repo_url, name, goal, record, ui):
+def project(ctx, repo_url, name, goal, record, ui, project_ref):
     """Initial setup for a new project from repository URL."""
 
     config = ctx.obj["config"]
@@ -367,6 +372,8 @@ def project(ctx, repo_url, name, goal, record, ui):
         if not config.ui_mode:
             console.print(f"[bold green]🚀 Setting up new project[/bold green]")
             console.print(f"[dim]Repository:[/dim] {repo_url}")
+            if project_ref:
+                console.print(f"[dim]Repository Ref:[/dim] {project_ref}")
             console.print(f"[dim]Project Name:[/dim] {project_name}")
             console.print(f"[dim]Docker Name:[/dim] {docker_name}")
             if name and name != project_name:
@@ -394,7 +401,11 @@ def project(ctx, repo_url, name, goal, record, ui):
 
         # Run the setup - pass project_name (from URL) and docker_label for metadata
         success = agent.setup_project(
-            project_url=repo_url, project_name=project_name, goal=goal, docker_label=docker_label
+            project_url=repo_url,
+            project_name=project_name,
+            goal=goal,
+            docker_label=docker_label,
+            project_ref=project_ref,
         )
 
         # Save artifacts if recording is enabled

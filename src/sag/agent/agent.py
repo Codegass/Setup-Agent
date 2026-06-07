@@ -189,7 +189,12 @@ class SetupAgent:
         return []
 
     def _save_project_metadata(
-        self, project_url: str, project_name: str, docker_label: str, goal: str
+        self,
+        project_url: str,
+        project_name: str,
+        docker_label: str,
+        goal: str,
+        project_ref: Optional[str] = None,
     ) -> bool:
         """
         Save project metadata to /workspace/.setup_agent/project_meta.json.
@@ -211,6 +216,7 @@ class SetupAgent:
             metadata = {
                 "project_name": project_name,
                 "project_url": project_url,
+                "project_ref": project_ref,
                 "docker_label": docker_label,
                 "goal": goal,
                 "created_at": datetime.now().isoformat(),
@@ -258,6 +264,7 @@ class SetupAgent:
         goal: str,
         interactive: bool = False,
         docker_label: Optional[str] = None,
+        project_ref: Optional[str] = None,
     ) -> bool:
         """Setup a project from scratch.
 
@@ -268,6 +275,7 @@ class SetupAgent:
             interactive: Whether to run in interactive mode
             docker_label: Docker container label (from --name flag).
                          If None, defaults to project_name.
+            project_ref: Optional Git ref-ish handle to checkout during clone.
         """
         # Default docker_label to project_name if not provided
         if docker_label is None:
@@ -283,11 +291,13 @@ class SetupAgent:
                 self.ui_manager = UIManager(project_name=project_name, console=self.console)
                 self.ui_manager.start()
             else:
+                ref_line = f"\n[dim]Repository Ref: {project_ref}[/dim]" if project_ref else ""
                 self.console.print(
                     Panel.fit(
                         f"[bold blue]Setting up project: {project_name}[/bold blue]\n"
                         f"[dim]Repository: {project_url}[/dim]\n"
-                        f"[dim]Goal: {goal}[/dim]",
+                        f"[dim]Goal: {goal}[/dim]"
+                        f"{ref_line}",
                         border_style="blue",
                     )
                 )
@@ -310,7 +320,7 @@ class SetupAgent:
             self._initialize_context_and_tools()
 
             # Step 1.6: Set repository URL for ReAct engine
-            self.react_engine.set_repository_url(project_url)
+            self.react_engine.set_repository_url(project_url, repository_ref=project_ref)
 
             self._emit(
                 EventType.STATUS_UPDATE, "Configuring ReAct engine...", phase=PhaseType.SETUP
@@ -365,6 +375,7 @@ class SetupAgent:
                     project_name=project_name,
                     docker_label=docker_label,
                     goal=goal,
+                    project_ref=project_ref,
                 )
 
             except Exception as e:
@@ -383,7 +394,13 @@ class SetupAgent:
             )
 
             # Step 3: Run the unified setup process
-            success = self._run_unified_setup(project_url, project_name, goal, interactive)
+            success = self._run_unified_setup(
+                project_url,
+                project_name,
+                goal,
+                interactive,
+                project_ref=project_ref,
+            )
 
             # Step 5: Handle final status
             if self.config.ui_mode:
@@ -770,13 +787,27 @@ Do not generate a final setup report unless the TASK explicitly asks for one.
             return False
 
     def _run_unified_setup(
-        self, project_url: str, project_name: str, goal: str, interactive: bool = False
+        self,
+        project_url: str,
+        project_name: str,
+        goal: str,
+        interactive: bool = False,
+        project_ref: Optional[str] = None,
     ) -> bool:
         """Run the unified project setup process."""
 
         # Create comprehensive setup prompt with intelligent planning approach
+        ref_instruction = ""
+        if project_ref:
+            ref_instruction = f"""
+
+Repository version handle: {project_ref}
+When cloning, pass ref="{project_ref}" to project_setup. Do not set up the default branch if this ref cannot be checked out.
+"""
+
         setup_prompt = f"""
 I need to setup the project '{project_name}' from the repository: {project_url}
+{ref_instruction}
 
 My goal: {goal}
 
