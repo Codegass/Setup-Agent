@@ -272,3 +272,15 @@ def test_start_and_stop_delegate_to_scheduler(tmp_path):
 
     assert scheduler.started
     assert scheduler.stopped
+
+
+def test_pending_launch_for_same_workspace_is_a_conflict(tmp_path):
+    service, store, _ = make_service(tmp_path)
+    service.submit_batch(request_for({"repo_url": REPO}))
+
+    outcome = service.submit_batch(request_for({"repo_url": REPO}))
+
+    assert outcome["accepted"] == []
+    assert outcome["rejected"][0]["status"] == "conflict"
+    assert "already in progress" in outcome["rejected"][0]["message"]
+    assert len(store.list_batches()) == 1

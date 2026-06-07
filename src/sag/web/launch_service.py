@@ -109,6 +109,10 @@ class LaunchService:
         rejected: list[dict] = []
         items: list[LaunchItem] = []
         seen_workspaces: set[str] = set()
+        # Pending launches don't have a container yet, so the Docker precheck
+        # alone would let a duplicate slip through and later report a false
+        # "completed" (the CLI's own conflict path exits 0 without running).
+        active_workspaces = self._store.active_workspace_ids()
 
         for row_index, row in enumerate(request.projects):
             try:
@@ -134,6 +138,17 @@ class LaunchService:
                         "workspace_id": workspace_id,
                         "status": "conflict",
                         "message": f"Duplicate workspace in batch: {workspace_id}",
+                    }
+                )
+                continue
+
+            if workspace_id in active_workspaces:
+                rejected.append(
+                    {
+                        "row_index": row_index,
+                        "workspace_id": workspace_id,
+                        "status": "conflict",
+                        "message": f"Launch already in progress for {workspace_id}",
                     }
                 )
                 continue

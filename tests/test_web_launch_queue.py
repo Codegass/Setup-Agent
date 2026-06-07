@@ -310,3 +310,13 @@ def test_concurrent_claims_never_double_claim_or_exceed_caps(tmp_path):
     assert len(set(claimed)) == 4
     statuses = {item["id"]: item["status"] for item in store.list_batches()[0]["items"]}
     assert sum(1 for status in statuses.values() if status == "launching") == 4
+
+
+def test_active_workspace_ids_reflects_unfinished_items(tmp_path):
+    store = make_store(tmp_path)
+    enqueue_three_queued_items(store, concurrency=3)
+    claimed = store.claim_next(global_cap=8, now=LATER)
+    store.mark_running(claimed.id, pid=1, now=LATER)
+    store.mark_completed(claimed.id, exit_code=0, now=LATER)
+
+    assert store.active_workspace_ids() == {"sag-b", "sag-c"}

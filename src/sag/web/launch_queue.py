@@ -254,6 +254,16 @@ class LaunchQueueStore:
             ).fetchall()
             return [_item_from_row(row) for row in rows]
 
+    def active_workspace_ids(self) -> set[str]:
+        """Workspace ids with a launch currently queued, launching, or running."""
+
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT workspace_id FROM launch_items"
+                " WHERE status IN ('queued', 'launching', 'running')"
+            ).fetchall()
+            return {row["workspace_id"] for row in rows}
+
     def _finish(
         self,
         item_id: str,
