@@ -96,9 +96,16 @@ describe("App", () => {
   })
 
   it("keeps stale dashboard data visible when refresh fails", async () => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(jsonResponse(dashboard))
-      .mockRejectedValueOnce(new Error("refresh down"))
+    let dashboardCalls = 0
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+      if (url === "/api/workspaces") {
+        dashboardCalls++
+        if (dashboardCalls === 1) return Promise.resolve(jsonResponse(dashboard))
+        return Promise.reject(new Error("refresh down"))
+      }
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
 
     render(<App />)
 

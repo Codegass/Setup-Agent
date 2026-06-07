@@ -1,23 +1,33 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
-import { fetchDashboard, fetchSession, submitTask } from "@/api/client"
+import {
+  fetchDashboard,
+  fetchLaunchQueue,
+  fetchSession,
+  submitProjectBatch,
+  submitTask,
+} from "@/api/client"
 import type {
   BuildSummary,
   DashboardResponse,
   ExecutionSessionDetail,
   ExecutionSessionSummary,
+  LaunchBatchResult,
+  LaunchQueueState,
   SubmitTaskResponse,
   WorkspaceSummary,
 } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
+import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
 import { Dashboard } from "@/pages/Dashboard"
 import { SessionDetail } from "@/pages/SessionDetail"
 import { Workspace, type WorkspaceSessionRow } from "@/pages/Workspace"
 
 const DASHBOARD_POLL_MS = 5000
 const SESSION_DETAIL_POLL_MS = 3000
+const LAUNCH_HIGHLIGHT_MS = 8000
 
 type Route =
   | { view: "dashboard" }
@@ -32,6 +42,25 @@ export function App() {
   const [sessionDetails, setSessionDetails] = useState<Record<string, ExecutionSessionDetail>>({})
   const [sessionLoading, setSessionLoading] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [launchQueue, setLaunchQueue] = useState<LaunchQueueState | null>(null)
+  const [launchDialogOpen, setLaunchDialogOpen] = useState(false)
+  const [launchNotice, setLaunchNotice] = useState<string | null>(null)
+  const [highlightedWorkspaces, setHighlightedWorkspaces] = useState<string[]>([])
+  const highlightTimers = useRef<number[]>([])
+
+  const loadLaunchQueue = useCallback(async () => {
+    try {
+      setLaunchQueue(await fetchLaunchQueue())
+    } catch {
+      // Queue state is auxiliary; dashboard errors are reported separately.
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      highlightTimers.current.forEach((timer) => window.clearTimeout(timer))
+    }
+  }, [])
 
   const loadDashboard = useCallback(async (options?: { silent?: boolean }) => {
     if (!options?.silent) {
@@ -53,15 +82,17 @@ export function App() {
 
   useEffect(() => {
     void loadDashboard()
-  }, [loadDashboard])
+    void loadLaunchQueue()
+  }, [loadDashboard, loadLaunchQueue])
 
   useEffect(() => {
     const interval = window.setInterval(() => {
       void loadDashboard({ silent: true })
+      void loadLaunchQueue()
     }, DASHBOARD_POLL_MS)
 
     return () => window.clearInterval(interval)
-  }, [loadDashboard])
+  }, [loadDashboard, loadLaunchQueue])
 
   const ensureSessionDetail = useCallback(async (sessionId: string, options?: { silent?: boolean }) => {
     if (!options?.silent) {
@@ -140,6 +171,31 @@ export function App() {
     const response = await submitTask(workspaceId, task, sourceSession)
     void loadDashboard()
     return response
+  }
+
+  const handleBatchSubmitted = (result: LaunchBatchResult) => {
+    setLaunchDialogOpen(false)
+    setLaunchNotice(
+      result.rejected.length
+        ? `${result.accepted.length} setup${result.accepted.length === 1 ? "" : "s"} launched, ` +
+            `${result.rejected.length} rejected: ` +
+            result.rejected
+              .map((row) => row.message)
+              .join("; ")
+        : null,
+    )
+
+    const ids = result.accepted.map((row) => row.workspace_id)
+    if (ids.length) {
+      setHighlightedWorkspaces((current) => [...new Set([...current, ...ids])])
+      const timer = window.setTimeout(() => {
+        setHighlightedWorkspaces((current) => current.filter((id) => !ids.includes(id)))
+      }, LAUNCH_HIGHLIGHT_MS)
+      highlightTimers.current.push(timer)
+    }
+
+    void loadDashboard({ silent: true })
+    void loadLaunchQueue()
   }
 
   return (
@@ -235,9 +291,23 @@ export function App() {
         </div>
       ) : null}
 
+      {launchNotice ? (
+        <div className="mx-auto max-w-[1180px] px-4 pt-5 sm:px-6 lg:px-8">
+          <Card className="flex flex-col gap-3 border-blue-100 bg-blue-50/50 px-4 py-3 text-[13px] sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-blue-700">{launchNotice}</div>
+            <Button onClick={() => setLaunchNotice(null)} type="button" variant="outline">
+              Dismiss
+            </Button>
+          </Card>
+        </div>
+      ) : null}
+
       {dashboard && route.view === "dashboard" ? (
         <Dashboard
           data={dashboard}
+          highlightedWorkspaces={highlightedWorkspaces}
+          launchQueue={launchQueue}
+          onLaunchSetups={() => setLaunchDialogOpen(true)}
           onOpenSession={openSession}
           onOpenWorkspace={openWorkspace}
           onRefresh={() => void loadDashboard()}
@@ -264,6 +334,15 @@ export function App() {
           onBack={() => openWorkspace(route.workspaceId)}
           onNewTask={(sourceSession) => openTaskFromSession(route.workspaceId, sourceSession)}
           route={route}
+        />
+      ) : null}
+
+      {launchDialogOpen ? (
+        <LaunchSetupsDialog
+          defaultConcurrency={launchQueue?.default_concurrency ?? 1}
+          onClose={() => setLaunchDialogOpen(false)}
+          onSubmit={submitProjectBatch}
+          onSubmitted={handleBatchSubmitted}
         />
       ) : null}
     </div>
