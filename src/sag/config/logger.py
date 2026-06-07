@@ -1,11 +1,22 @@
 """Advanced logging system for SAG with session-based and verbose controls."""
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+
+
+def generate_session_id() -> str:
+    """Generate a unique session ID.
+
+    The pid suffix keeps concurrent setups (for example, batch launches from
+    the Web UI that start in the same second) in separate session directories.
+    """
+
+    return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
 
 
 class SessionLogger:
@@ -28,8 +39,8 @@ class SessionLogger:
         logger.info(f"Session logs directory: {self.session_log_dir}")
 
     def _generate_session_id(self) -> str:
-        """Generate a unique session ID based on timestamp."""
-        return datetime.now().strftime("%Y%m%d_%H%M%S")
+        """Generate a unique session ID based on timestamp and pid."""
+        return generate_session_id()
 
     def _setup_loggers(self):
         """Setup all loggers with session-specific configuration."""

@@ -271,7 +271,7 @@ def test_container_session_registry_falls_back_to_setup_artifacts_without_index_
 
     rows = registry.list_workspace_sessions(workspace_summary())
 
-    assert rows[0].id == "SETUP-20260606-213241"
+    assert rows[0].id == "SETUP-commons-cli-20260606-213241"
     assert rows[0].title == "Setup and configure the commons-cli project to be runnable"
     assert rows[0].status == "completed"
     assert rows[0].entry == "CLI"
@@ -323,7 +323,7 @@ def test_container_session_registry_merges_web_sessions_with_setup_artifacts():
 
     rows = registry.list_workspace_sessions(workspace_summary())
 
-    assert [row.id for row in rows] == ["SETUP-20260606-213241", "UI-12345678"]
+    assert [row.id for row in rows] == ["SETUP-commons-cli-20260606-213241", "UI-12345678"]
 
 
 def test_container_session_registry_parses_setup_report_breakdown_table():
@@ -382,11 +382,11 @@ def test_container_session_registry_returns_setup_artifact_detail():
 
     detail = registry.get_workspace_session_detail(
         workspace_summary(),
-        "SETUP-20260606-213241",
+        "SETUP-commons-cli-20260606-213241",
     )
 
     assert detail is not None
-    assert detail.id == "SETUP-20260606-213241"
+    assert detail.id == "SETUP-commons-cli-20260606-213241"
     assert detail.report == "ready"
     assert detail.report_doc is not None
     assert detail.report_doc.title == "setup-report-20260606-213509.md"
@@ -435,7 +435,7 @@ def test_setup_artifact_detail_backfills_final_report_task_from_report_file():
 
     detail = registry.get_workspace_session_detail(
         workspace_summary(),
-        "SETUP-20260606-213241",
+        "SETUP-commons-cli-20260606-213241",
     )
 
     assert detail is not None
@@ -477,7 +477,7 @@ def test_container_session_registry_recovers_setup_logs_from_host_session(tmp_pa
 
     detail = registry.get_workspace_session_detail(
         workspace_summary(),
-        "SETUP-20260606-213241",
+        "SETUP-commons-cli-20260606-213241",
     )
 
     assert detail is not None
@@ -511,7 +511,7 @@ def test_container_session_registry_keeps_complete_setup_report_blocks():
 
     detail = registry.get_workspace_session_detail(
         workspace_summary(),
-        "SETUP-20260606-213241",
+        "SETUP-commons-cli-20260606-213241",
     )
 
     assert detail is not None
@@ -521,3 +521,66 @@ def test_container_session_registry_keeps_complete_setup_report_blocks():
         block.get("text") == "The setup report should not be truncated."
         for block in detail.report_doc.blocks
     )
+
+
+def test_same_second_setup_sessions_resolve_to_their_own_workspace():
+    # Two batch launches can start in the same second and create trunk contexts
+    # with identical timestamp stems. Session ids must stay unique per workspace
+    # or the global detail lookup returns the wrong project's context map.
+    def files_for(project: str) -> dict[str, str]:
+        return {
+            "/workspace/.setup_agent/contexts/trunk_20260607_173324.json": json.dumps(
+                {
+                    "context_id": "trunk_20260607_173324",
+                    "created_at": "2026-06-07 17:33:24.000000",
+                    "last_updated": "2026-06-07 17:35:09.000000",
+                    "goal": f"Setup {project}",
+                    "todo_list": [],
+                }
+            ),
+        }
+
+    def workspace_for(workspace_id: str, project: str) -> WorkspaceSummary:
+        return WorkspaceSummary(
+            id=workspace_id,
+            project=project,
+            container=workspace_id,
+            docker=DockerSummary(status="running"),
+        )
+
+    workspaces = {
+        "sag-commons-vfs": workspace_for("sag-commons-vfs", "commons-vfs"),
+        "sag-dubbo": workspace_for("sag-dubbo", "dubbo"),
+    }
+    orchestrators = {
+        "sag-commons-vfs": FakeOrchestrator(files_for("commons-vfs")),
+        "sag-dubbo": FakeOrchestrator(files_for("dubbo")),
+    }
+
+    class FakeWorkspaceRegistry:
+        def list_workspaces(self):
+            return list(workspaces.values())
+
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: orchestrators[workspace_id],
+        workspace_registry_factory=lambda: FakeWorkspaceRegistry(),
+    )
+
+    vfs_id = registry.list_workspace_sessions(workspaces["sag-commons-vfs"])[0].id
+    dubbo_id = registry.list_workspace_sessions(workspaces["sag-dubbo"])[0].id
+
+    assert vfs_id != dubbo_id
+
+    detail = registry.get_session_detail(dubbo_id)
+    assert detail.workspace == "sag-dubbo"
+    assert detail.title == "Setup dubbo"
+
+
+def test_timestamp_for_match_tolerates_unique_session_dir_suffixes():
+    from sag.web.session_registry import _timestamp_for_match
+
+    base = _timestamp_for_match("20260607_173245")
+    suffixed = _timestamp_for_match("20260607_173245_85955")
+
+    assert base is not None
+    assert suffixed == base

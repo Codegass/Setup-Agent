@@ -480,7 +480,7 @@ def _setup_artifact_item(
     )
 
     return {
-        "id": _setup_session_id(context_id, created),
+        "id": _setup_session_id(context_id, created, workspace_id),
         "workspace": workspace_id,
         "title": _text(trunk_data.get("goal"), default="Project setup"),
         "status": status,
@@ -597,20 +597,26 @@ def _setup_status(tasks: list[dict[str, Any]], report_path: str | None) -> str:
     return "running" if tasks else "unknown"
 
 
-def _setup_session_id(context_id: str, created: str) -> str:
+def _setup_session_id(context_id: str, created: str, workspace_id: str) -> str:
+    # Session detail lookups are global, while trunk timestamps have seconds
+    # granularity and collide across workspaces launched in the same second.
+    # Scoping the id by workspace keeps each setup resolvable to its own
+    # container.
+    label = workspace_id.removeprefix("sag-")
+
     match = re.search(r"(\d{8})_(\d{6})", context_id)
     if match:
-        return f"SETUP-{match.group(1)}-{match.group(2)}"
+        return f"SETUP-{label}-{match.group(1)}-{match.group(2)}"
 
     normalized = _normalize_timestamp(created)
     if normalized:
         try:
             parsed = datetime.fromisoformat(normalized)
         except ValueError:
-            return "SETUP-latest"
-        return f"SETUP-{parsed.strftime('%Y%m%d-%H%M%S')}"
+            return f"SETUP-{label}-latest"
+        return f"SETUP-{label}-{parsed.strftime('%Y%m%d-%H%M%S')}"
 
-    return "SETUP-latest"
+    return f"SETUP-{label}-latest"
 
 
 def _test_payload_from_report(report_raw: str | None) -> dict[str, Any]:
@@ -927,8 +933,13 @@ def _timestamp_for_match(value: str) -> float | None:
     except ValueError:
         pass
 
+    # Session dirs carry a uniqueness suffix (e.g. 20260607_173245_85955);
+    # match on the leading timestamp.
+    match = re.match(r"(\d{8}_\d{6})", value)
+    if match is None:
+        return None
     try:
-        return datetime.strptime(value, "%Y%m%d_%H%M%S").timestamp()
+        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").timestamp()
     except ValueError:
         return None
 
