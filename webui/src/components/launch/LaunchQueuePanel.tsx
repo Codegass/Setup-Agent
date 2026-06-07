@@ -66,11 +66,11 @@ function ActiveBatch({ batch }: { batch: LaunchQueueBatch }) {
         {batch.items.map((item) => (
           <div key={item.id} className="flex min-w-0 items-center gap-2">
             <StatusBadge status={item.status} />
-            <span className="truncate font-mono text-[11px] text-slate-600">
+            <span className="min-w-0 truncate font-mono text-[11px] text-slate-600">
               {item.workspace_id}
             </span>
             {item.ref ? (
-              <span className="truncate font-mono text-[10px] text-slate-400">
+              <span className="min-w-0 truncate font-mono text-[10px] text-slate-400">
                 {item.ref}
               </span>
             ) : null}
@@ -91,10 +91,14 @@ function FailedRows({ items }: { items: LaunchQueueItem[] }) {
         {items.map((item) => (
           <div key={item.id} className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
-              <span className="truncate font-mono text-[11px] text-slate-600">
+              <span className="min-w-0 truncate font-mono text-[11px] text-slate-600">
                 {item.workspace_id}
               </span>
-              <span className="truncate text-[12px] text-red-600">{item.error}</span>
+              {item.error ? (
+                <span className="min-w-0 truncate text-[12px] text-red-600">
+                  {item.error}
+                </span>
+              ) : null}
             </div>
             <div className="truncate font-mono text-[10px] text-slate-400">
               {item.process_log}

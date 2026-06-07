@@ -13,6 +13,7 @@ const statusByName: Record<string, StatusMeta> = {
   ready: { label: "Ready", tone: "green" },
   available: { label: "Available", tone: "green" },
   running: { label: "Running", tone: "blue" },
+  launching: { label: "Launching", tone: "blue" },
   connected: { label: "Connected", tone: "blue" },
   active: { label: "Active", tone: "blue" },
   partial: { label: "Partial", tone: "amber" },

@@ -86,4 +86,18 @@ describe("LaunchQueuePanel", () => {
       ),
     ).toBeInTheDocument()
   })
+
+  it("shows an idle message when no batch is running", () => {
+    render(
+      <LaunchQueuePanel
+        queue={{
+          default_concurrency: 4,
+          summary: { queued: 0, launching: 0, running: 0, completed: 3, failed: 0 },
+          batches: [],
+        }}
+      />,
+    )
+
+    expect(screen.getByText("No batch is currently running.")).toBeInTheDocument()
+  })
 })
