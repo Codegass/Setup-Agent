@@ -1,5 +1,6 @@
 """Tests for the launch scheduler worker."""
 
+import os
 import threading
 import time
 
@@ -203,3 +204,67 @@ def test_capacity_freed_by_completion_lets_next_item_start(tmp_path):
     scheduler.launch_ready()
 
     assert len(spawner.calls) == 2
+
+
+def test_reconcile_fails_dead_process_rows_with_restart_message(tmp_path):
+    store = make_store(tmp_path)
+    enqueue(
+        store,
+        [make_item("LAUNCH-00000001", status="running", pid=2_000_000_000)],
+    )
+    scheduler = LaunchScheduler(
+        store, spawn=FakeSpawner(), workspace_exists=lambda label: False, global_cap=8
+    )
+
+    scheduler.reconcile_stale()
+
+    item = item_states(store)["LAUNCH-00000001"]
+    assert item["status"] == "failed"
+    assert "UI restart" in item["error"]
+
+
+def test_reconcile_marks_completed_when_workspace_exists(tmp_path):
+    store = make_store(tmp_path)
+    enqueue(
+        store,
+        [make_item("LAUNCH-00000001", status="launching", pid=2_000_000_000)],
+    )
+    checked = []
+
+    def workspace_exists(docker_label):
+        checked.append(docker_label)
+        return True
+
+    scheduler = LaunchScheduler(
+        store, spawn=FakeSpawner(), workspace_exists=workspace_exists, global_cap=8
+    )
+
+    scheduler.reconcile_stale()
+
+    assert checked == ["commons-cli"]
+    assert item_states(store)["LAUNCH-00000001"]["status"] == "completed"
+
+
+def test_reconcile_leaves_alive_process_rows_untouched(tmp_path):
+    store = make_store(tmp_path)
+    enqueue(store, [make_item("LAUNCH-00000001", status="running", pid=os.getpid())])
+    scheduler = LaunchScheduler(
+        store, spawn=FakeSpawner(), workspace_exists=lambda label: False, global_cap=8
+    )
+
+    scheduler.reconcile_stale()
+
+    assert item_states(store)["LAUNCH-00000001"]["status"] == "running"
+
+
+def test_queued_items_from_previous_run_resume(tmp_path):
+    db_path = tmp_path / "launch_queue.sqlite3"
+    previous = LaunchQueueStore(db_path)
+    enqueue(previous, [make_item("LAUNCH-00000001")])
+
+    spawner = FakeSpawner()
+    scheduler = LaunchScheduler(LaunchQueueStore(db_path), spawn=spawner, global_cap=8)
+    scheduler.reconcile_stale()
+    scheduler.launch_ready()
+
+    assert len(spawner.calls) == 1
