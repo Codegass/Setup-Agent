@@ -103,7 +103,7 @@ class LaunchQueueStore:
         conn.execute("BEGIN IMMEDIATE")
         try:
             yield
-        except Exception:
+        except BaseException:
             conn.execute("ROLLBACK")
             raise
         conn.execute("COMMIT")
