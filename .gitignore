@@ -153,6 +153,7 @@ Thumbs.db
 # Project specific
 debug_*.py
 test_*.py
+!tests/test_*.py
 manual_*.py
 *.tmp
 *.temp
@@ -165,9 +166,17 @@ uv.lock
 # Claude Code
 Claude.md
 .claude
+.worktrees/
+.superpowers/
 FUNCTION_CALLING_SUPPORT.md
 student_tasks/
 docs/bash_tool_enhancements.md
 
 plan/
 docs/
+
+website/node_modules
+
+# SAG web UI frontend
+webui/node_modules/
+webui/dist/

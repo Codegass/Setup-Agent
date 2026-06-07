@@ -1,0 +1,346 @@
+from rich.console import Console
+
+from sag.ui.events import EventType, PhaseType, UIEvent
+from sag.ui.ui_manager import UIManager
+
+
+def make_manager():
+    console = Console(record=True, width=100)
+    return UIManager(project_name="commons-cli", console=console)
+
+
+def render_display_text(manager):
+    manager.console.print(manager._render_display())
+    return manager.console.export_text()
+
+
+def test_ui_manager_updates_snapshot_when_handling_events():
+    manager = make_manager()
+
+    manager.handle_event(UIEvent(EventType.PHASE_START, "Building", phase=PhaseType.BUILD))
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven",
+            metadata={"tool_name": "maven", "tool_params": {"goal": "compile"}},
+        )
+    )
+
+    snapshot = manager.snapshot()
+    assert snapshot.current_phase == PhaseType.BUILD
+    assert snapshot.active_operation.tool_name == "maven"
+
+
+def test_ui_manager_handles_unknown_event_without_crashing():
+    manager = make_manager()
+    event = UIEvent(EventType.STATUS_UPDATE, "Known")
+    event.event_type = "unknown_event"
+
+    manager.handle_event(event)
+
+    assert manager.snapshot().latest_warning is not None
+
+
+def test_ui_manager_handles_invalid_phase_without_polluting_legacy_state():
+    manager = make_manager()
+
+    event = UIEvent(EventType.PHASE_START, "bad")
+    event.phase = "not-a-phase"
+
+    manager.handle_event(event)
+
+    assert manager.snapshot().latest_warning is not None
+    assert manager.current_phase is None
+    assert manager.current_status == "Initializing"
+
+
+def test_ui_manager_live_update_failure_does_not_abort_event_handling():
+    manager = make_manager()
+
+    class FakeLive:
+        def update(self, renderable):
+            raise RuntimeError("live update exploded")
+
+    manager.live = FakeLive()
+
+    manager.handle_event(UIEvent(EventType.STATUS_UPDATE, "Still running"))
+
+    assert manager.snapshot().current_status == "Still running"
+    assert manager.snapshot().latest_warning is not None
+    assert "render" in manager.snapshot().latest_warning.message.lower()
+
+
+def test_ui_manager_does_not_render_when_live_display_is_not_started(monkeypatch):
+    manager = make_manager()
+    render_calls = 0
+
+    def broken_render():
+        nonlocal render_calls
+        render_calls += 1
+        raise RuntimeError("render should not run")
+
+    monkeypatch.setattr(manager, "_render_display", broken_render)
+
+    manager.handle_event(UIEvent(EventType.STATUS_UPDATE, "Still running"))
+    manager.handle_event(UIEvent(EventType.STATUS_UPDATE, "Still running again"))
+
+    assert render_calls == 0
+    assert manager.snapshot().current_status == "Still running again"
+    assert manager.snapshot().latest_warning is None
+
+
+def test_ui_manager_handles_malformed_agent_tool_params_without_crashing_legacy_path():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_THOUGHT,
+            "I need to compile the project.",
+            metadata={"step_num": 1},
+        )
+    )
+
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven",
+            metadata={"tool_name": "maven", "tool_params": "not-dict"},
+        )
+    )
+
+    assert manager.snapshot().active_operation.tool_name == "maven"
+    assert manager.current_status == "Using maven"
+
+
+def test_ui_manager_start_render_failure_does_not_abort_ui_mode(monkeypatch):
+    manager = make_manager()
+
+    def broken_render():
+        raise RuntimeError("initial render exploded")
+
+    monkeypatch.setattr(manager, "_render_display", broken_render)
+
+    manager.start()
+
+    assert manager.live is None
+    assert manager.snapshot().latest_warning is not None
+    assert "initial render" in manager.snapshot().latest_warning.message.lower()
+
+
+def test_display_final_summary_is_idempotent_no_op_with_snapshot_diagnosis():
+    manager = make_manager()
+    manager.handle_event(UIEvent(EventType.PHASE_START, "Building", phase=PhaseType.BUILD))
+    manager.handle_event(UIEvent(EventType.PHASE_ERROR, "Build failed", phase=PhaseType.BUILD))
+    manager.handle_event(UIEvent(EventType.FAILURE, "Project setup incomplete"))
+
+    manager.display_final_summary()
+    manager.display_final_summary()
+    output = manager.console.export_text()
+
+    assert output.count("Detailed Execution Log") == 1
+    assert output.count("Project setup incomplete") == 1
+
+
+def test_render_display_includes_live_timeline_and_active_operation():
+    manager = make_manager()
+    manager.handle_event(UIEvent(EventType.PHASE_START, "Building", phase=PhaseType.BUILD))
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven for build",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert "Timeline" in output
+    assert "Active Operation" in output
+    assert "maven" in output
+    assert "compile" in output
+
+
+def test_render_display_hides_active_operation_after_agent_observation():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.AGENT_ACTION,
+            "Using maven for build",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+    manager.handle_event(UIEvent(EventType.AGENT_OBSERVATION, "maven compile succeeded"))
+
+    output = render_display_text(manager)
+
+    assert "Active Operation" not in output
+    assert "maven compile succeeded" in output
+
+
+def test_render_display_hides_active_operation_after_tool_result():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_START,
+            "Running maven compile",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_RESULT,
+            "maven compile completed",
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+                "status": "completed",
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert "Active Operation" not in output
+    assert "maven compile completed" in output
+
+
+def test_render_display_includes_recovery_and_evidence_panels():
+    manager = make_manager()
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_RECOVERY,
+            "Retrying maven compile with normalized parameters",
+            level="warning",
+            metadata={
+                "recovery_strategy": "parameter normalization",
+                "retry_count": 1,
+            },
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.EVIDENCE_RECORDED,
+            "Captured maven log",
+            metadata={
+                "kind": "command",
+                "summary": "Captured maven compile output",
+                "path": "logs/maven.log",
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert "Recovery" in output
+    assert "Evidence" in output
+    assert "logs/maven.log" in output
+
+
+def test_render_display_bounds_long_timeline_operation_and_evidence_text():
+    manager = make_manager()
+    long_command = "mvn " + "compile " * 40
+    long_detail = "compiler detail " * 40
+    long_summary = "Captured maven output " + "line " * 40
+    long_path = "logs/" + "nested-directory/" * 20 + "maven.log"
+
+    manager.handle_event(
+        UIEvent(
+            EventType.TOOL_START,
+            long_command,
+            metadata={
+                "tool_name": "maven",
+                "tool_params": {"goal": "compile"},
+            },
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.STATUS_UPDATE,
+            "Inspecting compiler output",
+            details=long_detail,
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.EVIDENCE_RECORDED,
+            "Captured maven log",
+            metadata={
+                "kind": "command",
+                "summary": long_summary,
+                "path": long_path,
+            },
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert long_command not in output
+    assert long_detail not in output
+    assert long_summary not in output
+    assert long_path not in output
+    assert "mvn compile" in output
+    assert "compiler detail" in output
+    assert "Captured maven output" in output
+    assert "maven.log" in output
+
+
+def test_render_display_bounds_long_phase_step_details():
+    manager = make_manager()
+    long_step_details = "phase detail prefix " + "phase-middle " * 40 + "PHASE_DETAIL_TAIL"
+
+    manager.handle_event(
+        UIEvent(
+            EventType.STEP_START,
+            "Compile sources",
+            phase=PhaseType.BUILD,
+        )
+    )
+    manager.handle_event(
+        UIEvent(
+            EventType.STEP_COMPLETE,
+            "Compile sources",
+            phase=PhaseType.BUILD,
+            details=long_step_details,
+        )
+    )
+
+    output = render_display_text(manager)
+
+    assert long_step_details not in output
+    assert "PHASE_DETAIL_TAIL" not in output
+    assert "phase detail prefix" in output
+
+
+def test_render_display_bounds_latest_error_and_warning_text():
+    for event_type, useful_prefix, tail in (
+        (EventType.ERROR, "error prefix", "ERROR_LIVE_TAIL"),
+        (EventType.WARNING, "warning prefix", "WARNING_LIVE_TAIL"),
+    ):
+        manager = make_manager()
+        long_message = f"{useful_prefix} " + "message-middle " * 40 + tail
+        long_details = f"{useful_prefix} details " + "details-middle " * 40 + tail
+
+        manager.handle_event(
+            UIEvent(
+                event_type,
+                long_message,
+                details=long_details,
+                level="warning" if event_type == EventType.WARNING else "error",
+            )
+        )
+
+        output = render_display_text(manager)
+
+        assert long_message not in output
+        assert long_details not in output
+        assert tail not in output
+        assert useful_prefix in output
+        assert f"{useful_prefix} details" in output

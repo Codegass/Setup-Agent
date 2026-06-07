@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SAG — Setup Agent | Autonomous Java Project Configuration</title>
+<meta name="description" content="An open-source dual-model LLM agent for autonomous end-to-end Java project configuration. ICSE-NIER '26.">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<main>
+
+<!-- NAV -->
+<header class="g">
+  <a class="gc nav-brand" href="#">
+    <h2>Setup<br>Agent</h2>
+  </a>
+  <a class="gc nav-link" href="#architecture">Architecture</a>
+  <a class="gc nav-link" href="#results">Results</a>
+  <a class="gc nav-link" href="https://github.com/Codegass/Setup-Agent" target="_blank" rel="noopener noreferrer">GitHub</a>
+  <a class="gc nav-link" href="https://doi.org/10.1145/3786582.3786818" target="_blank" rel="noopener noreferrer">Paper</a>
+  <div class="gc nav-end">
+    <small>SAG v0.2.0</small>
+  </div>
+</header>
+
+<!-- HERO -->
+<div class="g">
+  <div class="gc hero">
+    <div class="hero-inner">
+      <small class="hero-badge">Open Source &middot; ICSE-NIER '26 &middot; Rio de Janeiro</small>
+      <span class="hero-title">Automating<br>The First Step.</span>
+      <p class="hero-sub">Not a Dockerfile generator. An autonomous dual-model agent that reasons, acts, and verifies inside isolated Docker containers — turning hours of Java project setup into minutes of autonomous execution.</p>
+
+      <div class="install">
+        <div class="install-step">
+          <div class="install-head">
+            <small>1. Install</small>
+            <button class="cp">COPY</button>
+          </div>
+          <div class="cmd"><code><span>git clone https://github.com/Codegass/Setup-Agent.git && cd Setup-Agent && uv sync</span></code></div>
+        </div>
+        <div class="install-step">
+          <div class="install-head">
+            <small>2. Setup a Project</small>
+            <button class="cp">COPY</button>
+          </div>
+          <div class="cmd"><code><span>sag project https://github.com/apache/commons-cli.git</span></code></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- RESULTS -->
+<div id="results" class="g">
+  <div class="gc col-full section-label">
+    <small>Evaluation Results &middot; 15 Apache Projects &middot; 180 Runs</small>
+  </div>
+  <div class="gc stat">
+    <div class="stat-num">84.4%</div>
+    <div class="stat-label">Build Success Rate</div>
+    <div class="stat-detail">o4-mini + GPT-4.1-mini configuration</div>
+  </div>
+  <div class="gc stat">
+    <div class="stat-num">5.5&times;</div>
+    <div class="stat-label">Cost Reduction</div>
+    <div class="stat-detail">vs. GPT-5+GPT-5 with higher accuracy</div>
+  </div>
+  <div class="gc stat">
+    <div class="stat-num">12.09</div>
+    <div class="stat-label">Think-to-Act Ratio</div>
+    <div class="stat-detail">Validates the dual-model separation</div>
+  </div>
+  <div class="gc stat">
+    <div class="stat-num">48.4%</div>
+    <div class="stat-label">Test Execution Rate</div>
+    <div class="stat-detail">Average across all configurations</div>
+  </div>
+</div>
+
+<!-- KEY FINDING -->
+<div class="g">
+  <div class="gc finding">
+    <blockquote>"Role specialization beats raw capacity — pairing a chain-of-thought Thinking Model with a smaller Action Model achieves higher success at 5.5&times; lower cost than uniformly applying powerful models."</blockquote>
+    <div class="finding-attr">Core Finding &middot; SAG Paper &middot; ICSE-NIER '26</div>
+  </div>
+</div>
+
+<!-- SEE IT IN ACTION -->
+<div id="demo" class="g">
+  <div class="gc demo-terminal">
+    <div class="term-head">
+      <div class="term-dots">
+        <span class="dot-red"></span>
+        <span class="dot-amber"></span>
+        <span class="dot-green"></span>
+      </div>
+      <span class="term-title">SAG</span>
+    </div>
+    <pre id="demo-pre"></pre>
+  </div>
+  <div class="gc demo-side">
+    <small class="demo-label">Setup Agent</small>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<div id="features" class="g">
+  <div class="gc col-full section-label">
+    <small>Features</small>
+  </div>
+  <div class="gc col-full feat-wrap">
+    <div class="feat-grid">
+      <div class="feat-item">
+        <small class="feat-title">Dual-Model ReAct Engine</small>
+        <p>Separates reasoning from execution. A chain-of-thought Thinking Model plans while a smaller Action Model translates plans into tool invocations via function calling. The 12.09 thinking-to-action ratio validates this separation.</p>
+      </div>
+      <div class="feat-item">
+        <small class="feat-title">Container-Native Isolation</small>
+        <p>SAG operates entirely within Docker containers — not generating Dockerfiles, but interactively exploring and configuring inside them. Zero host pollution, fully reproducible.</p>
+      </div>
+      <div class="feat-item">
+        <small class="feat-title">File-Based Validation</small>
+        <p>Examines concrete evidence on disk — .class files after compilation, surefire XML test reports, build artifacts. Prevents hallucinations where the agent believes it succeeded without actual completion.</p>
+      </div>
+      <div class="feat-item">
+        <small class="feat-title">Trunk &amp; Branch Context</small>
+        <p>Trunk Context maintains global state and task lists. Branch contexts capture subtask details. When a subtask ends, results merge back to Trunk — enabling complex chains without context loss.</p>
+      </div>
+      <div class="feat-item">
+        <small class="feat-title">Hierarchical Tool-Belt</small>
+        <p>Layered tools from low-level (Bash) through build specialists (Maven, Gradle) to high-level orchestrators (Project Analyzer). Graceful fallback when specialized tools encounter unexpected scenarios.</p>
+      </div>
+      <div class="feat-item">
+        <small class="feat-title">Agent State Evaluator</small>
+        <p>Analyzes Agent Memory to detect problematic patterns — repeated identical actions indicating the agent is stuck in a loop. Provides corrective feedback to break cycles autonomously.</p>
+      </div>
+    </div>
+  </div>
+  <div class="gc col-full section-label">
+    <a href="https://github.com/Codegass/Setup-Agent" target="_blank" rel="noopener noreferrer" class="more-link">View Source on GitHub ↗</a>
+  </div>
+</div>
+
+<!-- ARCHITECTURE -->
+<div id="architecture" class="g">
+  <div class="gc col-full section-label">
+    <small>Architecture</small>
+  </div>
+  <div class="gc col-full arch-content">
+    <span class="arch-title">How SAG Works.</span>
+
+    <div class="arch-tabs">
+      <button class="arch-tab active" data-tab="overview" onclick="showTab(event, 'overview')">Overview</button>
+      <button class="arch-tab" data-tab="dual" onclick="showTab(event, 'dual')">Dual-Model</button>
+      <button class="arch-tab" data-tab="docker" onclick="showTab(event, 'docker')">Docker</button>
+      <button class="arch-tab" data-tab="verify" onclick="showTab(event, 'verify')">Validation</button>
+    </div>
+
+    <!-- Overview -->
+    <div id="p-overview" class="arch-panel active">
+      <div class="diagram arch-overview">
+        <div class="arch-grid">
+
+          <!-- Col 1: User Input (top) + Setup Report (bottom) -->
+          <div class="ag ag-input dia-box c-dark">
+            <h5>User Input</h5>
+            <ul>
+              <li>Repository URL</li>
+              <li>Goal description</li>
+            </ul>
+          </div>
+
+          <div class="ag ag-report dia-box c-green">
+            <h5>Setup Report</h5>
+            <ul>
+              <li>Build &amp; test outcome</li>
+              <li>Per-task summary</li>
+            </ul>
+          </div>
+
+          <!-- Col 2 top: SAG Agent · ReAct Loop -->
+          <div class="ag ag-react">
+            <div class="ag-section-header c-amber">SAG Agent &middot; ReAct Loop</div>
+            <div class="react-quad">
+              <div class="dia-box c-amber r-thinking">
+                <h5>Thinking Model</h5>
+                <ul>
+                  <li>Reasoning</li>
+                  <li>Plan next action</li>
+                </ul>
+              </div>
+              <div class="r-arr r-plan"><span class="arr">→</span><span class="lbl">plan</span></div>
+              <div class="dia-box c-blue r-action">
+                <h5>Action Model</h5>
+                <ul>
+                  <li>Function calling</li>
+                  <li>Tool invocation</li>
+                </ul>
+              </div>
+
+              <div class="dia-box c-dark decision r-decision">
+                <h5>Tasks finished?</h5>
+                <ul>
+                  <li><span class="tag-yes">Y</span>→ Report</li>
+                  <li><span class="tag-no">N</span>→ Thinking</li>
+                </ul>
+              </div>
+              <div class="r-arr r-obs"><span class="arr">←</span><span class="lbl">obs</span></div>
+              <div class="dia-box c-green r-observation">
+                <h5>Observation</h5>
+                <ul>
+                  <li>Tool Results</li>
+                  <li>Run Status</li>
+                  <li class="obs-feedback">+ Validation ↑</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <!-- Col 3 spanning 2 rows: bridges ReAct↔Docker and Validation↔Docker -->
+          <div class="ag ag-bridge">
+            <div class="bridge-slot bridge-slot-react">
+              <div class="ag-bridge-row">
+                <span class="arr">→</span>
+                <span class="lbl">use tool</span>
+              </div>
+              <div class="ag-bridge-row">
+                <span class="arr">←</span>
+                <span class="lbl">tool output</span>
+              </div>
+            </div>
+            <div class="bridge-slot bridge-slot-valid">
+              <div class="ag-bridge-row bridge-row-mem">
+                <span class="arr">→</span>
+                <span class="lbl">checks memory</span>
+              </div>
+              <div class="ag-bridge-row bridge-row-files">
+                <span class="arr">→</span>
+                <span class="lbl">checks files</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Col 4 spanning 2 rows: Docker Container -->
+          <div class="ag ag-docker">
+            <div class="ag-section-header c-red">Docker Container</div>
+            <div class="dia-box c-blue ag-tools">
+              <h5>Tool Sets</h5>
+              <ul>
+                <li>Bash · Maven · Gradle</li>
+                <li>Sys Package · Analyzer</li>
+              </ul>
+            </div>
+            <div class="ag-fs">
+              <div class="ag-fs-label">File System</div>
+              <div class="ag-fs-inner">
+                <div class="dia-box c-green">
+                  <h5>Agent Memory</h5>
+                  <ul>
+                    <li>Trunk context</li>
+                    <li>Branch context</li>
+                  </ul>
+                </div>
+                <div class="dia-box c-dark">
+                  <h5>Java Project Files</h5>
+                  <ul>
+                    <li>src/ · pom.xml</li>
+                    <li>target/ · reports/</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Col 2 bottom: Validation System -->
+          <div class="ag ag-valid">
+            <div class="ag-feedback-top">
+              <span class="arr">↑</span>
+              <span class="lbl">feedback → Observation (ReAct Loop)</span>
+            </div>
+            <div class="ag-section-header c-amber">Validation System</div>
+            <div class="v-grid">
+              <div class="dia-box c-blue v-box">
+                <h5>Agent State Evaluator</h5>
+                <ul>
+                  <li>Rule based</li>
+                  <li>Detects stuck loops</li>
+                </ul>
+                <div class="v-target"><span class="arr">→</span> Agent Memory</div>
+              </div>
+              <div class="dia-box c-green v-box">
+                <h5>File Validator</h5>
+                <ul>
+                  <li>Rule based</li>
+                  <li>Ground truth over claims</li>
+                </ul>
+                <div class="v-target"><span class="arr">→</span> Java Project Files</div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+      <p class="explain">
+        The <strong>ReAct Loop</strong> cycles Thinking → Action → Observation → Decision; on each turn it either emits the Setup Report or goes back to Thinking. The <strong>Docker Container</strong> isolates execution and stores both the Agent Memory and the Java project files in one file system. The <strong>Validation System</strong> runs out of band — it reads memory and files directly from the container and <strong>feeds an independent observation back into the ReAct loop</strong>, anchoring reasoning to ground truth rather than the model's own claims.
+      </p>
+    </div>
+
+    <!-- Dual Model -->
+    <div id="p-dual" class="arch-panel">
+      <div class="diagram">
+        <div class="dia-row">
+          <div class="dia-box c-amber" style="flex:1;">
+            <h5>Thinking Model</h5>
+            <ul>
+              <li>Chain-of-thought reasoning</li>
+              <li>Analyze running status</li>
+              <li>Examine tool results</li>
+              <li>Read validation feedback</li>
+              <li>Plan recovery on failure</li>
+            </ul>
+            <div class="meta">o4-mini / GPT-5 &middot; 16,584 tokens avg</div>
+          </div>
+          <div class="dia-bidi">
+            <div class="dia-bidi-item">plan →</div>
+            <div class="dia-bidi-item" style="margin: 16px 0;">ReAct Loop</div>
+            <div class="dia-bidi-item">← observe</div>
+          </div>
+          <div class="dia-box c-blue" style="flex:1;">
+            <h5>Action Model</h5>
+            <ul>
+              <li>Translate plan → tools</li>
+              <li>Execute in container</li>
+              <li>Capture output</li>
+            </ul>
+            <div class="meta">GPT-4.1-mini / o4-m &middot; 1,372 tokens avg</div>
+          </div>
+          <div class="dia-arrow"><span class="arr">→</span><span class="lbl">tool calls</span></div>
+          <div class="dia-box c-dark" style="flex:0 0 auto; align-self:center;">
+            <h5>Termination</h5>
+            <ul>
+              <li>All tasks done? → validate &amp; report</li>
+              <li>Not done? → next iteration</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+      <p class="explain">
+        The extreme <strong>12.09 thinking-to-action token ratio</strong> validates the architectural separation — the Action Model primarily serves as a command translator, using only 1,372 tokens while the Thinking Model uses 16,584 for complex reasoning. This asymmetry means <strong>smaller action models achieve higher success rates at 5.5&times; lower cost</strong>.
+      </p>
+    </div>
+
+    <!-- Docker -->
+    <div id="p-docker" class="arch-panel">
+      <div class="diagram">
+        <div class="dia-row">
+          <div class="dia-box c-dark" style="flex:0 0 200px;">
+            <h5>Host Machine</h5>
+            <ul>
+              <li>SAG Agent Process</li>
+              <li>ReAct Engine</li>
+              <li>Context Manager</li>
+              <li>Tool Belt</li>
+              <li>Validator</li>
+            </ul>
+            <div class="meta" style="margin-top:12px;">Your machine is never modified.<br>Nothing installed on host.</div>
+          </div>
+          <div class="dia-arrow">
+            <span class="lbl">Docker API</span>
+            <span class="arr">→</span>
+          </div>
+          <div class="dia-section" style="flex:1;">
+            <div class="dia-section-header c-red">Docker Container &middot; /workspace</div>
+            <div class="dia-row">
+              <div class="dia-box c-dark" style="flex:1;">
+                <h5>Project Files</h5>
+                <ul>
+                  <li>src/ pom.xml build.xml</li>
+                  <li>target/ reports/</li>
+                </ul>
+              </div>
+              <div class="dia-box c-blue" style="flex:1;">
+                <h5>Tool Sets &middot; ↕ fallback</h5>
+                <ul>
+                  <li>Bash (low)</li>
+                  <li>Maven / Gradle (mid)</li>
+                  <li>Sys Package (mid)</li>
+                  <li>Analyzer (high)</li>
+                </ul>
+              </div>
+              <div class="dia-box c-green" style="flex:1;">
+                <h5>Agent Memory</h5>
+                <ul>
+                  <li>Trunk: goal, task list, progress</li>
+                  <li>Branch: subtask detail</li>
+                  <li>↕ merge back on done</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p class="explain">
+        SAG operates <strong>within Docker containers, not synthesizing Dockerfiles</strong>. The agent interactively explores the project, installs dependencies, resolves version conflicts, and builds — all inside the container. <strong>Disposable &middot; Reproducible &middot; Safe for untrusted code.</strong>
+      </p>
+    </div>
+
+    <!-- Verification -->
+    <div id="p-verify" class="arch-panel">
+      <div class="diagram">
+        <div class="dia-row">
+          <div class="dia-col" style="flex:0 0 180px; gap:12px;">
+            <div class="dia-box c-blue">
+              <h5>Tool Results</h5>
+              <ul><li>exit codes</li><li>stdout / stderr</li><li>build logs</li></ul>
+            </div>
+            <div class="dia-box c-green">
+              <h5>Physical Evidence</h5>
+              <ul><li>.class files</li><li>surefire/*.xml</li><li>compiled JARs</li></ul>
+            </div>
+          </div>
+          <div class="dia-arrow"><span class="arr">→</span></div>
+          <div class="dia-col" style="flex:0 0 220px; gap:12px;">
+            <div class="dia-box c-green">
+              <h5>File Validator</h5>
+              <ul>
+                <li>Reads actual files, not model claims</li>
+                <li>"Model says success" vs "XML shows 3 fail"</li>
+              </ul>
+            </div>
+            <div class="dia-box c-amber">
+              <h5>Agent State Evaluator</h5>
+              <ul>
+                <li>Reads agent memory</li>
+                <li>Detects stuck loops</li>
+                <li>Breaks repeat cycles</li>
+              </ul>
+            </div>
+          </div>
+          <div class="dia-arrow">
+            <span class="lbl">combined</span>
+            <span class="arr">→</span>
+          </div>
+          <div class="dia-box c-dark" style="flex:1; align-self:center;">
+            <h5>Observations</h5>
+            <ul>
+              <li>= tool results</li>
+              <li>+ file validation</li>
+              <li>+ state evaluation</li>
+            </ul>
+            <div class="meta">Fed back to Thinking Model each iteration</div>
+          </div>
+        </div>
+      </div>
+      <div class="dia-callout">
+        <p>LLMs hallucinate — especially about success. The File Validator uses the <strong>file system as ground truth</strong>, not the model's interpretation of command output. This dual-source feedback means even smaller, cheaper models drive the action loop reliably, enabling the <strong>84.4% success rate with mini models</strong>.</p>
+        <div class="tag">Hallucination-Resistant by Design</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- TEAM -->
+<div class="g">
+  <div class="gc col-full section-label">
+    <small>Authors &middot; Stevens Institute of Technology</small>
+  </div>
+  <div class="gc team-member highlight">
+    <h4>Chenhao Wei</h4>
+    <div class="aff">Stevens Institute of Technology</div>
+    <a href="https://scholar.google.com/citations?user=q6kIw60AAAAJ" class="gs" target="_blank" rel="noopener noreferrer">Google Scholar ↗</a>
+    <div class="role">First Author</div>
+  </div>
+  <div class="gc team-member">
+    <h4>Gengwu Zhao</h4>
+    <div class="aff">Stevens Institute of Technology</div>
+    <a href="https://scholar.google.com/citations?hl=zh-CN&user=QFl5ZekAAAAJ" class="gs" target="_blank" rel="noopener noreferrer">Google Scholar ↗</a>
+  </div>
+  <div class="gc team-member">
+    <h4>Xinyi Li</h4>
+    <div class="aff">Stevens Institute of Technology</div>
+  </div>
+  <div class="gc team-member">
+    <h4>Billy Ye</h4>
+    <div class="aff">Stevens Institute of Technology</div>
+  </div>
+  <div class="gc team-member highlight">
+    <h4>Lu Xiao</h4>
+    <div class="aff">Stevens Institute of Technology</div>
+    <a href="https://scholar.google.com/citations?user=s2Z7NFYAAAAJ" class="gs" target="_blank" rel="noopener noreferrer">Google Scholar ↗</a>
+    <div class="role">Corresponding Author</div>
+  </div>
+</div>
+
+<!-- CITATION -->
+<div class="g">
+  <div class="gc col-full section-label">
+    <small>Cite This Work</small>
+  </div>
+  <div class="gc col-full cite-content">
+    <div class="cite-title">Setup AGent (SAG): A Dual-Model LLM Agent for Autonomous End-to-End Java Project Configuration</div>
+    <div class="cite-meta">Chenhao Wei, Gengwu Zhao, Xinyi Li, Billy Ye, and Lu Xiao</div>
+    <div class="cite-venue">ICSE-NIER '26 &middot; IEEE/ACM 48th International Conference on Software Engineering &middot; April 2026 &middot; Rio de Janeiro, Brazil</div>
+    <a href="https://doi.org/10.1145/3786582.3786818" class="cite-doi" target="_blank" rel="noopener noreferrer">DOI: 10.1145/3786582.3786818 ↗</a>
+    <div class="bibtex">
+      <button class="cp">COPY</button>
+@inproceedings{wei2026sag,
+  title     = {Setup AGent (SAG): A Dual-Model LLM Agent for
+               Autonomous End-to-End Java Project Configuration},
+  author    = {Wei, Chenhao and Zhao, Gengwu and Li, Xinyi
+               and Ye, Billy and Xiao, Lu},
+  booktitle = {ICSE-NIER '26},
+  year      = {2026},
+  doi       = {10.1145/3786582.3786818}
+}
+    </div>
+  </div>
+</div>
+
+<!-- FOOTER -->
+<footer class="g footer">
+  <div class="gc">
+    <small>Setup Agent</small>
+    <small class="version">v0.2.0</small>
+  </div>
+  <div class="gc"></div>
+  <div class="gc">
+    <a href="https://github.com/Codegass/Setup-Agent" target="_blank" rel="noopener noreferrer"><small>GitHub ↗</small></a>
+  </div>
+  <div class="gc">
+    <a href="https://doi.org/10.1145/3786582.3786818" target="_blank" rel="noopener noreferrer"><small>Paper ↗</small></a>
+  </div>
+  <div class="gc">
+    <small>MIT License &middot; 2026</small>
+  </div>
+</footer>
+
+</main>
+
+<script src="js/main.js"></script>
+</body>
+</html>

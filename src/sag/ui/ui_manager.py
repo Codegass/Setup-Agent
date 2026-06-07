@@ -1,0 +1,735 @@
+"""
+UI Manager for Setup Agent
+
+Manages the Rich Live display and handles UI events to provide
+an interactive, auto-updating CLI interface.
+"""
+
+import time
+from typing import Optional
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+
+from sag.ui.components import (
+    create_active_operation_panel,
+    create_evidence_panel,
+    create_final_diagnosis_panel,
+    create_live_error_panel,
+    create_live_warning_panel,
+    create_phase_timeline,
+    create_phase_tree,
+    create_recent_timeline_panel,
+    create_recovery_panel,
+    create_status_header,
+    create_success_panel,
+    format_duration,
+)
+from sag.ui.diagnosis import build_final_diagnosis
+from sag.ui.events import EventType, PhaseType, UIEvent
+from sag.ui.state import UIRunState
+from sag.ui.state_aggregator import UIStateAggregator
+
+
+class UIManager:
+    """
+    Manages the UI display and event handling
+
+    Provides a live-updating display using Rich's Live component,
+    showing status dashboard, phase tree, and current operations.
+    """
+
+    def __init__(self, project_name: str, console: Optional[Console] = None):
+        """
+        Initialize the UI Manager
+
+        Args:
+            project_name: Name of the project being set up
+            console: Optional Rich Console instance (creates new one if not provided)
+        """
+        self.project_name = project_name
+        self.console = console or Console()
+        self._aggregator = UIStateAggregator(project_name)
+
+        # Timing
+        self.start_time = time.time()
+
+        # Legacy mutable fields remain as compatibility shims for final summary
+        # details and existing callers; live rendering now reads typed snapshots.
+        # Phase tracking
+        self.current_phase: Optional[PhaseType] = None
+        self.phases_data = {
+            PhaseType.SETUP: {"status": "pending", "steps": []},
+            PhaseType.BUILD: {"status": "pending", "steps": []},
+            PhaseType.TEST: {"status": "pending", "steps": []},
+            PhaseType.VERIFICATION: {"status": "pending", "steps": []},
+        }
+
+        # Current status
+        self.current_status = "Initializing"
+        self.current_step: Optional[str] = None
+
+        # Agent progress tracking
+        self.agent_current_step_num: int = 0
+        self.agent_current_action: Optional[str] = None  # "thinking", "acting", "observing"
+        self.agent_current_tool: Optional[str] = None
+        self.agent_tool_params: Optional[dict] = None  # Current tool parameters
+        self.agent_detail: Optional[str] = None  # Detailed status like "Using bash tool"
+
+        # Error/warning tracking
+        self.errors: list[UIEvent] = []
+        self.warnings: list[UIEvent] = []
+
+        # Final result
+        self.is_complete = False
+        self.final_status: Optional[str] = None
+        # Guards display_final_summary so callers (including cleanup paths)
+        # can invoke it unconditionally without producing a duplicate panel.
+        self._summary_shown = False
+
+        # Report information
+        self.report_data: Optional[dict] = None  # Report metadata (path, status, metrics)
+
+        # Live display
+        self.live: Optional[Live] = None
+
+        # Agent step tracking (for collapsible sections)
+        self.agent_steps: list[dict] = []
+        self.current_agent_step: Optional[dict] = None
+
+    def snapshot(self) -> UIRunState:
+        """Return the current typed UI run state."""
+        return self._aggregator.snapshot()
+
+    def start(self):
+        """Start the live display"""
+        try:
+            initial_render = self._render_display()
+            live = Live(initial_render, console=self.console, refresh_per_second=4, transient=False)
+            live.start()
+        except Exception as exc:
+            self.live = None
+            self._record_ui_warning(
+                "Initial render failed; continuing without live UI.",
+                details=str(exc),
+            )
+            return
+
+        self.live = live
+
+    def stop(self):
+        """Stop the live display"""
+        if self.live:
+            self.live.stop()
+
+    def _format_tool_params(self, tool_name: str, params: dict) -> str:
+        """
+        Format tool parameters for display
+
+        Args:
+            tool_name: Name of the tool
+            params: Tool parameters dictionary
+
+        Returns:
+            Formatted parameter string like "action='analyze'" or "command='mvn clean install'"
+        """
+        if not params:
+            return ""
+
+        # Define which parameters are most important for each tool
+        important_params = {
+            "bash": ["command"],
+            "manage_context": ["action"],
+            "file_io": ["action", "path"],
+            "maven": ["goal", "action"],
+            "gradle": ["task", "action"],
+            "project_setup": ["action"],
+            "project_analyzer": ["action"],
+            "report": ["action"],
+        }
+
+        # Get the important params for this tool, or use all params
+        params_to_show = important_params.get(tool_name, list(params.keys())[:2])
+
+        formatted_parts = []
+        for param in params_to_show:
+            if param in params:
+                value = params[param]
+                # Truncate long values
+                value_str = str(value)
+                if len(value_str) > 50:
+                    value_str = value_str[:47] + "..."
+                formatted_parts.append(f"{param}='{value_str}'")
+
+        if formatted_parts:
+            return f"({', '.join(formatted_parts)})"
+        return ""
+
+    def _detect_phase_from_action(self, tool_name: str, tool_params: dict) -> Optional[PhaseType]:
+        """
+        Detect which phase the agent is in based on tool usage.
+
+        Args:
+            tool_name: Name of the tool being used
+            tool_params: Tool parameters
+
+        Returns:
+            PhaseType if phase detected, None otherwise
+        """
+        # Already in verification or all phases complete - don't transition back
+        if self.current_phase == PhaseType.VERIFICATION:
+            return None
+
+        # Report tool = verification phase
+        if tool_name == "report":
+            return PhaseType.VERIFICATION
+
+        # Check for test-related activities
+        if tool_name in ["maven", "gradle"]:
+            goal = tool_params.get("goal", "")
+            task = tool_params.get("task", "")
+            action = tool_params.get("action", "")
+
+            # Test phase indicators
+            if "test" in goal.lower() or "test" in task.lower() or "test" in action.lower():
+                return PhaseType.TEST
+
+            # Build phase indicators (compile, package, install)
+            if any(
+                keyword in goal.lower() or keyword in task.lower()
+                for keyword in ["compile", "package", "install", "build", "assemble"]
+            ):
+                return PhaseType.BUILD
+
+        # Bash commands
+        if tool_name == "bash":
+            command = tool_params.get("command", "")
+            command_lower = command.lower()
+
+            # Test indicators in bash commands
+            if any(
+                keyword in command_lower
+                for keyword in ["mvn test", "gradle test", "pytest", "npm test", "test"]
+            ):
+                return PhaseType.TEST
+
+            # Build indicators in bash commands
+            if any(
+                keyword in command_lower
+                for keyword in [
+                    "mvn compile",
+                    "mvn package",
+                    "mvn install",
+                    "gradle build",
+                    "gradle assemble",
+                    "make",
+                    "npm run build",
+                ]
+            ):
+                return PhaseType.BUILD
+
+        return None
+
+    def _extract_thought_summary(self, thought: str) -> str:
+        """
+        Extract a meaningful summary from agent thought.
+
+        Args:
+            thought: Full thought content
+
+        Returns:
+            Concise summary (up to 80 chars); ellipsis only when truncated
+        """
+        # Remove common prefixes
+        thought = thought.strip()
+        thought = thought.replace("I need to ", "").replace("I should ", "").replace("I will ", "")
+
+        # Find first sentence or meaningful chunk
+        sentences = thought.split(". ")
+        if sentences:
+            summary = sentences[0].strip()
+            # Limit length
+            if len(summary) > 80:
+                summary = summary[:77] + "..."
+            elif len(summary) < 20 and len(sentences) > 1:
+                # If too short, include second sentence if available
+                second = sentences[1].strip()
+                if len(second) > 40:
+                    summary = f"{summary}. {second[:37]}..."
+                else:
+                    summary = f"{summary}. {second}"
+
+            return summary
+
+        # Fallback
+        return thought[:77] + "..." if len(thought) > 80 else thought
+
+    def _extract_observation_summary(self, observation: str) -> str:
+        """
+        Extract a meaningful summary from agent observation.
+
+        Args:
+            observation: Full observation content
+
+        Returns:
+            Concise summary (up to 100 chars); ellipsis only when truncated
+        """
+        # Clean up observation
+        observation = observation.strip()
+
+        # Look for key indicators of success/failure
+        if "successfully" in observation.lower() or "success" in observation.lower():
+            # Extract success message
+            lines = observation.split("\n")
+            for line in lines:
+                if "success" in line.lower():
+                    summary = line.strip()
+                    return summary[:97] + "..." if len(summary) > 100 else summary
+
+        # Look for error indicators
+        if "error" in observation.lower() or "failed" in observation.lower():
+            lines = observation.split("\n")
+            for line in lines:
+                if "error" in line.lower() or "failed" in line.lower():
+                    summary = line.strip()
+                    return summary[:97] + "..." if len(summary) > 100 else summary
+
+        # Default: first meaningful line
+        lines = observation.split("\n")
+        for line in lines:
+            line = line.strip()
+            if len(line) > 10:  # Skip very short lines
+                return line[:97] + "..." if len(line) > 100 else line
+
+        # Fallback
+        return observation[:97] + "..." if len(observation) > 100 else observation
+
+    def _format_report_summary(self) -> Panel:
+        """
+        Format report summary panel for display.
+
+        Returns:
+            Rich Panel with report information
+        """
+        if not self.report_data:
+            return Panel("No report data available", border_style="yellow")
+
+        # Extract report data
+        report_path = self.report_data.get("report_path", "Unknown")
+        status = self.report_data.get("status", "unknown")
+        build_success = self.report_data.get("build_success", False)
+        test_success = self.report_data.get("test_success", False)
+        total_tests = self.report_data.get("total_tests", 0)
+        passed_tests = self.report_data.get("passed_tests", 0)
+        test_pass_rate = self.report_data.get("test_pass_rate", 0)
+
+        # Calculate pass rate if not provided or if it's 0 but we have test data
+        if test_pass_rate == 0 and total_tests > 0:
+            test_pass_rate = (passed_tests / total_tests) * 100
+
+        # Build content
+        content = f"📄 [bold cyan]Final Report Generated[/bold cyan]\n\n"
+        content += f"  [cyan]Location:[/cyan] {report_path}\n"
+        content += f"  [cyan]Status:[/cyan] {status.upper()}\n\n"
+
+        content += "  [bold]Results:[/bold]\n"
+        build_icon = "✅" if build_success else "❌"
+        content += f"    {build_icon} Build: {'SUCCESS' if build_success else 'FAILED'}\n"
+
+        if total_tests > 0:
+            test_icon = "✅" if test_success else "❌"
+            content += f"    {test_icon} Tests: {passed_tests}/{total_tests} passed ({test_pass_rate:.1f}%)\n"
+
+        return Panel(
+            content,
+            title="📊 Setup Report",
+            border_style="green" if status == "success" else "yellow",
+            padding=(1, 2),
+        )
+
+    def handle_event(self, event: UIEvent):
+        """
+        Handle a UI event and update the display
+
+        Args:
+            event: The UI event to handle
+        """
+        try:
+            self._aggregator.handle(event)
+        except Exception as exc:
+            self._record_ui_warning(
+                "UI state aggregation failed; continuing with last known state.",
+                details=str(exc),
+            )
+
+        if self._is_legacy_safe_event(event):
+            self._handle_legacy_event(event)
+
+        self._safe_update_display()
+
+    def _is_legacy_safe_event(self, event: UIEvent) -> bool:
+        """Return whether a raw event is safe for legacy mutable handlers."""
+        if not isinstance(event, UIEvent):
+            return False
+        if not isinstance(event.event_type, EventType):
+            return False
+        if not isinstance(event.message, str):
+            return False
+        if event.phase is not None and not isinstance(event.phase, PhaseType):
+            return False
+        if event.details is not None and not isinstance(event.details, str):
+            return False
+        if not isinstance(event.level, str):
+            return False
+        return isinstance(event.metadata, dict)
+
+    def _handle_legacy_event(self, event: UIEvent):
+        """Update legacy mutable fields for the current render path."""
+        # Handle based on event type
+        if event.event_type == EventType.PHASE_START:
+            self._handle_phase_start(event)
+        elif event.event_type == EventType.PHASE_COMPLETE:
+            self._handle_phase_complete(event)
+        elif event.event_type == EventType.PHASE_ERROR:
+            self._handle_phase_error(event)
+        elif event.event_type == EventType.STEP_START:
+            self._handle_step_start(event)
+        elif event.event_type == EventType.STEP_COMPLETE:
+            self._handle_step_complete(event)
+        elif event.event_type == EventType.STEP_ERROR:
+            self._handle_step_error(event)
+        elif event.event_type == EventType.STATUS_UPDATE:
+            self._handle_status_update(event)
+        elif event.event_type == EventType.ERROR:
+            self._handle_error(event)
+        elif event.event_type == EventType.WARNING:
+            self._handle_warning(event)
+        elif event.event_type == EventType.SUCCESS:
+            self._handle_success(event)
+        elif event.event_type == EventType.FAILURE:
+            self._handle_failure(event)
+        elif event.event_type == EventType.REPORT_GENERATED:
+            self._handle_report_generated(event)
+        elif event.event_type in [
+            EventType.AGENT_THOUGHT,
+            EventType.AGENT_ACTION,
+            EventType.AGENT_OBSERVATION,
+        ]:
+            self._handle_agent_event(event)
+
+    def _handle_phase_start(self, event: UIEvent):
+        """Handle phase start event"""
+        self.current_phase = event.phase
+        if event.phase:
+            self.phases_data[event.phase]["status"] = "running"
+        self.current_status = event.message
+
+    def _handle_phase_complete(self, event: UIEvent):
+        """Handle phase complete event"""
+        if event.phase:
+            self.phases_data[event.phase]["status"] = "success"
+        self.current_status = event.message
+
+    def _handle_phase_error(self, event: UIEvent):
+        """Handle phase error event"""
+        if event.phase:
+            self.phases_data[event.phase]["status"] = "error"
+        self.errors.append(event)
+
+    def _handle_step_start(self, event: UIEvent):
+        """Handle step start event"""
+        self.current_step = event.message
+
+        if event.phase:
+            # Add step to phase
+            phase_data = self.phases_data.get(event.phase)
+            if phase_data:
+                phase_data["steps"].append(
+                    {"name": event.message, "status": "running", "details": event.details}
+                )
+
+    def _handle_step_complete(self, event: UIEvent):
+        """Handle step complete event"""
+        if event.phase:
+            # Update step status
+            phase_data = self.phases_data.get(event.phase)
+            if phase_data and phase_data["steps"]:
+                # Find the step by name and update
+                for step in phase_data["steps"]:
+                    if step["name"] == event.message or step["status"] == "running":
+                        step["status"] = "success"
+                        if event.details:
+                            step["details"] = event.details
+                        break
+
+    def _handle_step_error(self, event: UIEvent):
+        """Handle step error event"""
+        if event.phase:
+            # Update step status
+            phase_data = self.phases_data.get(event.phase)
+            if phase_data and phase_data["steps"]:
+                # Find the running step and mark as error
+                for step in phase_data["steps"]:
+                    if step["status"] == "running":
+                        step["status"] = "error"
+                        if event.details:
+                            step["details"] = event.details
+                        break
+
+        self.errors.append(event)
+
+    def _handle_status_update(self, event: UIEvent):
+        """Handle status update event"""
+        self.current_status = event.message
+
+    def _handle_error(self, event: UIEvent):
+        """Handle error event"""
+        self.errors.append(event)
+
+    def _handle_warning(self, event: UIEvent):
+        """Handle warning event"""
+        self.warnings.append(event)
+
+    def _handle_success(self, event: UIEvent):
+        """Handle success event"""
+        self.is_complete = True
+        self.final_status = "success"
+        self.current_status = event.message
+
+    def _handle_failure(self, event: UIEvent):
+        """Handle failure event"""
+        self.is_complete = True
+        self.final_status = "failure"
+        self.current_status = event.message
+
+    def _handle_report_generated(self, event: UIEvent):
+        """Handle report generation event"""
+        # Store report metadata
+        self.report_data = event.metadata
+
+        # Complete verification phase
+        if self.current_phase == PhaseType.VERIFICATION:
+            self.phases_data[PhaseType.VERIFICATION]["status"] = "success"
+
+        # Update status
+        self.current_status = "Report generated"
+
+    def _handle_agent_event(self, event: UIEvent):
+        """Handle agent ReAct events (thought, action, observation)"""
+        # Track agent steps for collapsible display
+        if event.event_type == EventType.AGENT_THOUGHT:
+            # Start a new agent step
+            self.agent_current_step_num = event.metadata.get(
+                "step_num", self.agent_current_step_num + 1
+            )
+            self.agent_current_action = "thinking"
+            self.agent_current_tool = None
+
+            # Extract meaningful summary from thought
+            thought_summary = self._extract_thought_summary(event.message)
+            self.agent_detail = f"Step {self.agent_current_step_num}: {thought_summary}"
+            self.current_status = thought_summary
+
+            self.current_agent_step = {
+                "thought": event.message,
+                "action": None,
+                "observation": None,
+                "status": "running",
+            }
+            self.agent_steps.append(self.current_agent_step)
+
+        elif event.event_type == EventType.AGENT_ACTION and self.current_agent_step:
+            self.agent_current_action = "acting"
+            tool_name = str(event.metadata.get("tool_name", "unknown"))
+            tool_params = event.metadata.get("tool_params", {})
+            if not isinstance(tool_params, dict):
+                tool_params = {}
+
+            self.agent_current_tool = tool_name
+            self.agent_tool_params = tool_params
+
+            # Detect phase transition based on tool usage
+            # NOTE: tool-name detection is a pure heuristic — it carries no signal
+            # about whether the previous phase actually succeeded. Updating
+            # `current_phase` is safe (it just drives the live indicator), but we
+            # must NOT mark the previous phase as "success" here; only explicit
+            # PHASE_COMPLETE / PHASE_ERROR events may transition phase status.
+            detected_phase = self._detect_phase_from_action(tool_name, tool_params)
+            if detected_phase and detected_phase != self.current_phase:
+                self.current_phase = detected_phase
+                if self.phases_data[detected_phase]["status"] == "pending":
+                    self.phases_data[detected_phase]["status"] = "running"
+
+            # Format parameters for display
+            params_str = self._format_tool_params(tool_name, tool_params)
+
+            # Build detailed status with parameters
+            if params_str:
+                self.agent_detail = f"Step {self.agent_current_step_num}: {tool_name} {params_str}"
+                self.current_status = f"Using {tool_name} {params_str}"
+            else:
+                self.agent_detail = f"Step {self.agent_current_step_num}: {tool_name}"
+                self.current_status = f"Using {tool_name}"
+
+            self.current_agent_step["action"] = event.message
+
+        elif event.event_type == EventType.AGENT_OBSERVATION and self.current_agent_step:
+            self.agent_current_action = "observing"
+
+            # Extract meaningful summary from observation
+            observation_summary = self._extract_observation_summary(event.message)
+            self.agent_detail = f"Step {self.agent_current_step_num}: {observation_summary}"
+            self.current_status = observation_summary
+
+            self.current_agent_step["observation"] = event.message
+            self.current_agent_step["status"] = "complete"
+            self.current_agent_step = None
+
+    def _render_display(self):
+        """Render the current display"""
+        state = self.snapshot()
+        elapsed = time.time() - self.start_time
+        elapsed_str = format_duration(elapsed)
+
+        elements = []
+        elements.append(create_status_header(state, elapsed_str))
+        elements.append("")
+        elements.append(create_phase_timeline(state))
+
+        for panel in (
+            create_active_operation_panel(state),
+            create_recovery_panel(state),
+            create_evidence_panel(state),
+            create_recent_timeline_panel(state),
+        ):
+            if panel:
+                elements.append("")
+                elements.append(panel)
+
+        if state.latest_error:
+            elements.append("")
+            elements.append(
+                create_live_error_panel(
+                    state.latest_error.message,
+                    details=state.latest_error.details,
+                )
+            )
+        elif state.latest_warning:
+            elements.append("")
+            elements.append(
+                create_live_warning_panel(
+                    state.latest_warning.message, details=state.latest_warning.details
+                )
+            )
+
+        return Group(*elements)
+
+    def _update_display(self):
+        """Update the live display"""
+        if not self.live:
+            return
+        renderable = self._render_display()
+        self.live.update(renderable)
+
+    def _safe_update_display(self):
+        """Update Rich display without allowing render failures to abort the run."""
+        try:
+            self._update_display()
+        except Exception as exc:
+            self._record_ui_warning(
+                "UI render failed; continuing without updating the live display.",
+                details=str(exc),
+            )
+
+    def _record_ui_warning(self, message: str, details: Optional[str] = None) -> None:
+        """Record an internal UI warning in typed state and legacy fields."""
+        warning = UIEvent(
+            EventType.WARNING,
+            message,
+            details=details,
+            level="warning",
+        )
+        try:
+            self._aggregator.handle(warning)
+        except Exception:
+            pass
+        self.warnings.append(warning)
+
+    def abort_running_phases(self, reason: str = "Phase aborted") -> None:
+        """Mark any still-running phase as errored.
+
+        Callers (e.g. agent cleanup paths) use this when teardown happens before
+        an explicit PHASE_COMPLETE / PHASE_ERROR has been emitted, so the
+        rendered phase tree truthfully reflects that the phase did not finish.
+        """
+        for phase, data in self.phases_data.items():
+            if data.get("status") == "running":
+                self.handle_event(
+                    UIEvent(
+                        event_type=EventType.PHASE_ERROR,
+                        message=reason,
+                        phase=phase,
+                        level="error",
+                    )
+                )
+
+    def display_final_summary(self):
+        """Display final summary with expandable sections.
+
+        Idempotent: subsequent calls are no-ops, so cleanup paths can invoke
+        this unconditionally without risking duplicate panels.
+        """
+        if self._summary_shown:
+            return
+        self._summary_shown = True
+        self.stop()
+
+        # Print final status
+        self.console.print()
+        self.console.print("=" * 60)
+        self.console.print()
+
+        elapsed = time.time() - self.start_time
+        elapsed_str = format_duration(elapsed)
+        diagnosis = build_final_diagnosis(self.snapshot())
+
+        if diagnosis.status == "success":
+            success_panel = create_success_panel(
+                diagnosis.outcome,
+                summary_items=[
+                    ("Total time", elapsed_str),
+                    (
+                        "Phases completed",
+                        f"{len(diagnosis.completed_phases)}/4",
+                    ),
+                ],
+            )
+            self.console.print(success_panel)
+        else:
+            self.console.print(create_final_diagnosis_panel(diagnosis))
+
+        # Print report information if available
+        if self.report_data:
+            self.console.print()
+            report_info = self._format_report_summary()
+            self.console.print(report_info)
+
+        # Print detailed phase tree with all steps expanded
+        self.console.print()
+        self.console.print(Panel("📋 Detailed Execution Log", border_style="cyan"))
+        self.console.print()
+        phase_tree = create_phase_tree(self.phases_data)
+        self.console.print(phase_tree)
+
+        # Print agent steps if any (collapsible summary)
+        if self.agent_steps:
+            self.console.print()
+            self.console.print(
+                Panel(f"🤖 Agent executed {len(self.agent_steps)} ReAct steps", border_style="blue")
+            )
+            self.console.print("[dim]Run with --verbose to see detailed agent reasoning[/dim]")
+
+        self.console.print()
+        self.console.print("=" * 60)
+        self.console.print()
