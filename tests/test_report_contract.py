@@ -1,5 +1,6 @@
 import json
 
+from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.tools.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool
 
@@ -25,6 +26,32 @@ class FakeReportOverlayOrchestrator:
         if path in self.unreadable_paths:
             return {"success": False, "content": "", "exit_code": 1}
         return {"success": True, "content": self.files.get(path, ""), "exit_code": 0}
+
+
+class FakeReportContextManager:
+    def __init__(self):
+        self.current_task_id = None
+        self.trunk = TrunkContext(
+            context_id="trunk_test",
+            goal="Set up demo",
+            project_url="https://example.test/demo.git",
+            project_name="demo",
+            todo_list=[
+                Task(id="task_1", description="Run tests", status=TaskStatus.COMPLETED),
+                Task(
+                    id="task_2",
+                    description="Generate comprehensive setup completion report",
+                    status=TaskStatus.PENDING,
+                ),
+            ],
+        )
+        self.saved_trunk = None
+
+    def load_trunk_context(self):
+        return self.trunk
+
+    def _save_trunk_context(self, trunk_context):
+        self.saved_trunk = trunk_context
 
 
 def _generate_report_with_overlay(overlay_json=None, unreadable_paths=None):
@@ -107,6 +134,52 @@ def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
     assert result.raw_data["full_report"] == "# Full Report"
     assert result.raw_data["report_snapshot"]["status"] == "success"
     assert result.metadata["verified_status"] == "success"
+
+
+def test_report_tool_marks_final_report_task_completed(monkeypatch):
+    context_manager = FakeReportContextManager()
+    tool = ReportTool(context_manager=context_manager)
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_generate_comprehensive_report",
+        lambda summary, status, details: (
+            "# Full Report",
+            "success",
+            "setup-report-test.md",
+            {
+                "build_success": True,
+                "test_success": True,
+                "physical_validation": {
+                    "test_analysis": {
+                        "pass_rate": 100,
+                        "total_tests": 1,
+                        "passed_tests": 1,
+                    }
+                },
+            },
+            {"status": "success"},
+        ),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_generate_condensed_log_output",
+        lambda verified_status,
+        report_filename,
+        actual_accomplishments,
+        report_snapshot: "condensed",
+    )
+
+    result = tool.execute(action="generate", summary="done", status="success")
+
+    final_task = context_manager.trunk.todo_list[1]
+    assert result.success is True
+    assert final_task.status == TaskStatus.COMPLETED
+    assert final_task.completed_at is not None
+    assert final_task.notes == "Final setup report generated."
+    assert "setup-report-test.md" in final_task.key_results
+    assert context_manager.saved_trunk is context_manager.trunk
 
 
 def test_markdown_report_includes_runtime_env_overlay_evidence():

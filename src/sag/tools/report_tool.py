@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
+from sag.agent.context_manager import TaskStatus
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.ui.events import EventType, UIEventEmitter
@@ -87,6 +88,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                     logger.warning(
                         f"Report already exists at {existing_report}, skipping duplicate generation"
                     )
+                    completed_context_task = self._mark_final_report_task_completed(
+                        existing_report, status
+                    )
 
                     # Read and return the existing report content
                     read_cmd = f"head -100 {existing_report}"
@@ -108,6 +112,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                             "status": status,
                             "existing_report": existing_report,
                             "duplicate_prevention": True,
+                            "context_task_completed": completed_context_task,
                         },
                     )
             except Exception as e:
@@ -166,6 +171,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                     actual_accomplishments,
                     report_snapshot,
                 ) = self._generate_comprehensive_report(summary, status, details)
+                completed_context_task = self._mark_final_report_task_completed(
+                    report_filename, verified_status
+                )
 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -175,6 +183,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     "verified_status": verified_status,  # Include the verified status
                     "timestamp": datetime.now().isoformat(),
                     "report_snapshot": report_snapshot,
+                    "context_task_completed": completed_context_task,
                 }
 
                 # ENHANCED: Provide condensed output for logs to reduce noise
@@ -231,6 +240,64 @@ class ReportTool(BaseTool, UIEventEmitter):
                 error=f"Report generation failed: {str(e)}",
                 suggestions=["Check if all required information is available"],
             )
+
+    def _mark_final_report_task_completed(
+        self, report_filename_or_path: str, verified_status: str
+    ) -> Optional[str]:
+        """Synchronize the final report TODO item after a report artifact is written."""
+        if not self.context_manager:
+            return None
+
+        try:
+            trunk_context = self.context_manager.load_trunk_context()
+        except Exception as exc:
+            logger.debug(f"Failed to load context while finalizing report task: {exc}")
+            return None
+
+        if not trunk_context or not getattr(trunk_context, "todo_list", None):
+            return None
+
+        report_path = self._normalize_report_path(report_filename_or_path)
+        target = self._find_final_report_task(trunk_context.todo_list)
+        if target is None:
+            return None
+
+        summary = "Final setup report generated."
+        key_results = f"report_path={report_path}; report_status={verified_status}"
+        trunk_context.update_task_status(target.id, TaskStatus.COMPLETED, summary)
+        trunk_context.update_task_key_results(target.id, key_results)
+        self.context_manager._save_trunk_context(trunk_context)
+
+        if getattr(self.context_manager, "current_task_id", None) == target.id:
+            self.context_manager.current_task_id = None
+
+        logger.info(f"Marked final report task complete: {target.id}")
+        return target.id
+
+    def _find_final_report_task(self, tasks: list[Any]) -> Optional[Any]:
+        incomplete = []
+        for task in tasks:
+            status = getattr(getattr(task, "status", None), "value", getattr(task, "status", ""))
+            if str(status).lower() == TaskStatus.COMPLETED.value:
+                continue
+            description = str(getattr(task, "description", "") or getattr(task, "title", ""))
+            if self._is_final_report_task_description(description):
+                incomplete.append(task)
+        return incomplete[-1] if incomplete else None
+
+    def _is_final_report_task_description(self, description: str) -> bool:
+        text = description.lower()
+        return "report" in text and any(
+            marker in text for marker in ("final", "completion", "comprehensive", "setup")
+        )
+
+    def _normalize_report_path(self, report_filename_or_path: str) -> str:
+        text = str(report_filename_or_path or "").strip()
+        if not text:
+            return "/workspace/setup-report.md"
+        if text.startswith("/workspace/"):
+            return text
+        return f"/workspace/{text}"
 
     def _generate_comprehensive_report(
         self, summary: str, status: str, details: str

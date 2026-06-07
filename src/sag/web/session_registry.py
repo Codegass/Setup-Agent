@@ -265,6 +265,9 @@ def _session_detail(
     summary = _session_summary(item, workspace_id)
     outcome = _text(item.get("outcome"), default=summary.title)
     build = _build_summary(item.get("build"))
+    report_doc = _report_document(item)
+    if context is not None and report_doc is not None:
+        context = _backfill_completed_report_task(context, report_doc)
 
     return ExecutionSessionDetail(
         id=summary.id,
@@ -278,13 +281,68 @@ def _session_detail(
         build=build,
         test=summary.test,
         report=summary.report,
-        report_doc=_report_document(item),
+        report_doc=report_doc,
         blocker=None,
         evidence=_evidence(item, outcome),
         files=None,
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
+    )
+
+
+def _backfill_completed_report_task(
+    context: ContextMap,
+    report_doc: ReportDocument,
+) -> ContextMap:
+    tasks = []
+    changed = False
+    report_ref = report_doc.path or report_doc.title
+    for task in context.tasks:
+        if _is_incomplete_final_report_context_task(task):
+            refs = [*task.refs]
+            if report_ref and report_ref not in refs:
+                refs.append(report_ref)
+            tasks.append(
+                task.model_copy(
+                    update={
+                        "status": "completed",
+                        "summary": task.summary
+                        or f"Final setup report generated: {report_doc.title}",
+                        "refs": refs,
+                    }
+                )
+            )
+            changed = True
+        else:
+            tasks.append(task)
+
+    if not changed:
+        return context
+
+    done = sum(1 for task in tasks if task.status.strip().lower() == "completed")
+    total = len(tasks)
+    state = "completed" if total and done == total else context.trunk.state
+    return context.model_copy(
+        update={
+            "tasks": tasks,
+            "trunk": context.trunk.model_copy(
+                update={
+                    "state": state,
+                    "progress": {"done": done, "total": total},
+                }
+            ),
+        }
+    )
+
+
+def _is_incomplete_final_report_context_task(task: Any) -> bool:
+    status = str(getattr(task, "status", "")).strip().lower()
+    if status == "completed":
+        return False
+    title = str(getattr(task, "title", "")).lower()
+    return "report" in title and any(
+        marker in title for marker in ("final", "completion", "comprehensive", "setup")
     )
 
 

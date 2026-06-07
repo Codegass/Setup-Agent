@@ -403,6 +403,50 @@ def test_container_session_registry_returns_setup_artifact_detail():
     assert detail.context.trunk.progress == {"done": 1, "total": 1}
 
 
+def test_setup_artifact_detail_backfills_final_report_task_from_report_file():
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Setup and configure the commons-cli project to be runnable",
+                "todo_list": [
+                    {"id": "task_1", "description": "Run tests", "status": "completed"},
+                    {
+                        "id": "task_2",
+                        "description": "Generate comprehensive setup completion report",
+                        "status": "pending",
+                        "notes": "",
+                        "key_results": "",
+                    },
+                ],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "# Project Setup Report\n\n"
+            "**Generated:** 2026-06-06 21:35:09\n"
+            "**Result:** SUCCESS\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(
+        workspace_summary(),
+        "SETUP-20260606-213241",
+    )
+
+    assert detail is not None
+    assert detail.context is not None
+    report_task = detail.context.tasks[1]
+    assert report_task.status == "completed"
+    assert report_task.summary == "Final setup report generated: setup-report-20260606-213509.md"
+    assert report_task.refs == ["setup-report-20260606-213509.md"]
+    assert detail.context.trunk.progress == {"done": 2, "total": 2}
+
+
 def test_container_session_registry_recovers_setup_logs_from_host_session(tmp_path: Path):
     session_dir = tmp_path / "session_20260606_213207"
     session_dir.mkdir()
