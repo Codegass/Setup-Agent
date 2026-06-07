@@ -67,6 +67,45 @@ class FakeLiveSessionRegistry:
         return self.detail
 
 
+class FakeMixedSessionRegistry:
+    def __init__(self):
+        self.setup = ExecutionSessionSummary(
+            id="SETUP-20260606-213241",
+            workspace="sag-commons-cli",
+            title="Setup and configure the commons-cli project to be runnable",
+            status="completed",
+            entry="CLI",
+            start="2026-06-06T21:32:41",
+            finish="2026-06-06T21:35:09",
+            duration="2m 28s",
+            build="success",
+            test=TestSummary(state="success", pass_count=420, total=430),
+            report="ready",
+            files=6,
+            evidence=7,
+        )
+        self.ui = ExecutionSessionSummary(
+            id="UI-12345678",
+            workspace="sag-commons-cli",
+            title="Run formatter tests",
+            status="running",
+            entry="Web UI",
+            start="2026-06-06T21:48:30",
+            finish=None,
+            duration="running",
+            build="none",
+            test=TestSummary(state="none"),
+            report="none",
+            files=0,
+            evidence=1,
+        )
+
+    def list_workspace_sessions(self, workspace):
+        if workspace.id == "sag-commons-cli":
+            return [self.setup, self.ui]
+        return []
+
+
 class RaisingWorkspaceRegistry:
     def list_workspaces(self):
         raise RuntimeError("docker socket unavailable")
@@ -151,6 +190,23 @@ def test_read_model_builder_marks_running_live_session_active():
 
     workspace = builder.dashboard().workspaces[0]
 
+    assert workspace.active_session == "UI-12345678"
+    assert workspace.latest_session == "UI-12345678"
+
+
+def test_read_model_builder_includes_all_workspace_sessions():
+    builder = ReadModelBuilder(
+        workspace_registry=FakeWorkspaceRegistry(),
+        session_registry=FakeMixedSessionRegistry(),
+        demo_mode=False,
+    )
+
+    workspace = builder.dashboard().workspaces[0]
+
+    assert [session.id for session in workspace.sessions] == [
+        "SETUP-20260606-213241",
+        "UI-12345678",
+    ]
     assert workspace.active_session == "UI-12345678"
     assert workspace.latest_session == "UI-12345678"
 

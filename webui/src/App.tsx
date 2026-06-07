@@ -5,6 +5,7 @@ import type {
   BuildSummary,
   DashboardResponse,
   ExecutionSessionDetail,
+  ExecutionSessionSummary,
   SubmitTaskResponse,
   WorkspaceSummary,
 } from "@/api/types"
@@ -314,16 +315,16 @@ function sessionRows(
   workspace: WorkspaceSummary,
   sessionDetails: Record<string, ExecutionSessionDetail>,
 ): WorkspaceSessionRow[] {
-  const ids = [workspace.activeSession, workspace.latestSession].filter(
-    (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
-  )
+  const summaries = workspace.sessions?.length
+    ? workspace.sessions
+    : fallbackSessionSummaries(workspace)
 
-  return ids.map((id) => {
-    const detail = sessionDetails[id]
+  return summaries.map((summary) => {
+    const detail = sessionDetails[summary.id]
 
     if (detail) {
       return {
-        id,
+        id: summary.id,
         title: detail.title,
         status: detail.status,
         entry: detail.entry,
@@ -337,18 +338,44 @@ function sessionRows(
     }
 
     return {
-      id,
-      title: workspace.task,
-      status: workspace.activeSession === id ? "active" : "latest",
-      entry: "SAG",
-      start: workspace.updated,
-      duration: "unknown",
-      build: normalizeWorkspaceBuild(workspace.build),
-      test: workspace.test,
-      evidenceCount: null,
-      filesCount: workspace.changed,
+      id: summary.id,
+      title: summary.title,
+      status: summary.status,
+      entry: summary.entry,
+      start: summary.start,
+      duration: summary.duration,
+      build: normalizeSummaryBuild(summary.build),
+      test: summary.test,
+      evidenceCount: summary.evidence,
+      filesCount: summary.files,
     }
   })
+}
+
+function fallbackSessionSummaries(workspace: WorkspaceSummary): ExecutionSessionSummary[] {
+  const ids = [workspace.activeSession, workspace.latestSession].filter(
+    (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
+  )
+
+  return ids.map((id) => ({
+    id,
+    workspace: workspace.id,
+    title: workspace.task,
+    status: workspace.activeSession === id ? "active" : "latest",
+    entry: "SAG",
+    start: workspace.updated,
+    finish: null,
+    duration: "unknown",
+    build: normalizeWorkspaceBuild(workspace.build).state,
+    test: workspace.test,
+    report: workspace.report,
+    files: workspace.changed,
+    evidence: 0,
+  }))
+}
+
+function normalizeSummaryBuild(build: string): BuildSummary {
+  return { state: build, tool: "", time: "", note: "" }
 }
 
 function normalizeWorkspaceBuild(build: WorkspaceSummary["build"]): BuildSummary {

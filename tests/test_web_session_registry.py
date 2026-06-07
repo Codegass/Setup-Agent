@@ -280,6 +280,52 @@ def test_container_session_registry_falls_back_to_setup_artifacts_without_index_
     assert rows[0].test.total == 430
 
 
+def test_container_session_registry_merges_web_sessions_with_setup_artifacts():
+    files = {
+        "/workspace/.setup_agent/sessions/index.json": json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "UI-12345678",
+                        "workspace": "sag-commons-cli",
+                        "title": "Run formatter tests",
+                        "status": "running",
+                        "entry": "Web UI",
+                        "start": "2026-06-06T21:48:30",
+                        "duration": "running",
+                        "build": "none",
+                        "test": {"state": "none", "pass": 0, "fail": 0, "skip": 0, "total": 0},
+                        "report": "none",
+                        "files": 0,
+                        "evidence": 1,
+                    }
+                ]
+            }
+        ),
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Setup and configure the commons-cli project to be runnable",
+                "todo_list": [],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "# Project Setup Report\n\n"
+            "**Generated:** 2026-06-06 21:35:09\n"
+            "**Result:** SUCCESS\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+
+    assert [row.id for row in rows] == ["SETUP-20260606-213241", "UI-12345678"]
+
+
 def test_container_session_registry_parses_setup_report_breakdown_table():
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(

@@ -40,7 +40,24 @@ export interface WorkspaceSummary {
   changed: number
   activeSession?: string | null
   latestSession?: string | null
+  sessions?: ExecutionSessionSummary[]
   updated: string
+}
+
+export interface ExecutionSessionSummary {
+  id: string
+  workspace: string
+  title: string
+  status: string
+  entry: string
+  start: string
+  finish?: string | null
+  duration: string
+  build: string
+  test: TestSummary
+  report: string
+  files: number
+  evidence: number
 }
 
 export interface DashboardResponse {

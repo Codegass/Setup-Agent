@@ -53,16 +53,13 @@ class ContainerSessionRegistry:
     def list_workspace_sessions(self, workspace: WorkspaceSummary) -> list[ExecutionSessionSummary]:
         orchestrator = self._orchestrator(workspace.id)
         raw = _read_container_file(orchestrator, SESSION_INDEX_PATH)
-        if raw is None:
-            return _legacy_session_summaries(
-                orchestrator, workspace.id
-            ) or _setup_artifact_summaries(orchestrator, workspace.id)
-
-        rows = parse_session_index(raw, workspace.id)
-        return (
-            rows
-            or _legacy_session_summaries(orchestrator, workspace.id)
-            or _setup_artifact_summaries(orchestrator, workspace.id)
+        rows = parse_session_index(raw, workspace.id) if raw is not None else []
+        return _merge_session_summaries(
+            [
+                *_setup_artifact_summaries(orchestrator, workspace.id),
+                *_legacy_session_summaries(orchestrator, workspace.id),
+                *rows,
+            ]
         )
 
     def get_session_detail(self, session_id: str) -> ExecutionSessionDetail:
@@ -374,6 +371,20 @@ def _setup_artifact_summaries(
     if item is None:
         return []
     return [_session_summary(item, workspace_id)]
+
+
+def _merge_session_summaries(
+    rows: list[ExecutionSessionSummary],
+) -> list[ExecutionSessionSummary]:
+    merged: dict[str, ExecutionSessionSummary] = {}
+    for row in rows:
+        merged[row.id] = row
+    return sorted(merged.values(), key=_session_sort_key)
+
+
+def _session_sort_key(row: ExecutionSessionSummary) -> tuple[str, str]:
+    timestamp = _normalize_timestamp(row.finish or row.start)
+    return (timestamp or row.finish or row.start or "", row.id)
 
 
 def _setup_artifact_item(orchestrator: Any, workspace_id: str) -> dict[str, Any] | None:

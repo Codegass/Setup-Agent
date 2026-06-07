@@ -103,6 +103,7 @@ class ReadModelBuilder:
                 "changed": latest.files,
                 "active_session": active.id if active is not None else None,
                 "latest_session": latest.id,
+                "sessions": sessions,
                 "updated": latest.finish or latest.start,
             }
         )

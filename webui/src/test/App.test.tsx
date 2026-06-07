@@ -275,6 +275,88 @@ describe("App", () => {
     expect(screen.getByText("Give me a report of all tests")).toBeInTheDocument()
   })
 
+  it("lists completed setup sessions alongside active workspace tasks", async () => {
+    const mixedDashboard = {
+      ...dashboard,
+      workspaces: [
+        {
+          ...dashboard.workspaces[0],
+          task: "Run formatter tests",
+          activeSession: "UI-12345678",
+          latestSession: "UI-12345678",
+          sessions: [
+            {
+              id: "SETUP-20260606-213241",
+              workspace: "sag-commons-cli",
+              title: "Setup and configure the commons-cli project to be runnable",
+              status: "completed",
+              entry: "CLI",
+              start: "2026-06-06T21:32:41",
+              finish: "2026-06-06T21:35:09",
+              duration: "2m 28s",
+              build: "success",
+              test: { state: "success", pass: 420, fail: 0, skip: 10, total: 430 },
+              report: "ready",
+              files: 6,
+              evidence: 7,
+            },
+            {
+              id: "UI-12345678",
+              workspace: "sag-commons-cli",
+              title: "Run formatter tests",
+              status: "running",
+              entry: "Web UI",
+              start: "2026-06-06T21:48:30",
+              finish: null,
+              duration: "running",
+              build: "none",
+              test: { state: "none", pass: 0, fail: 0, skip: 0, total: 0 },
+              report: "none",
+              files: 0,
+              evidence: 1,
+            },
+          ],
+        },
+      ],
+    }
+    const uiSessionDetail: ExecutionSessionDetail = {
+      ...sessionDetail,
+      id: "UI-12345678",
+      title: "Run formatter tests",
+      status: "running",
+      entry: "Web UI",
+      outcome: "Task is running.",
+    }
+
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+
+      if (url === "/api/workspaces") {
+        return Promise.resolve(jsonResponse(mixedDashboard))
+      }
+
+      if (url === "/api/sessions/UI-12345678") {
+        return Promise.resolve(jsonResponse(uiSessionDetail))
+      }
+
+      return Promise.reject(new Error(`unexpected fetch: ${url}`))
+    })
+
+    render(<App />)
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", {
+        name: /open workspace apache\/commons-cli/i,
+      }))[0],
+    )
+    fireEvent.click(screen.getByRole("button", { name: /sessions/i }))
+
+    expect(await screen.findByText("SETUP-20260606-213241")).toBeInTheDocument()
+    expect(screen.getByText("Setup and configure the commons-cli project to be runnable")).toBeInTheDocument()
+    expect(screen.getByText("UI-12345678")).toBeInTheDocument()
+    expect(screen.getByText("Run formatter tests")).toBeInTheDocument()
+  })
+
   it("does not mount the terminal panel when the workspace container is not running", async () => {
     const stoppedDashboard = {
       ...dashboard,

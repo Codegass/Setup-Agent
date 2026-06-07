@@ -102,9 +102,7 @@ class ActiveBranchSummary(WebModel):
     task: str = ""
     why: str = ""
     memory: list[str] = Field(default_factory=list)
-    last_refs: list[dict[str, str]] = Field(
-        default_factory=list, serialization_alias="lastRefs"
-    )
+    last_refs: list[dict[str, str]] = Field(default_factory=list, serialization_alias="lastRefs")
     pressure: float = 0.0
 
 
@@ -124,6 +122,22 @@ class ReportDocument(WebModel):
     blocks: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class ExecutionSessionSummary(WebModel):
+    id: str
+    workspace: str
+    title: str
+    status: str
+    entry: str
+    start: str
+    finish: str | None = None
+    duration: str
+    build: str
+    test: TestSummary
+    report: str
+    files: int
+    evidence: int
+
+
 class WorkspaceSummary(WebModel):
     id: str
     project: str
@@ -140,23 +154,8 @@ class WorkspaceSummary(WebModel):
     changed: int = 0
     active_session: str | None = Field(default=None, serialization_alias="activeSession")
     latest_session: str | None = Field(default=None, serialization_alias="latestSession")
+    sessions: list[ExecutionSessionSummary] = Field(default_factory=list)
     updated: str = "unknown"
-
-
-class ExecutionSessionSummary(WebModel):
-    id: str
-    workspace: str
-    title: str
-    status: str
-    entry: str
-    start: str
-    finish: str | None = None
-    duration: str
-    build: str
-    test: TestSummary
-    report: str
-    files: int
-    evidence: int
 
 
 class BlockerSummary(WebModel):
