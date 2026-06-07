@@ -64,6 +64,8 @@ def _workspace_exists_via_docker(docker_label: str) -> bool:
     """
 
     try:
+        # Deferred import: pulling in the orchestrator at module import time would
+        # drag Docker client setup into every web test that touches this module.
         from sag.docker_orch.orch import DockerOrchestrator
 
         return DockerOrchestrator(project_name=docker_label).container_exists()
@@ -81,21 +83,21 @@ class LaunchService:
         scheduler: LaunchScheduler | None = None,
         workspace_exists: Callable[[str], bool] | None = None,
     ):
-        self.store = store if store is not None else LaunchQueueStore(DEFAULT_DB_PATH)
-        self.workspace_exists = (
+        self._store = store if store is not None else LaunchQueueStore(DEFAULT_DB_PATH)
+        self._workspace_exists = (
             workspace_exists if workspace_exists is not None else _workspace_exists_via_docker
         )
-        self.scheduler = (
+        self._scheduler = (
             scheduler
             if scheduler is not None
-            else LaunchScheduler(self.store, workspace_exists=self.workspace_exists)
+            else LaunchScheduler(self._store, workspace_exists=self._workspace_exists)
         )
 
     def start(self) -> None:
-        self.scheduler.start()
+        self._scheduler.start()
 
     def stop(self) -> None:
-        self.scheduler.stop()
+        self._scheduler.stop()
 
     def submit_batch(self, request: LaunchBatchRequest) -> dict:
         concurrency = self._validate_concurrency(request.concurrency)
@@ -136,7 +138,7 @@ class LaunchService:
                 )
                 continue
 
-            if self.workspace_exists(docker_label):
+            if self._workspace_exists(docker_label):
                 rejected.append(
                     {
                         "row_index": row_index,
@@ -185,7 +187,7 @@ class LaunchService:
             )
 
         if items:
-            self.store.enqueue_batch(
+            self._store.enqueue_batch(
                 LaunchBatch(
                     id=batch_id,
                     created_at=created_at,
@@ -197,7 +199,7 @@ class LaunchService:
                 ),
                 items,
             )
-            self.scheduler.wake()
+            self._scheduler.wake()
 
         return {
             "batch_id": batch_id if items else None,
@@ -209,8 +211,8 @@ class LaunchService:
     def queue_state(self) -> dict:
         return {
             "default_concurrency": default_concurrency(),
-            "summary": self.store.summary_counts(),
-            "batches": self.store.list_batches(),
+            "summary": self._store.summary_counts(),
+            "batches": self._store.list_batches(),
         }
 
     def _validate_concurrency(self, value: int | None) -> int:

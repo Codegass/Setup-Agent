@@ -33,6 +33,8 @@ class FakeScheduler:
 
 
 def make_service(tmp_path, existing=(), cpu_count=8, monkeypatch=None):
+    if monkeypatch is not None:
+        monkeypatch.setattr("sag.web.launch_service.os.cpu_count", lambda: cpu_count)
     store = LaunchQueueStore(tmp_path / "launch_queue.sqlite3")
     scheduler = FakeScheduler()
     service = LaunchService(
@@ -40,8 +42,6 @@ def make_service(tmp_path, existing=(), cpu_count=8, monkeypatch=None):
         scheduler=scheduler,
         workspace_exists=lambda label: label in existing,
     )
-    if monkeypatch is not None:
-        monkeypatch.setattr("sag.web.launch_service.os.cpu_count", lambda: cpu_count)
     return service, store, scheduler
 
 
@@ -254,3 +254,21 @@ def test_queue_state_on_empty_store(tmp_path):
 
     assert state["batches"] == []
     assert sum(state["summary"].values()) == 0
+
+
+def test_concurrency_at_cpu_count_is_accepted(tmp_path, monkeypatch):
+    service, _, _ = make_service(tmp_path, cpu_count=4, monkeypatch=monkeypatch)
+
+    outcome = service.submit_batch(request_for({"repo_url": REPO}, concurrency=4))
+
+    assert outcome["concurrency"] == 4
+
+
+def test_start_and_stop_delegate_to_scheduler(tmp_path):
+    service, _, scheduler = make_service(tmp_path)
+
+    service.start()
+    service.stop()
+
+    assert scheduler.started
+    assert scheduler.stopped
