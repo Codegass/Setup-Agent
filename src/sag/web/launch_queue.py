@@ -189,6 +189,113 @@ class LaunchQueueStore:
                 )
             return batches
 
+    def claim_next(self, global_cap: int, now: str) -> LaunchItem | None:
+        """Atomically claim the oldest queued item that has capacity.
+
+        Honors each batch's stored concurrency and the global hard cap.
+        Returns the claimed item already marked ``launching``, or ``None``.
+        """
+
+        with contextlib.closing(self._connect()) as conn:
+            claimed: LaunchItem | None = None
+            with self._transaction(conn):
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM launch_items"
+                    " WHERE status IN ('launching', 'running')"
+                ).fetchone()[0]
+                if active < global_cap:
+                    row = conn.execute(
+                        "SELECT i.* FROM launch_items i"
+                        " JOIN launch_batches b ON b.id = i.batch_id"
+                        " WHERE i.status = 'queued'"
+                        "   AND ("
+                        "     SELECT COUNT(*) FROM launch_items a"
+                        "     WHERE a.batch_id = i.batch_id"
+                        "       AND a.status IN ('launching', 'running')"
+                        "   ) < b.concurrency"
+                        " ORDER BY i.created_at, i.row_index"
+                        " LIMIT 1"
+                    ).fetchone()
+                    if row is not None:
+                        conn.execute(
+                            "UPDATE launch_items"
+                            " SET status = 'launching', started_at = ?"
+                            " WHERE id = ?",
+                            (now, row["id"]),
+                        )
+                        claimed = replace(
+                            _item_from_row(row), status="launching", started_at=now
+                        )
+            return claimed
+
+    def mark_running(self, item_id: str, pid: int, now: str) -> None:
+        with contextlib.closing(self._connect()) as conn:
+            with self._transaction(conn):
+                conn.execute(
+                    "UPDATE launch_items"
+                    " SET status = 'running', pid = ?, started_at = COALESCE(started_at, ?)"
+                    " WHERE id = ?",
+                    (pid, now, item_id),
+                )
+
+    def mark_completed(self, item_id: str, exit_code: int, now: str) -> None:
+        self._finish(item_id, "completed", exit_code=exit_code, error=None, now=now)
+
+    def mark_failed(
+        self, item_id: str, error: str, now: str, exit_code: int | None = None
+    ) -> None:
+        self._finish(item_id, "failed", exit_code=exit_code, error=error, now=now)
+
+    def unfinished_items(self) -> list[LaunchItem]:
+        with contextlib.closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM launch_items"
+                " WHERE status IN ('launching', 'running')"
+                " ORDER BY created_at, row_index"
+            ).fetchall()
+            return [_item_from_row(row) for row in rows]
+
+    def _finish(
+        self,
+        item_id: str,
+        status: str,
+        exit_code: int | None,
+        error: str | None,
+        now: str,
+    ) -> None:
+        with contextlib.closing(self._connect()) as conn:
+            with self._transaction(conn):
+                conn.execute(
+                    "UPDATE launch_items"
+                    " SET status = ?, exit_code = ?, error = ?, finished_at = ?"
+                    " WHERE id = ?",
+                    (status, exit_code, error, now, item_id),
+                )
+                batch_row = conn.execute(
+                    "SELECT batch_id FROM launch_items WHERE id = ?", (item_id,)
+                ).fetchone()
+                if batch_row is not None:
+                    self._refresh_batch_status(conn, batch_row["batch_id"])
+
+    def _refresh_batch_status(self, conn: sqlite3.Connection, batch_id: str) -> None:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM launch_items"
+            " WHERE batch_id = ? AND status IN ('queued', 'launching', 'running')",
+            (batch_id,),
+        ).fetchone()[0]
+        if pending:
+            status = "running"
+        else:
+            failed = conn.execute(
+                "SELECT COUNT(*) FROM launch_items"
+                " WHERE batch_id = ? AND status = 'failed'",
+                (batch_id,),
+            ).fetchone()[0]
+            status = "failed" if failed else "completed"
+        conn.execute(
+            "UPDATE launch_batches SET status = ? WHERE id = ?", (status, batch_id)
+        )
+
 
 def _item_payload(row: sqlite3.Row) -> dict:
     return {
