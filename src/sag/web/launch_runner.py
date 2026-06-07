@@ -76,7 +76,11 @@ class LaunchScheduler:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        self.reconcile_stale()
+        try:
+            self.reconcile_stale()
+        except Exception:
+            # A failed reconcile must not leave the UI without a scheduler.
+            logger.exception("Stale launch reconcile failed")
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="sag-launch-scheduler"

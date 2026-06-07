@@ -175,6 +175,8 @@ class FakeLaunchService:
         self.outcome = outcome
         self.error = error
         self.requests = []
+        self.started = False
+        self.stopped = False
 
     def submit_batch(self, request):
         self.requests.append(request)
@@ -196,10 +198,10 @@ class FakeLaunchService:
         }
 
     def start(self):
-        pass
+        self.started = True
 
     def stop(self):
-        pass
+        self.stopped = True
 
 
 def launch_client(service):
@@ -320,3 +322,13 @@ def test_get_project_launches_returns_queue_state():
     assert body["default_concurrency"] == 3
     assert body["summary"]["completed"] == 2
     assert body["batches"] == []
+
+
+def test_lifespan_starts_and_stops_launch_service():
+    service = FakeLaunchService()
+
+    with launch_client(service):
+        assert service.started
+        assert not service.stopped
+
+    assert service.stopped

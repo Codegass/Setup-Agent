@@ -268,3 +268,19 @@ def test_queued_items_from_previous_run_resume(tmp_path):
     scheduler.launch_ready()
 
     assert len(spawner.calls) == 1
+
+
+def test_start_survives_reconcile_failure(tmp_path):
+    store = make_store(tmp_path)
+    scheduler = LaunchScheduler(store, spawn=FakeSpawner(), global_cap=8)
+
+    def boom():
+        raise RuntimeError("reconcile boom")
+
+    scheduler.reconcile_stale = boom
+    scheduler.start()
+    try:
+        assert scheduler._thread is not None
+        assert scheduler._thread.is_alive()
+    finally:
+        scheduler.stop()
