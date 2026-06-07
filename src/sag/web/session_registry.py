@@ -715,6 +715,7 @@ def _report_document(item: dict[str, Any]) -> ReportDocument | None:
 
 
 def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
+    max_blocks = 200
     blocks: list[dict[str, Any]] = []
     lines = report_raw.splitlines()
     index = 0
@@ -727,11 +728,13 @@ def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
 
         if text.startswith("#"):
             level = min(len(text) - len(text.lstrip("#")), 2)
-            blocks.append({"type": f"h{level}", "text": text.lstrip("#").strip()})
+            blocks.append(
+                {"type": f"h{level}", "text": _clean_inline_markdown(text.lstrip("#").strip())}
+            )
         elif text.lower().startswith("**generated:**"):
-            blocks.append({"type": "meta", "text": text.strip("*")})
+            blocks.append({"type": "meta", "text": _clean_inline_markdown(text)})
         elif text.lower().startswith("**result:**"):
-            result = text.removeprefix("**Result:**").strip()
+            result = _clean_inline_markdown(text.removeprefix("**Result:**").strip())
             blocks.append(
                 {
                     "type": "status",
@@ -742,8 +745,7 @@ def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
         elif text.startswith("|") or text.startswith("\u2502"):
             table_lines: list[str] = []
             while index < len(lines) and (
-                lines[index].strip().startswith("|")
-                or lines[index].strip().startswith("\u2502")
+                lines[index].strip().startswith("|") or lines[index].strip().startswith("\u2502")
             ):
                 table_lines.append(lines[index])
                 index += 1
@@ -752,9 +754,9 @@ def _report_blocks(report_raw: str) -> list[dict[str, Any]]:
                 blocks.append({"type": "table", "rows": rows})
             continue
         elif not text.startswith("```"):
-            blocks.append({"type": "p", "text": text})
+            blocks.append({"type": "p", "text": _clean_inline_markdown(text)})
 
-        if len(blocks) >= 12:
+        if len(blocks) >= max_blocks:
             break
         index += 1
     return blocks
@@ -790,7 +792,14 @@ def _report_rows(markdown: str) -> list[list[str]]:
 
 
 def _strip_markdown_cell(value: str) -> str:
-    return value.strip().strip("*").strip()
+    return _clean_inline_markdown(value)
+
+
+def _clean_inline_markdown(value: str) -> str:
+    text = value.strip()
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text.strip().strip("*").strip()
 
 
 def _is_table_separator(value: str) -> bool:

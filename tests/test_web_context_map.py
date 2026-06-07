@@ -97,6 +97,55 @@ def test_context_map_builder_uses_real_sag_in_progress_description_fields(tmp_pa
     assert ctx.active_branch.task == "Run integration tests"
 
 
+def test_context_map_builder_enriches_task_rows_from_branch_context(tmp_path: Path):
+    contexts = tmp_path / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    (contexts / "trunk_commons.json").write_text(
+        json.dumps(
+            {
+                "goal": "Set up commons-cli",
+                "todo_list": [
+                    {
+                        "id": "task_4",
+                        "description": "Compile project using Maven",
+                        "status": "completed",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (contexts / "task_4.json").write_text(
+        json.dumps(
+            {
+                "task_description": "Compile project using Maven",
+                "previous_task_summary": "Previous task: Java 8 verified.",
+                "history": [
+                    {
+                        "type": "action",
+                        "tool_name": "maven",
+                        "success": False,
+                        "output": "Maven 3.8.7 below requirement.\n... [Full output ref: output_old_maven] ...",
+                    },
+                    {
+                        "type": "action",
+                        "tool_name": "maven",
+                        "success": True,
+                        "output": "Maven Build Summary:\nBUILD SUCCESS\n... [Full output ref: output_build_success] ...",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = ContextMapBuilder(contexts).build()
+
+    assert ctx.tasks[0].summary.startswith("Previous task: Java 8 verified.")
+    assert "maven succeeded" in ctx.tasks[0].summary
+    assert ctx.tasks[0].refs == ["output_old_maven", "output_build_success"]
+
+
 def test_context_map_builder_handles_non_object_trunk_json(tmp_path: Path):
     for index, trunk_root in enumerate((["not", "a", "dict"], "not a dict"), start=1):
         contexts = tmp_path / f"case_{index}" / ".setup_agent" / "contexts"

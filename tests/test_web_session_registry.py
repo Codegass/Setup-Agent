@@ -438,3 +438,42 @@ def test_container_session_registry_recovers_setup_logs_from_host_session(tmp_pa
 
     assert detail is not None
     assert detail.logs == ["first line", "second line"]
+
+
+def test_container_session_registry_keeps_complete_setup_report_blocks():
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "goal": "Setup commons-cli",
+                "todo_list": [],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": "\n".join(
+            [
+                "# Project Setup Report",
+                "**Generated:** 2026-06-06 21:35:09",
+                "**Result:** SUCCESS",
+                *[f"### Section {index}" for index in range(1, 18)],
+                "### Final Notes",
+                "The setup report should not be truncated.",
+            ]
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(
+        workspace_summary(),
+        "SETUP-20260606-213241",
+    )
+
+    assert detail is not None
+    assert detail.report_doc is not None
+    assert any(block.get("text") == "Final Notes" for block in detail.report_doc.blocks)
+    assert any(
+        block.get("text") == "The setup report should not be truncated."
+        for block in detail.report_doc.blocks
+    )

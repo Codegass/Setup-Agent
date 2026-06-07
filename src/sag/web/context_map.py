@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -74,16 +75,106 @@ class ContextMapBuilder:
 
     def _task(self, item: dict[str, Any], index: int) -> ContextTask:
         task_id = str(item.get("id") or item.get("task_id") or f"T{index}")
+        branch_data = self._branch_data(task_id)
         return ContextTask(
             id=task_id,
             title=str(
-                item.get("task") or item.get("title") or item.get("description") or "Untitled task"
+                item.get("task")
+                or item.get("title")
+                or item.get("description")
+                or branch_data.get("task_description")
+                or branch_data.get("task")
+                or "Untitled task"
             ),
             status=str(item.get("status") or "pending"),
-            summary=str(item.get("summary") or ""),
-            refs=[str(ref) for ref in item.get("refs", [])],
+            summary=str(item.get("summary") or self._branch_summary(branch_data) or ""),
+            refs=[
+                *[str(ref) for ref in item.get("refs", [])],
+                *self._branch_refs(branch_data),
+            ],
             recovered=bool(item.get("recovered", False)),
         )
+
+    def _branch_path(self, task_id: str) -> Path:
+        filename = f"{task_id}.json" if task_id.startswith("task_") else f"task_{task_id}.json"
+        return self.contexts_dir / filename
+
+    def _branch_data(self, task_id: str) -> dict[str, Any]:
+        return self._read_json(self._branch_path(task_id))
+
+    def _branch_summary(self, data: dict[str, Any]) -> str:
+        parts: list[str] = []
+        previous = str(data.get("previous_task_summary") or "").strip()
+        if previous:
+            parts.append(previous)
+
+        action = self._latest_history_action(data)
+        if action is not None:
+            tool_name = str(action.get("tool_name") or "action")
+            outcome = "succeeded" if action.get("success") is True else "failed"
+            output = self._compact_text(str(action.get("output") or ""))
+            parts.append(
+                f"{tool_name} {outcome}: {output}" if output else f"{tool_name} {outcome}."
+            )
+
+        if parts:
+            return "\n".join(parts)
+
+        thought = self._latest_history_entry(data, "thought")
+        if thought is not None:
+            return self._compact_text(str(thought.get("content") or ""))
+
+        return ""
+
+    def _latest_history_action(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        history = data.get("history")
+        if not isinstance(history, list):
+            return None
+        return next(
+            (
+                item
+                for item in reversed(history)
+                if isinstance(item, dict) and item.get("type") == "action"
+            ),
+            None,
+        )
+
+    def _latest_history_entry(
+        self,
+        data: dict[str, Any],
+        entry_type: str,
+    ) -> dict[str, Any] | None:
+        history = data.get("history")
+        if not isinstance(history, list):
+            return None
+        return next(
+            (
+                item
+                for item in reversed(history)
+                if isinstance(item, dict) and item.get("type") == entry_type
+            ),
+            None,
+        )
+
+    def _branch_refs(self, data: dict[str, Any]) -> list[str]:
+        history = data.get("history")
+        if not isinstance(history, list):
+            return []
+
+        refs: list[str] = []
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            for match in re.findall(
+                r"Full output ref:\s*([A-Za-z0-9_-]+)", str(item.get("output") or "")
+            ):
+                if match not in refs:
+                    refs.append(match)
+        return refs
+
+    def _compact_text(self, value: str, limit: int = 220) -> str:
+        text = " ".join(value.split())
+        return text if len(text) <= limit else f"{text[: limit - 1].rstrip()}..."
 
     def _is_active_status(self, status: str) -> bool:
         return status.strip().lower() in {"active", "running", "in_progress"}
@@ -126,9 +217,7 @@ class ContextMapBuilder:
     def _active_branch(self, task_id: str | None) -> ActiveBranchSummary:
         if task_id is None:
             return ActiveBranchSummary()
-        filename = f"{task_id}.json" if task_id.startswith("task_") else f"task_{task_id}.json"
-        branch_path = self.contexts_dir / filename
-        data = self._read_json(branch_path)
+        data = self._branch_data(task_id)
         return ActiveBranchSummary(
             task=str(data.get("task") or ""),
             why=str(data.get("why") or ""),

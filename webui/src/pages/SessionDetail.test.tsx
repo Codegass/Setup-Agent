@@ -194,6 +194,52 @@ describe("SessionDetail", () => {
     expect(screen.queryByText("Active Branch Focus")).not.toBeInTheDocument()
   })
 
+  it("keeps branch task context details expandable", () => {
+    render(
+      <SessionDetail
+        detail={{
+          ...detail,
+          context: {
+            trunk: {
+              goal: "Setup commons-cli",
+              state: "partial",
+              progress: { done: 1, total: 1 },
+              summary: "",
+            },
+            tasks: [
+              {
+                id: "task_4",
+                title: "Compile project using Maven",
+                status: "completed",
+                summary: "Previous task: Java 8 verified.\nmaven succeeded: BUILD SUCCESS",
+                refs: ["output_build_success"],
+                recovered: false,
+              },
+            ],
+            activeBranch: {
+              task: "",
+              why: "",
+              memory: [],
+              lastRefs: [],
+              pressure: 0,
+            },
+            debug: {},
+          },
+        }}
+        initialTab="Context"
+        onBack={() => {}}
+        onNewTask={() => {}}
+      />,
+    )
+
+    expect(screen.queryByText(/maven succeeded/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /task_4 compile project using maven/i }))
+
+    expect(screen.getByText(/maven succeeded/)).toBeInTheDocument()
+    expect(screen.getByText("output_build_success")).toBeInTheDocument()
+  })
+
   it("starts a new task from the current session id", () => {
     const onNewTask = vi.fn()
 
