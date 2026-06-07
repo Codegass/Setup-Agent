@@ -51,7 +51,7 @@ describe("LaunchSetupsDialog", () => {
 
     expect(screen.getByLabelText("Repository URL row 1")).toHaveValue("")
     expect(screen.getByLabelText("Name row 1")).toHaveValue("")
-    expect(screen.getByLabelText("Ref row 1")).toHaveValue("")
+    expect(screen.getByLabelText("Version row 1")).toHaveValue("")
     expect(screen.getByLabelText("Goal row 1")).toHaveValue("")
     expect(screen.getByLabelText("Record row 1")).not.toBeChecked()
     expect(screen.getByLabelText("Concurrency")).toHaveValue(2)
@@ -81,11 +81,11 @@ describe("LaunchSetupsDialog", () => {
     expect(screen.getByLabelText("Repository URL row 1")).toHaveValue(
       "https://github.com/apache/commons-cli.git",
     )
-    expect(screen.getByLabelText("Ref row 1")).toHaveValue("rel/commons-cli-1.11.0")
+    expect(screen.getByLabelText("Version row 1")).toHaveValue("rel/commons-cli-1.11.0")
     expect(screen.getByLabelText("Repository URL row 2")).toHaveValue(
       "https://github.com/apache/dubbo.git",
     )
-    expect(screen.getByLabelText("Ref row 2")).toHaveValue("dubbo-3.2.19")
+    expect(screen.getByLabelText("Version row 2")).toHaveValue("dubbo-3.2.19")
   })
 
   it("submits trimmed rows and reports the result", async () => {
@@ -94,7 +94,7 @@ describe("LaunchSetupsDialog", () => {
     fireEvent.change(screen.getByLabelText("Repository URL row 1"), {
       target: { value: " https://github.com/apache/commons-cli.git " },
     })
-    fireEvent.change(screen.getByLabelText("Ref row 1"), {
+    fireEvent.change(screen.getByLabelText("Version row 1"), {
       target: { value: "v1.0" },
     })
     fireEvent.click(screen.getByLabelText("Record row 1"))
@@ -151,7 +151,7 @@ describe("LaunchSetupsDialog", () => {
   it("flags non-empty rows that are missing a repo url", async () => {
     const { onSubmit } = renderDialog()
 
-    fireEvent.change(screen.getByLabelText("Ref row 1"), {
+    fireEvent.change(screen.getByLabelText("Version row 1"), {
       target: { value: "v1.0" },
     })
     fireEvent.click(screen.getByRole("button", { name: "Launch setups" }))
@@ -183,7 +183,16 @@ describe("LaunchSetupsDialog", () => {
     expect(screen.getByLabelText("Repository URL row 1")).toHaveValue(
       "https://github.com/apache/dubbo.git",
     )
-    expect(screen.getByLabelText("Ref row 1")).toHaveValue("dubbo-3.2.19")
+    expect(screen.getByLabelText("Version row 1")).toHaveValue("dubbo-3.2.19")
     expect(screen.queryByLabelText("Repository URL row 2")).not.toBeInTheDocument()
+  })
+
+  it("explains accepted version formats via the info tooltip", () => {
+    renderDialog()
+
+    expect(screen.getByLabelText("Version help")).toHaveAttribute(
+      "title",
+      expect.stringContaining("commit hash"),
+    )
   })
 })

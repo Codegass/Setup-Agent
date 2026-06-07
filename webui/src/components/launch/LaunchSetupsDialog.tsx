@@ -1,6 +1,6 @@
 import { useState } from "react"
 import type { ClipboardEvent } from "react"
-import { Plus, Rocket, X } from "lucide-react"
+import { Info, Plus, Rocket, X } from "lucide-react"
 
 import type { LaunchBatchRequestBody, LaunchBatchResult } from "@/api/types"
 import { Button } from "@/components/common/Button"
@@ -24,6 +24,9 @@ interface LaunchSetupsDialogProps {
 
 const cellClass =
   "w-full rounded-md border border-slate-200 px-2 py-1.5 font-mono text-[12px] text-slate-700 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
+
+const VERSION_HELP =
+  "Branch, release tag, or commit hash (short or full), e.g. rel/commons-cli-1.11.0 or 1a2b3c4. Leave empty for the default branch."
 
 function isRowEmpty(row: LaunchRowDraft): boolean {
   return (
@@ -171,8 +174,8 @@ export function LaunchSetupsDialog({
           <DialogTitle>Launch setups</DialogTitle>
           <DialogDescription>
             One row per repository. Each accepted row runs sag project in its own
-            process. Paste multiple lines (repo URL, optionally followed by a ref)
-            into a repository cell to fill the grid.
+            process. Paste multiple lines (repo URL, optionally followed by a
+            version) into a repository cell to fill the grid.
           </DialogDescription>
         </DialogHeader>
 
@@ -200,12 +203,21 @@ export function LaunchSetupsDialog({
           </div>
 
           <div className="mt-3 grid grid-cols-[2.2fr_1fr_1.2fr_1.6fr_56px_36px] items-center gap-2">
-            {["Repo URL", "Name", "Ref", "Goal", "Record", ""].map((header) => (
+            {["Repo URL", "Name", "Version", "Goal", "Record", ""].map((header) => (
               <div
                 key={header || "actions"}
-                className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400"
+                className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400"
               >
                 {header}
+                {header === "Version" ? (
+                  <span
+                    aria-label="Version help"
+                    className="cursor-help text-slate-300 hover:text-slate-500"
+                    title={VERSION_HELP}
+                  >
+                    <Info aria-hidden="true" size={12} />
+                  </span>
+                ) : null}
               </div>
             ))}
             {rows.map((row, index) => (
@@ -288,10 +300,11 @@ function RowCells({
         value={row.name}
       />
       <input
-        aria-label={`Ref row ${rowLabel}`}
+        aria-label={`Version row ${rowLabel}`}
         className={cellClass}
         onChange={(event) => onChange({ ref: event.target.value })}
-        placeholder="optional"
+        placeholder="branch, tag, or commit"
+        title={VERSION_HELP}
         value={row.ref}
       />
       <input
