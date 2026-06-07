@@ -170,4 +170,20 @@ describe("LaunchSetupsDialog", () => {
     ).toBeInTheDocument()
     expect(onSubmit).not.toHaveBeenCalled()
   })
+
+  it("fills the ref column when pasting a single repo_url ref line", () => {
+    renderDialog()
+
+    fireEvent.paste(screen.getByLabelText("Repository URL row 1"), {
+      clipboardData: {
+        getData: () => "https://github.com/apache/dubbo.git dubbo-3.2.19",
+      },
+    })
+
+    expect(screen.getByLabelText("Repository URL row 1")).toHaveValue(
+      "https://github.com/apache/dubbo.git",
+    )
+    expect(screen.getByLabelText("Ref row 1")).toHaveValue("dubbo-3.2.19")
+    expect(screen.queryByLabelText("Repository URL row 2")).not.toBeInTheDocument()
+  })
 })

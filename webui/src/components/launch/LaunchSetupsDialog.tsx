@@ -65,7 +65,8 @@ export function LaunchSetupsDialog({
 
   const handleRepoPaste = (index: number, event: ClipboardEvent<HTMLInputElement>) => {
     const text = event.clipboardData.getData("text")
-    if (!text.includes("\n")) {
+    if (!/\s/.test(text.trim())) {
+      // A plain URL: let the native paste handle it.
       return
     }
     event.preventDefault()

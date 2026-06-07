@@ -62,5 +62,14 @@ export async function submitProjectBatch(
     return { ...body, status: response.status }
   }
 
-  throw new Error(`${response.status} ${response.statusText}`)
+  let detail = ""
+  try {
+    const body = (await response.json()) as { detail?: unknown }
+    if (typeof body.detail === "string") {
+      detail = body.detail
+    }
+  } catch {
+    // Non-JSON error body; fall back to the status line.
+  }
+  throw new Error(detail || `${response.status} ${response.statusText}`)
 }

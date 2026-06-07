@@ -190,4 +190,17 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith("/api/project-launches")
     expect(queue).toEqual(payload)
   })
+
+  it("surfaces server validation detail on 422", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(
+        { detail: "concurrency must be an integer between 1 and 8" },
+        { status: 422, statusText: "Unprocessable Entity" },
+      ),
+    )
+
+    await expect(
+      submitProjectBatch({ projects: [{ repo_url: "x" }] }),
+    ).rejects.toThrow("concurrency must be an integer between 1 and 8")
+  })
 })
