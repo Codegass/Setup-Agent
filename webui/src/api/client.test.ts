@@ -162,8 +162,7 @@ describe("api client", () => {
       projects: [{ repo_url: "https://github.com/x/existing.git" }],
     })
 
-    expect(result.status).toBe(409)
-    expect(result.rejected[0].message).toContain("already exists")
+    expect(result).toEqual({ status: 409, ...body })
   })
 
   it("throws on unexpected batch submit failures", async () => {
@@ -177,17 +176,18 @@ describe("api client", () => {
   })
 
   it("fetches the launch queue", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      jsonResponse({
-        default_concurrency: 4,
-        summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },
-        batches: [],
-      }),
-    )
+    const payload = {
+      default_concurrency: 4,
+      summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },
+      batches: [],
+    }
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(payload))
 
     const queue = await fetchLaunchQueue()
 
     expect(fetchMock).toHaveBeenCalledWith("/api/project-launches")
-    expect(queue.default_concurrency).toBe(4)
+    expect(queue).toEqual(payload)
   })
 })

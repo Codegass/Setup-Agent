@@ -59,7 +59,7 @@ export async function submitProjectBatch(
 
   if (response.status === 202 || response.status === 409) {
     const body = (await response.json()) as LaunchBatchResponse
-    return { status: response.status, ...body }
+    return { ...body, status: response.status }
   }
 
   throw new Error(`${response.status} ${response.statusText}`)
