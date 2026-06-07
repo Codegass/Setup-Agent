@@ -160,7 +160,7 @@ export function LaunchSetupsDialog({
     <Dialog
       open
       onOpenChange={(open) => {
-        if (!open) {
+        if (!open && !submitting) {
           onClose()
         }
       }}
@@ -169,12 +169,13 @@ export function LaunchSetupsDialog({
         <DialogHeader className="border-b border-slate-100 px-4 py-3">
           <DialogTitle>Launch setups</DialogTitle>
           <DialogDescription>
-            One row per repository. Each accepted row runs `sag project` in its own
+            One row per repository. Each accepted row runs sag project in its own
             process. Paste multiple lines (repo URL, optionally followed by a ref)
             into a repository cell to fill the grid.
           </DialogDescription>
         </DialogHeader>
 
+        <form onSubmit={(event) => { event.preventDefault(); void handleSubmit() }}>
         <div className="max-h-[60vh] overflow-y-auto p-4">
           <div className="flex items-center gap-2">
             <label
@@ -239,11 +240,12 @@ export function LaunchSetupsDialog({
           <Button disabled={submitting} onClick={onClose} type="button" variant="outline">
             Cancel
           </Button>
-          <Button disabled={submitting} onClick={() => void handleSubmit()} type="button">
+          <Button disabled={submitting} type="submit">
             <Rocket size={13} />
             {submitting ? "Launching" : "Launch setups"}
           </Button>
         </DialogFooter>
+        </form>
       </DialogContent>
     </Dialog>
   )
@@ -270,6 +272,7 @@ function RowCells({
     <>
       <input
         aria-label={`Repository URL row ${rowLabel}`}
+        autoFocus={index === 0}
         className={cellClass}
         onChange={(event) => onChange({ repoUrl: event.target.value })}
         onPaste={onRepoPaste}

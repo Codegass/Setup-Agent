@@ -159,4 +159,15 @@ describe("LaunchSetupsDialog", () => {
     expect(await screen.findByText(/Repository URL is required/)).toBeInTheDocument()
     expect(onSubmit).not.toHaveBeenCalled()
   })
+
+  it("blocks submit when no row has any input", async () => {
+    const { onSubmit } = renderDialog()
+
+    fireEvent.click(screen.getByRole("button", { name: "Launch setups" }))
+
+    expect(
+      await screen.findByText(/Add at least one repository URL/),
+    ).toBeInTheDocument()
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
 })
