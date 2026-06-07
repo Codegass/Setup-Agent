@@ -43,6 +43,7 @@ def make_builder():
 def test_initial_prompt_preserves_repository_and_tool_markers():
     prompt = make_builder().build_initial_system_prompt(
         repository_url="https://example.test/repo.git",
+        repository_ref=None,
         tool_calling_enabled=True,
     )
 
@@ -51,6 +52,28 @@ def test_initial_prompt_preserves_repository_and_tool_markers():
     assert "dummy: Dummy tool for prompt tests" in prompt
     assert "Usage: dummy()" in prompt
     assert "RESPONSE FORMAT" in prompt
+
+
+def test_initial_prompt_includes_repository_ref_when_present():
+    prompt = make_builder().build_initial_system_prompt(
+        repository_url="https://example.test/repo.git",
+        repository_ref="rel/commons-cli-1.11.0",
+        tool_calling_enabled=True,
+    )
+
+    assert "Repository ref: rel/commons-cli-1.11.0" in prompt
+    assert 'ref="rel/commons-cli-1.11.0"' in prompt
+
+
+def test_initial_prompt_omits_repository_ref_when_absent():
+    prompt = make_builder().build_initial_system_prompt(
+        repository_url="https://example.test/repo.git",
+        repository_ref=None,
+        tool_calling_enabled=True,
+    )
+
+    assert "Repository ref:" not in prompt
+    assert 'ref="' not in prompt
 
 
 def test_next_prompt_preserves_stuck_guidance_and_repository_url():
@@ -63,6 +86,7 @@ def test_next_prompt_preserves_stuck_guidance_and_repository_url():
     prompt = make_builder().build_next_prompt(
         steps=steps,
         repository_url="https://example.test/repo.git",
+        repository_ref=None,
         tool_calling_enabled=True,
         successful_states={"maven_success": False, "cloned_repos": set()},
     )

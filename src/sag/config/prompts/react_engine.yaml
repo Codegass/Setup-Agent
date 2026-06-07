@@ -9,6 +9,7 @@ initial_system:
   repository_url_notice: |
     🚨 IMPORTANT PROJECT INFORMATION 🚨
     Repository URL: {repository_url}
+    {repository_ref_notice}
     This URL is ALREADY PROVIDED - DO NOT ASK FOR IT AGAIN!
     Your first action should be to clone this repository using the project_setup tool.
   context_management: |
@@ -96,6 +97,7 @@ initial_system:
 
     EXAMPLE FLOW:
     1. project_setup(action="clone", repository_url="...", target_directory="my-project")
+       If a repository ref is provided, include that ref parameter in the clone call.
     2. ✅ Clone successful → IMMEDIATELY call project_analyzer(action="analyze", project_path="/workspace/my-project")
     3. 📋 Your generic tasks get replaced with smart tasks like "Setup Maven Java 17 environment", "Build with Maven", etc.
     4. Execute the intelligent plan
@@ -287,7 +289,8 @@ initial_system:
     - Prefer direct verification over broad project setup workflow.
   repository_url_reminder: |
     📂 REPOSITORY INFO: The target repository is {repository_url}
-    🔧 Use this URL when cloning: project_setup(action="clone", repository_url="{repository_url}")
+    {repository_ref_notice}
+    🔧 Use this URL when cloning: project_setup(action="clone", repository_url="{repository_url}"{repository_ref_clone_args})
   continuous_cycle_reminder: |
     🔄 REMEMBER THE CONTINUOUS CYCLE:
        manage_context(action="get_info") → manage_context(action="start_task") → [do work] → manage_context(action="complete_with_results") → BACK TO get_info → start next task → [repeat]
@@ -321,6 +324,7 @@ next_prompt:
     For diagnostics, run the exact diagnostic command requested and stop after verified tool output.
   stuck_repository_url_guidance: |
     The repository URL is already set: {repository_url}
+    {repository_ref_notice}
 
     USE CORRECT TASK MANAGEMENT FLOW:
     1. FIRST check context status:
@@ -330,7 +334,7 @@ next_prompt:
        Call manage_context with action="start_task" and task_id="task_1"
 
     3. IN TASK CONTEXT, clone the repository:
-       Call project_setup with action="clone" and repository_url="{repository_url}"
+       Call project_setup with action="clone", repository_url="{repository_url}"{repository_ref_clone_args}
 
     4. IMMEDIATELY after clone success:
        Call project_analyzer with action="analyze"
