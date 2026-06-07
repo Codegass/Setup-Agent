@@ -8,7 +8,6 @@ import sqlite3
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-ACTIVE_STATUSES = ("launching", "running")
 ALL_STATUSES = ("queued", "launching", "running", "completed", "failed")
 
 _SCHEMA = """
@@ -213,7 +212,7 @@ class LaunchQueueStore:
                         "     WHERE a.batch_id = i.batch_id"
                         "       AND a.status IN ('launching', 'running')"
                         "   ) < b.concurrency"
-                        " ORDER BY i.created_at, i.row_index"
+                        " ORDER BY i.created_at, i.row_index, i.id"
                         " LIMIT 1"
                     ).fetchone()
                     if row is not None:
@@ -234,7 +233,7 @@ class LaunchQueueStore:
                 conn.execute(
                     "UPDATE launch_items"
                     " SET status = 'running', pid = ?, started_at = COALESCE(started_at, ?)"
-                    " WHERE id = ?",
+                    " WHERE id = ? AND status = 'launching'",
                     (pid, now, item_id),
                 )
 

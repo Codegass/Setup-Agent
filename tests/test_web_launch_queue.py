@@ -263,3 +263,16 @@ def test_summary_counts_tracks_statuses(tmp_path):
         "completed": 1,
         "failed": 1,
     }
+
+
+def test_mark_running_does_not_resurrect_finished_item(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue_batch(make_batch(), [make_item("LAUNCH-00000001")])
+    claimed = store.claim_next(global_cap=8, now=LATER)
+    store.mark_failed(claimed.id, "spawn failed", now=LATER)
+
+    store.mark_running(claimed.id, pid=1, now=LATER)
+
+    batch = store.list_batches()[0]
+    assert batch["items"][0]["status"] == "failed"
+    assert batch["status"] == "failed"
