@@ -190,9 +190,9 @@ describe("LaunchSetupsDialog", () => {
   it("explains accepted version formats via the info tooltip", () => {
     renderDialog()
 
-    expect(screen.getByLabelText("Version help")).toHaveAttribute(
-      "title",
-      expect.stringContaining("commit hash"),
+    expect(screen.getByText(/release tag, or commit hash/)).toBeInTheDocument()
+    expect(screen.getByLabelText("Version help")).toContainElement(
+      screen.getByRole("tooltip", { hidden: true }),
     )
   })
 })

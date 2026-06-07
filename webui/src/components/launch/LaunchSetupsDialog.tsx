@@ -212,10 +212,16 @@ export function LaunchSetupsDialog({
                 {header === "Version" ? (
                   <span
                     aria-label="Version help"
-                    className="cursor-help text-slate-300 hover:text-slate-500"
-                    title={VERSION_HELP}
+                    className="group relative inline-flex cursor-help text-slate-300 hover:text-slate-500 focus-visible:text-slate-500 focus-visible:outline-none"
+                    tabIndex={0}
                   >
                     <Info aria-hidden="true" size={12} />
+                    <span
+                      className="pointer-events-none absolute left-1/2 top-full z-50 mt-1.5 hidden w-64 -translate-x-1/2 whitespace-normal rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-left font-sans text-[11px] font-normal normal-case tracking-normal text-slate-600 shadow-md group-hover:block group-focus-visible:block"
+                      role="tooltip"
+                    >
+                      {VERSION_HELP}
+                    </span>
                   </span>
                 ) : null}
               </div>
