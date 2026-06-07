@@ -16,6 +16,22 @@ class FakeOrchestrator:
                 return {"exit_code": 0, "output": self.files[path]}
             return {"exit_code": 1, "output": ""}
 
+        if command.startswith("find /workspace/.setup_agent/contexts"):
+            filenames = [
+                path.removeprefix("/workspace/.setup_agent/contexts/")
+                for path in sorted(self.files)
+                if path.startswith("/workspace/.setup_agent/contexts/")
+            ]
+            return {"exit_code": 0, "output": "\n".join(filenames)}
+
+        if command.startswith("find /workspace -maxdepth 1 -name 'setup-report-*.md'"):
+            reports = [
+                path
+                for path in sorted(self.files)
+                if path.startswith("/workspace/setup-report-") and path.endswith(".md")
+            ]
+            return {"exit_code": 0, "output": "\n".join(reports)}
+
         return {"exit_code": 0, "output": ""}
 
 
@@ -212,3 +228,119 @@ def test_container_session_registry_returns_legacy_last_comment_detail():
     assert detail.id == "LEGACY-20260606-211409"
     assert detail.outcome.startswith("Task completed")
     assert detail.evidence[0].source == "SAG session"
+
+
+def test_container_session_registry_falls_back_to_setup_artifacts_without_index_or_comment():
+    files = {
+        "/workspace/.setup_agent/project_meta.json": json.dumps(
+            {
+                "project_name": "commons-cli",
+                "project_url": "https://github.com/apache/commons-cli.git",
+                "goal": "Setup and configure the commons-cli project to be runnable",
+            }
+        ),
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Setup and configure the commons-cli project to be runnable",
+                "todo_list": [
+                    {"id": "task_1", "description": "Clone repository", "status": "completed"},
+                    {"id": "task_2", "description": "Run tests", "status": "completed"},
+                    {
+                        "id": "task_3",
+                        "description": "Generate final report",
+                        "status": "pending",
+                    },
+                ],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "# Project Setup Report\n\n"
+            "**Generated:** 2026-06-06 21:35:09\n"
+            "**Result:** SUCCESS\n\n"
+            "| **Tests Executed** | 430 |\n"
+            "| **Tests Passed** | 420 |\n"
+            "| **Pass Rate** | 97.7% |\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+
+    assert rows[0].id == "SETUP-20260606-213241"
+    assert rows[0].title == "Setup and configure the commons-cli project to be runnable"
+    assert rows[0].status == "completed"
+    assert rows[0].entry == "CLI"
+    assert rows[0].report == "ready"
+    assert rows[0].test.pass_count == 420
+    assert rows[0].test.total == 430
+
+
+def test_container_session_registry_parses_setup_report_breakdown_table():
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Set up commons-cli",
+                "todo_list": [],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "| Total Available | Executed | Passed | Failed | Errors | Skipped |\n"
+            "|-----------------|----------|--------|--------|---------|---------|\n"
+            "| 460 | 430 | 420 | 0 | 0 | 10 |\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+
+    assert rows[0].test.total == 430
+    assert rows[0].test.pass_count == 420
+    assert rows[0].test.fail_count == 0
+    assert rows[0].test.skip_count == 10
+
+
+def test_container_session_registry_returns_setup_artifact_detail():
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Setup and configure the commons-cli project to be runnable",
+                "todo_list": [
+                    {"id": "task_1", "description": "Clone repository", "status": "completed"},
+                ],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "# Project Setup Report\n\n"
+            "**Generated:** 2026-06-06 21:35:09\n"
+            "**Result:** SUCCESS\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(
+        workspace_summary(),
+        "SETUP-20260606-213241",
+    )
+
+    assert detail is not None
+    assert detail.id == "SETUP-20260606-213241"
+    assert detail.report == "ready"
+    assert detail.report_doc is not None
+    assert detail.report_doc.title == "setup-report-20260606-213509.md"
+    assert detail.context is not None
+    assert detail.context.trunk.progress == {"done": 1, "total": 1}
