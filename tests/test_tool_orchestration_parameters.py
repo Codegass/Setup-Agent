@@ -246,6 +246,31 @@ def test_project_setup_parameter_normalizer_injects_repository_ref():
     assert params["ref"] == "rel/commons-cli-1.11.0"
 
 
+@pytest.mark.parametrize("alias", ["tag", "release", "commit", "commit_hash", "version_ref"])
+def test_project_setup_parameter_normalizer_maps_version_handle_aliases_to_ref(alias):
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"project_setup": ProjectSetupLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "project_setup",
+        {
+            "action": "clone",
+            "repository_url": "https://example.test/repo.git",
+            alias: "rel/commons-cli-1.11.0",
+            "version": "1.11.0",
+        },
+        fixes,
+    )
+
+    assert params["ref"] == "rel/commons-cli-1.11.0"
+    assert alias not in params
+    assert params["version"] == "1.11.0"
+
+
 def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():
     fixes = []
     normalizer = ToolParameterNormalizer(

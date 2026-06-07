@@ -537,6 +537,11 @@ class ToolParameterNormalizer:
                 "destination": "target_directory",
                 "dest": "target_directory",
                 "output": "target_directory",
+                "tag": "ref",
+                "release": "ref",
+                "commit": "ref",
+                "commit_hash": "ref",
+                "version_ref": "ref",
             },
             "maven": {
                 # Don't map 'goals' - it's a separate parameter from 'command'

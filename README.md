@@ -177,9 +177,16 @@ nano .env  # Fill in your API keys and other settings
 # Start setting up a new project
 uv run sag project https://github.com/fastapi/fastapi.git
 
+# Start from a specific branch, tag, release tag, short commit, or full commit
+uv run sag project https://github.com/apache/commons-cli.git --ref rel/commons-cli-1.11.0
+
 # List all managed projects and their status
 uv run sag list
 ```
+
+Use the Git repository URL with `--ref` for versioned setup targets. For example,
+use `https://github.com/apache/dubbo.git --ref dubbo-3.2.19` rather than a
+GitHub `/releases` page URL.
 
 SAG creates Docker containers named `sag-<project>` by default. The Web UI reads
 those managed containers and shows their latest setup state, sessions, evidence,
@@ -353,16 +360,18 @@ SAG provides a clean and powerful set of CLI commands.
 |---|---|
 | `--name <name>` | Override the Docker container name (default: extracted from URL). **Note:** This only affects the Docker container/volume naming (`sag-<name>`), not the project directory name. The cloned repository will always use the directory name from the URL. |
 | `--goal <goal>` | Custom setup goal (default: auto-generated based on project name). |
+| `--ref <handle>` | Set up a specific Git ref, such as a branch, tag, release tag, short commit, or full commit hash. SAG clones the repository, checks out this ref, and records the resolved commit. |
 | `--record` | Save setup artifacts (contexts, reports) to local session logs for debugging and auditing. |
 
-**Example with custom Docker name:**
+**Example with a version handle and custom Docker name:**
 ```bash
-# Clone commons-cli but name the Docker container "cli-test"
-sag project https://github.com/apache/commons-cli.git --name cli-test
+# Clone commons-cli at a release tag but name the Docker container "cli-test"
+sag project https://github.com/apache/commons-cli.git --ref rel/commons-cli-1.11.0 --name cli-test
 
 # Result:
 # - Docker container: sag-cli-test
 # - Project directory: /workspace/commons-cli (always matches git repo name)
+# - Git checkout: rel/commons-cli-1.11.0, with resolved commit recorded in metadata
 # - To run tasks later: sag run sag-cli-test --task "..."
 ```
 

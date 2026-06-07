@@ -1394,7 +1394,9 @@ Project Setup Tool Usage Examples:
 
 2. Clone with specific options:
    project_setup(action="clone", repository_url="https://github.com/user/repo.git", 
-                 target_directory="my-project", branch="develop", auto_install_deps=True)
+                 target_directory="my-project", ref="v1.2.3", auto_install_deps=True)
+   # ref may be a branch, tag, release tag, short commit, or full commit hash.
+   # branch is still accepted as a legacy alias when ref is absent.
 
 3. Detect project type:
    project_setup(action="detect_project_type")
