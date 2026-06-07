@@ -227,7 +227,7 @@ class ToolchainManager:
 
     def _discover_standalone_maven(self, spec: ToolchainSpec) -> List[ToolExecutableCandidate]:
         result = self.orchestrator.execute_command(
-            "find /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f 2>/dev/null"
+            "find /workspace /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f 2>/dev/null"
         )
         if result.get("exit_code") != 0:
             return []

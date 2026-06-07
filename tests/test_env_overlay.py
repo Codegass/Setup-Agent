@@ -17,6 +17,8 @@ class FakeEnvOverlayOrchestrator:
 
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
+        if command.startswith("test -x "):
+            return {"success": True, "output": "EXISTS\n", "exit_code": 0}
         return {"success": True, "output": "", "exit_code": 0}
 
     def write_file(self, path, content):

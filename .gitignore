@@ -153,6 +153,7 @@ Thumbs.db
 # Project specific
 debug_*.py
 test_*.py
+!tests/test_*.py
 manual_*.py
 *.tmp
 *.temp

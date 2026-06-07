@@ -1151,11 +1151,55 @@ IMPORTANT:
     def _is_build_or_test_task_description(self, task_description: str) -> bool:
         build_terms = ["compile", "build", "package", "install"]
         test_terms = ["test", "tests", "verify"]
-        tool_terms = ["maven", "gradle", "npm", "yarn", "pnpm", "pytest"]
+        tool_terms = ["maven", "mvn", "gradle", "gradlew", "npm", "yarn", "pnpm", "pytest"]
         return (
             any(term in task_description for term in build_terms + test_terms)
             and any(term in task_description for term in tool_terms)
         )
+
+    def _has_required_build_or_test_tool_execution(self) -> Optional[bool]:
+        """Return whether current task history contains a successful build/test tool action."""
+        task_id = getattr(self.context_manager, "current_task_id", None)
+        if not task_id or not hasattr(self.context_manager, "load_branch_history"):
+            return None
+
+        branch_history = self.context_manager.load_branch_history(task_id)
+        if branch_history is None:
+            return None
+
+        build_tools = {"maven", "gradle", "npm", "yarn", "pnpm", "pytest"}
+        shell_tools = {"bash"}
+        shell_build_markers = (
+            "mvn",
+            "maven",
+            "gradle",
+            "gradlew",
+            "npm test",
+            "npm run",
+            "yarn",
+            "pnpm",
+            "pytest",
+        )
+
+        for entry in getattr(branch_history, "history", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "action" or not entry.get("success"):
+                continue
+
+            tool_name = str(entry.get("tool_name") or "").lower()
+            if tool_name in build_tools:
+                return True
+
+            if tool_name in shell_tools:
+                searchable = " ".join(
+                    str(entry.get(field) or "")
+                    for field in ("command", "output", "content", "tool_input")
+                ).lower()
+                if any(marker in searchable for marker in shell_build_markers):
+                    return True
+
+        return False
 
     def _has_unresolved_failure_signal(self, text: str) -> bool:
         resolved_phrases = [
@@ -1223,6 +1267,23 @@ IMPORTANT:
                     }
                 )
                 return validation_result
+
+            if self._is_build_or_test_task_description(task_description):
+                has_tool_evidence = self._has_required_build_or_test_tool_execution()
+                if has_tool_evidence is False:
+                    validation_result.update(
+                        {
+                            "valid": False,
+                            "reason": "Build/test task missing successful tool execution evidence",
+                            "suggestions": [
+                                "Run the relevant build or test tool before completing this task",
+                                "Use maven, gradle, npm, yarn, pnpm, or pytest as appropriate",
+                                "Do not complete build/test tasks based only on summary text",
+                                "Use force=True only when intentionally recording a manually verified exception",
+                            ],
+                        }
+                    )
+                    return validation_result
 
             # Task-specific validation rules
             if "project_analyzer" in task_description or "analyze project" in task_description:

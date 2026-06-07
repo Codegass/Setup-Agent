@@ -727,6 +727,57 @@ def test_maven_module_and_test_exclusion_recovery_records_exclusions():
     assert execution.metadata["recovery"]["recovery_params"] == expected_params
 
 
+def test_maven_version_error_returns_env_overlay_guidance_without_retry():
+    guidance = []
+    maven = ResultTool(
+        "maven",
+        [
+            ToolResult(
+                success=False,
+                output=(
+                    "[ERROR] Detected Maven Version: 3.8.7 is not in the allowed range [3.9,)."
+                ),
+                error="Maven build failed",
+                error_code="MAVEN_VERSION_ERROR",
+                metadata={
+                    "maven_version_requirement": {
+                        "raw": "[3.9,)",
+                        "source": "build_error",
+                        "kind": "range",
+                    },
+                    "maven_runtime": {
+                        "executable": "/usr/bin/mvn",
+                        "version": "3.8.7",
+                        "source": "system",
+                    },
+                },
+            )
+        ],
+    )
+    orchestrator = _orchestrator(tools={"maven": maven}, guidance=guidance)
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"command": "compile", "working_directory": "/workspace/app"},
+            validated_params={"command": "compile", "working_directory": "/workspace/app"},
+        )
+    )
+
+    assert execution.status == "recovery_attempted"
+    assert execution.recovery_strategy == "maven_version_contract_guidance"
+    assert execution.result.error_code == "MAVEN_VERSION_ERROR"
+    assert execution.executed_params == {
+        "command": "compile",
+        "working_directory": "/workspace/app",
+    }
+    assert maven.calls == [{"command": "compile", "working_directory": "/workspace/app"}]
+    assert len(guidance) == 1
+    assert guidance[0][1] == "high"
+    assert "MAVEN VERSION REQUIREMENT" in guidance[0][0]
+    assert "env register" in guidance[0][0]
+
+
 def test_maven_timeout_returns_guidance_without_retry():
     guidance = []
     maven = ResultTool(

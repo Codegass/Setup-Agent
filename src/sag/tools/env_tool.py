@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any, Optional
 
 from sag.runtime.env_overlay import EnvOverlayStore
@@ -61,6 +62,9 @@ class EnvTool(BaseTool):
                 return self._result("inspect", overlay)
 
             if action_name == "register":
+                validation_error = self._validate_executable(params["executable"])
+                if validation_error:
+                    return validation_error
                 overlay = self.store.register(
                     params["tool"],
                     params["executable"],
@@ -73,6 +77,9 @@ class EnvTool(BaseTool):
                 return self._result("register", overlay)
 
             if action_name == "activate":
+                validation_error = self._validate_executable(params["executable"])
+                if validation_error:
+                    return validation_error
                 overlay = self.store.activate(params["tool"], params["executable"])
                 return self._result(
                     "activate",
@@ -151,6 +158,32 @@ class EnvTool(BaseTool):
             raise ValueError("action is required")
         params["action"] = str(params["action"]).strip().lower()
         return params
+
+    def _validate_executable(self, executable: str) -> Optional[ToolResult]:
+        orchestrator = getattr(self.store, "orchestrator", None)
+        if orchestrator is None or not hasattr(orchestrator, "execute_command"):
+            return None
+
+        result = orchestrator.execute_command(
+            f"test -x {shlex.quote(executable)} && echo EXISTS || echo MISSING"
+        )
+        output = result.get("output") or ""
+        if result.get("exit_code") == 0 and "EXISTS" in output:
+            return None
+
+        return ToolResult(
+            success=False,
+            output="",
+            error=f"Env overlay executable is not executable or does not exist: {executable}",
+            error_code="ENV_EXECUTABLE_NOT_FOUND",
+            suggestions=[
+                "Use bash to verify the exact installed executable path before registering it.",
+                "For downloaded runtimes, register the actual bin executable path under /workspace, /opt, /tmp, or /usr/local.",
+                "Use env inspect to review the current active candidate before retrying a build.",
+            ],
+            raw_data={"executable": executable},
+            metadata={"action": "validate_executable"},
+        )
 
     def _result(
         self,

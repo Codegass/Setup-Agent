@@ -564,6 +564,47 @@ def test_maven_failed_result_metadata_includes_runtime_facts_for_version_error()
     }
 
 
+def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidance():
+    output = (
+        "[ERROR] BUILD FAILURE\n"
+        "Rule 0: org.apache.maven.enforcer.rules.version.RequireMavenVersion failed\n"
+        "Detected Maven Version: 3.8.7 is not in the allowed range [3.9,)."
+    )
+    orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 1})
+    tool = MavenTool(
+        orchestrator,
+        toolchain_manager=FakeToolchainManager(
+            path="/usr/bin/mvn",
+            version="3.8.7",
+            source="system",
+        ),
+    )
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="compile",
+        working_directory="/workspace/project",
+        raw_output=True,
+    )
+
+    assert result.success is False
+    assert result.output == output
+    assert result.raw_output == output
+    assert result.error_code == "MAVEN_VERSION_ERROR"
+    assert result.metadata["maven_version_requirement"] == {
+        "raw": "[3.9,)",
+        "source": "build_error",
+        "kind": "range",
+    }
+    assert result.metadata["maven_runtime"] == {
+        "executable": "/usr/bin/mvn",
+        "version": "3.8.7",
+        "source": "system",
+    }
+    assert any("env register" in suggestion for suggestion in result.suggestions)
+    assert any("bash" in suggestion and "download" in suggestion for suggestion in result.suggestions)
+
+
 def test_maven_tool_runs_version_command_as_diagnostic_without_pom_validation():
     orchestrator = VersionCommandOrchestrator()
     tool = MavenTool(orchestrator, toolchain_manager=FakeToolchainManager("/usr/bin/mvn"))

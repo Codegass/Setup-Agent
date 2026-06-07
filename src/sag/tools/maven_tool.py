@@ -388,22 +388,37 @@ class MavenTool(BaseTool):
                 logger.debug(f"Tracked Maven command: {maven_cmd[:100]}...")
 
             if raw_output:
-                return ToolResult(
-                    success=analysis["build_success"],  # Use analyzed build success, not exit code
-                    output=result["output"],
-                    raw_output=result["output"],
-                    metadata={
-                        "command": maven_cmd,
-                        "exit_code": result["exit_code"],
-                        "analysis": analysis,
-                        "maven_runtime": maven_runtime,
-                        **(
-                            {"maven_version_requirement": requested_requirement_metadata}
-                            if requested_requirement_metadata
-                            else {}
-                        ),
-                    },
+                if analysis["build_success"]:
+                    return ToolResult(
+                        success=True,
+                        output=result["output"],
+                        raw_output=result["output"],
+                        metadata={
+                            "command": maven_cmd,
+                            "exit_code": result["exit_code"],
+                            "analysis": analysis,
+                            "maven_runtime": maven_runtime,
+                            "output_ref_id": ref_id,
+                            **(
+                                {"maven_version_requirement": requested_requirement_metadata}
+                                if requested_requirement_metadata
+                                else {}
+                            ),
+                        },
+                    )
+
+                error_result = self._handle_maven_error(
+                    result["output"],
+                    result["exit_code"],
+                    maven_cmd,
+                    analysis,
+                    maven_runtime,
                 )
+                error_result.output = result["output"]
+                error_result.raw_output = result["output"]
+                if ref_id:
+                    error_result.metadata["output_ref_id"] = ref_id
+                return error_result
 
             # Use analysis result to determine success, not just exit code
             if analysis["build_success"]:
@@ -650,7 +665,7 @@ class MavenTool(BaseTool):
                 ),
                 (
                     "Use bash to inspect candidates: "
-                    "find /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
+                    "find /workspace /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
                 ),
                 "If the project can use system Maven, omit maven_version_requirement on the next call.",
             ],
@@ -1535,6 +1550,39 @@ class MavenTool(BaseTool):
             documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
 
         # Check for Java version issues (including Maven Enforcer plugin)
+        if analysis.get("maven_version_requirement"):
+            requirement = analysis["maven_version_requirement"]
+            raw_requirement = requirement.get("raw", "the required range")
+            runtime_executable = (maven_runtime or {}).get("executable", "the current mvn")
+            runtime_version = (maven_runtime or {}).get("version", "unknown")
+            error_code = "MAVEN_VERSION_ERROR"
+            error_suggestions.extend(
+                [
+                    (
+                        f"Maven version requirement detected: {raw_requirement}; "
+                        f"current {runtime_executable} reports {runtime_version}"
+                    ),
+                    (
+                        "Use bash to download or unpack a Maven distribution that satisfies "
+                        f"{raw_requirement}; apt may only provide an older distro package"
+                    ),
+                    (
+                        "Use env register/activate for the new executable, e.g. "
+                        "env(action='register', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
+                        "version='<version>', path_prepend=['/workspace/apache-maven-<version>/bin'], activate=True)"
+                    ),
+                    (
+                        f"Retry with maven(command='{command}', "
+                        f"maven_version_requirement='{raw_requirement}')"
+                    ),
+                    (
+                        "If an exact Maven executable is proven incompatible, record it with "
+                        "env(action='block', tool='maven', executable='<path>', version='<version>')"
+                    ),
+                ]
+            )
+            documentation_links.append("https://maven.apache.org/download.cgi")
+
         if (
             "Unsupported major.minor version" in output
             or "java.lang.UnsupportedClassVersionError" in output
