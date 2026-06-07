@@ -39,6 +39,13 @@ def _spawn_subprocess(argv: list[str], log_path: Path) -> Any:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Whether a launch subprocess with this pid is still running.
+
+    Treats EPERM as dead: launches always run under the server's own UID, so a
+    permission error means the pid was reused by another user's process. POSIX
+    only — on Windows ``os.kill(pid, 0)`` would terminate the target.
+    """
+
     try:
         os.kill(pid, 0)
     except OSError:
@@ -81,6 +88,8 @@ class LaunchScheduler:
         self._wake.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                logger.warning("Launch scheduler thread did not stop within 5s")
             self._thread = None
 
     def wake(self) -> None:
@@ -150,6 +159,7 @@ class LaunchScheduler:
             exit_code = process.wait()
         except Exception as exc:
             self.store.mark_failed(item_id, f"Lost launch process: {exc}", now=_now())
+            self._wake.set()
             return
         if exit_code == 0:
             self.store.mark_completed(item_id, exit_code=0, now=_now())
@@ -160,3 +170,5 @@ class LaunchScheduler:
                 now=_now(),
                 exit_code=exit_code,
             )
+        # Freed capacity: nudge the scheduler instead of waiting out the poll.
+        self._wake.set()
