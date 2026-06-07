@@ -6,10 +6,12 @@ import asyncio
 import contextlib
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from sag.web.read_model import ReadModelBuilder
 from sag.web.task_runner import TaskRequest, TaskRunner
@@ -25,6 +27,7 @@ def create_app(
     read_model: ReadModelBuilder | None = None,
     task_runner: TaskRunner | None = None,
     terminal_adapter: TerminalAdapter | None = None,
+    static_dir: Path | None = None,
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
     runner = task_runner if task_runner is not None else TaskRunner()
@@ -109,6 +112,9 @@ def create_app(
                     await output_task
             if socket is not None:
                 await close_socket(socket)
+
+    if static_dir is not None:
+        app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
     return app
 

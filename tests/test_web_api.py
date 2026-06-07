@@ -32,6 +32,37 @@ def test_dashboard_endpoint_returns_workspaces():
     assert response.json()["workspaces"][0]["id"] == "sag-commons-cli"
 
 
+def test_static_root_serves_web_ui_index(tmp_path):
+    (tmp_path / "index.html").write_text(
+        "<!doctype html><div id=\"root\">SAG Workbench</div>",
+        encoding="utf-8",
+    )
+    app = create_app(ReadModelBuilder(demo_mode=True), static_dir=tmp_path)
+    client = TestClient(app)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "SAG Workbench" in response.text
+
+
+def test_static_assets_do_not_shadow_api_routes(tmp_path):
+    assets_dir = tmp_path / "assets"
+    assets_dir.mkdir()
+    (tmp_path / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    (assets_dir / "app.js").write_text("console.log('sag');", encoding="utf-8")
+    app = create_app(ReadModelBuilder(demo_mode=True), static_dir=tmp_path)
+    client = TestClient(app)
+
+    asset_response = client.get("/assets/app.js")
+    api_response = client.get("/api/workspaces")
+
+    assert asset_response.status_code == 200
+    assert "console.log('sag')" in asset_response.text
+    assert api_response.status_code == 200
+    assert api_response.json()["workspaces"][0]["id"] == "sag-commons-cli"
+
+
 def test_submit_task_is_workspace_scoped():
     task_runner = FakeTaskRunner()
     app = create_app(ReadModelBuilder(demo_mode=True), task_runner=task_runner)
