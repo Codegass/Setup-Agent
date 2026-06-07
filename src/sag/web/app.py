@@ -10,9 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from loguru import logger
+
+from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
 from sag.web.read_model import ReadModelBuilder
 from sag.web.task_runner import TaskRequest, TaskRunner
 from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
@@ -28,17 +31,25 @@ def create_app(
     task_runner: TaskRunner | None = None,
     terminal_adapter: TerminalAdapter | None = None,
     static_dir: Path | None = None,
+    launch_service: LaunchService | None = None,
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
     runner = task_runner if task_runner is not None else TaskRunner()
     terminal_bridge = terminal_adapter if terminal_adapter is not None else TerminalAdapter()
     owns_terminal_bridge = terminal_adapter is None
+    launches = launch_service if launch_service is not None else LaunchService()
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
+            await asyncio.to_thread(launches.start)
+        except Exception:
+            logger.exception("Failed to start launch scheduler")
+        try:
             yield
         finally:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(launches.stop)
             if owns_terminal_bridge:
                 close = getattr(terminal_bridge, "close", None)
                 if close is not None:
@@ -54,6 +65,20 @@ def create_app(
     @app.post("/api/workspaces/{workspace_id}/tasks", status_code=202)
     def submit_task(workspace_id: str, request: TaskRequest) -> dict:
         return runner.submit(workspace_id, request)
+
+    @app.post("/api/project-launches/batch")
+    def submit_project_batch(request: LaunchBatchRequest) -> JSONResponse:
+        try:
+            outcome = launches.submit_batch(request)
+        except LaunchValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        status_code = 202 if outcome["accepted"] else 409
+        return JSONResponse(status_code=status_code, content=outcome)
+
+    @app.get("/api/project-launches")
+    def get_project_launches() -> dict:
+        return launches.queue_state()
 
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: str) -> dict:

@@ -168,3 +168,155 @@ def test_create_app_uses_falsy_injected_read_model(monkeypatch):
 
     assert response.status_code == 200
     assert response.json()["workspaces"][0]["id"] == "sag-commons-cli"
+
+
+class FakeLaunchService:
+    def __init__(self, outcome=None, error=None):
+        self.outcome = outcome
+        self.error = error
+        self.requests = []
+
+    def submit_batch(self, request):
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return self.outcome
+
+    def queue_state(self):
+        return {
+            "default_concurrency": 3,
+            "summary": {
+                "queued": 1,
+                "launching": 0,
+                "running": 1,
+                "completed": 2,
+                "failed": 0,
+            },
+            "batches": [],
+        }
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+def launch_client(service):
+    app = create_app(ReadModelBuilder(demo_mode=True), launch_service=service)
+    return TestClient(app)
+
+
+def test_batch_submit_returns_202_with_accepted_and_rejected_rows():
+    service = FakeLaunchService(
+        outcome={
+            "batch_id": "BATCH-20260607-abcdef",
+            "concurrency": 2,
+            "accepted": [
+                {
+                    "launch_id": "LAUNCH-12345678",
+                    "row_index": 0,
+                    "workspace_id": "sag-commons-cli",
+                    "status": "queued",
+                }
+            ],
+            "rejected": [
+                {
+                    "row_index": 1,
+                    "workspace_id": "sag-existing",
+                    "status": "conflict",
+                    "message": "Workspace already exists: sag-existing",
+                }
+            ],
+        }
+    )
+    client = launch_client(service)
+
+    response = client.post(
+        "/api/project-launches/batch",
+        json={
+            "concurrency": 2,
+            "projects": [
+                {"repo_url": "https://github.com/apache/commons-cli.git"},
+                {"repo_url": "https://github.com/x/existing.git"},
+            ],
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["batch_id"] == "BATCH-20260607-abcdef"
+    assert len(service.requests) == 1
+    assert service.requests[0].projects[0].repo_url == (
+        "https://github.com/apache/commons-cli.git"
+    )
+
+
+def test_batch_submit_returns_409_when_every_row_conflicts():
+    service = FakeLaunchService(
+        outcome={
+            "batch_id": None,
+            "concurrency": 2,
+            "accepted": [],
+            "rejected": [
+                {
+                    "row_index": 0,
+                    "workspace_id": "sag-existing",
+                    "status": "conflict",
+                    "message": "Workspace already exists: sag-existing",
+                }
+            ],
+        }
+    )
+    client = launch_client(service)
+
+    response = client.post(
+        "/api/project-launches/batch",
+        json={"projects": [{"repo_url": "https://github.com/x/existing.git"}]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["rejected"][0]["status"] == "conflict"
+
+
+def test_batch_submit_returns_422_for_invalid_shape():
+    client = launch_client(FakeLaunchService())
+
+    no_projects = client.post("/api/project-launches/batch", json={"projects": []})
+    blank_repo = client.post(
+        "/api/project-launches/batch", json={"projects": [{"repo_url": "   "}]}
+    )
+
+    assert no_projects.status_code == 422
+    assert blank_repo.status_code == 422
+
+
+def test_batch_submit_returns_422_for_out_of_range_concurrency():
+    from sag.web.launch_service import LaunchValidationError
+
+    service = FakeLaunchService(
+        error=LaunchValidationError("concurrency must be an integer between 1 and 8")
+    )
+    client = launch_client(service)
+
+    response = client.post(
+        "/api/project-launches/batch",
+        json={
+            "concurrency": 99,
+            "projects": [{"repo_url": "https://github.com/apache/commons-cli.git"}],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "concurrency" in response.json()["detail"]
+
+
+def test_get_project_launches_returns_queue_state():
+    client = launch_client(FakeLaunchService())
+
+    response = client.get("/api/project-launches")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["default_concurrency"] == 3
+    assert body["summary"]["completed"] == 2
+    assert body["batches"] == []
