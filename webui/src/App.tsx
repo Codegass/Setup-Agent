@@ -175,13 +175,14 @@ export function App() {
 
   const handleBatchSubmitted = (result: LaunchBatchResult) => {
     setLaunchDialogOpen(false)
+    const shownRejections = result.rejected.slice(0, 3).map((row) => row.message)
+    const hiddenRejections = result.rejected.length - shownRejections.length
     setLaunchNotice(
       result.rejected.length
         ? `${result.accepted.length} setup${result.accepted.length === 1 ? "" : "s"} launched, ` +
             `${result.rejected.length} rejected: ` +
-            result.rejected
-              .map((row) => row.message)
-              .join("; ")
+            shownRejections.join("; ") +
+            (hiddenRejections > 0 ? ` and ${hiddenRejections} more` : "")
         : null,
     )
 

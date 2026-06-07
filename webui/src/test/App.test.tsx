@@ -70,6 +70,12 @@ const sessionDetail: ExecutionSessionDetail = {
   logs: ["BUILD SUCCESS"],
 }
 
+const emptyLaunchQueue = {
+  default_concurrency: 4,
+  summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },
+  batches: [],
+}
+
 describe("App", () => {
   afterEach(() => {
     cleanup()
@@ -77,7 +83,13 @@ describe("App", () => {
   })
 
   it("fetches and renders dashboard data after loading", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(dashboard))
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) =>
+      Promise.resolve(
+        String(input) === "/api/project-launches"
+          ? jsonResponse(emptyLaunchQueue)
+          : jsonResponse(dashboard),
+      ),
+    )
 
     render(<App />)
 
@@ -418,7 +430,13 @@ describe("App", () => {
         },
       ],
     }
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(jsonResponse(stoppedDashboard))
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) =>
+      Promise.resolve(
+        String(input) === "/api/project-launches"
+          ? jsonResponse(emptyLaunchQueue)
+          : jsonResponse(stoppedDashboard),
+      ),
+    )
 
     render(<App />)
 
