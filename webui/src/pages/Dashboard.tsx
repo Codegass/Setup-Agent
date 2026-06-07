@@ -8,14 +8,16 @@ import {
   FileText,
   GitBranch,
   RefreshCw,
+  Rocket,
   X,
 } from "lucide-react"
 
-import type { DashboardResponse, WorkspaceSummary } from "@/api/types"
+import type { DashboardResponse, LaunchQueueState, WorkspaceSummary } from "@/api/types"
 import { Badge, StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
 import { TestBar } from "@/components/common/TestBar"
+import { LaunchQueuePanel } from "@/components/launch/LaunchQueuePanel"
 
 interface DashboardProps {
   data: DashboardResponse
@@ -23,6 +25,9 @@ interface DashboardProps {
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
   onRefresh?: () => void
   refreshing?: boolean
+  onLaunchSetups?: () => void
+  launchQueue?: LaunchQueueState | null
+  highlightedWorkspaces?: string[]
 }
 
 interface BuildDetails {
@@ -98,6 +103,9 @@ export function Dashboard({
   onOpenSession,
   onRefresh,
   refreshing = false,
+  onLaunchSetups,
+  launchQueue = null,
+  highlightedWorkspaces = [],
 }: DashboardProps) {
   const workspaces = data.workspaces
   const running = workspaces.filter((w) => normalize(w.docker.status) === "running").length
@@ -124,6 +132,12 @@ export function Dashboard({
               <span className="font-mono text-[11px] text-slate-400">v{data.docker.version}</span>
             ) : null}
           </div>
+          {onLaunchSetups ? (
+            <Button onClick={onLaunchSetups} type="button">
+              <Rocket size={14} />
+              Launch setups
+            </Button>
+          ) : null}
           {onRefresh ? (
             <Button
               aria-label="Refresh dashboard"
@@ -155,6 +169,10 @@ export function Dashboard({
         />
       </div>
 
+      {launchQueue && launchQueue.batches.length > 0 ? (
+        <LaunchQueuePanel queue={launchQueue} />
+      ) : null}
+
       <Card className="mt-5 hidden overflow-hidden lg:block">
         <div
           className={`grid ${tableColumns} items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5`}
@@ -171,6 +189,7 @@ export function Dashboard({
         {workspaces.map((workspace) => (
           <WorkspaceRow
             key={workspace.id}
+            highlighted={highlightedWorkspaces.includes(workspace.id)}
             onOpenSession={onOpenSession}
             onOpenWorkspace={onOpenWorkspace}
             workspace={workspace}
@@ -182,6 +201,7 @@ export function Dashboard({
         {workspaces.map((workspace) => (
           <WorkspaceCard
             key={workspace.id}
+            highlighted={highlightedWorkspaces.includes(workspace.id)}
             onOpenSession={onOpenSession}
             onOpenWorkspace={onOpenWorkspace}
             workspace={workspace}
@@ -227,10 +247,12 @@ function WorkspaceRow({
   workspace,
   onOpenWorkspace,
   onOpenSession,
+  highlighted = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
+  highlighted?: boolean
 }) {
   const openWorkspace = () => onOpenWorkspace(workspace.id)
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -247,7 +269,9 @@ function WorkspaceRow({
   return (
     <div
       aria-label={`Open workspace ${workspace.project}`}
-      className={`group grid ${tableColumns} cursor-pointer items-center gap-3 border-b border-slate-100 px-4 py-3 text-left last:border-b-0 hover:bg-slate-50/70 focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30`}
+      className={`group grid ${tableColumns} cursor-pointer items-center gap-3 border-b border-slate-100 px-4 py-3 text-left transition-colors duration-700 last:border-b-0 hover:bg-slate-50/70 focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 ${
+        highlighted ? "bg-blue-50/60" : ""
+      }`}
       onClick={openWorkspace}
       onKeyDown={handleKeyDown}
       role="button"
@@ -273,15 +297,19 @@ function WorkspaceCard({
   workspace,
   onOpenWorkspace,
   onOpenSession,
+  highlighted = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
+  highlighted?: boolean
 }) {
   return (
     <Card
       aria-label={`Open workspace ${workspace.project}`}
-      className="cursor-pointer p-4 hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30"
+      className={`cursor-pointer p-4 transition-colors duration-700 hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 ${
+        highlighted ? "border-blue-200 bg-blue-50/60" : ""
+      }`}
       onClick={() => onOpenWorkspace(workspace.id)}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) {

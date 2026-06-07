@@ -127,4 +127,60 @@ describe("Dashboard", () => {
     expect(onOpenWorkspace).toHaveBeenCalledTimes(1)
     expect(onOpenWorkspace).toHaveBeenCalledWith("sag-commons-cli")
   })
+
+  it("renders the launch setups action and reports clicks", () => {
+    const onLaunchSetups = vi.fn()
+    render(
+      <Dashboard
+        data={dashboard}
+        onLaunchSetups={onLaunchSetups}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Launch setups" }))
+
+    expect(onLaunchSetups).toHaveBeenCalled()
+  })
+
+  it("renders the launch queue panel when queue data has batches", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        launchQueue={{
+          default_concurrency: 4,
+          summary: { queued: 1, launching: 0, running: 0, completed: 0, failed: 0 },
+          batches: [
+            {
+              id: "BATCH-20260607-abcdef",
+              status: "running",
+              concurrency: 2,
+              created: "2026-06-07T02:30:00",
+              items: [],
+            },
+          ],
+        }}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    expect(screen.getByText("Launch queue")).toBeInTheDocument()
+  })
+
+  it("highlights newly launched workspaces", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        highlightedWorkspaces={["sag-commons-cli"]}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    const rows = screen.getAllByLabelText(/open workspace/i)
+    const highlighted = rows.filter((row) => row.className.includes("bg-blue-50"))
+    expect(highlighted.length).toBeGreaterThan(0)
+  })
 })
