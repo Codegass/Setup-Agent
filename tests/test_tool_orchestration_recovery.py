@@ -15,6 +15,7 @@ class ResultTool(BaseTool):
                 "task": {"type": "string"},
                 "tasks": {"type": "string"},
                 "repository_url": {"type": "string"},
+                "ref": {"type": "string"},
                 "summary": {"type": "string"},
                 "task_id": {"type": "string"},
                 "java_version": {"type": "string"},
@@ -73,6 +74,7 @@ def _orchestrator(
     tools,
     context_manager=None,
     repository_url=None,
+    repository_ref=None,
     events=None,
     state_updates=None,
     successful_states=None,
@@ -93,6 +95,7 @@ def _orchestrator(
         recent_tool_executions=[],
         successful_states=successful_states,
         repository_url=repository_url,
+        repository_ref=repository_ref,
         track_tool_execution=lambda signature, success: None,
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
@@ -152,6 +155,7 @@ def test_project_setup_recovery_injects_repository_url():
     orchestrator = _orchestrator(
         tools={"project_setup": tool},
         repository_url="https://example.com/repo.git",
+        repository_ref="rel/commons-cli-1.11.0",
         events=events,
         state_updates=state_updates,
     )
@@ -171,10 +175,15 @@ def test_project_setup_recovery_injects_repository_url():
     assert execution.executed_params == {
         "action": "clone",
         "repository_url": "https://example.com/repo.git",
+        "ref": "rel/commons-cli-1.11.0",
     }
     assert tool.calls == [
         {"action": "clone"},
-        {"action": "clone", "repository_url": "https://example.com/repo.git"},
+        {
+            "action": "clone",
+            "repository_url": "https://example.com/repo.git",
+            "ref": "rel/commons-cli-1.11.0",
+        },
     ]
     assert execution.metadata["recovery"]["attempted"] is True
     assert execution.metadata["recovery"]["success"] is True
@@ -182,6 +191,7 @@ def test_project_setup_recovery_injects_repository_url():
     recovery_events = [event for event in events if event.event_type == "tool_recovery"]
     assert len(recovery_events) == 1
     assert recovery_events[0].metadata["recovery_strategy"] == "project_setup_repository_url"
+    assert recovery_events[0].metadata["recovery_params"]["ref"] == "rel/commons-cli-1.11.0"
     assert recovery_events[0].metadata["success"] is True
     assert recovery_events[0].metadata["replacement_result_success"] is True
     assert recovery_events[0].metadata["recovery_params"] == execution.executed_params

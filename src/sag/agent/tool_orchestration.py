@@ -199,6 +199,7 @@ class ToolOrchestrator:
         recent_tool_executions: MutableSequence[dict[str, Any] | ToolExecutionRecord],
         successful_states: Dict[str, Any],
         repository_url: Optional[str],
+        repository_ref: Optional[str] = None,
         track_tool_execution: Callable[[str, bool], None],
         update_successful_states: Callable[[str, Dict[str, Any], ToolResult], None],
         add_system_guidance: Callable[[str, GuidancePriority], None],
@@ -214,6 +215,7 @@ class ToolOrchestrator:
         self.recent_tool_executions = recent_tool_executions
         self.successful_states = successful_states
         self.repository_url = repository_url
+        self.repository_ref = repository_ref
         self.track_tool_execution = track_tool_execution
         self.update_successful_states = update_successful_states
         self.add_system_guidance = add_system_guidance
@@ -224,6 +226,7 @@ class ToolOrchestrator:
             tools=self.tools,
             successful_states=self.successful_states,
             repository_url=self.repository_url,
+            repository_ref=self.repository_ref,
             logger=self.logger,
         )
         self.recovery_handler = ToolRecoveryHandler(
@@ -231,6 +234,7 @@ class ToolOrchestrator:
             context_manager=self.context_manager,
             successful_states=self.successful_states,
             repository_url=self.repository_url,
+            repository_ref=self.repository_ref,
             add_system_guidance=self.add_system_guidance,
             logger=self.logger,
         )

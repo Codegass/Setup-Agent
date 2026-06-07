@@ -67,6 +67,7 @@ def _engine_with_context(context=None):
     engine.config = FakeConfig()
     engine.agent_logger = FakeAgentLogger()
     engine.token_tracker = FakeTokenTracker()
+    engine.repository_ref = "rel/commons-cli-1.11.0"
     engine.output_storage = None
     engine.emit = lambda *args, **kwargs: None
     engine._force_thinking_next = False
@@ -109,6 +110,7 @@ def test_get_tool_orchestrator_wires_engine_dependencies():
     assert orchestrator.recent_tool_executions is engine.recent_tool_executions
     assert orchestrator.successful_states is engine.successful_states
     assert orchestrator.repository_url == "https://example.test/repo.git"
+    assert orchestrator.repository_ref == "rel/commons-cli-1.11.0"
     assert orchestrator.track_tool_execution.__self__ is engine
     assert orchestrator.track_tool_execution.__func__ is ReActEngine._track_tool_execution
     assert orchestrator.update_successful_states.__self__ is engine
@@ -119,6 +121,18 @@ def test_get_tool_orchestrator_wires_engine_dependencies():
     assert orchestrator.get_timestamp.__func__ is ReActEngine._get_timestamp
     assert orchestrator.event_sink.__self__ is engine
     assert orchestrator.event_sink.__func__ is ReActEngine._handle_tool_lifecycle_event
+
+
+def test_react_engine_set_repository_url_accepts_ref():
+    engine = _engine_with_context()
+
+    engine.set_repository_url(
+        "https://example.test/other.git",
+        repository_ref="ae44dcd",
+    )
+
+    assert engine.repository_url == "https://example.test/other.git"
+    assert engine.repository_ref == "ae44dcd"
 
 
 def test_add_system_guidance_accepts_string_priority():

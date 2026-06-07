@@ -22,6 +22,7 @@ class ToolRecoveryHandler:
         context_manager: Any,
         successful_states: Dict[str, Any],
         repository_url: Optional[str],
+        repository_ref: Optional[str] = None,
         add_system_guidance: Any,
         logger: Any = None,
     ) -> None:
@@ -29,6 +30,7 @@ class ToolRecoveryHandler:
         self.context_manager = context_manager
         self.successful_states = successful_states
         self.repository_url = repository_url
+        self.repository_ref = repository_ref
         self.add_system_guidance = add_system_guidance
         self.logger = logger or default_logger
 
@@ -130,10 +132,15 @@ class ToolRecoveryHandler:
         if action == "clone" and not params.get("repository_url") and self.repository_url:
             recovery_params = dict(params)
             recovery_params["repository_url"] = self.repository_url
+            if self.repository_ref and not recovery_params.get("ref"):
+                recovery_params["ref"] = self.repository_ref
             result = self.tools["project_setup"].safe_execute(**recovery_params)
             return self._attempted(
                 strategy="project_setup_repository_url",
-                message=f"Recovered by injecting repository URL: {self.repository_url}",
+                message=(
+                    f"Recovered by injecting repository URL: {self.repository_url}"
+                    + (f" and ref: {self.repository_ref}" if self.repository_ref else "")
+                ),
                 result=result,
                 recovery_params=recovery_params,
             )

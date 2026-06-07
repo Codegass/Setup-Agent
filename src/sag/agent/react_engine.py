@@ -32,7 +32,11 @@ class ReActEngine(UIEventEmitter):
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
     def __init__(
-        self, context_manager: ContextManager, tools: List[BaseTool], repository_url: str = None
+        self,
+        context_manager: ContextManager,
+        tools: List[BaseTool],
+        repository_url: str = None,
+        repository_ref: str = None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -40,6 +44,7 @@ class ReActEngine(UIEventEmitter):
         self.config = get_config()
         self.prompts = load_react_engine_prompts()
         self.repository_url = repository_url
+        self.repository_ref = repository_ref
         self.prompt_builder = ReActPromptBuilder(
             prompts=self.prompts,
             context_manager=self.context_manager,
@@ -126,11 +131,16 @@ class ReActEngine(UIEventEmitter):
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
         if repository_url:
             logger.info(f"Repository URL: {repository_url}")
+        if repository_ref:
+            logger.info(f"Repository ref: {repository_ref}")
 
-    def set_repository_url(self, repository_url: str):
-        """Set the repository URL for the current project."""
+    def set_repository_url(self, repository_url: str, repository_ref: str | None = None):
+        """Set the repository target for the current project."""
         self.repository_url = repository_url
+        self.repository_ref = repository_ref
         logger.info(f"Repository URL set: {repository_url}")
+        if repository_ref:
+            logger.info(f"Repository ref set: {repository_ref}")
 
     def run_react_loop(
         self,
@@ -154,6 +164,7 @@ class ReActEngine(UIEventEmitter):
         current_prompt = (
             self.prompt_builder.build_initial_system_prompt(
                 repository_url=self.repository_url,
+                repository_ref=self.repository_ref,
                 tool_calling_enabled=self.llm_client.capabilities_for(
                     ReactModelMode.ACTION
                 ).supports_function_calling,
@@ -239,6 +250,7 @@ class ReActEngine(UIEventEmitter):
                 current_prompt = self.prompt_builder.build_next_prompt(
                     steps=self.steps,
                     repository_url=self.repository_url,
+                    repository_ref=self.repository_ref,
                     tool_calling_enabled=self.llm_client.capabilities_for(
                         ReactModelMode.ACTION
                     ).supports_function_calling,
@@ -329,6 +341,7 @@ class ReActEngine(UIEventEmitter):
             recent_tool_executions=self.recent_tool_executions,
             successful_states=self.successful_states,
             repository_url=self.repository_url,
+            repository_ref=self.repository_ref,
             track_tool_execution=self._track_tool_execution,
             update_successful_states=self._update_successful_states,
             add_system_guidance=self._add_system_guidance,

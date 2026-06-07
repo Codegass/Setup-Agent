@@ -22,6 +22,23 @@ class BashLikeTool(BaseTool):
         )
 
 
+class ProjectSetupLikeTool(BaseTool):
+    def __init__(self):
+        super().__init__("project_setup", "Project setup test tool")
+        self._parameter_schema = {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string"},
+                "repository_url": {"type": "string"},
+                "ref": {"type": "string"},
+            },
+            "required": [],
+        }
+
+    def execute(self, **params) -> ToolResult:
+        return ToolResult(success=True, output=str(params))
+
+
 def _orchestrator(**overrides):
     events = overrides.pop("events", [])
     tracking_calls = overrides.pop("tracking_calls", [])
@@ -212,6 +229,21 @@ def test_bash_parameter_normalizer_does_not_append_fail_at_end_to_compound_maven
     )
 
     assert params["command"] == "cd /workspace/project && mvn -version"
+
+
+def test_project_setup_parameter_normalizer_injects_repository_ref():
+    fixes = []
+    normalizer = ToolParameterNormalizer(
+        tools={"project_setup": ProjectSetupLikeTool()},
+        successful_states={"working_directory": "/workspace/project"},
+        repository_url="https://example.test/repo.git",
+        repository_ref="rel/commons-cli-1.11.0",
+    )
+
+    params = normalizer.validate_and_fix("project_setup", {"action": "clone"}, fixes)
+
+    assert params["repository_url"] == "https://example.test/repo.git"
+    assert params["ref"] == "rel/commons-cli-1.11.0"
 
 
 def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():

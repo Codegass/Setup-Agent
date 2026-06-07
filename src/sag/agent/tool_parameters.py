@@ -21,11 +21,13 @@ class ToolParameterNormalizer:
         tools: Dict[str, BaseTool],
         successful_states: Dict[str, Any],
         repository_url: Optional[str],
+        repository_ref: Optional[str] = None,
         logger: Any = None,
     ) -> None:
         self.tools = tools
         self.successful_states = successful_states
         self.repository_url = repository_url
+        self.repository_ref = repository_ref
         self.logger = logger or default_logger
 
     def _add_parameter_fix(
@@ -763,6 +765,17 @@ class ToolParameterNormalizer:
                         reason="Injected repository URL from orchestrator state",
                         source="state_injection",
                     )
+                    if self.repository_ref and not fixed_params.get("ref"):
+                        ref_before = fixed_params.get("ref")
+                        fixed_params["ref"] = self.repository_ref
+                        self._add_parameter_fix(
+                            fixes,
+                            field="ref",
+                            before=ref_before,
+                            after=self.repository_ref,
+                            reason="Injected repository ref from orchestrator state",
+                            source="state_injection",
+                        )
                 else:
                     fixed_params["action"] = "detect_project_type"
                     self._add_parameter_fix(
@@ -812,6 +825,17 @@ class ToolParameterNormalizer:
                         reason="Injected repository URL from orchestrator state",
                         source="state_injection",
                     )
+                    if self.repository_ref and not fixed_params.get("ref"):
+                        ref_before = fixed_params.get("ref")
+                        fixed_params["ref"] = self.repository_ref
+                        self._add_parameter_fix(
+                            fixes,
+                            field="ref",
+                            before=ref_before,
+                            after=self.repository_ref,
+                            reason="Injected repository ref from orchestrator state",
+                            source="state_injection",
+                        )
                     self.logger.info(f"🔧 Auto-injected repository URL: {self.repository_url}")
 
             # CRITICAL FIX: Handle target_directory correctly for workspace vs fallback modes
