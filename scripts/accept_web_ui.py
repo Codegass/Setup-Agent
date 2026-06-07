@@ -64,6 +64,14 @@ FRONTEND_SESSION_FILES = [
     "webui/src/components/session/LogsView.tsx",
 ]
 
+TERMINAL_FILES = [
+    "src/sag/web/terminal.py",
+    "src/sag/web/app.py",
+    "webui/package.json",
+    "webui/src/pages/Workspace.tsx",
+    "webui/src/components/terminal/TerminalPanel.tsx",
+]
+
 
 PRODUCT_BOUNDARY_PATTERNS = {
     "workspace task route": ("src/sag/web/app.py", "/api/workspaces/{workspace_id}/tasks"),
@@ -91,12 +99,25 @@ WORKSPACE_SESSION_PATTERNS = {
     "app submits workspace tasks": ("webui/src/App.tsx", "submitTask"),
 }
 
+TERMINAL_PATTERNS = {
+    "terminal websocket route": ("src/sag/web/app.py", "/api/workspaces/{workspace_id}/terminal"),
+    "terminal app injection": ("src/sag/web/app.py", "terminal_adapter"),
+    "terminal exec options": ("src/sag/web/terminal.py", "build_exec_options"),
+    "terminal panel xterm": ("webui/src/components/terminal/TerminalPanel.tsx", "@xterm/xterm"),
+    "terminal panel fit addon": (
+        "webui/src/components/terminal/TerminalPanel.tsx",
+        "@xterm/addon-fit",
+    ),
+    "terminal panel websocket": ("webui/src/components/terminal/TerminalPanel.tsx", "new WebSocket"),
+    "workspace uses terminal panel": ("webui/src/pages/Workspace.tsx", "TerminalPanel"),
+}
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--phase",
-        choices=["skeleton", "backend", "workspace-session", "frontend", "final"],
+        choices=["skeleton", "backend", "workspace-session", "terminal", "frontend", "final"],
         required=True,
     )
     parser.add_argument(
@@ -115,11 +136,13 @@ def main() -> int:
         require_patterns(PRODUCT_BOUNDARY_PATTERNS, failures)
 
     if not args.skip_commands:
+        if args.phase == "terminal":
+            run(["uv", "run", "pytest", "tests/test_web_terminal.py", "tests/test_web_api.py", "-v"], failures)
         if args.phase in {"backend", "final"}:
             backend_tests = backend_web_test_paths(failures)
             if backend_tests:
                 run(["uv", "run", "pytest", *backend_tests, "-v"], failures)
-        if args.phase in {"frontend", "final"} and (ROOT / "webui/package.json").exists():
+        if args.phase in {"terminal", "frontend", "final"} and (ROOT / "webui/package.json").exists():
             run(["npm", "test"], failures, cwd=ROOT / "webui")
             run(["npm", "run", "build"], failures, cwd=ROOT / "webui")
 
@@ -144,6 +167,8 @@ def check_phase_files(phase: str, failures: list[str]) -> None:
         require_files(BACKEND_FILES, failures)
     if phase == "workspace-session":
         require_files(FRONTEND_SESSION_FILES, failures)
+    if phase == "terminal":
+        require_files(TERMINAL_FILES, failures)
     if phase in {"frontend", "final"}:
         require_files(FRONTEND_FILES, failures)
     if phase == "final":
@@ -153,6 +178,8 @@ def check_phase_files(phase: str, failures: list[str]) -> None:
 def check_phase_patterns(phase: str, failures: list[str]) -> None:
     if phase == "workspace-session":
         require_patterns(WORKSPACE_SESSION_PATTERNS, failures)
+    if phase == "terminal":
+        require_patterns(TERMINAL_PATTERNS, failures)
 
 
 def require_patterns(patterns: dict[str, tuple[str, str]], failures: list[str]) -> None:

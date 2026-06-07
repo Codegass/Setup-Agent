@@ -106,6 +106,51 @@ def test_workspace_session_phase_reports_missing_task_fifteen_patterns(tmp_path,
     assert "missing product-boundary pattern app submits workspace tasks: submitTask" in failures
 
 
+def test_terminal_phase_is_available_as_task_sixteen_acceptance_gate():
+    result = subprocess.run(
+        [sys.executable, "scripts/accept_web_ui.py", "--phase", "terminal", "--skip-commands"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 2, result.stderr
+
+
+def test_terminal_phase_checks_terminal_patterns(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+
+    for path in module.FRONTEND_FILES + module.BACKEND_FILES:
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("", encoding="utf-8")
+
+    for _label, (path, pattern) in module.TERMINAL_PATTERNS.items():
+        target = tmp_path / path
+        target.write_text(target.read_text(encoding="utf-8") + f"\n{pattern}\n", encoding="utf-8")
+
+    failures: list[str] = []
+
+    module.check_phase_patterns("terminal", failures)
+
+    assert failures == []
+
+
+def test_terminal_phase_reports_missing_lazy_terminal_pattern(tmp_path, monkeypatch):
+    module = load_acceptance_module()
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    app_path = tmp_path / "src/sag/web/app.py"
+    app_path.parent.mkdir(parents=True, exist_ok=True)
+    app_path.write_text("/api/workspaces/{workspace_id}/terminal\n", encoding="utf-8")
+
+    failures: list[str] = []
+
+    module.check_phase_patterns("terminal", failures)
+
+    assert "missing product-boundary pattern terminal app injection: terminal_adapter" in failures
+
+
 def test_backend_web_tests_are_expanded_to_concrete_paths(tmp_path, monkeypatch):
     module = load_acceptance_module()
     tests_dir = tmp_path / "tests"
