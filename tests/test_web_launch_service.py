@@ -213,3 +213,44 @@ def test_blank_repo_url_fails_request_validation():
 def test_empty_projects_list_fails_request_validation():
     with pytest.raises(ValueError):
         LaunchBatchRequest(concurrency=None, projects=[])
+
+
+def test_queue_state_reports_defaults_summary_and_batches(tmp_path, monkeypatch):
+    service, _, _ = make_service(tmp_path, cpu_count=8, monkeypatch=monkeypatch)
+    outcome = service.submit_batch(
+        request_for({"repo_url": REPO, "ref": "v1.0"}, concurrency=2)
+    )
+
+    state = service.queue_state()
+
+    assert state["default_concurrency"] == 4  # max(1, min(8 // 2, 4))
+    assert state["summary"] == {
+        "queued": 1,
+        "launching": 0,
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+    }
+    assert len(state["batches"]) == 1
+    batch = state["batches"][0]
+    assert batch["id"] == outcome["batch_id"]
+    assert batch["status"] == "running"
+    assert batch["concurrency"] == 2
+    item = batch["items"][0]
+    assert item["id"] == outcome["accepted"][0]["launch_id"]
+    assert item["repo_url"] == REPO
+    assert item["ref"] == "v1.0"
+    assert item["status"] == "queued"
+    assert item["pid"] is None
+    assert item["exit_code"] is None
+    assert item["error"] is None
+    assert item["process_log"].startswith("logs/project_launches/")
+
+
+def test_queue_state_on_empty_store(tmp_path):
+    service, _, _ = make_service(tmp_path)
+
+    state = service.queue_state()
+
+    assert state["batches"] == []
+    assert sum(state["summary"].values()) == 0
