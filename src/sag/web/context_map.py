@@ -83,6 +83,7 @@ class ContextMapBuilder:
     def _task(self, item: dict[str, Any], index: int) -> ContextTask:
         task_id = str(item.get("id") or item.get("task_id") or f"T{index}")
         branch_data = self._branch_data(task_id)
+        summary = str(item.get("summary") or self._branch_summary(branch_data) or "")
         return ContextTask(
             id=task_id,
             title=str(
@@ -94,11 +95,12 @@ class ContextMapBuilder:
                 or "Untitled task"
             ),
             status=str(item.get("status") or "pending"),
-            summary=str(item.get("summary") or self._branch_summary(branch_data) or ""),
+            summary=summary,
             refs=self._dedupe_refs(
                 [
                     *[self._context_ref(ref) for ref in item.get("refs", [])],
                     *self._branch_refs(branch_data),
+                    *[self._context_ref(ref) for ref in self._output_refs_from_text(summary)],
                 ]
             ),
             recovered=bool(item.get("recovered", False)),
@@ -113,7 +115,9 @@ class ContextMapBuilder:
 
     def _branch_summary(self, data: dict[str, Any]) -> str:
         parts: list[str] = []
-        previous = str(data.get("previous_task_summary") or "").strip()
+        previous = self._clean_internal_output_markers(
+            str(data.get("previous_task_summary") or "")
+        )
         if previous:
             parts.append(previous)
 
@@ -122,6 +126,7 @@ class ContextMapBuilder:
             tool_name = str(action.get("tool_name") or "action")
             outcome = "succeeded" if action.get("success") is True else "failed"
             output = self._full_output_for_history_item(action) or str(action.get("output") or "")
+            output = self._clean_internal_output_markers(output)
             output = self._compact_text(output)
             parts.append(
                 f"{tool_name} {outcome}:\n{output}" if output else f"{tool_name} {outcome}."
@@ -184,8 +189,27 @@ class ContextMapBuilder:
     def _compact_text(self, value: str) -> str:
         return "\n".join(" ".join(line.split()) for line in value.splitlines()).strip()
 
+    def _clean_internal_output_markers(self, value: str) -> str:
+        lines: list[str] = []
+        for line in value.splitlines():
+            stripped = line.strip()
+            if re.match(r"^\.\.\. \[Output truncated:.*\] \.\.\.$", stripped, re.IGNORECASE):
+                continue
+            if re.match(r"^\.\.\. \[Search with:.*\] \.\.\.$", stripped, re.IGNORECASE):
+                continue
+            ref_match = re.match(
+                r"^\.\.\. \[Full output ref:\s*(output_[A-Za-z0-9_-]+)\] \.\.\.$",
+                stripped,
+                re.IGNORECASE,
+            )
+            if ref_match:
+                lines.append(f"Full output ref: {ref_match.group(1)}")
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+
     def _output_refs_from_text(self, value: str) -> list[str]:
-        return re.findall(r"Full output ref:\s*([A-Za-z0-9_-]+)", value)
+        return re.findall(r"\boutput_[A-Za-z0-9_-]+\b", value)
 
     def _full_output_for_history_item(self, item: dict[str, Any]) -> str | None:
         for ref in self._output_refs_from_text(str(item.get("output") or "")):
