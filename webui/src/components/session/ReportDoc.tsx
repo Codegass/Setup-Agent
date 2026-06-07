@@ -1,7 +1,6 @@
-import { ExternalLink, FileText } from "lucide-react"
+import { FileText } from "lucide-react"
 
 import type { ReportDocument } from "@/api/types"
-import { Button } from "@/components/common/Button"
 import { Card, CardHead } from "@/components/common/Card"
 
 export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
@@ -19,12 +18,12 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
         icon={<FileText size={16} className="text-slate-400" />}
         right={
           doc.path ? (
-            <Button asChild size="sm" variant="outline">
-              <a href={doc.path}>
-                <ExternalLink size={13} />
-                Open raw
-              </a>
-            </Button>
+            <span
+              className="block max-w-[280px] truncate rounded-md border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-[10.5px] text-slate-500"
+              title={doc.path}
+            >
+              {doc.path}
+            </span>
           ) : null
         }
         sub={`Generated ${doc.generated}`}
@@ -44,6 +43,19 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
 function ReportBlock({ block }: { block: Record<string, unknown> }) {
   const type = typeof block.type === "string" ? block.type : "unknown"
   const text = typeof block.text === "string" ? block.text : ""
+  const heading = typeof block.heading === "string" ? block.heading : ""
+  const body = typeof block.body === "string" ? block.body : text
+
+  if ((type === "summary" || type === "evidence") && body) {
+    return (
+      <section className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5">
+        {heading ? (
+          <div className="text-[13px] font-semibold text-slate-800">{heading}</div>
+        ) : null}
+        <p className="mt-1 text-[13px] leading-relaxed text-slate-600">{body}</p>
+      </section>
+    )
+  }
 
   if (type === "h1") {
     return <h1 className="text-[20px] font-semibold tracking-tight text-slate-900">{text}</h1>

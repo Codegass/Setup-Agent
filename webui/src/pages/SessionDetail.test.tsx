@@ -93,6 +93,31 @@ describe("SessionDetail", () => {
     expect(screen.getByText("HelpFormatterTest")).toBeInTheDocument()
   })
 
+  it("shows report source paths without linking to unserved workspace files", () => {
+    render(
+      <SessionDetail
+        detail={{
+          ...detail,
+          reportDoc: {
+            title: "setup-report.md",
+            generated: "now",
+            path: ".setup_agent/reports/setup-report.md",
+            blocks: [
+              { type: "h1", text: "Setup report" },
+              { type: "p", text: "Project builds." },
+            ],
+          },
+        }}
+        initialTab="Report"
+        onBack={() => {}}
+        onNewTask={() => {}}
+      />,
+    )
+
+    expect(screen.getByText(".setup_agent/reports/setup-report.md")).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /open raw/i })).not.toBeInTheDocument()
+  })
+
   it("starts a new task from the current session id", () => {
     const onNewTask = vi.fn()
 

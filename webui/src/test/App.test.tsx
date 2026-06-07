@@ -146,6 +146,7 @@ describe("App", () => {
     expect(screen.getByText("Independent workspace shell")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: /^new task$/i }))
+    expect(screen.getByRole("dialog", { name: "New task" })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText("Task description"), {
       target: { value: "Fix HelpFormatter line wrapping" },
     })

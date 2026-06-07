@@ -29,6 +29,14 @@ import { ContextMap } from "@/components/session/ContextMap"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { TestCard } from "@/components/session/TestCard"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
 const workspaceTabs = ["Overview", "Sessions", "Terminal", "Settings"] as const
@@ -565,19 +573,24 @@ function NewTaskModal({
   }
 
   return (
-    <div
-      className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/30 p-4"
-      onClick={onClose}
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose()
+        }
+      }}
     >
-      <Card
-        className="w-full max-w-[520px] shadow-xl"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <CardHead
-          icon={<Plus size={16} className="text-blue-600" />}
-          sub={`Creates a new execution session in ${workspace.id}`}
-          title="New task"
-        />
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[520px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
+        <DialogHeader className="border-b border-slate-100 px-4 py-3">
+          <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-slate-800">
+            <Plus size={16} className="text-blue-600" />
+            New task
+          </DialogTitle>
+          <DialogDescription className="font-mono text-[11px] text-slate-500">
+            Creates a new execution session in {workspace.id}
+          </DialogDescription>
+        </DialogHeader>
         <form className="p-4" onSubmit={handleSubmit}>
           {sourceSession ? (
             <div className="mb-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-[12px] text-blue-700">
@@ -592,6 +605,7 @@ function NewTaskModal({
             Task description
           </label>
           <textarea
+            autoFocus
             className="mt-1.5 w-full resize-none rounded-md border border-slate-200 p-3 text-[13px] text-slate-700 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
             id="workspace-task"
             onChange={(event) => setTask(event.target.value)}
@@ -604,7 +618,7 @@ function NewTaskModal({
             POST /api/workspaces/{workspace.id}/tasks
           </div>
           {error ? <div className="mt-3 text-[12px] text-red-600">{error}</div> : null}
-          <div className="mt-4 flex justify-end gap-2">
+          <DialogFooter className="mt-4 gap-2 sm:space-x-0">
             <Button disabled={submitting} onClick={onClose} type="button" variant="outline">
               Cancel
             </Button>
@@ -612,10 +626,10 @@ function NewTaskModal({
               <Send size={13} />
               {submitting ? "Submitting" : "Submit task"}
             </Button>
-          </div>
+          </DialogFooter>
         </form>
-      </Card>
-    </div>
+      </DialogContent>
+    </Dialog>
   )
 }
 
