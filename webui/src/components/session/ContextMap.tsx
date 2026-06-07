@@ -6,6 +6,17 @@ import { Badge, StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { cn } from "@/lib/utils"
 
+type BranchDetail =
+  | { type: "pair"; label: string; value: string }
+  | { type: "kv"; label: string; value: string }
+  | { type: "text"; value: string }
+
+interface TrunkProgress {
+  done: number
+  total: number
+  percent: number
+}
+
 const taskIcons: Record<string, React.ReactNode> = {
   completed: <Check size={13} className="text-emerald-600" />,
   active: <Activity size={13} className="text-blue-600" />,
@@ -18,8 +29,124 @@ function progressWidth(value: number): string {
   return `${Math.max(0, Math.min(100, bounded))}%`
 }
 
+function trunkProgress(progress: Record<string, number>): TrunkProgress | null {
+  const done = numericProgressValue(progress, ["done", "completed", "complete"])
+  const explicitTotal = numericProgressValue(progress, ["total"])
+  const total =
+    explicitTotal ??
+    Object.entries(progress).reduce((sum, [key, value]) => {
+      if (["done", "completed", "complete"].includes(key.toLowerCase())) {
+        return sum
+      }
+      return sum + safeNumber(value)
+    }, done ?? 0)
+
+  if (done === null || total <= 0) {
+    return null
+  }
+
+  return {
+    done,
+    total,
+    percent: (done / total) * 100,
+  }
+}
+
+function numericProgressValue(progress: Record<string, number>, keys: string[]): number | null {
+  for (const key of keys) {
+    const match = Object.entries(progress).find(
+      ([candidate]) => candidate.toLowerCase() === key,
+    )
+    if (match) {
+      return safeNumber(match[1])
+    }
+  }
+  return null
+}
+
+function safeNumber(value: number): number {
+  return Number.isFinite(value) ? value : 0
+}
+
 function refLabel(ref: Record<string, string>): string {
   return ref.label ?? ref.ref ?? ref.path ?? Object.entries(ref).map(([key, value]) => `${key}:${value}`).join(" ")
+}
+
+function branchDetails(summary: string): BranchDetail[] {
+  const details: BranchDetail[] = []
+  for (const line of summary.split("\n")) {
+    for (const segment of line.split(";")) {
+      const text = segment.trim()
+      if (!text) {
+        continue
+      }
+
+      const kv = text.match(/^([A-Za-z][\w.-]*)=(.+)$/)
+      if (kv) {
+        details.push({ type: "kv", label: kv[1], value: kv[2].trim() })
+        continue
+      }
+
+      const previousTask = text.match(/^Previous task\s+(\([^)]+\)):\s*(.+)$/i)
+      if (previousTask) {
+        details.push({
+          type: "pair",
+          label: "Previous task",
+          value: `${previousTask[1]}: ${previousTask[2].trim()}`,
+        })
+        continue
+      }
+
+      const pair = text.match(/^([^:]{3,56}):\s+(.+)$/)
+      if (pair) {
+        details.push({ type: "pair", label: pair[1].trim(), value: pair[2].trim() })
+        continue
+      }
+
+      details.push({ type: "text", value: text })
+    }
+  }
+  return details
+}
+
+function BranchDetailList({ summary }: { summary: string }) {
+  const details = branchDetails(summary)
+  if (!details.length) {
+    return null
+  }
+
+  return (
+    <div className="space-y-2">
+      {details.map((detail, index) => {
+        if (detail.type === "text") {
+          return (
+            <p key={`${detail.value}-${index}`} className="leading-relaxed text-slate-600">
+              {detail.value}
+            </p>
+          )
+        }
+
+        return (
+          <div
+            key={`${detail.label}-${detail.value}-${index}`}
+            className="grid gap-1 rounded-md bg-slate-50 px-2.5 py-2 sm:grid-cols-[150px_1fr]"
+          >
+            <span className="font-mono text-[10.5px] uppercase tracking-[0.08em] text-slate-400">
+              {detail.label}
+            </span>
+            <span
+              className={cn(
+                "min-w-0 break-words text-[12px] leading-relaxed text-slate-600",
+                detail.type === "kv" && "font-mono",
+              )}
+            >
+              {detail.value}
+            </span>
+          </div>
+        )
+      })}
+    </div>
+  )
 }
 
 export function ContextMap({
@@ -31,7 +158,7 @@ export function ContextMap({
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [debugOpen, setDebugOpen] = useState(false)
-  const progressEntries = Object.entries(ctx.trunk.progress)
+  const progress = trunkProgress(ctx.trunk.progress)
   const hasActiveBranch =
     Boolean(ctx.activeBranch.task.trim()) ||
     Boolean(ctx.activeBranch.why.trim()) ||
@@ -53,21 +180,29 @@ export function ContextMap({
             <StatusBadge status={ctx.trunk.state} />
           </div>
           <p className="mt-2 text-[13px] leading-relaxed text-slate-600">{ctx.trunk.goal}</p>
-          {progressEntries.length ? (
-            <div className="mt-3 space-y-2">
-              {progressEntries.map(([key, value]) => (
-                <div key={key} className="flex items-center gap-3">
-                  <span className="w-24 shrink-0 truncate font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
-                    {key}
-                  </span>
-                  <div className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200">
-                    <div className="h-full bg-blue-500" style={{ width: progressWidth(value) }} />
-                  </div>
-                  <span className="w-12 shrink-0 text-right font-mono text-[11px] text-slate-500">
-                    {value}
-                  </span>
+          {progress ? (
+            <div className="mt-3">
+              <div className="flex items-center gap-3">
+                <span className="w-24 shrink-0 truncate font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                  Done / Total
+                </span>
+                <div
+                  aria-label="Done / Total"
+                  aria-valuemax={progress.total}
+                  aria-valuemin={0}
+                  aria-valuenow={progress.done}
+                  className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200"
+                  role="progressbar"
+                >
+                  <div
+                    className="h-full bg-blue-500"
+                    style={{ width: progressWidth(progress.percent) }}
+                  />
                 </div>
-              ))}
+                <span className="w-16 shrink-0 text-right font-mono text-[11px] text-slate-500">
+                  {progress.done} / {progress.total}
+                </span>
+              </div>
             </div>
           ) : null}
           {!preview && ctx.trunk.summary.trim() ? (
@@ -120,8 +255,8 @@ export function ContextMap({
                 </button>
                 {isOpen && hasDetails ? (
                   <div className="px-2.5 pb-2.5 pl-9">
-                    <div className="rounded-md border border-slate-200 bg-white p-2.5 text-[12px] text-slate-500">
-                      {task.summary}
+                    <div className="max-h-[360px] overflow-auto rounded-md border border-slate-200 bg-white p-2.5 text-[12px] text-slate-500">
+                      <BranchDetailList summary={task.summary} />
                       {task.refs.length ? (
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           {task.refs.map((ref) => (

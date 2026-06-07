@@ -146,6 +146,49 @@ def test_context_map_builder_enriches_task_rows_from_branch_context(tmp_path: Pa
     assert ctx.tasks[0].refs == ["output_old_maven", "output_build_success"]
 
 
+def test_context_map_builder_preserves_full_branch_summary(tmp_path: Path):
+    contexts = tmp_path / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    long_tail = " ".join(f"detail_{index}" for index in range(80))
+    (contexts / "trunk_commons.json").write_text(
+        json.dumps(
+            {
+                "goal": "Set up commons-lang",
+                "todo_list": [
+                    {
+                        "id": "task_5",
+                        "description": "Generate comprehensive setup completion report",
+                        "status": "completed",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (contexts / "task_5.json").write_text(
+        json.dumps(
+            {
+                "task_description": "Generate comprehensive setup completion report",
+                "previous_task_summary": "Previous task (task_4): tests passed.",
+                "history": [
+                    {
+                        "type": "action",
+                        "tool_name": "report",
+                        "success": True,
+                        "output": f"Report generated successfully. {long_tail}",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = ContextMapBuilder(contexts).build()
+
+    assert "detail_79" in ctx.tasks[0].summary
+    assert "..." not in ctx.tasks[0].summary
+
+
 def test_context_map_builder_handles_non_object_trunk_json(tmp_path: Path):
     for index, trunk_root in enumerate((["not", "a", "dict"], "not a dict"), start=1):
         contexts = tmp_path / f"case_{index}" / ".setup_agent" / "contexts"

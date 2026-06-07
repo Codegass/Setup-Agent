@@ -172,9 +172,9 @@ class ContextMapBuilder:
                     refs.append(match)
         return refs
 
-    def _compact_text(self, value: str, limit: int = 220) -> str:
+    def _compact_text(self, value: str) -> str:
         text = " ".join(value.split())
-        return text if len(text) <= limit else f"{text[: limit - 1].rstrip()}..."
+        return text
 
     def _is_active_status(self, status: str) -> bool:
         return status.strip().lower() in {"active", "running", "in_progress"}
