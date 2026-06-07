@@ -17,6 +17,7 @@ from sag.web.context_map import ContextMapBuilder
 from sag.web.models import (
     BuildSummary,
     ContextMap,
+    ContextReference,
     EvidenceGroup,
     EvidenceRecord,
     ExecutionSessionDetail,
@@ -301,8 +302,14 @@ def _backfill_completed_report_task(
     for task in context.tasks:
         if _is_incomplete_final_report_context_task(task):
             refs = [*task.refs]
-            if report_ref and report_ref not in refs:
-                refs.append(report_ref)
+            if report_ref and report_ref not in {ref.ref for ref in refs}:
+                refs.append(
+                    ContextReference(
+                        ref=report_ref,
+                        label=report_ref,
+                        kind="report",
+                    )
+                )
             tasks.append(
                 task.model_copy(
                     update={

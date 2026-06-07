@@ -128,7 +128,7 @@ export interface ContextMap {
     title: string
     status: string
     summary: string
-    refs: string[]
+    refs: Array<ContextReference | string>
     recovered: boolean
   }>
   activeBranch: {
@@ -139,6 +139,17 @@ export interface ContextMap {
     pressure: number
   }
   debug: Record<string, unknown>
+}
+
+export interface ContextReference {
+  ref: string
+  label: string
+  kind?: string
+  tool?: string | null
+  taskId?: string | null
+  timestamp?: string | null
+  content?: string | null
+  contentLength?: number | null
 }
 
 export interface SubmitTaskResponse {

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class WebModel(BaseModel):
@@ -82,13 +82,36 @@ class FileChangeDigest(WebModel):
     items: list[FileChangeItem] = Field(default_factory=list)
 
 
+class ContextReference(WebModel):
+    ref: str
+    label: str
+    kind: str = "output"
+    tool: str | None = None
+    task_id: str | None = Field(default=None, serialization_alias="taskId")
+    timestamp: str | None = None
+    content: str | None = None
+    content_length: int | None = Field(default=None, serialization_alias="contentLength")
+
+
 class ContextTask(WebModel):
     id: str
     title: str
     status: str
     summary: str = ""
-    refs: list[str] = Field(default_factory=list)
+    refs: list[ContextReference] = Field(default_factory=list)
     recovered: bool = False
+
+    @field_validator("refs", mode="before")
+    @classmethod
+    def _coerce_refs(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        return [
+            {"ref": str(ref), "label": str(ref), "kind": "reference"}
+            if isinstance(ref, str)
+            else ref
+            for ref in value
+        ]
 
 
 class TrunkSummary(WebModel):

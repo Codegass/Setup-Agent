@@ -7,12 +7,19 @@ import re
 from pathlib import Path
 from typing import Any
 
-from sag.web.models import ActiveBranchSummary, ContextMap, ContextTask, TrunkSummary
+from sag.web.models import (
+    ActiveBranchSummary,
+    ContextMap,
+    ContextReference,
+    ContextTask,
+    TrunkSummary,
+)
 
 
 class ContextMapBuilder:
     def __init__(self, contexts_dir: Path):
         self.contexts_dir = contexts_dir
+        self._output_records: dict[str, dict[str, Any]] | None = None
 
     def build(self) -> ContextMap | None:
         trunk_path = self._find_trunk()
@@ -88,10 +95,12 @@ class ContextMapBuilder:
             ),
             status=str(item.get("status") or "pending"),
             summary=str(item.get("summary") or self._branch_summary(branch_data) or ""),
-            refs=[
-                *[str(ref) for ref in item.get("refs", [])],
-                *self._branch_refs(branch_data),
-            ],
+            refs=self._dedupe_refs(
+                [
+                    *[self._context_ref(ref) for ref in item.get("refs", [])],
+                    *self._branch_refs(branch_data),
+                ]
+            ),
             recovered=bool(item.get("recovered", False)),
         )
 
@@ -112,9 +121,10 @@ class ContextMapBuilder:
         if action is not None:
             tool_name = str(action.get("tool_name") or "action")
             outcome = "succeeded" if action.get("success") is True else "failed"
-            output = self._compact_text(str(action.get("output") or ""))
+            output = self._full_output_for_history_item(action) or str(action.get("output") or "")
+            output = self._compact_text(output)
             parts.append(
-                f"{tool_name} {outcome}: {output}" if output else f"{tool_name} {outcome}."
+                f"{tool_name} {outcome}:\n{output}" if output else f"{tool_name} {outcome}."
             )
 
         if parts:
@@ -156,25 +166,105 @@ class ContextMapBuilder:
             None,
         )
 
-    def _branch_refs(self, data: dict[str, Any]) -> list[str]:
+    def _branch_refs(self, data: dict[str, Any]) -> list[ContextReference]:
         history = data.get("history")
         if not isinstance(history, list):
             return []
 
-        refs: list[str] = []
+        refs: list[ContextReference] = []
         for item in history:
             if not isinstance(item, dict):
                 continue
-            for match in re.findall(
-                r"Full output ref:\s*([A-Za-z0-9_-]+)", str(item.get("output") or "")
-            ):
-                if match not in refs:
-                    refs.append(match)
+            refs.extend(
+                self._context_ref(match)
+                for match in self._output_refs_from_text(str(item.get("output") or ""))
+            )
         return refs
 
     def _compact_text(self, value: str) -> str:
-        text = " ".join(value.split())
-        return text
+        return "\n".join(" ".join(line.split()) for line in value.splitlines()).strip()
+
+    def _output_refs_from_text(self, value: str) -> list[str]:
+        return re.findall(r"Full output ref:\s*([A-Za-z0-9_-]+)", value)
+
+    def _full_output_for_history_item(self, item: dict[str, Any]) -> str | None:
+        for ref in self._output_refs_from_text(str(item.get("output") or "")):
+            record = self._output_record(ref)
+            content = record.get("output")
+            if isinstance(content, str) and content:
+                return content
+        return None
+
+    def _context_ref(self, value: Any) -> ContextReference:
+        if isinstance(value, dict):
+            ref = str(value.get("ref") or value.get("id") or value.get("path") or "")
+            label = str(value.get("label") or ref)
+            return ContextReference(
+                ref=ref,
+                label=label,
+                kind=str(value.get("kind") or "reference"),
+                tool=str(value.get("tool")) if value.get("tool") is not None else None,
+                task_id=str(value.get("task_id") or value.get("taskId"))
+                if value.get("task_id") or value.get("taskId")
+                else None,
+                timestamp=str(value.get("timestamp")) if value.get("timestamp") is not None else None,
+                content=str(value.get("content")) if value.get("content") is not None else None,
+                content_length=self._int_or_none(value.get("content_length") or value.get("contentLength")),
+            )
+
+        ref = str(value)
+        record = self._output_record(ref)
+        content = record.get("output") if record else None
+        return ContextReference(
+            ref=ref,
+            label=ref,
+            kind="output" if ref.startswith("output_") else "reference",
+            tool=str(record.get("tool_name")) if record.get("tool_name") is not None else None,
+            task_id=str(record.get("task_id")) if record.get("task_id") is not None else None,
+            timestamp=str(record.get("timestamp")) if record.get("timestamp") is not None else None,
+            content=content if isinstance(content, str) else None,
+            content_length=self._int_or_none(record.get("output_length"))
+            or (len(content) if isinstance(content, str) else None),
+        )
+
+    def _dedupe_refs(self, refs: list[ContextReference]) -> list[ContextReference]:
+        deduped: list[ContextReference] = []
+        seen: set[str] = set()
+        for ref in refs:
+            key = ref.ref
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(ref)
+        return deduped
+
+    def _output_record(self, ref: str) -> dict[str, Any]:
+        return self._output_records_by_ref().get(ref, {})
+
+    def _output_records_by_ref(self) -> dict[str, dict[str, Any]]:
+        if self._output_records is not None:
+            return self._output_records
+
+        records: dict[str, dict[str, Any]] = {}
+        path = self.contexts_dir / "full_outputs.jsonl"
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                record = json.loads(line)
+                if isinstance(record, dict) and record.get("ref_id"):
+                    records[str(record["ref_id"])] = record
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        self._output_records = records
+        return records
+
+    def _int_or_none(self, value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def _is_active_status(self, status: str) -> bool:
         return status.strip().lower() in {"active", "running", "in_progress"}

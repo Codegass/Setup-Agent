@@ -19,7 +19,15 @@ const context: ContextMapModel = {
       status: "completed",
       summary:
         "Previous task (task_3): Maven compile passed; build_status=success; project_path=/workspace/commons-lang\nmaven succeeded: BUILD SUCCESS\nFull output ref: output_full_test_log",
-      refs: ["output_full_test_log"],
+      refs: [
+        {
+          ref: "output_full_test_log",
+          label: "output_full_test_log",
+          content: "Full Maven output\nBUILD SUCCESS\nTail line",
+          contentLength: 41,
+          tool: "maven",
+        },
+      ],
       recovered: false,
     },
   ],
@@ -62,5 +70,16 @@ describe("ContextMap", () => {
     expect(screen.getByText("maven succeeded")).toBeInTheDocument()
     expect(screen.getByText("BUILD SUCCESS")).toBeInTheDocument()
     expect(screen.getAllByText("output_full_test_log")).toHaveLength(2)
+  })
+
+  it("opens a full output preview from a branch ref", () => {
+    render(<ContextMap ctx={context} />)
+
+    fireEvent.click(screen.getByRole("button", { name: /task_4/i }))
+    fireEvent.click(screen.getByRole("button", { name: "output_full_test_log" }))
+
+    expect(screen.getByText("Output preview")).toBeInTheDocument()
+    expect(screen.getByText(/Full Maven output/)).toBeInTheDocument()
+    expect(screen.getByText(/Tail line/)).toBeInTheDocument()
   })
 })

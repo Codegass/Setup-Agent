@@ -34,6 +34,13 @@ def test_ui_command_uses_localhost_ephemeral_port_and_live_data_by_default(monke
     assert calls == {"host": "127.0.0.1", "port": 0, "demo": False}
 
 
+def test_version_command_uses_package_version():
+    result = CliRunner().invoke(cli, ["version"])
+
+    assert result.exit_code == 0
+    assert "0.3.0" in result.output
+
+
 def test_run_web_server_mounts_bundled_static_dir(monkeypatch):
     calls = {}
     sentinel_app = object()

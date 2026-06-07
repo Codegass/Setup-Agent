@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
+from sag import __version__
 from sag.agent.context_manager import TaskStatus
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
@@ -3979,28 +3980,8 @@ class ReportTool(BaseTool, UIEventEmitter):
     # ==================== NEW IMPROVED REPORT RENDERING METHODS ====================
 
     def _get_setup_agent_version(self) -> str:
-        """Get the Setup-Agent version from pyproject.toml."""
-        try:
-            import re
-            from pathlib import Path
-
-            # Look for pyproject.toml in the parent directories
-            current = Path(__file__).resolve()
-            for _ in range(5):  # Look up to 5 levels
-                current = current.parent
-                pyproject_path = current / "pyproject.toml"
-                if pyproject_path.exists():
-                    # Simple parsing without requiring tomllib
-                    with open(pyproject_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                        # Look for version = "x.x.x" pattern
-                        match = re.search(r'version\s*=\s*["\']([^"\']+)["\']', content)
-                        if match:
-                            return match.group(1)
-            return "0.1.2"  # Default version if not found
-        except Exception as e:
-            logger.debug(f"Could not read version from pyproject.toml: {e}")
-            return "0.1.2"  # Default version on error
+        """Get the Setup-Agent version used in generated reports."""
+        return __version__
 
     def _render_enhanced_header(
         self, timestamp: str, status: str, project_info: dict, snapshot: dict = None

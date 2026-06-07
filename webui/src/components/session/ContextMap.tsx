@@ -4,6 +4,13 @@ import { useState } from "react"
 import type { ContextMap as ContextMapModel } from "@/api/types"
 import { Badge, StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
 type BranchDetail =
@@ -16,6 +23,8 @@ interface TrunkProgress {
   total: number
   percent: number
 }
+
+type ContextRef = ContextMapModel["tasks"][number]["refs"][number]
 
 const taskIcons: Record<string, React.ReactNode> = {
   completed: <Check size={13} className="text-emerald-600" />,
@@ -70,6 +79,29 @@ function safeNumber(value: number): number {
 
 function refLabel(ref: Record<string, string>): string {
   return ref.label ?? ref.ref ?? ref.path ?? Object.entries(ref).map(([key, value]) => `${key}:${value}`).join(" ")
+}
+
+function contextRefLabel(ref: ContextRef): string {
+  return typeof ref === "string" ? ref : ref.label || ref.ref
+}
+
+function contextRefKey(ref: ContextRef): string {
+  return typeof ref === "string" ? ref : ref.ref
+}
+
+function contextRefContent(ref: ContextRef): string | null {
+  return typeof ref === "string" ? null : ref.content ?? null
+}
+
+function contextRefLength(ref: ContextRef): number | null {
+  if (typeof ref === "string") {
+    return null
+  }
+  return ref.contentLength ?? ref.content?.length ?? null
+}
+
+function contextRefTool(ref: ContextRef): string | null {
+  return typeof ref === "string" ? null : ref.tool ?? null
 }
 
 function branchDetails(summary: string): BranchDetail[] {
@@ -158,6 +190,7 @@ export function ContextMap({
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [debugOpen, setDebugOpen] = useState(false)
+  const [selectedRef, setSelectedRef] = useState<ContextRef | null>(null)
   const progress = trunkProgress(ctx.trunk.progress)
   const hasActiveBranch =
     Boolean(ctx.activeBranch.task.trim()) ||
@@ -260,12 +293,26 @@ export function ContextMap({
                       {task.refs.length ? (
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           {task.refs.map((ref) => (
-                            <span
-                              key={ref}
-                              className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500"
-                            >
-                              {ref}
-                            </span>
+                            contextRefContent(ref) ? (
+                              <button
+                                key={contextRefKey(ref)}
+                                className="rounded bg-blue-50 px-1.5 py-0.5 font-mono text-[10px] text-blue-600 hover:bg-blue-100"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  setSelectedRef(ref)
+                                }}
+                                type="button"
+                              >
+                                {contextRefLabel(ref)}
+                              </button>
+                            ) : (
+                              <span
+                                key={contextRefKey(ref)}
+                                className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500"
+                              >
+                                {contextRefLabel(ref)}
+                              </span>
+                            )
                           ))}
                         </div>
                       ) : null}
@@ -280,6 +327,26 @@ export function ContextMap({
 
       {!preview ? (
         <>
+          <Dialog open={Boolean(selectedRef)} onOpenChange={(open) => !open && setSelectedRef(null)}>
+            <DialogContent className="max-h-[82vh] w-[calc(100vw-2rem)] max-w-[920px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
+              <DialogHeader className="border-b border-slate-100 px-4 py-3">
+                <DialogTitle className="text-[13px] font-semibold text-slate-800">
+                  Output preview
+                </DialogTitle>
+                <DialogDescription className="font-mono text-[11px] text-slate-500">
+                  {selectedRef ? contextRefLabel(selectedRef) : ""}
+                  {selectedRef && contextRefTool(selectedRef) ? ` · ${contextRefTool(selectedRef)}` : ""}
+                  {selectedRef && contextRefLength(selectedRef)
+                    ? ` · ${contextRefLength(selectedRef)} chars`
+                    : ""}
+                </DialogDescription>
+              </DialogHeader>
+              <pre className="max-h-[68vh] overflow-auto whitespace-pre-wrap break-words bg-slate-950 p-4 font-mono text-[11.5px] leading-relaxed text-slate-100">
+                {selectedRef ? contextRefContent(selectedRef) : ""}
+              </pre>
+            </DialogContent>
+          </Dialog>
+
           {hasActiveBranch ? (
             <Card className="p-4">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">

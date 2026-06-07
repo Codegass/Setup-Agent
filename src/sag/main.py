@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from sag import __version__
 from sag.agent.agent import SetupAgent
 from sag.config import (
     Config,
@@ -627,7 +628,9 @@ def ui(host, port, demo):
 @cli.command()
 def version():
     """Show SAG version information."""
-    console.print("[bold blue]SAG[/bold blue] (Setup-Agent) version [green]0.2.0[/green]")
+    console.print(
+        f"[bold blue]SAG[/bold blue] (Setup-Agent) version [green]{__version__}[/green]"
+    )
     console.print("[dim]LLM-powered project setup automation[/dim]")
 
 

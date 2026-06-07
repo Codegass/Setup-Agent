@@ -143,7 +143,7 @@ def test_context_map_builder_enriches_task_rows_from_branch_context(tmp_path: Pa
 
     assert ctx.tasks[0].summary.startswith("Previous task: Java 8 verified.")
     assert "maven succeeded" in ctx.tasks[0].summary
-    assert ctx.tasks[0].refs == ["output_old_maven", "output_build_success"]
+    assert [ref.ref for ref in ctx.tasks[0].refs] == ["output_old_maven", "output_build_success"]
 
 
 def test_context_map_builder_preserves_full_branch_summary(tmp_path: Path):
@@ -187,6 +187,78 @@ def test_context_map_builder_preserves_full_branch_summary(tmp_path: Path):
 
     assert "detail_79" in ctx.tasks[0].summary
     assert "..." not in ctx.tasks[0].summary
+
+
+def test_context_map_builder_resolves_full_output_refs(tmp_path: Path):
+    contexts = tmp_path / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    full_output = "\n".join(
+        [
+            "PROJECT_SETUP SUCCEEDED",
+            "Repository cloned successfully.",
+            "Java Version Required: 17",
+            *[f"deep_detail_{index}" for index in range(80)],
+        ]
+    )
+    (contexts / "full_outputs.jsonl").write_text(
+        json.dumps(
+            {
+                "ref_id": "output_project_setup",
+                "task_id": "task_1",
+                "tool_name": "project_setup",
+                "timestamp": "2026-06-07T00:00:00",
+                "output_length": len(full_output),
+                "output": full_output,
+                "metadata": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (contexts / "trunk_commons.json").write_text(
+        json.dumps(
+            {
+                "goal": "Set up commons-cli",
+                "todo_list": [
+                    {
+                        "id": "task_1",
+                        "description": "Clone repository and setup basic environment",
+                        "status": "completed",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (contexts / "task_1.json").write_text(
+        json.dumps(
+            {
+                "task_description": "Clone repository and setup basic environment",
+                "history": [
+                    {
+                        "type": "action",
+                        "tool_name": "project_setup",
+                        "success": True,
+                        "output": (
+                            "PROJECT_SETUP SUCCEEDED\n"
+                            "Java Version Required:...\n"
+                            "... [Full output ref: output_project_setup] ..."
+                        ),
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = ContextMapBuilder(contexts).build()
+
+    assert "deep_detail_79" in ctx.tasks[0].summary
+    assert "Java Version Required: 17" in ctx.tasks[0].summary
+    assert "Java Version Required:..." not in ctx.tasks[0].summary
+    assert ctx.tasks[0].refs[0].ref == "output_project_setup"
+    assert ctx.tasks[0].refs[0].content == full_output
+    assert ctx.tasks[0].refs[0].content_length == len(full_output)
 
 
 def test_context_map_builder_handles_non_object_trunk_json(tmp_path: Path):

@@ -93,6 +93,16 @@ def _generate_report_with_overlay(overlay_json=None, unreadable_paths=None):
     )
 
 
+def test_report_header_uses_package_version():
+    lines = ReportTool()._render_enhanced_header(
+        "2026-06-06 12:00:00",
+        "success",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+    )
+
+    assert lines[0] == "# 🎯 Project Setup Report v0.3.0"
+
+
 def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
     tool = ReportTool()
 

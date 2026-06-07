@@ -443,7 +443,7 @@ def test_setup_artifact_detail_backfills_final_report_task_from_report_file():
     report_task = detail.context.tasks[1]
     assert report_task.status == "completed"
     assert report_task.summary == "Final setup report generated: setup-report-20260606-213509.md"
-    assert report_task.refs == ["setup-report-20260606-213509.md"]
+    assert [ref.ref for ref in report_task.refs] == ["setup-report-20260606-213509.md"]
     assert detail.context.trunk.progress == {"done": 2, "total": 2}
 
 
