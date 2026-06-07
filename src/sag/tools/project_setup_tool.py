@@ -2,6 +2,7 @@
 
 import os
 import re
+import shlex
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -224,6 +225,7 @@ class ProjectSetupTool(BaseTool):
         repository_url: Optional[str] = None,
         target_directory: Optional[str] = None,
         branch: Optional[str] = None,
+        ref: Optional[str] = None,
         auto_install_deps: bool = True,
         working_directory: str = "/workspace",
         **kwargs,
@@ -235,7 +237,8 @@ class ProjectSetupTool(BaseTool):
             action: Action to perform ('clone', 'detect_project_type', 'install_dependencies', 'analyze_structure')
             repository_url: Git repository URL (required for 'clone')
             target_directory: Directory to clone into (optional, auto-generated if not provided)
-            branch: Git branch to clone (optional, uses default branch if not provided)
+            branch: Legacy branch/ref handle to check out after cloning (optional)
+            ref: Git branch, tag, release tag, or commit hash to check out after cloning
             auto_install_deps: Whether to automatically install dependencies after cloning
             working_directory: Base directory for operations
         """
@@ -263,7 +266,12 @@ class ProjectSetupTool(BaseTool):
         try:
             if action == "clone":
                 return self._clone_repository(
-                    repository_url, target_directory, branch, auto_install_deps, working_directory
+                    repository_url,
+                    target_directory,
+                    branch,
+                    ref,
+                    auto_install_deps,
+                    working_directory,
                 )
             elif action == "detect_project_type":
                 return self._detect_project_type(working_directory)
@@ -289,6 +297,7 @@ class ProjectSetupTool(BaseTool):
         repository_url: str,
         target_directory: str,
         branch: str,
+        ref: Optional[str],
         auto_install_deps: bool,
         working_directory: str,
     ) -> ToolResult:
@@ -309,11 +318,13 @@ class ProjectSetupTool(BaseTool):
         if not target_directory:
             target_directory = repository_url.split("/")[-1].replace(".git", "")
 
+        legacy_branch = branch if branch and not ref else None
+        requested_ref = ref or legacy_branch
+
         # Build git clone command
-        clone_cmd = f"git clone"
-        if branch:
-            clone_cmd += f" -b {branch}"
-        clone_cmd += f" {repository_url} {target_directory}"
+        clone_cmd = (
+            f"git clone {shlex.quote(repository_url)} {shlex.quote(target_directory)}"
+        )
 
         # Check if git is installed
         git_check = self.orchestrator.execute_command("which git", workdir=working_directory)
@@ -357,11 +368,28 @@ class ProjectSetupTool(BaseTool):
                 error_code="CLONE_VERIFICATION_FAILED",
             )
 
+        if requested_ref:
+            checkout_result = self._checkout_ref(
+                clone_path=clone_path,
+                requested_ref=requested_ref,
+                working_directory=working_directory,
+                repository_url=repository_url,
+                target_directory=target_directory,
+            )
+            if checkout_result is not None:
+                return checkout_result
+
+        resolved_commit = self._resolve_commit(clone_path, working_directory)
+
         output = f"✅ Repository cloned successfully!\n\n"
         output += f"📂 Repository: {repository_url}\n"
         output += f"📁 Directory: {clone_path}\n"
-        if branch:
-            output += f"🌿 Branch: {branch}\n"
+        if legacy_branch:
+            output += f"🌿 Branch: {legacy_branch}\n"
+        if requested_ref:
+            output += f"🔖 Ref: {requested_ref}\n"
+        if resolved_commit:
+            output += f"🧾 Commit: {resolved_commit}\n"
 
         # Detect project type
         project_type = self._detect_project_type_in_directory(clone_path)
@@ -383,8 +411,11 @@ class ProjectSetupTool(BaseTool):
             "clone_path": clone_path,
             "project_type": project_type,
             "java_version_required": java_version_required,
-            "branch": branch,
+            "ref": requested_ref,
+            "resolved_commit": resolved_commit,
         }
+        if legacy_branch:
+            metadata["branch"] = legacy_branch
 
         # Auto-install dependencies if requested
         if auto_install_deps and project_type["type"] != "unknown":
@@ -424,6 +455,96 @@ class ProjectSetupTool(BaseTool):
             output += f"• Use bash tool for custom setup commands\n"
 
         return ToolResult(success=True, output=output, metadata=metadata)
+
+    def _checkout_ref(
+        self,
+        *,
+        clone_path: str,
+        requested_ref: str,
+        working_directory: str,
+        repository_url: str,
+        target_directory: str,
+    ) -> Optional[ToolResult]:
+        """Fetch tags and check out the requested repository ref."""
+
+        fetch_cmd = f"git -C {shlex.quote(clone_path)} fetch --tags --force"
+        fetch_result = self.orchestrator.execute_command(fetch_cmd, workdir=working_directory)
+        if fetch_result["exit_code"] != 0:
+            return self._handle_ref_checkout_error(
+                output=fetch_result.get("output", ""),
+                repository_url=repository_url,
+                target_directory=target_directory,
+                clone_path=clone_path,
+                requested_ref=requested_ref,
+                command=fetch_cmd,
+                error_code="REF_FETCH_FAILED",
+            )
+
+        checkout_cmd = (
+            f"git -C {shlex.quote(clone_path)} checkout --detach {shlex.quote(requested_ref)}"
+        )
+        checkout_result = self.orchestrator.execute_command(
+            checkout_cmd, workdir=working_directory
+        )
+        if checkout_result["exit_code"] != 0:
+            return self._handle_ref_checkout_error(
+                output=checkout_result.get("output", ""),
+                repository_url=repository_url,
+                target_directory=target_directory,
+                clone_path=clone_path,
+                requested_ref=requested_ref,
+                command=checkout_cmd,
+                error_code="REF_CHECKOUT_FAILED",
+            )
+
+        return None
+
+    def _resolve_commit(self, clone_path: str, working_directory: str) -> Optional[str]:
+        """Resolve the checked-out commit SHA for traceable setup reports."""
+
+        commit_cmd = f"git -C {shlex.quote(clone_path)} rev-parse HEAD"
+        commit_result = self.orchestrator.execute_command(commit_cmd, workdir=working_directory)
+        if commit_result["exit_code"] != 0:
+            logger.warning(
+                f"Could not resolve git commit for cloned repository: {commit_result.get('output', '')}"
+            )
+            return None
+
+        resolved_commit = commit_result.get("output", "").strip()
+        return resolved_commit or None
+
+    def _handle_ref_checkout_error(
+        self,
+        *,
+        output: str,
+        repository_url: str,
+        target_directory: str,
+        clone_path: str,
+        requested_ref: str,
+        command: str,
+        error_code: str,
+    ) -> ToolResult:
+        """Return a clone result failure when the requested ref cannot be checked out."""
+
+        return ToolResult(
+            success=False,
+            output="",
+            error=f"Failed to check out repository ref '{requested_ref}'",
+            error_code=error_code,
+            suggestions=[
+                "Verify the ref exists as a branch, tag, release tag, or commit in the repository",
+                "For short commit hashes, provide at least enough characters for Git to resolve uniquely",
+                "Try checking the available refs with bash before retrying setup",
+            ],
+            raw_output=output,
+            metadata={
+                "repository_url": repository_url,
+                "target_directory": target_directory,
+                "clone_path": clone_path,
+                "ref": requested_ref,
+                "command": command,
+            },
+        )
 
     def _detect_project_type(self, working_directory: str) -> ToolResult:
         """Detect project type based on files in the directory."""

@@ -78,6 +78,136 @@ class FakeProjectSetupOrchestrator:
         return {"success": True, "output": "", "exit_code": 0}
 
 
+class FakeCloneOrchestrator:
+    def __init__(self, *, checkout_success=True):
+        self.checkout_success = checkout_success
+        self.commands = []
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append((command, workdir, timeout))
+
+        if command == "which git":
+            return {"success": True, "output": "/usr/bin/git\n", "exit_code": 0}
+
+        if command == "git clone https://github.com/apache/commons-cli.git commons-cli":
+            return {"success": True, "output": "Cloning into 'commons-cli'...", "exit_code": 0}
+
+        if command == "ls -la /workspace/commons-cli":
+            return {"success": True, "output": "total 8", "exit_code": 0}
+
+        if command == "git -C /workspace/commons-cli fetch --tags --force":
+            return {"success": True, "output": "", "exit_code": 0}
+
+        if command.startswith("git -C /workspace/commons-cli checkout --detach "):
+            if self.checkout_success:
+                return {
+                    "success": True,
+                    "output": "HEAD is now at ae44dcd release",
+                    "exit_code": 0,
+                }
+            return {
+                "success": False,
+                "output": "error: pathspec 'missing-ref' did not match any file(s) known to git",
+                "exit_code": 1,
+            }
+
+        if command == "git -C /workspace/commons-cli rev-parse HEAD":
+            return {
+                "success": True,
+                "output": "ae44dcdffd28d6a1a32dc4e0801b715adcef162e\n",
+                "exit_code": 0,
+            }
+
+        if command.startswith("find /workspace/commons-cli "):
+            return {
+                "success": True,
+                "output": "/workspace/commons-cli/pom.xml\n",
+                "exit_code": 0,
+            }
+
+        if command == "cat /workspace/commons-cli/pom.xml":
+            return {
+                "success": True,
+                "output": (
+                    "<project><properties><maven.compiler.release>8</maven.compiler.release>"
+                    "</properties></project>"
+                ),
+                "exit_code": 0,
+            }
+
+        return {"success": True, "output": "", "exit_code": 0}
+
+
+def test_project_setup_clone_checks_out_ref_and_records_resolved_commit():
+    orchestrator = FakeCloneOrchestrator()
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        ref="rel/commons-cli-1.11.0",
+        auto_install_deps=False,
+    )
+
+    assert result.success is True
+    assert (
+        "git -C /workspace/commons-cli fetch --tags --force",
+        "/workspace",
+        None,
+    ) in orchestrator.commands
+    assert (
+        "git -C /workspace/commons-cli checkout --detach rel/commons-cli-1.11.0",
+        "/workspace",
+        None,
+    ) in orchestrator.commands
+    assert result.metadata["ref"] == "rel/commons-cli-1.11.0"
+    assert result.metadata["resolved_commit"] == "ae44dcdffd28d6a1a32dc4e0801b715adcef162e"
+    assert "🔖 Ref: rel/commons-cli-1.11.0" in result.output
+    assert "🧾 Commit: ae44dcdffd28d6a1a32dc4e0801b715adcef162e" in result.output
+
+
+def test_project_setup_clone_bad_ref_fails_without_project_detection():
+    orchestrator = FakeCloneOrchestrator(checkout_success=False)
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        ref="missing-ref",
+        auto_install_deps=False,
+    )
+
+    assert result.success is False
+    assert result.error_code == "REF_CHECKOUT_FAILED"
+    assert result.metadata["ref"] == "missing-ref"
+    assert not any(
+        command.startswith("find /workspace/commons-cli ")
+        for command, _, _ in orchestrator.commands
+    )
+
+
+def test_project_setup_legacy_branch_maps_to_ref_when_ref_absent():
+    orchestrator = FakeCloneOrchestrator()
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        branch="rel/commons-cli-1.11.0",
+        auto_install_deps=False,
+    )
+
+    assert result.success is True
+    assert (
+        "git -C /workspace/commons-cli checkout --detach rel/commons-cli-1.11.0",
+        "/workspace",
+        None,
+    ) in orchestrator.commands
+    assert not any("git clone -b" in command for command, _, _ in orchestrator.commands)
+    assert result.metadata["ref"] == "rel/commons-cli-1.11.0"
+    assert result.metadata["branch"] == "rel/commons-cli-1.11.0"
+
+
 def test_maven_dependency_install_registers_java_and_maven_overlay():
     orchestrator = FakeProjectSetupOrchestrator()
     tool = ProjectSetupTool(orchestrator)
