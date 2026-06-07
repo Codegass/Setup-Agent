@@ -104,6 +104,10 @@ function contextRefTool(ref: ContextRef): string | null {
   return typeof ref === "string" ? null : ref.tool ?? null
 }
 
+function findContextRef(refs: ContextRef[], label: string): ContextRef | null {
+  return refs.find((ref) => contextRefKey(ref) === label || contextRefLabel(ref) === label) ?? null
+}
+
 function branchDetails(summary: string): BranchDetail[] {
   const details: BranchDetail[] = []
   for (const line of summary.split("\n")) {
@@ -141,7 +145,52 @@ function branchDetails(summary: string): BranchDetail[] {
   return details
 }
 
-function BranchDetailList({ summary }: { summary: string }) {
+function InlineOutputRefs({
+  refs,
+  text,
+  onOpenRef,
+}: {
+  refs: ContextRef[]
+  text: string
+  onOpenRef: (ref: ContextRef) => void
+}) {
+  const parts = text.split(/\b(output_[A-Za-z0-9_-]+)\b/g)
+
+  return (
+    <>
+      {parts.map((part, index) => {
+        const ref = part.startsWith("output_") ? findContextRef(refs, part) : null
+        if (!ref || !contextRefContent(ref)) {
+          return <span key={`${part}-${index}`}>{part}</span>
+        }
+
+        return (
+          <button
+            key={`${part}-${index}`}
+            className="rounded bg-blue-50 px-1 py-0.5 font-mono text-[11px] text-blue-600 hover:bg-blue-100"
+            onClick={(event) => {
+              event.stopPropagation()
+              onOpenRef(ref)
+            }}
+            type="button"
+          >
+            {part}
+          </button>
+        )
+      })}
+    </>
+  )
+}
+
+function BranchDetailList({
+  refs,
+  summary,
+  onOpenRef,
+}: {
+  refs: ContextRef[]
+  summary: string
+  onOpenRef: (ref: ContextRef) => void
+}) {
   const details = branchDetails(summary)
   if (!details.length) {
     return null
@@ -153,7 +202,7 @@ function BranchDetailList({ summary }: { summary: string }) {
         if (detail.type === "text") {
           return (
             <p key={`${detail.value}-${index}`} className="leading-relaxed text-slate-600">
-              {detail.value}
+              <InlineOutputRefs onOpenRef={onOpenRef} refs={refs} text={detail.value} />
             </p>
           )
         }
@@ -172,7 +221,7 @@ function BranchDetailList({ summary }: { summary: string }) {
                 detail.type === "kv" && "font-mono",
               )}
             >
-              {detail.value}
+              <InlineOutputRefs onOpenRef={onOpenRef} refs={refs} text={detail.value} />
             </span>
           </div>
         )
@@ -289,7 +338,11 @@ export function ContextMap({
                 {isOpen && hasDetails ? (
                   <div className="px-2.5 pb-2.5 pl-9">
                     <div className="max-h-[360px] overflow-auto rounded-md border border-slate-200 bg-white p-2.5 text-[12px] text-slate-500">
-                      <BranchDetailList summary={task.summary} />
+                      <BranchDetailList
+                        onOpenRef={setSelectedRef}
+                        refs={task.refs}
+                        summary={task.summary}
+                      />
                       {task.refs.length ? (
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           {task.refs.map((ref) => (

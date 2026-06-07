@@ -76,10 +76,25 @@ describe("ContextMap", () => {
     render(<ContextMap ctx={context} />)
 
     fireEvent.click(screen.getByRole("button", { name: /task_4/i }))
-    fireEvent.click(screen.getByRole("button", { name: "output_full_test_log" }))
+    const refs = screen.getAllByRole("button", { name: "output_full_test_log" })
+    fireEvent.click(refs[1])
 
     expect(screen.getByText("Output preview")).toBeInTheDocument()
     expect(screen.getByText(/Full Maven output/)).toBeInTheDocument()
     expect(screen.getByText(/Tail line/)).toBeInTheDocument()
+  })
+
+  it("opens a full output preview from an inline output ref in branch details", () => {
+    render(<ContextMap ctx={context} />)
+
+    fireEvent.click(screen.getByRole("button", { name: /task_4/i }))
+    const refs = screen.getAllByRole("button", { name: "output_full_test_log" })
+    expect(refs).toHaveLength(2)
+    const inlineRef = refs[0]
+
+    fireEvent.click(inlineRef)
+
+    expect(screen.getByText("Output preview")).toBeInTheDocument()
+    expect(screen.getByText(/Full Maven output/)).toBeInTheDocument()
   })
 })
