@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { statusMeta } from "./status"
+import { isUsefulEvidenceStatus, statusMeta } from "./status"
 
 describe("statusMeta", () => {
   it("matches the SAG demo status tones", () => {
@@ -25,5 +25,12 @@ describe("statusMeta", () => {
       label: "Waiting-room",
       tone: "neutral",
     })
+  })
+
+  it("suppresses default evidence statuses from noisy surfaces", () => {
+    expect(isUsefulEvidenceStatus("unknown")).toBe(false)
+    expect(isUsefulEvidenceStatus(null)).toBe(false)
+    expect(isUsefulEvidenceStatus("partial")).toBe(true)
+    expect(isUsefulEvidenceStatus("conflict")).toBe(true)
   })
 })

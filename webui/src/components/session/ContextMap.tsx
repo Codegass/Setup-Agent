@@ -3,6 +3,7 @@ import { useState } from "react"
 
 import type { ContextMap as ContextMapModel } from "@/api/types"
 import { Badge, StatusBadge } from "@/components/common/Badge"
+import { isUsefulEvidenceStatus } from "@/components/common/status"
 import { Card } from "@/components/common/Card"
 import {
   Dialog,
@@ -104,13 +105,20 @@ function contextRefTool(ref: ContextRef): string | null {
   return typeof ref === "string" ? null : ref.tool ?? null
 }
 
-function usefulEvidenceStatus(status?: string | null): boolean {
-  const normalized = status?.trim().toLowerCase()
-  return Boolean(normalized && !["unknown", "none"].includes(normalized))
-}
-
 function findContextRef(refs: ContextRef[], label: string): ContextRef | null {
   return refs.find((ref) => contextRefKey(ref) === label || contextRefLabel(ref) === label) ?? null
+}
+
+function dedupeContextRefs(refs: ContextRef[]): ContextRef[] {
+  const seen = new Set<string>()
+  return refs.filter((ref) => {
+    const key = contextRefKey(ref)
+    if (seen.has(key)) {
+      return false
+    }
+    seen.add(key)
+    return true
+  })
 }
 
 function branchDetails(summary: string): BranchDetail[] {
@@ -305,9 +313,12 @@ export function ContextMap({
             const active = task.status.trim().toLowerCase() === "active"
             const conflicts = task.conflicts ?? []
             const evidenceRefs = task.evidenceRefs ?? []
-            const allRefs = [...task.refs, ...evidenceRefs]
+            const allRefs = dedupeContextRefs([...task.refs, ...evidenceRefs])
+            const visibleEvidenceRefs = dedupeContextRefs(evidenceRefs).filter(
+              (ref) => !task.refs.some((taskRef) => contextRefKey(taskRef) === contextRefKey(ref)),
+            )
             const showEvidenceStatus =
-              usefulEvidenceStatus(task.evidenceStatus) ||
+              isUsefulEvidenceStatus(task.evidenceStatus) ||
               conflicts.length > 0 ||
               evidenceRefs.length > 0
             const evidenceStatus = task.evidenceStatus?.trim() || "unknown"
@@ -315,7 +326,7 @@ export function ContextMap({
               Boolean(task.summary.trim()) ||
               task.refs.length > 0 ||
               conflicts.length > 0 ||
-              evidenceRefs.length > 0
+              visibleEvidenceRefs.length > 0
 
             return (
               <div key={task.id} className={cn("rounded-md", active && "bg-blue-50/50 ring-1 ring-blue-100")}>
@@ -404,13 +415,13 @@ export function ContextMap({
                           ))}
                         </div>
                       ) : null}
-                      {evidenceRefs.length ? (
+                      {visibleEvidenceRefs.length ? (
                         <div className="mt-2">
                           <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
                             Evidence refs
                           </div>
                           <div className="flex flex-wrap gap-1.5">
-                            {evidenceRefs.map((ref) => (
+                            {visibleEvidenceRefs.map((ref) => (
                               contextRefContent(ref) ? (
                                 <button
                                   key={contextRefKey(ref)}

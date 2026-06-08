@@ -19,7 +19,8 @@ import type {
   TestSummary,
   WorkspaceSummary,
 } from "@/api/types"
-import { Badge, StatusBadge } from "@/components/common/Badge"
+import { Badge, LabeledStatus, StatusBadge } from "@/components/common/Badge"
+import { isUsefulEvidenceStatus } from "@/components/common/status"
 import { Button } from "@/components/common/Button"
 import { Card, CardHead } from "@/components/common/Card"
 import { Tabs } from "@/components/common/Tabs"
@@ -47,7 +48,7 @@ export interface WorkspaceSessionRow {
   id: string
   title: string
   status: string
-  evidenceStatus: string
+  evidenceStatus?: string | null
   entry: string
   start: string
   duration: string
@@ -222,8 +223,9 @@ function OverviewTab({
                     status={latest?.status ?? (workspace.activeSession ? "active" : "latest")}
                   />
                   <LabeledStatus
+                    hideUnknown
                     label="Evidence status"
-                    status={latest?.evidenceStatus ?? workspace.evidenceStatus ?? "unknown"}
+                    status={latest?.evidenceStatus ?? workspace.evidenceStatus}
                   />
                 </>
               ) : null}
@@ -406,7 +408,9 @@ function SessionsTab({
             </div>
             <div className="flex flex-wrap gap-1.5 lg:flex-col lg:items-start">
               <StatusBadge status={session.status} />
-              <StatusBadge dot={false} status={session.evidenceStatus} />
+              {isUsefulEvidenceStatus(session.evidenceStatus) ? (
+                <StatusBadge dot={false} status={session.evidenceStatus ?? "unknown"} />
+              ) : null}
             </div>
             <div>
               <Badge mono>{session.entry}</Badge>
@@ -463,17 +467,6 @@ function TerminalTab({ workspace }: { workspace: WorkspaceSummary }) {
         </p>
       </div>
     </Card>
-  )
-}
-
-function LabeledStatus({ label, status }: { label: string; status: string }) {
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
-        {label}
-      </span>
-      <StatusBadge status={status} />
-    </span>
   )
 }
 

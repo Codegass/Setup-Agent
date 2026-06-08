@@ -80,6 +80,20 @@ describe("SessionDetail", () => {
     expect(screen.getAllByText("Conflict")).not.toHaveLength(0)
   })
 
+  it("does not render default unknown evidence status as header noise", () => {
+    render(
+      <SessionDetail
+        detail={{ ...detail, evidenceStatus: "unknown" }}
+        onBack={() => {}}
+        onNewTask={() => {}}
+      />,
+    )
+
+    expect(screen.getAllByText("Flow")).not.toHaveLength(0)
+    expect(screen.queryByText("Evidence status")).not.toBeInTheDocument()
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument()
+  })
+
   it("opens evidence and report tabs without changing the default status tab", () => {
     render(
       <SessionDetail

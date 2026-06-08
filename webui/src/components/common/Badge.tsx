@@ -3,7 +3,7 @@ import type * as React from "react"
 import type { Tone } from "@/api/types"
 import { cn } from "@/lib/utils"
 
-import { statusMeta } from "./status"
+import { isUsefulEvidenceStatus, statusMeta } from "./status"
 
 const toneClasses: Record<Tone, string> = {
   neutral: "border-slate-200 bg-slate-100 text-slate-600",
@@ -84,5 +84,29 @@ export function StatusBadge({
       ) : null}
       {label ?? meta.label}
     </Badge>
+  )
+}
+
+export function LabeledStatus({
+  label,
+  status,
+  hideUnknown = false,
+}: {
+  label: string
+  status?: string | null
+  hideUnknown?: boolean
+}) {
+  const normalized = status?.trim() || "unknown"
+  if (hideUnknown && !isUsefulEvidenceStatus(normalized)) {
+    return null
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+        {label}
+      </span>
+      <StatusBadge status={normalized} />
+    </span>
   )
 }

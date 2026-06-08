@@ -49,3 +49,8 @@ export function statusMeta(status: string): StatusMeta {
     tone: "neutral",
   }
 }
+
+export function isUsefulEvidenceStatus(status?: string | null): boolean {
+  const normalized = status?.trim().toLowerCase()
+  return Boolean(normalized && !["unknown", "none"].includes(normalized))
+}

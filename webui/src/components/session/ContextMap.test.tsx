@@ -126,4 +126,35 @@ describe("ContextMap", () => {
     expect(screen.getByText("Output preview")).toBeInTheDocument()
     expect(screen.getByText(/Validator saw one failing test/)).toBeInTheDocument()
   })
+
+  it("does not duplicate evidence refs already folded into task refs", () => {
+    render(
+      <ContextMap
+        ctx={{
+          ...context,
+          tasks: [
+            {
+              ...context.tasks[0],
+              summary: "",
+              refs: [
+                ...context.tasks[0].refs,
+                {
+                  ref: "output_validator_conflict",
+                  label: "validator conflict",
+                  content: "Validator saw one failing test after Maven reported success.",
+                  contentLength: 55,
+                  tool: "test-validator",
+                },
+              ],
+            },
+          ],
+        }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: /task_4/i }))
+
+    expect(screen.getAllByRole("button", { name: "validator conflict" })).toHaveLength(1)
+    expect(screen.queryByText("Evidence refs")).not.toBeInTheDocument()
+  })
 })

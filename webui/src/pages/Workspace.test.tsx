@@ -105,4 +105,25 @@ describe("Workspace", () => {
     expect(screen.getByText("Completed")).toBeInTheDocument()
     expect(screen.getByText("Partial")).toBeInTheDocument()
   })
+
+  it("suppresses default unknown evidence status noise", () => {
+    render(
+      <Workspace
+        latest={{ ...latest, evidenceStatus: "unknown" }}
+        onBack={() => {}}
+        onOpenSession={() => {}}
+        onSubmitTask={vi.fn()}
+        sessions={[{ ...sessions[0], evidenceStatus: "unknown" }]}
+        workspace={{ ...workspace, evidenceStatus: "unknown" }}
+      />,
+    )
+
+    expect(screen.getByText("Flow")).toBeInTheDocument()
+    expect(screen.queryByText("Evidence status")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions 1" }))
+
+    expect(screen.getByText("Completed")).toBeInTheDocument()
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument()
+  })
 })
