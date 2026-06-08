@@ -1,0 +1,167 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-06-07T00:00:00Z",
+  "title": "Design System: SAG Workbench",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Console Blue",
+        "canonical": "oklch(0.55 0.2 255)",
+        "tonalRamp": ["oklch(0.22 0.09 258)", "oklch(0.31 0.13 257)", "oklch(0.40 0.17 256)", "oklch(0.48 0.20 255)", "oklch(0.55 0.20 255)", "oklch(0.66 0.16 255)", "oklch(0.78 0.10 254)", "oklch(0.93 0.03 252)"]
+      },
+      "foreground": {
+        "role": "neutral",
+        "displayName": "Console Ink",
+        "canonical": "oklch(0.208 0.04 265)",
+        "tonalRamp": ["oklch(0.15 0.03 265)", "oklch(0.21 0.04 265)", "oklch(0.30 0.04 264)", "oklch(0.41 0.04 263)", "oklch(0.53 0.03 262)", "oklch(0.66 0.02 260)", "oklch(0.80 0.015 255)", "oklch(0.93 0.008 250)"]
+      },
+      "background": {
+        "role": "neutral",
+        "displayName": "Slate Field",
+        "canonical": "oklch(0.985 0.003 247)",
+        "tonalRamp": ["oklch(0.21 0.02 258)", "oklch(0.31 0.02 255)", "oklch(0.45 0.015 252)", "oklch(0.60 0.012 250)", "oklch(0.74 0.01 249)", "oklch(0.86 0.008 248)", "oklch(0.94 0.005 247)", "oklch(0.985 0.003 247)"]
+      },
+      "muted-foreground": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "oklch(0.47 0.035 263)",
+        "tonalRamp": ["oklch(0.20 0.03 265)", "oklch(0.29 0.035 264)", "oklch(0.38 0.035 263)", "oklch(0.47 0.035 263)", "oklch(0.58 0.03 261)", "oklch(0.70 0.022 257)", "oklch(0.82 0.014 252)", "oklch(0.92 0.008 249)"]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "oklch(0.89 0.012 247)",
+        "tonalRamp": ["oklch(0.40 0.02 255)", "oklch(0.52 0.018 252)", "oklch(0.64 0.016 250)", "oklch(0.74 0.014 249)", "oklch(0.83 0.013 248)", "oklch(0.89 0.012 247)", "oklch(0.94 0.008 247)", "oklch(0.97 0.005 247)"]
+      },
+      "status-running": {
+        "role": "tertiary",
+        "displayName": "Running Blue",
+        "canonical": "oklch(0.488 0.243 264)",
+        "tonalRamp": ["oklch(0.28 0.14 266)", "oklch(0.37 0.19 265)", "oklch(0.45 0.23 264)", "oklch(0.49 0.243 264)", "oklch(0.60 0.20 263)", "oklch(0.72 0.14 261)", "oklch(0.85 0.07 256)", "oklch(0.96 0.02 250)"]
+      },
+      "status-success": {
+        "role": "tertiary",
+        "displayName": "Success Green",
+        "canonical": "oklch(0.596 0.145 163)",
+        "tonalRamp": ["oklch(0.30 0.07 165)", "oklch(0.40 0.10 164)", "oklch(0.50 0.13 163)", "oklch(0.60 0.145 163)", "oklch(0.70 0.13 162)", "oklch(0.80 0.10 161)", "oklch(0.89 0.06 160)", "oklch(0.96 0.02 159)"]
+      },
+      "status-failed": {
+        "role": "tertiary",
+        "displayName": "Failed Red",
+        "canonical": "oklch(0.577 0.245 27)",
+        "tonalRamp": ["oklch(0.32 0.14 28)", "oklch(0.42 0.19 28)", "oklch(0.51 0.23 27)", "oklch(0.58 0.245 27)", "oklch(0.68 0.21 26)", "oklch(0.79 0.15 25)", "oklch(0.89 0.08 23)", "oklch(0.96 0.02 22)"]
+      },
+      "status-attention": {
+        "role": "tertiary",
+        "displayName": "Attention Amber",
+        "canonical": "oklch(0.555 0.163 49)",
+        "tonalRamp": ["oklch(0.31 0.09 52)", "oklch(0.41 0.12 51)", "oklch(0.50 0.15 50)", "oklch(0.56 0.163 49)", "oklch(0.68 0.15 60)", "oklch(0.80 0.11 70)", "oklch(0.90 0.07 80)", "oklch(0.97 0.03 90)"]
+      },
+      "status-idle": {
+        "role": "neutral",
+        "displayName": "Idle Slate",
+        "canonical": "oklch(0.446 0.043 257)",
+        "tonalRamp": ["oklch(0.21 0.02 258)", "oklch(0.31 0.03 257)", "oklch(0.40 0.04 257)", "oklch(0.45 0.043 257)", "oklch(0.58 0.035 255)", "oklch(0.70 0.025 252)", "oklch(0.83 0.015 249)", "oklch(0.94 0.008 247)"]
+      }
+    },
+    "typographyMeta": {
+      "page-title": { "displayName": "Page Title", "purpose": "The single heading per view; text-balance applied." },
+      "metric": { "displayName": "Metric", "purpose": "Large tabular-nums counts in summary stats." },
+      "card-title": { "displayName": "Card Title", "purpose": "Panel and card headers." },
+      "body": { "displayName": "Body", "purpose": "Task descriptions and prose; cap at 65-75ch." },
+      "meta": { "displayName": "Meta", "purpose": "Secondary descriptions and counts." },
+      "label": { "displayName": "Label", "purpose": "Uppercase column headers and field eyebrows; reserve for table headers and badges." },
+      "data": { "displayName": "Data (mono)", "purpose": "Machine identifiers: ids, refs, hashes, paths, PIDs, exit codes." }
+    },
+    "shadows": [
+      { "name": "overlay", "value": "0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)", "purpose": "Dialogs and popovers only; the sole elevated surfaces. Everything else is flat." }
+    ],
+    "motion": [
+      { "name": "state-transition", "value": "200ms cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Ease-out for state changes (hover tints, status shifts, highlight fade)." },
+      { "name": "dialog-pop-in", "value": "200ms ease-out (opacity 0 to 1, scale 0.95 to 1)", "purpose": "Dialog entrance; centered by flex layout so only opacity and scale animate." },
+      { "name": "dialog-pop-out", "value": "150ms ease-in (opacity 1 to 0, scale 1 to 0.95)", "purpose": "Dialog exit." }
+    ],
+    "breakpoints": [
+      { "name": "lg", "value": "1024px", "purpose": "Desktop grid table appears; below this the dashboard collapses to stacked cards." },
+      { "name": "content-max", "value": "1180px", "purpose": "Max content width for the centered app shell." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The single high-emphasis action per view (Launch setups, Submit).",
+      "html": "<button class=\"ds-btn-primary\">Launch setups</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; font: 500 13px Inter, ui-sans-serif, system-ui, sans-serif; color: oklch(0.985 0.003 247); background: oklch(0.55 0.2 255); border: none; border-radius: 6px; cursor: pointer; transition: background 200ms cubic-bezier(0.16,1,0.3,1); } .ds-btn-primary:hover { background: oklch(0.55 0.2 255 / 0.9); } .ds-btn-primary:focus-visible { outline: none; box-shadow: 0 0 0 1px oklch(0.55 0.2 255); }"
+    },
+    {
+      "name": "Outline Button",
+      "kind": "button",
+      "refersTo": "button-outline",
+      "description": "Default secondary action (Refresh, Cancel).",
+      "html": "<button class=\"ds-btn-outline\">Refresh</button>",
+      "css": ".ds-btn-outline { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 12px; font: 500 13px Inter, ui-sans-serif, system-ui, sans-serif; color: oklch(0.24 0.04 265); background: oklch(1 0 0); border: 1px solid oklch(0.89 0.012 247); border-radius: 6px; cursor: pointer; transition: background 200ms ease; } .ds-btn-outline:hover { background: oklch(0.955 0.008 247); } .ds-btn-outline:focus-visible { outline: none; box-shadow: 0 0 0 1px oklch(0.55 0.2 255); }"
+    },
+    {
+      "name": "Status Badge (running)",
+      "kind": "chip",
+      "refersTo": "badge-status",
+      "description": "Pill that maps any status string to one of five status tones via a single vocabulary; a leading dot carries the tone and pulses on live states.",
+      "html": "<span class=\"ds-badge-running\"><span class=\"ds-dot\"></span>Running</span>",
+      "css": ".ds-badge-running { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; font: 500 11px Inter, ui-sans-serif, system-ui, sans-serif; line-height: 1; color: oklch(0.488 0.243 264); background: oklch(0.97 0.02 256); border: 1px solid oklch(0.85 0.07 256); border-radius: 9999px; } .ds-badge-running .ds-dot { width: 6px; height: 6px; border-radius: 9999px; background: oklch(0.62 0.19 256); }"
+    },
+    {
+      "name": "Panel Card",
+      "kind": "card",
+      "refersTo": "card",
+      "description": "Flat surface lifted off the field by a hairline border, no resting shadow.",
+      "html": "<div class=\"ds-card\"><div class=\"ds-card-head\">Launch queue</div><div class=\"ds-card-body\">Web-triggered sag project setups</div></div>",
+      "css": ".ds-card { background: oklch(1 0 0); color: oklch(0.208 0.04 265); border: 1px solid oklch(0.89 0.012 247); border-radius: 8px; box-shadow: none; overflow: hidden; } .ds-card-head { padding: 12px 16px; border-bottom: 1px solid oklch(0.92 0.01 247); font: 600 13px Inter, ui-sans-serif, system-ui, sans-serif; } .ds-card-body { padding: 12px 16px; font: 400 13px Inter, ui-sans-serif, system-ui, sans-serif; color: oklch(0.47 0.035 263); }"
+    },
+    {
+      "name": "Mono Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Field for machine values (repo URL, ref, name); mono text, hairline stroke, blue focus ring.",
+      "html": "<input class=\"ds-input\" placeholder=\"https://github.com/owner/repo.git\" />",
+      "css": ".ds-input { width: 100%; padding: 6px 8px; font: 400 12px ui-monospace, SFMono-Regular, Menlo, monospace; color: oklch(0.24 0.04 265); background: oklch(1 0 0); border: 1px solid oklch(0.89 0.012 247); border-radius: 6px; outline: none; transition: border-color 150ms ease, box-shadow 150ms ease; } .ds-input::placeholder { color: oklch(0.6 0.02 256); } .ds-input:focus { border-color: oklch(0.55 0.2 255); box-shadow: 0 0 0 2px oklch(0.55 0.2 255 / 0.2); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Instrument Panel",
+    "overview": "SAG Workbench is read the way a pilot reads a console: a dense field of instruments where nothing draws the eye until something is wrong. The surface is a near-white slate, the chrome is hairline, and the only saturated color on screen belongs to live state. A healthy fleet of workspaces should look almost monochrome; a failed setup should be the one lit gauge you cannot miss. Type does the structural work that ornament does elsewhere, and monospace carries the engineering payload. The system rejects the generic SaaS analytics dashboard and refuses to hide engineering detail behind gloss. The mood is observant, precise, and unhurried.",
+    "keyCharacteristics": [
+      "Status earns color; everything else is slate and ink.",
+      "Monospace is a first-class voice for machine identifiers, not an accent.",
+      "Flat by default; depth appears only on overlays and on hover.",
+      "Dense but legible: many rows are welcome, hierarchy keeps them scannable.",
+      "Light is the shipping theme; a full dark palette is wired and supported, awaiting a switch."
+    ],
+    "rules": [
+      { "name": "The Signal Rule", "body": "Saturated color belongs to state and to the single primary action only. If a hue on screen is not reporting status or marking the primary action, it is wrong. A dashboard of healthy workspaces should read as nearly grayscale.", "section": "colors" },
+      { "name": "The Hairline Rule", "body": "Structure is carried by 1px borders in Hairline, not by shadow and not by fills. Colored side-stripe borders are forbidden.", "section": "colors" },
+      { "name": "The Mono Payload Rule", "body": "Every machine-generated identifier (id, ref, hash, path, PID, exit code) is set in the mono face. Prose and human labels are Inter. The two voices never cross.", "section": "typography" },
+      { "name": "The Flat-By-Default Rule", "body": "Surfaces are flat at rest. Borders do the separating; shadow is reserved for elements that genuinely float (dialogs, popovers). If a card has a resting drop shadow, it is wrong.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do keep saturated color for status and the single primary action only; a healthy dashboard should read nearly grayscale.",
+      "Do set every machine identifier in the mono face, and all prose and human labels in Inter.",
+      "Do separate surfaces with 1px Hairline borders; reserve shadow for dialogs and popovers.",
+      "Do route every status string through statusMeta so a state maps to the same tone everywhere.",
+      "Do keep Muted Ink as the lightest text used for content; lighter slates are for icons and separators only.",
+      "Do show engineering detail plainly; exit codes, paths, and refs are content, not noise."
+    ],
+    "donts": [
+      "Don't build the generic SaaS analytics dashboard: no hero-metric template, no identical card grids, no gradient accents, no decorative illustration.",
+      "Don't hide engineering detail behind gloss.",
+      "Don't use background-clip: text gradients or any gradient as accent.",
+      "Don't put a resting drop shadow on a card.",
+      "Don't use colored side-stripe borders greater than 1px on cards, rows, or alerts.",
+      "Don't nest cards inside cards.",
+      "Don't use the 10px uppercase tracked label as the voice for every piece of text.",
+      "Don't let saturated color appear on inactive or healthy states."
+    ]
+  }
+}
