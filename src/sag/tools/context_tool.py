@@ -29,6 +29,9 @@ class ContextTool(BaseTool):
         summary: Optional[str] = None,
         new_context: Optional[List[Dict[str, Any]]] = None,
         key_results: Optional[str] = None,
+        evidence_refs: Optional[List[str]] = None,
+        evidence_status: Optional[str] = None,
+        conflicts: Optional[List[str]] = None,
         force: bool = False,
     ) -> ToolResult:
         """
@@ -41,6 +44,9 @@ class ContextTool(BaseTool):
             summary: Summary of work done (required for 'complete_task', 'complete_with_results')
             new_context: Compacted context history (required for 'compact_context')
             key_results: Key results to record (required for 'complete_with_results')
+            evidence_refs: Optional raw/tool/validator refs backing the task result
+            evidence_status: Optional agent claim for evidence quality/status
+            conflicts: Optional contradiction IDs discovered during the task
             force: Force completion even if validation fails (use with caution)
         """
 
@@ -121,7 +127,14 @@ class ContextTool(BaseTool):
             elif action in ["complete_task", "switch_to_trunk"]:
                 return self._complete_task(summary)
             elif action == "complete_with_results":
-                return self._complete_task_with_results(summary, key_results, force)
+                return self._complete_task_with_results(
+                    summary,
+                    key_results,
+                    evidence_refs=evidence_refs,
+                    evidence_status=evidence_status,
+                    conflicts=conflicts,
+                    force=force,
+                )
 
         except Exception as e:
             raise ToolError(
@@ -553,7 +566,13 @@ class ContextTool(BaseTool):
             )
 
     def _complete_task_with_results(
-        self, summary: Optional[str], key_results: Optional[str], force: bool = False
+        self,
+        summary: Optional[str],
+        key_results: Optional[str],
+        evidence_refs: Optional[List[str]] = None,
+        evidence_status: Optional[str] = None,
+        conflicts: Optional[List[str]] = None,
+        force: bool = False,
     ) -> ToolResult:
         """
         Complete current task with key results recording - ATOMIC operation to prevent state/action separation.
@@ -563,6 +582,9 @@ class ContextTool(BaseTool):
         Args:
             summary: Summary of what was accomplished
             key_results: Key results to record for future tasks
+            evidence_refs: Optional raw/tool/validator refs backing the task result
+            evidence_status: Optional agent claim for evidence quality/status
+            conflicts: Optional contradiction IDs discovered during the task
             force: Override validation failures (use with caution)
         """
         if not summary:
@@ -728,6 +750,12 @@ class ContextTool(BaseTool):
             # Perform all updates on the fresh context
             fresh_trunk_context.update_task_status(current_task_id, TaskStatus.COMPLETED, summary)
             fresh_trunk_context.update_task_key_results(current_task_id, key_results)
+            fresh_trunk_context.update_task_evidence(
+                current_task_id,
+                evidence_status=evidence_status,
+                evidence_refs=evidence_refs or [],
+                conflicts=conflicts or [],
+            )
 
             # Save once with all updates
             self.context_manager._save_trunk_context(fresh_trunk_context)
@@ -779,6 +807,9 @@ class ContextTool(BaseTool):
             enhanced_result.update(
                 {
                     "key_results": key_results,
+                    "evidence_status": evidence_status,
+                    "evidence_refs": evidence_refs or [],
+                    "conflicts": conflicts or [],
                     "atomic_completion": True,
                     "completion_method": "complete_with_results",
                 }
@@ -923,7 +954,9 @@ Context Management Tool Usage Examples (Enhanced with Human-Friendly TODO List):
 5. Complete task with validation (RECOMMENDED - atomic):
    manage_context(action="complete_with_results", 
                   summary="Successfully built all modules with Maven", 
-                  key_results="BUILD SUCCESS: All 15 modules compiled without errors. Tests: 247 passed, 0 failed.")
+                  key_results="BUILD SUCCESS: All 15 modules compiled without errors. Tests: 247 passed, 0 failed.",
+                  evidence_status="success",
+                  evidence_refs=["maven_stdout", "surefire_xml"])
 
    🚨 CRITICAL for CORE SETUP tasks: Summary and key_results MUST include explicit success confirmation!
 
@@ -946,6 +979,7 @@ ENHANCED FEATURES:
 IMPORTANT:
 • USE complete_with_results instead of complete_task - it's ATOMIC and prevents state/action separation!
 • key_results should be specific and useful for next tasks (file locations, build results, test outcomes)
+• complete_with_results accepts optional evidence_status, evidence_refs, and conflicts fields and stores them with the task
 • CORE SETUP tasks are CRITICAL - provide explicit success confirmation
 • Context switching is AUTOMATIC when you use start_task and complete_with_results
 • The key_results from previous tasks will be available to guide your next task
@@ -990,6 +1024,24 @@ IMPORTANT:
                 "key_results": {
                     "type": "string",
                     "description": "Key results to record for future tasks (required for complete_with_results)",
+                    "default": None,
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional raw/tool/validator refs backing the task result",
+                    "default": None,
+                },
+                "evidence_status": {
+                    "type": "string",
+                    "enum": ["success", "partial", "blocked", "conflict", "unknown"],
+                    "description": "Optional agent claim; validator/context may refine it",
+                    "default": None,
+                },
+                "conflicts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional contradiction ids discovered during the task",
                     "default": None,
                 },
                 "new_context": {

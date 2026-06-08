@@ -1,5 +1,6 @@
 from sag.agent.context_manager import ContextManager, TaskStatus
 from sag.evidence import EvidenceStatus
+from sag.tools.context_tool import ContextTool
 
 
 def test_trunk_task_records_narrative_and_evidence(tmp_path):
@@ -138,3 +139,32 @@ def test_get_current_context_info_branch_includes_evidence_fields(tmp_path):
 
     assert "task_1 evidence_status: partial" in info["previous_task_evidence_digest"]
     assert info["current_task_evidence_refs"] == ["output_test"]
+
+
+def test_complete_with_results_preserves_narrative_and_evidence(tmp_path):
+    manager = ContextManager(workspace_path=str(tmp_path))
+    trunk = manager.create_trunk_context(
+        goal="Set up project",
+        project_url="https://example.test/demo",
+        project_name="demo",
+    )
+    task_id = trunk.add_task("Record setup evidence")
+    manager._save_trunk_context(trunk)
+    manager.start_new_branch(task_id)
+    tool = ContextTool(manager)
+
+    result = tool.execute(
+        action="complete_with_results",
+        summary="Maven test command exited zero after ignoring failures.",
+        key_results="Tests: 206 / 214 passed, 96.3% pass rate, 3 failed, 5 skipped.",
+        evidence_status="partial",
+        evidence_refs=["output_abc", "surefire_xml"],
+    )
+
+    assert result.success is True
+    reloaded = manager.load_trunk_context()
+    task = reloaded.todo_list[0]
+    assert task.status.value == "completed"
+    assert task.key_results.startswith("Tests: 206 / 214 passed")
+    assert task.evidence_status.value == "partial"
+    assert task.evidence_refs == ["output_abc", "surefire_xml"]
