@@ -255,6 +255,10 @@ def test_setup_artifact_evidence_status_prefers_report_result_and_task_evidence(
     assert _setup_evidence_status({}, [{"status": "completed"}], None) == "unknown"
 
 
+def test_setup_artifact_evidence_status_reads_plain_result_token():
+    assert _setup_evidence_status({}, [], "Result: SUCCESS\n") == "success"
+
+
 def test_setup_artifact_evidence_status_ignores_generic_status_table_prose():
     report_raw = "| Status | Build succeeded; no blocked tasks |\n"
 
