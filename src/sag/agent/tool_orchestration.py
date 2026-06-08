@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
+from sag.evidence import EvidenceStatus
 from sag.tools.base import BaseTool, ToolResult
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
@@ -131,11 +132,41 @@ def _format_maven_version_contract(result: ToolResult) -> str:
     return "\n".join(lines)
 
 
+def _format_evidence_observation(result: ToolResult) -> list[str]:
+    status = result.status
+    status_value = status.value if isinstance(status, EvidenceStatus) else str(status)
+    include_status = bool(
+        status
+        and (
+            status != EvidenceStatus.SUCCESS
+            or result.evidence_refs
+            or result.conflicts
+            or result.test_stats
+        )
+    )
+
+    lines: list[str] = []
+    if include_status:
+        lines.append(f"Evidence status: {status_value}")
+    if result.evidence_refs:
+        lines.append(f"Evidence refs: {', '.join(result.evidence_refs)}")
+    if result.conflicts:
+        lines.append(f"Conflicts: {', '.join(result.conflicts)}")
+    if result.test_stats:
+        lines.append(f"Test stats: {result.test_stats.as_summary()}")
+    return lines
+
+
 def format_tool_result(tool_name: str, result: ToolResult) -> str:
     """Format tool result for observation. Output truncation is now handled in BaseTool."""
+    evidence_lines = _format_evidence_observation(result)
+
     if result.success:
         # For successful results, preserve key status information
         formatted = f"✅ {tool_name} executed successfully"
+
+        if evidence_lines:
+            formatted += "\n" + "\n".join(evidence_lines)
 
         # Add command information for bash tool
         if tool_name == "bash" and result.metadata and "command" in result.metadata:
@@ -161,6 +192,9 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         # For failed results, show error and suggestions
         error_msg = result.error if result.error else "Unknown error occurred"
         formatted = f"❌ {tool_name} failed: {error_msg}"
+
+        if evidence_lines:
+            formatted += "\n" + "\n".join(evidence_lines)
 
         # Add command information for failed bash tool
         if tool_name == "bash" and result.metadata and "command" in result.metadata:

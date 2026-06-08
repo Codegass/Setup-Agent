@@ -1,3 +1,5 @@
+from sag.agent.tool_orchestration import format_tool_result
+from sag.evidence import EvidenceStatus, TestStats
 from sag.agent.tool_orchestration import (
     ParameterFix,
     ToolCall,
@@ -70,3 +72,32 @@ def test_lifecycle_event_is_ui_agnostic_metadata_carrier():
 
     assert event.event_type == "tool_start"
     assert event.metadata["raw_params"] == {"path": "README.md"}
+
+
+def test_tool_observation_includes_evidence_status_refs_and_conflicts():
+    result = ToolResult(
+        success=True,
+        status=EvidenceStatus.PARTIAL,
+        output="Maven exited zero but tests failed.",
+        evidence_refs=["output_abc"],
+        conflicts=["maven_success_vs_surefire_failures"],
+    )
+
+    observation = format_tool_result("maven", result)
+
+    assert "Evidence status: partial" in observation
+    assert "Evidence refs: output_abc" in observation
+    assert "Conflicts: maven_success_vs_surefire_failures" in observation
+
+
+def test_tool_observation_includes_test_stats_summary_when_present():
+    result = ToolResult(
+        success=True,
+        status=EvidenceStatus.PARTIAL,
+        output="Maven exited zero but tests failed.",
+        test_stats=TestStats(executed=214, passed=206, failed=3, skipped=5),
+    )
+
+    observation = format_tool_result("maven", result)
+
+    assert "Test stats: 206 / 214 passed, 96.3% pass rate, 3 failed, 5 skipped" in observation

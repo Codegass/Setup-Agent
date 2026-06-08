@@ -2,6 +2,7 @@ from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
 from sag.config.prompt_loader import load_react_engine_prompts
+from sag.evidence import EvidenceStatus
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType
 
@@ -370,6 +371,40 @@ def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator(
     observation_events = [event for event in emitted if event[0][0] == EventType.AGENT_OBSERVATION]
     assert len(observation_events) == 1
     assert "echo executed successfully" in observation_events[0][1]["message"]
+
+
+def test_execute_steps_forces_thinking_after_partial_status_without_success(monkeypatch):
+    result = ToolResult(success=False, status=EvidenceStatus.PARTIAL, output="needs review")
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: example",
+        tool_name="example",
+        tool_params={"command": "pwd"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="example", raw_params={"command": "pwd"}),
+        result=result,
+        status="recovery_attempted",
+        raw_params={"command": "pwd"},
+        validated_params={"command": "pwd"},
+        executed_params={"command": "pwd"},
+        observation_text="formatted observation",
+        attempted_execution=True,
+    )
+    engine = _engine_with_context()
+    engine.tools = {}
+
+    class FakeOrchestrator:
+        def execute(self, call):
+            engine.seen_call = call
+            return execution
+
+    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
+
+    assert engine._execute_steps([step]) is True
+    assert engine._force_thinking_after_success is True
 
 
 def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():

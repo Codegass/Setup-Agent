@@ -7,6 +7,7 @@ from loguru import logger
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
+from sag.evidence import EvidenceStatus
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
@@ -467,10 +468,16 @@ class ReActEngine(UIEventEmitter):
                 self._add_observation_step(execution.observation_text)
 
                 # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
-                if result.success:
+                evidence_status = result.status
+                should_force_thinking = result.success or evidence_status in {
+                    EvidenceStatus.PARTIAL,
+                    EvidenceStatus.CONFLICT,
+                    EvidenceStatus.UNKNOWN,
+                }
+                if should_force_thinking:
                     self._force_thinking_after_success = True
                     logger.debug(
-                        f"✅ Tool {step.tool_name} succeeded - forcing thinking on next iteration"
+                        f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
                     )
 
                 # Log to branch context if we're in one
