@@ -17,6 +17,7 @@ const context: ContextMapModel = {
       id: "task_4",
       title: "Run tests using Maven",
       status: "completed",
+      evidenceStatus: "conflict",
       summary:
         "Previous task (task_3): Maven compile passed; build_status=success; project_path=/workspace/commons-lang\nmaven succeeded: BUILD SUCCESS\nFull output ref: output_full_test_log",
       refs: [
@@ -28,6 +29,16 @@ const context: ContextMapModel = {
           tool: "maven",
         },
       ],
+      evidenceRefs: [
+        {
+          ref: "output_validator_conflict",
+          label: "validator conflict",
+          content: "Validator saw one failing test after Maven reported success.",
+          contentLength: 55,
+          tool: "test-validator",
+        },
+      ],
+      conflicts: ["Maven summary says success but validator found one failed test."],
       recovered: false,
     },
   ],
@@ -96,5 +107,23 @@ describe("ContextMap", () => {
 
     expect(screen.getByText("Output preview")).toBeInTheDocument()
     expect(screen.getByText(/Full Maven output/)).toBeInTheDocument()
+  })
+
+  it("shows task evidence status, conflicts, and evidence reference previews", () => {
+    render(<ContextMap ctx={context} />)
+
+    expect(screen.getByText("Conflict")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /task_4/i }))
+
+    expect(screen.getByText("Conflicts")).toBeInTheDocument()
+    expect(
+      screen.getByText("Maven summary says success but validator found one failed test."),
+    ).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "validator conflict" }))
+
+    expect(screen.getByText("Output preview")).toBeInTheDocument()
+    expect(screen.getByText(/Validator saw one failing test/)).toBeInTheDocument()
   })
 })

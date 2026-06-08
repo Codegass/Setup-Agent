@@ -6,9 +6,22 @@ function percent(value: number, total: number): string {
   return `${Math.max(0, Math.min(100, (value / total) * 100))}%`
 }
 
+function formatPercent(value: number): string {
+  return `${new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: 1,
+    minimumFractionDigits: Number.isInteger(value) ? 0 : 1,
+  }).format(value)}%`
+}
+
+function finiteRate(value?: number | null): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null
+}
+
 export function TestCard({ test }: { test: TestSummary }) {
   const hasTests = test.total > 0
-  const passRate = hasTests ? Math.round((test.pass / test.total) * 100) : 0
+  const computedPassRate = hasTests ? Math.round((test.pass / test.total) * 100) : null
+  const passRate = finiteRate(test.passRate) ?? computedPassRate
+  const executionRate = finiteRate(test.executionRate)
 
   return (
     <Card className="p-4">
@@ -38,7 +51,12 @@ export function TestCard({ test }: { test: TestSummary }) {
         <span className="text-emerald-600">{test.pass} pass</span>
         <span className={test.fail ? "text-red-600" : "text-slate-500"}>{test.fail} fail</span>
         <span className="text-slate-500">{test.skip} skip</span>
-        {hasTests ? <span className="text-slate-500">{passRate}% pass rate</span> : null}
+        {passRate !== null ? (
+          <span className="text-slate-500">{formatPercent(passRate)} pass rate</span>
+        ) : null}
+        {executionRate !== null ? (
+          <span className="text-slate-500">{formatPercent(executionRate)} executed</span>
+        ) : null}
       </div>
       {test.note ? <div className="mt-2 text-[12px] text-slate-500">{test.note}</div> : null}
     </Card>

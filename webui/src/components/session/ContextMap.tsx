@@ -104,6 +104,11 @@ function contextRefTool(ref: ContextRef): string | null {
   return typeof ref === "string" ? null : ref.tool ?? null
 }
 
+function usefulEvidenceStatus(status?: string | null): boolean {
+  const normalized = status?.trim().toLowerCase()
+  return Boolean(normalized && !["unknown", "none"].includes(normalized))
+}
+
 function findContextRef(refs: ContextRef[], label: string): ContextRef | null {
   return refs.find((ref) => contextRefKey(ref) === label || contextRefLabel(ref) === label) ?? null
 }
@@ -298,7 +303,19 @@ export function ContextMap({
           {ctx.tasks.map((task) => {
             const isOpen = expanded[task.id] ?? false
             const active = task.status.trim().toLowerCase() === "active"
-            const hasDetails = Boolean(task.summary.trim()) || task.refs.length > 0
+            const conflicts = task.conflicts ?? []
+            const evidenceRefs = task.evidenceRefs ?? []
+            const allRefs = [...task.refs, ...evidenceRefs]
+            const showEvidenceStatus =
+              usefulEvidenceStatus(task.evidenceStatus) ||
+              conflicts.length > 0 ||
+              evidenceRefs.length > 0
+            const evidenceStatus = task.evidenceStatus?.trim() || "unknown"
+            const hasDetails =
+              Boolean(task.summary.trim()) ||
+              task.refs.length > 0 ||
+              conflicts.length > 0 ||
+              evidenceRefs.length > 0
 
             return (
               <div key={task.id} className={cn("rounded-md", active && "bg-blue-50/50 ring-1 ring-blue-100")}>
@@ -328,6 +345,7 @@ export function ContextMap({
                   </span>
                   {task.recovered ? <Badge tone="amber">recovered</Badge> : null}
                   {active ? <Badge tone="blue">active branch</Badge> : null}
+                  {showEvidenceStatus ? <StatusBadge dot={false} status={evidenceStatus} /> : null}
                   {hasDetails ? (
                     <ChevronDown
                       className={cn("ml-auto shrink-0 text-slate-300 transition-transform", isOpen && "rotate-180")}
@@ -340,9 +358,26 @@ export function ContextMap({
                     <div className="max-h-[360px] overflow-auto rounded-md border border-slate-200 bg-white p-2.5 text-[12px] text-slate-500">
                       <BranchDetailList
                         onOpenRef={setSelectedRef}
-                        refs={task.refs}
+                        refs={allRefs}
                         summary={task.summary}
                       />
+                      {conflicts.length ? (
+                        <div className="mt-2 rounded-md border border-red-100 bg-red-50/50 px-2.5 py-2">
+                          <div className="font-mono text-[10px] uppercase tracking-[0.12em] text-red-500">
+                            Conflicts
+                          </div>
+                          <ul className="mt-1 space-y-1">
+                            {conflicts.map((conflict, index) => (
+                              <li
+                                key={`${conflict}-${index}`}
+                                className="break-words text-[12px] leading-relaxed text-slate-600"
+                              >
+                                {conflict}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
                       {task.refs.length ? (
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           {task.refs.map((ref) => (
@@ -367,6 +402,37 @@ export function ContextMap({
                               </span>
                             )
                           ))}
+                        </div>
+                      ) : null}
+                      {evidenceRefs.length ? (
+                        <div className="mt-2">
+                          <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                            Evidence refs
+                          </div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {evidenceRefs.map((ref) => (
+                              contextRefContent(ref) ? (
+                                <button
+                                  key={contextRefKey(ref)}
+                                  className="rounded bg-blue-50 px-1.5 py-0.5 font-mono text-[10px] text-blue-600 hover:bg-blue-100"
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    setSelectedRef(ref)
+                                  }}
+                                  type="button"
+                                >
+                                  {contextRefLabel(ref)}
+                                </button>
+                              ) : (
+                                <span
+                                  key={contextRefKey(ref)}
+                                  className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500"
+                                >
+                                  {contextRefLabel(ref)}
+                                </span>
+                              )
+                            ))}
+                          </div>
                         </div>
                       ) : null}
                     </div>

@@ -13,6 +13,8 @@ export interface TestSummary {
   fail: number
   skip: number
   total: number
+  passRate?: number | null
+  executionRate?: number | null
   note?: string
 }
 
@@ -36,6 +38,7 @@ export interface WorkspaceSummary {
   task: string
   build: BuildSummary | string
   test: TestSummary
+  evidenceStatus?: string | null
   report: string
   changed: number
   activeSession?: string | null
@@ -55,6 +58,7 @@ export interface ExecutionSessionSummary {
   duration: string
   build: string
   test: TestSummary
+  evidenceStatus?: string | null
   report: string
   files: number
   evidence: number
@@ -91,6 +95,7 @@ export interface ExecutionSessionDetail {
   start: string
   duration: string
   outcome: string
+  evidenceStatus?: string | null
   build: BuildSummary
   test: TestSummary
   report: string
@@ -127,8 +132,11 @@ export interface ContextMap {
     id: string
     title: string
     status: string
+    evidenceStatus?: string | null
     summary: string
     refs: Array<ContextReference | string>
+    evidenceRefs?: Array<ContextReference | string> | null
+    conflicts?: string[] | null
     recovered: boolean
   }>
   activeBranch: {

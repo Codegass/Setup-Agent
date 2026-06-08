@@ -10,6 +10,7 @@ const detail: ExecutionSessionDetail = {
   workspace: "sag-commons-cli",
   title: "Build project and execute full test suite",
   status: "running",
+  evidenceStatus: "conflict",
   entry: "CLI",
   start: "02:14:08",
   duration: "running · 2m 11s",
@@ -73,6 +74,10 @@ describe("SessionDetail", () => {
     expect(screen.getByText("Build project and execute full test suite")).toBeInTheDocument()
     expect(screen.getByText("312")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Status" })).toBeInTheDocument()
+    expect(screen.getAllByText("Flow")).not.toHaveLength(0)
+    expect(screen.getAllByText("Evidence status")).not.toHaveLength(0)
+    expect(screen.getAllByText("Running")).not.toHaveLength(0)
+    expect(screen.getAllByText("Conflict")).not.toHaveLength(0)
   })
 
   it("opens evidence and report tabs without changing the default status tab", () => {

@@ -16,6 +16,8 @@ describe("statusMeta", () => {
     expect(statusMeta("pending")).toEqual({ label: "Pending", tone: "neutral" })
     expect(statusMeta("none")).toEqual({ label: "—", tone: "neutral" })
     expect(statusMeta("fail")).toEqual({ label: "Failed", tone: "red" })
+    expect(statusMeta("conflict")).toEqual({ label: "Conflict", tone: "red" })
+    expect(statusMeta("unknown")).toEqual({ label: "Unknown", tone: "neutral" })
   })
 
   it("normalizes unknown status labels without changing their tone", () => {

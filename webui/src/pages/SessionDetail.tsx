@@ -46,7 +46,8 @@ export function SessionDetail({ detail, onBack, onNewTask, initialTab }: Props) 
               Back
             </Button>
             <Badge mono>{detail.id}</Badge>
-            <StatusBadge status={detail.status} />
+            <LabeledStatus label="Flow" status={detail.status} />
+            <LabeledStatus label="Evidence status" status={detail.evidenceStatus ?? "unknown"} />
             {detail.partial ? <Badge tone="amber">partial discovery</Badge> : null}
           </div>
           <h1 className="text-[22px] font-semibold tracking-tight text-slate-900">
@@ -113,6 +114,10 @@ function StatusTab({ detail }: { detail: ExecutionSessionDetail }) {
           title="Outcome"
         />
         <div className="px-4 py-3.5">
+          <div className="mb-3 flex flex-wrap items-center gap-2">
+            <LabeledStatus label="Flow" status={detail.status} />
+            <LabeledStatus label="Evidence status" status={detail.evidenceStatus ?? "unknown"} />
+          </div>
           <p className="text-[13px] leading-relaxed text-slate-600">{detail.outcome}</p>
         </div>
       </Card>
@@ -187,6 +192,17 @@ function FilesTab({ detail }: { detail: ExecutionSessionDetail }) {
       />
       <FilesDigest digest={detail.files} />
     </Card>
+  )
+}
+
+function LabeledStatus({ label, status }: { label: string; status: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+        {label}
+      </span>
+      <StatusBadge status={status} />
+    </span>
   )
 }
 

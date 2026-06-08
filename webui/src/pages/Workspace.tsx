@@ -47,6 +47,7 @@ export interface WorkspaceSessionRow {
   id: string
   title: string
   status: string
+  evidenceStatus: string
   entry: string
   start: string
   duration: string
@@ -214,7 +215,18 @@ function OverviewTab({
                 {workspace.activeSession ? "Active session" : "Latest session"}
               </span>
               {latest ? <span className="font-mono text-[11px] text-slate-500">{latest.id}</span> : null}
-              {latest ? <StatusBadge status={latest.status} /> : null}
+              {latest || workspace.latestSession ? (
+                <>
+                  <LabeledStatus
+                    label="Flow"
+                    status={latest?.status ?? (workspace.activeSession ? "active" : "latest")}
+                  />
+                  <LabeledStatus
+                    label="Evidence status"
+                    status={latest?.evidenceStatus ?? workspace.evidenceStatus ?? "unknown"}
+                  />
+                </>
+              ) : null}
             </div>
             <div className="mt-1 truncate text-[14px] font-medium text-slate-800">
               {latest?.title ?? workspace.task}
@@ -367,7 +379,7 @@ function SessionsTab({
   return (
     <Card className="overflow-hidden">
       <div className="hidden grid-cols-[1.8fr_0.8fr_0.8fr_1fr_0.5fr_0.5fr_40px] items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5 lg:grid">
-        {["Task", "Status", "Entry", "Build / test", "Evid.", "Files", ""].map((header) => (
+        {["Task", "Flow / evidence", "Entry", "Build / test", "Evid.", "Files", ""].map((header) => (
           <div key={header} className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
             {header}
           </div>
@@ -392,8 +404,9 @@ function SessionsTab({
                 {session.start} / {session.duration}
               </div>
             </div>
-            <div>
+            <div className="flex flex-wrap gap-1.5 lg:flex-col lg:items-start">
               <StatusBadge status={session.status} />
+              <StatusBadge dot={false} status={session.evidenceStatus} />
             </div>
             <div>
               <Badge mono>{session.entry}</Badge>
@@ -450,6 +463,17 @@ function TerminalTab({ workspace }: { workspace: WorkspaceSummary }) {
         </p>
       </div>
     </Card>
+  )
+}
+
+function LabeledStatus({ label, status }: { label: string; status: string }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+        {label}
+      </span>
+      <StatusBadge status={status} />
+    </span>
   )
 }
 
