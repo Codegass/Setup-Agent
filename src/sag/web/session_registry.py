@@ -639,8 +639,9 @@ def _setup_evidence_status(
 def _evidence_status_from_result_line(report_raw: str) -> str | None:
     for line in report_raw.splitlines():
         text = line.strip()
-        if text.lower().startswith("**result:**") or text.lower().startswith("result:"):
-            return _extract_evidence_status(text)
+        lowered = text.lower()
+        if lowered.startswith("**result:**") or lowered.startswith("result:"):
+            return _extract_prefixed_evidence_status(text.split(":", 1)[1])
     return None
 
 
@@ -712,6 +713,13 @@ def _extract_evidence_status_token(value: Any) -> str | None:
     statuses = [token for token in tokens if token in _EVIDENCE_STATUS_VALUES]
     if len(statuses) == 1 and len(tokens) == 1:
         return statuses[0]
+    return None
+
+
+def _extract_prefixed_evidence_status(value: Any) -> str | None:
+    tokens = re.findall(r"[a-z]+", _text(value, default="").lower())
+    if tokens and tokens[0] in _EVIDENCE_STATUS_VALUES:
+        return tokens[0]
     return None
 
 

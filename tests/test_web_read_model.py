@@ -261,6 +261,12 @@ def test_setup_artifact_evidence_status_ignores_generic_status_table_prose():
     assert _setup_evidence_status({"evidence_status": "success"}, [], report_raw) == "success"
 
 
+def test_setup_artifact_evidence_status_ignores_result_line_prose_after_label():
+    report_raw = "Result: no blocked tasks; build completed\n"
+
+    assert _setup_evidence_status({"evidence_status": "success"}, [], report_raw) == "success"
+
+
 def test_setup_artifact_evidence_status_reads_explicit_evidence_status_table():
     report_raw = "| Evidence Status | ⚠️ PARTIAL |\n"
 
