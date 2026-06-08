@@ -215,3 +215,30 @@ def test_bash_background_failed_start_preserves_execution_facts():
     assert result.metadata["execution"]["executed"] is True
     assert result.metadata["execution"]["exit_code"] == 126
     assert result.metadata["execution"]["timed_out"] is False
+
+
+def test_bash_safe_execute_missing_command_backfills_pre_execution_metadata():
+    tool = BashTool(None)
+
+    result = tool.safe_execute()
+
+    assert result.success is False
+    assert result.error_code == "MISSING_PARAMETERS"
+    assert result.metadata["execution"]["executed"] is False
+    assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False
+    assert result.metadata["failure_category"] == "validation"
+    assert result.metadata["retryable"] is True
+
+
+def test_bash_safe_execute_no_orchestrator_preserves_execution_metadata():
+    tool = BashTool(None)
+
+    result = tool.safe_execute(command="echo hi")
+
+    assert result.success is False
+    assert result.error_code == "NO_ORCHESTRATOR"
+    assert result.metadata["execution"]["executed"] is False
+    assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False
+    assert result.metadata["failure_category"] == "execution"

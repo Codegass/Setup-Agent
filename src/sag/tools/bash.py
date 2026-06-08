@@ -127,6 +127,8 @@ class BashTool(BaseTool):
         output: str,
         error: str,
         error_code: str,
+        failure_category: str,
+        retryable: bool,
         suggestions: Optional[List[str]] = None,
         raw_output: str = "",
     ) -> ToolResult:
@@ -138,7 +140,10 @@ class BashTool(BaseTool):
             suggestions=suggestions or [],
             raw_output=raw_output,
             metadata=self._with_execution_metadata(
-                None,
+                {
+                    "failure_category": failure_category,
+                    "retryable": retryable,
+                },
                 command=command,
                 working_directory=working_directory,
                 exit_code=None,
@@ -148,9 +153,67 @@ class BashTool(BaseTool):
             ),
         )
 
+    def _maybe_backfill_pre_execution_metadata(
+        self,
+        result: ToolResult,
+        *,
+        command: Optional[str],
+        working_directory: Optional[str],
+    ) -> ToolResult:
+        if "execution" in result.metadata:
+            return result
+
+        if result.error_code not in {
+            "MISSING_PARAMETERS",
+            "UNEXPECTED_PARAMETERS",
+            "MISSING_COMMAND",
+            "INVALID_PARAMETERS",
+            "INVALID_TIMEOUT",
+            "NO_ORCHESTRATOR",
+            "COMMAND_BLOCKED",
+            "INTERACTIVE_COMMAND",
+        }:
+            return result
+
+        metadata = dict(result.metadata)
+        metadata.setdefault(
+            "failure_category",
+            "execution" if result.error_code == "NO_ORCHESTRATOR" else "validation",
+        )
+        metadata.setdefault("retryable", result.error_code != "NO_ORCHESTRATOR")
+        result.metadata = self._with_execution_metadata(
+            metadata,
+            command=command,
+            working_directory=working_directory,
+            exit_code=None,
+            timed_out=False,
+            duration=0,
+            executed=False,
+        )
+        return result
+
     def _ensure_working_directory(self, requested_workdir: str) -> str:
         """Smart working directory validation and setup."""
         return self._validate_and_fix_working_directory(requested_workdir)
+
+    def _validate_parameters(self, kwargs: Dict[str, Any]) -> None:
+        super()._validate_parameters(kwargs)
+
+        command = kwargs.get("command")
+        if command is None:
+            raise ToolError(
+                message="Missing required parameters: command",
+                category="validation",
+                error_code="MISSING_PARAMETERS",
+                suggestions=[
+                    "Provide the missing parameters: command",
+                    "Use the parameter schema to understand required parameters",
+                    "Example usage: bash(command=<value>)",
+                ],
+                documentation_links=[f"Tool documentation: {self.get_usage_example()}"],
+                details={"missing_parameters": ["command"]},
+                retryable=True,
+            )
 
     def _validate_command(self, command: str) -> tuple[bool, str]:
         """Validate command against allowlist/blocklist.
@@ -434,6 +497,8 @@ class BashTool(BaseTool):
                 ),
                 error=f"Invalid parameters: {invalid_params}",
                 error_code="INVALID_PARAMETERS",
+                failure_category="validation",
+                retryable=True,
             )
 
         # Check for required parameter
@@ -449,6 +514,8 @@ class BashTool(BaseTool):
                 ),
                 error="Missing required parameter: command",
                 error_code="MISSING_COMMAND",
+                failure_category="validation",
+                retryable=True,
             )
 
         try:
@@ -460,6 +527,8 @@ class BashTool(BaseTool):
                 output="❌ Invalid timeout for bash tool: timeout must be a positive integer.",
                 error="Invalid timeout: must be a positive integer",
                 error_code="INVALID_TIMEOUT",
+                failure_category="validation",
+                retryable=True,
             )
         if timeout <= 0:
             return self._pre_execution_failure(
@@ -468,6 +537,8 @@ class BashTool(BaseTool):
                 output="❌ Invalid timeout for bash tool: timeout must be greater than 0.",
                 error="Invalid timeout: must be greater than 0",
                 error_code="INVALID_TIMEOUT",
+                failure_category="validation",
+                retryable=True,
             )
 
         if not self.docker_orchestrator:
@@ -477,6 +548,8 @@ class BashTool(BaseTool):
                 output="Docker orchestrator not available",
                 error="Docker orchestrator not available",
                 error_code="NO_ORCHESTRATOR",
+                failure_category="execution",
+                retryable=False,
                 suggestions=["Ensure Docker is running and container is available"],
             )
 
@@ -489,6 +562,8 @@ class BashTool(BaseTool):
                 output=f"Command validation failed: {error_msg}",
                 error=f"Command validation failed: {error_msg}",
                 error_code="COMMAND_BLOCKED",
+                failure_category="validation",
+                retryable=True,
                 suggestions=[
                     "Check if the command is allowed by security policy",
                     "Use alternative commands that are permitted",
@@ -505,6 +580,8 @@ class BashTool(BaseTool):
                 output="Interactive command detected",
                 error="Interactive command detected",
                 error_code="INTERACTIVE_COMMAND",
+                failure_category="validation",
+                retryable=True,
                 suggestions=[suggestion, "Use non-interactive alternatives"],
             )
 
@@ -757,6 +834,14 @@ class BashTool(BaseTool):
                 ],
                 error_code="EXECUTION_ERROR",
             )
+
+    def safe_execute(self, **kwargs) -> ToolResult:
+        result = super().safe_execute(**kwargs)
+        return self._maybe_backfill_pre_execution_metadata(
+            result,
+            command=kwargs.get("command"),
+            working_directory=kwargs.get("working_directory", "/workspace"),
+        )
 
     def _execute_background_command(
         self, command: str, workdir: str, env_vars: Dict[str, str]
