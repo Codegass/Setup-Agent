@@ -111,7 +111,7 @@ def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
     monkeypatch.setattr(
         tool,
         "_generate_comprehensive_report",
-        lambda summary, status, details: (
+        lambda summary, status, details, **kwargs: (
             "# Full Report",
             "success",
             "setup-report-test.md",
@@ -154,7 +154,7 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     monkeypatch.setattr(
         tool,
         "_generate_comprehensive_report",
-        lambda summary, status, details: (
+        lambda summary, status, details, **kwargs: (
             "# Full Report",
             "success",
             "setup-report-test.md",
@@ -210,6 +210,208 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     assert result.raw_data["test_stats"]["pass_rate"] == 96.3
 
 
+def test_real_report_renderer_includes_evidence_result(monkeypatch):
+    tool = ReportTool()
+    saved_markdown = {}
+
+    actual_accomplishments = {
+        "repository_cloned": True,
+        "build_success": True,
+        "test_success": False,
+        "physical_validation": {
+            "class_files": 18,
+            "jar_files": 1,
+            "test_analysis": {
+                "pass_rate": 96.3,
+                "total_tests": 214,
+                "passed_tests": 206,
+                "failed_tests": 3,
+                "error_tests": 0,
+                "skipped_tests": 5,
+                "report_files_count": 1,
+            },
+        },
+    }
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_verify_execution_history",
+        lambda status, summary: ("success", actual_accomplishments),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_collect_execution_metrics",
+        lambda: {
+            "total_actions": 1,
+            "successful_actions": 1,
+            "failed_actions": 0,
+            "success_rate": 100,
+            "tools_used": {},
+            "tool_failures": {},
+            "phases": {
+                "clone": {"status": True},
+                "analyze": {"status": True},
+                "build": {"status": True},
+                "test": {"status": False},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_get_project_info",
+        lambda: {
+            "directory": "/workspace/demo",
+            "type": "Maven Java Project",
+            "build_system": "Maven",
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_save_markdown_report",
+        lambda markdown, timestamp, filename: saved_markdown.setdefault("content", markdown),
+    )
+
+    result = tool.execute(
+        action="generate",
+        summary="done",
+        status="success",
+        evidence_status="partial",
+        test_stats={"executed": 214, "passed": 206, "failed": 3, "skipped": 5},
+        conflicts=["test_failures_detected"],
+        evidence_refs=["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
+    )
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.PARTIAL
+    assert "Result: PARTIAL" in result.raw_data["full_report"]
+    assert "96.3% pass rate" in result.raw_data["full_report"]
+    assert "3 failed" in result.raw_data["full_report"]
+    assert "test_failures_detected" in result.raw_data["full_report"]
+    assert "/workspace/demo/target/surefire-reports/TEST-demo.xml" in result.raw_data["full_report"]
+    assert "**Result:** ⚠️ PARTIAL" in saved_markdown["content"]
+    assert "96.3% pass rate" in saved_markdown["content"]
+    assert "3 failed" in saved_markdown["content"]
+    assert "test_failures_detected" in saved_markdown["content"]
+    assert "/workspace/demo/target/surefire-reports/TEST-demo.xml" in saved_markdown["content"]
+    assert "**Result:** ✅ SUCCESS" not in saved_markdown["content"]
+
+
+def test_report_failed_legacy_status_maps_to_blocked(monkeypatch):
+    tool = ReportTool()
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_generate_comprehensive_report",
+        lambda summary, status, details, **kwargs: (
+            "# Full Report",
+            "fail",
+            "setup-report-test.md",
+            {"build_success": False, "test_success": False},
+            {"status": "fail"},
+        ),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_generate_condensed_log_output",
+        lambda verified_status,
+        report_filename,
+        actual_accomplishments,
+        report_snapshot: "condensed",
+    )
+
+    result = tool.execute(action="generate", summary="blocked", status="fail")
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.BLOCKED
+    assert result.metadata["evidence_status"] == "blocked"
+    assert result.raw_data["evidence_status"] == "blocked"
+
+
+def test_report_uses_validator_evidence_defaults_when_kwargs_missing(monkeypatch):
+    tool = ReportTool()
+    saved_markdown = {}
+
+    actual_accomplishments = {
+        "repository_cloned": True,
+        "build_success": True,
+        "test_success": False,
+        "physical_validation": {
+            "build_status": {
+                "evidence_status": "success",
+                "conflicts": [],
+                "evidence_refs": ["/workspace/demo/target/demo-1.0.jar"],
+            },
+            "test_status": {
+                "evidence_status": "partial",
+                "test_stats": {
+                    "executed": 214,
+                    "passed": 206,
+                    "failed": 3,
+                    "skipped": 5,
+                },
+                "conflicts": ["test_failures_detected"],
+                "evidence_refs": ["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
+            },
+            "test_analysis": {
+                "pass_rate": 96.3,
+                "total_tests": 214,
+                "passed_tests": 206,
+                "failed_tests": 3,
+                "error_tests": 0,
+                "skipped_tests": 5,
+            },
+        },
+    }
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_verify_execution_history",
+        lambda status, summary: ("success", actual_accomplishments),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_collect_execution_metrics",
+        lambda: {
+            "phases": {
+                "clone": {"status": True},
+                "analyze": {"status": True},
+                "build": {"status": True},
+                "test": {"status": False},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_get_project_info",
+        lambda: {
+            "directory": "/workspace/demo",
+            "type": "Maven Java Project",
+            "build_system": "Maven",
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_save_markdown_report",
+        lambda markdown, timestamp, filename: saved_markdown.setdefault("content", markdown),
+    )
+
+    result = tool.execute(action="generate", summary="done", status="success")
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.PARTIAL
+    assert result.metadata["verified_status"] == "success"
+    assert result.metadata["evidence_status"] == "partial"
+    assert "Result: PARTIAL" in result.raw_data["full_report"]
+    assert "96.3% pass rate" in result.raw_data["full_report"]
+    assert "3 failed" in result.raw_data["full_report"]
+    assert "test_failures_detected" in result.raw_data["full_report"]
+    assert "/workspace/demo/target/surefire-reports/TEST-demo.xml" in result.raw_data["full_report"]
+    assert "**Result:** ⚠️ PARTIAL" in saved_markdown["content"]
+
+
 def test_report_tool_marks_final_report_task_completed(monkeypatch):
     context_manager = FakeReportContextManager()
     tool = ReportTool(context_manager=context_manager)
@@ -218,7 +420,7 @@ def test_report_tool_marks_final_report_task_completed(monkeypatch):
     monkeypatch.setattr(
         tool,
         "_generate_comprehensive_report",
-        lambda summary, status, details: (
+        lambda summary, status, details, **kwargs: (
             "# Full Report",
             "success",
             "setup-report-test.md",

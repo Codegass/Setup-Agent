@@ -81,6 +81,10 @@ def test_real_tool_custom_schema_is_preserved():
     assert schema["properties"]["action"]["enum"] == ["generate"]
     assert "status" in schema["properties"]
     assert "details" in schema["properties"]
+    assert "evidence_status" in schema["properties"]
+    assert "test_stats" in schema["properties"]
+    assert "conflicts" in schema["properties"]
+    assert "evidence_refs" in schema["properties"]
 
 
 def test_bash_tool_schema_exposes_timeout_for_agent_use():
@@ -107,6 +111,7 @@ def test_inherited_custom_schema_is_preserved():
     assert schema["properties"]["action"]["enum"] == ["generate"]
     assert "status" in schema["properties"]
     assert "details" in schema["properties"]
+    assert "evidence_status" in schema["properties"]
 
 
 def test_context_tool_schema_exposes_force_and_evidence_fields():

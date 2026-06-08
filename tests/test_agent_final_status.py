@@ -163,14 +163,14 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
             "total_tests": 430,
             "passed_tests": 420,
             "failed_tests": 1,
-            "error_tests": 0,
+            "error_tests": 2,
             "skipped_tests": 9,
             "test_exclusions": [],
             "modules_without_tests": [],
             "report_files": [
                 "/workspace/demo/target/surefire-reports/TEST-com.example.DemoTest.xml"
             ],
-            "parsing_errors": [],
+            "parsing_errors": ["Error parsing /workspace/demo/target/surefire-reports/TEST-bad.xml"],
         },
     )
 
@@ -182,10 +182,82 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
     assert result["test_stats"]["failed"] > 0
     assert result["test_stats"]["skipped"] == 9
     assert result["test_stats"]["pass_rate"] == 97.7
-    assert result["conflicts"] == ["1 failed test(s)"]
+    assert result["conflicts"] == [
+        "test_failures_detected",
+        "test_errors_detected",
+        "test_report_parse_error",
+    ]
+    assert result["parsing_errors"] == [
+        "Error parsing /workspace/demo/target/surefire-reports/TEST-bad.xml"
+    ]
     assert result["evidence_refs"] == [
         "/workspace/demo/target/surefire-reports/TEST-com.example.DemoTest.xml"
     ]
+
+
+def test_build_validation_refs_prefer_artifact_samples(monkeypatch):
+    validator = PhysicalValidator(project_path="/workspace")
+
+    monkeypatch.setattr(validator, "_detect_build_system", lambda project_dir: "maven")
+    monkeypatch.setattr(
+        validator,
+        "_check_build_artifacts_complete",
+        lambda project_dir: {"exist": True, "count": 2, "jar_count": 1, "class_count": 1},
+    )
+    monkeypatch.setattr(
+        validator,
+        "_validate_maven_fingerprints",
+        lambda project_dir: {"valid": False, "details": {}, "modules": []},
+    )
+    monkeypatch.setattr(validator, "_get_expected_artifacts", lambda project_dir, build_system: [])
+    monkeypatch.setattr(
+        validator,
+        "_check_class_files",
+        lambda project_dir: {
+            "count": 1,
+            "paths": ["/workspace/demo/target/classes/com/example/Demo.class"],
+        },
+    )
+    monkeypatch.setattr(
+        validator,
+        "_check_jar_files",
+        lambda project_dir: {
+            "count": 1,
+            "paths": ["/workspace/demo/target/demo-1.0.jar"],
+        },
+    )
+
+    result = validator.validate_build_status("demo")
+
+    assert result["success"] is True
+    assert result["conflicts"] == []
+    assert result["evidence_refs"] == [
+        "/workspace/demo/target/classes/com/example/Demo.class",
+        "/workspace/demo/target/demo-1.0.jar",
+    ]
+
+
+def test_failed_build_validation_uses_stable_conflict_and_project_fallback(monkeypatch):
+    validator = PhysicalValidator(project_path="/workspace")
+
+    monkeypatch.setattr(validator, "_detect_build_system", lambda project_dir: "maven")
+    monkeypatch.setattr(
+        validator,
+        "_check_build_artifacts_complete",
+        lambda project_dir: {"exist": False, "count": 0, "jar_count": 0, "class_count": 0},
+    )
+    monkeypatch.setattr(
+        validator,
+        "_validate_maven_fingerprints",
+        lambda project_dir: {"valid": False, "details": {}, "modules": []},
+    )
+
+    result = validator.validate_build_status("demo")
+
+    assert result["success"] is False
+    assert result["reason"] == "No build evidence found (no artifacts or build fingerprints)"
+    assert result["conflicts"] == ["build_validation_failed"]
+    assert result["evidence_refs"] == ["/workspace/demo"]
 
 
 def test_verified_final_status_uses_project_metadata_over_docker_label():

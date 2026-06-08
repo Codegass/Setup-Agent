@@ -8,7 +8,7 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
-from sag.evidence import TestStats, coerce_evidence_status
+from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.ui.events import EventType, UIEventEmitter
@@ -18,6 +18,19 @@ from .base import BaseTool, ToolResult
 
 MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS = 5
 MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
+
+
+REPORT_LEGACY_STATUS_TO_EVIDENCE_STATUS = {
+    "success": "success",
+    "fail": "blocked",
+    "failed": "blocked",
+    "failure": "blocked",
+    "error": "blocked",
+    "partial": "partial",
+    "conflict": "conflict",
+    "unknown": "unknown",
+    "blocked": "blocked",
+}
 
 
 class ReportTool(BaseTool, UIEventEmitter):
@@ -82,7 +95,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         result_test_stats = self._coerce_report_test_stats(test_stats)
         result_conflicts = list(conflicts or [])
         result_evidence_refs = list(evidence_refs or [])
-        result_evidence_status = coerce_evidence_status(evidence_status or status)
+        result_evidence_status = self._coerce_report_evidence_status(evidence_status, status)
 
         # IDEMPOTENCY CHECK: Prevent multiple report generation
         # Check if a report was already generated recently (within last 5 minutes)
@@ -202,10 +215,34 @@ class ReportTool(BaseTool, UIEventEmitter):
                     report_filename,
                     actual_accomplishments,
                     report_snapshot,
-                ) = self._generate_comprehensive_report(summary, status, details)
+                ) = self._generate_comprehensive_report(
+                    summary,
+                    status,
+                    details,
+                    evidence_status=evidence_status,
+                    test_stats=result_test_stats,
+                    conflicts=conflicts,
+                    evidence_refs=evidence_refs,
+                )
                 completed_context_task = self._mark_final_report_task_completed(
                     report_filename, verified_status
                 )
+
+                evidence_result = report_snapshot.get("evidence_result", {})
+                result_evidence_status = self._coerce_report_evidence_status(
+                    evidence_result.get("status"),
+                    evidence_status,
+                    verified_status,
+                    status,
+                )
+                if test_stats is None:
+                    result_test_stats = self._coerce_report_test_stats(
+                        evidence_result.get("test_stats")
+                    )
+                if conflicts is None:
+                    result_conflicts = list(evidence_result.get("conflicts") or [])
+                if evidence_refs is None:
+                    result_evidence_refs = list(evidence_result.get("evidence_refs") or [])
 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -214,9 +251,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     "status": status,
                     "final_flow_status": status,
                     "verified_status": verified_status,  # Include the verified status
-                    "evidence_status": coerce_evidence_status(
-                        evidence_status or verified_status or status
-                    ).value,
+                    "evidence_status": result_evidence_status.value,
                     "timestamp": datetime.now().isoformat(),
                     "report_snapshot": report_snapshot,
                     "context_task_completed": completed_context_task,
@@ -350,6 +385,131 @@ class ReportTool(BaseTool, UIEventEmitter):
             data["execution_rate"] = execution_rate
         return data
 
+    def _map_report_status_to_evidence_status(self, status: Any) -> str:
+        """Map report legacy statuses onto shared evidence statuses."""
+        if status is None:
+            return "unknown"
+        if hasattr(status, "value"):
+            status = status.value
+        normalized = str(status).strip().lower()
+        if not normalized:
+            return "unknown"
+        return REPORT_LEGACY_STATUS_TO_EVIDENCE_STATUS.get(normalized, "unknown")
+
+    def _coerce_report_evidence_status(self, *statuses: Any):
+        for status in statuses:
+            if status is None:
+                continue
+            mapped = self._map_report_status_to_evidence_status(status)
+            if mapped != "unknown" or str(status).strip().lower() in {"unknown", ""}:
+                return coerce_evidence_status(mapped)
+        return coerce_evidence_status(None)
+
+    def _resolve_report_evidence_result(
+        self,
+        evidence_status: Optional[str],
+        test_stats: Optional[Dict[str, Any] | TestStats],
+        conflicts: Optional[List[str]],
+        evidence_refs: Optional[List[str]],
+        verified_status: str,
+        claimed_status: str,
+        actual_accomplishments: dict,
+    ) -> Dict[str, Any]:
+        """Resolve explicit report evidence with physical validator defaults."""
+        defaults = self._extract_report_evidence_defaults(actual_accomplishments)
+
+        resolved_test_stats = self._coerce_report_test_stats(test_stats)
+        if resolved_test_stats is None:
+            resolved_test_stats = self._coerce_report_test_stats(defaults.get("test_stats"))
+
+        resolved_conflicts = (
+            list(conflicts) if conflicts is not None else list(defaults.get("conflicts") or [])
+        )
+        resolved_refs = (
+            list(evidence_refs)
+            if evidence_refs is not None
+            else list(defaults.get("evidence_refs") or [])
+        )
+
+        status_candidates: List[Any] = []
+        if evidence_status is not None:
+            status_candidates.append(evidence_status)
+        else:
+            status_candidates.extend(defaults.get("status_candidates") or [])
+            derived_status = self._derive_evidence_status_from_test_stats(
+                resolved_test_stats, resolved_conflicts
+            )
+            if derived_status:
+                status_candidates.append(derived_status)
+        status_candidates.extend([verified_status, claimed_status])
+
+        if evidence_status is None and len(status_candidates) > 1:
+            evidence_status_value = aggregate_evidence_status(
+                self._coerce_report_evidence_status(candidate) for candidate in status_candidates
+            )
+        else:
+            evidence_status_value = self._coerce_report_evidence_status(*status_candidates)
+
+        serialized_stats = (
+            self._serialize_report_test_stats(resolved_test_stats) if resolved_test_stats else None
+        )
+        return {
+            "status": evidence_status_value.value,
+            "test_stats": serialized_stats,
+            "conflicts": resolved_conflicts,
+            "evidence_refs": resolved_refs,
+        }
+
+    def _extract_report_evidence_defaults(self, actual_accomplishments: dict) -> Dict[str, Any]:
+        actual_accomplishments = actual_accomplishments or {}
+        physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
+        build_status = physical_validation.get("build_status", {}) or {}
+        test_status = physical_validation.get("test_status", {}) or {}
+        test_analysis = physical_validation.get("test_analysis", {}) or {}
+
+        status_candidates = [
+            actual_accomplishments.get("evidence_status"),
+            build_status.get("evidence_status"),
+            test_status.get("evidence_status"),
+        ]
+
+        test_stats = (
+            actual_accomplishments.get("test_stats")
+            or test_status.get("test_stats")
+            or {
+                "executed": test_analysis.get("total_tests"),
+                "passed": test_analysis.get("passed_tests"),
+                "failed": (test_analysis.get("failed_tests") or 0)
+                + (test_analysis.get("error_tests") or 0),
+                "skipped": test_analysis.get("skipped_tests"),
+            }
+        )
+
+        conflicts: List[str] = []
+        evidence_refs: List[str] = []
+        for source in (actual_accomplishments, build_status, test_status):
+            conflicts.extend(source.get("conflicts") or [])
+            evidence_refs.extend(source.get("evidence_refs") or [])
+        evidence_refs.extend(test_analysis.get("report_files") or [])
+
+        return {
+            "status_candidates": [status for status in status_candidates if status],
+            "test_stats": test_stats,
+            "conflicts": list(dict.fromkeys(conflicts)),
+            "evidence_refs": list(dict.fromkeys(evidence_refs)),
+        }
+
+    def _derive_evidence_status_from_test_stats(
+        self, test_stats: Optional[TestStats], conflicts: List[str]
+    ) -> Optional[str]:
+        if not test_stats:
+            return "partial" if conflicts else None
+        if test_stats.failed > 0:
+            return "partial" if test_stats.passed > 0 else "blocked"
+        if test_stats.executed > 0:
+            return "success"
+        return "partial" if conflicts else None
+
     def _append_evidence_summary_to_output(
         self,
         output: str,
@@ -366,6 +526,36 @@ class ReportTool(BaseTool, UIEventEmitter):
         if conflicts:
             lines.append(f"Conflicts: {'; '.join(conflicts)}")
         return "\n".join(lines).rstrip()
+
+    def _render_console_evidence_result(self, snapshot: Optional[Dict[str, Any]]) -> List[str]:
+        evidence = (snapshot or {}).get("evidence_result") or {}
+        if not evidence:
+            return []
+
+        lines = [f"Result: {str(evidence.get('status', 'unknown')).upper()}"]
+        test_stats = self._coerce_report_test_stats(evidence.get("test_stats"))
+        if test_stats:
+            lines.append(f"Tests: {test_stats.as_summary()}")
+        conflicts = evidence.get("conflicts") or []
+        if conflicts:
+            lines.append(f"Conflicts: {'; '.join(conflicts)}")
+        refs = evidence.get("evidence_refs") or []
+        if refs:
+            lines.append(f"Evidence refs: {'; '.join(refs)}")
+        return lines
+
+    def _render_markdown_evidence_details(self, evidence: Dict[str, Any]) -> List[str]:
+        lines: List[str] = []
+        test_stats = self._coerce_report_test_stats(evidence.get("test_stats"))
+        if test_stats:
+            lines.append(f"**Tests:** {test_stats.as_summary()}")
+        conflicts = evidence.get("conflicts") or []
+        if conflicts:
+            lines.append(f"**Conflicts:** {'; '.join(conflicts)}")
+        refs = evidence.get("evidence_refs") or []
+        if refs:
+            lines.append(f"**Evidence refs:** {'; '.join(refs)}")
+        return lines
 
     def _mark_final_report_task_completed(
         self, report_filename_or_path: str, verified_status: str
@@ -426,7 +616,14 @@ class ReportTool(BaseTool, UIEventEmitter):
         return f"/workspace/{text}"
 
     def _generate_comprehensive_report(
-        self, summary: str, status: str, details: str
+        self,
+        summary: str,
+        status: str,
+        details: str,
+        evidence_status: Optional[str] = None,
+        test_stats: Optional[Dict[str, Any] | TestStats] = None,
+        conflicts: Optional[List[str]] = None,
+        evidence_refs: Optional[List[str]] = None,
     ) -> Tuple[str, str, str, dict, dict]:
         """Generate a comprehensive project setup report."""
 
@@ -442,6 +639,15 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Verify execution history and adjust status/summary if needed
         verified_status, actual_accomplishments = self._verify_execution_history(status, summary)
+        report_evidence_result = self._resolve_report_evidence_result(
+            evidence_status,
+            test_stats,
+            conflicts,
+            evidence_refs,
+            verified_status,
+            status,
+            actual_accomplishments,
+        )
 
         # Ensure the report action itself is reflected as a successful execution
         self._finalize_report_metrics(execution_metrics, verified_status)
@@ -494,6 +700,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             project_info or {},
             actual_accomplishments,
             execution_metrics,
+            report_evidence_result,
         )
 
         # Generate both console and markdown versions with verified information and metrics
@@ -941,6 +1148,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         project_info: dict,
         actual_accomplishments: dict,
         execution_metrics: dict,
+        evidence_result: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Create a normalized snapshot used for rendering condensed and markdown reports."""
 
@@ -1175,6 +1383,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             "flags": flags,
             "last_command": test_history.get("last_cmd", {}),
             "failed_tests": test_history.get("failed_tests", []),
+            "evidence_result": evidence_result or {},
         }
 
         attention = self._evaluate_attention_flags(snapshot)
@@ -1902,6 +2111,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 test_status = self.physical_validator.validate_test_status(
                     project_name_for_validator
                 )
+                actual_accomplishments["physical_validation"]["test_status"] = test_status
 
                 # Log test status insights
                 if test_status.get("pass_rate", 0) <= 80 and test_status.get("has_test_reports"):
@@ -2571,8 +2781,11 @@ class ReportTool(BaseTool, UIEventEmitter):
             "=" * 80,
             f"⏰ Generated: {timestamp}",
             f"📊 Status: {status.upper()}",
-            "",
         ]
+        evidence_lines = self._render_console_evidence_result(report_snapshot)
+        if evidence_lines:
+            report_lines.extend(evidence_lines)
+        report_lines.append("")
 
         # Add project information
         if project_info:
@@ -4149,6 +4362,23 @@ class ReportTool(BaseTool, UIEventEmitter):
         lines.append(f"**{project_name}** | {project_type} | {build_system}{java_version}")
         lines.append(f"**Generated:** {timestamp}")
 
+        evidence_result = (snapshot or {}).get("evidence_result") or {}
+        if evidence_result:
+            evidence_status = str(evidence_result.get("status", "unknown")).upper()
+            icon = {
+                "SUCCESS": "✅",
+                "PARTIAL": "⚠️",
+                "BLOCKED": "⛔",
+                "CONFLICT": "⚠️",
+                "UNKNOWN": "❔",
+            }.get(evidence_status, "❔")
+            result_msg = f"**Result:** {icon} {evidence_status}"
+            evidence_details = self._render_markdown_evidence_details(evidence_result)
+            lines.append(result_msg)
+            lines.extend(evidence_details)
+            lines.append("")
+            return lines
+
         # Determine result message based on status and test metrics
         result_msg = f"**Result:** "
         if status.upper() == "SUCCESS":
@@ -4638,6 +4868,36 @@ class ReportTool(BaseTool, UIEventEmitter):
                     "type": "string",
                     "description": "Additional details about the setup process",
                     "default": None,
+                },
+                "evidence_status": {
+                    "type": "string",
+                    "enum": ["success", "partial", "blocked", "conflict", "unknown"],
+                    "description": "Evidence-backed result status for the report",
+                    "default": None,
+                },
+                "test_stats": {
+                    "type": "object",
+                    "description": "Evidence-backed test counts for the report",
+                    "default": None,
+                    "properties": {
+                        "discovered": {"type": "integer"},
+                        "executed": {"type": "integer"},
+                        "passed": {"type": "integer"},
+                        "failed": {"type": "integer"},
+                        "skipped": {"type": "integer"},
+                    },
+                },
+                "conflicts": {
+                    "type": "array",
+                    "description": "Stable evidence conflict identifiers",
+                    "default": None,
+                    "items": {"type": "string"},
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "description": "Traceable evidence references such as report or artifact paths",
+                    "default": None,
+                    "items": {"type": "string"},
                 },
             },
             "required": ["action"],

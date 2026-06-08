@@ -1660,7 +1660,7 @@ class PhysicalValidator:
             success = False
             reason = "No build evidence found (no artifacts or build fingerprints)"
 
-        conflicts = [] if success else [reason]
+        conflicts = [] if success else ["build_validation_failed"]
         result = {
             "success": success,
             "evidence": evidence,
@@ -1668,11 +1668,22 @@ class PhysicalValidator:
             "evidence_status": "success" if success else "blocked",
             "test_stats": None,
             "conflicts": conflicts,
-            "evidence_refs": [project_dir],
+            "evidence_refs": self._build_status_evidence_refs(project_dir, artifacts_result),
         }
 
         logger.info(f"Build validation complete: {'SUCCESS' if success else 'FAILURE'} - {reason}")
         return result
+
+    def _build_status_evidence_refs(
+        self, project_dir: str, artifacts_result: Dict[str, any]
+    ) -> List[str]:
+        """Prefer concrete artifact samples over the project directory reference."""
+        refs: List[str] = []
+        if artifacts_result.get("class_count", 0) > 0:
+            refs.extend((self._check_class_files(project_dir).get("paths") or [])[:5])
+        if artifacts_result.get("jar_count", 0) > 0:
+            refs.extend((self._check_jar_files(project_dir).get("paths") or [])[:5])
+        return list(dict.fromkeys(refs)) or [project_dir]
 
     def validate_test_status(self, project_name: str) -> Dict[str, any]:
         """
@@ -1736,11 +1747,11 @@ class PhysicalValidator:
         report_files = test_metrics.get("report_files", [])
         conflicts = []
         if test_metrics.get("failed_tests", 0):
-            conflicts.append(f"{test_metrics['failed_tests']} failed test(s)")
+            conflicts.append("test_failures_detected")
         if test_metrics.get("error_tests", 0):
-            conflicts.append(f"{test_metrics['error_tests']} error test(s)")
+            conflicts.append("test_errors_detected")
         if test_metrics.get("parsing_errors", []):
-            conflicts.extend(test_metrics.get("parsing_errors", []))
+            conflicts.append("test_report_parse_error")
 
         if not test_metrics.get("valid", False):
             evidence_status = "unknown"
@@ -1769,8 +1780,8 @@ class PhysicalValidator:
             "parsing_errors": test_metrics.get("parsing_errors", []),
             "evidence_status": evidence_status,
             "test_stats": test_stats,
-            "conflicts": conflicts,
-            "evidence_refs": list(report_files),
+            "conflicts": list(dict.fromkeys(conflicts)),
+            "evidence_refs": list(report_files) or [project_dir],
         }
 
         logger.info(f"Test validation complete: {status} - {reason}")
