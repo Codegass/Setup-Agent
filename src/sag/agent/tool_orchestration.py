@@ -133,7 +133,11 @@ def _format_maven_version_contract(result: ToolResult) -> str:
 
 
 def _format_evidence_observation(result: ToolResult) -> list[str]:
-    normalized_status = coerce_evidence_status(result.status)
+    normalized_status = (
+        ToolResult._status_from_success(result.success)
+        if result.status is None
+        else coerce_evidence_status(result.status)
+    )
     include_status = bool(
         normalized_status != EvidenceStatus.SUCCESS
         or result.evidence_refs

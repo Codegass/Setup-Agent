@@ -119,6 +119,14 @@ def test_tool_observation_omits_success_status_for_default_success():
     assert "Evidence status:" not in observation
 
 
+def test_tool_observation_omits_success_status_for_legacy_constructed_success():
+    result = ToolResult.model_construct(success=True, output="ok")
+
+    observation = format_tool_result("bash", result)
+
+    assert "Evidence status:" not in observation
+
+
 def test_tool_observation_normalizes_raw_success_string_before_visibility_check():
     result = ToolResult.model_construct(success=True, status="SUCCESS", output="ok")
 

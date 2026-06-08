@@ -7,7 +7,7 @@ from loguru import logger
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceStatus, coerce_evidence_status
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
@@ -468,7 +468,7 @@ class ReActEngine(UIEventEmitter):
                 self._add_observation_step(execution.observation_text)
 
                 # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
-                evidence_status = result.status
+                evidence_status = coerce_evidence_status(result.status)
                 should_force_thinking = result.success or evidence_status in {
                     EvidenceStatus.PARTIAL,
                     EvidenceStatus.CONFLICT,
