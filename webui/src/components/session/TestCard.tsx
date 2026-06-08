@@ -13,7 +13,7 @@ export function TestCard({ test }: { test: TestSummary }) {
   return (
     <Card className="p-4">
       <div className="flex items-center justify-between gap-3">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400">
+        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
           Tests
         </div>
         <StatusBadge status={test.state} />
@@ -23,9 +23,9 @@ export function TestCard({ test }: { test: TestSummary }) {
           {hasTests ? test.pass : "-"}
         </span>
         {hasTests ? (
-          <span className="text-[13px] text-slate-400">/ {test.total} passed</span>
+          <span className="text-[13px] text-slate-500">/ {test.total} passed</span>
         ) : (
-          <span className="text-[13px] text-slate-400">no tests recorded</span>
+          <span className="text-[13px] text-slate-500">no tests recorded</span>
         )}
       </div>
       {hasTests ? (
@@ -36,9 +36,9 @@ export function TestCard({ test }: { test: TestSummary }) {
       ) : null}
       <div className="mt-2.5 flex flex-wrap items-center gap-3 font-mono text-[11px]">
         <span className="text-emerald-600">{test.pass} pass</span>
-        <span className={test.fail ? "text-red-600" : "text-slate-400"}>{test.fail} fail</span>
-        <span className="text-slate-400">{test.skip} skip</span>
-        {hasTests ? <span className="text-slate-400">{passRate}% pass rate</span> : null}
+        <span className={test.fail ? "text-red-600" : "text-slate-500"}>{test.fail} fail</span>
+        <span className="text-slate-500">{test.skip} skip</span>
+        {hasTests ? <span className="text-slate-500">{passRate}% pass rate</span> : null}
       </div>
       {test.note ? <div className="mt-2 text-[12px] text-slate-500">{test.note}</div> : null}
     </Card>

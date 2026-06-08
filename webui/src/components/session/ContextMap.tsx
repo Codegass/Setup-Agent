@@ -29,7 +29,7 @@ type ContextRef = ContextMapModel["tasks"][number]["refs"][number]
 const taskIcons: Record<string, React.ReactNode> = {
   completed: <Check size={13} className="text-emerald-600" />,
   active: <Activity size={13} className="text-blue-600" />,
-  pending: <Clock size={13} className="text-slate-400" />,
+  pending: <Clock size={13} className="text-slate-500" />,
   failed: <X size={13} className="text-red-600" />,
 }
 
@@ -212,7 +212,7 @@ function BranchDetailList({
             key={`${detail.label}-${detail.value}-${index}`}
             className="grid gap-1 rounded-md bg-slate-50 px-2.5 py-2 sm:grid-cols-[150px_1fr]"
           >
-            <span className="font-mono text-[10.5px] uppercase tracking-[0.08em] text-slate-400">
+            <span className="font-mono text-[10.5px] uppercase tracking-[0.08em] text-slate-500">
               {detail.label}
             </span>
             <span
@@ -265,7 +265,7 @@ export function ContextMap({
           {progress ? (
             <div className="mt-3">
               <div className="flex items-center gap-3">
-                <span className="w-24 shrink-0 truncate font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                <span className="w-24 shrink-0 truncate font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
                   Done / Total
                 </span>
                 <div
@@ -315,7 +315,7 @@ export function ContextMap({
                   type="button"
                 >
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white">
-                    {taskIcons[task.status.trim().toLowerCase()] ?? <Clock size={13} className="text-slate-400" />}
+                    {taskIcons[task.status.trim().toLowerCase()] ?? <Clock size={13} className="text-slate-500" />}
                   </span>
                   <span className="font-mono text-[10px] text-slate-300">{task.id}</span>
                   <span
@@ -410,7 +410,7 @@ export function ContextMap({
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
                   context pressure
                 </span>
                 <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-100">
@@ -430,7 +430,7 @@ export function ContextMap({
             <div className="mt-1 text-[12.5px] text-slate-500">{ctx.activeBranch.why}</div>
             {ctx.activeBranch.memory.length ? (
               <>
-                <div className="mt-3.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                <div className="mt-3.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
                   recent branch memory
                 </div>
                 <ul className="mt-1.5 space-y-1">
@@ -445,7 +445,7 @@ export function ContextMap({
             ) : null}
             {ctx.activeBranch.lastRefs.length ? (
               <>
-                <div className="mt-3.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                <div className="mt-3.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
                   last tool / evidence references
                 </div>
                 <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -470,7 +470,7 @@ export function ContextMap({
               onClick={() => setDebugOpen((current) => !current)}
               type="button"
             >
-              <Cpu size={14} className="text-slate-400" />
+              <Cpu size={14} className="text-slate-500" />
               <span className="text-[12.5px] font-medium text-slate-600">
                 Debug drawer - raw trunk/branch context
               </span>

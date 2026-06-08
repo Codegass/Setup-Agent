@@ -109,7 +109,7 @@ export function Workspace({
           <h1 className="text-[22px] font-semibold tracking-tight text-slate-900">
             {workspace.project}
           </h1>
-          <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-slate-400">
+          <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-slate-500">
             <span>{workspace.container}</span>
             <span>/</span>
             <span>{workspace.stack}</span>
@@ -210,10 +210,10 @@ function OverviewTab({
         <div className="flex flex-col gap-3 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2.5">
-              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400">
+              <span className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
                 {workspace.activeSession ? "Active session" : "Latest session"}
               </span>
-              {latest ? <span className="font-mono text-[11px] text-slate-400">{latest.id}</span> : null}
+              {latest ? <span className="font-mono text-[11px] text-slate-500">{latest.id}</span> : null}
               {latest ? <StatusBadge status={latest.status} /> : null}
             </div>
             <div className="mt-1 truncate text-[14px] font-medium text-slate-800">
@@ -247,7 +247,7 @@ function OverviewTab({
             {latest?.outcome ?? workspace.task}
           </div>
           {!latest && workspace.latestSession ? (
-            <div className="mt-2 font-mono text-[11px] text-slate-400">
+            <div className="mt-2 font-mono text-[11px] text-slate-500">
               Fetching latest session detail from /api/sessions/{workspace.latestSession}.
             </div>
           ) : null}
@@ -262,7 +262,7 @@ function OverviewTab({
       {latest?.report === "ready" && latest.reportDoc ? (
         <Card className="overflow-hidden">
           <CardHead
-            icon={<FileText size={15} className="text-slate-400" />}
+            icon={<FileText size={15} className="text-slate-500" />}
             right={
               <Button
                 onClick={() => onOpenSession(latest.id, "Report")}
@@ -289,7 +289,7 @@ function OverviewTab({
         <div className="grid gap-4 md:grid-cols-2">
           <Card className="overflow-hidden">
             <CardHead
-              icon={<FileText size={15} className="text-slate-400" />}
+              icon={<FileText size={15} className="text-slate-500" />}
               right={
                 <Button
                   onClick={() => onOpenSession(latest.id, "Files")}
@@ -307,7 +307,7 @@ function OverviewTab({
           </Card>
           <Card className="overflow-hidden">
             <CardHead
-              icon={<Activity size={15} className="text-slate-400" />}
+              icon={<Activity size={15} className="text-slate-500" />}
               right={
                 <Button
                   onClick={() => onOpenSession(latest.id, "Evidence")}
@@ -329,7 +329,7 @@ function OverviewTab({
       {latest?.context && !latest.partial ? (
         <div>
           <div className="mb-2 flex items-center justify-between">
-            <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400">
+            <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
               Context map - trunk / branch
             </div>
             <Button
@@ -358,7 +358,7 @@ function SessionsTab({
 }) {
   if (!rows.length) {
     return (
-      <Card className="p-10 text-center text-[13px] text-slate-400">
+      <Card className="p-10 text-center text-[13px] text-slate-500">
         No sessions are available from the current dashboard and latest-session API data.
       </Card>
     )
@@ -368,7 +368,7 @@ function SessionsTab({
     <Card className="overflow-hidden">
       <div className="hidden grid-cols-[1.8fr_0.8fr_0.8fr_1fr_0.5fr_0.5fr_40px] items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5 lg:grid">
         {["Task", "Status", "Entry", "Build / test", "Evid.", "Files", ""].map((header) => (
-          <div key={header} className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+          <div key={header} className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
             {header}
           </div>
         ))}
@@ -388,7 +388,7 @@ function SessionsTab({
                   {session.title}
                 </span>
               </div>
-              <div className="mt-0.5 font-mono text-[10px] text-slate-400">
+              <div className="mt-0.5 font-mono text-[10px] text-slate-500">
                 {session.start} / {session.duration}
               </div>
             </div>
@@ -411,7 +411,7 @@ function SessionsTab({
             </div>
             <div className="font-mono text-[12px] text-slate-500">{session.filesCount ?? "-"}</div>
             <div className="flex justify-end opacity-0 transition-opacity group-hover:opacity-100">
-              <ArrowRight size={15} className="text-slate-400" />
+              <ArrowRight size={15} className="text-slate-500" />
             </div>
           </button>
         ))}
@@ -426,7 +426,7 @@ function TerminalTab({ workspace }: { workspace: WorkspaceSummary }) {
   return (
     <Card className="overflow-hidden">
       <CardHead
-        icon={<Terminal size={16} className="text-slate-400" />}
+        icon={<Terminal size={16} className="text-slate-500" />}
         right={<StatusBadge status={workspace.docker.status} />}
         sub={running ? "WebSocket exec bridge" : "Container is not running"}
         title="Independent workspace shell"
@@ -444,7 +444,7 @@ function TerminalTab({ workspace }: { workspace: WorkspaceSummary }) {
             </div>
           </div>
         )}
-        <p className="mt-3 text-[12px] leading-relaxed text-slate-400">
+        <p className="mt-3 text-[12px] leading-relaxed text-slate-500">
           Terminal commands run as an independent workspace operation.
           Session details above remain read-only execution records.
         </p>
@@ -462,25 +462,25 @@ function SettingsTab({
 }) {
   return (
     <div className="grid gap-4 md:grid-cols-2">
-      <SettingsCard icon={<Box size={15} className="text-slate-400" />} title="Container">
+      <SettingsCard icon={<Box size={15} className="text-slate-500" />} title="Container">
         <SettingsRow label="Name" value={workspace.container} />
         <SettingsRow label="Status" value={<StatusBadge status={workspace.docker.status} />} />
         <SettingsRow label="Image" value={workspace.docker.image ?? "unknown"} />
         <SettingsRow label="Endpoint" value={workspace.docker.endpoint ?? "local Docker"} />
       </SettingsCard>
-      <SettingsCard icon={<GitBranch size={15} className="text-slate-400" />} title="Workspace">
+      <SettingsCard icon={<GitBranch size={15} className="text-slate-500" />} title="Workspace">
         <SettingsRow label="Project" value={workspace.project} />
         <SettingsRow label="Stack" value={workspace.stack} />
         <SettingsRow label="Tag" value={workspace.tag ?? "untracked"} />
         <SettingsRow label="Commit" value={workspace.commit ?? "unknown"} />
       </SettingsCard>
-      <SettingsCard icon={<Activity size={15} className="text-slate-400" />} title="Sessions">
+      <SettingsCard icon={<Activity size={15} className="text-slate-500" />} title="Sessions">
         <SettingsRow label="Active" value={workspace.activeSession ?? "none"} />
         <SettingsRow label="Latest" value={workspace.latestSession ?? "none"} />
         <SettingsRow label="Latest status" value={latest ? <StatusBadge status={latest.status} /> : "not loaded"} />
         <SettingsRow label="Updated" value={workspace.updated} />
       </SettingsCard>
-      <SettingsCard icon={<SettingsIcon size={15} className="text-slate-400" />} title="Read model">
+      <SettingsCard icon={<SettingsIcon size={15} className="text-slate-500" />} title="Read model">
         <SettingsRow label="Build" value={normalizeWorkspaceBuild(workspace.build).state} />
         <SettingsRow label="Test" value={workspace.test.state} />
         <SettingsRow label="Report" value={workspace.report} />
@@ -594,7 +594,7 @@ function NewTaskModal({
             </div>
           ) : null}
           <label
-            className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400"
+            className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500"
             htmlFor="workspace-task"
           >
             Task description
@@ -608,7 +608,7 @@ function NewTaskModal({
             rows={4}
             value={task}
           />
-          <div className="mt-2 flex items-center gap-2 font-mono text-[10.5px] text-slate-400">
+          <div className="mt-2 flex items-center gap-2 font-mono text-[10.5px] text-slate-500">
             <Box size={12} />
             POST /api/workspaces/{workspace.id}/tasks
           </div>

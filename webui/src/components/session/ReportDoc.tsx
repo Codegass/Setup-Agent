@@ -6,7 +6,7 @@ import { Card, CardHead } from "@/components/common/Card"
 export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
   if (!doc) {
     return (
-      <div className="px-4 py-10 text-center text-[13px] text-slate-400">
+      <div className="px-4 py-10 text-center text-[13px] text-slate-500">
         No report generated for this session.
       </div>
     )
@@ -15,7 +15,7 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
   return (
     <Card className="overflow-hidden">
       <CardHead
-        icon={<FileText size={16} className="text-slate-400" />}
+        icon={<FileText size={16} className="text-slate-500" />}
         right={
           doc.path ? (
             <span
@@ -30,7 +30,7 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
         title={doc.title}
       />
       <div className="px-6 py-5">
-        <div className="mx-auto max-w-[680px] space-y-3">
+        <div className="mx-auto max-w-[640px] space-y-3">
           {doc.blocks.map((block, index) => (
             <ReportBlock block={block} key={index} />
           ))}
@@ -70,7 +70,7 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
   }
 
   if (type === "meta") {
-    return <div className="font-mono text-[11px] text-slate-400">{text}</div>
+    return <div className="font-mono text-[11px] text-slate-500">{text}</div>
   }
 
   if (type === "p") {

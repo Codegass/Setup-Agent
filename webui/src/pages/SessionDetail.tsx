@@ -52,7 +52,7 @@ export function SessionDetail({ detail, onBack, onNewTask, initialTab }: Props) 
           <h1 className="text-[22px] font-semibold tracking-tight text-slate-900">
             {detail.title}
           </h1>
-          <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-slate-400">
+          <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-slate-500">
             <span>{detail.workspace}</span>
             <span>/</span>
             <span>{detail.entry}</span>
@@ -107,7 +107,7 @@ function StatusTab({ detail }: { detail: ExecutionSessionDetail }) {
 
       <Card className="overflow-hidden">
         <CardHead
-          icon={<GitBranch size={16} className="text-slate-400" />}
+          icon={<GitBranch size={16} className="text-slate-500" />}
           right={<StatusBadge status={detail.report} label={`Report: ${detail.report}`} />}
           sub={`${detail.entry} / ${detail.duration}`}
           title="Outcome"
@@ -137,7 +137,7 @@ function StatusTab({ detail }: { detail: ExecutionSessionDetail }) {
       {detail.report === "ready" && detail.reportDoc ? (
         <Card className="overflow-hidden">
           <CardHead
-            icon={<FileText size={15} className="text-slate-400" />}
+            icon={<FileText size={15} className="text-slate-500" />}
             sub={detail.reportDoc.title}
             title="Latest report"
           />
@@ -156,7 +156,7 @@ function EvidenceTab({ detail }: { detail: ExecutionSessionDetail }) {
   return (
     <Card className="overflow-hidden">
       <CardHead
-        icon={<FileText size={16} className="text-slate-400" />}
+        icon={<FileText size={16} className="text-slate-500" />}
         sub="Grouped by trusted runtime source"
         title="Evidence"
       />
@@ -168,7 +168,7 @@ function EvidenceTab({ detail }: { detail: ExecutionSessionDetail }) {
 function ContextTab({ detail }: { detail: ExecutionSessionDetail }) {
   if (!detail.context) {
     return (
-      <Card className="px-4 py-10 text-center text-[13px] text-slate-400">
+      <Card className="px-4 py-10 text-center text-[13px] text-slate-500">
         Context map unavailable for this session.
       </Card>
     )
@@ -181,7 +181,7 @@ function FilesTab({ detail }: { detail: ExecutionSessionDetail }) {
   return (
     <Card className="overflow-hidden">
       <CardHead
-        icon={<FileText size={16} className="text-slate-400" />}
+        icon={<FileText size={16} className="text-slate-500" />}
         sub={detail.files ? `${detail.files.items.length} changed paths` : "unavailable"}
         title="Files"
       />

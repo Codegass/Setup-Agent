@@ -67,7 +67,7 @@ export function EvidenceTimeline({
               <span className="hidden flex-1 truncate text-[12px] text-slate-500 sm:block">
                 {group.summary}
               </span>
-              <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-400">
+              <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-500">
                 {group.counts}
               </span>
               <span className="shrink-0 font-mono text-[10px] text-slate-300">
@@ -95,7 +95,7 @@ export function EvidenceTimeline({
                         <span className="text-[12.5px] font-medium text-slate-700">
                           {record.title}
                         </span>
-                        <span className="ml-auto font-mono text-[10px] text-slate-400">
+                        <span className="ml-auto font-mono text-[10px] text-slate-500">
                           {record.time}
                         </span>
                       </div>
@@ -109,7 +109,7 @@ export function EvidenceTimeline({
                     </Card>
                   ))
                 ) : (
-                  <div className="rounded-md border border-slate-200 bg-white px-3 py-2 text-[12px] text-slate-400">
+                  <div className="rounded-md border border-slate-200 bg-white px-3 py-2 text-[12px] text-slate-500">
                     No record-level evidence captured for this source.
                   </div>
                 )}
@@ -124,7 +124,7 @@ export function EvidenceTimeline({
 
 function EmptyEvidence() {
   return (
-    <div className="px-4 py-8 text-center text-[13px] text-slate-400">
+    <div className="px-4 py-8 text-center text-[13px] text-slate-500">
       Evidence is not available for this session.
     </div>
   )

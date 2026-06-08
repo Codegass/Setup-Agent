@@ -22,7 +22,7 @@ export function FilesDigest({
 
   if (!digest) {
     return (
-      <div className="px-4 py-6 text-center text-[13px] text-slate-400">
+      <div className="px-4 py-6 text-center text-[13px] text-slate-500">
         No file snapshot was captured for this execution.
       </div>
     )
@@ -38,7 +38,7 @@ export function FilesDigest({
           <CountDot color="bg-blue-500" label={`${digest.counts.modified} modified`} />
           <CountDot color="bg-red-500" label={`${digest.counts.deleted} deleted`} />
           <CountDot color="bg-amber-500" label={`${digest.counts.renamed} renamed`} />
-          <div className="ml-auto font-mono text-[10.5px] text-slate-400">
+          <div className="ml-auto font-mono text-[10.5px] text-slate-500">
             snapshot {digest.snapshot.base} - {digest.snapshot.head} / {digest.snapshot.mode}
           </div>
         </div>
@@ -68,12 +68,12 @@ export function FilesDigest({
                     {file.change}
                   </Badge>
                   {file.type === "dir" ? (
-                    <Folder size={14} className="shrink-0 text-slate-400" />
+                    <Folder size={14} className="shrink-0 text-slate-500" />
                   ) : (
-                    <FileText size={14} className="shrink-0 text-slate-400" />
+                    <FileText size={14} className="shrink-0 text-slate-500" />
                   )}
                   <span className="truncate font-mono text-[12px] text-slate-600">{file.path}</span>
-                  <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-400">
+                  <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-500">
                     {file.size}
                   </span>
                   <span className="hidden shrink-0 font-mono text-[10px] text-slate-300 sm:block">
@@ -83,7 +83,7 @@ export function FilesDigest({
                 {open && !preview ? (
                   <div className="border-t border-slate-100 bg-slate-50/50 px-4 py-3 sm:pl-[88px]">
                     <div className="text-[12px] text-slate-500">{file.note}</div>
-                    <div className="mt-2 inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-400">
+                    <div className="mt-2 inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-500">
                       <Search size={12} />
                       Content diff is intentionally on demand.
                     </div>
@@ -93,7 +93,7 @@ export function FilesDigest({
             )
           })
         ) : (
-          <div className="px-4 py-6 text-center text-[13px] text-slate-400">
+          <div className="px-4 py-6 text-center text-[13px] text-slate-500">
             No file changes captured in this digest.
           </div>
         )}
