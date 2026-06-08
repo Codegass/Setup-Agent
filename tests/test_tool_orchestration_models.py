@@ -101,3 +101,27 @@ def test_tool_observation_includes_test_stats_summary_when_present():
     observation = format_tool_result("maven", result)
 
     assert "Test stats: 206 / 214 passed, 96.3% pass rate, 3 failed, 5 skipped" in observation
+
+
+def test_tool_observation_omits_success_status_for_raw_success_string():
+    result = ToolResult.model_construct(success=True, status="success", output="ok")
+
+    observation = format_tool_result("bash", result)
+
+    assert "Evidence status:" not in observation
+
+
+def test_tool_observation_omits_success_status_for_default_success():
+    result = ToolResult(success=True, output="ok")
+
+    observation = format_tool_result("bash", result)
+
+    assert "Evidence status:" not in observation
+
+
+def test_tool_observation_normalizes_raw_success_string_before_visibility_check():
+    result = ToolResult.model_construct(success=True, status="SUCCESS", output="ok")
+
+    observation = format_tool_result("bash", result)
+
+    assert "Evidence status:" not in observation

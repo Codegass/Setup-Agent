@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceStatus, coerce_evidence_status
 from sag.tools.base import BaseTool, ToolResult
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
@@ -133,21 +133,17 @@ def _format_maven_version_contract(result: ToolResult) -> str:
 
 
 def _format_evidence_observation(result: ToolResult) -> list[str]:
-    status = result.status
-    status_value = status.value if isinstance(status, EvidenceStatus) else str(status)
+    normalized_status = coerce_evidence_status(result.status)
     include_status = bool(
-        status
-        and (
-            status != EvidenceStatus.SUCCESS
-            or result.evidence_refs
-            or result.conflicts
-            or result.test_stats
-        )
+        normalized_status != EvidenceStatus.SUCCESS
+        or result.evidence_refs
+        or result.conflicts
+        or result.test_stats
     )
 
     lines: list[str] = []
     if include_status:
-        lines.append(f"Evidence status: {status_value}")
+        lines.append(f"Evidence status: {normalized_status.value}")
     if result.evidence_refs:
         lines.append(f"Evidence refs: {', '.join(result.evidence_refs)}")
     if result.conflicts:
