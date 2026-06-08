@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
+from sag.evidence import EvidenceStatus, TestStats
 
 from .base import BaseTool, ToolError, ToolResult
 from .command_tracker import CommandTracker
@@ -394,11 +395,13 @@ class MavenTool(BaseTool):
                 logger.debug(f"Tracked Maven command: {maven_cmd[:100]}...")
 
             if raw_output:
+                evidence_fields = self._maven_evidence_fields(analysis, ref_id)
                 if analysis["build_success"]:
                     return ToolResult(
                         success=True,
                         output=result["output"],
                         raw_output=result["output"],
+                        **evidence_fields,
                         metadata={
                             "command": maven_cmd,
                             "exit_code": result["exit_code"],
@@ -419,6 +422,7 @@ class MavenTool(BaseTool):
                     maven_cmd,
                     analysis,
                     maven_runtime,
+                    output_ref_id=ref_id,
                 )
                 error_result.output = result["output"]
                 error_result.raw_output = result["output"]
@@ -427,6 +431,7 @@ class MavenTool(BaseTool):
                 return error_result
 
             # Use analysis result to determine success, not just exit code
+            evidence_fields = self._maven_evidence_fields(analysis, ref_id)
             if analysis["build_success"]:
                 if any(goal in command.lower() for goal in ["test", "verify"]):
                     self._record_test_summary(
@@ -467,6 +472,7 @@ class MavenTool(BaseTool):
                                 maven_cmd,
                                 analysis,
                                 maven_runtime,
+                                output_ref_id=ref_id,
                             )
                     except Exception as e:
                         logger.warning(f"Could not validate build artifacts: {e}")
@@ -475,6 +481,7 @@ class MavenTool(BaseTool):
                     success=True,
                     output=self._format_success_output_enhanced(analysis, ref_id),
                     raw_output=result["output"],
+                    **evidence_fields,
                     metadata={
                         "command": maven_cmd,
                         "exit_code": result["exit_code"],
@@ -501,6 +508,7 @@ class MavenTool(BaseTool):
                     maven_cmd,
                     analysis,
                     maven_runtime,
+                    output_ref_id=ref_id,
                 )
 
         except Exception as e:
@@ -1183,10 +1191,13 @@ class MavenTool(BaseTool):
                     failures = int(test_match.group(2))
                     errors = int(test_match.group(3))
                     analysis["tests_run"] = {
-                        "total": int(test_match.group(1)),
-                        "failures": failures,
-                        "errors": errors,
-                        "skipped": int(test_match.group(4)),
+                        "total": (analysis["tests_run"] or {}).get("total", 0)
+                        + int(test_match.group(1)),
+                        "failures": (analysis["tests_run"] or {}).get("failures", 0)
+                        + failures,
+                        "errors": (analysis["tests_run"] or {}).get("errors", 0) + errors,
+                        "skipped": (analysis["tests_run"] or {}).get("skipped", 0)
+                        + int(test_match.group(4)),
                     }
                     analysis["test_failure_count"] += failures
                     analysis["test_error_count"] += errors
@@ -1391,6 +1402,43 @@ class MavenTool(BaseTool):
 
         return output
 
+    def _maven_test_stats(self, analysis: Dict[str, Any]) -> Optional[TestStats]:
+        tests = analysis.get("tests_run") or {}
+        executed = int(tests.get("total") or 0)
+        if executed <= 0:
+            return None
+
+        failed = int(tests.get("failures") or 0) + int(tests.get("errors") or 0)
+        skipped = int(tests.get("skipped") or 0)
+        passed = max(executed - failed - skipped, 0)
+        return TestStats(
+            executed=executed,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+        )
+
+    def _maven_evidence_fields(
+        self, analysis: Dict[str, Any], output_ref_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {}
+        test_stats = self._maven_test_stats(analysis)
+        if test_stats:
+            fields["test_stats"] = test_stats
+
+        has_test_failures = bool(test_stats and test_stats.failed > 0)
+        build_claimed_success = bool(
+            analysis.get("has_build_success_marker") or analysis.get("exit_code") == 0
+        )
+        if has_test_failures and build_claimed_success:
+            fields["status"] = EvidenceStatus.PARTIAL
+            fields["conflicts"] = ["maven_success_vs_test_failures"]
+
+        if output_ref_id:
+            fields["evidence_refs"] = [output_ref_id]
+
+        return fields
+
     def _handle_maven_error(
         self,
         output: str,
@@ -1398,6 +1446,7 @@ class MavenTool(BaseTool):
         command: str,
         analysis: Dict[str, Any],
         maven_runtime: Dict[str, Any] | None = None,
+        output_ref_id: Optional[str] = None,
     ) -> ToolResult:
         """Enhanced error handling with specific suggestions based on error type."""
         """Handle Maven build errors with detailed analysis."""
@@ -1734,10 +1783,13 @@ class MavenTool(BaseTool):
         }
         if maven_runtime:
             metadata["maven_runtime"] = maven_runtime
+        if output_ref_id:
+            metadata["output_ref_id"] = output_ref_id
         if analysis.get("maven_version_requirement"):
             metadata["maven_version_requirement"] = analysis["maven_version_requirement"]
             metadata["compatible_maven_candidate"] = None
 
+        evidence_fields = self._maven_evidence_fields(analysis, output_ref_id)
         return ToolResult(
             success=False,
             output=error_output,  # Show key error lines immediately
@@ -1747,6 +1799,7 @@ class MavenTool(BaseTool):
             documentation_links=documentation_links,
             raw_output=output,
             metadata=metadata,
+            **evidence_fields,
         )
 
     def _record_test_summary(

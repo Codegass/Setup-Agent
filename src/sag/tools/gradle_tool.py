@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
+from sag.evidence import EvidenceStatus, TestStats
 
 from .base import BaseTool, ToolError, ToolResult
 from .toolchain_manager import ToolchainManager, ToolchainSpec
@@ -235,22 +236,27 @@ class GradleTool(BaseTool):
                 logger.debug(f"Stored Gradle output with ref_id: {ref_id}")
 
             if raw_output:
+                evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
                 return ToolResult(
                     success=result["exit_code"] == 0,
                     output=result["output"],
                     raw_output=result["output"],
+                    **evidence_fields,
                     metadata={
                         "command": gradle_cmd,
                         "exit_code": result["exit_code"],
                         "analysis": analysis,
+                        "output_ref_id": ref_id,
                     },
                 )
 
+            evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
             if result["exit_code"] == 0:
                 return ToolResult(
                     success=True,
                     output=self._format_success_output_enhanced(analysis, ref_id),
                     raw_output=result["output"],
+                    **evidence_fields,
                     metadata={
                         "command": gradle_cmd,
                         "exit_code": result["exit_code"],
@@ -260,7 +266,11 @@ class GradleTool(BaseTool):
                 )
             else:
                 return self._handle_gradle_error(
-                    result["output"], result["exit_code"], gradle_cmd, analysis
+                    result["output"],
+                    result["exit_code"],
+                    gradle_cmd,
+                    analysis,
+                    output_ref_id=ref_id,
                 )
 
         except Exception as e:
@@ -530,6 +540,10 @@ class GradleTool(BaseTool):
                 if fail_match:
                     analysis["test_results"]["failed"] = int(fail_match.group(1))
 
+                skipped_match = re.search(r"(\d+)\s+skipped", line, re.IGNORECASE)
+                if skipped_match:
+                    analysis["test_results"]["skipped"] = int(skipped_match.group(1))
+
             # Check for compilation errors
             if "compilation failed" in line.lower() or "compiler error" in line.lower():
                 # Extract error details from surrounding lines
@@ -661,8 +675,50 @@ class GradleTool(BaseTool):
 
         return output
 
+    def _gradle_test_stats(self, analysis: Dict[str, Any]) -> Optional[TestStats]:
+        results = analysis.get("test_results") or {}
+        executed = int(results.get("total") or 0)
+        if executed <= 0:
+            return None
+
+        failed = int(results.get("failed") or 0)
+        skipped = int(results.get("skipped") or 0)
+        passed = max(executed - failed - skipped, 0)
+        return TestStats(
+            executed=executed,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+        )
+
+    def _gradle_evidence_fields(
+        self, analysis: Dict[str, Any], output_ref_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {}
+        test_stats = self._gradle_test_stats(analysis)
+        if test_stats:
+            fields["test_stats"] = test_stats
+
+        has_test_failures = bool(test_stats and test_stats.failed > 0)
+        build_claimed_success = bool(
+            analysis.get("build_successful") or analysis.get("exit_code") == 0
+        )
+        if has_test_failures and build_claimed_success:
+            fields["status"] = EvidenceStatus.PARTIAL
+            fields["conflicts"] = ["gradle_success_vs_test_failures"]
+
+        if output_ref_id:
+            fields["evidence_refs"] = [output_ref_id]
+
+        return fields
+
     def _handle_gradle_error(
-        self, output: str, exit_code: int, command: str, analysis: Dict[str, Any]
+        self,
+        output: str,
+        exit_code: int,
+        command: str,
+        analysis: Dict[str, Any],
+        output_ref_id: Optional[str] = None,
     ) -> ToolResult:
         """Handle Gradle execution errors with detailed analysis."""
         error_message = f"Gradle command failed with exit code {exit_code}"
@@ -750,21 +806,29 @@ class GradleTool(BaseTool):
         # Extract the most relevant error snippet
         error_snippet = self._extract_gradle_key_info(output)
 
-        raise ToolError(
-            message=error_message,
+        metadata = {
+            "exit_code": exit_code,
+            "command": command,
+            "analysis": analysis,
+            "error_snippet": error_snippet,
+        }
+        if output_ref_id:
+            metadata["output_ref_id"] = output_ref_id
+
+        evidence_fields = self._gradle_evidence_fields(analysis, output_ref_id)
+        return ToolResult(
+            success=False,
+            output=error_snippet,
+            error=error_message,
+            error_code="GRADLE_BUILD_FAILED",
             suggestions=suggestions,
             documentation_links=[
                 "https://docs.gradle.org/current/userguide/troubleshooting.html",
                 "https://docs.gradle.org/current/userguide/command_line_interface.html#sec:command_line_debugging",
             ],
-            error_code="GRADLE_BUILD_FAILED",
             raw_output=output,
-            metadata={
-                "exit_code": exit_code,
-                "command": command,
-                "analysis": analysis,
-                "error_snippet": error_snippet,
-            },
+            metadata=metadata,
+            **evidence_fields,
         )
 
     def _extract_gradle_key_info(self, output: str) -> str:

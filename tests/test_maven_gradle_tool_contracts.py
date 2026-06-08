@@ -1,3 +1,4 @@
+from sag.evidence import EvidenceStatus
 from sag.tools.base import ToolResult
 from sag.tools.gradle_tool import GradleTool
 from sag.tools.maven_tool import MavenTool
@@ -80,6 +81,16 @@ class FakeToolchainManager:
             ),
             reason="test resolver",
         )
+
+
+class FakeOutputStorage:
+    def __init__(self, ref_id="output_build_log"):
+        self.ref_id = ref_id
+        self.stored = []
+
+    def store_output(self, **kwargs):
+        self.stored.append(kwargs)
+        return self.ref_id
 
 
 class WrapperBuildToolOrchestrator(FakeBuildToolOrchestrator):
@@ -191,6 +202,38 @@ def test_maven_fail_at_end_test_reports_failures_despite_ignored_exit_code():
     assert "-Dmaven.test.failure.ignore=true" in orchestrator.monitored_commands[0][0]
 
 
+def test_maven_success_marker_with_surefire_failures_returns_partial_evidence():
+    output = "\n".join(
+        [
+            "[INFO] --- maven-surefire-plugin:3.5.5:test (default-test) @ demo ---",
+            "[INFO] Tests run: 214, Failures: 3, Errors: 0, Skipped: 5",
+            "[INFO] BUILD SUCCESS",
+            "[INFO] " + "x" * 900,
+        ]
+    )
+    orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 0})
+    tool = MavenTool(orchestrator)
+    tool.output_storage = FakeOutputStorage("output_maven_success_with_failed_tests")
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        fail_at_end=True,
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is False
+    assert result.status == EvidenceStatus.PARTIAL
+    assert result.test_stats.executed == 214
+    assert result.test_stats.failed == 3
+    assert result.test_stats.skipped == 5
+    assert result.test_stats.passed == 206
+    assert result.test_stats.pass_rate == 96.3
+    assert result.conflicts == ["maven_success_vs_test_failures"]
+    assert result.evidence_refs == ["output_maven_success_with_failed_tests"]
+    assert result.metadata["output_ref_id"] == "output_maven_success_with_failed_tests"
+
+
 def test_maven_explicit_ignore_test_failures_preserves_success_result():
     orchestrator = FakeBuildToolOrchestrator(
         {
@@ -217,6 +260,37 @@ def test_maven_explicit_ignore_test_failures_preserves_success_result():
     assert result.success is True
     assert result.metadata["analysis"]["test_failure_count"] == 1
     assert "ignored_test_failures_detected" not in result.metadata["analysis"]
+
+
+def test_gradle_success_marker_with_failed_tests_returns_partial_evidence():
+    output = "\n".join(
+        [
+            "> Task :test",
+            "214 tests completed, 3 failed, 5 skipped",
+            "BUILD SUCCESSFUL in 10s",
+            "x" * 900,
+        ]
+    )
+    orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 0})
+    tool = GradleTool(orchestrator)
+    tool.output_storage = FakeOutputStorage("output_gradle_success_with_failed_tests")
+
+    result = tool.execute(
+        tasks="test",
+        working_directory="/workspace/project",
+        use_wrapper=False,
+    )
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.PARTIAL
+    assert result.test_stats.executed == 214
+    assert result.test_stats.failed == 3
+    assert result.test_stats.skipped == 5
+    assert result.test_stats.passed == 206
+    assert result.test_stats.pass_rate == 96.3
+    assert result.conflicts == ["gradle_success_vs_test_failures"]
+    assert result.evidence_refs == ["output_gradle_success_with_failed_tests"]
+    assert result.metadata["output_ref_id"] == "output_gradle_success_with_failed_tests"
 
 
 def test_maven_timeout_result_preserves_env_overlay_runtime_and_requested_version():
