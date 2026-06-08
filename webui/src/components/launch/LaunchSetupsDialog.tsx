@@ -1,6 +1,6 @@
 import { useState } from "react"
 import type { ClipboardEvent } from "react"
-import { Info, Plus, Rocket, X } from "lucide-react"
+import { Info, Loader2, Plus, Rocket, X } from "lucide-react"
 
 import type { LaunchBatchRequestBody, LaunchBatchResult } from "@/api/types"
 import { Button } from "@/components/common/Button"
@@ -15,18 +15,20 @@ import {
 
 import { emptyLaunchRow, parsePastedRepoLines, type LaunchRowDraft } from "./launchRows"
 
+const cellBase =
+  "w-full rounded-md border px-2 py-1.5 font-mono text-[12px] text-slate-700 outline-none focus:ring-2"
+const cellNormal = "border-slate-200 focus:border-blue-500 focus:ring-blue-500/20"
+const cellError = "border-red-400 focus:border-red-500 focus:ring-red-500/20"
+
+const VERSION_HELP =
+  "Branch, release tag, or commit hash (short or full), e.g. rel/commons-cli-1.11.0 or 1a2b3c4. Leave empty for the default branch."
+
 interface LaunchSetupsDialogProps {
   defaultConcurrency: number
   onClose: () => void
   onSubmit: (payload: LaunchBatchRequestBody) => Promise<LaunchBatchResult>
   onSubmitted: (result: LaunchBatchResult) => void
 }
-
-const cellClass =
-  "w-full rounded-md border border-slate-200 px-2 py-1.5 font-mono text-[12px] text-slate-700 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
-
-const VERSION_HELP =
-  "Branch, release tag, or commit hash (short or full), e.g. rel/commons-cli-1.11.0 or 1a2b3c4. Leave empty for the default branch."
 
 function isRowEmpty(row: LaunchRowDraft): boolean {
   return (
@@ -54,6 +56,16 @@ export function LaunchSetupsDialog({
     setRows((current) =>
       current.map((row, rowIndex) => (rowIndex === index ? { ...row, ...patch } : row)),
     )
+    // Editing a row clears the error it just saw, so stale messages don't linger.
+    setRowErrors((current) => {
+      if (current[index] === undefined) {
+        return current
+      }
+      const next = { ...current }
+      delete next[index]
+      return next
+    })
+    setFormError(null)
   }
 
   const addRow = () => setRows((current) => [...current, emptyLaunchRow()])
@@ -173,97 +185,102 @@ export function LaunchSetupsDialog({
         <DialogHeader className="border-b border-slate-100 px-4 py-3">
           <DialogTitle>Launch setups</DialogTitle>
           <DialogDescription>
-            One row per repository. Each accepted row runs sag project in its own
-            process. Paste multiple lines (repo URL, optionally followed by a
-            version) into a repository cell to fill the grid.
+            One row per repository. Each accepted row runs sag project in its own process.
           </DialogDescription>
         </DialogHeader>
 
         <form onSubmit={(event) => { event.preventDefault(); void handleSubmit() }}>
-        <div className="max-h-[60vh] overflow-y-auto p-4">
-          <div className="flex items-center gap-2">
-            <label
-              className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500"
-              htmlFor="launch-concurrency"
-            >
-              Concurrency
-            </label>
-            <input
-              aria-label="Concurrency"
-              className={`${cellClass} w-20`}
-              id="launch-concurrency"
-              min={1}
-              onChange={(event) => setConcurrency(event.target.value)}
-              type="number"
-              value={concurrency}
-            />
-            <span className="text-[11px] text-slate-500">
-              parallel setups for this batch
-            </span>
-          </div>
-
-          <div className="mt-3 grid grid-cols-[2.2fr_1fr_1.2fr_1.6fr_56px_36px] items-center gap-2">
-            {["Repo URL", "Name", "Version", "Goal", "Record", ""].map((header) => (
-              <div
-                key={header || "actions"}
-                className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
-              >
-                {header}
-                {header === "Version" ? (
-                  <span
-                    aria-label="Version help"
-                    className="group relative inline-flex cursor-help text-slate-300 hover:text-slate-500 focus-visible:text-slate-500 focus-visible:outline-none"
-                    tabIndex={0}
-                  >
-                    <Info aria-hidden="true" size={12} />
-                    <span
-                      className="pointer-events-none absolute left-1/2 top-full z-50 mt-1.5 hidden w-64 -translate-x-1/2 whitespace-normal rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-left font-sans text-[11px] font-normal normal-case tracking-normal text-slate-600 shadow-md group-hover:block group-focus-visible:block"
-                      role="tooltip"
-                    >
-                      {VERSION_HELP}
-                    </span>
-                  </span>
-                ) : null}
-              </div>
-            ))}
-            {rows.map((row, index) => (
-              <RowCells
-                key={index}
-                error={rowErrors[index]}
-                index={index}
-                onChange={(patch) => updateRow(index, patch)}
-                onRemove={() => removeRow(index)}
-                onRepoPaste={(event) => handleRepoPaste(index, event)}
-                row={row}
-              />
-            ))}
-          </div>
-
-          <Button
-            className="mt-3"
-            onClick={addRow}
-            size="sm"
-            type="button"
-            variant="outline"
+          <fieldset
+            className="m-0 block max-h-[60vh] min-w-0 overflow-y-auto border-0 p-4"
+            disabled={submitting}
           >
-            <Plus size={13} />
-            Add row
-          </Button>
+            <div className="flex items-center gap-2">
+              <label
+                className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500"
+                htmlFor="launch-concurrency"
+              >
+                Concurrency
+              </label>
+              <input
+                aria-label="Concurrency"
+                className={`${cellBase} ${cellNormal} w-20`}
+                id="launch-concurrency"
+                min={1}
+                onChange={(event) => setConcurrency(event.target.value)}
+                type="number"
+                value={concurrency}
+              />
+              <span className="text-[11px] text-slate-500">
+                parallel setups for this batch (1 or more)
+              </span>
+            </div>
 
-          {formError ? (
-            <div className="mt-3 text-[12px] text-red-600">{formError}</div>
-          ) : null}
-        </div>
+            <div className="mt-3 grid grid-cols-[2.2fr_1fr_1.2fr_1.6fr_56px_36px] items-center gap-2">
+              {["Repo URL", "Name", "Version", "Goal", "Record", ""].map((header) => (
+                <div
+                  key={header || "actions"}
+                  className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
+                >
+                  {header}
+                  {header === "Version" ? (
+                    <span
+                      aria-label="Version help"
+                      className="group relative inline-flex cursor-help text-slate-400 hover:text-slate-600 focus-visible:text-slate-600 focus-visible:outline-none"
+                      tabIndex={0}
+                    >
+                      <Info aria-hidden="true" size={12} />
+                      <span
+                        className="pointer-events-none absolute left-1/2 top-full z-50 mt-1.5 hidden w-64 -translate-x-1/2 whitespace-normal rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-left font-sans text-[11px] font-normal normal-case tracking-normal text-slate-600 shadow-md group-hover:block group-focus-visible:block"
+                        role="tooltip"
+                      >
+                        {VERSION_HELP}
+                      </span>
+                    </span>
+                  ) : null}
+                </div>
+              ))}
+              {rows.map((row, index) => (
+                <RowCells
+                  key={index}
+                  error={rowErrors[index]}
+                  index={index}
+                  onChange={(patch) => updateRow(index, patch)}
+                  onRemove={() => removeRow(index)}
+                  onRepoPaste={(event) => handleRepoPaste(index, event)}
+                  row={row}
+                />
+              ))}
+            </div>
 
-        <DialogFooter className="gap-2 border-t border-slate-100 px-4 py-3 sm:space-x-0">
-          <Button disabled={submitting} onClick={onClose} type="button" variant="outline">
-            Cancel
-          </Button>
-          <Button disabled={submitting} type="submit">
-            <Rocket size={13} />
-            {submitting ? "Launching" : "Launch setups"}
-          </Button>
-        </DialogFooter>
+            <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2">
+              <Button onClick={addRow} size="sm" type="button" variant="outline">
+                <Plus size={13} />
+                Add row
+              </Button>
+              <span className="text-[11px] text-slate-500">
+                Tip: paste <span className="font-mono">repo-url version</span> lines into a
+                URL cell to fill multiple rows.
+              </span>
+            </div>
+
+            {formError ? (
+              <div className="mt-3 text-[12px] text-red-600">{formError}</div>
+            ) : null}
+          </fieldset>
+
+          <DialogFooter className="gap-2 border-t border-slate-100 px-4 py-3 sm:space-x-0">
+            <Button disabled={submitting} onClick={onClose} type="button" variant="outline">
+              Cancel
+            </Button>
+            <Button disabled={submitting} type="submit">
+              {submitting ? (
+                <Loader2 className="animate-spin" size={13} />
+              ) : (
+                <Rocket size={13} />
+              )}
+              {submitting ? "Launching" : "Launch setups"}
+            </Button>
+          </DialogFooter>
         </form>
       </DialogContent>
     </Dialog>
@@ -290,9 +307,10 @@ function RowCells({
   return (
     <>
       <input
+        aria-invalid={error ? true : undefined}
         aria-label={`Repository URL row ${rowLabel}`}
         autoFocus={index === 0}
-        className={cellClass}
+        className={`${cellBase} ${error ? cellError : cellNormal}`}
         onChange={(event) => onChange({ repoUrl: event.target.value })}
         onPaste={onRepoPaste}
         placeholder="https://github.com/owner/repo.git"
@@ -300,14 +318,14 @@ function RowCells({
       />
       <input
         aria-label={`Name row ${rowLabel}`}
-        className={cellClass}
+        className={`${cellBase} ${cellNormal}`}
         onChange={(event) => onChange({ name: event.target.value })}
         placeholder="optional"
         value={row.name}
       />
       <input
         aria-label={`Version row ${rowLabel}`}
-        className={cellClass}
+        className={`${cellBase} ${cellNormal}`}
         onChange={(event) => onChange({ ref: event.target.value })}
         placeholder="branch, tag, or commit"
         title={VERSION_HELP}
@@ -315,7 +333,7 @@ function RowCells({
       />
       <input
         aria-label={`Goal row ${rowLabel}`}
-        className={cellClass}
+        className={`${cellBase} ${cellNormal}`}
         onChange={(event) => onChange({ goal: event.target.value })}
         placeholder="optional"
         value={row.goal}
@@ -331,7 +349,7 @@ function RowCells({
       </div>
       <button
         aria-label={`Remove row ${rowLabel}`}
-        className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+        className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:opacity-40"
         onClick={onRemove}
         type="button"
       >
