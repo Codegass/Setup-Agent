@@ -20,7 +20,7 @@ from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchVali
 from sag.web.read_model import ReadModelBuilder
 from sag.web.task_runner import TaskRequest, TaskRunner
 from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
-from sag.web.workspace_service import WorkspaceService
+from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
 
 
 def _single_snapshot(payload: dict) -> Iterator[str]:
@@ -82,6 +82,11 @@ def create_app(
             return workspaces.delete_workspace(workspace_id)
         except WorkspaceBusyError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except WorkspaceDeletionError as exc:
+            # Docker daemon unreachable or the container could not be removed.
+            # Surface a meaningful detail (not an opaque 500) so the client can
+            # keep the dialog open and tell the user what to retry.
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post("/api/project-launches/batch")
     def submit_project_batch(request: LaunchBatchRequest) -> JSONResponse:

@@ -8,7 +8,7 @@ from sag.web.launch_queue import (
     LaunchQueueStore,
     WorkspaceBusyError,
 )
-from sag.web.workspace_service import WorkspaceService
+from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
 
 NOW = "2026-06-07T10:00:00"
 
@@ -16,14 +16,20 @@ NOW = "2026-06-07T10:00:00"
 class FakeOrchestrator:
     """Records remove_project() calls; never touches real Docker."""
 
-    def __init__(self, workspace_id, removed=True):
+    def __init__(self, workspace_id, removed=True, still_exists=False):
         self.workspace_id = workspace_id
         self._removed = removed
+        self._still_exists = still_exists
         self.remove_calls = 0
+        self.exists_calls = 0
 
     def remove_project(self):
         self.remove_calls += 1
         return self._removed
+
+    def container_exists(self):
+        self.exists_calls += 1
+        return self._still_exists
 
 
 def make_store(tmp_path):
@@ -65,12 +71,18 @@ def enqueue(
     return item
 
 
-def make_service(tmp_path, orchestrators=None, removed=True, launches_root=None):
+def make_service(
+    tmp_path,
+    orchestrators=None,
+    removed=True,
+    still_exists=False,
+    launches_root=None,
+):
     store = make_store(tmp_path)
     created: dict = {} if orchestrators is None else orchestrators
 
     def factory(workspace_id):
-        orch = FakeOrchestrator(workspace_id, removed=removed)
+        orch = FakeOrchestrator(workspace_id, removed=removed, still_exists=still_exists)
         created[workspace_id] = orch
         return orch
 
@@ -150,11 +162,53 @@ def test_delete_workspace_deletes_log_and_prunes_empty_batch_dir(tmp_path):
     assert not batch_dir.exists()
 
 
-def test_delete_workspace_reports_container_not_removed(tmp_path):
-    service, store, _ = make_service(tmp_path, removed=False)
+def test_delete_workspace_raises_when_container_persists(tmp_path):
+    # remove_project failed (swallowed the error) and the container is still
+    # there: this is a partial failure, not a success.
+    service, store, orchestrators = make_service(
+        tmp_path, removed=False, still_exists=True
+    )
+    enqueue(store, workspace_id="sag-a")
+
+    with pytest.raises(WorkspaceDeletionError):
+        service.delete_workspace("sag-a")
+
+    assert orchestrators["sag-a"].remove_calls == 1
+    # The queue rows were still cleared, so the failure must be surfaced.
+    assert store.list_batches() == []
+
+
+def test_delete_workspace_treats_vanished_container_as_removed(tmp_path):
+    # remove_project returned False but the container is actually gone: the
+    # delete effectively succeeded, so report success (not a spurious error).
+    service, store, orchestrators = make_service(
+        tmp_path, removed=False, still_exists=False
+    )
     enqueue(store, workspace_id="sag-a")
 
     result = service.delete_workspace("sag-a")
 
-    assert result["container_removed"] is False
+    assert result["container_removed"] is True
     assert result["queue_items_removed"] == 1
+    assert orchestrators["sag-a"].exists_calls == 1
+
+
+def test_delete_workspace_keeps_queue_when_orchestrator_construction_fails(tmp_path):
+    # A Docker daemon outage surfaces while building the orchestrator, before any
+    # row is deleted: the launch history must survive so the delete is retryable.
+    store = make_store(tmp_path)
+    enqueue(store, workspace_id="sag-a")
+
+    def failing_factory(workspace_id):
+        raise RuntimeError("docker daemon unreachable")
+
+    service = WorkspaceService(
+        store=store,
+        orchestrator_factory=failing_factory,
+        launches_root=tmp_path / "launches",
+    )
+
+    with pytest.raises(WorkspaceDeletionError):
+        service.delete_workspace("sag-a")
+
+    assert len(store.list_batches()[0]["items"]) == 1

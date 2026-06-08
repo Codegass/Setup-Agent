@@ -385,3 +385,22 @@ def test_delete_workspace_returns_409_when_busy():
     assert response.status_code == 409
     assert "active launch" in response.json()["detail"]
     assert service.calls == ["sag-x"]
+
+
+def test_delete_workspace_returns_502_on_deletion_error():
+    from sag.web.workspace_service import WorkspaceDeletionError
+
+    service = FakeWorkspaceService(
+        error=WorkspaceDeletionError(
+            "Launch history for sag-x was cleared, but its Docker container "
+            "could not be removed."
+        )
+    )
+    app = create_app(ReadModelBuilder(demo_mode=True), workspace_service=service)
+    client = TestClient(app)
+
+    response = client.delete("/api/workspaces/sag-x")
+
+    assert response.status_code == 502
+    assert "could not be removed" in response.json()["detail"]
+    assert service.calls == ["sag-x"]

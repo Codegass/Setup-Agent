@@ -272,6 +272,22 @@ class LaunchQueueStore:
             ).fetchall()
             return {row["workspace_id"] for row in rows}
 
+    def is_workspace_busy(self, workspace_id: str) -> bool:
+        """Return True if the workspace has a ``launching`` or ``running`` item.
+
+        Read-only counterpart to the atomic busy-guard in
+        ``delete_workspace_items``. Lets a caller reject a busy workspace before
+        touching Docker, so busy rejection works even when the daemon is down.
+        """
+
+        with contextlib.closing(self._connect()) as conn:
+            active = conn.execute(
+                "SELECT COUNT(*) FROM launch_items"
+                " WHERE workspace_id = ? AND status IN ('launching', 'running')",
+                (workspace_id,),
+            ).fetchone()[0]
+            return bool(active)
+
     def delete_workspace_items(self, workspace_id: str) -> tuple[int, list[str]]:
         """Atomically delete every launch_item for ``workspace_id``.
 
