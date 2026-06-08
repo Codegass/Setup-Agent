@@ -157,4 +157,30 @@ describe("ContextMap", () => {
     expect(screen.getAllByRole("button", { name: "validator conflict" })).toHaveLength(1)
     expect(screen.queryByText("Evidence refs")).not.toBeInTheDocument()
   })
+
+  it("does not show an unknown evidence badge just because refs exist", () => {
+    render(
+      <ContextMap
+        ctx={{
+          ...context,
+          tasks: [
+            {
+              ...context.tasks[0],
+              evidenceStatus: "unknown",
+              conflicts: [],
+              refs: [],
+              summary: "",
+            },
+          ],
+        }}
+      />,
+    )
+
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /task_4/i }))
+
+    expect(screen.getByText("Evidence refs")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "validator conflict" })).toBeInTheDocument()
+  })
 })

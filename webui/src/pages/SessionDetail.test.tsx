@@ -94,6 +94,19 @@ describe("SessionDetail", () => {
     expect(screen.queryByText("Unknown")).not.toBeInTheDocument()
   })
 
+  it("renders blocked evidence status when validator evidence blocks success", () => {
+    render(
+      <SessionDetail
+        detail={{ ...detail, evidenceStatus: "blocked" }}
+        onBack={() => {}}
+        onNewTask={() => {}}
+      />,
+    )
+
+    expect(screen.getAllByText("Evidence status")).not.toHaveLength(0)
+    expect(screen.getAllByText("Blocked")).not.toHaveLength(0)
+  })
+
   it("opens evidence and report tabs without changing the default status tab", () => {
     render(
       <SessionDetail

@@ -126,4 +126,24 @@ describe("Workspace", () => {
     expect(screen.getByText("Completed")).toBeInTheDocument()
     expect(screen.queryByText("Unknown")).not.toBeInTheDocument()
   })
+
+  it("renders blocked evidence status in overview and session rows", () => {
+    render(
+      <Workspace
+        latest={{ ...latest, evidenceStatus: "blocked" }}
+        onBack={() => {}}
+        onOpenSession={() => {}}
+        onSubmitTask={vi.fn()}
+        sessions={[{ ...sessions[0], evidenceStatus: "blocked" }]}
+        workspace={workspace}
+      />,
+    )
+
+    expect(screen.getByText("Evidence status")).toBeInTheDocument()
+    expect(screen.getAllByText("Blocked")).not.toHaveLength(0)
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions 1" }))
+
+    expect(screen.getAllByText("Blocked")).not.toHaveLength(0)
+  })
 })

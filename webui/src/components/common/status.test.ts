@@ -32,5 +32,6 @@ describe("statusMeta", () => {
     expect(isUsefulEvidenceStatus(null)).toBe(false)
     expect(isUsefulEvidenceStatus("partial")).toBe(true)
     expect(isUsefulEvidenceStatus("conflict")).toBe(true)
+    expect(isUsefulEvidenceStatus("blocked")).toBe(true)
   })
 })

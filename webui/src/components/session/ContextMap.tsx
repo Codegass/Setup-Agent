@@ -319,8 +319,7 @@ export function ContextMap({
             )
             const showEvidenceStatus =
               isUsefulEvidenceStatus(task.evidenceStatus) ||
-              conflicts.length > 0 ||
-              evidenceRefs.length > 0
+              conflicts.length > 0
             const evidenceStatus = task.evidenceStatus?.trim() || "unknown"
             const hasDetails =
               Boolean(task.summary.trim()) ||
