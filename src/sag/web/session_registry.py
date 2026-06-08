@@ -875,10 +875,35 @@ def _report_int(report_raw: str, label: str) -> int:
 def _build_state_from_report(report_raw: str | None) -> str:
     if not report_raw:
         return "none"
+
+    # Real reports encode build status as a ✅/❌ marker in the "Build" row of
+    # the Build & Test Overview table (e.g. "✅ 115 classes, 0 JARs") and never
+    # contain the literal phrase "build success". Read that marker first so a
+    # successful build is not reported as "unknown".
+    marker_state = _status_from_marker(_build_note_from_report(report_raw))
+    if marker_state != "unknown":
+        return marker_state
+
     lowered = report_raw.lower()
     if "build failed" in lowered or "build failure" in lowered:
         return "failed"
-    if "build passed" in lowered or "build success" in lowered or "result:** success" in lowered:
+    if (
+        "build passed" in lowered
+        or "build success" in lowered
+        # Reports write "**Result:** ✅ SUCCESS"; tolerate the emoji between
+        # the label and the word so the plain-text fallback still matches.
+        or re.search(r"result:\*\*\s*[^\n]*success", lowered) is not None
+    ):
+        return "success"
+    return "unknown"
+
+
+def _status_from_marker(text: str) -> str:
+    """Map a ✅/❌ status marker (as used in the report tables) to a state."""
+
+    if "❌" in text or "🔴" in text:
+        return "failed"
+    if "✅" in text:
         return "success"
     return "unknown"
 

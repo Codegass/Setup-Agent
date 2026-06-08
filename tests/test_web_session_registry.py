@@ -437,6 +437,68 @@ def test_container_session_registry_parses_setup_report_breakdown_table():
     assert rows[0].test.skip_count == 10
 
 
+def test_setup_artifact_build_state_reads_checkmark_marker():
+    # Real reports mark the build with a ✅ in the Build row and write
+    # "**Result:** ✅ SUCCESS"; they never contain the literal phrase
+    # "build success". The dashboard must still report success, not "unknown".
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Set up commons-cli",
+                "todo_list": [
+                    {"id": "task_1", "description": "Compile", "status": "completed"},
+                ],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "# 🎯 Project Setup Report\n\n"
+            "**Result:** ✅ SUCCESS\n\n"
+            "### Build & Test Overview\n"
+            "│ Build           │ ✅ 115 classes, 0 JARs            │\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+
+    assert rows[0].build == "success"
+
+
+def test_setup_artifact_build_state_reads_failure_marker():
+    # A failed build is marked with ❌ in the Build row.
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
+            {
+                "context_id": "trunk_20260606_213241",
+                "created_at": "2026-06-06 21:32:41.079329",
+                "last_updated": "2026-06-06 21:35:09.305137",
+                "goal": "Set up commons-cli",
+                "todo_list": [
+                    {"id": "task_1", "description": "Compile", "status": "failed"},
+                ],
+            }
+        ),
+        "/workspace/setup-report-20260606-213509.md": (
+            "# 🎯 Project Setup Report\n\n"
+            "**Result:** ❌ INCOMPLETE\n\n"
+            "### Build & Test Overview\n"
+            "│ Build           │ ❌ compilation failed             │\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    rows = registry.list_workspace_sessions(workspace_summary())
+
+    assert rows[0].build == "failed"
+
+
 def test_container_session_registry_returns_setup_artifact_detail():
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
