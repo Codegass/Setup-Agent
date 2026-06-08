@@ -53,6 +53,32 @@ def test_branch_receives_previous_summary_and_evidence_digest(tmp_path):
     assert "output_build" in branch.previous_task_evidence_digest
 
 
+def test_branch_receives_previous_evidence_digest_without_key_results(tmp_path):
+    manager = ContextManager(workspace_path=str(tmp_path))
+    trunk = manager.create_trunk_context(
+        goal="Set up project",
+        project_url="https://example.test/demo",
+        project_name="demo",
+    )
+    task_1 = trunk.add_task("Run build")
+    task_2 = trunk.add_task("Run tests")
+    trunk.update_task_status(task_1, TaskStatus.COMPLETED)
+    manager._save_trunk_context(trunk)
+    manager.update_task_evidence(
+        task_1,
+        evidence_status="partial",
+        evidence_refs=["output_build_only"],
+        conflicts=[],
+    )
+
+    result = manager.start_new_branch(task_2)
+    branch = manager.load_branch_history(task_2)
+
+    assert result["previous_summary"] == ""
+    assert "task_1 evidence_status: partial" in branch.previous_task_evidence_digest
+    assert "output_build_only" in branch.previous_task_evidence_digest
+
+
 def test_get_current_context_info_includes_task_evidence_fields(tmp_path):
     manager = ContextManager(workspace_path=str(tmp_path))
     trunk = manager.create_trunk_context(

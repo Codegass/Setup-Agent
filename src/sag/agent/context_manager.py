@@ -536,11 +536,12 @@ CONTEXT_EOF"""
         for i, t in enumerate(trunk_context.todo_list):
             if t.id == task_id and i > 0:
                 prev_task = trunk_context.todo_list[i - 1]
-                if prev_task.status == TaskStatus.COMPLETED and prev_task.key_results:
-                    previous_summary = f"Previous task ({prev_task.id}): {prev_task.key_results}"
+                if prev_task.status == TaskStatus.COMPLETED:
                     previous_task_evidence_digest = self._format_previous_task_evidence_digest(
                         prev_task
                     )
+                if prev_task.status == TaskStatus.COMPLETED and prev_task.key_results:
+                    previous_summary = f"Previous task ({prev_task.id}): {prev_task.key_results}"
                 break
 
         # Create branch history file
