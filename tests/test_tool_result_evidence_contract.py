@@ -72,6 +72,7 @@ def test_tool_result_preserves_explicit_domain_status_when_success_changes():
 
 class FakeBashOrchestrator:
     def __init__(self, result):
+        self.container_name = "demo-container"
         self.result = result
 
     def execute_command(
@@ -82,6 +83,14 @@ class FakeBashOrchestrator:
         environment=None,
         timeout=None,
     ):
+        if "test -d /workspace" in command:
+            return {
+                "success": True,
+                "output": "EXISTS",
+                "exit_code": 0,
+                "stdout": "EXISTS",
+                "stderr": "",
+            }
         return self.result
 
     def execute_command_with_monitoring(self, **kwargs):
@@ -140,4 +149,69 @@ def test_bash_blocked_command_reports_pre_execution_facts():
     assert result.error_code == "COMMAND_BLOCKED"
     assert result.metadata["execution"]["executed"] is False
     assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False
+
+
+def test_bash_no_orchestrator_reports_pre_execution_facts():
+    tool = BashTool(docker_orchestrator=None)
+
+    result = tool.execute(command="echo hi", working_directory="/workspace/project")
+
+    assert result.success is False
+    assert result.error_code == "NO_ORCHESTRATOR"
+    assert result.metadata["execution"]["executed"] is False
+    assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False
+    assert "Docker is running" in result.suggestions[0]
+
+
+def test_bash_interactive_command_reports_pre_execution_facts():
+    tool = BashTool(docker_orchestrator=FakeBashOrchestrator({"success": True, "output": "ok"}))
+
+    result = tool.execute(command="vim file.txt", working_directory="/workspace/project")
+
+    assert result.success is False
+    assert result.error_code == "INTERACTIVE_COMMAND"
+    assert result.metadata["execution"]["executed"] is False
+    assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False
+
+
+def test_bash_background_success_reports_execution_facts():
+    tool = BashTool(
+        docker_orchestrator=FakeBashOrchestrator(
+            {
+                "success": True,
+                "output": "1234",
+                "exit_code": 0,
+            }
+        )
+    )
+
+    result = tool.execute(command="sleep 60 &", working_directory="/workspace/project")
+
+    assert result.success is True
+    assert result.metadata["execution"]["executed"] is True
+    assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False
+    assert result.metadata["background_pids"] == [1234]
+
+
+def test_bash_background_failed_start_preserves_execution_facts():
+    tool = BashTool(
+        docker_orchestrator=FakeBashOrchestrator(
+            {
+                "success": False,
+                "output": "permission denied",
+                "exit_code": 126,
+            }
+        )
+    )
+
+    result = tool.execute(command="sleep 60 &", working_directory="/workspace/project")
+
+    assert result.success is False
+    assert result.error_code == "BACKGROUND_START_FAILED"
+    assert result.metadata["execution"]["executed"] is True
+    assert result.metadata["execution"]["exit_code"] == 126
     assert result.metadata["execution"]["timed_out"] is False
