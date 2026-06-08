@@ -70,7 +70,7 @@ export function EvidenceTimeline({
               <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-500">
                 {group.counts}
               </span>
-              <span className="shrink-0 font-mono text-[10px] text-slate-300">
+              <span className="shrink-0 font-mono text-[10px] text-slate-500">
                 {group.time}
               </span>
               {!preview ? (

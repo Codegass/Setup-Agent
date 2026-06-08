@@ -383,7 +383,7 @@ function SessionsTab({
           >
             <div className="min-w-0">
               <div className="flex items-center gap-2">
-                <span className="font-mono text-[10px] text-slate-300">{session.id}</span>
+                <span className="font-mono text-[10px] text-slate-500">{session.id}</span>
                 <span className="truncate text-[13px] font-medium text-slate-700 group-hover:text-blue-600">
                   {session.title}
                 </span>
@@ -403,7 +403,7 @@ function SessionsTab({
               {session.test.total > 0 ? (
                 <TestBar fail={session.test.fail} pass={session.test.pass} total={session.test.total} />
               ) : (
-                <span className="text-[11px] text-slate-300">no tests</span>
+                <span className="text-[11px] text-slate-500">no tests</span>
               )}
             </div>
             <div className="font-mono text-[12px] text-slate-500">

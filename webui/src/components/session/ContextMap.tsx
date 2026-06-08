@@ -317,7 +317,7 @@ export function ContextMap({
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white">
                     {taskIcons[task.status.trim().toLowerCase()] ?? <Clock size={13} className="text-slate-500" />}
                   </span>
-                  <span className="font-mono text-[10px] text-slate-300">{task.id}</span>
+                  <span className="font-mono text-[10px] text-slate-500">{task.id}</span>
                   <span
                     className={cn(
                       "min-w-0 truncate text-[13px]",

@@ -76,7 +76,7 @@ export function FilesDigest({
                   <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-500">
                     {file.size}
                   </span>
-                  <span className="hidden shrink-0 font-mono text-[10px] text-slate-300 sm:block">
+                  <span className="hidden shrink-0 font-mono text-[10px] text-slate-500 sm:block">
                     {file.mtime}
                   </span>
                 </button>
