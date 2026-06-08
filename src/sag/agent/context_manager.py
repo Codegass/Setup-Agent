@@ -800,6 +800,8 @@ CONTEXT_EOF"""
                     "context_type": "branch",
                     "task_id": self.current_task_id,
                     "task_description": branch_history.task_description,
+                    "previous_task_evidence_digest": branch_history.previous_task_evidence_digest,
+                    "current_task_evidence_refs": branch_history.current_task_evidence_refs,
                     "entry_count": branch_history.entry_count,
                     "token_count": branch_history.token_count,
                     "needs_compression": branch_history.token_count

@@ -105,3 +105,36 @@ def test_get_current_context_info_includes_task_evidence_fields(tmp_path):
     assert task["evidence_refs"] == ["output_abc"]
     assert task["conflicts"] == ["report_mismatch"]
     assert task["validator_findings"][0]["reason"] == "report mismatch"
+
+
+def test_get_current_context_info_branch_includes_evidence_fields(tmp_path):
+    manager = ContextManager(workspace_path=str(tmp_path))
+    trunk = manager.create_trunk_context(
+        goal="Set up project",
+        project_url="https://example.test/demo",
+        project_name="demo",
+    )
+    task_1 = trunk.add_task("Run build")
+    task_2 = trunk.add_task("Run tests")
+    trunk.update_task_status(task_1, TaskStatus.COMPLETED)
+    trunk.update_task_key_results(task_1, "Build completed.")
+    manager._save_trunk_context(trunk)
+    manager.update_task_evidence(
+        task_1,
+        evidence_status="partial",
+        evidence_refs=["output_build"],
+        conflicts=[],
+    )
+
+    manager.start_new_branch(task_2)
+    branch = manager.load_branch_history(task_2)
+    branch.current_task_evidence_refs = ["output_test"]
+    manager._save_branch_history(
+        branch, str(manager.contexts_dir / f"{task_2}.json")
+    )
+    manager.current_task_id = task_2
+
+    info = manager.get_current_context_info()
+
+    assert "task_1 evidence_status: partial" in info["previous_task_evidence_digest"]
+    assert info["current_task_evidence_refs"] == ["output_test"]
