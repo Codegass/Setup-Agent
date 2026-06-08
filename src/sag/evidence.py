@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Iterable
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 
 
 class EvidenceStatus(str, Enum):
@@ -30,6 +30,10 @@ class EvidenceFinding(BaseModel):
     status: EvidenceStatus = EvidenceStatus.UNKNOWN
     refs: list[str] = Field(default_factory=list)
     details: dict[str, object] = Field(default_factory=dict)
+
+    @field_serializer("status")
+    def _serialize_status(self, status: EvidenceStatus) -> str:
+        return status.value
 
 
 class TestStats(BaseModel):
