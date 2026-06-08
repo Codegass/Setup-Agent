@@ -452,4 +452,57 @@ describe("App", () => {
     ).toBeInTheDocument()
     expect(screen.queryByLabelText("Workspace terminal")).not.toBeInTheDocument()
   })
+
+  it("deletes a workspace from the dashboard and refetches", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input)
+      const method = (init?.method ?? "GET").toUpperCase()
+
+      if (url === "/api/workspaces" && method === "GET") {
+        return Promise.resolve(jsonResponse(dashboard))
+      }
+
+      if (url === "/api/workspaces/sag-commons-cli" && method === "DELETE") {
+        return Promise.resolve(
+          jsonResponse({
+            workspace_id: "sag-commons-cli",
+            container_removed: true,
+            queue_items_removed: 1,
+            status: "deleted",
+          }),
+        )
+      }
+
+      if (url === "/api/project-launches") {
+        return Promise.resolve(jsonResponse(emptyLaunchQueue))
+      }
+
+      return Promise.reject(new Error(`unexpected fetch: ${method} ${url}`))
+    })
+
+    render(<App />)
+
+    fireEvent.click(
+      (await screen.findAllByRole("button", {
+        name: /delete workspace apache\/commons-cli/i,
+      }))[0],
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete workspace" }))
+
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith("/api/workspaces/sag-commons-cli", {
+        method: "DELETE",
+      })
+    })
+
+    await waitFor(() => {
+      const dashboardGets = fetchSpy.mock.calls.filter(
+        ([calledInput, calledInit]) =>
+          String(calledInput) === "/api/workspaces" &&
+          (calledInit?.method ?? "GET").toUpperCase() === "GET",
+      )
+      expect(dashboardGets.length).toBeGreaterThanOrEqual(2)
+    })
+  })
 })

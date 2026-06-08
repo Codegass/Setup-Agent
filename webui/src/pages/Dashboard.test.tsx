@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { DashboardResponse, LaunchQueueItem, LaunchQueueState } from "@/api/types"
@@ -237,6 +237,76 @@ describe("Dashboard", () => {
       screen.getAllByText("sag project exited with code 1").length,
     ).toBeGreaterThan(0)
     expect(screen.getAllByText("Failed").length).toBeGreaterThan(0)
+  })
+
+  it("opens the delete confirm dialog without triggering the workspace row", () => {
+    const onOpenWorkspace = vi.fn()
+
+    render(
+      <Dashboard
+        data={dashboard}
+        onDeleteWorkspace={() => Promise.resolve()}
+        onOpenSession={() => {}}
+        onOpenWorkspace={onOpenWorkspace}
+      />,
+    )
+
+    const deleteButton = screen.getAllByRole("button", {
+      name: /delete workspace apache\/commons-cli/i,
+    })[0]
+
+    fireEvent.keyDown(deleteButton, { key: "Enter" })
+    fireEvent.click(deleteButton)
+
+    expect(onOpenWorkspace).not.toHaveBeenCalled()
+    expect(screen.getByRole("dialog", { name: "Delete workspace" })).toBeInTheDocument()
+  })
+
+  it("confirms a workspace delete with the correct id", async () => {
+    const onDeleteWorkspace = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <Dashboard
+        data={dashboard}
+        onDeleteWorkspace={onDeleteWorkspace}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getAllByRole("button", {
+        name: /delete workspace apache\/commons-cli/i,
+      })[0],
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete workspace" }))
+
+    await waitFor(() => {
+      expect(onDeleteWorkspace).toHaveBeenCalledWith("sag-commons-cli")
+    })
+  })
+
+  it("exposes a remove action on failed pending launches", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        launchQueue={queueWith([
+          queueItem({ status: "failed", error: "sag project exited with code 1" }),
+        ])}
+        onDeleteWorkspace={() => Promise.resolve()}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    const removeButton = screen.getAllByRole("button", {
+      name: /remove failed launch dubbo/i,
+    })[0]
+
+    fireEvent.click(removeButton)
+
+    expect(screen.getByRole("dialog", { name: "Remove launch" })).toBeInTheDocument()
   })
 
   it("highlights newly launched workspaces", () => {

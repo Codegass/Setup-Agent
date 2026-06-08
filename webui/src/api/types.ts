@@ -167,6 +167,13 @@ export interface SubmitTaskResponse {
   status: string
 }
 
+export interface DeleteWorkspaceResult {
+  workspace_id: string
+  container_removed: boolean
+  queue_items_removed: number
+  status: string
+}
+
 export interface ReportDocument {
   title: string
   path?: string | null

@@ -1,3 +1,4 @@
+import { useState } from "react"
 import type { KeyboardEvent, ReactNode } from "react"
 import {
   Activity,
@@ -9,6 +10,7 @@ import {
   GitBranch,
   RefreshCw,
   Rocket,
+  Trash2,
   X,
 } from "lucide-react"
 
@@ -22,6 +24,10 @@ import { Badge, StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
 import { TestBar } from "@/components/common/TestBar"
+import {
+  DeleteWorkspaceDialog,
+  type DeleteWorkspaceTarget,
+} from "@/components/workspace/DeleteWorkspaceDialog"
 
 interface DashboardProps {
   data: DashboardResponse
@@ -30,6 +36,7 @@ interface DashboardProps {
   onRefresh?: () => void
   refreshing?: boolean
   onLaunchSetups?: () => void
+  onDeleteWorkspace?: (workspaceId: string) => Promise<void>
   launchQueue?: LaunchQueueState | null
   highlightedWorkspaces?: string[]
 }
@@ -163,9 +170,11 @@ export function Dashboard({
   onRefresh,
   refreshing = false,
   onLaunchSetups,
+  onDeleteWorkspace,
   launchQueue = null,
   highlightedWorkspaces = [],
 }: DashboardProps) {
+  const [deleteTarget, setDeleteTarget] = useState<DeleteWorkspaceTarget | null>(null)
   const workspaces = data.workspaces
   const running = workspaces.filter((w) => normalize(w.docker.status) === "running").length
   const pendingLaunches = pendingLaunchItems(launchQueue, workspaces)
@@ -250,12 +259,17 @@ export function Dashboard({
               ))}
             </div>
             {pendingLaunches.map((item) => (
-              <PendingLaunchRow key={`pending-${item.id}`} item={item} />
+              <PendingLaunchRow
+                key={`pending-${item.id}`}
+                item={item}
+                onDelete={setDeleteTarget}
+              />
             ))}
             {workspaces.map((workspace) => (
               <WorkspaceRow
                 key={workspace.id}
                 highlighted={highlightedWorkspaces.includes(workspace.id)}
+                onDelete={setDeleteTarget}
                 onOpenSession={onOpenSession}
                 onOpenWorkspace={onOpenWorkspace}
                 workspace={workspace}
@@ -265,12 +279,17 @@ export function Dashboard({
 
           <div className="mt-5 grid gap-3 lg:hidden">
             {pendingLaunches.map((item) => (
-              <PendingLaunchCard key={`pending-${item.id}`} item={item} />
+              <PendingLaunchCard
+                key={`pending-${item.id}`}
+                item={item}
+                onDelete={setDeleteTarget}
+              />
             ))}
             {workspaces.map((workspace) => (
               <WorkspaceCard
                 key={workspace.id}
                 highlighted={highlightedWorkspaces.includes(workspace.id)}
+                onDelete={setDeleteTarget}
                 onOpenSession={onOpenSession}
                 onOpenWorkspace={onOpenWorkspace}
                 workspace={workspace}
@@ -283,6 +302,17 @@ export function Dashboard({
       <p className="mt-3 px-1 font-mono text-[10px] text-slate-500">
         Refreshes automatically · or use Refresh
       </p>
+
+      {deleteTarget ? (
+        <DeleteWorkspaceDialog
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={async (id) => {
+            await onDeleteWorkspace?.(id)
+            setDeleteTarget(null)
+          }}
+          target={deleteTarget}
+        />
+      ) : null}
     </div>
   )
 }
@@ -339,11 +369,13 @@ function WorkspaceRow({
   workspace,
   onOpenWorkspace,
   onOpenSession,
+  onDelete,
   highlighted = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
+  onDelete: (target: DeleteWorkspaceTarget) => void
   highlighted?: boolean
 }) {
   const openWorkspace = () => onOpenWorkspace(workspace.id)
@@ -377,6 +409,7 @@ function WorkspaceRow({
       <ReportCell workspace={workspace} />
       <ChangedCell changed={workspace.changed} />
       <RowActions
+        onDelete={onDelete}
         onOpenSession={onOpenSession}
         onOpenWorkspace={onOpenWorkspace}
         workspace={workspace}
@@ -389,11 +422,13 @@ function WorkspaceCard({
   workspace,
   onOpenWorkspace,
   onOpenSession,
+  onDelete,
   highlighted = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
+  onDelete: (target: DeleteWorkspaceTarget) => void
   highlighted?: boolean
 }) {
   return (
@@ -445,6 +480,7 @@ function WorkspaceCard({
         <ReportCell workspace={workspace} />
         <RowActions
           alwaysVisible
+          onDelete={onDelete}
           onOpenSession={onOpenSession}
           onOpenWorkspace={onOpenWorkspace}
           workspace={workspace}
@@ -454,7 +490,42 @@ function WorkspaceCard({
   )
 }
 
-function PendingLaunchRow({ item }: { item: LaunchQueueItem }) {
+function launchDeleteTarget(item: LaunchQueueItem, project: string): DeleteWorkspaceTarget {
+  return { workspaceId: item.workspace_id, label: project, kind: "launch" }
+}
+
+function RemoveLaunchButton({
+  item,
+  project,
+  onDelete,
+}: {
+  item: LaunchQueueItem
+  project: string
+  onDelete: (target: DeleteWorkspaceTarget) => void
+}) {
+  return (
+    <button
+      aria-label={`Remove failed launch ${project}`}
+      className="shrink-0 rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+      onClick={(event) => {
+        event.stopPropagation()
+        onDelete(launchDeleteTarget(item, project))
+      }}
+      onKeyDown={(event) => event.stopPropagation()}
+      type="button"
+    >
+      <Trash2 size={15} />
+    </button>
+  )
+}
+
+function PendingLaunchRow({
+  item,
+  onDelete,
+}: {
+  item: LaunchQueueItem
+  onDelete: (target: DeleteWorkspaceTarget) => void
+}) {
   const project = launchProjectName(item)
   const failed = normalize(item.status) === "failed"
 
@@ -486,12 +557,23 @@ function PendingLaunchRow({ item }: { item: LaunchQueueItem }) {
         >
           {launchStatusLine(item)}
         </span>
+        {failed ? (
+          <div className="ml-auto">
+            <RemoveLaunchButton item={item} onDelete={onDelete} project={project} />
+          </div>
+        ) : null}
       </div>
     </div>
   )
 }
 
-function PendingLaunchCard({ item }: { item: LaunchQueueItem }) {
+function PendingLaunchCard({
+  item,
+  onDelete,
+}: {
+  item: LaunchQueueItem
+  onDelete: (target: DeleteWorkspaceTarget) => void
+}) {
   const project = launchProjectName(item)
   const failed = normalize(item.status) === "failed"
 
@@ -514,7 +596,12 @@ function PendingLaunchCard({ item }: { item: LaunchQueueItem }) {
             ) : null}
           </div>
         </div>
-        <StatusBadge status={item.status} />
+        <div className="flex items-center gap-1.5">
+          <StatusBadge status={item.status} />
+          {failed ? (
+            <RemoveLaunchButton item={item} onDelete={onDelete} project={project} />
+          ) : null}
+        </div>
       </div>
       <div
         className={`mt-3 text-[12.5px] ${failed ? "text-red-600" : "text-slate-500"}`}
@@ -669,11 +756,13 @@ function RowActions({
   workspace,
   onOpenWorkspace,
   onOpenSession,
+  onDelete,
   alwaysVisible = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
+  onDelete: (target: DeleteWorkspaceTarget) => void
   alwaysVisible?: boolean
 }) {
   const showReportAction = reportIsReady(workspace) && Boolean(workspace.latestSession)
@@ -709,6 +798,22 @@ function RowActions({
         type="button"
       >
         <ArrowRight size={15} />
+      </button>
+      <button
+        aria-label={`Delete workspace ${workspace.project}`}
+        className="rounded-md p-1.5 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+        onClick={(event) => {
+          event.stopPropagation()
+          onDelete({
+            workspaceId: workspace.id,
+            label: workspace.project,
+            kind: "workspace",
+          })
+        }}
+        onKeyDown={(event) => event.stopPropagation()}
+        type="button"
+      >
+        <Trash2 size={15} />
       </button>
     </div>
   )

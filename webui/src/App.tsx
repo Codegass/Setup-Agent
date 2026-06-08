@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 
 import {
+  deleteWorkspace as deleteWorkspaceRequest,
   fetchDashboard,
   fetchLaunchQueue,
   fetchSession,
@@ -173,6 +174,13 @@ export function App() {
     return response
   }
 
+  const deleteWorkspace = async (workspaceId: string): Promise<void> => {
+    // Let errors propagate so the confirm dialog can surface a 409.
+    await deleteWorkspaceRequest(workspaceId)
+    await loadDashboard()
+    await loadLaunchQueue()
+  }
+
   const handleBatchSubmitted = (result: LaunchBatchResult) => {
     setLaunchDialogOpen(false)
     const shownRejections = result.rejected.slice(0, 3).map((row) => row.message)
@@ -308,6 +316,7 @@ export function App() {
           data={dashboard}
           highlightedWorkspaces={highlightedWorkspaces}
           launchQueue={launchQueue}
+          onDeleteWorkspace={deleteWorkspace}
           onLaunchSetups={() => setLaunchDialogOpen(true)}
           onOpenSession={openSession}
           onOpenWorkspace={openWorkspace}

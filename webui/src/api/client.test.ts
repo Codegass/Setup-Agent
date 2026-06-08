@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import {
+  deleteWorkspace,
   fetchDashboard,
   fetchLaunchQueue,
   fetchSession,
@@ -189,6 +190,38 @@ describe("api client", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("/api/project-launches")
     expect(queue).toEqual(payload)
+  })
+
+  it("deletes a workspace via DELETE and returns the result", async () => {
+    const body = {
+      workspace_id: "sag-commons-cli",
+      container_removed: true,
+      queue_items_removed: 2,
+      status: "deleted",
+    }
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(jsonResponse(body))
+
+    const result = await deleteWorkspace("sag-commons-cli")
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/workspaces/sag-commons-cli", {
+      method: "DELETE",
+    })
+    expect(result).toEqual(body)
+  })
+
+  it("rejects with the conflict detail when a setup is in progress", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse(
+        { detail: "Workspace sag-commons-cli has a setup in progress" },
+        { status: 409, statusText: "Conflict" },
+      ),
+    )
+
+    await expect(deleteWorkspace("sag-commons-cli")).rejects.toThrow(
+      "Workspace sag-commons-cli has a setup in progress",
+    )
   })
 
   it("surfaces server validation detail on 422", async () => {

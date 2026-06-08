@@ -1,5 +1,6 @@
 import type {
   DashboardResponse,
+  DeleteWorkspaceResult,
   ExecutionSessionDetail,
   LaunchBatchRequestBody,
   LaunchBatchResponse,
@@ -42,6 +43,30 @@ export async function submitTask(
       body: JSON.stringify({ task, source_session: sourceSession ?? null }),
     }),
   )
+}
+
+export async function deleteWorkspace(
+  workspaceId: string,
+): Promise<DeleteWorkspaceResult> {
+  const response = await fetch(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}`,
+    { method: "DELETE" },
+  )
+
+  if (response.ok) {
+    return (await response.json()) as DeleteWorkspaceResult
+  }
+
+  let detail = ""
+  try {
+    const body = (await response.json()) as { detail?: unknown }
+    if (typeof body.detail === "string") {
+      detail = body.detail
+    }
+  } catch {
+    // Non-JSON error body; fall back to the status line.
+  }
+  throw new Error(detail || `${response.status} ${response.statusText}`)
 }
 
 export function fetchLaunchQueue(): Promise<LaunchQueueState> {
