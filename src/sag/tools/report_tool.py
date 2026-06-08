@@ -400,9 +400,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         for status in statuses:
             if status is None:
                 continue
+            raw_status = status.value if hasattr(status, "value") else status
+            normalized = str(raw_status).strip().lower()
+            if not normalized:
+                return coerce_evidence_status(None)
             mapped = self._map_report_status_to_evidence_status(status)
-            if mapped != "unknown" or str(status).strip().lower() in {"unknown", ""}:
-                return coerce_evidence_status(mapped)
+            return coerce_evidence_status(mapped)
         return coerce_evidence_status(None)
 
     def _resolve_report_evidence_result(
@@ -473,16 +476,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             test_status.get("evidence_status"),
         ]
 
-        test_stats = (
-            actual_accomplishments.get("test_stats")
-            or test_status.get("test_stats")
-            or {
-                "executed": test_analysis.get("total_tests"),
-                "passed": test_analysis.get("passed_tests"),
-                "failed": (test_analysis.get("failed_tests") or 0)
-                + (test_analysis.get("error_tests") or 0),
-                "skipped": test_analysis.get("skipped_tests"),
-            }
+        test_stats = self._extract_report_test_stats_default(
+            actual_accomplishments, test_status, test_analysis
         )
 
         conflicts: List[str] = []
@@ -498,6 +493,59 @@ class ReportTool(BaseTool, UIEventEmitter):
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(dict.fromkeys(evidence_refs)),
         }
+
+    def _extract_report_test_stats_default(
+        self, actual_accomplishments: dict, test_status: dict, test_analysis: dict
+    ) -> Optional[Dict[str, Any] | TestStats]:
+        accomplishment_stats = actual_accomplishments.get("test_stats")
+        if self._has_report_test_count_evidence(accomplishment_stats):
+            return accomplishment_stats
+
+        validator_stats = test_status.get("test_stats")
+        if self._has_report_test_count_evidence(validator_stats):
+            return validator_stats
+
+        if self._has_report_test_count_evidence(test_analysis):
+            return {
+                "executed": test_analysis.get("total_tests"),
+                "passed": test_analysis.get("passed_tests"),
+                "failed": (test_analysis.get("failed_tests") or 0)
+                + (test_analysis.get("error_tests") or 0),
+                "skipped": test_analysis.get("skipped_tests"),
+            }
+
+        return None
+
+    def _has_report_test_count_evidence(self, value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, TestStats):
+            return True
+        if not isinstance(value, dict):
+            return False
+
+        count_keys = {
+            "discovered",
+            "static_test_count",
+            "executed",
+            "total",
+            "total_tests",
+            "passed",
+            "passed_tests",
+            "failed",
+            "failed_tests",
+            "errors",
+            "error",
+            "error_tests",
+            "skipped",
+            "skipped_tests",
+            "raw_total_tests",
+            "raw_passed_tests",
+            "raw_failed_tests",
+            "raw_error_tests",
+            "raw_skipped_tests",
+        }
+        return any(key in value and value.get(key) is not None for key in count_keys)
 
     def _derive_evidence_status_from_test_stats(
         self, test_stats: Optional[TestStats], conflicts: List[str]
@@ -529,7 +577,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
     def _render_console_evidence_result(self, snapshot: Optional[Dict[str, Any]]) -> List[str]:
         evidence = (snapshot or {}).get("evidence_result") or {}
-        if not evidence:
+        if not self._should_render_report_evidence_result(evidence):
             return []
 
         lines = [f"Result: {str(evidence.get('status', 'unknown')).upper()}"]
@@ -556,6 +604,17 @@ class ReportTool(BaseTool, UIEventEmitter):
         if refs:
             lines.append(f"**Evidence refs:** {'; '.join(refs)}")
         return lines
+
+    def _should_render_report_evidence_result(self, evidence: Dict[str, Any]) -> bool:
+        if not evidence:
+            return False
+        test_stats = self._coerce_report_test_stats(evidence.get("test_stats"))
+        conflicts = evidence.get("conflicts") or []
+        refs = evidence.get("evidence_refs") or []
+        status = str(evidence.get("status", "unknown")).strip().lower()
+        if status == "success" and not test_stats and not conflicts and not refs:
+            return False
+        return True
 
     def _mark_final_report_task_completed(
         self, report_filename_or_path: str, verified_status: str
@@ -4363,7 +4422,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         lines.append(f"**Generated:** {timestamp}")
 
         evidence_result = (snapshot or {}).get("evidence_result") or {}
-        if evidence_result:
+        if self._should_render_report_evidence_result(evidence_result):
             evidence_status = str(evidence_result.get("status", "unknown")).upper()
             icon = {
                 "SUCCESS": "✅",

@@ -1736,14 +1736,29 @@ class PhysicalValidator:
             or test_metrics.get("discovered_tests")
             or test_metrics.get("static_test_count")
         )
-        test_stats = {
-            "discovered": discovered,
-            "executed": test_metrics.get("total_tests", 0),
-            "passed": test_metrics.get("passed_tests", 0),
-            "failed": failed_count,
-            "skipped": test_metrics.get("skipped_tests", 0),
-            "pass_rate": round(pass_rate, 1),
-        }
+        has_test_count_evidence = test_metrics.get("valid", False) or any(
+            key in test_metrics and test_metrics.get(key) is not None
+            for key in (
+                "discovered",
+                "discovered_tests",
+                "static_test_count",
+                "total_tests",
+                "passed_tests",
+                "failed_tests",
+                "error_tests",
+                "skipped_tests",
+            )
+        )
+        test_stats = None
+        if has_test_count_evidence and test_metrics.get("valid", False):
+            test_stats = {
+                "discovered": discovered,
+                "executed": test_metrics.get("total_tests", 0),
+                "passed": test_metrics.get("passed_tests", 0),
+                "failed": failed_count,
+                "skipped": test_metrics.get("skipped_tests", 0),
+                "pass_rate": round(pass_rate, 1),
+            }
         report_files = test_metrics.get("report_files", [])
         conflicts = []
         if test_metrics.get("failed_tests", 0):

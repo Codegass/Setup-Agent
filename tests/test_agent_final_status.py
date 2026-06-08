@@ -260,6 +260,34 @@ def test_failed_build_validation_uses_stable_conflict_and_project_fallback(monke
     assert result["evidence_refs"] == ["/workspace/demo"]
 
 
+def test_test_validation_without_reports_does_not_emit_empty_test_stats(monkeypatch):
+    validator = PhysicalValidator(project_path="/workspace")
+
+    monkeypatch.setattr(
+        validator,
+        "parse_test_reports_with_catalog",
+        lambda project_dir: {
+            "valid": False,
+            "total_tests": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+            "error_tests": 0,
+            "skipped_tests": 0,
+            "test_exclusions": [],
+            "modules_without_tests": [],
+            "report_files": [],
+            "parsing_errors": [],
+        },
+    )
+
+    result = validator.validate_test_status("demo")
+
+    assert result["evidence_status"] == "unknown"
+    assert result["has_test_reports"] is False
+    assert result["test_stats"] is None
+    assert result["evidence_refs"] == ["/workspace/demo"]
+
+
 def test_verified_final_status_uses_project_metadata_over_docker_label():
     validator = FakePhysicalValidator(
         build_status={"success": True, "reason": "Build fingerprints found"},

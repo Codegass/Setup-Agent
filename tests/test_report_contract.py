@@ -412,6 +412,115 @@ def test_report_uses_validator_evidence_defaults_when_kwargs_missing(monkeypatch
     assert "**Result:** ⚠️ PARTIAL" in saved_markdown["content"]
 
 
+def test_ordinary_success_report_does_not_render_empty_test_stats(monkeypatch):
+    tool = ReportTool()
+    saved_markdown = {}
+
+    actual_accomplishments = {
+        "repository_cloned": True,
+        "build_success": True,
+        "test_success": True,
+        "physical_validation": {},
+    }
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_verify_execution_history",
+        lambda status, summary: ("success", actual_accomplishments),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_collect_execution_metrics",
+        lambda: {
+            "phases": {
+                "clone": {"status": True},
+                "analyze": {"status": True},
+                "build": {"status": True},
+                "test": {"status": True},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_get_project_info",
+        lambda: {
+            "directory": "/workspace/demo",
+            "type": "Generic Project",
+            "build_system": "Unknown",
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_save_markdown_report",
+        lambda markdown, timestamp, filename: saved_markdown.setdefault("content", markdown),
+    )
+
+    result = tool.execute(action="generate", summary="done", status="success")
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.SUCCESS
+    assert result.raw_data["test_stats"] is None
+    assert "0 / 0 passed" not in result.output
+    assert "0 / 0 passed" not in result.raw_data["full_report"]
+    assert "0 / 0 passed" not in saved_markdown["content"]
+    assert "Tests: 0 / 0 passed" not in result.raw_data["full_report"]
+    assert "**Tests:** 0 / 0 passed" not in saved_markdown["content"]
+    assert "Result: SUCCESS" not in result.raw_data["full_report"]
+
+
+def test_invalid_explicit_evidence_status_is_unknown_without_success_fallback(monkeypatch):
+    tool = ReportTool()
+
+    actual_accomplishments = {
+        "repository_cloned": True,
+        "build_success": True,
+        "test_success": True,
+        "physical_validation": {},
+    }
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_verify_execution_history",
+        lambda status, summary: ("success", actual_accomplishments),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_collect_execution_metrics",
+        lambda: {
+            "phases": {
+                "clone": {"status": True},
+                "analyze": {"status": True},
+                "build": {"status": True},
+                "test": {"status": True},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        tool,
+        "_get_project_info",
+        lambda: {
+            "directory": "/workspace/demo",
+            "type": "Generic Project",
+            "build_system": "Unknown",
+        },
+    )
+    monkeypatch.setattr(tool, "_save_markdown_report", lambda markdown, timestamp, filename: None)
+
+    result = tool.execute(
+        action="generate",
+        summary="done",
+        status="success",
+        evidence_status="bogus",
+    )
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.UNKNOWN
+    assert result.metadata["evidence_status"] == "unknown"
+    assert result.raw_data["evidence_status"] == "unknown"
+
+
 def test_report_tool_marks_final_report_task_completed(monkeypatch):
     context_manager = FakeReportContextManager()
     tool = ReportTool(context_manager=context_manager)
