@@ -51,8 +51,18 @@ def make_workspace(
 def test_build_exec_options_request_interactive_tty():
     from sag.web.terminal import build_exec_options
 
-    assert build_exec_options() == {"cmd": "/bin/bash", "stdin": True, "tty": True}
-    assert build_exec_options("/bin/sh") == {"cmd": "/bin/sh", "stdin": True, "tty": True}
+    assert build_exec_options() == {
+        "cmd": "/bin/bash",
+        "stdin": True,
+        "tty": True,
+        "environment": {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+    }
+    assert build_exec_options("/bin/sh") == {
+        "cmd": "/bin/sh",
+        "stdin": True,
+        "tty": True,
+        "environment": {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+    }
 
 
 def test_terminal_adapter_uses_injected_docker_client_for_exec_socket():
@@ -83,7 +93,15 @@ def test_terminal_adapter_uses_injected_docker_client_for_exec_socket():
 
     assert adapter.open_socket("sag-demo", shell="/bin/sh") is socket
     assert docker_client.api.created == [
-        ("sag-demo", {"cmd": "/bin/sh", "stdin": True, "tty": True})
+        (
+            "sag-demo",
+            {
+                "cmd": "/bin/sh",
+                "stdin": True,
+                "tty": True,
+                "environment": {"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+            },
+        )
     ]
     assert docker_client.api.started == [("exec-123", {"tty": True, "socket": True})]
 

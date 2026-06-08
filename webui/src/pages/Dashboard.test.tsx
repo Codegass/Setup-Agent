@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { DashboardResponse } from "@/api/types"
+import type { DashboardResponse, LaunchQueueItem, LaunchQueueState } from "@/api/types"
 
 import { Dashboard } from "./Dashboard"
 
@@ -144,29 +144,83 @@ describe("Dashboard", () => {
     expect(onLaunchSetups).toHaveBeenCalled()
   })
 
-  it("renders the launch queue panel when queue data has batches", () => {
+  const queueWith = (items: LaunchQueueItem[]): LaunchQueueState => ({
+    default_concurrency: 4,
+    summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },
+    batches: [
+      {
+        id: "BATCH-20260607-abcdef",
+        status: "running",
+        concurrency: 2,
+        created: "2026-06-07T02:30:00",
+        items,
+      },
+    ],
+  })
+
+  const queueItem = (overrides: Partial<LaunchQueueItem>): LaunchQueueItem => ({
+    id: "LAUNCH-00000001",
+    row_index: 0,
+    repo_url: "https://github.com/apache/dubbo.git",
+    workspace_id: "sag-dubbo",
+    ref: "dubbo-3.3.3",
+    status: "queued",
+    pid: null,
+    exit_code: null,
+    error: null,
+    process_log: "logs/project_launches/BATCH-20260607-abcdef/LAUNCH-00000001.log",
+    ...overrides,
+  })
+
+  it("shows queued launches as greyed placeholder rows in the list", () => {
     render(
       <Dashboard
         data={dashboard}
-        launchQueue={{
-          default_concurrency: 4,
-          summary: { queued: 1, launching: 0, running: 0, completed: 0, failed: 0 },
-          batches: [
-            {
-              id: "BATCH-20260607-abcdef",
-              status: "running",
-              concurrency: 2,
-              created: "2026-06-07T02:30:00",
-              items: [],
-            },
-          ],
-        }}
+        launchQueue={queueWith([queueItem({})])}
         onOpenSession={() => {}}
         onOpenWorkspace={() => {}}
       />,
     )
 
-    expect(screen.getByText("Launch queue")).toBeInTheDocument()
+    const rows = screen.getAllByLabelText("Pending launch dubbo")
+    expect(rows.length).toBeGreaterThan(0)
+    expect(screen.getAllByText("Queued").length).toBeGreaterThan(0)
+    expect(
+      screen.getAllByText("Waiting for a free setup slot").length,
+    ).toBeGreaterThan(0)
+  })
+
+  it("does not duplicate launches whose workspace is already discovered", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        launchQueue={queueWith([
+          queueItem({ workspace_id: "sag-commons-cli", status: "running" }),
+        ])}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    expect(screen.queryByLabelText(/pending launch/i)).not.toBeInTheDocument()
+  })
+
+  it("shows failed launches inline with their error", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        launchQueue={queueWith([
+          queueItem({ status: "failed", error: "sag project exited with code 1" }),
+        ])}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    expect(
+      screen.getAllByText("sag project exited with code 1").length,
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText("Failed").length).toBeGreaterThan(0)
   })
 
   it("highlights newly launched workspaces", () => {

@@ -907,11 +907,7 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
         """Get the verified final status using separate build and test validation."""
 
-        project_name = getattr(self.orchestrator, "project_name", None) or getattr(
-            self, "project_name", None
-        )
-        if not project_name and hasattr(self.context_manager, "project_name"):
-            project_name = self.context_manager.project_name
+        project_name = self._get_project_name_for_validation()
 
         if not project_name:
             logger.warning("🔍 No project name available for verification")
@@ -1015,6 +1011,53 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                 )
 
             return False
+
+    def _get_project_name_for_validation(self) -> Optional[str]:
+        """Resolve the real workspace project directory for final validation."""
+
+        project_name = self._read_project_name_from_metadata()
+        if project_name:
+            return project_name
+
+        project_name = getattr(self.orchestrator, "project_name", None) or getattr(
+            self, "project_name", None
+        )
+        if not project_name and hasattr(self.context_manager, "project_name"):
+            project_name = self.context_manager.project_name
+
+        return project_name
+
+    def _read_project_name_from_metadata(self) -> Optional[str]:
+        """Read actual repo directory from project metadata when --name used a custom label."""
+
+        try:
+            result = self.orchestrator.execute_command(
+                "cat /workspace/.setup_agent/project_meta.json 2>/dev/null"
+            )
+        except Exception as exc:
+            logger.debug(f"Could not read project metadata for validation: {exc}")
+            return None
+
+        if result.get("exit_code") != 0:
+            return None
+
+        try:
+            metadata = json.loads((result.get("output") or "").strip())
+        except json.JSONDecodeError as exc:
+            logger.warning(f"Failed to parse project metadata for validation: {exc}")
+            return None
+
+        if not isinstance(metadata, dict):
+            return None
+
+        project_name = metadata.get("project_name")
+        if isinstance(project_name, str):
+            project_name = project_name.strip()
+            if project_name:
+                logger.info(f"Using project metadata for validation: project_name={project_name}")
+                return project_name
+
+        return None
 
     def _provide_setup_summary(self, success: bool):
         """Provide a summary of the setup process."""

@@ -13,6 +13,7 @@ from docker.errors import APIError, DockerException, NotFound
 from loguru import logger
 
 from sag.config import get_config
+from sag.runtime.exec_env import DEFAULT_UTF8_ENVIRONMENT, default_utf8_environment
 
 
 ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
@@ -236,13 +237,18 @@ class DockerOrchestrator:
 
         # Check if we're in an interactive terminal
         is_tty = sys.stdin.isatty()
+        env_args = [
+            arg
+            for key, value in DEFAULT_UTF8_ENVIRONMENT.items()
+            for arg in ("-e", f"{key}={value}")
+        ]
 
         if is_tty:
             # Use docker exec with -it for interactive terminal
-            cmd = ["docker", "exec", "-it", self.container_name, shell]
+            cmd = ["docker", "exec", *env_args, "-it", self.container_name, shell]
         else:
             # Use docker exec without -it for non-interactive (piped input)
-            cmd = ["docker", "exec", "-i", self.container_name, shell]
+            cmd = ["docker", "exec", *env_args, "-i", self.container_name, shell]
 
         logger.info(f"Connecting to container with command: {' '.join(cmd)}")
         logger.info(f"TTY mode: {is_tty}")
@@ -265,10 +271,18 @@ class DockerOrchestrator:
     def _runtime_profile_prefix(self) -> str:
         """Return shell sources needed before running commands in the container."""
         return (
+            "export LANG=${LANG:-C.UTF-8}; "
+            "export LC_ALL=${LC_ALL:-C.UTF-8}; "
             f"source {ENV_OVERLAY_SCRIPT_PATH} 2>/dev/null || true; "
             "source /etc/profile 2>/dev/null || true; "
             "source ~/.bashrc 2>/dev/null || true"
         )
+
+    def _default_exec_environment(
+        self, environment: Optional[Dict[str, str]] = None
+    ) -> Dict[str, str]:
+        """Merge caller-provided env with SAG's safe UTF-8 execution defaults."""
+        return default_utf8_environment(environment)
 
     def _is_json_content(self, output: str, command: str) -> bool:
         """
@@ -525,7 +539,7 @@ class DockerOrchestrator:
 
         try:
             # Prepare environment
-            exec_env = environment if environment else {}
+            exec_env = self._default_exec_environment(environment)
 
             # Execute the command with stderr capture
             # Use demux to separate stdout and stderr when requested
@@ -749,6 +763,7 @@ class DockerOrchestrator:
                 workdir=None,  # Handled by cd command in bash
                 stream=True,  # Enable streaming to monitor output
                 demux=True,  # Separate stdout/stderr
+                environment=self._default_exec_environment(),
             )
 
             # Start CPU monitoring thread if enabled
@@ -1296,7 +1311,11 @@ class DockerOrchestrator:
             "working_dir": self.config.workspace_path,
             # Remove volume mount - files will be stored inside container
             # "volumes": {self.volume_name: {"bind": self.config.workspace_path, "mode": "rw"}},
-            "environment": {"DEBIAN_FRONTEND": "noninteractive", "TERM": "xterm-256color"},
+            "environment": {
+                **DEFAULT_UTF8_ENVIRONMENT,
+                "DEBIAN_FRONTEND": "noninteractive",
+                "TERM": "xterm-256color",
+            },
             "labels": {
                 "setup-agent.project": self.project_name,
                 "setup-agent.created": datetime.now().isoformat(),
@@ -1533,6 +1552,8 @@ class DockerOrchestrator:
 # SAG Environment Setup Script
 export WORKSPACE_PATH="{self.config.workspace_path}"
 export SAG_CONTAINER_INITIALIZED="true"
+export LANG="${{LANG:-C.UTF-8}}"
+export LC_ALL="${{LC_ALL:-C.UTF-8}}"
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Ensure workspace always exists

@@ -161,6 +161,64 @@ def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
     assert result.metadata["command"] == orchestrator.monitored_commands[0][0]
 
 
+def test_maven_fail_at_end_test_reports_failures_despite_ignored_exit_code():
+    orchestrator = FakeBuildToolOrchestrator(
+        {
+            "output": "\n".join(
+                [
+                    "[INFO] --- maven-surefire-plugin:3.5.5:test (default-test) @ demo ---",
+                    "[INFO] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+                    "[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0",
+                    "[INFO] BUILD SUCCESS",
+                ]
+            ),
+            "exit_code": 0,
+        }
+    )
+    tool = MavenTool(orchestrator)
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        fail_at_end=True,
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is False
+    assert result.error_code == "TEST_FAILURE"
+    assert result.metadata["analysis"]["ignored_test_failures_detected"] is True
+    assert result.metadata["analysis"]["test_failure_count"] == 1
+    assert "-Dmaven.test.failure.ignore=true" in orchestrator.monitored_commands[0][0]
+
+
+def test_maven_explicit_ignore_test_failures_preserves_success_result():
+    orchestrator = FakeBuildToolOrchestrator(
+        {
+            "output": "\n".join(
+                [
+                    "[INFO] --- maven-surefire-plugin:3.5.5:test (default-test) @ demo ---",
+                    "[INFO] Tests run: 4, Failures: 1, Errors: 0, Skipped: 0",
+                    "[INFO] BUILD SUCCESS",
+                ]
+            ),
+            "exit_code": 0,
+        }
+    )
+    tool = MavenTool(orchestrator)
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(
+        command="test",
+        fail_at_end=True,
+        ignore_test_failures=True,
+        working_directory="/workspace/project",
+    )
+
+    assert result.success is True
+    assert result.metadata["analysis"]["test_failure_count"] == 1
+    assert "ignored_test_failures_detected" not in result.metadata["analysis"]
+
+
 def test_maven_timeout_result_preserves_env_overlay_runtime_and_requested_version():
     orchestrator = FakeBuildToolOrchestrator(
         {

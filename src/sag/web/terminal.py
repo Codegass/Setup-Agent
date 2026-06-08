@@ -5,9 +5,16 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from sag.runtime.exec_env import default_utf8_environment
+
 
 def build_exec_options(shell: str = "/bin/bash") -> dict[str, object]:
-    return {"cmd": shell, "stdin": True, "tty": True}
+    return {
+        "cmd": shell,
+        "stdin": True,
+        "tty": True,
+        "environment": default_utf8_environment(),
+    }
 
 
 class TerminalAdapter:

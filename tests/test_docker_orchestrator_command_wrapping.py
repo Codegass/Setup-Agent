@@ -47,6 +47,87 @@ def build_orchestrator(container):
     return orchestrator
 
 
+def test_runtime_profile_prefix_exports_utf8_locale_before_tools_run():
+    orchestrator = DockerOrchestrator.__new__(DockerOrchestrator)
+
+    prefix = orchestrator._runtime_profile_prefix()
+
+    assert "export LANG=${LANG:-C.UTF-8}" in prefix
+    assert "export LC_ALL=${LC_ALL:-C.UTF-8}" in prefix
+    assert prefix.index("export LANG=${LANG:-C.UTF-8}") < prefix.index(
+        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
+    )
+
+
+def test_execute_command_passes_utf8_environment_to_docker_exec():
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command("locale")
+
+    assert result["success"] is True
+    exec_env = container.exec_calls[-1]["kwargs"]["environment"]
+    assert exec_env["LANG"] == "C.UTF-8"
+    assert exec_env["LC_ALL"] == "C.UTF-8"
+
+
+def test_execute_command_preserves_explicit_environment_overrides():
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command(
+        "locale",
+        environment={"LANG": "en_US.UTF-8", "CUSTOM_FLAG": "1"},
+    )
+
+    assert result["success"] is True
+    exec_env = container.exec_calls[-1]["kwargs"]["environment"]
+    assert exec_env["LANG"] == "en_US.UTF-8"
+    assert exec_env["LC_ALL"] == "C.UTF-8"
+    assert exec_env["CUSTOM_FLAG"] == "1"
+
+
+def test_execute_command_with_monitoring_passes_utf8_environment_to_docker_exec():
+    container = FakeContainer(FakeStreamingExecResult())
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command_with_monitoring(
+        "mvn test",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is True
+    exec_env = container.exec_calls[-1]["kwargs"]["environment"]
+    assert exec_env["LANG"] == "C.UTF-8"
+    assert exec_env["LC_ALL"] == "C.UTF-8"
+
+
+def test_connect_to_container_passes_utf8_environment_to_docker_exec(monkeypatch):
+    container = FakeContainer()
+    orchestrator = build_orchestrator(container)
+    calls = []
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    monkeypatch.setattr("subprocess.call", lambda cmd: calls.append(cmd) or 0)
+
+    orchestrator.connect_to_container("/bin/sh")
+
+    assert calls == [
+        [
+            "docker",
+            "exec",
+            "-e",
+            "LANG=C.UTF-8",
+            "-e",
+            "LC_ALL=C.UTF-8",
+            "-i",
+            "sag-demo",
+            "/bin/sh",
+        ]
+    ]
+
+
 def test_runtime_profile_prefix_sources_env_overlay_before_shell_profiles():
     orchestrator = DockerOrchestrator.__new__(DockerOrchestrator)
 
@@ -70,12 +151,13 @@ def test_execute_command_sources_env_overlay_before_cd_and_command():
 
     assert result["success"] is True
     wrapped_command = container.exec_calls[-1]["exec_command"][2]
-    assert wrapped_command.startswith(
-        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true; "
-        "source /etc/profile 2>/dev/null || true; "
-        "source ~/.bashrc 2>/dev/null || true; "
-        f"cd {shlex.quote(workdir)} && echo hi"
+    assert wrapped_command.index(
+        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
+    ) < wrapped_command.index("source /etc/profile 2>/dev/null || true")
+    assert wrapped_command.index("source /etc/profile 2>/dev/null || true") < (
+        wrapped_command.index("source ~/.bashrc 2>/dev/null || true")
     )
+    assert wrapped_command.endswith(f"cd {shlex.quote(workdir)} && echo hi")
 
 
 def test_execute_command_shell_quotes_workdir_with_space_and_single_quote():
@@ -105,12 +187,13 @@ def test_execute_command_with_monitoring_sources_env_overlay_before_cd_and_comma
 
     assert result["success"] is True
     wrapped_command = container.exec_calls[-1]["exec_command"][2]
-    assert wrapped_command.startswith(
-        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true; "
-        "source /etc/profile 2>/dev/null || true; "
-        "source ~/.bashrc 2>/dev/null || true; "
-        f"cd {shlex.quote(workdir)} && echo hi"
+    assert wrapped_command.index(
+        "source /workspace/.setup_agent/env_overlay.sh 2>/dev/null || true"
+    ) < wrapped_command.index("source /etc/profile 2>/dev/null || true")
+    assert wrapped_command.index("source /etc/profile 2>/dev/null || true") < (
+        wrapped_command.index("source ~/.bashrc 2>/dev/null || true")
     )
+    assert wrapped_command.endswith(f"cd {shlex.quote(workdir)} && echo hi")
 
 
 def test_execute_command_with_monitoring_treats_unknown_exit_build_failure_as_failure():

@@ -240,10 +240,12 @@ class MavenTool(BaseTool):
         # CRITICAL FIX: Make fail_at_end work correctly for test commands
         # Maven's --fail-at-end doesn't continue after test failures, only compilation failures
         # For test commands with fail_at_end, automatically add maven.test.failure.ignore=true
+        auto_ignore_test_failures = False
         if fail_at_end and command in ["test", "verify", "integration-test"]:
             logger.info("📝 Enabling test failure ignore for fail_at_end with test command")
             logger.info("   (Maven's --fail-at-end doesn't continue after test failures)")
             properties = self._append_maven_property(properties, "maven.test.failure.ignore=true")
+            auto_ignore_test_failures = not ignore_test_failures
 
         # Validate that pom.xml exists in the working directory
         pom_validation = self._validate_pom_exists(working_directory, pom_file)
@@ -337,6 +339,10 @@ class MavenTool(BaseTool):
 
             # Analyze the output
             analysis = self._analyze_maven_output(result["output"], result["exit_code"])
+            if auto_ignore_test_failures and analysis.get("test_failure_count", 0) > 0:
+                analysis["build_success"] = False
+                analysis["error_type"] = analysis.get("error_type") or "TEST_FAILURE"
+                analysis["ignored_test_failures_detected"] = True
             if requested_requirement_metadata and not analysis.get(
                 "maven_version_requirement"
             ):
@@ -1067,6 +1073,8 @@ class MavenTool(BaseTool):
             "error_type": None,  # Track specific error type
             "failed_modules": [],
             "failed_tests": [],
+            "test_failure_count": 0,
+            "test_error_count": 0,
             "surefire_reports": [],
             "skipped_modules": [],
             "reactor_summary": [],
@@ -1172,12 +1180,16 @@ class MavenTool(BaseTool):
                     r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", line
                 )
                 if test_match:
+                    failures = int(test_match.group(2))
+                    errors = int(test_match.group(3))
                     analysis["tests_run"] = {
                         "total": int(test_match.group(1)),
-                        "failures": int(test_match.group(2)),
-                        "errors": int(test_match.group(3)),
+                        "failures": failures,
+                        "errors": errors,
                         "skipped": int(test_match.group(4)),
                     }
+                    analysis["test_failure_count"] += failures
+                    analysis["test_error_count"] += errors
 
             # Extract compilation errors
             if "[ERROR]" in line and (".java:" in line or "compilation error" in line.lower()):
@@ -1271,6 +1283,10 @@ class MavenTool(BaseTool):
                     seen.add(test)
                     unique_tests.append(test)
             analysis["failed_tests"] = unique_tests
+            if not analysis["error_type"]:
+                analysis["error_type"] = "TEST_FAILURE"
+
+        if analysis["test_failure_count"] or analysis["test_error_count"]:
             if not analysis["error_type"]:
                 analysis["error_type"] = "TEST_FAILURE"
 
@@ -1494,9 +1510,7 @@ class MavenTool(BaseTool):
                     f"Review Surefire report output at {report_path} for full failure context."
                 )
 
-        if analysis["tests_run"] and (
-            analysis["tests_run"]["failures"] > 0 or analysis["tests_run"]["errors"] > 0
-        ):
+        if analysis.get("test_failure_count", 0) > 0 or analysis.get("test_error_count", 0) > 0:
             error_code = "TEST_FAILURE"
             error_suggestions.extend(
                 [
@@ -1700,12 +1714,11 @@ class MavenTool(BaseTool):
         if analysis["compilation_errors"]:
             error_message += f"\nCompilation errors found: {len(analysis['compilation_errors'])}"
 
-        if analysis["tests_run"]:
-            tests = analysis["tests_run"]
-            if tests["failures"] > 0 or tests["errors"] > 0:
-                error_message += (
-                    f"\nTest failures: {tests['failures']}, Test errors: {tests['errors']}"
-                )
+        if analysis.get("test_failure_count", 0) > 0 or analysis.get("test_error_count", 0) > 0:
+            error_message += (
+                f"\nTest failures: {analysis.get('test_failure_count', 0)}, "
+                f"Test errors: {analysis.get('test_error_count', 0)}"
+            )
 
         # Extract key error lines for immediate visibility
         error_output = self._extract_key_error_lines(output)
