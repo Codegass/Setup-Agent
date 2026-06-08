@@ -1,5 +1,6 @@
 from sag.evidence import EvidenceStatus
 from sag.tools.base import ToolResult
+from sag.tools.bash import BashTool
 
 
 def test_tool_result_defaults_status_from_success_boolean():
@@ -67,3 +68,61 @@ def test_tool_result_preserves_explicit_domain_status_when_success_changes():
 
     assert partial.status == EvidenceStatus.PARTIAL
     assert conflict.status == EvidenceStatus.CONFLICT
+
+
+class FakeBashOrchestrator:
+    def __init__(self, result):
+        self.result = result
+
+    def execute_command(
+        self,
+        command,
+        workdir=None,
+        capture_stderr=True,
+        environment=None,
+        timeout=None,
+    ):
+        return self.result
+
+    def execute_command_with_monitoring(self, **kwargs):
+        return self.result
+
+
+def test_bash_success_reports_execution_facts_without_domain_status():
+    tool = BashTool(
+        docker_orchestrator=FakeBashOrchestrator(
+            {
+                "success": True,
+                "exit_code": 0,
+                "output": "BUILD SUCCESS",
+                "duration": 1.25,
+            }
+        )
+    )
+
+    result = tool.execute(command="mvn test", working_directory="/workspace/project", timeout=30)
+
+    assert result.success is True
+    assert result.metadata["execution"]["executed"] is True
+    assert result.metadata["execution"]["exit_code"] == 0
+    assert result.metadata["execution"]["timed_out"] is False
+    assert "domain_status" not in result.metadata
+
+
+def test_bash_nonzero_reports_executed_nonzero_without_domain_status():
+    tool = BashTool(
+        docker_orchestrator=FakeBashOrchestrator(
+            {
+                "success": False,
+                "exit_code": 2,
+                "output": "tests failed",
+            }
+        )
+    )
+
+    result = tool.execute(command="npm test", working_directory="/workspace/project", timeout=30)
+
+    assert result.success is False
+    assert result.metadata["execution"]["executed"] is True
+    assert result.metadata["execution"]["exit_code"] == 2
+    assert result.status.value == "blocked"

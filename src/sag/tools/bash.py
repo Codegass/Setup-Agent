@@ -78,6 +78,47 @@ class BashTool(BaseTool):
         self.config = config or BashToolConfig()
         self.background_processes: Dict[str, List[int]] = {}  # Track background PIDs per container
 
+    @staticmethod
+    def _execution_metadata(
+        command: str,
+        working_directory: Optional[str],
+        *,
+        exit_code: Optional[int],
+        timed_out: bool,
+        duration: Optional[float],
+        executed: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "command": command,
+            "cwd": working_directory,
+            "executed": bool(exit_code is not None) if executed is None else executed,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "duration": 0 if duration is None else duration,
+        }
+
+    def _with_execution_metadata(
+        self,
+        metadata: Optional[Dict[str, Any]],
+        *,
+        command: str,
+        working_directory: Optional[str],
+        exit_code: Optional[int],
+        timed_out: bool,
+        duration: Optional[float],
+        executed: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        result_metadata = dict(metadata or {})
+        result_metadata["execution"] = self._execution_metadata(
+            command,
+            working_directory,
+            exit_code=exit_code,
+            timed_out=timed_out,
+            duration=duration,
+            executed=executed,
+        )
+        return result_metadata
+
     def _ensure_working_directory(self, requested_workdir: str) -> str:
         """Smart working directory validation and setup."""
         return self._validate_and_fix_working_directory(requested_workdir)
@@ -363,6 +404,15 @@ class BashTool(BaseTool):
                 ),
                 error=f"Invalid parameters: {invalid_params}",
                 raw_output="",
+                metadata=self._with_execution_metadata(
+                    None,
+                    command=command,
+                    working_directory=working_directory,
+                    exit_code=None,
+                    timed_out=False,
+                    duration=0,
+                    executed=False,
+                ),
             )
 
         # Check for required parameter
@@ -377,6 +427,15 @@ class BashTool(BaseTool):
                 ),
                 error="Missing required parameter: command",
                 raw_output="",
+                metadata=self._with_execution_metadata(
+                    None,
+                    command=command,
+                    working_directory=working_directory,
+                    exit_code=None,
+                    timed_out=False,
+                    duration=0,
+                    executed=False,
+                ),
             )
 
         try:
@@ -387,6 +446,15 @@ class BashTool(BaseTool):
                 output="❌ Invalid timeout for bash tool: timeout must be a positive integer.",
                 error="Invalid timeout: must be a positive integer",
                 raw_output="",
+                metadata=self._with_execution_metadata(
+                    None,
+                    command=command,
+                    working_directory=working_directory,
+                    exit_code=None,
+                    timed_out=False,
+                    duration=0,
+                    executed=False,
+                ),
             )
         if timeout <= 0:
             return ToolResult(
@@ -394,6 +462,15 @@ class BashTool(BaseTool):
                 output="❌ Invalid timeout for bash tool: timeout must be greater than 0.",
                 error="Invalid timeout: must be greater than 0",
                 raw_output="",
+                metadata=self._with_execution_metadata(
+                    None,
+                    command=command,
+                    working_directory=working_directory,
+                    exit_code=None,
+                    timed_out=False,
+                    duration=0,
+                    executed=False,
+                ),
             )
 
         if not self.docker_orchestrator:
@@ -550,11 +627,18 @@ class BashTool(BaseTool):
                     error=error_msg,
                     suggestions=suggestions,
                     error_code=f"TIMEOUT_{termination_reason.upper()}",
-                    metadata={
-                        "termination_reason": termination_reason,
-                        "timeout": timeout,
-                        "monitoring_info": monitoring_info,
-                    },
+                    metadata=self._with_execution_metadata(
+                        {
+                            "termination_reason": termination_reason,
+                            "timeout": timeout,
+                            "monitoring_info": monitoring_info,
+                        },
+                        command=command,
+                        working_directory=workdir,
+                        exit_code=result.get("exit_code"),
+                        timed_out=True,
+                        duration=result.get("duration", monitoring_info.get("execution_time")),
+                    ),
                 )
 
             # Normal command completion
@@ -583,21 +667,30 @@ class BashTool(BaseTool):
                     success=True,
                     output=extracted_output,
                     raw_output=result["output"],
-                    metadata={
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "exit_code": result.get("exit_code", 0),
-                        "signal": result.get("signal"),
-                        "execution_directory": workdir,
-                        "environment_vars": env_vars,
-                        "timeout": timeout,
-                        "monitoring_info": result.get("monitoring_info"),
-                        "is_long_running": is_long_running_command,
-                        "completion_signals": completion_signals,
-                        "command_type": self._get_command_type(command),
-                        "extracted_values": self._extract_values(result["output"], command),
-                        "background_pids": [],
-                    },
+                    metadata=self._with_execution_metadata(
+                        {
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": result.get("exit_code", 0),
+                            "signal": result.get("signal"),
+                            "execution_directory": workdir,
+                            "environment_vars": env_vars,
+                            "timeout": timeout,
+                            "monitoring_info": result.get("monitoring_info"),
+                            "is_long_running": is_long_running_command,
+                            "completion_signals": completion_signals,
+                            "command_type": self._get_command_type(command),
+                            "extracted_values": self._extract_values(result["output"], command),
+                            "background_pids": [],
+                        },
+                        command=command,
+                        working_directory=workdir,
+                        exit_code=result.get("exit_code", 0),
+                        timed_out=False,
+                        duration=result.get(
+                            "duration", (result.get("monitoring_info") or {}).get("execution_time")
+                        ),
+                    ),
                 )
             else:
                 # Analyze error for specific failure patterns
@@ -615,19 +708,28 @@ class BashTool(BaseTool):
                         error_analysis, command, result.get("exit_code")
                     ),
                     error_code=error_analysis.get("error_code", "COMMAND_FAILED"),
-                    metadata={
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "exit_code": result.get("exit_code"),
-                        "signal": result.get("signal"),
-                        "execution_directory": workdir,
-                        "environment_vars": env_vars,
-                        "timeout": timeout,
-                        "monitoring_info": result.get("monitoring_info"),
-                        "error_analysis": error_analysis,
-                        "recovery_commands": self._get_recovery_commands(error_analysis),
-                        "background_pids": [],
-                    },
+                    metadata=self._with_execution_metadata(
+                        {
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": result.get("exit_code"),
+                            "signal": result.get("signal"),
+                            "execution_directory": workdir,
+                            "environment_vars": env_vars,
+                            "timeout": timeout,
+                            "monitoring_info": result.get("monitoring_info"),
+                            "error_analysis": error_analysis,
+                            "recovery_commands": self._get_recovery_commands(error_analysis),
+                            "background_pids": [],
+                        },
+                        command=command,
+                        working_directory=workdir,
+                        exit_code=result.get("exit_code"),
+                        timed_out=False,
+                        duration=result.get(
+                            "duration", (result.get("monitoring_info") or {}).get("execution_time")
+                        ),
+                    ),
                 )
 
         except Exception as e:
@@ -673,17 +775,25 @@ class BashTool(BaseTool):
                 return ToolResult(
                     success=True,
                     output=f"Background process started with PID: {pid}",
-                    metadata={
-                        "background_pids": [pid],
-                        "execution_directory": workdir,
-                        "environment_vars": env_vars,
-                        "command_type": "background",
-                        "output_file": f"/tmp/sag_bg_{pid}.out",
-                        "stdout": "",
-                        "stderr": "",
-                        "exit_code": None,
-                        "signal": None,
-                    },
+                    metadata=self._with_execution_metadata(
+                        {
+                            "background_pids": [pid],
+                            "execution_directory": workdir,
+                            "environment_vars": env_vars,
+                            "command_type": "background",
+                            "output_file": f"/tmp/sag_bg_{pid}.out",
+                            "stdout": "",
+                            "stderr": "",
+                            "exit_code": None,
+                            "signal": None,
+                        },
+                        command=command,
+                        working_directory=workdir,
+                        exit_code=None,
+                        timed_out=False,
+                        duration=result.get("duration"),
+                        executed=True,
+                    ),
                 )
             else:
                 return ToolResult(
@@ -696,7 +806,14 @@ class BashTool(BaseTool):
                         "Check container logs for errors",
                     ],
                     error_code="BACKGROUND_START_FAILED",
-                    metadata={"background_pids": []},
+                    metadata=self._with_execution_metadata(
+                        {"background_pids": []},
+                        command=command,
+                        working_directory=workdir,
+                        exit_code=result.get("exit_code"),
+                        timed_out=False,
+                        duration=result.get("duration"),
+                    ),
                 )
 
         except Exception as e:
