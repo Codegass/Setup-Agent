@@ -209,3 +209,23 @@ def test_bash_tool_timeout_termination_reports_requested_timeout():
     assert "2 minutes" in result.error
     assert result.metadata["timeout"] == 120
     assert result.metadata["termination_reason"] == "absolute_timeout"
+
+
+def test_bash_tool_monitoring_error_is_not_marked_as_timeout():
+    orchestrator = FakeBashOrchestrator(
+        monitoring_result={
+            "success": False,
+            "output": "monitor failed",
+            "exit_code": 70,
+            "termination_reason": "monitoring_error",
+            "monitoring_info": {"execution_time": 12.0},
+        }
+    )
+    tool = BashTool(orchestrator)
+
+    result = tool.execute(command="npm install", timeout=120)
+
+    assert result.success is False
+    assert result.error_code == "MONITORING_ERROR"
+    assert result.metadata["execution"]["timed_out"] is False
+    assert result.metadata["termination_reason"] == "monitoring_error"

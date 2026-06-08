@@ -1,6 +1,6 @@
 from sag.evidence import EvidenceStatus
 from sag.tools.base import ToolResult
-from sag.tools.bash import BashTool
+from sag.tools.bash import BashTool, BashToolConfig
 
 
 def test_tool_result_defaults_status_from_success_boolean():
@@ -126,3 +126,18 @@ def test_bash_nonzero_reports_executed_nonzero_without_domain_status():
     assert result.metadata["execution"]["executed"] is True
     assert result.metadata["execution"]["exit_code"] == 2
     assert result.status.value == "blocked"
+
+
+def test_bash_blocked_command_reports_pre_execution_facts():
+    tool = BashTool(
+        docker_orchestrator=FakeBashOrchestrator({"success": True, "exit_code": 0, "output": "ok"}),
+        config=BashToolConfig(blocked_commands=["rm"]),
+    )
+
+    result = tool.execute(command="rm -rf /tmp/demo", working_directory="/workspace/project")
+
+    assert result.success is False
+    assert result.error_code == "COMMAND_BLOCKED"
+    assert result.metadata["execution"]["executed"] is False
+    assert result.metadata["execution"]["exit_code"] is None
+    assert result.metadata["execution"]["timed_out"] is False

@@ -119,6 +119,35 @@ class BashTool(BaseTool):
         )
         return result_metadata
 
+    def _pre_execution_failure(
+        self,
+        *,
+        command: Optional[str],
+        working_directory: Optional[str],
+        output: str,
+        error: str,
+        error_code: str,
+        suggestions: Optional[List[str]] = None,
+        raw_output: str = "",
+    ) -> ToolResult:
+        return ToolResult(
+            success=False,
+            output=output,
+            error=error,
+            error_code=error_code,
+            suggestions=suggestions or [],
+            raw_output=raw_output,
+            metadata=self._with_execution_metadata(
+                None,
+                command=command,
+                working_directory=working_directory,
+                exit_code=None,
+                timed_out=False,
+                duration=0,
+                executed=False,
+            ),
+        )
+
     def _ensure_working_directory(self, requested_workdir: str) -> str:
         """Smart working directory validation and setup."""
         return self._validate_and_fix_working_directory(requested_workdir)
@@ -390,8 +419,9 @@ class BashTool(BaseTool):
         # Check for unexpected parameters and provide clear error feedback
         if kwargs:
             invalid_params = list(kwargs.keys())
-            return ToolResult(
-                success=False,
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
                 output=(
                     f"❌ Invalid parameters for bash tool: {invalid_params}\n\n"
                     f"✅ Valid parameters:\n"
@@ -403,22 +433,14 @@ class BashTool(BaseTool):
                     f"Example: bash(command='ls -la', timeout=30)"
                 ),
                 error=f"Invalid parameters: {invalid_params}",
-                raw_output="",
-                metadata=self._with_execution_metadata(
-                    None,
-                    command=command,
-                    working_directory=working_directory,
-                    exit_code=None,
-                    timed_out=False,
-                    duration=0,
-                    executed=False,
-                ),
+                error_code="INVALID_PARAMETERS",
             )
 
         # Check for required parameter
         if not command or not command.strip():
-            return ToolResult(
-                success=False,
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
                 output=(
                     "❌ Missing required parameter: 'command'\n\n"
                     "The bash tool requires a 'command' parameter.\n"
@@ -426,80 +448,64 @@ class BashTool(BaseTool):
                     "Example: bash(command='mvn clean test', timeout=3600)"
                 ),
                 error="Missing required parameter: command",
-                raw_output="",
-                metadata=self._with_execution_metadata(
-                    None,
-                    command=command,
-                    working_directory=working_directory,
-                    exit_code=None,
-                    timed_out=False,
-                    duration=0,
-                    executed=False,
-                ),
+                error_code="MISSING_COMMAND",
             )
 
         try:
             timeout = int(timeout)
         except (TypeError, ValueError):
-            return ToolResult(
-                success=False,
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
                 output="❌ Invalid timeout for bash tool: timeout must be a positive integer.",
                 error="Invalid timeout: must be a positive integer",
-                raw_output="",
-                metadata=self._with_execution_metadata(
-                    None,
-                    command=command,
-                    working_directory=working_directory,
-                    exit_code=None,
-                    timed_out=False,
-                    duration=0,
-                    executed=False,
-                ),
+                error_code="INVALID_TIMEOUT",
             )
         if timeout <= 0:
-            return ToolResult(
-                success=False,
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
                 output="❌ Invalid timeout for bash tool: timeout must be greater than 0.",
                 error="Invalid timeout: must be greater than 0",
-                raw_output="",
-                metadata=self._with_execution_metadata(
-                    None,
-                    command=command,
-                    working_directory=working_directory,
-                    exit_code=None,
-                    timed_out=False,
-                    duration=0,
-                    executed=False,
-                ),
+                error_code="INVALID_TIMEOUT",
             )
 
         if not self.docker_orchestrator:
-            raise ToolError(
-                message="Docker orchestrator not available",
-                suggestions=["Ensure Docker is running and container is available"],
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
+                output="Docker orchestrator not available",
+                error="Docker orchestrator not available",
                 error_code="NO_ORCHESTRATOR",
+                suggestions=["Ensure Docker is running and container is available"],
             )
 
         # Validate command against security policies
         is_valid, error_msg = self._validate_command(command)
         if not is_valid:
-            raise ToolError(
-                message=f"Command validation failed: {error_msg}",
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
+                output=f"Command validation failed: {error_msg}",
+                error=f"Command validation failed: {error_msg}",
+                error_code="COMMAND_BLOCKED",
                 suggestions=[
                     "Check if the command is allowed by security policy",
                     "Use alternative commands that are permitted",
                     "Contact administrator to update security policy if needed",
                 ],
-                error_code="COMMAND_BLOCKED",
             )
 
         # Check for interactive commands
         is_interactive, suggestion = self._detect_interactive_command(command)
         if is_interactive and self.config.block_interactive_commands:
-            raise ToolError(
-                message="Interactive command detected",
-                suggestions=[suggestion, "Use non-interactive alternatives"],
+            return self._pre_execution_failure(
+                command=command,
+                working_directory=working_directory,
+                output="Interactive command detected",
+                error="Interactive command detected",
                 error_code="INTERACTIVE_COMMAND",
+                suggestions=[suggestion, "Use non-interactive alternatives"],
             )
 
         # Smart working directory validation and setup
@@ -606,6 +612,14 @@ class BashTool(BaseTool):
                 error_msg = error_messages.get(
                     termination_reason, f"Command terminated: {termination_reason}"
                 )
+                is_timeout = termination_reason in {"absolute_timeout", "silent_timeout"}
+                error_code = (
+                    f"TIMEOUT_{termination_reason.upper()}"
+                    if is_timeout
+                    else "MONITORING_ERROR"
+                    if termination_reason == "monitoring_error"
+                    else f"COMMAND_TERMINATED_{termination_reason.upper()}"
+                )
 
                 # Include monitoring info in suggestions
                 monitoring_info = result.get("monitoring_info", {})
@@ -626,7 +640,7 @@ class BashTool(BaseTool):
                     output=result.get("output", ""),
                     error=error_msg,
                     suggestions=suggestions,
-                    error_code=f"TIMEOUT_{termination_reason.upper()}",
+                    error_code=error_code,
                     metadata=self._with_execution_metadata(
                         {
                             "termination_reason": termination_reason,
@@ -636,7 +650,7 @@ class BashTool(BaseTool):
                         command=command,
                         working_directory=workdir,
                         exit_code=result.get("exit_code"),
-                        timed_out=True,
+                        timed_out=is_timeout,
                         duration=result.get("duration", monitoring_info.get("execution_time")),
                     ),
                 )
