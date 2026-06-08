@@ -135,12 +135,20 @@ function pendingLaunchItems(
       pending.push(item)
     }
   }
-  return pending
+  // Attention-first: failed launches sort above active, active above queued.
+  const rank: Record<string, number> = { failed: 0, running: 1, launching: 2, queued: 3 }
+  return pending.sort(
+    (a, b) => (rank[normalize(a.status)] ?? 4) - (rank[normalize(b.status)] ?? 4),
+  )
 }
 
 function workspaceMeta(workspace: WorkspaceSummary): string {
-  return [workspace.stack, workspace.commit ?? "unknown", workspace.updated]
-    .filter(Boolean)
+  // Drop "unknown"/"Unknown" placeholders so the line carries only real signal.
+  return [workspace.stack, workspace.commit, workspace.updated]
+    .filter(
+      (value): value is string =>
+        typeof value === "string" && value.length > 0 && value.toLowerCase() !== "unknown",
+    )
     .join(" · ")
 }
 
@@ -220,7 +228,7 @@ export function Dashboard({
           icon={attention ? <AlertTriangle size={14} className="text-red-500" /> : null}
           label="Need attention"
           value={attention}
-          sub="failed or exited"
+          sub="failed, partial, or stopped"
         />
       </div>
 
@@ -267,7 +275,7 @@ export function Dashboard({
       </div>
 
       <p className="mt-3 px-1 font-mono text-[10px] text-slate-500">
-        GET /api/workspaces · manual refresh
+        Refreshes automatically · or use Refresh
       </p>
     </div>
   )
@@ -447,6 +455,7 @@ function PendingLaunchRow({ item }: { item: LaunchQueueItem }) {
         <StatusBadge status={item.status} />
         <span
           className={`min-w-0 truncate text-[12.5px] ${failed ? "text-red-600" : "text-slate-500"}`}
+          title={failed ? item.error ?? undefined : undefined}
         >
           {launchStatusLine(item)}
         </span>
@@ -482,6 +491,7 @@ function PendingLaunchCard({ item }: { item: LaunchQueueItem }) {
       </div>
       <div
         className={`mt-3 text-[12.5px] ${failed ? "text-red-600" : "text-slate-500"}`}
+        title={failed ? item.error ?? undefined : undefined}
       >
         {launchStatusLine(item)}
       </div>
