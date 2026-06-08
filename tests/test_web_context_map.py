@@ -104,6 +104,70 @@ def test_context_map_builder_exposes_task_evidence_state_and_refs(tmp_path: Path
     assert alias_data["evidenceRefs"][0]["ref"] == "output_validator"
 
 
+def test_context_map_builder_hydrates_dict_evidence_refs_from_full_outputs(tmp_path: Path):
+    contexts = tmp_path / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    (contexts / "full_outputs.jsonl").write_text(
+        json.dumps(
+            {
+                "ref_id": "output_validator",
+                "task_id": "T2",
+                "tool_name": "pytest",
+                "timestamp": "2026-06-07T00:00:00",
+                "output_length": 18,
+                "output": "rich output preview",
+                "metadata": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (contexts / "trunk_commons.json").write_text(
+        json.dumps(
+            {
+                "goal": "Set up commons-cli",
+                "todo_list": [
+                    {
+                        "id": "T2",
+                        "task": "Run tests",
+                        "status": "completed",
+                        "evidence_refs": [
+                            {
+                                "ref": "output_validator",
+                                "label": "validator evidence",
+                            }
+                        ],
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (contexts / "task_T2.json").write_text(
+        json.dumps(
+            {
+                "history": [
+                    {
+                        "type": "action",
+                        "tool_name": "pytest",
+                        "success": True,
+                        "output": "Full output ref: output_validator",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ctx = ContextMapBuilder(contexts).build()
+
+    task = ctx.tasks[0]
+    assert task.refs[0].label == "validator evidence"
+    assert task.refs[0].tool == "pytest"
+    assert task.refs[0].content == "rich output preview"
+    assert task.refs[0].content_length == 18
+
+
 def test_context_map_builder_uses_real_sag_in_progress_description_fields(tmp_path: Path):
     contexts = tmp_path / ".setup_agent" / "contexts"
     contexts.mkdir(parents=True)

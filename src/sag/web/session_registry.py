@@ -140,6 +140,7 @@ class ContainerSessionStore:
             "title": task,
             "status": "running",
             "evidence_status": "unknown",
+            "evidence_status_source": "default",
             "entry": "Web UI",
             "start": now,
             "finish": None,
@@ -186,8 +187,9 @@ class ContainerSessionStore:
             sessions.append(item)
 
         item["status"] = "completed" if success else "failed"
-        if _explicit_evidence_status(item) is None:
+        if _should_set_finished_evidence_status(item):
             item["evidence_status"] = "success" if success else "blocked"
+            item["evidence_status_source"] = "finish"
         item["finish"] = now
         item["duration"] = _duration(str(item.get("start") or now), now)
         item["outcome"] = outcome
@@ -651,8 +653,8 @@ def _evidence_status_from_report_snapshot(report_raw: str) -> str | None:
         if len(row) < 2:
             continue
         label = _clean_status_label(row[0])
-        if label in {"evidencestatus", "result", "status"}:
-            status = _extract_evidence_status(" ".join(row[1:]))
+        if label in {"evidencestatus", "evidenceresult", "evidencestate"}:
+            status = _extract_evidence_status_token(" ".join(row[1:]))
             if status is not None:
                 return status
 
@@ -705,6 +707,14 @@ def _extract_evidence_status(value: Any) -> str | None:
     return None
 
 
+def _extract_evidence_status_token(value: Any) -> str | None:
+    tokens = re.findall(r"[a-z]+", _text(value, default="").lower())
+    statuses = [token for token in tokens if token in _EVIDENCE_STATUS_VALUES]
+    if len(statuses) == 1 and len(tokens) == 1:
+        return statuses[0]
+    return None
+
+
 def _explicit_evidence_status(item: dict[str, Any]) -> str | None:
     return _normalize_evidence_status(_value_for_keys(item, "evidence_status", "evidenceStatus"))
 
@@ -713,11 +723,19 @@ def _evidence_status(item: dict[str, Any]) -> str:
     return _explicit_evidence_status(item) or "unknown"
 
 
+def _should_set_finished_evidence_status(item: dict[str, Any]) -> bool:
+    status = _explicit_evidence_status(item)
+    if status is None:
+        return True
+    source = _text(item.get("evidence_status_source"), default="")
+    return status == "unknown" and source in {"", "default"}
+
+
 def _normalize_evidence_status(value: Any) -> str | None:
     text = _text(value, default="").lower()
     if text in _EVIDENCE_STATUS_VALUES:
         return text
-    return _extract_evidence_status(text)
+    return _extract_evidence_status_token(text)
 
 
 def _aggregate_evidence_status(statuses: Any) -> str | None:

@@ -232,18 +232,36 @@ class ContextMapBuilder:
     def _context_ref(self, value: Any) -> ContextReference:
         if isinstance(value, dict):
             ref = str(value.get("ref") or value.get("id") or value.get("path") or "")
+            record = self._output_record(ref)
+            content = value.get("content")
+            if content is None:
+                content = record.get("output")
             label = str(value.get("label") or ref)
             return ContextReference(
                 ref=ref,
                 label=label,
-                kind=str(value.get("kind") or "reference"),
-                tool=str(value.get("tool")) if value.get("tool") is not None else None,
+                kind=str(
+                    value.get("kind")
+                    or ("output" if record or ref.startswith("output_") else "reference")
+                ),
+                tool=str(value.get("tool") or record.get("tool_name"))
+                if value.get("tool") is not None or record.get("tool_name") is not None
+                else None,
                 task_id=str(value.get("task_id") or value.get("taskId"))
                 if value.get("task_id") or value.get("taskId")
+                else str(record.get("task_id"))
+                if record.get("task_id") is not None
                 else None,
-                timestamp=str(value.get("timestamp")) if value.get("timestamp") is not None else None,
-                content=str(value.get("content")) if value.get("content") is not None else None,
-                content_length=self._int_or_none(value.get("content_length") or value.get("contentLength")),
+                timestamp=str(value.get("timestamp") or record.get("timestamp"))
+                if value.get("timestamp") is not None or record.get("timestamp") is not None
+                else None,
+                content=str(content) if content is not None else None,
+                content_length=self._int_or_none(
+                    value.get("content_length")
+                    or value.get("contentLength")
+                    or record.get("output_length")
+                )
+                or (len(content) if isinstance(content, str) else None),
             )
 
         ref = str(value)

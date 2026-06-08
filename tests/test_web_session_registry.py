@@ -1,8 +1,10 @@
 import json
+import shlex
+from datetime import datetime
 from pathlib import Path
 
 from sag.web.models import DockerSummary, WorkspaceSummary
-from sag.web.session_registry import ContainerSessionRegistry, SessionRegistry
+from sag.web.session_registry import ContainerSessionRegistry, ContainerSessionStore, SessionRegistry
 
 
 class FakeOrchestrator:
@@ -15,6 +17,16 @@ class FakeOrchestrator:
             if path in self.files:
                 return {"exit_code": 0, "output": self.files[path]}
             return {"exit_code": 1, "output": ""}
+
+        if "printf %s" in command and ">" in command:
+            tokens = shlex.split(command)
+            try:
+                value = tokens[tokens.index("printf") + 2]
+                path = tokens[tokens.index(">") + 1]
+            except (ValueError, IndexError):
+                return {"exit_code": 1, "output": "bad write command"}
+            self.files[path] = value
+            return {"exit_code": 0, "output": ""}
 
         if command.startswith("find /workspace/.setup_agent/contexts"):
             filenames = [
@@ -181,6 +193,76 @@ def test_session_registry_strips_text_and_defaults_blank_optional_fields(tmp_pat
     assert rows[0].duration == "—"
     assert rows[0].build == "success"
     assert rows[0].report == "ready"
+
+
+def test_container_session_store_finalizes_default_unknown_evidence_status():
+    files = {}
+    orchestrator = FakeOrchestrator(files)
+    store = ContainerSessionStore(
+        orchestrator_factory=lambda workspace_id: orchestrator,
+        clock=lambda: datetime(2026, 6, 8, 6, 30, 0),
+    )
+
+    store.mark_started(
+        workspace_id="sag-commons-cli",
+        session_id="UI-success",
+        task="Run tests",
+        source_session=None,
+    )
+    store.mark_finished(
+        workspace_id="sag-commons-cli",
+        session_id="UI-success",
+        success=True,
+        outcome="Task completed.",
+    )
+
+    store.mark_started(
+        workspace_id="sag-commons-cli",
+        session_id="UI-failed",
+        task="Run tests",
+        source_session=None,
+    )
+    store.mark_finished(
+        workspace_id="sag-commons-cli",
+        session_id="UI-failed",
+        success=False,
+        outcome="Task failed.",
+    )
+
+    payload = json.loads(files["/workspace/.setup_agent/sessions/index.json"])
+    by_id = {item["id"]: item for item in payload["sessions"]}
+    assert by_id["UI-success"]["evidence_status"] == "success"
+    assert by_id["UI-failed"]["evidence_status"] == "blocked"
+
+
+def test_container_session_store_preserves_explicit_evidence_status_on_finish():
+    files = {}
+    orchestrator = FakeOrchestrator(files)
+    store = ContainerSessionStore(
+        orchestrator_factory=lambda workspace_id: orchestrator,
+        clock=lambda: datetime(2026, 6, 8, 6, 30, 0),
+    )
+
+    store.mark_started(
+        workspace_id="sag-commons-cli",
+        session_id="UI-partial",
+        task="Run tests",
+        source_session=None,
+    )
+    payload = json.loads(files["/workspace/.setup_agent/sessions/index.json"])
+    payload["sessions"][0]["evidence_status"] = "partial"
+    payload["sessions"][0]["evidence_status_source"] = "tool"
+    files["/workspace/.setup_agent/sessions/index.json"] = json.dumps(payload)
+
+    store.mark_finished(
+        workspace_id="sag-commons-cli",
+        session_id="UI-partial",
+        success=True,
+        outcome="Task completed with unresolved test evidence.",
+    )
+
+    payload = json.loads(files["/workspace/.setup_agent/sessions/index.json"])
+    assert payload["sessions"][0]["evidence_status"] == "partial"
 
 
 def test_container_session_registry_falls_back_to_last_comment_without_index():
