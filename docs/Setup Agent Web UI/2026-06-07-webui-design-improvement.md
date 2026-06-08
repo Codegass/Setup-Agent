@@ -28,7 +28,7 @@ Standing guardrails for every phase:
 | # | Finding | Evidence |
 |---|---|---|
 | B1 | No `prefers-reduced-motion` support anywhere | `grep prefers-reduced-motion webui/src` returns nothing; animate-ping status pulses, dialog pop, highlight fade, refresh spinner all unconditional |
-| B2 | Intended fonts never ported from the prototype | The design prototype (`docs/Setup Agent Web UI/SAG Workbench.html`) loads Inter 400-700 + Space Mono 400/700 from Google Fonts; production declares `font-family: Inter` (`styles.css:89`) but loads nothing, so users silently get system sans and system mono |
+| B2 | Inter declared but never loaded | `styles.css:89` sets `font-family: Inter, ...`; no @font-face, fontsource package, or font link exists, so users silently get system fonts |
 | B3 | 87 instances of `text-slate-400` used for meaningful text | ~3.0:1 contrast on white; fails AA 4.5:1 at the 10-12px sizes it is used for (table headers, meta lines, provenance text) |
 | B4 | No dashboard empty state | `Dashboard.tsx` has no `workspaces.length === 0` branch; first-run shows a bare table header |
 | B5 | Summary-card trio is the hero-metric template | Three identical Cards (number + label + sub) at the top of the dashboard; the exact anti-reference pattern |
@@ -42,11 +42,9 @@ Standing guardrails for every phase:
 
 **Command:** `/impeccable document`
 
-The design prototype in `docs/Setup Agent Web UI/` (`SAG Workbench.html`,
-`src/*.jsx` reference implementations, `screenshots/` of intended states) is
-the design source of truth; production was ported from it incompletely.
-DESIGN.md captures both: the tokens production actually uses and the
-prototype intent it drifted from (fonts being the proven case).
+The prototype in `docs/Setup Agent Web UI/` is outdated; `webui/src/` is the
+authoritative current design and the only thing DESIGN.md captures. The
+prototype and its screenshots are historical reference at most.
 
 Generate `docs/DESIGN.md` from the existing code: OKLCH tokens in `styles.css`,
 component inventory (`Badge`/`StatusBadge`, `Button`, `Card`/`CardHead`,
@@ -74,10 +72,9 @@ Acceptance: a scored critique snapshot the later phases consume as a backlog.
 
 The highest-leverage, lowest-risk fixes; everything later builds on them.
 
-1. Restore the prototype's type voice (fixes B2): self-host Inter
-   (`@fontsource-variable/inter`) and Space Mono (`@fontsource/space-mono`,
-   400/700) so the mono voice that carries ids, refs, and labels matches the
-   original design; `font-display: swap`; no CDN for a local tool. Tune the scale while
+1. Load Inter properly (fixes B2): self-host via
+   `@fontsource-variable/inter`, `font-display: swap`, no CDN for a local
+   tool. The mono stack stays as declared in production code. Tune the scale while
    at it: establish a fixed rem scale with 1.125-1.2 steps; raise the 10px
    floor to 11px; reserve uppercase+tracking for true table headers and
    badges, demote everywhere else to sentence-case labels (B9).
