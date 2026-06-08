@@ -79,8 +79,26 @@ class TrunkContext(BaseContext):
         data.pop("context_type", None)
         super().__init__(context_type=ContextType.TRUNK, **data)
 
+    @staticmethod
+    def _normalize_task_description(description: str) -> str:
+        """Normalize a task description for duplicate detection."""
+        return " ".join((description or "").split()).strip().lower()
+
     def add_task(self, description: str) -> str:
-        """Add a new task to the TODO list."""
+        """Add a new task to the TODO list.
+
+        De-duplicates against existing tasks (any status): re-issuing a task
+        that already exists returns the existing id instead of appending a
+        copy. This stops re-planning from piling up identical tasks (e.g. a
+        generic "explore" template) that the agent would otherwise re-run
+        without noticing.
+        """
+        normalized = self._normalize_task_description(description)
+        for existing in self.todo_list:
+            if self._normalize_task_description(existing.description) == normalized:
+                logger.info(f"Skipped duplicate task (already present as {existing.id}): {description}")
+                return existing.id
+
         task_id = f"task_{len(self.todo_list) + 1}"
         task = Task(id=task_id, description=description)
         self.todo_list.append(task)
