@@ -10,6 +10,14 @@ from pathlib import Path
 
 ALL_STATUSES = ("queued", "launching", "running", "completed", "failed")
 
+
+class WorkspaceBusyError(RuntimeError):
+    """Raised when a workspace still has a launching or running launch item.
+
+    Deleting such a workspace would orphan an in-flight setup, so the store
+    refuses and changes nothing.
+    """
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS launch_batches (
     id TEXT PRIMARY KEY,
@@ -263,6 +271,56 @@ class LaunchQueueStore:
                 " WHERE status IN ('queued', 'launching', 'running')"
             ).fetchall()
             return {row["workspace_id"] for row in rows}
+
+    def delete_workspace_items(self, workspace_id: str) -> tuple[int, list[str]]:
+        """Atomically delete every launch_item for ``workspace_id``.
+
+        Inside one ``BEGIN IMMEDIATE`` transaction: refuse (raising
+        ``WorkspaceBusyError`` and deleting nothing) if any matching item is
+        currently ``launching`` or ``running``; otherwise delete the matching
+        items, drop any batch row left with zero items, and return the deleted
+        count together with the removed items' ``process_log`` paths. Zero
+        matching items is a normal success returning ``(0, [])``.
+        """
+
+        with contextlib.closing(self._connect()) as conn:
+            deleted = 0
+            process_logs: list[str] = []
+            with self._transaction(conn):
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM launch_items"
+                    " WHERE workspace_id = ? AND status IN ('launching', 'running')",
+                    (workspace_id,),
+                ).fetchone()[0]
+                if active:
+                    raise WorkspaceBusyError(
+                        f"Workspace has an active launch: {workspace_id}"
+                    )
+
+                rows = conn.execute(
+                    "SELECT batch_id, process_log FROM launch_items"
+                    " WHERE workspace_id = ?",
+                    (workspace_id,),
+                ).fetchall()
+                process_logs = [row["process_log"] for row in rows]
+                deleted = len(rows)
+                batch_ids = {row["batch_id"] for row in rows}
+
+                conn.execute(
+                    "DELETE FROM launch_items WHERE workspace_id = ?",
+                    (workspace_id,),
+                )
+
+                for batch_id in batch_ids:
+                    remaining = conn.execute(
+                        "SELECT COUNT(*) FROM launch_items WHERE batch_id = ?",
+                        (batch_id,),
+                    ).fetchone()[0]
+                    if remaining == 0:
+                        conn.execute(
+                            "DELETE FROM launch_batches WHERE id = ?", (batch_id,)
+                        )
+            return deleted, process_logs
 
     def _finish(
         self,

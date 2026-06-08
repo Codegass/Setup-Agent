@@ -1,6 +1,13 @@
 """Tests for the SQLite-backed launch queue store."""
 
-from sag.web.launch_queue import LaunchBatch, LaunchItem, LaunchQueueStore
+import pytest
+
+from sag.web.launch_queue import (
+    LaunchBatch,
+    LaunchItem,
+    LaunchQueueStore,
+    WorkspaceBusyError,
+)
 
 NOW = "2026-06-07T10:00:00"
 LATER = "2026-06-07T10:05:00"
@@ -320,3 +327,104 @@ def test_active_workspace_ids_reflects_unfinished_items(tmp_path):
     store.mark_completed(claimed.id, exit_code=0, now=LATER)
 
     assert store.active_workspace_ids() == {"sag-b", "sag-c"}
+
+
+def test_delete_workspace_items_removes_only_target_and_returns_logs(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue_batch(
+        make_batch("BATCH-20260607-aaaaaa", total=2, accepted=2),
+        [
+            make_item(
+                "LAUNCH-00000001",
+                "BATCH-20260607-aaaaaa",
+                row_index=0,
+                workspace_id="sag-a",
+                docker_label="a",
+            ),
+            make_item(
+                "LAUNCH-00000002",
+                "BATCH-20260607-aaaaaa",
+                row_index=1,
+                workspace_id="sag-b",
+                docker_label="b",
+            ),
+        ],
+    )
+
+    deleted, logs = store.delete_workspace_items("sag-a")
+
+    assert deleted == 1
+    assert logs == ["logs/project_launches/BATCH-20260607-aaaaaa/LAUNCH-00000001.log"]
+    remaining = {
+        item["id"] for batch in store.list_batches() for item in batch["items"]
+    }
+    assert remaining == {"LAUNCH-00000002"}
+    # The batch still has another item, so it must survive.
+    assert [batch["id"] for batch in store.list_batches()] == ["BATCH-20260607-aaaaaa"]
+
+
+def test_delete_workspace_items_drops_emptied_batch_only(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue_batch(
+        make_batch("BATCH-20260607-aaaaaa", total=1, accepted=1),
+        [
+            make_item(
+                "LAUNCH-00000001",
+                "BATCH-20260607-aaaaaa",
+                workspace_id="sag-a",
+                docker_label="a",
+            )
+        ],
+    )
+    store.enqueue_batch(
+        make_batch("BATCH-20260607-bbbbbb", total=1, accepted=1),
+        [
+            make_item(
+                "LAUNCH-00000002",
+                "BATCH-20260607-bbbbbb",
+                workspace_id="sag-b",
+                docker_label="b",
+            )
+        ],
+    )
+
+    deleted, _ = store.delete_workspace_items("sag-a")
+
+    assert deleted == 1
+    # The now-empty batch is gone; the untouched workspace's batch remains.
+    assert [batch["id"] for batch in store.list_batches()] == ["BATCH-20260607-bbbbbb"]
+
+
+def test_delete_workspace_items_returns_zero_when_no_match(tmp_path):
+    store = make_store(tmp_path)
+    enqueue_three_queued_items(store, concurrency=3)
+
+    deleted, logs = store.delete_workspace_items("sag-does-not-exist")
+
+    assert deleted == 0
+    assert logs == []
+    assert len(store.list_batches()[0]["items"]) == 3
+
+
+def test_delete_workspace_items_raises_when_launching(tmp_path):
+    store = make_store(tmp_path)
+    enqueue_three_queued_items(store, concurrency=3)
+    claimed = store.claim_next(global_cap=8, now=LATER)  # marks sag-a launching
+
+    with pytest.raises(WorkspaceBusyError):
+        store.delete_workspace_items(claimed.workspace_id)
+
+    # Deleted nothing.
+    assert len(store.list_batches()[0]["items"]) == 3
+
+
+def test_delete_workspace_items_raises_when_running(tmp_path):
+    store = make_store(tmp_path)
+    enqueue_three_queued_items(store, concurrency=3)
+    claimed = store.claim_next(global_cap=8, now=LATER)
+    store.mark_running(claimed.id, pid=1, now=LATER)
+
+    with pytest.raises(WorkspaceBusyError):
+        store.delete_workspace_items(claimed.workspace_id)
+
+    assert len(store.list_batches()[0]["items"]) == 3

@@ -15,10 +15,12 @@ from fastapi.staticfiles import StaticFiles
 
 from loguru import logger
 
+from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
 from sag.web.read_model import ReadModelBuilder
 from sag.web.task_runner import TaskRequest, TaskRunner
 from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
+from sag.web.workspace_service import WorkspaceService
 
 
 def _single_snapshot(payload: dict) -> Iterator[str]:
@@ -32,12 +34,20 @@ def create_app(
     terminal_adapter: TerminalAdapter | None = None,
     static_dir: Path | None = None,
     launch_service: LaunchService | None = None,
+    workspace_service: WorkspaceService | None = None,
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
     runner = task_runner if task_runner is not None else TaskRunner()
     terminal_bridge = terminal_adapter if terminal_adapter is not None else TerminalAdapter()
     owns_terminal_bridge = terminal_adapter is None
     launches = launch_service if launch_service is not None else LaunchService()
+    # Share the launch service's store/DB so queue cleanup and launch state stay
+    # consistent; a fake launch service without a store falls back to the default.
+    workspaces = (
+        workspace_service
+        if workspace_service is not None
+        else WorkspaceService(store=getattr(launches, "_store", None))
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -65,6 +75,13 @@ def create_app(
     @app.post("/api/workspaces/{workspace_id}/tasks", status_code=202)
     def submit_task(workspace_id: str, request: TaskRequest) -> dict:
         return runner.submit(workspace_id, request)
+
+    @app.delete("/api/workspaces/{workspace_id}")
+    def delete_workspace(workspace_id: str) -> dict:
+        try:
+            return workspaces.delete_workspace(workspace_id)
+        except WorkspaceBusyError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/project-launches/batch")
     def submit_project_batch(request: LaunchBatchRequest) -> JSONResponse:

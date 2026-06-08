@@ -332,3 +332,56 @@ def test_lifespan_starts_and_stops_launch_service():
         assert not service.stopped
 
     assert service.stopped
+
+
+class FakeWorkspaceService:
+    def __init__(self, result=None, error=None):
+        self.result = result
+        self.error = error
+        self.calls = []
+
+    def delete_workspace(self, workspace_id):
+        self.calls.append(workspace_id)
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+def test_delete_workspace_returns_200_with_result_body():
+    service = FakeWorkspaceService(
+        result={
+            "workspace_id": "sag-commons-cli",
+            "container_removed": True,
+            "queue_items_removed": 2,
+            "status": "deleted",
+        }
+    )
+    app = create_app(ReadModelBuilder(demo_mode=True), workspace_service=service)
+    client = TestClient(app)
+
+    response = client.delete("/api/workspaces/sag-commons-cli")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "workspace_id": "sag-commons-cli",
+        "container_removed": True,
+        "queue_items_removed": 2,
+        "status": "deleted",
+    }
+    assert service.calls == ["sag-commons-cli"]
+
+
+def test_delete_workspace_returns_409_when_busy():
+    from sag.web.launch_queue import WorkspaceBusyError
+
+    service = FakeWorkspaceService(
+        error=WorkspaceBusyError("Workspace has an active launch: sag-x")
+    )
+    app = create_app(ReadModelBuilder(demo_mode=True), workspace_service=service)
+    client = TestClient(app)
+
+    response = client.delete("/api/workspaces/sag-x")
+
+    assert response.status_code == 409
+    assert "active launch" in response.json()["detail"]
+    assert service.calls == ["sag-x"]
