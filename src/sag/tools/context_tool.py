@@ -33,6 +33,7 @@ class ContextTool(BaseTool):
         evidence_status: Optional[str] = None,
         conflicts: Optional[List[str]] = None,
         force: bool = False,
+        next_tasks: Optional[List[str]] = None,
     ) -> ToolResult:
         """
         Execute context management actions.
@@ -48,6 +49,7 @@ class ContextTool(BaseTool):
             evidence_status: Optional agent claim for evidence quality/status
             conflicts: Optional contradiction IDs discovered during the task
             force: Force completion even if validation fails (use with caution)
+            next_tasks: Optional model-authored follow-up tasks to append after completion
         """
 
         # The base class now handles parameter validation automatically
@@ -134,6 +136,7 @@ class ContextTool(BaseTool):
                     evidence_status=evidence_status,
                     conflicts=conflicts,
                     force=force,
+                    next_tasks=next_tasks,
                 )
 
         except Exception as e:
@@ -565,6 +568,24 @@ class ContextTool(BaseTool):
                 message=f"Failed to complete task: {str(e)}", error_code="COMPLETE_TASK_ERROR"
             )
 
+    @staticmethod
+    def _apply_next_tasks(trunk_context, next_tasks) -> list:
+        """Add model-proposed follow-up tasks, dropping blanks. Dedup is
+        enforced by TrunkContext.add_task, so verbatim repeats collapse to the
+        existing task id."""
+        added_ids = []
+        seen = set()
+        for raw in next_tasks or []:
+            description = (raw or "").strip()
+            if not description:
+                continue
+            key = " ".join(description.split()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            added_ids.append(trunk_context.add_task(description))
+        return added_ids
+
     def _complete_task_with_results(
         self,
         summary: Optional[str],
@@ -573,6 +594,7 @@ class ContextTool(BaseTool):
         evidence_status: Optional[str] = None,
         conflicts: Optional[List[str]] = None,
         force: bool = False,
+        next_tasks: Optional[List[str]] = None,
     ) -> ToolResult:
         """
         Complete current task with key results recording - ATOMIC operation to prevent state/action separation.
@@ -586,6 +608,7 @@ class ContextTool(BaseTool):
             evidence_status: Optional agent claim for evidence quality/status
             conflicts: Optional contradiction IDs discovered during the task
             force: Override validation failures (use with caution)
+            next_tasks: Optional model-authored follow-up tasks to append after completion
         """
         if not summary:
             raise ToolError(
@@ -759,6 +782,14 @@ class ContextTool(BaseTool):
 
             # Save once with all updates
             self.context_manager._save_trunk_context(fresh_trunk_context)
+
+            # Model-authored follow-up tasks: append concrete next steps the
+            # model proposed for this completion. Reuse the fresh context we
+            # just saved (no extra load), dedup is enforced by add_task.
+            if next_tasks:
+                added_ids = self._apply_next_tasks(fresh_trunk_context, next_tasks)
+                self.context_manager._save_trunk_context(fresh_trunk_context)
+                logger.info(f"Model proposed {len(added_ids)} follow-up task(s): {added_ids}")
 
             # Clear current task in context manager
             self.context_manager.current_task_id = None

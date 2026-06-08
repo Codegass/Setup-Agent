@@ -66,6 +66,7 @@ initial_system:
       • get_info: Check current context and available tasks
       • CRITICAL: complete_with_results is an ACTION, not a separate tool!
       • Example: manage_context(action="complete_with_results", summary="Task completed successfully", key_results="Built project, all tests pass")
+      • When a build/test step fails or you discover a more specific next step, pass next_tasks=["<concrete, specific action>"] to complete_with_results to plan your own follow-up. Make each task DIFFERENT from anything in ATTEMPT HISTORY — never restate a task you already tried.
     - maven: 🔥 PREFERRED for Maven projects - Execute Maven commands (NOT mvn)
       • ✅ USE THIS for: compile, test, package, install, clean, verify
       • ✅ Multi-module support: maven(command='test', fail_at_end=True) tests ALL modules
