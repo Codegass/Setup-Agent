@@ -1139,7 +1139,7 @@ git commit -m "Teach agent evidence status rules"
 - Modify: `tests/test_web_read_model.py`
 - Modify: `tests/test_web_demo_data.py`
 
-- [ ] **Step 1: Add failing web model tests**
+- [x] **Step 1: Add failing web model tests**
 
 In `tests/test_web_models.py`, add:
 
@@ -1172,7 +1172,7 @@ def test_session_detail_exposes_flow_status_and_evidence_status():
     assert payload["test"]["passRate"] == 96.3
 ```
 
-- [ ] **Step 2: Run web backend model test to verify it fails**
+- [x] **Step 2: Run web backend model test to verify it fails**
 
 Run:
 
@@ -1182,7 +1182,7 @@ uv run pytest tests/test_web_models.py::test_session_detail_exposes_flow_status_
 
 Expected: missing fields.
 
-- [ ] **Step 3: Add backend read model fields**
+- [x] **Step 3: Add backend read model fields**
 
 Modify `src/sag/web/models.py`:
 
@@ -1212,7 +1212,7 @@ evidence_refs: list[str] = Field(default_factory=list, serialization_alias="evid
 conflicts: list[str] = Field(default_factory=list)
 ```
 
-- [ ] **Step 4: Map evidence data from session/context files**
+- [x] **Step 4: Map evidence data from session/context files**
 
 Update `src/sag/web/session_registry.py`, `src/sag/web/context_map.py`, and `src/sag/web/evidence.py` so they read:
 
@@ -1226,7 +1226,7 @@ test_status.get("execution_rate")
 
 When no evidence exists, return `unknown` instead of inventing success.
 
-- [ ] **Step 5: Update demo data**
+- [x] **Step 5: Update demo data**
 
 In `src/sag/web/demo_data.py`, include at least one session with:
 
@@ -1236,7 +1236,7 @@ evidence_status="partial"
 test.passRate=96.3
 ```
 
-- [ ] **Step 6: Run web backend tests**
+- [x] **Step 6: Run web backend tests**
 
 Run:
 
@@ -1246,7 +1246,7 @@ uv run pytest tests/test_web_models.py tests/test_web_context_map.py tests/test_
 
 Expected: all tests pass.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/sag/web/models.py src/sag/web/session_registry.py src/sag/web/context_map.py src/sag/web/evidence.py src/sag/web/read_model.py src/sag/web/demo_data.py tests/test_web_models.py tests/test_web_context_map.py tests/test_web_evidence.py tests/test_web_read_model.py tests/test_web_demo_data.py
@@ -1269,7 +1269,7 @@ git commit -m "Expose evidence state in web models"
 - Modify: `webui/src/components/session/ContextMap.test.tsx`
 - Modify: `webui/src/components/common/status.test.ts`
 
-- [ ] **Step 1: Add failing React UI tests**
+- [x] **Step 1: Add failing React UI tests**
 
 In `webui/src/pages/SessionDetail.test.tsx`, add:
 
@@ -1299,7 +1299,7 @@ it("shows completed flow with partial evidence result and preserves pass rate", 
 
 Use the existing test fixture names in `SessionDetail.test.tsx`. If the helper is named differently, adapt only the helper call, not the assertions.
 
-- [ ] **Step 2: Run UI test to verify it fails**
+- [x] **Step 2: Run UI test to verify it fails**
 
 Run:
 
@@ -1310,7 +1310,7 @@ npm test -- SessionDetail.test.tsx --run
 
 Expected: missing `evidenceStatus` handling or pass rate display.
 
-- [ ] **Step 3: Update TypeScript API types**
+- [x] **Step 3: Update TypeScript API types**
 
 Modify `webui/src/api/types.ts`:
 
@@ -1331,7 +1331,7 @@ export interface TestSummary {
 
 Add `evidenceStatus?: EvidenceStatus` to workspace/session/context task interfaces.
 
-- [ ] **Step 4: Update status tone mapping**
+- [x] **Step 4: Update status tone mapping**
 
 In `webui/src/components/common/status.ts`, add evidence status tone mapping:
 
@@ -1353,7 +1353,7 @@ export function toneForEvidenceStatus(status: string | undefined): Tone {
 
 Add tests in `status.test.ts` for all five states.
 
-- [ ] **Step 5: Update cards and pages**
+- [x] **Step 5: Update cards and pages**
 
 In session/workspace pages, display flow and evidence separately:
 
@@ -1383,7 +1383,7 @@ Render:
 
 Do not hide `fail`/`skip` counts when pass rate is high.
 
-- [ ] **Step 6: Update context map task rendering**
+- [x] **Step 6: Update context map task rendering**
 
 In `ContextMap.tsx`, show each task's evidence status when present:
 
@@ -1397,7 +1397,7 @@ In `ContextMap.tsx`, show each task's evidence status when present:
 
 Keep branch task details expandable and keep output refs clickable/previewable using the existing ref preview behavior.
 
-- [ ] **Step 7: Run frontend tests**
+- [x] **Step 7: Run frontend tests**
 
 Run:
 
@@ -1408,7 +1408,7 @@ npm test -- --run
 
 Expected: all frontend tests pass.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add webui/src/api/types.ts webui/src/components/common/status.ts webui/src/components/session/BuildCard.tsx webui/src/components/session/TestCard.tsx webui/src/components/session/EvidenceTimeline.tsx webui/src/components/session/ContextMap.tsx webui/src/pages/Workspace.tsx webui/src/pages/SessionDetail.tsx webui/src/pages/SessionDetail.test.tsx webui/src/pages/Dashboard.test.tsx webui/src/components/session/ContextMap.test.tsx webui/src/components/common/status.test.ts
