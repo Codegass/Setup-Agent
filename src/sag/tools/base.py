@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 
 from loguru import logger
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from sag.evidence import EvidenceFinding, EvidenceStatus, TestStats, coerce_evidence_status
 
@@ -64,6 +64,8 @@ class ToolError(Exception):
 class ToolResult(BaseModel):
     """Result of a tool execution."""
 
+    model_config = ConfigDict(validate_assignment=True)
+
     success: bool
     output: str
     status: EvidenceStatus | str | None = None
@@ -79,13 +81,29 @@ class ToolResult(BaseModel):
     validator_findings: List[EvidenceFinding] = Field(default_factory=list)
     test_stats: Optional[TestStats] = None
 
+    @staticmethod
+    def _status_from_success(success: bool) -> EvidenceStatus:
+        return EvidenceStatus.SUCCESS if success else EvidenceStatus.BLOCKED
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _coerce_status(cls, value: EvidenceStatus | str | None) -> EvidenceStatus | None:
+        if value is None:
+            return None
+        return coerce_evidence_status(value)
+
     @model_validator(mode="after")
     def _normalize_evidence_fields(self) -> "ToolResult":
         if self.status is None:
-            self.status = EvidenceStatus.SUCCESS if self.success else EvidenceStatus.BLOCKED
-        else:
-            self.status = coerce_evidence_status(self.status)
+            object.__setattr__(self, "status", self._status_from_success(self.success))
         return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == "success":
+            status = getattr(self, "status", None)
+            if status in (None, EvidenceStatus.SUCCESS, EvidenceStatus.BLOCKED):
+                super().__setattr__("status", self._status_from_success(self.success))
 
     def __str__(self) -> str:
         if self.success:
