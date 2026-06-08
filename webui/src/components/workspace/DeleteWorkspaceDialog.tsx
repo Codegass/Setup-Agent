@@ -44,7 +44,9 @@ export function DeleteWorkspaceDialog({
     try {
       await onConfirm(target.workspaceId)
     } catch (err) {
-      setError(String(err))
+      // Surface the server's message (e.g. the 409/502 detail) without the
+      // JS "Error: " prefix that String(err) prepends.
+      setError(err instanceof Error ? err.message : String(err))
       setSubmitting(false)
     }
   }

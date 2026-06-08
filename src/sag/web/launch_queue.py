@@ -336,6 +336,11 @@ class LaunchQueueStore:
                         conn.execute(
                             "DELETE FROM launch_batches WHERE id = ?", (batch_id,)
                         )
+                    else:
+                        # A surviving batch may now have a different makeup (e.g.
+                        # its only failed item was removed): recompute its status
+                        # so list_batches does not report a stale 'failed'.
+                        self._refresh_batch_status(conn, batch_id)
             return deleted, process_logs
 
     def _finish(

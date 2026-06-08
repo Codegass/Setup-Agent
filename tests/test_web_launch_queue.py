@@ -395,6 +395,46 @@ def test_delete_workspace_items_drops_emptied_batch_only(tmp_path):
     assert [batch["id"] for batch in store.list_batches()] == ["BATCH-20260607-bbbbbb"]
 
 
+def test_delete_workspace_items_refreshes_surviving_batch_status(tmp_path):
+    store = make_store(tmp_path)
+    store.enqueue_batch(
+        make_batch("BATCH-20260607-cccccc", concurrency=2, total=2, accepted=2),
+        [
+            make_item(
+                "LAUNCH-00000001",
+                "BATCH-20260607-cccccc",
+                row_index=0,
+                workspace_id="sag-a",
+                docker_label="a",
+            ),
+            make_item(
+                "LAUNCH-00000002",
+                "BATCH-20260607-cccccc",
+                row_index=1,
+                workspace_id="sag-b",
+                docker_label="b",
+            ),
+        ],
+    )
+    first = store.claim_next(global_cap=8, now=LATER)  # sag-a (row 0)
+    store.mark_running(first.id, pid=1, now=LATER)
+    second = store.claim_next(global_cap=8, now=LATER)  # sag-b (row 1)
+    store.mark_running(second.id, pid=2, now=LATER)
+    store.mark_failed(first.id, "boom", now=LATER, exit_code=1)
+    store.mark_completed(second.id, exit_code=0, now=LATER)
+    # The failed item makes the whole batch report 'failed'.
+    assert store.list_batches()[0]["status"] == "failed"
+
+    # Removing only the failed workspace must not leave a stale 'failed' status
+    # on the otherwise all-completed batch.
+    deleted, _ = store.delete_workspace_items("sag-a")
+
+    assert deleted == 1
+    batch = store.list_batches()[0]
+    assert batch["id"] == "BATCH-20260607-cccccc"
+    assert batch["status"] == "completed"
+
+
 def test_delete_workspace_items_returns_zero_when_no_match(tmp_path):
     store = make_store(tmp_path)
     enqueue_three_queued_items(store, concurrency=3)
