@@ -152,6 +152,10 @@ def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():
 
     assert "RUN TASK MODE" in prompt
     assert "TASK COMPLETE:" in prompt
+    assert "BUILD SUCCESS cannot override validator findings" in prompt
+    assert "partial, conflict, or unknown evidence" in prompt
+    assert "read evidence refs or raw output refs" in prompt
+    assert "Do not start, continue, or complete setup TODO tasks" in prompt
     assert "INTELLIGENT SETUP WORKFLOW" not in prompt
     assert "MANDATORY WORKFLOW FOR PROJECT SETUP" not in prompt
     assert "REMEMBER THE CONTINUOUS CYCLE" not in prompt
@@ -260,3 +264,8 @@ def test_mode_prompts_use_run_task_variants():
     assert "output only TASK COMPLETE and never include ACTION" in thinking_prompt
     assert "RUN TASK ACTION MODE" in action_prompt
     assert "Do not start or complete setup TODO tasks" in action_prompt
+    assert "BUILD SUCCESS cannot override validator findings" in action_prompt
+    assert "partial, conflict, or unknown evidence" in action_prompt
+    assert "read evidence refs or raw output refs" in action_prompt
+    assert "INTELLIGENT SETUP WORKFLOW" not in action_prompt
+    assert "MANDATORY WORKFLOW FOR PROJECT SETUP" not in action_prompt

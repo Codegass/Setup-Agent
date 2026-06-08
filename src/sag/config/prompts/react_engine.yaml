@@ -47,6 +47,10 @@ initial_system:
     - Use manage_context only when project state or prior findings are directly needed.
     - After tool output proves the requested TASK is done, write a thought starting with:
       TASK COMPLETE: <brief evidence-backed summary>
+
+    Evidence status rules:
+    - BUILD SUCCESS cannot override validator findings.
+    - For partial, conflict, or unknown evidence, read evidence refs or raw output refs before making TASK COMPLETE / final claim.
   tool_clarification: |
     AVAILABLE TOOLS:
     - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
@@ -478,9 +482,11 @@ mode_prompts:
 
     CRITICAL RULES:
     1. Execute the direct tool call recommended by the thinking step.
-    2. Do not start or complete setup TODO tasks.
+    2. Do not start or complete setup TODO tasks unless the TASK explicitly asks for that.
     3. Do not convert diagnostics into build/test workflow.
     4. If asked to run a diagnostic command, preserve that command.
+    5. BUILD SUCCESS cannot override validator findings.
+    6. For partial, conflict, or unknown evidence, read evidence refs or raw output refs before making TASK COMPLETE / final claim.
 
     RESPONSE FORMAT (when function calling is supported):
     Use function calling directly to execute the needed tool.

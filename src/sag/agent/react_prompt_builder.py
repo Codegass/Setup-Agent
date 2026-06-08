@@ -75,14 +75,14 @@ class ReActPromptBuilder:
             parts.append("\n".join(tool_lines))
 
         # Add explicit tool name clarification
-        # Prompt: src/sag/config/prompts/react_engine.yaml:50 initial_system.tool_clarification
+        # Prompt: src/sag/config/prompts/react_engine.yaml:54 initial_system.tool_clarification
         parts.append(self.prompts.get("initial_system.tool_clarification"))
         if not is_run_task:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:84 initial_system.intelligent_setup_workflow
+            # Prompt: src/sag/config/prompts/react_engine.yaml:88 initial_system.intelligent_setup_workflow
             parts.append(self.prompts.get("initial_system.intelligent_setup_workflow"))
-            # Prompt: src/sag/config/prompts/react_engine.yaml:113 initial_system.maven_pom_recovery
+            # Prompt: src/sag/config/prompts/react_engine.yaml:117 initial_system.maven_pom_recovery
             parts.append(self.prompts.get("initial_system.maven_pom_recovery"))
-            # Prompt: src/sag/config/prompts/react_engine.yaml:155 initial_system.maven_multimodule_testing
+            # Prompt: src/sag/config/prompts/react_engine.yaml:159 initial_system.maven_multimodule_testing
             parts.append(self.prompts.get("initial_system.maven_multimodule_testing"))
 
         context_part = f"""
@@ -108,26 +108,26 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         # Add different instructions based on function calling support
         if tool_calling_enabled:
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:236 initial_system.run_task_function_calling_response_format
+                # Prompt: src/sag/config/prompts/react_engine.yaml:240 initial_system.run_task_function_calling_response_format
                 parts.append(
                     self.prompts.get("initial_system.run_task_function_calling_response_format")
                 )
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:197 initial_system.function_calling_response_format
+                # Prompt: src/sag/config/prompts/react_engine.yaml:201 initial_system.function_calling_response_format
                 parts.append(self.prompts.get("initial_system.function_calling_response_format"))
         else:
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:281 initial_system.run_task_prompt_based_response_format
+                # Prompt: src/sag/config/prompts/react_engine.yaml:285 initial_system.run_task_prompt_based_response_format
                 parts.append(
                     self.prompts.get("initial_system.run_task_prompt_based_response_format")
                 )
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:247 initial_system.prompt_based_response_format
+                # Prompt: src/sag/config/prompts/react_engine.yaml:251 initial_system.prompt_based_response_format
                 parts.append(self.prompts.get("initial_system.prompt_based_response_format"))
 
         # Add repository URL reminder if available
         if repository_url and not is_run_task:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:297 initial_system.repository_url_reminder
+            # Prompt: src/sag/config/prompts/react_engine.yaml:301 initial_system.repository_url_reminder
             parts.append(
                 self.prompts.format(
                     "initial_system.repository_url_reminder",
@@ -138,10 +138,10 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             )
 
         if is_run_task:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:306 initial_system.run_task_completion_reminder
+            # Prompt: src/sag/config/prompts/react_engine.yaml:310 initial_system.run_task_completion_reminder
             parts.append(self.prompts.get("initial_system.run_task_completion_reminder"))
         else:
-            # Prompt: src/sag/config/prompts/react_engine.yaml:301 initial_system.continuous_cycle_reminder
+            # Prompt: src/sag/config/prompts/react_engine.yaml:305 initial_system.continuous_cycle_reminder
             parts.append(self.prompts.get("initial_system.continuous_cycle_reminder"))
 
         return "\n\n".join(part.rstrip() for part in parts if part).rstrip() + "\n"
@@ -159,7 +159,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         """Build the prompt for the next iteration."""
         is_run_task = workflow_mode == "run_task"
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:311 next_prompt.conversation_header
+        # Prompt: src/sag/config/prompts/react_engine.yaml:315 next_prompt.conversation_header
         prompt = self.prompts.get("next_prompt.conversation_header").rstrip() + "\n\n"
 
         # Limit recent steps to avoid context window overflow
@@ -170,7 +170,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if len(steps) > max_steps * 2:
             # Take first 2 steps (usually context and first action) and last max_steps
             recent_steps = steps[:2] + steps[-max_steps:]
-            # Prompt: src/sag/config/prompts/react_engine.yaml:313 next_prompt.omitted_steps_notice
+            # Prompt: src/sag/config/prompts/react_engine.yaml:317 next_prompt.omitted_steps_notice
             prompt += self.prompts.get("next_prompt.omitted_steps_notice").rstrip() + "\n\n"
         elif len(steps) > max_steps:
             # Just take the most recent steps
@@ -205,18 +205,18 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if thoughts_without_actions >= 3:
             # Model seems stuck in thinking without acting
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:327 next_prompt.run_task_stuck_function_calling_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:331 next_prompt.run_task_stuck_function_calling_guidance
                 prompt += self.prompts.get(
                     "next_prompt.run_task_stuck_function_calling_guidance"
                 ).rstrip()
                 prompt += "\n\n"
             elif tool_calling_enabled:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:315 next_prompt.stuck_function_calling_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:319 next_prompt.stuck_function_calling_guidance
                 prompt += self.prompts.get("next_prompt.stuck_function_calling_guidance").rstrip()
                 prompt += "\n\n"
                 # Add specific guidance based on repository URL
                 if repository_url:
-                    # Prompt: src/sag/config/prompts/react_engine.yaml:332 next_prompt.stuck_repository_url_guidance
+                    # Prompt: src/sag/config/prompts/react_engine.yaml:336 next_prompt.stuck_repository_url_guidance
                     prompt += self.prompts.format(
                         "next_prompt.stuck_repository_url_guidance",
                         repository_url=repository_url,
@@ -225,11 +225,11 @@ Current Focus: {context_info.get('focus', 'Not specified')}
                     ).rstrip()
                     prompt += "\n"
             else:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:357 next_prompt.stuck_prompt_based_guidance
+                # Prompt: src/sag/config/prompts/react_engine.yaml:361 next_prompt.stuck_prompt_based_guidance
                 prompt += self.prompts.get("next_prompt.stuck_prompt_based_guidance").rstrip()
                 prompt += "\n\n"
 
-        # Prompt: src/sag/config/prompts/react_engine.yaml:366 next_prompt.continuation
+        # Prompt: src/sag/config/prompts/react_engine.yaml:370 next_prompt.continuation
         prompt += self.prompts.get("next_prompt.continuation").rstrip() + "\n\n"
 
         # Apply memory protection to prevent critical info loss due to context pollution
@@ -265,20 +265,20 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         is_run_task = workflow_mode == "run_task"
         if mode == ReactModelMode.THINKING:
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:412 mode_prompts.run_task_thinking
+                # Prompt: src/sag/config/prompts/react_engine.yaml:416 mode_prompts.run_task_thinking
                 return (
                     self.prompts.get("mode_prompts.run_task_thinking").rstrip() + "\n" + base_prompt
                 )
-            # Prompt: src/sag/config/prompts/react_engine.yaml:369 mode_prompts.thinking
+            # Prompt: src/sag/config/prompts/react_engine.yaml:373 mode_prompts.thinking
             return self.prompts.get("mode_prompts.thinking").rstrip() + "\n" + base_prompt
 
         if mode == ReactModelMode.ACTION:
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:475 mode_prompts.run_task_action
+                # Prompt: src/sag/config/prompts/react_engine.yaml:479 mode_prompts.run_task_action
                 return (
                     self.prompts.get("mode_prompts.run_task_action").rstrip() + "\n" + base_prompt
                 )
-            # Prompt: src/sag/config/prompts/react_engine.yaml:427 mode_prompts.action
+            # Prompt: src/sag/config/prompts/react_engine.yaml:431 mode_prompts.action
             return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
 
         raise ValueError(f"Unsupported React model mode: {mode}")
