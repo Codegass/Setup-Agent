@@ -30,6 +30,13 @@ initial_system:
     - Context switching is AUTOMATIC - you only specify which task to work on
     - The key_results from completed tasks will guide your next actions
 
+    Evidence status rules:
+    - completed means the branch task flow ended; it does not automatically mean setup succeeded.
+    - BUILD SUCCESS cannot override validator findings.
+    - For partial, conflict, or unknown evidence, read evidence refs or raw output refs before making a final claim.
+    - If evidence is missing, gather more evidence using bash or domain tools.
+    - Reports must distinguish success, partial, blocked, conflict, and unknown.
+
     AVAILABLE TOOLS:
   run_task_context_management: |
     RUN TASK MODE:
@@ -438,6 +445,8 @@ mode_prompts:
     PARAMETERS: [JSON object with required parameters]
 
     CRITICAL: If the thinking model recommended a specific tool and action, execute it precisely.
+    When evidence is partial, conflict, or unknown, read evidence refs or raw output refs before taking or finalizing the next action.
+    BUILD SUCCESS cannot override validator findings.
 
     AVAILABLE TOOLS AND THEIR PURPOSE:
     - project_setup: Clone repositories and detect project types

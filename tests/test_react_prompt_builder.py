@@ -54,6 +54,19 @@ def test_initial_prompt_preserves_repository_and_tool_markers():
     assert "RESPONSE FORMAT" in prompt
 
 
+def test_initial_prompt_explains_evidence_status_rules():
+    prompt = make_builder().build_initial_system_prompt(
+        repository_url="https://example.test/repo.git",
+        repository_ref=None,
+        tool_calling_enabled=True,
+    )
+
+    assert "completed means the branch task flow ended" in prompt
+    assert "BUILD SUCCESS cannot override validator findings" in prompt
+    assert "partial, conflict, or unknown" in prompt
+    assert "read evidence refs or raw output refs" in prompt
+
+
 def test_initial_prompt_includes_repository_ref_when_present():
     prompt = make_builder().build_initial_system_prompt(
         repository_url="https://example.test/repo.git",
@@ -106,6 +119,13 @@ def test_mode_prompt_wraps_base_once():
     assert action.count("ACTION MODEL INSTRUCTIONS") == 1
     assert thinking.endswith("base prompt")
     assert action.endswith("base prompt")
+
+
+def test_action_prompt_requires_reading_evidence_refs_for_uncertain_states():
+    prompt = make_builder().build_mode_prompt("base prompt", ReactModelMode.ACTION)
+
+    assert "partial, conflict, or unknown" in prompt
+    assert "read evidence refs or raw output refs" in prompt
 
 
 def test_invalidate_trunk_cache_clears_builder_cache():
