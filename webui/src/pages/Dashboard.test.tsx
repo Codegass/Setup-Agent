@@ -144,6 +144,22 @@ describe("Dashboard", () => {
     expect(onLaunchSetups).toHaveBeenCalled()
   })
 
+  it("teaches a first-run empty state when there are no workspaces or launches", () => {
+    const onLaunchSetups = vi.fn()
+    render(
+      <Dashboard
+        data={{ docker: { status: "connected" }, workspaces: [] }}
+        onLaunchSetups={onLaunchSetups}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+
+    expect(screen.getByText(/No workspaces yet/i)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Launch your first setup" }))
+    expect(onLaunchSetups).toHaveBeenCalled()
+  })
+
   const queueWith = (items: LaunchQueueItem[]): LaunchQueueState => ({
     default_concurrency: 4,
     summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },

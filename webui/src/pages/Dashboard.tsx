@@ -232,52 +232,79 @@ export function Dashboard({
         />
       </div>
 
-      <Card className="mt-5 hidden overflow-hidden lg:block">
-        <div
-          className={`grid ${tableColumns} items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5`}
-        >
-          {tableHeaders.map((header) => (
+      {workspaces.length === 0 && pendingLaunches.length === 0 ? (
+        <EmptyState onLaunchSetups={onLaunchSetups} />
+      ) : (
+        <>
+          <Card className="mt-5 hidden overflow-hidden lg:block">
             <div
-              key={header}
-              className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
+              className={`grid ${tableColumns} items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5`}
             >
-              {header}
+              {tableHeaders.map((header) => (
+                <div
+                  key={header}
+                  className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
+                >
+                  {header}
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
-        {pendingLaunches.map((item) => (
-          <PendingLaunchRow key={`pending-${item.id}`} item={item} />
-        ))}
-        {workspaces.map((workspace) => (
-          <WorkspaceRow
-            key={workspace.id}
-            highlighted={highlightedWorkspaces.includes(workspace.id)}
-            onOpenSession={onOpenSession}
-            onOpenWorkspace={onOpenWorkspace}
-            workspace={workspace}
-          />
-        ))}
-      </Card>
+            {pendingLaunches.map((item) => (
+              <PendingLaunchRow key={`pending-${item.id}`} item={item} />
+            ))}
+            {workspaces.map((workspace) => (
+              <WorkspaceRow
+                key={workspace.id}
+                highlighted={highlightedWorkspaces.includes(workspace.id)}
+                onOpenSession={onOpenSession}
+                onOpenWorkspace={onOpenWorkspace}
+                workspace={workspace}
+              />
+            ))}
+          </Card>
 
-      <div className="mt-5 grid gap-3 lg:hidden">
-        {pendingLaunches.map((item) => (
-          <PendingLaunchCard key={`pending-${item.id}`} item={item} />
-        ))}
-        {workspaces.map((workspace) => (
-          <WorkspaceCard
-            key={workspace.id}
-            highlighted={highlightedWorkspaces.includes(workspace.id)}
-            onOpenSession={onOpenSession}
-            onOpenWorkspace={onOpenWorkspace}
-            workspace={workspace}
-          />
-        ))}
-      </div>
+          <div className="mt-5 grid gap-3 lg:hidden">
+            {pendingLaunches.map((item) => (
+              <PendingLaunchCard key={`pending-${item.id}`} item={item} />
+            ))}
+            {workspaces.map((workspace) => (
+              <WorkspaceCard
+                key={workspace.id}
+                highlighted={highlightedWorkspaces.includes(workspace.id)}
+                onOpenSession={onOpenSession}
+                onOpenWorkspace={onOpenWorkspace}
+                workspace={workspace}
+              />
+            ))}
+          </div>
+        </>
+      )}
 
       <p className="mt-3 px-1 font-mono text-[10px] text-slate-500">
         Refreshes automatically · or use Refresh
       </p>
     </div>
+  )
+}
+
+function EmptyState({ onLaunchSetups }: { onLaunchSetups?: () => void }) {
+  return (
+    <Card className="mt-5 flex flex-col items-center px-6 py-14 text-center">
+      <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-400">
+        <GitBranch size={20} />
+      </div>
+      <h2 className="mt-4 text-[15px] font-semibold text-slate-800">No workspaces yet</h2>
+      <p className="mt-1.5 max-w-[420px] text-[13px] leading-relaxed text-slate-500">
+        A workspace is a SAG-managed container set up from a repository. Launch one or
+        more setups to get started; paste a list of repo URLs to queue many at once.
+      </p>
+      {onLaunchSetups ? (
+        <Button className="mt-5" onClick={onLaunchSetups} type="button">
+          <Rocket size={14} />
+          Launch your first setup
+        </Button>
+      ) : null}
+    </Card>
   )
 }
 
