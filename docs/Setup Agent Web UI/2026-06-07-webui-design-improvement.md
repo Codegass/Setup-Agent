@@ -1,9 +1,12 @@
 # SAG Workbench Design Improvement Plan
 
 Driven by the impeccable skill (product register). Strategic ground truth lives
-in `PRODUCT.md` (calm mission-control; status earns color; glanceability
+in `docs/PRODUCT.md` (calm mission-control; status earns color; glanceability
 first; evidence within two clicks; self-explanatory on first run; WCAG AA
-basics). Every phase below is an impeccable command run against a named
+basics). `docs/DESIGN.md` (Phase 0 output) sits beside it; both stay directly
+in `docs/` because the impeccable loader only searches the project root,
+`.agents/context/`, and `docs/` (flat). All other design artifacts (this plan,
+critique snapshots, screenshots) live in `docs/Setup Agent Web UI/`. Every phase below is an impeccable command run against a named
 surface, with evidence-based findings already verified in the code and
 concrete acceptance criteria.
 
@@ -39,12 +42,12 @@ Standing guardrails for every phase:
 
 **Command:** `/impeccable document`
 
-Generate `DESIGN.md` from the existing code: OKLCH tokens in `styles.css`,
+Generate `docs/DESIGN.md` from the existing code: OKLCH tokens in `styles.css`,
 component inventory (`Badge`/`StatusBadge`, `Button`, `Card`/`CardHead`,
 `TestBar`, dialog primitives, launch components), spacing and type scale in
 use. This is the before-photo every later phase diffs against.
 
-Acceptance: DESIGN.md exists and names the real tokens, not aspirational ones.
+Acceptance: docs/DESIGN.md exists and names the real tokens, not aspirational ones.
 
 ## Phase 1: Scored critique with screenshots
 
