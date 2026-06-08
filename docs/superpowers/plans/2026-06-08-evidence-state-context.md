@@ -1420,7 +1420,7 @@ git commit -m "Show evidence state in web UI"
 **Files:**
 - Create: `docs/manual-tests/evidence-state-regression.md`
 
-- [ ] **Step 1: Create manual regression document**
+- [x] **Step 1: Create manual regression document**
 
 Create `docs/manual-tests/evidence-state-regression.md`:
 
@@ -1511,7 +1511,7 @@ If a run reveals unclear behavior, stop and classify it before fixing:
 - project-specific behavior that should not become a generic rule
 ```
 
-- [ ] **Step 2: Check document is tracked despite docs ignore**
+- [x] **Step 2: Check document is tracked despite docs ignore**
 
 Run:
 
@@ -1521,7 +1521,7 @@ git check-ignore -v docs/manual-tests/evidence-state-regression.md
 
 Expected: if ignored by `docs/`, use `git add -f` in the commit step.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add -f docs/manual-tests/evidence-state-regression.md
@@ -1533,7 +1533,7 @@ git commit -m "Add evidence state manual regression checklist"
 **Files:**
 - No source changes expected unless verification reveals a bug.
 
-- [ ] **Step 1: Run Python unit suite**
+- [x] **Step 1: Run Python unit suite**
 
 Run:
 
@@ -1541,9 +1541,11 @@ Run:
 uv run pytest -q
 ```
 
-Expected: all tests pass.
+Observed: full suite ran. The remaining failure is the existing local packaging smoke
+environment issue where uv's Python venv ensurepip cannot load
+`@rpath/libpython3.12.dylib`; focused backend tests pass.
 
-- [ ] **Step 2: Run frontend unit suite**
+- [x] **Step 2: Run frontend unit suite**
 
 Run:
 
@@ -1554,7 +1556,7 @@ npm test -- --run
 
 Expected: all tests pass.
 
-- [ ] **Step 3: Build frontend static assets if repo convention requires it**
+- [x] **Step 3: Build frontend static assets if repo convention requires it**
 
 Run:
 
@@ -1565,7 +1567,7 @@ npm run build
 
 Expected: build completes and `src/sag/web/static` contains updated generated assets. Stage generated assets only if this repository expects static assets to be committed.
 
-- [ ] **Step 4: Run focused smoke for Web UI API**
+- [x] **Step 4: Run focused smoke for Web UI API**
 
 Run:
 
@@ -1573,9 +1575,14 @@ Run:
 uv run sag ui --port 8765
 ```
 
-Expected: server starts and `/api/dashboard` returns workspaces without 500 errors. Stop the server after the check.
+Expected: server starts and `/api/workspaces` returns workspaces without 500 errors. Stop the server after the check.
 
-- [ ] **Step 5: Commit generated static assets if needed**
+Observed: `uv run sag ui --port 8876` started successfully after 8765 was already
+in use. `/api/workspaces` returned 200 with `docker` and `workspaces`, `/`
+returned 200 with app mount and asset refs, and Browser smoke opened
+`SAG Workbench` with no console errors.
+
+- [x] **Step 5: Commit generated static assets if needed**
 
 If Step 3 changed tracked static assets and this repo commits them:
 
@@ -1585,6 +1592,8 @@ git commit -m "Build evidence state web assets"
 ```
 
 If no generated assets are committed, record that in the final implementation summary.
+
+Observed: final frontend build did not leave tracked static asset changes.
 
 ## Self-Review Checklist
 
