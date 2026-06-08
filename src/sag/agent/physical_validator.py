@@ -1660,7 +1660,16 @@ class PhysicalValidator:
             success = False
             reason = "No build evidence found (no artifacts or build fingerprints)"
 
-        result = {"success": success, "evidence": evidence, "reason": reason}
+        conflicts = [] if success else [reason]
+        result = {
+            "success": success,
+            "evidence": evidence,
+            "reason": reason,
+            "evidence_status": "success" if success else "blocked",
+            "test_stats": None,
+            "conflicts": conflicts,
+            "evidence_refs": [project_dir],
+        }
 
         logger.info(f"Build validation complete: {'SUCCESS' if success else 'FAILURE'} - {reason}")
         return result
@@ -1710,6 +1719,40 @@ class PhysicalValidator:
             status = "FAILED"
             reason = f"All tests failed: 0/{test_metrics['total_tests']} passed"
 
+        failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
+        discovered = (
+            test_metrics.get("discovered")
+            or test_metrics.get("discovered_tests")
+            or test_metrics.get("static_test_count")
+        )
+        test_stats = {
+            "discovered": discovered,
+            "executed": test_metrics.get("total_tests", 0),
+            "passed": test_metrics.get("passed_tests", 0),
+            "failed": failed_count,
+            "skipped": test_metrics.get("skipped_tests", 0),
+            "pass_rate": round(pass_rate, 1),
+        }
+        report_files = test_metrics.get("report_files", [])
+        conflicts = []
+        if test_metrics.get("failed_tests", 0):
+            conflicts.append(f"{test_metrics['failed_tests']} failed test(s)")
+        if test_metrics.get("error_tests", 0):
+            conflicts.append(f"{test_metrics['error_tests']} error test(s)")
+        if test_metrics.get("parsing_errors", []):
+            conflicts.extend(test_metrics.get("parsing_errors", []))
+
+        if not test_metrics.get("valid", False):
+            evidence_status = "unknown"
+        elif failed_count > 0:
+            evidence_status = "partial"
+        elif pass_rate == 100.0:
+            evidence_status = "success"
+        elif pass_rate > 0:
+            evidence_status = "partial"
+        else:
+            evidence_status = "blocked"
+
         result = {
             "has_test_reports": test_metrics.get("valid", False),
             "total_tests": test_metrics.get("total_tests", 0),
@@ -1722,8 +1765,12 @@ class PhysicalValidator:
             "modules_without_tests": test_metrics.get("modules_without_tests", []),
             "status": status,
             "reason": reason,
-            "report_files": test_metrics.get("report_files", []),
+            "report_files": report_files,
             "parsing_errors": test_metrics.get("parsing_errors", []),
+            "evidence_status": evidence_status,
+            "test_stats": test_stats,
+            "conflicts": conflicts,
+            "evidence_refs": list(report_files),
         }
 
         logger.info(f"Test validation complete: {status} - {reason}")

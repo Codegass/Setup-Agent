@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from sag.agent.agent import SetupAgent
+from sag.agent.physical_validator import PhysicalValidator
 
 
 class FakePhysicalValidator:
@@ -149,6 +150,42 @@ def test_verified_final_status_rejects_failed_tests():
     )
 
     assert agent._get_verified_final_status(react_engine_success=True) is False
+
+
+def test_failed_test_validation_carries_evidence_state(monkeypatch):
+    validator = PhysicalValidator(project_path="/workspace")
+
+    monkeypatch.setattr(
+        validator,
+        "parse_test_reports_with_catalog",
+        lambda project_dir: {
+            "valid": True,
+            "total_tests": 430,
+            "passed_tests": 420,
+            "failed_tests": 1,
+            "error_tests": 0,
+            "skipped_tests": 9,
+            "test_exclusions": [],
+            "modules_without_tests": [],
+            "report_files": [
+                "/workspace/demo/target/surefire-reports/TEST-com.example.DemoTest.xml"
+            ],
+            "parsing_errors": [],
+        },
+    )
+
+    result = validator.validate_test_status("demo")
+
+    assert result["evidence_status"] == "partial"
+    assert result["test_stats"]["executed"] == 430
+    assert result["test_stats"]["passed"] == 420
+    assert result["test_stats"]["failed"] > 0
+    assert result["test_stats"]["skipped"] == 9
+    assert result["test_stats"]["pass_rate"] == 97.7
+    assert result["conflicts"] == ["1 failed test(s)"]
+    assert result["evidence_refs"] == [
+        "/workspace/demo/target/surefire-reports/TEST-com.example.DemoTest.xml"
+    ]
 
 
 def test_verified_final_status_uses_project_metadata_over_docker_label():

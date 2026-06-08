@@ -1,5 +1,6 @@
 import json
 
+from sag.evidence import EvidenceStatus, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.tools.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool
@@ -144,6 +145,69 @@ def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
     assert result.raw_data["full_report"] == "# Full Report"
     assert result.raw_data["report_snapshot"]["status"] == "success"
     assert result.metadata["verified_status"] == "success"
+
+
+def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(monkeypatch):
+    tool = ReportTool()
+
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_generate_comprehensive_report",
+        lambda summary, status, details: (
+            "# Full Report",
+            "success",
+            "setup-report-test.md",
+            {
+                "build_success": True,
+                "test_success": False,
+                "physical_validation": {
+                    "test_analysis": {
+                        "pass_rate": 96.3,
+                        "total_tests": 214,
+                        "passed_tests": 206,
+                        "failed_tests": 3,
+                        "skipped_tests": 5,
+                    }
+                },
+            },
+            {"status": "success"},
+        ),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_generate_condensed_log_output",
+        lambda verified_status,
+        report_filename,
+        actual_accomplishments,
+        report_snapshot: "condensed",
+    )
+
+    result = tool.execute(
+        action="generate",
+        summary="done",
+        status="success",
+        evidence_status="partial",
+        test_stats={"executed": 214, "passed": 206, "failed": 3, "skipped": 5},
+        conflicts=["3 tests failed"],
+        evidence_refs=["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
+    )
+
+    assert result.success is True
+    assert result.status == EvidenceStatus.PARTIAL
+    assert isinstance(result.test_stats, TestStats)
+    assert result.test_stats.pass_rate == 96.3
+    assert result.test_stats.failed == 3
+    assert result.conflicts == ["3 tests failed"]
+    assert result.evidence_refs == ["/workspace/demo/target/surefire-reports/TEST-demo.xml"]
+    assert "Result: PARTIAL" in result.output
+    assert "96.3% pass rate" in result.output
+    assert "3 failed" in result.output
+    assert "3 tests failed" in result.output
+    assert result.metadata["status"] == "success"
+    assert result.metadata["evidence_status"] == "partial"
+    assert result.raw_data["evidence_status"] == "partial"
+    assert result.raw_data["test_stats"]["pass_rate"] == 96.3
 
 
 def test_report_tool_marks_final_report_task_completed(monkeypatch):

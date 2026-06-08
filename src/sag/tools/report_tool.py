@@ -8,6 +8,7 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
+from sag.evidence import TestStats, coerce_evidence_status
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.ui.events import EventType, UIEventEmitter
@@ -61,6 +62,10 @@ class ReportTool(BaseTool, UIEventEmitter):
         summary: Optional[str] = None,
         status: str = "success",
         details: Optional[str] = None,
+        evidence_status: Optional[str] = None,
+        test_stats: Optional[Dict[str, Any] | TestStats] = None,
+        conflicts: Optional[List[str]] = None,
+        evidence_refs: Optional[List[str]] = None,
         **kwargs,
     ) -> ToolResult:
         """
@@ -74,6 +79,10 @@ class ReportTool(BaseTool, UIEventEmitter):
                    - 'fail': Build failed OR test report not found OR test pass rate <= 80%
             details: Additional details about the setup process
         """
+        result_test_stats = self._coerce_report_test_stats(test_stats)
+        result_conflicts = list(conflicts or [])
+        result_evidence_refs = list(evidence_refs or [])
+        result_evidence_status = coerce_evidence_status(evidence_status or status)
 
         # IDEMPOTENCY CHECK: Prevent multiple report generation
         # Check if a report was already generated recently (within last 5 minutes)
@@ -103,17 +112,35 @@ class ReportTool(BaseTool, UIEventEmitter):
                     # Return the information about the existing report
                     return ToolResult(
                         success=True,
-                        output=f"📄 Report already generated: {existing_report}\n"
-                        f"Status: {status.upper()}\n"
-                        f"(Using existing report to prevent duplicates)\n\n"
-                        f"{existing_content[:500]}...",
+                        output=self._append_evidence_summary_to_output(
+                            f"📄 Report already generated: {existing_report}\n"
+                            f"Status: {status.upper()}\n"
+                            f"(Using existing report to prevent duplicates)\n\n"
+                            f"{existing_content[:500]}...",
+                            result_evidence_status.value,
+                            result_test_stats,
+                            result_conflicts,
+                        ),
+                        status=result_evidence_status,
+                        test_stats=result_test_stats,
+                        conflicts=result_conflicts,
+                        evidence_refs=result_evidence_refs,
                         metadata={
                             "task_completed": True,
                             "completion_signal": True,
                             "status": status,
+                            "final_flow_status": status,
+                            "evidence_status": result_evidence_status.value,
                             "existing_report": existing_report,
                             "duplicate_prevention": True,
                             "context_task_completed": completed_context_task,
+                            "test_stats": (
+                                self._serialize_report_test_stats(result_test_stats)
+                                if result_test_stats
+                                else None
+                            ),
+                            "conflicts": result_conflicts,
+                            "evidence_refs": result_evidence_refs,
                         },
                     )
             except Exception as e:
@@ -134,6 +161,10 @@ class ReportTool(BaseTool, UIEventEmitter):
                     f"     • 'success': Build passed AND test pass rate > 80%\n"
                     f"     • 'fail': Build failed OR tests not found OR pass rate <= 80%\n"
                     f"  - details (optional): Additional details about the setup\n\n"
+                    f"  - evidence_status (optional): success/partial/blocked/conflict/unknown\n"
+                    f"  - test_stats (optional): TestStats or test counts dictionary\n"
+                    f"  - conflicts (optional): List of evidence conflicts\n"
+                    f"  - evidence_refs (optional): List of traceable evidence references\n\n"
                     f"Example: report(action='generate')\n"
                     f"Example: report(action='generate', summary='Project built successfully', status='success')\n"
                     f"Example: report(action='generate', summary='Project built successfully', status='success', details='All build and test tasks completed successfully')"
@@ -181,11 +212,21 @@ class ReportTool(BaseTool, UIEventEmitter):
                     "task_completed": True,
                     "completion_signal": True,
                     "status": status,
+                    "final_flow_status": status,
                     "verified_status": verified_status,  # Include the verified status
+                    "evidence_status": coerce_evidence_status(
+                        evidence_status or verified_status or status
+                    ).value,
                     "timestamp": datetime.now().isoformat(),
                     "report_snapshot": report_snapshot,
                     "context_task_completed": completed_context_task,
                 }
+                if result_test_stats:
+                    metadata["test_stats"] = self._serialize_report_test_stats(result_test_stats)
+                if result_conflicts:
+                    metadata["conflicts"] = result_conflicts
+                if result_evidence_refs:
+                    metadata["evidence_refs"] = result_evidence_refs
 
                 # ENHANCED: Provide condensed output for logs to reduce noise
                 # Full report is saved to markdown file, logs get summary only
@@ -194,6 +235,12 @@ class ReportTool(BaseTool, UIEventEmitter):
                     report_filename,
                     actual_accomplishments,
                     report_snapshot,
+                )
+                condensed_output = self._append_evidence_summary_to_output(
+                    condensed_output,
+                    metadata["evidence_status"],
+                    result_test_stats,
+                    result_conflicts,
                 )
 
                 # Emit UI event for report generation
@@ -218,11 +265,25 @@ class ReportTool(BaseTool, UIEventEmitter):
                 return ToolResult(
                     success=True,
                     output=condensed_output,
+                    status=metadata["evidence_status"],
                     metadata=metadata,
                     documentation_links=[],
+                    test_stats=result_test_stats,
+                    conflicts=result_conflicts,
+                    evidence_refs=result_evidence_refs,
                     raw_data={
                         "full_report": report,
                         "report_snapshot": report_snapshot,
+                        "final_flow_status": status,
+                        "verified_status": verified_status,
+                        "evidence_status": metadata["evidence_status"],
+                        "test_stats": (
+                            self._serialize_report_test_stats(result_test_stats)
+                            if result_test_stats
+                            else None
+                        ),
+                        "conflicts": result_conflicts,
+                        "evidence_refs": result_evidence_refs,
                     },  # Store full report outside condensed metadata
                 )
             else:
@@ -241,6 +302,70 @@ class ReportTool(BaseTool, UIEventEmitter):
                 error=f"Report generation failed: {str(e)}",
                 suggestions=["Check if all required information is available"],
             )
+
+    def _coerce_report_test_stats(
+        self, test_stats: Optional[Dict[str, Any] | TestStats]
+    ) -> Optional[TestStats]:
+        """Normalize report test stats into the shared evidence model."""
+        if test_stats is None:
+            return None
+        if isinstance(test_stats, TestStats):
+            return test_stats
+        if not isinstance(test_stats, dict):
+            logger.debug(f"Ignoring unsupported report test_stats value: {type(test_stats)}")
+            return None
+
+        def as_int(*keys: str, default: Optional[int] = 0) -> Optional[int]:
+            for key in keys:
+                value = test_stats.get(key)
+                if value is None:
+                    continue
+                try:
+                    return int(value)
+                except (TypeError, ValueError):
+                    continue
+            return default
+
+        failed = as_int("failed", "failed_tests", default=0) or 0
+        failed += as_int("error", "errors", "error_tests", default=0) or 0
+        skipped = as_int("skipped", "skipped_tests", default=0) or 0
+        passed = as_int("passed", "passed_tests", default=0) or 0
+        executed = as_int("executed", "total", "total_tests", default=None)
+        if executed is None:
+            executed = passed + failed + skipped
+
+        return TestStats(
+            discovered=as_int("discovered", "static_test_count", default=None),
+            executed=executed,
+            passed=passed,
+            failed=failed,
+            skipped=skipped,
+        )
+
+    def _serialize_report_test_stats(self, test_stats: TestStats) -> Dict[str, Any]:
+        data = test_stats.model_dump()
+        data["pass_rate"] = test_stats.pass_rate
+        execution_rate = test_stats.execution_rate
+        if execution_rate is not None:
+            data["execution_rate"] = execution_rate
+        return data
+
+    def _append_evidence_summary_to_output(
+        self,
+        output: str,
+        evidence_status: str,
+        test_stats: Optional[TestStats],
+        conflicts: List[str],
+    ) -> str:
+        if evidence_status == "success" and not test_stats and not conflicts:
+            return output
+
+        lines = [output.rstrip(), "", f"Result: {evidence_status.upper()}"]
+        if test_stats:
+            lines.append(f"Tests: {test_stats.as_summary()}")
+        if conflicts:
+            lines.append(f"Conflicts: {'; '.join(conflicts)}")
+        return "\n".join(lines).rstrip()
 
     def _mark_final_report_task_completed(
         self, report_filename_or_path: str, verified_status: str
