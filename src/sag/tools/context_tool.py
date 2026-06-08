@@ -780,6 +780,10 @@ class ContextTool(BaseTool):
             else:
                 result["all_tasks_completed"] = True
 
+            completed_task = next(
+                task for task in fresh_trunk_context.todo_list if task.id == current_task_id
+            )
+
             output = f"✅ Task completed atomically: {current_task_id}\n\n"
             output += f"📋 Completion summary:\n{summary}\n\n"
             output += f"🔑 Key results recorded:\n{key_results}\n\n"
@@ -807,9 +811,9 @@ class ContextTool(BaseTool):
             enhanced_result.update(
                 {
                     "key_results": key_results,
-                    "evidence_status": evidence_status,
-                    "evidence_refs": evidence_refs or [],
-                    "conflicts": conflicts or [],
+                    "evidence_status": completed_task.evidence_status.value,
+                    "evidence_refs": completed_task.evidence_refs,
+                    "conflicts": completed_task.conflicts,
                     "atomic_completion": True,
                     "completion_method": "complete_with_results",
                 }

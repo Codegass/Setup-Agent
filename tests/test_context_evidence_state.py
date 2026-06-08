@@ -162,6 +162,9 @@ def test_complete_with_results_preserves_narrative_and_evidence(tmp_path):
     )
 
     assert result.success is True
+    assert result.metadata["evidence_status"] == "partial"
+    assert result.metadata["evidence_refs"] == ["output_abc", "surefire_xml"]
+    assert result.metadata["conflicts"] == []
     reloaded = manager.load_trunk_context()
     task = reloaded.todo_list[0]
     assert task.status.value == "completed"
@@ -195,6 +198,9 @@ def test_complete_with_results_preserves_existing_evidence_when_omitted(tmp_path
     )
 
     assert result.success is True
+    assert result.metadata["evidence_status"] == "partial"
+    assert result.metadata["evidence_refs"] == ["output_abc", "surefire_xml"]
+    assert result.metadata["conflicts"] == ["report_mismatch"]
     reloaded = manager.load_trunk_context()
     task = reloaded.todo_list[0]
     assert task.status.value == "completed"

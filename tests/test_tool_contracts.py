@@ -119,3 +119,14 @@ def test_context_tool_schema_exposes_force_and_evidence_fields():
     assert "evidence_refs" in properties
     assert "evidence_status" in properties
     assert "conflicts" in properties
+
+
+def test_context_tool_schema_keeps_action_specific_required_semantics():
+    schema = ContextTool(SimpleNamespace()).get_parameter_schema()
+    properties = schema["properties"]
+
+    assert schema["required"] == ["action"]
+    assert "summary" not in schema["required"]
+    assert "key_results" not in schema["required"]
+    assert "required for complete_task" in properties["summary"]["description"]
+    assert "required for complete_with_results" in properties["key_results"]["description"]
