@@ -97,6 +97,7 @@ class ReadModelBuilder:
         return workspace.model_copy(
             update={
                 "task": (active or latest).title,
+                "evidence_status": latest.evidence_status,
                 "build": latest.build,
                 "test": latest.test,
                 "report": latest.report,

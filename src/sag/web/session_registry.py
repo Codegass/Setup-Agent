@@ -28,6 +28,8 @@ from sag.web.models import (
 )
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
+_EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
+_EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
 
 
 class SessionRegistry:
@@ -137,6 +139,7 @@ class ContainerSessionStore:
             "workspace": workspace_id,
             "title": task,
             "status": "running",
+            "evidence_status": "unknown",
             "entry": "Web UI",
             "start": now,
             "finish": None,
@@ -183,6 +186,8 @@ class ContainerSessionStore:
             sessions.append(item)
 
         item["status"] = "completed" if success else "failed"
+        if _explicit_evidence_status(item) is None:
+            item["evidence_status"] = "success" if success else "blocked"
         item["finish"] = now
         item["duration"] = _duration(str(item.get("start") or now), now)
         item["outcome"] = outcome
@@ -240,6 +245,7 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
         workspace=_text(item.get("workspace"), default=workspace_id),
         title=_text(item.get("title"), default="Untitled task"),
         status=_text(item.get("status"), default="unknown"),
+        evidence_status=_evidence_status(item),
         entry=_text(item.get("entry"), default="external"),
         start=_text(item.get("start"), default="—"),
         finish=_optional_text(item.get("finish")),
@@ -247,10 +253,14 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
         build=_build_state_value(item.get("build")),
         test=TestSummary(
             state=_text(test.get("state"), default="none"),
-            pass_count=_to_int(test.get("pass")),
-            fail_count=_to_int(test.get("fail")),
-            skip_count=_to_int(test.get("skip")),
+            pass_count=_to_int(_value_for_keys(test, "pass", "pass_count")),
+            fail_count=_to_int(_value_for_keys(test, "fail", "fail_count")),
+            skip_count=_to_int(_value_for_keys(test, "skip", "skip_count")),
             total=_to_int(test.get("total")),
+            pass_rate=_to_float_or_none(_value_for_keys(test, "pass_rate", "passRate")),
+            execution_rate=_to_float_or_none(
+                _value_for_keys(test, "execution_rate", "executionRate")
+            ),
         ),
         report=_text(item.get("report"), default="none"),
         files=_to_int(item.get("files")),
@@ -275,6 +285,7 @@ def _session_detail(
         workspace=summary.workspace,
         title=summary.title,
         status=summary.status,
+        evidence_status=summary.evidence_status,
         entry=summary.entry,
         start=summary.start,
         duration=summary.duration,
@@ -473,6 +484,7 @@ def _setup_artifact_item(
     tasks = _raw_task_dicts(trunk_data)
     status = _setup_status(tasks, report_path)
     test = _test_payload_from_report(report_raw)
+    evidence_status = _setup_evidence_status(trunk_data, tasks, report_raw)
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     project_name = _text(
         trunk_data.get("project_name"),
@@ -484,6 +496,7 @@ def _setup_artifact_item(
         "workspace": workspace_id,
         "title": _text(trunk_data.get("goal"), default="Project setup"),
         "status": status,
+        "evidence_status": evidence_status,
         "entry": "CLI",
         "start": _normalize_timestamp(created) or created or "—",
         "finish": _normalize_timestamp(finish) if status == "completed" else None,
@@ -597,6 +610,130 @@ def _setup_status(tasks: list[dict[str, Any]], report_path: str | None) -> str:
     return "running" if tasks else "unknown"
 
 
+def _setup_evidence_status(
+    trunk_data: dict[str, Any],
+    tasks: list[dict[str, Any]],
+    report_raw: str | None,
+) -> str:
+    if report_raw:
+        explicit_result = _evidence_status_from_result_line(report_raw)
+        if explicit_result is not None:
+            return explicit_result
+
+        snapshot_status = _evidence_status_from_report_snapshot(report_raw)
+        if snapshot_status is not None:
+            return snapshot_status
+
+    explicit_trunk_status = _explicit_evidence_status(trunk_data)
+    if explicit_trunk_status is not None:
+        return explicit_trunk_status
+
+    task_status = _aggregate_evidence_status(
+        _explicit_evidence_status(task) for task in tasks if isinstance(task, dict)
+    )
+    return task_status or "unknown"
+
+
+def _evidence_status_from_result_line(report_raw: str) -> str | None:
+    for line in report_raw.splitlines():
+        text = line.strip()
+        if text.lower().startswith("**result:**") or text.lower().startswith("result:"):
+            return _extract_evidence_status(text)
+    return None
+
+
+def _evidence_status_from_report_snapshot(report_raw: str) -> str | None:
+    structured_status = _evidence_status_from_json(report_raw)
+    if structured_status is not None:
+        return structured_status
+
+    for row in _report_rows(report_raw):
+        if len(row) < 2:
+            continue
+        label = _clean_status_label(row[0])
+        if label in {"evidencestatus", "result", "status"}:
+            status = _extract_evidence_status(" ".join(row[1:]))
+            if status is not None:
+                return status
+
+    patterns = [
+        r"evidence[_\s-]*status\s*[:=]\s*([A-Za-z]+)",
+        r'"evidenceStatus"\s*:\s*"([A-Za-z]+)"',
+        r'"evidence_status"\s*:\s*"([A-Za-z]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, report_raw, flags=re.IGNORECASE)
+        if match:
+            status = _extract_evidence_status(match.group(1))
+            if status is not None:
+                return status
+
+    return None
+
+
+def _evidence_status_from_json(raw: str) -> str | None:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return _evidence_status_from_json_value(payload)
+
+
+def _evidence_status_from_json_value(value: Any) -> str | None:
+    if isinstance(value, dict):
+        status = _explicit_evidence_status(value)
+        if status is not None:
+            return status
+        for child in value.values():
+            status = _evidence_status_from_json_value(child)
+            if status is not None:
+                return status
+    elif isinstance(value, list):
+        return _aggregate_evidence_status(_evidence_status_from_json_value(child) for child in value)
+    return None
+
+
+def _clean_status_label(value: str) -> str:
+    return re.sub(r"[^a-z]", "", value.lower())
+
+
+def _extract_evidence_status(value: Any) -> str | None:
+    text = _text(value, default="").lower()
+    match = re.search(r"\b(success|partial|blocked|conflict|unknown)\b", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _explicit_evidence_status(item: dict[str, Any]) -> str | None:
+    return _normalize_evidence_status(_value_for_keys(item, "evidence_status", "evidenceStatus"))
+
+
+def _evidence_status(item: dict[str, Any]) -> str:
+    return _explicit_evidence_status(item) or "unknown"
+
+
+def _normalize_evidence_status(value: Any) -> str | None:
+    text = _text(value, default="").lower()
+    if text in _EVIDENCE_STATUS_VALUES:
+        return text
+    return _extract_evidence_status(text)
+
+
+def _aggregate_evidence_status(statuses: Any) -> str | None:
+    normalized = [
+        status
+        for status in (_normalize_evidence_status(status) for status in statuses)
+        if status is not None
+    ]
+    if not normalized:
+        return None
+    for candidate in _EVIDENCE_STATUS_PRECEDENCE:
+        if candidate in normalized:
+            return candidate
+    return "unknown"
+
+
 def _setup_session_id(context_id: str, created: str, workspace_id: str) -> str:
     # Session detail lookups are global, while trunk timestamps have seconds
     # granularity and collide across workspaces launched in the same second.
@@ -621,7 +758,15 @@ def _setup_session_id(context_id: str, created: str, workspace_id: str) -> str:
 
 def _test_payload_from_report(report_raw: str | None) -> dict[str, Any]:
     if not report_raw:
-        return {"state": "none", "pass": 0, "fail": 0, "skip": 0, "total": 0}
+        return {
+            "state": "none",
+            "pass": 0,
+            "fail": 0,
+            "skip": 0,
+            "total": 0,
+            "pass_rate": None,
+            "execution_rate": None,
+        }
 
     breakdown = _test_breakdown_from_report(report_raw)
     if breakdown is not None:
@@ -642,6 +787,8 @@ def _test_payload_from_report(report_raw: str | None) -> dict[str, Any]:
         "fail": fail_count,
         "skip": skipped,
         "total": total,
+        "pass_rate": _rate(pass_count, total),
+        "execution_rate": None,
     }
 
 
@@ -665,7 +812,7 @@ def _test_breakdown_from_report(report_raw: str) -> dict[str, Any] | None:
             if len(values) < 6:
                 continue
 
-            _, executed, passed, failed, errors, skipped = values[:6]
+            total_available, executed, passed, failed, errors, skipped = values[:6]
             fail_count = failed + errors
             state = "success" if executed and fail_count == 0 else "partial" if executed else "none"
             return {
@@ -674,9 +821,17 @@ def _test_breakdown_from_report(report_raw: str) -> dict[str, Any] | None:
                 "fail": fail_count,
                 "skip": skipped,
                 "total": executed,
+                "pass_rate": _rate(passed, executed),
+                "execution_rate": _rate(executed, total_available),
             }
 
     return None
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    if denominator <= 0:
+        return None
+    return round((numerator / denominator) * 100, 1)
 
 
 def _report_int(report_raw: str, label: str) -> int:
@@ -970,7 +1125,7 @@ def _build_summary(value: Any) -> BuildSummary:
 
 def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
     time = _display_time(_optional_text(item.get("finish")) or _text(item.get("start"), default=""))
-    status = _status_for_evidence(_text(item.get("status"), default="info"))
+    status = _status_for_evidence(_evidence_status(item))
     record = EvidenceRecord(
         time=time,
         status=status,
@@ -992,8 +1147,10 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
 
 def _status_for_evidence(status: str) -> str:
     normalized = status.strip().lower()
-    if normalized in {"completed", "success", "succeeded"}:
+    if normalized in {"success", "completed", "succeeded"}:
         return "success"
+    if normalized in {"blocked", "conflict", "unknown"}:
+        return normalized
     if normalized in {"failed", "failure", "error"}:
         return "failure"
     if normalized in {"partial", "incomplete"}:
@@ -1175,6 +1332,22 @@ def _to_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _to_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _value_for_keys(item: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in item:
+            return item[key]
+    return None
 
 
 __all__ = [

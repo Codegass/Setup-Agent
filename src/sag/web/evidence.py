@@ -14,15 +14,21 @@ from sag.web.models import EvidenceGroup, EvidenceRecord
 _STATUS_SEVERITY = {
     "info": 0,
     "success": 1,
-    "partial": 2,
-    "failure": 3,
+    "unknown": 2,
+    "partial": 3,
+    "failure": 4,
+    "conflict": 5,
+    "blocked": 6,
 }
 _STATUS_ALIASES = {
+    "block": "blocked",
     "complete": "success",
     "completed": "success",
+    "conflicted": "conflict",
     "fail": "failure",
     "failed": "failure",
     "error": "failure",
+    "incomplete": "partial",
     "ok": "success",
     "pass": "success",
     "passed": "success",
@@ -92,6 +98,11 @@ def _source(record: UIEvidenceRecord, metadata: dict[str, Any]) -> str:
 
 
 def _status(metadata: dict[str, Any]) -> str:
+    explicit_evidence_status = _text(
+        metadata.get("evidence_status") or metadata.get("evidenceStatus")
+    )
+    if explicit_evidence_status:
+        return _status_for_severity(explicit_evidence_status.lower())
     return _status_for_severity(_text(metadata.get("status"), fallback="info").lower())
 
 

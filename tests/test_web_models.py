@@ -16,19 +16,32 @@ def test_workspace_summary_serializes_demo_shape():
         docker=DockerSummary(status="running", image="sag/base:24.04"),
         task="Build project and run full test suite",
         build=BuildSummary(state="success", tool="Maven", time="47.2s"),
-        test=TestSummary(state="partial", pass_count=312, fail_count=8, skip_count=0, total=320),
+        test=TestSummary(
+            state="partial",
+            pass_count=312,
+            fail_count=8,
+            skip_count=0,
+            total=320,
+            pass_rate=97.5,
+            execution_rate=100.0,
+        ),
         report="ready",
         changed=7,
         active_session="CC-3",
         latest_session="CC-3",
         updated="just now",
+        evidence_status="partial",
     )
 
     data = summary.model_dump(mode="json")
+    alias_data = summary.model_dump(mode="json", by_alias=True)
     assert data["id"] == "sag-commons-cli"
     assert data["docker"]["status"] == "running"
     assert data["test"]["pass_count"] == 312
     assert data["latest_session"] == "CC-3"
+    assert alias_data["evidenceStatus"] == "partial"
+    assert alias_data["test"]["passRate"] == 97.5
+    assert alias_data["test"]["executionRate"] == 100.0
 
 
 def test_session_summary_uses_workspace_task_entry_semantics():
@@ -45,7 +58,9 @@ def test_session_summary_uses_workspace_task_entry_semantics():
         report="ready",
         files=7,
         evidence=18,
+        evidence_status="partial",
     )
 
     assert session.workspace == "sag-commons-cli"
     assert session.entry == "CLI"
+    assert session.model_dump(mode="json", by_alias=True)["evidenceStatus"] == "partial"

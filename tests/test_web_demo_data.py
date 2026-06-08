@@ -10,6 +10,8 @@ def test_demo_dashboard_matches_local_ui_demo_shape():
     assert workspace.docker.status == "running"
     assert workspace.latest_session == "CC-3"
     assert workspace.test.pass_count == 312
+    assert workspace.test.pass_rate == 97.5
+    assert workspace.evidence_status == "partial"
     assert "1.6.0" in f"{workspace.release} {workspace.tag}"
 
 
@@ -17,6 +19,9 @@ def test_demo_session_contains_evidence_context_files_and_report():
     detail = get_demo_session("CC-3")
 
     assert detail.id == "CC-3"
+    assert detail.status == "completed"
+    assert detail.evidence_status == "partial"
+    assert detail.test.pass_rate == 97.5
     assert detail.evidence[0].source == "Project analyzer"
     assert detail.context is not None
     assert detail.files is not None

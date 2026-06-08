@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 import sag.web.read_model as read_model_module
@@ -9,6 +11,7 @@ from sag.web.models import (
     TestSummary,
 )
 from sag.web.read_model import ReadModelBuilder
+from sag.web.session_registry import _setup_evidence_status, parse_session_index
 
 
 class FakeWorkspaceRegistry:
@@ -175,6 +178,81 @@ def test_read_model_builder_enriches_workspaces_from_live_sessions():
     assert workspace.active_session is None
     assert workspace.task == "Give me a report of all tests"
     assert workspace.updated == "2026-06-06T21:14:09"
+
+
+def test_parse_session_index_preserves_completed_flow_partial_evidence_and_test_rates():
+    rows = parse_session_index(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "SETUP-20260606-213241",
+                        "workspace": "sag-commons-cli",
+                        "title": "Set up project",
+                        "status": "completed",
+                        "evidenceStatus": "partial",
+                        "entry": "CLI",
+                        "start": "2026-06-06T21:32:41",
+                        "finish": "2026-06-06T21:35:09",
+                        "duration": "2m 28s",
+                        "build": "success",
+                        "test": {
+                            "state": "partial",
+                            "pass": 312,
+                            "fail": 8,
+                            "skip": 0,
+                            "total": 320,
+                            "passRate": 97.5,
+                            "executionRate": 100.0,
+                        },
+                        "report": "ready",
+                        "files": 6,
+                        "evidence": 7,
+                    },
+                    {
+                        "id": "SETUP-unknown-evidence",
+                        "title": "Completed without evidence metadata",
+                        "status": "completed",
+                        "entry": "CLI",
+                        "start": "2026-06-06T21:32:41",
+                        "duration": "2m 28s",
+                        "build": "success",
+                        "test": {"state": "none"},
+                        "report": "ready",
+                        "files": 0,
+                        "evidence": 0,
+                    },
+                ]
+            }
+        ),
+        "sag-commons-cli",
+    )
+
+    assert rows[0].status == "completed"
+    assert rows[0].evidence_status == "partial"
+    assert rows[0].test.pass_rate == 97.5
+    assert rows[0].test.execution_rate == 100.0
+    assert rows[1].status == "completed"
+    assert rows[1].evidence_status == "unknown"
+
+
+def test_setup_artifact_evidence_status_prefers_report_result_and_task_evidence():
+    tasks = [
+        {
+            "id": "T1",
+            "status": "completed",
+            "evidence_status": "success",
+        },
+        {
+            "id": "T2",
+            "status": "completed",
+            "evidence_status": "conflict",
+        },
+    ]
+
+    assert _setup_evidence_status({}, tasks, "**Result:** ⚠️ PARTIAL\n") == "partial"
+    assert _setup_evidence_status({}, tasks, None) == "conflict"
+    assert _setup_evidence_status({}, [{"status": "completed"}], None) == "unknown"
 
 
 def test_read_model_builder_marks_running_live_session_active():

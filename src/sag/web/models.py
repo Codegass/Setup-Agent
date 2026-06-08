@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class WebModel(BaseModel):
@@ -34,6 +34,16 @@ class TestSummary(WebModel):
     fail_count: int = Field(default=0, serialization_alias="fail")
     skip_count: int = Field(default=0, serialization_alias="skip")
     total: int = 0
+    pass_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("pass_rate", "passRate"),
+        serialization_alias="passRate",
+    )
+    execution_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("execution_rate", "executionRate"),
+        serialization_alias="executionRate",
+    )
     note: str = ""
 
 
@@ -97,11 +107,22 @@ class ContextTask(WebModel):
     id: str
     title: str
     status: str
+    evidence_status: str = Field(
+        default="unknown",
+        validation_alias=AliasChoices("evidence_status", "evidenceStatus"),
+        serialization_alias="evidenceStatus",
+    )
+    evidence_refs: list[ContextReference] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
+        serialization_alias="evidenceRefs",
+    )
+    conflicts: list[str] = Field(default_factory=list)
     summary: str = ""
     refs: list[ContextReference] = Field(default_factory=list)
     recovered: bool = False
 
-    @field_validator("refs", mode="before")
+    @field_validator("refs", "evidence_refs", mode="before")
     @classmethod
     def _coerce_refs(cls, value: Any) -> Any:
         if not isinstance(value, list):
@@ -150,6 +171,11 @@ class ExecutionSessionSummary(WebModel):
     workspace: str
     title: str
     status: str
+    evidence_status: str = Field(
+        default="unknown",
+        validation_alias=AliasChoices("evidence_status", "evidenceStatus"),
+        serialization_alias="evidenceStatus",
+    )
     entry: str
     start: str
     finish: str | None = None
@@ -171,6 +197,11 @@ class WorkspaceSummary(WebModel):
     commit: str | None = None
     docker: DockerSummary
     task: str = "No current task"
+    evidence_status: str = Field(
+        default="unknown",
+        validation_alias=AliasChoices("evidence_status", "evidenceStatus"),
+        serialization_alias="evidenceStatus",
+    )
     build: BuildSummary | str = "none"
     test: TestSummary = Field(default_factory=TestSummary)
     report: str = "none"
@@ -193,6 +224,11 @@ class ExecutionSessionDetail(WebModel):
     workspace: str
     title: str
     status: str
+    evidence_status: str = Field(
+        default="unknown",
+        validation_alias=AliasChoices("evidence_status", "evidenceStatus"),
+        serialization_alias="evidenceStatus",
+    )
     entry: str
     start: str
     duration: str

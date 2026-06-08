@@ -92,6 +92,46 @@ def test_evidence_index_normalizes_completed_command_status_to_success():
     assert groups[0].records[0].status == "success"
 
 
+def test_evidence_index_prefers_evidence_status_metadata_and_supports_severe_states():
+    records = [
+        UIEvidenceRecord(
+            timestamp=datetime(2026, 6, 6, 2, 13, tzinfo=timezone.utc),
+            kind="validation",
+            summary="validator could not prove setup",
+            metadata={
+                "source": "Verifier",
+                "status": "completed",
+                "evidence_status": "blocked",
+            },
+        ),
+        UIEvidenceRecord(
+            timestamp=datetime(2026, 6, 6, 2, 14, tzinfo=timezone.utc),
+            kind="validation",
+            summary="runtime facts conflict",
+            metadata={
+                "source": "Verifier",
+                "evidenceStatus": "conflict",
+            },
+        ),
+        UIEvidenceRecord(
+            timestamp=datetime(2026, 6, 6, 2, 15, tzinfo=timezone.utc),
+            kind="analysis",
+            summary="status is not known yet",
+            metadata={
+                "source": "Analyzer",
+                "evidenceStatus": "unknown",
+            },
+        ),
+    ]
+
+    groups = EvidenceIndex().from_ui_records(records)
+
+    assert groups[0].status == "blocked"
+    assert [record.status for record in groups[0].records] == ["blocked", "conflict"]
+    assert groups[1].status == "unknown"
+    assert groups[1].records[0].status == "unknown"
+
+
 def test_evidence_index_handles_empty_or_unexpected_metadata():
     records = [
         UIEvidenceRecord(

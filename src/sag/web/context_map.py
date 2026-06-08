@@ -84,6 +84,10 @@ class ContextMapBuilder:
         task_id = str(item.get("id") or item.get("task_id") or f"T{index}")
         branch_data = self._branch_data(task_id)
         summary = str(item.get("summary") or self._branch_summary(branch_data) or "")
+        evidence_refs = [
+            self._context_ref(ref)
+            for ref in self._list_value(item.get("evidence_refs") or item.get("evidenceRefs"))
+        ]
         return ContextTask(
             id=task_id,
             title=str(
@@ -95,10 +99,16 @@ class ContextMapBuilder:
                 or "Untitled task"
             ),
             status=str(item.get("status") or "pending"),
+            evidence_status=str(
+                item.get("evidence_status") or item.get("evidenceStatus") or "unknown"
+            ),
+            evidence_refs=self._dedupe_refs(evidence_refs),
+            conflicts=self._string_list(item.get("conflicts")),
             summary=summary,
             refs=self._dedupe_refs(
                 [
                     *[self._context_ref(ref) for ref in item.get("refs", [])],
+                    *evidence_refs,
                     *self._branch_refs(branch_data),
                     *[self._context_ref(ref) for ref in self._output_refs_from_text(summary)],
                 ]
@@ -289,6 +299,14 @@ class ContextMapBuilder:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    def _list_value(self, value: Any) -> list[Any]:
+        return value if isinstance(value, list) else []
+
+    def _string_list(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item) for item in value]
 
     def _is_active_status(self, status: str) -> bool:
         return status.strip().lower() in {"active", "running", "in_progress"}
