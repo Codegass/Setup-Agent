@@ -753,8 +753,8 @@ class ContextTool(BaseTool):
             fresh_trunk_context.update_task_evidence(
                 current_task_id,
                 evidence_status=evidence_status,
-                evidence_refs=evidence_refs or [],
-                conflicts=conflicts or [],
+                evidence_refs=evidence_refs,
+                conflicts=conflicts,
             )
 
             # Save once with all updates
@@ -1049,6 +1049,11 @@ IMPORTANT:
                     "items": {"type": "object"},
                     "description": "Compressed context history (required for compact_context)",
                     "default": None,
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Force completion even if validation fails (use with caution)",
+                    "default": False,
                 },
             },
             "required": ["action"],

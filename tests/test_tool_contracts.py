@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import Optional
 
 from sag.agent.react_llm import ReactLLMClient
@@ -6,6 +7,7 @@ from sag.config.models import LogLevel
 from sag.config.settings import Config
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
+from sag.tools.context_tool import ContextTool
 from sag.tools.report_tool import ReportTool
 
 
@@ -105,3 +107,15 @@ def test_inherited_custom_schema_is_preserved():
     assert schema["properties"]["action"]["enum"] == ["generate"]
     assert "status" in schema["properties"]
     assert "details" in schema["properties"]
+
+
+def test_context_tool_schema_exposes_force_and_evidence_fields():
+    schema = ContextTool(SimpleNamespace()).get_parameter_schema()
+    properties = schema["properties"]
+
+    assert "force" in properties
+    assert properties["force"]["type"] == "boolean"
+    assert properties["force"]["default"] is False
+    assert "evidence_refs" in properties
+    assert "evidence_status" in properties
+    assert "conflicts" in properties

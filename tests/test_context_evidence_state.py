@@ -168,3 +168,36 @@ def test_complete_with_results_preserves_narrative_and_evidence(tmp_path):
     assert task.key_results.startswith("Tests: 206 / 214 passed")
     assert task.evidence_status.value == "partial"
     assert task.evidence_refs == ["output_abc", "surefire_xml"]
+
+
+def test_complete_with_results_preserves_existing_evidence_when_omitted(tmp_path):
+    manager = ContextManager(workspace_path=str(tmp_path))
+    trunk = manager.create_trunk_context(
+        goal="Set up project",
+        project_url="https://example.test/demo",
+        project_name="demo",
+    )
+    task_id = trunk.add_task("Record setup evidence")
+    manager._save_trunk_context(trunk)
+    manager.start_new_branch(task_id)
+    manager.update_task_evidence(
+        task_id,
+        evidence_status="partial",
+        evidence_refs=["output_abc", "surefire_xml"],
+        conflicts=["report_mismatch"],
+    )
+    tool = ContextTool(manager)
+
+    result = tool.execute(
+        action="complete_with_results",
+        summary="Recorded the final setup evidence state.",
+        key_results="Evidence preserved for later review.",
+    )
+
+    assert result.success is True
+    reloaded = manager.load_trunk_context()
+    task = reloaded.todo_list[0]
+    assert task.status.value == "completed"
+    assert task.evidence_status.value == "partial"
+    assert task.evidence_refs == ["output_abc", "surefire_xml"]
+    assert task.conflicts == ["report_mismatch"]
