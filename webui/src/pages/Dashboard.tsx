@@ -12,12 +12,16 @@ import {
   X,
 } from "lucide-react"
 
-import type { DashboardResponse, LaunchQueueState, WorkspaceSummary } from "@/api/types"
+import type {
+  DashboardResponse,
+  LaunchQueueItem,
+  LaunchQueueState,
+  WorkspaceSummary,
+} from "@/api/types"
 import { Badge, StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
 import { TestBar } from "@/components/common/TestBar"
-import { LaunchQueuePanel } from "@/components/launch/LaunchQueuePanel"
 
 interface DashboardProps {
   data: DashboardResponse
@@ -78,13 +82,60 @@ function needsAttention(workspace: WorkspaceSummary): boolean {
   const testState = normalize(workspace.test.state)
   const dockerState = normalize(workspace.docker.status)
 
-  return (
-    buildState === "failure" ||
-    buildState === "failed" ||
+  const buildFailed = buildState === "failure" || buildState === "failed"
+  const testFailed =
     testState === "fail" ||
     testState === "failed" ||
-    dockerState === "exited"
-  )
+    (testState === "partial" && workspace.test.fail > 0)
+  // Any container that isn't running or freshly created has stopped unexpectedly.
+  const containerDown =
+    dockerState !== "" && dockerState !== "running" && dockerState !== "created"
+
+  return buildFailed || testFailed || containerDown
+}
+
+function launchProjectName(item: LaunchQueueItem): string {
+  return item.workspace_id.replace(/^sag-/, "")
+}
+
+function launchStatusLine(item: LaunchQueueItem): string {
+  switch (normalize(item.status)) {
+    case "queued":
+      return "Waiting for a free setup slot"
+    case "launching":
+    case "running":
+      return "Setting up…"
+    case "failed":
+      return item.error || "Setup failed"
+    default:
+      return item.error || "Setup pending"
+  }
+}
+
+function pendingLaunchItems(
+  launchQueue: LaunchQueueState | null,
+  workspaces: WorkspaceSummary[],
+): LaunchQueueItem[] {
+  if (!launchQueue) {
+    return []
+  }
+  const discovered = new Set(workspaces.map((workspace) => workspace.id))
+  const seen = new Set<string>()
+  const pending: LaunchQueueItem[] = []
+  for (const batch of launchQueue.batches) {
+    for (const item of batch.items) {
+      const state = normalize(item.status)
+      if (state === "completed" || discovered.has(item.workspace_id)) {
+        continue
+      }
+      if (seen.has(item.workspace_id)) {
+        continue
+      }
+      seen.add(item.workspace_id)
+      pending.push(item)
+    }
+  }
+  return pending
 }
 
 function workspaceMeta(workspace: WorkspaceSummary): string {
@@ -109,13 +160,17 @@ export function Dashboard({
 }: DashboardProps) {
   const workspaces = data.workspaces
   const running = workspaces.filter((w) => normalize(w.docker.status) === "running").length
-  const attention = workspaces.filter(needsAttention).length
+  const pendingLaunches = pendingLaunchItems(launchQueue, workspaces)
+  const failedLaunches = pendingLaunches.filter(
+    (item) => normalize(item.status) === "failed",
+  ).length
+  const attention = workspaces.filter(needsAttention).length + failedLaunches
 
   return (
     <div className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div className="min-w-0">
-          <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400">
+          <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
             sag ui · local workbench
           </div>
           <h1 className="mt-1.5 text-[22px] font-semibold tracking-tight text-slate-900">
@@ -129,7 +184,7 @@ export function Dashboard({
           <div className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-white px-2.5 py-1.5">
             <StatusBadge status={data.docker.status} label="Docker" />
             {data.docker.version ? (
-              <span className="font-mono text-[11px] text-slate-400">v{data.docker.version}</span>
+              <span className="font-mono text-[11px] text-slate-500">v{data.docker.version}</span>
             ) : null}
           </div>
           {onLaunchSetups ? (
@@ -169,10 +224,6 @@ export function Dashboard({
         />
       </div>
 
-      {launchQueue && launchQueue.batches.length > 0 ? (
-        <LaunchQueuePanel queue={launchQueue} />
-      ) : null}
-
       <Card className="mt-5 hidden overflow-hidden lg:block">
         <div
           className={`grid ${tableColumns} items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-2.5`}
@@ -180,12 +231,15 @@ export function Dashboard({
           {tableHeaders.map((header) => (
             <div
               key={header}
-              className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400"
+              className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
             >
               {header}
             </div>
           ))}
         </div>
+        {pendingLaunches.map((item) => (
+          <PendingLaunchRow key={`pending-${item.id}`} item={item} />
+        ))}
         {workspaces.map((workspace) => (
           <WorkspaceRow
             key={workspace.id}
@@ -198,6 +252,9 @@ export function Dashboard({
       </Card>
 
       <div className="mt-5 grid gap-3 lg:hidden">
+        {pendingLaunches.map((item) => (
+          <PendingLaunchCard key={`pending-${item.id}`} item={item} />
+        ))}
         {workspaces.map((workspace) => (
           <WorkspaceCard
             key={workspace.id}
@@ -209,7 +266,7 @@ export function Dashboard({
         ))}
       </div>
 
-      <p className="mt-3 px-1 font-mono text-[10px] text-slate-400">
+      <p className="mt-3 px-1 font-mono text-[10px] text-slate-500">
         GET /api/workspaces · manual refresh
       </p>
     </div>
@@ -230,14 +287,14 @@ function SummaryCard({
   return (
     <Card className="px-4 py-3.5">
       <div className="flex items-center justify-between gap-3">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400">
+        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
           {label}
         </div>
         {icon}
       </div>
       <div className="mt-1.5 flex items-baseline gap-2">
         <span className="text-[26px] font-semibold tabular-nums text-slate-900">{value}</span>
-        <span className="min-w-0 text-[12px] text-slate-400">{sub}</span>
+        <span className="min-w-0 text-[12px] text-slate-500">{sub}</span>
       </div>
     </Card>
   )
@@ -362,6 +419,76 @@ function WorkspaceCard({
   )
 }
 
+function PendingLaunchRow({ item }: { item: LaunchQueueItem }) {
+  const project = launchProjectName(item)
+  const failed = normalize(item.status) === "failed"
+
+  return (
+    <div
+      aria-label={`Pending launch ${project}`}
+      className={`grid ${tableColumns} items-center gap-3 border-b border-slate-100 px-4 py-3 text-left last:border-b-0 ${
+        failed ? "bg-red-50/40" : "bg-slate-50/40"
+      }`}
+    >
+      <div className="flex min-w-0 items-center gap-2.5">
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-dashed border-slate-300 bg-white text-slate-400">
+          <GitBranch size={14} />
+        </div>
+        <div className="min-w-0">
+          <div className="truncate text-[13px] font-medium text-slate-600">{project}</div>
+          {item.ref ? (
+            <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
+              {item.ref}
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <div className="col-span-7 flex min-w-0 items-center gap-2.5">
+        <StatusBadge status={item.status} />
+        <span
+          className={`min-w-0 truncate text-[12.5px] ${failed ? "text-red-600" : "text-slate-500"}`}
+        >
+          {launchStatusLine(item)}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function PendingLaunchCard({ item }: { item: LaunchQueueItem }) {
+  const project = launchProjectName(item)
+  const failed = normalize(item.status) === "failed"
+
+  return (
+    <Card
+      aria-label={`Pending launch ${project}`}
+      className={`p-4 ${failed ? "border-red-100 bg-red-50/40" : "bg-slate-50/40"}`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-dashed border-slate-300 bg-white text-slate-400">
+            <GitBranch size={14} />
+          </div>
+          <div className="min-w-0">
+            <div className="truncate text-[13px] font-medium text-slate-600">{project}</div>
+            {item.ref ? (
+              <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
+                {item.ref}
+              </div>
+            ) : null}
+          </div>
+        </div>
+        <StatusBadge status={item.status} />
+      </div>
+      <div
+        className={`mt-3 text-[12.5px] ${failed ? "text-red-600" : "text-slate-500"}`}
+      >
+        {launchStatusLine(item)}
+      </div>
+    </Card>
+  )
+}
+
 function ProjectCell({ workspace }: { workspace: WorkspaceSummary }) {
   return (
     <div className="flex min-w-0 items-center gap-2.5">
@@ -383,7 +510,7 @@ function ProjectCell({ workspace }: { workspace: WorkspaceSummary }) {
             </Badge>
           ) : null}
         </div>
-        <div className="mt-0.5 truncate font-mono text-[10px] text-slate-400">
+        <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
           {workspaceMeta(workspace)}
         </div>
       </div>
@@ -431,7 +558,7 @@ function BuildCell({ build }: { build: WorkspaceSummary["build"] }) {
           <Check size={14} />
           Success
         </span>
-        {meta ? <div className="mt-0.5 font-mono text-[10px] text-slate-400">{meta}</div> : null}
+        {meta ? <div className="mt-0.5 font-mono text-[10px] text-slate-500">{meta}</div> : null}
       </div>
     )
   }
@@ -443,14 +570,14 @@ function BuildCell({ build }: { build: WorkspaceSummary["build"] }) {
           <X size={14} />
           Failure
         </span>
-        {meta ? <div className="mt-0.5 font-mono text-[10px] text-slate-400">{meta}</div> : null}
+        {meta ? <div className="mt-0.5 font-mono text-[10px] text-slate-500">{meta}</div> : null}
       </div>
     )
   }
 
   if (state === "pending" || state === "queued") {
     return (
-      <span className="inline-flex items-center gap-1.5 text-[12px] text-slate-400">
+      <span className="inline-flex items-center gap-1.5 text-[12px] text-slate-500">
         <Clock size={13} />
         Pending
       </span>
@@ -468,7 +595,7 @@ function TestCell({ workspace }: { workspace: WorkspaceSummary }) {
   const state = normalize(workspace.test.state)
 
   if (state === "pending" || state === "none") {
-    return <span className="text-[12px] text-slate-400">Pending</span>
+    return <span className="text-[12px] text-slate-500">Pending</span>
   }
 
   return (
@@ -553,7 +680,7 @@ function RowActions({
 function MobileField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="min-w-0">
-      <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+      <div className="mb-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
         {label}
       </div>
       {children}

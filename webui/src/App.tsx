@@ -230,13 +230,13 @@ export function App() {
                   }
                 />
                 {dashboard.docker.version ? (
-                  <span className="font-mono text-[10.5px] text-slate-400">
+                  <span className="font-mono text-[10.5px] text-slate-500">
                     v{dashboard.docker.version}
                   </span>
                 ) : null}
               </div>
             ) : (
-              <div className="rounded-md border border-slate-200 px-2 py-1 font-mono text-[10.5px] text-slate-400">
+              <div className="rounded-md border border-slate-200 px-2 py-1 font-mono text-[10.5px] text-slate-500">
                 docker · checking
               </div>
             )}
@@ -526,7 +526,7 @@ function Breadcrumb({
         className={`whitespace-nowrap text-[12.5px] ${
           route.view === "dashboard"
             ? "font-medium text-slate-700"
-            : "text-slate-400 hover:text-slate-700"
+            : "text-slate-500 hover:text-slate-700"
         }`}
         disabled={route.view === "dashboard"}
         onClick={onDashboard}
@@ -545,7 +545,7 @@ function Breadcrumb({
       {route.view === "session" ? (
         <>
           <span className="text-slate-200">/</span>
-          <span className="max-w-[32vw] truncate text-[12.5px] text-slate-400 sm:max-w-none">
+          <span className="max-w-[32vw] truncate text-[12.5px] text-slate-500 sm:max-w-none">
             {route.workspaceId}
           </span>
           <span className="text-slate-200">/</span>
@@ -570,7 +570,7 @@ function PlaceholderView({
   return (
     <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
       <Card className="p-5">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400">
+        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
           {label}
         </div>
         <h1 className="mt-1.5 text-[22px] font-semibold tracking-tight text-slate-900">

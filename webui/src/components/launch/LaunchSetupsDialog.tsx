@@ -183,7 +183,7 @@ export function LaunchSetupsDialog({
         <div className="max-h-[60vh] overflow-y-auto p-4">
           <div className="flex items-center gap-2">
             <label
-              className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-400"
+              className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500"
               htmlFor="launch-concurrency"
             >
               Concurrency
@@ -197,7 +197,7 @@ export function LaunchSetupsDialog({
               type="number"
               value={concurrency}
             />
-            <span className="text-[11px] text-slate-400">
+            <span className="text-[11px] text-slate-500">
               parallel setups for this batch
             </span>
           </div>
@@ -206,7 +206,7 @@ export function LaunchSetupsDialog({
             {["Repo URL", "Name", "Version", "Goal", "Record", ""].map((header) => (
               <div
                 key={header || "actions"}
-                className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400"
+                className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
               >
                 {header}
                 {header === "Version" ? (
