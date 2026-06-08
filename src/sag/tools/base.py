@@ -6,7 +6,9 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+from sag.evidence import EvidenceFinding, EvidenceStatus, TestStats, coerce_evidence_status
 
 
 class ToolError(Exception):
@@ -64,6 +66,7 @@ class ToolResult(BaseModel):
 
     success: bool
     output: str
+    status: EvidenceStatus | str | None = None
     error: Optional[str] = None
     error_code: Optional[str] = None
     suggestions: List[str] = Field(default_factory=list)
@@ -71,6 +74,18 @@ class ToolResult(BaseModel):
     raw_output: Optional[str] = None
     raw_data: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    validator_findings: List[EvidenceFinding] = Field(default_factory=list)
+    test_stats: Optional[TestStats] = None
+
+    @model_validator(mode="after")
+    def _normalize_evidence_fields(self) -> "ToolResult":
+        if self.status is None:
+            self.status = EvidenceStatus.SUCCESS if self.success else EvidenceStatus.BLOCKED
+        else:
+            self.status = coerce_evidence_status(self.status)
+        return self
 
     def __str__(self) -> str:
         if self.success:
