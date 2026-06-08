@@ -1844,11 +1844,59 @@ OUTPUT:
 
         return True
 
+    # Build files that let the fallback pick a concrete build/test plan.
+    _FALLBACK_BUILD_MARKERS = (
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "package.json",
+        "requirements.txt",
+        "pyproject.toml",
+    )
+
+    def _redetect_build_files(self, project_path: str) -> List[str]:
+        """Re-scan the project root for build files.
+
+        The main analysis can fail to record build files (it errored out, or it
+        only checked ``build.gradle`` and missed a Kotlin-DSL ``build.gradle.kts``
+        like apache/beam's root). Without this, the fallback treats a known
+        Maven/Gradle project as "completely unknown" and tells the agent to
+        manually explore, which can loop. Re-detecting here keeps the fallback
+        anchored to the real build system.
+        """
+        if not self.docker_orchestrator:
+            return []
+
+        found: List[str] = []
+        for marker in self._FALLBACK_BUILD_MARKERS:
+            try:
+                result = self.docker_orchestrator.execute_command(
+                    f"test -f {project_path}/{marker} && echo 'exists' || echo 'missing'"
+                )
+            except Exception as exc:  # never let detection crash the fallback
+                logger.debug(f"Build-file re-detection failed for {marker}: {exc}")
+                continue
+            if result.get("success") and "exists" in result.get("output", ""):
+                found.append(marker)
+        return found
+
     def _generate_three_step_fallback_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """Generate three-step fallback plan for unknown project types."""
         plan = []
         existing_files = analysis.get("existing_files", [])
         project_path = analysis.get("project_path", "/workspace")
+
+        # If the analysis recorded no recognizable build file, re-scan the root
+        # before giving up. This stops a known build system (e.g. a Gradle repo
+        # whose root is build.gradle.kts) from being mislabeled "unknown" and
+        # sending the agent into a manual-exploration loop.
+        if not any(marker in existing_files for marker in self._FALLBACK_BUILD_MARKERS):
+            redetected = self._redetect_build_files(project_path)
+            if redetected:
+                existing_files = list(dict.fromkeys([*existing_files, *redetected]))
+                logger.info(f"Fallback re-detected build files: {redetected}")
 
         logger.info("Generating three-step fallback execution plan for unknown project type")
 
@@ -1881,7 +1929,15 @@ OUTPUT:
                     "core_step": "test",
                 }
             )
-        elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
+        elif any(
+            f in existing_files
+            for f in [
+                "build.gradle",
+                "build.gradle.kts",
+                "settings.gradle",
+                "settings.gradle.kts",
+            ]
+        ):
             plan.append(
                 {
                     "id": "setup_environment",
