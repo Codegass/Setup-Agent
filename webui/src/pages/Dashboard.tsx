@@ -434,7 +434,7 @@ function PendingLaunchRow({ item }: { item: LaunchQueueItem }) {
   return (
     <div
       aria-label={`Pending launch ${project}`}
-      className={`grid ${tableColumns} items-center gap-3 border-b border-slate-100 px-4 py-3 text-left last:border-b-0 ${
+      className={`grid ${tableColumns} animate-in fade-in-0 items-center gap-3 border-b border-slate-100 px-4 py-3 text-left duration-200 last:border-b-0 ${
         failed ? "bg-red-50/40" : "bg-slate-50/40"
       }`}
     >
@@ -471,7 +471,7 @@ function PendingLaunchCard({ item }: { item: LaunchQueueItem }) {
   return (
     <Card
       aria-label={`Pending launch ${project}`}
-      className={`p-4 ${failed ? "border-red-100 bg-red-50/40" : "bg-slate-50/40"}`}
+      className={`animate-in fade-in-0 p-4 duration-200 ${failed ? "border-red-100 bg-red-50/40" : "bg-slate-50/40"}`}
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2.5">
