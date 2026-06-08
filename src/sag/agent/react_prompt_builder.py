@@ -13,6 +13,23 @@ from sag.tools.base import BaseTool
 from .react_types import ReactModelMode, ReActStep, StepType
 
 
+def _format_attempt_history(todo_list) -> str:
+    """Render every task with its status, flagging descriptions tried more
+    than once so the model can see (and stop) repetition."""
+    from collections import Counter
+
+    norm = lambda d: " ".join((d or "").split()).strip().lower()
+    counts = Counter(norm(t.description) for t in todo_list)
+
+    lines = ["  🧾 ATTEMPT HISTORY (every task tried so far):"]
+    for task in todo_list:
+        repeats = counts[norm(task.description)]
+        flag = f" ⚠️ tried ×{repeats} — do NOT repeat; try a different approach" if repeats > 1 else ""
+        desc = task.description if len(task.description) <= 100 else task.description[:97] + "..."
+        lines.append(f"    - {task.id} [{task.status.value}] {desc}{flag}")
+    return "\n".join(lines)
+
+
 class ReActPromptBuilder:
     """Build ReAct prompts and own prompt-related context caching."""
 
@@ -383,6 +400,8 @@ Current Focus: {context_info.get('focus', 'Not specified')}
                     # Show available task IDs to prevent hallucinations
                     all_task_ids = [task.id for task in trunk_context.todo_list]
                     plan_summary.append(f"  📝 VALID IDs: {', '.join(all_task_ids)}")
+
+                    plan_summary.append(_format_attempt_history(trunk_context.todo_list))
 
                     # CRITICAL: Add previous task's key results as context for next task
                     previous_task_results = []
