@@ -529,10 +529,15 @@ class GradleTool(BaseTool):
 
             # Extract test results
             if "tests completed" in line.lower() or "test run:" in line.lower():
+                if not analysis["test_results"]:
+                    analysis["test_results"] = {}
+
                 test_match = re.search(r"(\d+)\s+tests?\s+completed", line, re.IGNORECASE)
+                if not test_match:
+                    test_match = re.search(
+                        r"test run:\s*(\d+)\s+tests?", line, re.IGNORECASE
+                    )
                 if test_match:
-                    if not analysis["test_results"]:
-                        analysis["test_results"] = {}
                     analysis["test_results"]["total"] = int(test_match.group(1))
 
                 # Look for failures and errors

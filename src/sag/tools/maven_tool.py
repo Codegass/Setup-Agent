@@ -1173,6 +1173,36 @@ class MavenTool(BaseTool):
         failed_tests: List[str] = []
         collecting_failed_tests = False
         last_summary_module: Optional[str] = None
+        test_summary_re = re.compile(
+            r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)"
+        )
+        test_execution_boundary_re = re.compile(
+            r"--- maven-(?:surefire|failsafe)-plugin:.* @ .+ ---"
+        )
+        current_test_execution: Optional[Dict[str, int]] = None
+        current_execution_has_final_summary = False
+        expecting_final_test_summary = False
+
+        def flush_test_execution() -> None:
+            nonlocal current_test_execution
+            nonlocal current_execution_has_final_summary
+            nonlocal expecting_final_test_summary
+
+            if current_test_execution:
+                totals = analysis["tests_run"] or {
+                    "total": 0,
+                    "failures": 0,
+                    "errors": 0,
+                    "skipped": 0,
+                }
+                for key in ("total", "failures", "errors", "skipped"):
+                    totals[key] += current_test_execution.get(key, 0)
+                analysis["tests_run"] = totals
+
+            current_test_execution = None
+            current_execution_has_final_summary = False
+            expecting_final_test_summary = False
+
         for line in lines:
             line = line.strip()
 
@@ -1181,26 +1211,40 @@ class MavenTool(BaseTool):
                 phase_match = re.search(r"--- maven-(\w+)-plugin:", line)
                 if phase_match:
                     analysis["phases_executed"].append(phase_match.group(1))
+                if test_execution_boundary_re.search(line):
+                    flush_test_execution()
+
+            if re.search(r"\bResults:\s*$", line):
+                expecting_final_test_summary = True
 
             # Extract test results
             if "Tests run:" in line:
-                test_match = re.search(
-                    r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", line
-                )
+                test_match = test_summary_re.search(line)
                 if test_match:
-                    failures = int(test_match.group(2))
-                    errors = int(test_match.group(3))
-                    analysis["tests_run"] = {
-                        "total": (analysis["tests_run"] or {}).get("total", 0)
-                        + int(test_match.group(1)),
-                        "failures": (analysis["tests_run"] or {}).get("failures", 0)
-                        + failures,
-                        "errors": (analysis["tests_run"] or {}).get("errors", 0) + errors,
-                        "skipped": (analysis["tests_run"] or {}).get("skipped", 0)
-                        + int(test_match.group(4)),
+                    summary = {
+                        "total": int(test_match.group(1)),
+                        "failures": int(test_match.group(2)),
+                        "errors": int(test_match.group(3)),
+                        "skipped": int(test_match.group(4)),
                     }
-                    analysis["test_failure_count"] += failures
-                    analysis["test_error_count"] += errors
+
+                    if current_test_execution is None:
+                        current_test_execution = {
+                            "total": 0,
+                            "failures": 0,
+                            "errors": 0,
+                            "skipped": 0,
+                        }
+
+                    if expecting_final_test_summary:
+                        current_test_execution = summary
+                        current_execution_has_final_summary = True
+                        expecting_final_test_summary = False
+                    elif current_execution_has_final_summary:
+                        current_test_execution = summary
+                    else:
+                        for key, value in summary.items():
+                            current_test_execution[key] += value
 
             # Extract compilation errors
             if "[ERROR]" in line and (".java:" in line or "compilation error" in line.lower()):
@@ -1279,6 +1323,11 @@ class MavenTool(BaseTool):
                     analysis["skipped_modules"].append(last_summary_module)
                 if not analysis.get("error_type"):
                     analysis["error_type"] = "MODULE_BANNED"
+
+        flush_test_execution()
+        if analysis["tests_run"]:
+            analysis["test_failure_count"] = int(analysis["tests_run"].get("failures") or 0)
+            analysis["test_error_count"] = int(analysis["tests_run"].get("errors") or 0)
 
         if failed_modules:
             analysis["failed_modules"] = failed_modules
