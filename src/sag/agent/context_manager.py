@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from sag.evidence import EvidenceFinding, EvidenceStatus, coerce_evidence_status
+
 
 class TaskStatus(str, Enum):
     """Status of a task in the TODO list."""
@@ -30,6 +32,10 @@ class Task(BaseModel):
     completed_at: Optional[datetime] = None
     notes: str = ""
     key_results: str = ""  # Stores key results after task completion
+    evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
+    evidence_refs: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    validator_findings: List[EvidenceFinding] = Field(default_factory=list)
 
 
 class ContextType(str, Enum):
@@ -130,6 +136,39 @@ class TrunkContext(BaseContext):
                 return True
         return False
 
+    def update_task_evidence(
+        self,
+        task_id: str,
+        evidence_status: EvidenceStatus | str | None = None,
+        evidence_refs: Optional[List[str]] = None,
+        conflicts: Optional[List[str]] = None,
+        validator_findings: Optional[List[EvidenceFinding | Dict[str, Any]]] = None,
+    ) -> bool:
+        """Update the evidence state of a task."""
+        for task in self.todo_list:
+            if task.id != task_id:
+                continue
+
+            if evidence_status is not None:
+                task.evidence_status = coerce_evidence_status(evidence_status)
+            if evidence_refs is not None:
+                task.evidence_refs = evidence_refs
+            if conflicts is not None:
+                task.conflicts = conflicts
+            if validator_findings is not None:
+                task.validator_findings = [
+                    finding
+                    if isinstance(finding, EvidenceFinding)
+                    else EvidenceFinding(**finding)
+                    for finding in validator_findings
+                ]
+
+            self.update_timestamp()
+            logger.info(f"Updated evidence state for task {task_id}")
+            return True
+
+        return False
+
     def get_progress_summary(self) -> str:
         """Get a summary of current progress."""
         total = len(self.todo_list)
@@ -205,6 +244,8 @@ class BranchContextHistory(BaseModel):
 
     # Key information inherited from previous task
     previous_task_summary: str = ""
+    previous_task_evidence_digest: str = ""
+    current_task_evidence_refs: List[str] = Field(default_factory=list)
 
     # Core: records all events during task execution
     history: List[Dict[str, Any]] = Field(default_factory=list)
@@ -429,6 +470,39 @@ CONTEXT_EOF"""
             logger.error(f"Failed to save trunk context: {e}")
             raise
 
+    def update_task_evidence(
+        self,
+        task_id: str,
+        evidence_status: EvidenceStatus | str | None = None,
+        evidence_refs: Optional[List[str]] = None,
+        conflicts: Optional[List[str]] = None,
+        validator_findings: Optional[List[EvidenceFinding | Dict[str, Any]]] = None,
+    ) -> bool:
+        """Update evidence state for a task in the trunk context."""
+        trunk_context = self.load_trunk_context()
+        if not trunk_context:
+            return False
+
+        updated = trunk_context.update_task_evidence(
+            task_id=task_id,
+            evidence_status=evidence_status,
+            evidence_refs=evidence_refs,
+            conflicts=conflicts,
+            validator_findings=validator_findings,
+        )
+        if updated:
+            self._save_trunk_context(trunk_context)
+        return updated
+
+    def _format_previous_task_evidence_digest(self, task: Task) -> str:
+        """Format a compact evidence digest for the previous task."""
+        lines = [f"{task.id} evidence_status: {task.evidence_status.value}"]
+        if task.evidence_refs:
+            lines.append(f"evidence_refs: {', '.join(task.evidence_refs)}")
+        if task.conflicts:
+            lines.append(f"conflicts: {', '.join(task.conflicts)}")
+        return "\n".join(lines)
+
     def start_new_branch(self, task_id: str) -> Dict[str, Any]:
         """Start a new branch task."""
         # Load trunk context
@@ -458,11 +532,15 @@ CONTEXT_EOF"""
 
         # Get key results from previous completed task
         previous_summary = ""
+        previous_task_evidence_digest = ""
         for i, t in enumerate(trunk_context.todo_list):
             if t.id == task_id and i > 0:
                 prev_task = trunk_context.todo_list[i - 1]
                 if prev_task.status == TaskStatus.COMPLETED and prev_task.key_results:
                     previous_summary = f"Previous task ({prev_task.id}): {prev_task.key_results}"
+                    previous_task_evidence_digest = self._format_previous_task_evidence_digest(
+                        prev_task
+                    )
                 break
 
         # Create branch history file
@@ -470,6 +548,7 @@ CONTEXT_EOF"""
             task_id=task_id,
             task_description=task.description,
             previous_task_summary=previous_summary,
+            previous_task_evidence_digest=previous_task_evidence_digest,
         )
 
         # Save branch history file
@@ -753,6 +832,12 @@ CONTEXT_EOF"""
                         ),
                         "notes": task.notes,
                         "key_results": task.key_results,
+                        "evidence_status": task.evidence_status.value,
+                        "evidence_refs": task.evidence_refs,
+                        "conflicts": task.conflicts,
+                        "validator_findings": [
+                            finding.model_dump() for finding in task.validator_findings
+                        ],
                     }
                 )
 
