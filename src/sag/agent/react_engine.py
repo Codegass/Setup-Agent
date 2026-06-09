@@ -151,6 +151,9 @@ class ReActEngine(UIEventEmitter):
         )
         # Cache of the workspace build-file probe (None = not yet probed).
         self._artifact_build_probe: Optional[bool] = None
+        # Artifact count at the first sample; only growth beyond it counts as
+        # progress, so vendored/pre-existing build output can't disarm the guard.
+        self._artifact_baseline: Optional[int] = None
 
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
@@ -189,7 +192,19 @@ class ReActEngine(UIEventEmitter):
             logger.info(f"Repository ref set: {repository_ref}")
 
     def _artifact_signal(self) -> int:
-        """Cheap physical-progress signal: class files + JAR files."""
+        """New build artifacts (.class/JAR) produced since the run started.
+
+        A baseline is captured on the first sample so a repo that *vendors*
+        committed build output (or one cloned with stale artifacts) does not
+        pre-disarm the no-progress guard: only artifacts created during this run
+        count as physical progress."""
+        raw = self._raw_artifact_count()
+        if self._artifact_baseline is None:
+            self._artifact_baseline = raw
+        return max(0, raw - self._artifact_baseline)
+
+    def _raw_artifact_count(self) -> int:
+        """Total class + JAR files currently in the workspace."""
         # `Config` has no project_name; derive it from the context manager
         # (same source used by _validate_physical_state), falling back to None
         # which makes the validator scan the whole workspace recursively.

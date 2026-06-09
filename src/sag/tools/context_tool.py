@@ -588,10 +588,18 @@ class ContextTool(BaseTool):
                     insert_at = i + 1
                     break
 
+        # Bound a single completion's injection: drop non-strings, cap the
+        # count, and truncate over-long descriptions, so a malformed or runaway
+        # proposal can neither crash the (atomic) completion nor bloat the trunk.
+        max_followups = 5
+        max_len = 500
+
         added_ids = []
         seen = set()
-        for raw in next_tasks or []:
-            description = (raw or "").strip()
+        for raw in list(next_tasks or [])[:max_followups]:
+            if not isinstance(raw, str):
+                continue
+            description = raw.strip()[:max_len]
             if not description:
                 continue
             key = " ".join(description.split()).lower()
@@ -804,18 +812,18 @@ class ContextTool(BaseTool):
                 conflicts=conflicts,
             )
 
-            # Save once with all updates
-            self.context_manager._save_trunk_context(fresh_trunk_context)
-
-            # Model-authored follow-up tasks: append concrete next steps the
-            # model proposed for this completion. Reuse the fresh context we
-            # just saved (no extra load), dedup is enforced by add_task.
+            # Model-authored follow-up tasks: insert the concrete next steps the
+            # model proposed BEFORE the single save below, so the whole
+            # completion persists in one write. _apply_next_tasks is robust to
+            # malformed input, so it cannot leave a half-written state.
             if next_tasks:
                 added_ids = self._apply_next_tasks(
                     fresh_trunk_context, next_tasks, after_task_id=current_task_id
                 )
-                self.context_manager._save_trunk_context(fresh_trunk_context)
                 logger.info(f"Model proposed {len(added_ids)} follow-up task(s): {added_ids}")
+
+            # Save once with all updates
+            self.context_manager._save_trunk_context(fresh_trunk_context)
 
             # Clear current task in context manager
             self.context_manager.current_task_id = None

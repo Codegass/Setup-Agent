@@ -1,5 +1,5 @@
 # tests/test_trunk_context_dedup.py
-from sag.agent.context_manager import TrunkContext, TaskStatus
+from sag.agent.context_manager import TrunkContext
 
 
 def _trunk():

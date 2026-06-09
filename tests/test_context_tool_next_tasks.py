@@ -81,6 +81,31 @@ def test_apply_next_tasks_without_after_id_appends_at_tail():
     assert [t.description for t in trunk.todo_list] == ["build", "run_tests", "cleanup"]
 
 
+def test_apply_next_tasks_drops_non_string_elements():
+    # The schema says array of strings; a malformed element (int/list/dict)
+    # must be dropped, not crash the atomic completion.
+    trunk = FakeTrunk()
+    added = ContextTool._apply_next_tasks(trunk, ["real task", 123, ["nested"], None, {"a": 1}])
+    assert trunk.added == ["real task"]
+    assert added == ["task_1"]
+
+
+def test_apply_next_tasks_caps_the_number_of_followups():
+    trunk = FakeTrunk()
+    proposed = [f"task number {i}" for i in range(20)]
+    added = ContextTool._apply_next_tasks(trunk, proposed)
+    # A model cannot flood the trunk with an unbounded number of follow-ups.
+    assert len(trunk.added) <= 5
+    assert len(added) <= 5
+
+
+def test_apply_next_tasks_truncates_overlong_description():
+    trunk = FakeTrunk()
+    ContextTool._apply_next_tasks(trunk, ["x" * 5000])
+    assert len(trunk.added) == 1
+    assert len(trunk.added[0]) <= 500
+
+
 def test_next_tasks_is_exposed_in_parameter_schema():
     # Function-calling mode sends the manual schema to the model; next_tasks
     # must be advertised there or the model can never author follow-ups.
