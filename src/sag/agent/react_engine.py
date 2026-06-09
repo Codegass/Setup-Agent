@@ -29,6 +29,30 @@ from .tool_orchestration import (
 )
 
 
+class NoProgressGuard:
+    """Trips only when a run has completed `threshold` tasks without EVER
+    producing a build artifact. Once any artifact (.class/JAR) appears, the run
+    has made physical progress and the guard never trips again — so it cannot
+    halt a normal build during its test/report phase, only a run that is stuck
+    never building anything (e.g. an analyzer that keeps emitting explore tasks
+    that compile nothing)."""
+
+    def __init__(self, threshold: int = 6):
+        self.threshold = threshold
+        self._ever_built = False
+        self._stagnant = 0
+
+    def update(self, artifact_signal: int) -> bool:
+        if artifact_signal > 0:
+            self._ever_built = True
+            self._stagnant = 0
+            return False
+        if self._ever_built:
+            return False
+        self._stagnant += 1
+        return self._stagnant >= self.threshold
+
+
 class ReActEngine(UIEventEmitter):
     """Core ReAct (Reasoning and Acting) engine with dual model support."""
 
@@ -107,6 +131,12 @@ class ReActEngine(UIEventEmitter):
             docker_orchestrator=orchestrator, project_path="/workspace"
         )
 
+        # No-physical-progress guard: halt a run that completes tasks without
+        # ever producing build artifacts (anti-thrash).
+        self.progress_guard = NoProgressGuard(
+            threshold=getattr(self.config, "no_progress_task_limit", 6)
+        )
+
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
@@ -142,6 +172,24 @@ class ReActEngine(UIEventEmitter):
         logger.info(f"Repository URL set: {repository_url}")
         if repository_ref:
             logger.info(f"Repository ref set: {repository_ref}")
+
+    def _artifact_signal(self) -> int:
+        """Cheap physical-progress signal: class files + JAR files."""
+        try:
+            result = self.physical_validator.validate_build_artifacts(self.config.project_name)
+            return int(result.get("class_files", 0)) + int(result.get("jar_files", 0))
+        except Exception:
+            return 0
+
+    def _check_progress_after_task(self) -> bool:
+        """Return True if the run should stop because no build progress is
+        being made across consecutive completed tasks."""
+        tripped = self.progress_guard.update(self._artifact_signal())
+        if tripped:
+            self.agent_logger.warning(
+                "Stopping: multiple tasks completed with no new build artifacts (no physical progress)."
+            )
+        return tripped
 
     def run_react_loop(
         self,
@@ -238,6 +286,26 @@ class ReActEngine(UIEventEmitter):
                     # Export token usage before successful completion
                     self._export_token_usage_csv()
                     return True
+
+                # NO-PHYSICAL-PROGRESS GUARD: when a task completed this
+                # iteration (a successful complete_with_results) but the run has
+                # produced no build artifacts across several tasks, stop instead
+                # of thrashing to the iteration cap.
+                completed_task_this_iteration = any(
+                    step.step_type == StepType.ACTION
+                    and step.tool_name == "manage_context"
+                    and (step.tool_params or {}).get("action") == "complete_with_results"
+                    and step.tool_result is not None
+                    and step.tool_result.success
+                    for step in parsed_steps
+                )
+                if completed_task_this_iteration and self._check_progress_after_task():
+                    logger.warning(
+                        "ReAct loop stopped: no build progress after repeated completed tasks"
+                    )
+                    # Export token usage before no-progress completion
+                    self._export_token_usage_csv()
+                    return False
 
                 # DEPRECATED: Legacy checks now handled by state_evaluator
                 # Check for context switching guidance
