@@ -16,10 +16,16 @@ class FakeProjectSetupOrchestrator:
         install_success=True,
         java_setup_verification_success=True,
         maven_path=MVN_BIN,
+        pom_content=None,
+        base_maven_version=None,
+        provision_maven_success=True,
     ):
         self.install_success = install_success
         self.java_setup_verification_success = java_setup_verification_success
         self.maven_path = maven_path
+        self.pom_content = pom_content
+        self.base_maven_version = base_maven_version
+        self.provision_maven_success = provision_maven_success
         self.commands = []
         self.files = {}
 
@@ -33,6 +39,30 @@ class FakeProjectSetupOrchestrator:
             if self.install_success:
                 return {"success": True, "output": "installed", "exit_code": 0}
             return {"success": False, "output": "install failed", "exit_code": 100}
+
+        if command.startswith("cat ") and command.endswith("/pom.xml"):
+            if self.pom_content is not None:
+                return {"success": True, "output": self.pom_content, "exit_code": 0}
+            return {"success": False, "output": "", "exit_code": 1}
+
+        if command == "mvn -version":
+            if self.base_maven_version:
+                return {
+                    "success": True,
+                    "output": f"Apache Maven {self.base_maven_version} (base image)",
+                    "exit_code": 0,
+                }
+            return {"success": False, "output": "mvn: not found", "exit_code": 127}
+
+        if command.startswith("mkdir -p /opt &&"):
+            if self.provision_maven_success:
+                return {"success": True, "output": "", "exit_code": 0}
+            return {"success": False, "output": "download failed", "exit_code": 1}
+
+        if command.startswith("test -x /opt/apache-maven-"):
+            if self.provision_maven_success:
+                return {"success": True, "output": "present", "exit_code": 0}
+            return {"success": False, "output": "", "exit_code": 1}
 
         if command.startswith("ls -d /usr/lib/jvm/java-17-openjdk-"):
             return {"success": True, "output": JAVA_HOME, "exit_code": 0}
@@ -259,4 +289,136 @@ def test_failed_project_java_verification_does_not_activate_java_overlay_runtime
     assert result["success"] is True
     overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
     assert "java" not in overlay["tools"]
+    assert overlay["tools"]["maven"]["active"] == MVN_BIN
+
+
+def test_gradle_dependency_install_installs_detected_jdk_and_returns_success():
+    orchestrator = FakeProjectSetupOrchestrator()
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool._install_dependencies_for_project_type(
+        {"type": "gradle"},
+        "/workspace/project",
+        "17",
+    )
+
+    assert result["success"] is True
+
+    install_cmds = [
+        cmd
+        for cmd, _, _ in orchestrator.commands
+        if cmd.startswith("DEBIAN_FRONTEND=noninteractive apt-get install")
+    ]
+    assert install_cmds, "expected an apt-get install command"
+    assert any("openjdk-17-jdk" in cmd for cmd in install_cmds)
+    # Gradle uses the gradlew wrapper, so the maven package must NOT be installed.
+    assert all(not cmd.split("openjdk-17-jdk")[-1].strip().startswith("maven") for cmd in install_cmds)
+    assert all(" maven" not in cmd for cmd in install_cmds)
+
+    overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
+    java_entry = overlay["tools"]["java"]
+    assert java_entry["active"] == JAVA_BIN
+    assert java_entry["candidates"][JAVA_BIN]["version"] == "17"
+    # No maven overlay should be registered for a gradle project.
+    assert "maven" not in overlay["tools"]
+
+
+def test_gradle_dependency_install_without_version_falls_back_to_default_jdk():
+    orchestrator = FakeProjectSetupOrchestrator()
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool._install_dependencies_for_project_type(
+        {"type": "gradle"},
+        "/workspace/project",
+        None,
+    )
+
+    assert result["success"] is True
+
+    install_cmds = [
+        cmd
+        for cmd, _, _ in orchestrator.commands
+        if cmd.startswith("DEBIAN_FRONTEND=noninteractive apt-get install")
+    ]
+    assert install_cmds, "expected an apt-get install command"
+    assert any("default-jdk" in cmd for cmd in install_cmds)
+    assert all("openjdk-" not in cmd for cmd in install_cmds)
+    assert all(" maven" not in cmd for cmd in install_cmds)
+
+
+def test_maven_install_provisions_required_maven_before_build():
+    import re
+
+    pom = (
+        "<project><build><plugins><plugin>"
+        "<artifactId>maven-enforcer-plugin</artifactId>"
+        "<configuration><rules>"
+        "<requireMavenVersion><version>[3.9,)</version></requireMavenVersion>"
+        "</rules></configuration>"
+        "</plugin></plugins></build></project>"
+    )
+    orchestrator = FakeProjectSetupOrchestrator(
+        pom_content=pom,
+        base_maven_version="3.8.7",
+    )
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool._install_dependencies_for_project_type(
+        {"type": "maven"},
+        "/workspace/project",
+        "17",
+    )
+
+    assert result["success"] is True
+
+    # A standalone Maven >= 3.9 must be downloaded and registered as active.
+    assert any(
+        "apache-maven-3.9.9-bin.tar.gz" in cmd for cmd, _, _ in orchestrator.commands
+    ), "expected a standalone Maven download command"
+
+    overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
+    maven_entry = overlay["tools"]["maven"]
+    provisioned_bin = "/opt/apache-maven-3.9.9/bin/mvn"
+    assert maven_entry["active"] == provisioned_bin
+    assert maven_entry["candidates"][provisioned_bin]["version"] == "3.9.9"
+    assert maven_entry["candidates"][provisioned_bin]["path_prepend"] == [
+        "/opt/apache-maven-3.9.9/bin"
+    ]
+
+    # Provisioning must happen proactively, before any build/test goal runs.
+    build_cmds = [
+        cmd
+        for cmd, _, _ in orchestrator.commands
+        if re.match(r"^(\./mvnw|mvn)\s+(clean|compile|package|verify|test|install)\b", cmd)
+    ]
+    assert build_cmds == []
+
+
+def test_maven_install_does_not_provision_when_base_satisfies_requirement():
+    pom = (
+        "<project><build><plugins><plugin>"
+        "<artifactId>maven-enforcer-plugin</artifactId>"
+        "<configuration><rules>"
+        "<requireMavenVersion><version>[3.6,)</version></requireMavenVersion>"
+        "</rules></configuration>"
+        "</plugin></plugins></build></project>"
+    )
+    orchestrator = FakeProjectSetupOrchestrator(
+        pom_content=pom,
+        base_maven_version="3.8.7",
+    )
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool._install_dependencies_for_project_type(
+        {"type": "maven"},
+        "/workspace/project",
+        "17",
+    )
+
+    assert result["success"] is True
+    assert not any(
+        "apache-maven-3.9.9-bin.tar.gz" in cmd for cmd, _, _ in orchestrator.commands
+    )
+
+    overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
     assert overlay["tools"]["maven"]["active"] == MVN_BIN

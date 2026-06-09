@@ -11,6 +11,11 @@ from sag.runtime import EnvOverlayStore
 
 from .base import BaseTool, ToolError, ToolResult
 
+# Standalone Maven version provisioned when a project enforces a minimum greater
+# than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
+# requireMavenVersion enforcement without waiting for build failures.
+MAVEN_PROVISION_VERSION = "3.9.9"
+
 
 class ProjectSetupTool(BaseTool):
     """Tool for project setup tasks like cloning repositories and installing dependencies."""
@@ -834,6 +839,7 @@ class ProjectSetupTool(BaseTool):
                 if java_home:
                     self._register_java_runtime_overlay(java_home, java_version)
                 self._register_maven_runtime_overlay()
+                self._provision_required_maven_if_needed(directory)
 
                 installed_description = (
                     f"Java JDK {java_version or 'default'} and Maven with environment setup"
@@ -871,12 +877,93 @@ class ProjectSetupTool(BaseTool):
                                     java_version if alt_package != "default-jdk" else None,
                                 )
                             self._register_maven_runtime_overlay()
+                            self._provision_required_maven_if_needed(directory)
                             return {
                                 "success": True,
                                 "installed": f"{alt_package} and Maven with environment setup",
                                 "java_version": (
                                     java_version if alt_package != "default-jdk" else None
                                 ),
+                                "java_home": java_home,
+                                "output": alt_result["output"],
+                            }
+
+                return {
+                    "success": False,
+                    "error": result["output"],
+                    "exit_code": result["exit_code"],
+                    "java_version_requested": java_version,
+                }
+
+        elif project_type["type"] == "gradle":
+            # Gradle ships its own build tool via the gradlew wrapper, so only the
+            # JDK needs provisioning here. Do NOT install the maven package.
+            if java_version and java_version.isdigit():
+                java_package = f"openjdk-{java_version}-jdk"
+                logger.info(
+                    f"Installing dependencies for Gradle project with Java {java_version}: {java_package}"
+                )
+            else:
+                java_package = "default-jdk"
+                logger.info("Installing dependencies for Gradle project: default-jdk")
+
+            # 1. Update package lists
+            logger.info("Updating package lists with apt-get update...")
+            update_result = self.orchestrator.execute_command("apt-get update")
+            if not update_result["success"]:
+                logger.warning(
+                    f"apt-get update failed, but proceeding with install: {update_result['output']}"
+                )
+
+            # 2. Install the JDK package only (gradlew wrapper handles the build tool)
+            install_cmd = f"DEBIAN_FRONTEND=noninteractive apt-get install -y {java_package}"
+            result = self.orchestrator.execute_command(install_cmd, workdir=directory)
+
+            if result["success"]:
+                # Setup Java environment after installation
+                java_home = self._setup_java_environment(java_version)
+                if java_home:
+                    self._register_java_runtime_overlay(java_home, java_version)
+
+                installed_description = (
+                    f"Java JDK {java_version or 'default'} with environment setup "
+                    "(Gradle uses the gradlew wrapper)"
+                )
+                return {
+                    "success": True,
+                    "installed": installed_description,
+                    "java_version": java_version,
+                    "java_home": java_home,
+                    "output": result["output"],
+                }
+            else:
+                # Try alternative packages if the specific version fails
+                if java_version and java_package != "default-jdk":
+                    logger.warning(f"Failed to install {java_package}, trying alternative packages")
+                    alt_packages = [
+                        f"openjdk-{java_version}-jdk-headless",
+                        f"java-{java_version}-openjdk",
+                        "default-jdk",  # Final fallback
+                    ]
+
+                    for alt_package in alt_packages:
+                        logger.info(f"Trying alternative package: {alt_package}")
+                        alt_cmd = f"DEBIAN_FRONTEND=noninteractive apt-get install -y {alt_package}"
+                        alt_result = self.orchestrator.execute_command(alt_cmd, workdir=directory)
+                        if alt_result["success"]:
+                            effective_version = (
+                                java_version if alt_package != "default-jdk" else None
+                            )
+                            java_home = self._setup_java_environment(effective_version)
+                            if java_home:
+                                self._register_java_runtime_overlay(java_home, effective_version)
+                            return {
+                                "success": True,
+                                "installed": (
+                                    f"{alt_package} with environment setup "
+                                    "(Gradle uses the gradlew wrapper)"
+                                ),
+                                "java_version": effective_version,
                                 "java_home": java_home,
                                 "output": alt_result["output"],
                             }
@@ -932,6 +1019,140 @@ class ProjectSetupTool(BaseTool):
             )
         except Exception as exc:
             logger.warning(f"Failed to register Maven env overlay: {exc}")
+
+    def _provision_required_maven_if_needed(self, directory: str) -> bool:
+        """Proactively provision a newer Maven when the POM enforces a higher minimum.
+
+        Projects frequently pin a Maven minimum via the enforcer plugin's
+        ``requireMavenVersion`` rule. The base image ships an older Maven (e.g. 3.8.7),
+        so the build would otherwise fail with "Detected Maven Version ... is not in the
+        allowed range" and waste iterations. Installing the enforced minimum up-front,
+        before the first build, avoids that reactive churn.
+
+        Conservative by design: only acts when an enforced minimum is detected AND the
+        installed Maven does not already satisfy it.
+        """
+        try:
+            required = self._detect_maven_version_requirement(directory)
+            if not required:
+                return False
+
+            if self._version_lt(MAVEN_PROVISION_VERSION, required):
+                logger.warning(
+                    f"Enforced Maven minimum {required} exceeds the provisionable version "
+                    f"{MAVEN_PROVISION_VERSION}; leaving Maven resolution to the build step"
+                )
+                return False
+
+            base_version = self._detect_installed_maven_version()
+            if base_version and not self._version_lt(base_version, required):
+                logger.info(
+                    f"Installed Maven {base_version} already satisfies enforced minimum {required}"
+                )
+                return False
+
+            logger.info(
+                f"POM enforces Maven >= {required} but base Maven is "
+                f"{base_version or 'unknown'}; provisioning Maven {MAVEN_PROVISION_VERSION}"
+            )
+            return self._provision_standalone_maven(required)
+        except Exception as exc:
+            logger.warning(f"Proactive Maven provisioning skipped due to error: {exc}")
+            return False
+
+    def _detect_maven_version_requirement(self, directory: str) -> Optional[str]:
+        """Detect an enforced minimum Maven version from the POM's requireMavenVersion rule."""
+        pom_result = self.orchestrator.execute_command(f"cat {directory}/pom.xml")
+        if pom_result.get("exit_code") != 0 or not pom_result.get("output"):
+            return None
+
+        match = re.search(
+            r"<requireMavenVersion>.*?<version>\s*([^<]+?)\s*</version>.*?</requireMavenVersion>",
+            pom_result["output"],
+            re.DOTALL | re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        minimum = self._extract_minimum_version(match.group(1))
+        if minimum:
+            logger.info(f"Detected enforced Maven minimum version: {minimum}")
+        return minimum
+
+    @staticmethod
+    def _extract_minimum_version(raw: str) -> Optional[str]:
+        """Extract the lower-bound version from a Maven version requirement string.
+
+        Handles ranges like ``[3.9,)`` / ``(3.6,4.0)`` and plain pins like ``3.9.9``
+        or ``>=3.9`` by returning the first dotted version sequence found.
+        """
+        match = re.search(r"\d+(?:\.\d+)*", raw or "")
+        return match.group(0) if match else None
+
+    def _detect_installed_maven_version(self) -> Optional[str]:
+        """Return the version reported by the Maven currently on PATH, if any."""
+        result = self.orchestrator.execute_command("mvn -version")
+        output = result.get("output", "") or ""
+        match = re.search(r"Apache Maven\s+(\d+(?:\.\d+)*)", output)
+        return match.group(1) if match else None
+
+    def _provision_standalone_maven(self, required_version: str) -> bool:
+        """Download a standalone Maven distribution and register it as the active runtime."""
+        maven_version = MAVEN_PROVISION_VERSION
+        install_root = "/opt"
+        maven_dir = f"{install_root}/apache-maven-{maven_version}"
+        mvn_bin = f"{maven_dir}/bin/mvn"
+        archive = f"/tmp/apache-maven-{maven_version}-bin.tar.gz"
+        url = (
+            "https://archive.apache.org/dist/maven/maven-3/"
+            f"{maven_version}/binaries/apache-maven-{maven_version}-bin.tar.gz"
+        )
+
+        download_cmd = (
+            f"mkdir -p {install_root} && "
+            f"(curl -fsSL {url} -o {archive} || wget -qO {archive} {url}) && "
+            f"tar -xzf {archive} -C {install_root}"
+        )
+        download_result = self.orchestrator.execute_command(download_cmd)
+        if not download_result.get("success"):
+            logger.warning(
+                f"Failed to download Maven {maven_version}: {download_result.get('output', '')}"
+            )
+            return False
+
+        verify_result = self.orchestrator.execute_command(f"test -x {mvn_bin} && echo present")
+        if "present" not in verify_result.get("output", ""):
+            logger.warning(f"Provisioned Maven binary not found at {mvn_bin}")
+            return False
+
+        try:
+            EnvOverlayStore(self.orchestrator).register(
+                "maven",
+                mvn_bin,
+                version=maven_version,
+                source="project_setup_install",
+                path_prepend=[f"{maven_dir}/bin"],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register provisioned Maven env overlay: {exc}")
+            return False
+
+        logger.info(
+            f"Provisioned and registered Maven {maven_version} to satisfy enforced "
+            f"minimum {required_version}"
+        )
+        return True
+
+    @staticmethod
+    def _version_lt(left: str, right: str) -> bool:
+        """Return True when version ``left`` is strictly lower than ``right``."""
+
+        def to_tuple(version: str):
+            parts = re.findall(r"\d+", version or "")
+            return tuple(int(part) for part in parts) if parts else (0,)
+
+        return to_tuple(left) < to_tuple(right)
 
     def _setup_java_environment(self, java_version: Optional[str] = None):
         """Setup JAVA_HOME environment variable and alternatives for specific Java version."""
