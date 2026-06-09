@@ -85,13 +85,23 @@ class TrunkContext(BaseContext):
         return " ".join((description or "").split()).strip().lower()
 
     def add_task(self, description: str) -> str:
-        """Add a new task to the TODO list.
+        """Add a new task to the end of the TODO list.
 
         De-duplicates against existing tasks (any status): re-issuing a task
         that already exists returns the existing id instead of appending a
         copy. This stops re-planning from piling up identical tasks (e.g. a
         generic "explore" template) that the agent would otherwise re-run
         without noticing.
+        """
+        return self.insert_task(description)
+
+    def insert_task(self, description: str, index: Optional[int] = None) -> str:
+        """Insert a new task at `index` (default: append at the end).
+
+        Shares add_task's de-duplication: an existing identical task keeps its
+        position and id instead of being duplicated. Inserting in the middle is
+        safe because ids are derived from the list length (which only grows), so
+        they stay unique even after positional inserts.
         """
         normalized = self._normalize_task_description(description)
         for existing in self.todo_list:
@@ -101,7 +111,10 @@ class TrunkContext(BaseContext):
 
         task_id = f"task_{len(self.todo_list) + 1}"
         task = Task(id=task_id, description=description)
-        self.todo_list.append(task)
+        if index is None or index >= len(self.todo_list):
+            self.todo_list.append(task)
+        else:
+            self.todo_list.insert(max(0, index), task)
         self.update_timestamp()
         logger.info(f"Added task to TODO: {description}")
         return task_id

@@ -35,14 +35,26 @@ class NoProgressGuard:
     has made physical progress and the guard never trips again — so it cannot
     halt a normal build during its test/report phase, only a run that is stuck
     never building anything (e.g. an analyzer that keeps emitting explore tasks
-    that compile nothing)."""
+    that compile nothing).
+
+    The artifact signal is Java-only (.class/JAR files), so the guard is armed
+    ONLY when an artifact-bearing build is expected (Java/Maven/Gradle). For
+    project types whose build produces no such artifacts (Node.js/Python/Rust/
+    Go), `artifacts_expected` is False and the guard is a no-op — otherwise a
+    perfectly healthy run that simply completes more than `threshold` tasks
+    would be force-stopped because its artifact signal is structurally 0."""
 
     def __init__(self, threshold: int = 6):
         self.threshold = threshold
         self._ever_built = False
         self._stagnant = 0
 
-    def update(self, artifact_signal: int) -> bool:
+    def update(self, artifact_signal: int, artifacts_expected: bool = True) -> bool:
+        # Never arm the guard for project types that cannot produce an
+        # observable build artifact: there is no signal it could ever see, so
+        # tripping would only halt healthy runs.
+        if not artifacts_expected:
+            return False
         if artifact_signal > 0:
             self._ever_built = True
             self._stagnant = 0
@@ -132,10 +144,13 @@ class ReActEngine(UIEventEmitter):
         )
 
         # No-physical-progress guard: halt a run that completes tasks without
-        # ever producing build artifacts (anti-thrash).
+        # ever producing build artifacts (anti-thrash). Only armed for
+        # artifact-bearing builds (Java/Maven/Gradle); see _expects_build_artifacts.
         self.progress_guard = NoProgressGuard(
             threshold=getattr(self.config, "no_progress_task_limit", 6)
         )
+        # Cache of the workspace build-file probe (None = not yet probed).
+        self._artifact_build_probe: Optional[bool] = None
 
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
@@ -175,16 +190,65 @@ class ReActEngine(UIEventEmitter):
 
     def _artifact_signal(self) -> int:
         """Cheap physical-progress signal: class files + JAR files."""
+        # `Config` has no project_name; derive it from the context manager
+        # (same source used by _validate_physical_state), falling back to None
+        # which makes the validator scan the whole workspace recursively.
+        project_name = None
+        if hasattr(self.context_manager, "project_name"):
+            project_name = self.context_manager.project_name
         try:
-            result = self.physical_validator.validate_build_artifacts(self.config.project_name)
+            result = self.physical_validator.validate_build_artifacts(project_name)
             return int(result.get("class_files", 0)) + int(result.get("jar_files", 0))
-        except Exception:
+        except Exception as exc:
+            # Don't let a probe failure silently degrade the guard into an
+            # unconditional "stop after N tasks": surface it.
+            self.agent_logger.warning(f"Artifact-signal probe failed: {exc}")
             return 0
+
+    def _expects_build_artifacts(self) -> bool:
+        """Whether this project is expected to produce observable build
+        artifacts (.class/JAR files) that `_artifact_signal` can count.
+
+        Only Java/Maven/Gradle projects qualify. For Node.js/Python/Rust/Go the
+        artifact signal is structurally always 0, so the no-progress guard must
+        NOT be armed for them — otherwise a healthy run that simply completes
+        more than `threshold` tasks would be force-stopped. We arm the guard
+        only when we POSITIVELY detect an artifact-bearing build."""
+        # Project type discovered during execution (set as Maven/Gradle builds
+        # run) always wins and can flip on at any point in the run.
+        project_type = (self.successful_states.get("project_type") or "").lower()
+        if project_type in ("maven", "gradle", "java"):
+            return True
+
+        # Otherwise probe the workspace once for Java/Maven/Gradle build files.
+        if self._artifact_build_probe is not None:
+            return self._artifact_build_probe
+
+        expects = False
+        try:
+            cmd = (
+                "find /workspace -maxdepth 3 "
+                "\\( -name pom.xml -o -name build.gradle -o -name build.gradle.kts \\) "
+                "-type f 2>/dev/null | head -1"
+            )
+            result = self.physical_validator._execute_command_with_logging(
+                cmd, "build-artifact expectation probe"
+            )
+            expects = bool((result.get("output") or "").strip())
+        except Exception as exc:
+            self.agent_logger.warning(f"Build-artifact expectation probe failed: {exc}")
+            expects = False
+
+        self._artifact_build_probe = expects
+        return expects
 
     def _check_progress_after_task(self) -> bool:
         """Return True if the run should stop because no build progress is
         being made across consecutive completed tasks."""
-        tripped = self.progress_guard.update(self._artifact_signal())
+        tripped = self.progress_guard.update(
+            self._artifact_signal(),
+            artifacts_expected=self._expects_build_artifacts(),
+        )
         if tripped:
             self.agent_logger.warning(
                 "Stopping: multiple tasks completed with no new build artifacts (no physical progress)."

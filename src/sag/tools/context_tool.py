@@ -569,10 +569,25 @@ class ContextTool(BaseTool):
             )
 
     @staticmethod
-    def _apply_next_tasks(trunk_context, next_tasks) -> list:
-        """Add model-proposed follow-up tasks, dropping blanks. Dedup is
-        enforced by TrunkContext.add_task, so verbatim repeats collapse to the
-        existing task id."""
+    def _apply_next_tasks(trunk_context, next_tasks, after_task_id=None) -> list:
+        """Add model-proposed follow-up tasks, dropping blanks.
+
+        When `after_task_id` is given, follow-ups are inserted IMMEDIATELY after
+        the just-completed task — i.e. BEFORE the remaining pending tasks — so a
+        failure-recovery step ("fix X then rebuild") becomes the next action
+        instead of being queued behind tasks that depend on the broken build
+        (get_next_pending_task returns the first pending task in strict order).
+        Without it, follow-ups are appended at the tail. Dedup is enforced by
+        TrunkContext.insert_task, so verbatim repeats collapse to the existing
+        task id.
+        """
+        insert_at = None
+        if after_task_id is not None:
+            for i, task in enumerate(getattr(trunk_context, "todo_list", []) or []):
+                if task.id == after_task_id:
+                    insert_at = i + 1
+                    break
+
         added_ids = []
         seen = set()
         for raw in next_tasks or []:
@@ -583,7 +598,16 @@ class ContextTool(BaseTool):
             if key in seen:
                 continue
             seen.add(key)
-            added_ids.append(trunk_context.add_task(description))
+            if insert_at is None:
+                added_ids.append(trunk_context.add_task(description))
+            else:
+                len_before = len(trunk_context.todo_list)
+                added_ids.append(trunk_context.insert_task(description, insert_at))
+                # Only advance the cursor when a task was actually inserted
+                # (dedup may collapse it onto an existing task elsewhere),
+                # keeping the proposed follow-ups in their given order.
+                if len(trunk_context.todo_list) > len_before:
+                    insert_at += 1
         return added_ids
 
     def _complete_task_with_results(
@@ -787,7 +811,9 @@ class ContextTool(BaseTool):
             # model proposed for this completion. Reuse the fresh context we
             # just saved (no extra load), dedup is enforced by add_task.
             if next_tasks:
-                added_ids = self._apply_next_tasks(fresh_trunk_context, next_tasks)
+                added_ids = self._apply_next_tasks(
+                    fresh_trunk_context, next_tasks, after_task_id=current_task_id
+                )
                 self.context_manager._save_trunk_context(fresh_trunk_context)
                 logger.info(f"Model proposed {len(added_ids)} follow-up task(s): {added_ids}")
 
@@ -1077,6 +1103,17 @@ IMPORTANT:
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Optional contradiction ids discovered during the task",
+                    "default": None,
+                },
+                "next_tasks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Optional model-authored follow-up tasks (for complete_with_results). "
+                        "Each entry is a concrete, specific next action; follow-ups run NEXT "
+                        "(inserted right after this task, before remaining pending tasks). "
+                        "Make each DIFFERENT from anything already attempted."
+                    ),
                     "default": None,
                 },
                 "new_context": {
