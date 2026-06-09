@@ -11,6 +11,33 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from .base import ToolResult
+
+
+def detached_handoff_tool_result(
+    tool_name: str, command: str, result: Dict[str, Any]
+) -> ToolResult:
+    """ToolResult for a build command handed off to background execution.
+
+    The command is still running (dispatch_status="running_detached"); success
+    is True because nothing failed — the observation tells the agent how to
+    poll the log tail and detect completion.
+    """
+    dispatch = result.get("dispatch") or {}
+    return ToolResult(
+        success=True,
+        output=result.get("output", ""),
+        metadata={
+            "dispatch_status": "running_detached",
+            "tool": tool_name,
+            "command": command,
+            "pid": dispatch.get("pid"),
+            "log_path": dispatch.get("log_path"),
+            "exit_code_path": dispatch.get("exit_code_path"),
+            "soft_timeout": dispatch.get("soft_timeout"),
+        },
+    )
+
 
 class BuildAnalyzer:
     """Centralized build output analysis following DRY principle."""

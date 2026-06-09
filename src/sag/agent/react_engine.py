@@ -1,6 +1,7 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -27,6 +28,21 @@ from .tool_orchestration import (
     ToolLifecycleEvent,
     ToolOrchestrator,
 )
+
+
+def wall_clock_exceeded(
+    start_time: float, cap_seconds: Optional[float], now: Optional[float] = None
+) -> bool:
+    """Whether a run's global wall-clock cap has been exceeded.
+
+    A cap of None/0/negative disables the check. This bounds total run time
+    regardless of per-command behavior — long builds are no longer hard-killed
+    per command (dispatch-and-poll), so this is the run's only hard time limit.
+    """
+    if not cap_seconds or cap_seconds <= 0:
+        return False
+    current = now if now is not None else time.time()
+    return (current - start_time) > cap_seconds
 
 
 class NoProgressGuard:
@@ -312,8 +328,20 @@ class ReActEngine(UIEventEmitter):
         previous_completion_mode = self.state_evaluator.completion_mode
         self.state_evaluator.completion_mode = completion_mode
 
+        run_started_at = time.time()
+        wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
+
         try:
             while self.current_iteration < max_iter:
+                if wall_clock_exceeded(run_started_at, wall_clock_cap):
+                    elapsed = time.time() - run_started_at
+                    logger.warning(
+                        f"ReAct loop stopped: global wall-clock cap of {wall_clock_cap}s "
+                        f"reached after {elapsed:.0f}s / {self.current_iteration} iterations"
+                    )
+                    self._export_token_usage_csv()
+                    return False
+
                 self.current_iteration += 1
                 self.agent_logger.info(f"ReAct iteration {self.current_iteration}/{max_iter}")
 

@@ -11,6 +11,7 @@ from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceStatus, TestStats
 
 from .base import BaseTool, ToolError, ToolResult
+from .build_utils import detached_handoff_tool_result
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 
@@ -197,7 +198,16 @@ class GradleTool(BaseTool):
                 ]
             )
 
-            if is_long_running and hasattr(self.orchestrator, "execute_command_with_monitoring"):
+            if is_long_running and hasattr(self.orchestrator, "execute_command_with_soft_timeout"):
+                # Dispatch-and-poll: run detached with a soft window; if still
+                # running when it closes, hand the log tail back to the agent
+                # instead of killing a legitimately long build.
+                logger.info(f"Executing Gradle command via dispatch-and-poll: {gradle_cmd}")
+                result = self.orchestrator.execute_command_with_soft_timeout(
+                    gradle_cmd,
+                    workdir=working_directory,
+                )
+            elif is_long_running and hasattr(self.orchestrator, "execute_command_with_monitoring"):
                 # Use monitoring version with extended timeouts for build commands
                 logger.info(f"Executing Gradle command with extended timeout: {gradle_cmd}")
                 result = self.orchestrator.execute_command_with_monitoring(
@@ -212,6 +222,9 @@ class GradleTool(BaseTool):
                 result = self.orchestrator.execute_command(
                     gradle_cmd, workdir=working_directory, timeout=timeout
                 )
+
+            if result.get("dispatch_status") == "running_detached":
+                return detached_handoff_tool_result("gradle", gradle_cmd, result)
 
             if result.get("termination_reason"):
                 return self._timeout_result_from_command(result, gradle_cmd, tasks)

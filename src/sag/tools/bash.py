@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolError, ToolResult
+from .build_utils import detached_handoff_tool_result
 
 
 @dataclass
@@ -637,7 +638,23 @@ class BashTool(BaseTool):
             if is_background and self.config.enable_background_processes:
                 return self._execute_background_command(command, workdir, env_vars)
 
-            if is_long_running_command:
+            if is_long_running_command and hasattr(
+                self.docker_orchestrator, "execute_command_with_soft_timeout"
+            ):
+                # Dispatch-and-poll: run detached with a soft window bounded by
+                # the caller's timeout; if still running when it closes, hand
+                # the log tail back instead of killing the process.
+                soft_timeout = min(timeout, self._dispatch_soft_timeout_default())
+                logger.info(
+                    f"🔍 Using dispatch-and-poll for long-running command (soft window: {soft_timeout}s)"
+                )
+                result = self.docker_orchestrator.execute_command_with_soft_timeout(
+                    command=command,
+                    workdir=workdir,
+                    environment=env_vars,
+                    soft_timeout=soft_timeout,
+                )
+            elif is_long_running_command:
                 # Get dynamic timeouts based on command type
                 silent_timeout, absolute_timeout = self._get_command_timeout(command)
                 absolute_timeout = timeout
@@ -665,6 +682,11 @@ class BashTool(BaseTool):
                     environment=env_vars,
                     timeout=timeout,
                 )
+
+            # Handle dispatch-and-poll handoff: the command is still running in
+            # the background; tell the agent how to poll the log tail.
+            if result.get("dispatch_status") == "running_detached":
+                return detached_handoff_tool_result("bash", command, result)
 
             # Handle timeout terminations
             if result.get("termination_reason"):
@@ -1008,6 +1030,11 @@ class BashTool(BaseTool):
                 return True
 
         return False
+
+    def _dispatch_soft_timeout_default(self) -> int:
+        """Configured soft window for dispatch-and-poll (settings fallback 900s)."""
+        config = getattr(self.docker_orchestrator, "config", None)
+        return getattr(config, "dispatch_soft_timeout_seconds", 900) or 900
 
     def _detect_completion_signals(self, output: str, command: str) -> dict:
         """Detect completion signals in command output."""

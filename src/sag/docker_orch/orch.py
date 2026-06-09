@@ -5,6 +5,7 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -752,6 +753,8 @@ class DockerOrchestrator:
             "process_terminated": False,
             "termination_reason": None,
             "cpu_warnings": 0,
+            # Liveness-probe fragment for blind enforcement if the stream dies.
+            "command_fragment": command[:60],
         }
 
         try:
@@ -906,6 +909,226 @@ class DockerOrchestrator:
         )
         return optimized_command
 
+    DISPATCH_DIR = "/tmp/sag_jobs"
+
+    def execute_command_detached(
+        self,
+        command: str,
+        workdir: Optional[str] = None,
+        environment: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Start a command detached from the exec stream.
+
+        Output goes to a container log file and the exit code to <log>.exit
+        when the command finishes; the process is never killed by a stream or
+        socket failure. Returns a handle for poll_detached_command.
+        """
+        job_id = uuid.uuid4().hex[:12]
+        log_path = f"{self.DISPATCH_DIR}/{job_id}.log"
+        exit_code_path = f"{log_path}.exit"
+
+        runtime_profile_prefix = self._runtime_profile_prefix()
+        if workdir:
+            inner = f"{runtime_profile_prefix}; cd {shlex.quote(workdir)} && {command}"
+        else:
+            inner = f"{runtime_profile_prefix}; {command}"
+        wrapped = f"{inner}; echo $? > {shlex.quote(exit_code_path)}"
+        launcher = (
+            f"mkdir -p {self.DISPATCH_DIR} && "
+            f"nohup bash -c {shlex.quote(wrapped)} > {shlex.quote(log_path)} 2>&1 & echo $!"
+        )
+
+        result = self.execute_command(
+            launcher, workdir=None, environment=environment, timeout=60
+        )
+
+        pid: Optional[int] = None
+        for token in reversed((result.get("output") or "").split()):
+            if token.isdigit():
+                pid = int(token)
+                break
+        started = result.get("exit_code") == 0 and pid is not None
+
+        if started:
+            logger.info(f"🚀 Dispatched detached command (pid {pid}, log {log_path}): {command}")
+        else:
+            logger.error(
+                f"Failed to dispatch detached command: {command} "
+                f"(exit={result.get('exit_code')}, output={result.get('output', '')[:200]})"
+            )
+
+        return {
+            "started": started,
+            "job_id": job_id,
+            "pid": pid,
+            "log_path": log_path,
+            "exit_code_path": exit_code_path,
+            "command": command,
+            "launch_output": result.get("output", ""),
+        }
+
+    def poll_detached_command(self, handle: Dict[str, Any], tail_lines: int = 40) -> Dict[str, Any]:
+        """Poll a detached command: completion state, exit code, and log tail."""
+        log_path = shlex.quote(handle["log_path"])
+        exit_code_path = shlex.quote(handle["exit_code_path"])
+        pid = handle.get("pid")
+
+        liveness = (
+            f'elif kill -0 {int(pid)} 2>/dev/null; then echo "STATE:RUNNING"; '
+            if pid
+            else ""
+        )
+        probe = (
+            f'if [ -f {exit_code_path} ]; then echo "STATE:EXIT:$(cat {exit_code_path})"; '
+            f'{liveness}'
+            f'else echo "STATE:VANISHED"; fi; '
+            f'echo "SIZE:$(wc -c < {log_path} 2>/dev/null || echo 0)"; '
+            f'echo "---TAIL---"; tail -n {int(tail_lines)} {log_path} 2>/dev/null'
+        )
+        result = self.execute_command(probe, workdir=None, timeout=60)
+        output = result.get("output") or ""
+
+        finished = False
+        running = False
+        exit_code: Optional[int] = None
+        log_size = 0
+        for line in output.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("STATE:EXIT:"):
+                finished = True
+                code_text = stripped.rsplit(":", 1)[-1].strip()
+                try:
+                    exit_code = int(code_text)
+                except ValueError:
+                    exit_code = None
+            elif stripped == "STATE:RUNNING":
+                running = True
+            elif stripped.startswith("SIZE:"):
+                try:
+                    log_size = int(stripped.split(":", 1)[1].strip())
+                except ValueError:
+                    log_size = 0
+        tail = output.split("---TAIL---", 1)[1].strip() if "---TAIL---" in output else ""
+
+        return {
+            "finished": finished,
+            "running": running,
+            "exit_code": exit_code,
+            "tail": tail,
+            "log_size": log_size,
+            "probe_success": result.get("exit_code") == 0,
+        }
+
+    def execute_command_with_soft_timeout(
+        self,
+        command: str,
+        workdir: Optional[str] = None,
+        environment: Optional[Dict[str, str]] = None,
+        soft_timeout: Optional[int] = None,
+        poll_interval: Optional[float] = None,
+        tail_lines: int = 40,
+    ) -> Dict[str, Any]:
+        """Dispatch-and-poll execution with a soft window (no hard kill).
+
+        The command runs detached with output in a container log file. If it
+        finishes within soft_timeout, the result looks like a normal
+        execute_command result. If it is still running when the window closes,
+        the result is a handoff (dispatch_status="running_detached") carrying
+        the log tail and poll instructions — the process keeps running and the
+        agent checks the log tail across iterations; only the run-level
+        wall-clock cap bounds it.
+        """
+        config = getattr(self, "config", None)
+        if soft_timeout is None:
+            soft_timeout = getattr(config, "dispatch_soft_timeout_seconds", 900) or 900
+        if poll_interval is None:
+            poll_interval = getattr(config, "dispatch_poll_interval_seconds", 15) or 15
+
+        handle = self.execute_command_detached(command, workdir=workdir, environment=environment)
+        if not handle.get("started"):
+            return {
+                "success": False,
+                "exit_code": 1,
+                "output": f"Failed to dispatch command: {handle.get('launch_output', '')}",
+                "termination_reason": None,
+                "dispatch_status": "dispatch_failed",
+                "dispatch": handle,
+            }
+
+        deadline = time.time() + max(1, int(soft_timeout))
+        # Short early polls catch quick commands without paying a full interval.
+        delays = [2, 5, 10]
+        poll_count = 0
+        while True:
+            now = time.time()
+            if now >= deadline:
+                break
+            delay = delays[poll_count] if poll_count < len(delays) else poll_interval
+            time.sleep(max(0.05, min(delay, deadline - now)))
+            poll_count += 1
+            poll = self.poll_detached_command(handle, tail_lines=tail_lines)
+            if poll.get("finished") or (poll.get("probe_success") and not poll.get("running")):
+                return self._collect_detached_result(handle, poll)
+
+        final_poll = self.poll_detached_command(handle, tail_lines=tail_lines)
+        if final_poll.get("finished") or (
+            final_poll.get("probe_success") and not final_poll.get("running")
+        ):
+            return self._collect_detached_result(handle, final_poll)
+
+        logger.info(
+            f"⏳ Soft window of {soft_timeout}s expired; handing off still-running command "
+            f"(pid {handle['pid']}, log {handle['log_path']})"
+        )
+        handoff_output = (
+            f"⏳ Command still running after the {soft_timeout}s soft window — it was left "
+            f"running in the background (NOT killed).\n"
+            f"Background job: pid {handle['pid']}, log file {handle['log_path']}\n"
+            f"Last output:\n{final_poll.get('tail') or '(no output yet)'}\n\n"
+            f"NEXT STEPS — poll the log instead of re-running the command:\n"
+            f"  1. Progress: bash(command=\"tail -n 50 {handle['log_path']}\")\n"
+            f"  2. Completion: bash(command=\"cat {handle['exit_code_path']} 2>/dev/null || echo STILL_RUNNING\") "
+            f"— prints the exit code once the command finishes\n"
+            f"  3. Do other useful work between polls; do NOT start the same build again."
+        )
+        return {
+            "success": True,
+            "exit_code": None,
+            "output": handoff_output,
+            "termination_reason": None,
+            "dispatch_status": "running_detached",
+            "dispatch": {
+                **handle,
+                "last_tail": final_poll.get("tail", ""),
+                "log_size": final_poll.get("log_size", 0),
+                "soft_timeout": soft_timeout,
+            },
+        }
+
+    def _collect_detached_result(
+        self, handle: Dict[str, Any], poll: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Build an execute_command-shaped result for a finished detached command."""
+        log_result = self.execute_command(
+            f"cat {shlex.quote(handle['log_path'])}", workdir=None, timeout=120
+        )
+        output = log_result.get("output") or poll.get("tail") or ""
+
+        exit_code = poll.get("exit_code")
+        if exit_code is None:
+            # Process gone without an exit file (crashed/killed) — fail safe.
+            exit_code = 1
+            output += "\n[detached command ended without recording an exit code]"
+
+        return {
+            "success": exit_code == 0,
+            "exit_code": exit_code,
+            "output": output,
+            "termination_reason": None,
+            "dispatch_status": "completed_detached",
+            "dispatch": handle,
+        }
+
     def _monitor_execution_with_timeouts(
         self, exec_result, monitoring_state: dict, silent_timeout: int, absolute_timeout: int
     ) -> Dict[str, Any]:
@@ -913,10 +1136,16 @@ class DockerOrchestrator:
 
         output_buffer = []
         last_chunk_time = time.time()
+        saw_stream_read_timeout = False
+        stream_broken = False
 
         try:
-            # Read output stream with timeout monitoring
-            for chunk in exec_result.output:
+            # Read output stream with timeout monitoring. Timeout checks run
+            # BEFORE each read so they fire even when no chunk ever arrives —
+            # a socket read timeout on the stream must not disable enforcement
+            # (that suppression let a 1200s-capped gradle build run for 20000s).
+            stream = iter(exec_result.output)
+            while True:
                 current_time = time.time()
 
                 # Check absolute timeout
@@ -932,6 +1161,31 @@ class DockerOrchestrator:
                     monitoring_state["termination_reason"] = "silent_timeout"
                     self._terminate_container_processes()
                     break
+
+                try:
+                    chunk = next(stream)
+                except StopIteration:
+                    # A generator that previously raised is closed for good, so
+                    # a StopIteration right after a read timeout means the
+                    # stream died — NOT that the process finished.
+                    if saw_stream_read_timeout:
+                        stream_broken = True
+                    break
+                except Exception as stream_exc:
+                    if self._is_stream_read_timeout(stream_exc):
+                        saw_stream_read_timeout = True
+                        logger.warning(
+                            f"📡 Output stream read timeout ({stream_exc}); "
+                            "continuing wall-clock timeout enforcement"
+                        )
+                        continue
+                    raise
+
+                # A chunk arrived after a read timeout: the stream is resumable,
+                # so a later StopIteration is a genuine end-of-stream.
+                saw_stream_read_timeout = False
+
+                current_time = time.time()
 
                 # Process the chunk
                 if chunk[0]:  # stdout
@@ -953,6 +1207,14 @@ class DockerOrchestrator:
                     output_buffer.append(f"STDERR: {decoded_chunk}")
                     last_chunk_time = current_time
                     monitoring_state["last_output_time"] = current_time
+
+            # The stream died after a read timeout but the container process
+            # may still be running unsupervised — keep enforcing the same
+            # wall-clock timeouts without output visibility.
+            if stream_broken and monitoring_state["termination_reason"] is None:
+                self._enforce_timeouts_without_stream(
+                    monitoring_state, silent_timeout, absolute_timeout, last_chunk_time
+                )
 
             # Combine all output
             full_output = "".join(output_buffer)
@@ -1004,6 +1266,82 @@ class DockerOrchestrator:
                 "termination_reason": "monitoring_error",
                 "monitoring_info": monitoring_state,
             }
+
+    @staticmethod
+    def _is_stream_read_timeout(exc: Exception) -> bool:
+        """Whether a streaming-exec exception is a socket read timeout.
+
+        Covers socket.timeout/TimeoutError plus the requests/urllib3 wrappers
+        docker-py surfaces ("Read timed out. (read timeout=60)").
+        """
+        if isinstance(exc, TimeoutError):
+            return True
+        return "read timed out" in str(exc).lower()
+
+    def _command_still_running(self, command_fragment: str) -> Optional[bool]:
+        """Best-effort liveness probe for a command after its stream died.
+
+        Returns True/False when the probe works, None when it cannot tell
+        (probe failure must not be mistaken for process exit).
+        """
+        fragment = (command_fragment or "").strip()
+        if not fragment:
+            return None
+        try:
+            probe = (
+                f"ps -eo args | grep -F {shlex.quote(fragment)} | grep -v grep | head -1"
+            )
+            result = self.execute_command(probe, workdir=None, timeout=30)
+            if result.get("exit_code") != 0:
+                return None
+            return bool((result.get("output") or "").strip())
+        except Exception as exc:
+            logger.debug(f"Liveness probe failed: {exc}")
+            return None
+
+    def _enforce_timeouts_without_stream(
+        self,
+        monitoring_state: dict,
+        silent_timeout: int,
+        absolute_timeout: int,
+        last_chunk_time: float,
+    ) -> None:
+        """Enforce absolute/silent timeouts after the output stream died.
+
+        The docker exec output generator is closed once it raises (e.g. a
+        socket read timeout), but the container process keeps running. Poll
+        for liveness and apply the same timeout rules the streaming loop
+        would; terminate on breach. Without this, a broken stream silently
+        disabled all enforcement and runaway builds consumed the whole run.
+        """
+        poll_interval = monitoring_state.get("blind_poll_interval", 10.0)
+        fragment = monitoring_state.get("command_fragment") or ""
+        logger.warning(
+            "📡 Output stream lost; enforcing timeouts blind "
+            f"(absolute={absolute_timeout}s, silent={silent_timeout}s)"
+        )
+        while True:
+            now = time.time()
+            if now - monitoring_state["start_time"] > absolute_timeout:
+                logger.error(
+                    f"⏰ ABSOLUTE TIMEOUT (stream lost): command exceeded {absolute_timeout}s limit"
+                )
+                monitoring_state["termination_reason"] = "absolute_timeout"
+                self._terminate_container_processes()
+                return
+            if now - last_chunk_time > silent_timeout:
+                logger.warning(
+                    f"🔇 SILENT TIMEOUT (stream lost): no observed output for {silent_timeout}s"
+                )
+                monitoring_state["termination_reason"] = "silent_timeout"
+                self._terminate_container_processes()
+                return
+            if self._command_still_running(fragment) is False:
+                logger.info("📡 Process finished after stream loss; ending monitoring")
+                return
+            remaining_absolute = absolute_timeout - (now - monitoring_state["start_time"])
+            remaining_silent = silent_timeout - (now - last_chunk_time)
+            time.sleep(max(0.05, min(poll_interval, remaining_absolute, remaining_silent)))
 
     def _monitor_cpu_usage(self, monitoring_state: dict, check_interval: int):
         """Monitor CPU usage to detect hung processes."""
