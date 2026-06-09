@@ -144,6 +144,11 @@ class ReActEngine(UIEventEmitter):
             project_path="/workspace",
             test_pass_threshold=self.config.test_pass_threshold,
         )
+        # Share the validator with the context manager so ContextTool's
+        # completion-evidence gate reuses it (probe cache + threshold) instead
+        # of constructing a fresh one per completion attempt.
+        if getattr(self.context_manager, "physical_validator", None) is None:
+            self.context_manager.physical_validator = self.physical_validator
 
         # No-physical-progress guard: halt a run that completes tasks without
         # ever producing build artifacts (anti-thrash). Only armed for
@@ -916,116 +921,6 @@ class ReActEngine(UIEventEmitter):
 
         # DEPRECATED: Task completion detection now handled by state_evaluator
         # self._check_task_completion_opportunity(observation)
-
-    def _is_task_complete(self) -> bool:
-        """Check if the current task is complete."""
-        # Check for report tool completion signal (highest priority)
-        recent_steps = self.steps[-3:] if len(self.steps) >= 3 else self.steps
-
-        for step in recent_steps:
-            if step.step_type == StepType.ACTION and step.tool_name == "report":
-                if step.tool_result and step.tool_result.success:
-                    metadata = step.tool_result.metadata or {}
-                    if metadata.get("completion_signal") or metadata.get("task_completed"):
-                        logger.info("Task completion detected via report tool")
-                        return True
-
-        # Check for successful Maven test completion (rule-based completion)
-        if self._check_maven_completion():
-            logger.info("Task completion detected via Maven success criteria")
-            return True
-
-        # Look at recent steps for EXPLICIT completion indicators
-        recent_steps = self.steps[-5:] if len(self.steps) >= 5 else self.steps
-
-        for step in recent_steps:
-            if step.step_type == StepType.THOUGHT:
-                content_lower = step.content.lower()
-                # Only consider overall completion phrases, not individual task completion
-                if any(
-                    phrase in content_lower
-                    for phrase in [
-                        "all tasks completed",
-                        "project setup complete",
-                        "setup finished",
-                        "build and test complete",
-                        "maven build successful and report generated",
-                        "final report completed",
-                    ]
-                ):
-                    logger.info(f"Task completion detected via thought: {step.content[:100]}...")
-                    return True
-
-            elif step.step_type == StepType.ACTION and step.tool_name == "manage_context":
-                # Only consider trunk context operations that indicate ALL tasks are done
-                if step.tool_params and step.tool_params.get("action") == "complete_task":
-                    # Check if this was the completion of the LAST task
-                    if step.tool_result and step.tool_result.success and step.tool_result.metadata:
-                        metadata = step.tool_result.metadata
-                        # Only complete if there are no more tasks OR if explicit completion signal
-                        if metadata.get("all_tasks_completed") or not metadata.get("next_task"):
-                            logger.info("Task completion detected: all TODO tasks completed")
-                            return True
-
-                # Don't treat individual branch task completion as overall completion
-                # The agent should continue with the next task in the TODO list
-
-        return False
-
-    def _check_maven_completion(self) -> bool:
-        """Check if Maven project has been successfully built and tested."""
-        # Look for successful Maven test execution in recent steps
-        recent_steps = self.steps[-10:] if len(self.steps) >= 10 else self.steps
-
-        maven_compile_success = False
-        maven_test_success = False
-
-        for step in recent_steps:
-            if (
-                step.step_type == StepType.ACTION
-                and step.tool_name == "maven"
-                and step.tool_result
-                and step.tool_result.success
-            ):
-
-                output = step.tool_result.output or ""
-                command = step.tool_params.get("command", "") if step.tool_params else ""
-
-                # Check for successful compilation
-                if "compile" in command.lower() and "BUILD SUCCESS" in output:
-                    maven_compile_success = True
-                    logger.debug("Maven compile success detected")
-
-                # Check for successful test execution
-                if (
-                    "test" in command.lower()
-                    and "BUILD SUCCESS" in output
-                    and "Tests run:" in output
-                ):
-
-                    # Parse test results
-                    import re
-
-                    test_match = re.search(
-                        r"Tests run: (\d+), Failures: (\d+), Errors: (\d+)", output
-                    )
-                    if test_match:
-                        total, failures, errors = map(int, test_match.groups())
-                        if failures == 0 and errors == 0 and total > 0:
-                            maven_test_success = True
-                            logger.info(
-                                f"Maven test success detected: {total} tests, 0 failures, 0 errors"
-                            )
-
-        # Consider task complete if test succeeded (test usually includes compilation)
-        # OR if both compile and test succeeded explicitly
-        if maven_test_success or (maven_compile_success and maven_test_success):
-            logger.info("Maven project completion criteria met: test successful")
-            # Add completion guidance for the agent
-            self._add_completion_guidance("Maven build and test completed successfully")
-            return True
-
-        return False
 
     def _add_completion_guidance(self, reason: str):
         """Add guidance to help agent recognize task completion."""

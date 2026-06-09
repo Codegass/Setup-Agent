@@ -587,11 +587,15 @@ class AgentStateEvaluator:
                     # Check for completion signal in metadata
                     metadata = getattr(step.tool_result, "metadata", {})
                     if metadata.get("completion_signal") or metadata.get("task_completed"):
-                        # A run cannot be reported complete while a build/test
+                        # A run cannot be reported SUCCESSFUL while a build/test
                         # task in the plan still has no real build artifacts.
                         # This closes the "build/compile task closed with 0
-                        # artifacts but the run ended successful" defect.
-                        if not self._run_build_evidence_satisfied():
+                        # artifacts but the run ended successful" defect. An
+                        # honest fail/partial report is allowed to end the run
+                        # (withholding it would just spin to max_iterations).
+                        status = str(metadata.get("status") or "").lower()
+                        claims_success = status in ("", "success")
+                        if claims_success and not self._run_build_evidence_satisfied():
                             logger.warning(
                                 "Run-complete signal withheld: a build/test task has no physical build artifacts."
                             )
@@ -631,7 +635,8 @@ class AgentStateEvaluator:
 
         try:
             trunk = self.context_manager.load_trunk_context()
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Run-success build-evidence gate skipped (trunk unavailable): {exc}")
             return True
 
         todo = getattr(trunk, "todo_list", None) if trunk is not None else None
@@ -650,10 +655,14 @@ class AgentStateEvaluator:
         if not has_build_task:
             return True
 
-        project_name = getattr(self.context_manager, "project_name", None)
+        # Project name lives on the trunk context (ContextManager has no
+        # project_name attribute); without it the probe would scan the
+        # workspace root, detect no build system, and never object.
+        project_name = getattr(trunk, "project_name", None)
         try:
             build_status = validator.validate_build_status(project_name)
-        except Exception:
+        except Exception as exc:
+            logger.warning(f"Run-success build-evidence gate skipped (probe error): {exc}")
             return True
 
         build_system = (build_status.get("evidence") or {}).get("build_system")

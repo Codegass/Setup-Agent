@@ -139,6 +139,10 @@ class ContextTool(BaseTool):
                     next_tasks=next_tasks,
                 )
 
+        except ToolError:
+            # Preserve structured errors (suggestions, error_code, the
+            # force=True escape hint) instead of re-wrapping them generically.
+            raise
         except Exception as e:
             raise ToolError(
                 message=f"Context management failed: {str(e)}",
@@ -1394,20 +1398,33 @@ IMPORTANT:
         return re.search(r"(^|\W)errors?(:|\W|$)", normalized) is not None
 
     def _is_test_task_description(self, task_description: str) -> bool:
-        """A build/test task is a TEST task when it mentions test/verify terms.
+        """A build/test task is a TEST task when it mentions "test"/"tests".
 
-        Anything else that qualifies as build/test (compile/build/package/install)
-        is treated as a compile/build task. Callers must first confirm the task is
-        build/test via `_is_build_or_test_task_description`.
+        Word-boundary match so e.g. "latest" does not classify a provisioning
+        task as a test task. Callers must first confirm the task is build/test
+        via `_is_build_or_test_task_description`.
         """
-        return any(term in task_description for term in ("test", "verify"))
+        return re.search(r"\btests?\b", task_description) is not None
+
+    def _is_compile_or_package_task_description(self, task_description: str) -> bool:
+        """Whether the task asks for compiled output (vs. provisioning/setup)."""
+        return re.search(r"\b(compile|build|package)\b", task_description) is not None
+
+    def _mentions_java_build_tool(self, task_description: str) -> bool:
+        """Only maven/gradle tasks can be judged on .class/JAR/report evidence."""
+        return any(term in task_description for term in ("maven", "mvn", "gradle"))
+
+    def _is_dependency_setup_task_description(self, task_description: str) -> bool:
+        """Dependency installation legitimately produces no compiled artifacts."""
+        return re.search(r"\bdependenc(?:y|ies)\b", task_description) is not None
 
     def _documents_unmet_requirement(self, combined_results: str) -> bool:
         """Whether the task documents a still-unmet toolchain requirement.
 
         Scans the completion summary/key_results AND the branch-history
-        observations for tight, high-signal phrases (the literal strings a
-        missing JDK/Maven emit). Kept narrow to avoid false positives.
+        observations/action outputs for tight, high-signal phrases (the literal
+        strings a missing JDK/Maven emit). Thought entries are excluded — the
+        agent merely *mentioning* a requirement must not arm the gate.
         """
         unmet_phrases = (
             "java_home is not set",
@@ -1423,7 +1440,7 @@ IMPORTANT:
             except Exception:
                 branch_history = None
             for entry in getattr(branch_history, "history", []) or []:
-                if isinstance(entry, dict):
+                if isinstance(entry, dict) and entry.get("type") in ("action", "observation"):
                     texts.append(
                         " ".join(
                             str(entry.get(field) or "")
@@ -1450,7 +1467,7 @@ IMPORTANT:
         if branch_history is None:
             return False
 
-        remediation_tools = {"project_setup", "system"}
+        remediation_tools = {"project_setup", "system", "env"}
         remediation_markers = (
             "apt-get",
             "apt install",
@@ -1460,7 +1477,6 @@ IMPORTANT:
             "update-alternatives",
             "openjdk",
             "default-jdk",
-            "jdk",
             "export java_home",
             "java_home=",
             "sdk install",
@@ -1512,23 +1528,47 @@ IMPORTANT:
             logger.warning(f"Could not build PhysicalValidator for completion gate: {exc}")
             return None
 
+    def _get_completion_project_name(self) -> Optional[str]:
+        """Project name for physical probes, read from the trunk context.
+
+        ContextManager itself has no project_name attribute — only the trunk
+        context does. None is acceptable (the validator then probes the
+        workspace root) but loses Phase-2 build-system precision.
+        """
+        try:
+            trunk = self.context_manager.load_trunk_context()
+        except Exception:
+            return None
+        return getattr(trunk, "project_name", None) if trunk is not None else None
+
     def _validate_build_test_physical_evidence(
         self, task_description: str
     ) -> Optional[Dict[str, Any]]:
-        """Block a build/test completion that lacks physical evidence.
+        """Block a maven/gradle build/test completion that lacks physical evidence.
 
-        compile/build task -> require .class/JAR artifacts on disk;
-        test task          -> require parsed test reports on disk.
+        compile/build/package task -> require .class/JAR artifacts on disk;
+        test task                  -> require parsed test reports on disk.
+
+        Scoped to tasks naming a Java build tool AND (for the artifact check)
+        a probe-confirmed maven/gradle build system — Node/Python/etc. builds
+        structurally have no .class/JAR/surefire evidence and must never be
+        judged on it. Dependency-setup tasks are exempt (resolving dependencies
+        legitimately compiles nothing).
 
         Returns a validation-failure dict to block, or None to allow. Never
         blocks when a validator cannot be reached or a probe errors, so a
         legitimately-finished task is never trapped.
         """
+        if not self._mentions_java_build_tool(task_description):
+            return None
+        if self._is_dependency_setup_task_description(task_description):
+            return None
+
         validator = self._get_completion_physical_validator()
         if validator is None:
             return None
 
-        project_name = getattr(self.context_manager, "project_name", None)
+        project_name = self._get_completion_project_name()
         try:
             if self._is_test_task_description(task_description):
                 status = validator.validate_test_status(project_name)
@@ -1543,8 +1583,11 @@ IMPORTANT:
                             "Use force=True only when intentionally recording a manually verified exception",
                         ],
                     }
-            else:
+            elif self._is_compile_or_package_task_description(task_description):
                 status = validator.validate_build_status(project_name)
+                build_system = (status.get("evidence") or {}).get("build_system")
+                if build_system not in ("maven", "gradle"):
+                    return None
                 if not status.get("success"):
                     reason = status.get("reason") or "no build artifacts found"
                     return {
@@ -1582,9 +1625,11 @@ IMPORTANT:
 
             combined_results = f"{summary_lower}\n{key_results_lower}"
             if self._is_build_or_test_task_description(task_description):
-                # Gate order (cheapest/text-based first, physical probe last):
-                #   1. documented unresolved failure
+                # Gate order:
+                #   1. documented unresolved failure (text)
                 #   2. unmet toolchain requirement with no remediation attempted
+                #      — only when physical evidence CONFIRMS the build/test is
+                #      missing; a green build overrides stale requirement text
                 #   3. no successful build/test tool execution recorded
                 #   4. no physical artifacts/test reports on disk
                 if self._has_unresolved_failure_signal(combined_results):
@@ -1601,9 +1646,13 @@ IMPORTANT:
                     )
                     return validation_result
 
-                if self._documents_unmet_requirement(
-                    combined_results
-                ) and not self._has_remediation_action():
+                physical_block = self._validate_build_test_physical_evidence(task_description)
+
+                if (
+                    physical_block is not None
+                    and self._documents_unmet_requirement(combined_results)
+                    and not self._has_remediation_action()
+                ):
                     validation_result.update(
                         {
                             "valid": False,
@@ -1634,7 +1683,6 @@ IMPORTANT:
                     )
                     return validation_result
 
-                physical_block = self._validate_build_test_physical_evidence(task_description)
                 if physical_block is not None:
                     return physical_block
 
