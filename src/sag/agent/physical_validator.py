@@ -34,6 +34,7 @@ from urllib.parse import quote
 
 from loguru import logger
 
+from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
     TestCaseCatalog,
@@ -42,6 +43,40 @@ from sag.testcases.catalog import (
     merge_testcase_status,
     normalize_testcase_identifier,
 )
+
+
+def evaluate_run_verdict(
+    build_green: bool,
+    pass_rate: float,
+    *,
+    test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
+) -> str:
+    """SINGLE SOURCE OF TRUTH for the build+test run verdict.
+
+    This is the one documented place that decides whether a run is a pass or a
+    fail. Both the report verdict (``ReportTool._determine_actual_status``) and
+    the run/test success path read this policy so the two can never diverge.
+
+    Policy:
+        * build NOT green                              -> "failed"
+        * build green AND pass_rate >= threshold       -> "success"
+        * build green AND pass_rate <  threshold       -> "failed"
+
+    A build that compiled with at least ``test_pass_threshold`` of its tests
+    passing is a SUCCESS (a partial pass), not a failure.
+
+    Args:
+        build_green: Whether the build produced real compiled artifacts.
+        pass_rate: Test pass rate as a PERCENTAGE in the range 0-100.
+        test_pass_threshold: Required pass rate as a FRACTION in 0-1
+            (default :data:`DEFAULT_TEST_PASS_THRESHOLD`, i.e. 0.8 -> 80%).
+
+    Returns:
+        ``"success"`` or ``"failed"``.
+    """
+    if not build_green:
+        return "failed"
+    return "success" if pass_rate >= test_pass_threshold * 100.0 else "failed"
 
 
 class PhysicalValidator:
@@ -57,6 +92,7 @@ class PhysicalValidator:
         docker_orchestrator=None,
         project_path: str = "/workspace",
         compilation_recency_hours: int = 1,
+        test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
     ):
         """
         Initialize physical validator.
@@ -65,10 +101,13 @@ class PhysicalValidator:
             docker_orchestrator: Docker orchestrator for command execution
             project_path: Base path of the project in container
             compilation_recency_hours: Hours to consider compilation as recent (default 1)
+            test_pass_threshold: Minimum test pass rate (fraction 0-1) for a
+                build-green run to be a SUCCESS. Feeds :func:`evaluate_run_verdict`.
         """
         self.docker_orchestrator = docker_orchestrator
         self.project_path = project_path
         self.compilation_recency_hours = compilation_recency_hours
+        self.test_pass_threshold = test_pass_threshold
 
         # Cache for validation results with TTL
         self.validation_cache = {}
@@ -684,6 +723,7 @@ class PhysicalValidator:
             "unique_error_tests": 0,
             "unique_skipped_tests": 0,
             "test_success": False,
+            "failing_test_names": [],
             "report_files": [],
             "parsing_errors": [],
         }
@@ -863,6 +903,16 @@ class PhysicalValidator:
                 test_result["test_case_records"] = {
                     key: record.to_dict() for key, record in test_case_records.items()
                 }
+
+                # Enumerate the failing/erroring tests (sampled) so callers can
+                # report WHICH tests failed, not just a count. Required to be
+                # populated whenever the run verdict fails on tests.
+                failing_test_names = [
+                    record.key
+                    for record in test_case_records.values()
+                    if record.final_status in ("failed", "error")
+                ]
+                test_result["failing_test_names"] = sorted(failing_test_names)[:50]
 
                 test_result["unique_tests"] = len(test_case_records)
                 for record in test_case_records.values():
@@ -1716,6 +1766,17 @@ class PhysicalValidator:
         # Calculate pass rate
         pass_rate = self.calculate_test_pass_rate(test_metrics)
 
+        # Apply the SINGLE verdict policy (same one the report verdict reads) so
+        # the PARTIAL/FAILED boundary uses the documented pass-rate threshold
+        # rather than an implicit "any pass > 0" rule.
+        threshold_pct = self.test_pass_threshold * 100.0
+        tests_pass_threshold = (
+            evaluate_run_verdict(
+                True, pass_rate, test_pass_threshold=self.test_pass_threshold
+            )
+            == "success"
+        )
+
         # Determine test status based on metrics
         if not test_metrics.get("valid", False):
             status = "WARNING"
@@ -1723,12 +1784,18 @@ class PhysicalValidator:
         elif pass_rate == 100.0:
             status = "SUCCESS"
             reason = f"All {test_metrics['total_tests']} tests passed"
-        elif pass_rate > 0:
+        elif tests_pass_threshold:
             status = "PARTIAL"
-            reason = f"Tests partially passed: {test_metrics['passed_tests']}/{test_metrics['total_tests']} ({pass_rate:.1f}%)"
+            reason = (
+                f"Tests passed above the {threshold_pct:.0f}% threshold: "
+                f"{test_metrics['passed_tests']}/{test_metrics['total_tests']} ({pass_rate:.1f}%)"
+            )
         else:
             status = "FAILED"
-            reason = f"All tests failed: 0/{test_metrics['total_tests']} passed"
+            reason = (
+                f"Tests below the {threshold_pct:.0f}% pass threshold: "
+                f"{test_metrics['passed_tests']}/{test_metrics['total_tests']} ({pass_rate:.1f}%)"
+            )
 
         failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
         discovered = (
@@ -1770,13 +1837,13 @@ class PhysicalValidator:
 
         if not test_metrics.get("valid", False):
             evidence_status = "unknown"
-        elif failed_count > 0:
-            evidence_status = "partial"
-        elif pass_rate == 100.0:
+        elif pass_rate == 100.0 and failed_count == 0:
             evidence_status = "success"
-        elif pass_rate > 0:
+        elif tests_pass_threshold:
+            # Passed the threshold but not perfect -> partial pass (still a pass).
             evidence_status = "partial"
         else:
+            # Below the threshold -> the verdict fails on tests.
             evidence_status = "blocked"
 
         result = {
@@ -1787,6 +1854,7 @@ class PhysicalValidator:
             "error_tests": test_metrics.get("error_tests", 0),
             "skipped_tests": test_metrics.get("skipped_tests", 0),
             "pass_rate": pass_rate,
+            "failing_test_names": test_metrics.get("failing_test_names", []),
             "test_exclusions": test_metrics.get("test_exclusions", []),
             "modules_without_tests": test_metrics.get("modules_without_tests", []),
             "status": status,
@@ -2183,8 +2251,13 @@ class PhysicalValidator:
 
         result = {"exist": False, "count": 0, "jar_count": 0, "class_count": 0, "details": {}}
 
-        # Count JAR files (complete scan, no head limit)
-        jar_cmd = f"find {project_dir} -name '*.jar' -type f 2>/dev/null | wc -l"
+        # Count JAR files (complete scan, no head limit). Exclude the Gradle
+        # wrapper/tooling jar: it ships with the repo and is NOT a build output,
+        # so it must never count as evidence that the project compiled.
+        jar_cmd = (
+            f"find {project_dir} -name '*.jar' -type f "
+            f"-not -path '*/gradle/wrapper/*' 2>/dev/null | wc -l"
+        )
         jar_result = self._execute_command_with_logging(jar_cmd, "counting JAR files")
         if jar_result["success"]:
             result["jar_count"] = int(jar_result["output"].strip() or 0)
@@ -2663,41 +2736,60 @@ class PhysicalValidator:
 
     def _validate_gradle_cache(self, project_dir: str) -> Dict[str, any]:
         """
-        Validate Gradle build cache without executing gradle commands.
+        Validate a Gradle build by its REAL compiled outputs (not the cache dir).
 
-        Checks:
-        - .gradle/ directory structure
-        - build/classes/ directories
-        - build/libs/*.jar files
+        The PRIMARY (and only deciding) success criterion is the presence of
+        compiled outputs produced by an actual build:
+        - ``*.class`` files under any ``build/classes`` directory (covers the
+          single-project ``build/classes/java/main`` layout and every
+          subproject), and/or
+        - real ``*.jar`` files under any ``build/libs`` directory.
+
+        Wrapper/tooling jars (``gradle/wrapper/gradle-wrapper.jar``) are
+        explicitly excluded - they ship with the repository and are not build
+        outputs. The bare ``.gradle/`` cache directory is recorded only as a
+        NON-DECIDING hint: its mere existence must never make a build "valid".
         """
         result = {"valid": False, "details": {}, "subprojects": []}
 
-        # Check Gradle cache directories
-        cache_checks = [
-            f"{project_dir}/.gradle",
-            f"{project_dir}/build/classes",
-            f"{project_dir}/build/libs",
-        ]
+        # Non-deciding hint: the .gradle cache directory. Recorded for evidence
+        # only; it does NOT contribute to validity.
+        gradle_dir_cmd = f"test -d {project_dir}/.gradle"
+        if self._execute_command_with_logging(gradle_dir_cmd, "checking .gradle cache (hint)")[
+            "success"
+        ]:
+            result["details"]["gradle_cache_dir"] = True
 
-        cache_found = 0
-        for cache_path in cache_checks:
-            cmd = f"test -d {cache_path}"
-            check_result = self._execute_command_with_logging(cmd, f"checking {cache_path}")
-            if check_result["success"]:
-                cache_found += 1
-                result["details"][cache_path.split("/")[-1]] = True
+        # PRIMARY: compiled .class files under any build/classes directory.
+        class_cmd = (
+            f"find {project_dir} -path '*/build/classes/*' -name '*.class' -type f "
+            f"2>/dev/null | wc -l"
+        )
+        class_result = self._execute_command_with_logging(
+            class_cmd, "counting Gradle compiled classes"
+        )
+        class_count = (
+            int(class_result["output"].strip() or 0) if class_result["success"] else 0
+        )
+        if class_count > 0:
+            result["details"]["class_count"] = class_count
 
-        # Check for JAR files in build/libs
-        jars_cmd = f"find {project_dir}/build/libs -name '*.jar' -type f 2>/dev/null | wc -l"
+        # PRIMARY: real JARs under any build/libs directory (exclude wrapper jar).
+        jars_cmd = (
+            f"find {project_dir} -path '*/build/libs/*.jar' -type f "
+            f"-not -path '*/gradle/wrapper/*' 2>/dev/null | wc -l"
+        )
         jars_result = self._execute_command_with_logging(jars_cmd, "counting Gradle JARs")
-        if jars_result["success"]:
-            jar_count = int(jars_result["output"].strip() or 0)
-            if jar_count > 0:
-                result["details"]["jar_count"] = jar_count
-                cache_found += 1
+        jar_count = int(jars_result["output"].strip() or 0) if jars_result["success"] else 0
+        if jar_count > 0:
+            result["details"]["jar_count"] = jar_count
 
-        # Check for multi-project builds
-        subprojects_cmd = f"find {project_dir} -mindepth 2 -maxdepth 2 -name 'build.gradle' -o -name 'build.gradle.kts' 2>/dev/null"
+        # Informational: enumerate multi-project subprojects that actually
+        # produced compiled output (does NOT decide validity on its own).
+        subprojects_cmd = (
+            f"find {project_dir} -mindepth 2 -maxdepth 2 "
+            f"\\( -name 'build.gradle' -o -name 'build.gradle.kts' \\) 2>/dev/null"
+        )
         subprojects_result = self._execute_command_with_logging(
             subprojects_cmd, "finding Gradle subprojects"
         )
@@ -2708,16 +2800,24 @@ class PhysicalValidator:
                     subproject_dir = "/".join(subproject_build.split("/")[:-1])
                     subproject_name = subproject_dir.split("/")[-1]
 
-                    # Check subproject build directory
-                    subproject_build_dir = f"{subproject_dir}/build"
-                    cmd = f"test -d {subproject_build_dir}"
-                    if self._execute_command_with_logging(
-                        cmd, f"checking subproject {subproject_name}"
-                    )["success"]:
+                    sub_class_cmd = (
+                        f"find {subproject_dir} -path '*/build/classes/*' -name '*.class' "
+                        f"-type f 2>/dev/null | wc -l"
+                    )
+                    sub_class_result = self._execute_command_with_logging(
+                        sub_class_cmd, f"counting subproject {subproject_name} classes"
+                    )
+                    sub_class_count = (
+                        int(sub_class_result["output"].strip() or 0)
+                        if sub_class_result["success"]
+                        else 0
+                    )
+                    if sub_class_count > 0:
                         result["subprojects"].append(subproject_name)
 
-        # Determine validity
-        result["valid"] = cache_found > 0 or len(result["subprojects"]) > 0
+        # Determine validity from REAL compiled outputs only. The .gradle cache
+        # directory alone can NEVER yield success.
+        result["valid"] = class_count > 0 or jar_count > 0
 
         return result
 

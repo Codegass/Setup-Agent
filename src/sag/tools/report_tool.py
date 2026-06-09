@@ -8,6 +8,8 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
+from sag.agent.physical_validator import evaluate_run_verdict
+from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
@@ -88,8 +90,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             action: Action to perform ('generate' for final report)
             summary: Brief summary of what was accomplished
             status: Overall status ('success' or 'fail') - REQUIRED
-                   - 'success': Build validation passed AND test pass rate > 80%
-                   - 'fail': Build failed OR test report not found OR test pass rate <= 80%
+                   - 'success': Build validation passed AND test pass rate >= 80%
+                   - 'fail': Build failed OR test report not found OR test pass rate < 80%
             details: Additional details about the setup process
         """
         result_test_stats = self._coerce_report_test_stats(test_stats)
@@ -171,8 +173,8 @@ class ReportTool(BaseTool, UIEventEmitter):
                     f"  - action (optional): 'generate' (default: 'generate')\n"
                     f"  - summary (optional): Brief summary of accomplishments\n"
                     f"  - status (required): 'success' or 'fail'\n"
-                    f"     • 'success': Build passed AND test pass rate > 80%\n"
-                    f"     • 'fail': Build failed OR tests not found OR pass rate <= 80%\n"
+                    f"     • 'success': Build passed AND test pass rate >= 80%\n"
+                    f"     • 'fail': Build failed OR tests not found OR pass rate < 80%\n"
                     f"  - details (optional): Additional details about the setup\n\n"
                     f"  - evidence_status (optional): success/partial/blocked/conflict/unknown\n"
                     f"  - test_stats (optional): TestStats or test counts dictionary\n"
@@ -189,8 +191,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             return ToolResult(
                 success=False,
                 output="❌ Missing required parameter: 'status'. Must be either 'success' or 'fail'\n"
-                "• 'success': Build passed AND test pass rate > 80%\n"
-                "• 'fail': Build failed OR tests not found OR pass rate <= 80%",
+                "• 'success': Build passed AND test pass rate >= 80%\n"
+                "• 'fail': Build failed OR tests not found OR pass rate < 80%",
                 error="Missing required parameter: status",
             )
 
@@ -1410,7 +1412,17 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         tests_ok = None
         if pass_pct is not None:
-            tests_ok = pass_pct >= 80
+            # Use the SAME pass-rate threshold as the run verdict so the
+            # dashboard pass/fail can never diverge from the header verdict.
+            snapshot_threshold_pct = (
+                getattr(
+                    self.physical_validator,
+                    "test_pass_threshold",
+                    DEFAULT_TEST_PASS_THRESHOLD,
+                )
+                * 100.0
+            )
+            tests_ok = pass_pct >= snapshot_threshold_pct
         elif status["tests_total"] is not None:
             tests_ok = actual_accomplishments.get("test_success", False)
         status["tests_ok"] = tests_ok
@@ -1812,7 +1824,13 @@ class ReportTool(BaseTool, UIEventEmitter):
     ) -> str:
         """
         Reconcile claimed status with evidence-based status.
-        Binary logic: success (build passed AND test >80%) or fail
+
+        Uses the SINGLE verdict policy (``evaluate_run_verdict``) shared with
+        ``_determine_actual_status`` and the physical validator so this fallback
+        path can never diverge from the primary verdict:
+        build green AND pass_rate >= ``test_pass_threshold`` -> success; else fail.
+        A build-green run that passed the threshold is a SUCCESS (partial pass),
+        not a failure.
         """
         # Extract core step results
         repository_cloned = accomplishments.get("repository_cloned", False)
@@ -1844,10 +1862,6 @@ class ReportTool(BaseTool, UIEventEmitter):
             f"📊 Core steps - Clone: {repository_cloned}, Build: {build_success}, Test pass rate: {test_pass_rate:.1f}%"
         )
 
-        # Update evidence_status to use binary logic
-        if evidence_status in ["failed", "partial"]:
-            evidence_status = "fail"
-
         # Evidence-based status is authoritative
         if not repository_cloned:
             logger.error("❌ Repository clone failed - cannot proceed")
@@ -1857,15 +1871,23 @@ class ReportTool(BaseTool, UIEventEmitter):
             logger.error("❌ Build failed - compilation issues prevent success")
             return "fail"
 
-        # Check test pass rate
-        if test_pass_rate > 80:
+        # Delegate the test gate to the single verdict policy so this fallback
+        # path agrees with _determine_actual_status (no header-vs-dashboard drift).
+        threshold = getattr(
+            self.physical_validator, "test_pass_threshold", DEFAULT_TEST_PASS_THRESHOLD
+        )
+        threshold_pct = threshold * 100.0
+        verdict = evaluate_run_verdict(
+            build_green=True, pass_rate=test_pass_rate, test_pass_threshold=threshold
+        )
+        if verdict == "success":
             logger.info(
-                f"✅ Success confirmed: Build passed, Test pass rate {test_pass_rate:.1f}% > 80%"
+                f"✅ Success confirmed: Build passed, Test pass rate "
+                f"{test_pass_rate:.1f}% >= {threshold_pct:.0f}%"
             )
             return "success"
-        else:
-            logger.warning(f"❌ Fail: Test pass rate {test_pass_rate:.1f}% <= 80%")
-            return "fail"
+        logger.warning(f"❌ Fail: Test pass rate {test_pass_rate:.1f}% < {threshold_pct:.0f}%")
+        return "fail"
 
     def _collect_execution_metrics(self) -> dict:
         """Collect comprehensive execution metrics from the session."""
@@ -2722,10 +2744,13 @@ class ReportTool(BaseTool, UIEventEmitter):
 
     def _determine_actual_status(self, accomplishments: dict) -> str:
         """
-        Determine the actual status based on build and test results.
-        Binary status logic (no partial):
-        - SUCCESS: Build passed AND test pass rate > 80%
-        - FAIL: Build failed OR test report not found OR test pass rate <= 80%
+        Determine the actual run verdict from build and test results.
+
+        Delegates the final pass/fail decision to ``evaluate_run_verdict`` (the
+        single source of truth shared with the physical validator):
+        - SUCCESS: build green AND test pass rate >= ``test_pass_threshold``
+        - FAIL: repository not cloned, build failed, no test reports, or test
+          pass rate < ``test_pass_threshold``
         """
         # Extract the three core indicators
         repository_cloned = accomplishments.get("repository_cloned", False)
@@ -2808,13 +2833,24 @@ class ReportTool(BaseTool, UIEventEmitter):
             logger.warning("⚠️ No test execution detected - treating as 0% pass rate")
             return "fail"
 
-        # Final determination based on pass rate threshold
-        if test_pass_rate > 80:
-            logger.info(f"✅ SUCCESS: Build passed ✓, Test pass rate {test_pass_rate:.1f}% > 80% ✓")
+        # Final determination via the SINGLE verdict policy shared with the
+        # physical validator (evaluate_run_verdict) - no hardcoded threshold.
+        # At this point the build is green (we returned "fail" above otherwise).
+        threshold = getattr(
+            self.physical_validator, "test_pass_threshold", DEFAULT_TEST_PASS_THRESHOLD
+        )
+        threshold_pct = threshold * 100.0
+        verdict = evaluate_run_verdict(
+            build_green=True, pass_rate=test_pass_rate, test_pass_threshold=threshold
+        )
+        if verdict == "success":
+            logger.info(
+                f"✅ SUCCESS: Build passed ✓, Test pass rate "
+                f"{test_pass_rate:.1f}% >= {threshold_pct:.0f}% ✓"
+            )
             return "success"
-        else:
-            logger.warning(f"❌ FAIL: Test pass rate {test_pass_rate:.1f}% <= 80%")
-            return "fail"
+        logger.warning(f"❌ FAIL: Test pass rate {test_pass_rate:.1f}% < {threshold_pct:.0f}%")
+        return "fail"
 
     def _generate_console_report(
         self,

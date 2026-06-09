@@ -9,6 +9,12 @@ from pydantic import BaseModel, Field
 
 from .models import LogLevel
 
+# Test verdict policy: the required fraction of executed tests that must pass for a
+# build-green run to count as a SUCCESS. This is the SINGLE SOURCE OF TRUTH for the
+# pass-rate gate consumed by both the report verdict and the run/test success policy
+# (replaces the previously hardcoded "80%" magic number scattered across modules).
+DEFAULT_TEST_PASS_THRESHOLD = 0.8
+
 
 class Config(BaseModel):
     """Main configuration class."""
@@ -58,6 +64,10 @@ class Config(BaseModel):
     max_iterations: int = Field(default=50)
     context_switch_threshold: int = Field(default=20)
 
+    # Validation / verdict policy
+    # Minimum test pass rate (fraction, 0-1) for a build-green run to be a SUCCESS.
+    test_pass_threshold: float = Field(default=DEFAULT_TEST_PASS_THRESHOLD)
+
     @classmethod
     def from_env(cls) -> "Config":
         """Create configuration from environment variables."""
@@ -103,6 +113,9 @@ class Config(BaseModel):
             workspace_path=os.getenv("SAG_WORKSPACE_PATH", "/workspace"),
             max_iterations=int(os.getenv("SAG_MAX_ITERATIONS", "50")),
             context_switch_threshold=int(os.getenv("SAG_CONTEXT_SWITCH_THRESHOLD", "20")),
+            test_pass_threshold=float(
+                os.getenv("SAG_TEST_PASS_THRESHOLD", str(DEFAULT_TEST_PASS_THRESHOLD))
+            ),
         )
 
     def get_litellm_model_name(self, model_type: str = "action") -> str:
