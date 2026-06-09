@@ -140,7 +140,9 @@ class ReActEngine(UIEventEmitter):
 
         # Initialize physical validator for fact-based validation
         self.physical_validator = PhysicalValidator(
-            docker_orchestrator=orchestrator, project_path="/workspace"
+            docker_orchestrator=orchestrator,
+            project_path="/workspace",
+            test_pass_threshold=self.config.test_pass_threshold,
         )
 
         # No-physical-progress guard: halt a run that completes tasks without

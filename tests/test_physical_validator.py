@@ -246,6 +246,12 @@ def test_settings_test_pass_threshold_default():
     assert Config().test_pass_threshold == 0.8
 
 
+def test_settings_test_pass_threshold_from_env(monkeypatch):
+    """SAG_TEST_PASS_THRESHOLD must override the default in Config.from_env."""
+    monkeypatch.setenv("SAG_TEST_PASS_THRESHOLD", "0.95")
+    assert Config.from_env().test_pass_threshold == 0.95
+
+
 @pytest.mark.parametrize(
     "build_green,pass_rate,expected",
     [
@@ -466,3 +472,35 @@ def test_report_and_validator_verdicts_agree_for_partial_pass(monkeypatch):
     assert report_verdict == "success"
     assert test_status["status"] == "PARTIAL"
     assert test_status["evidence_status"] != "blocked"
+
+
+def test_test_pass_threshold_feeds_both_report_and_run_verdict(monkeypatch):
+    """A non-default test_pass_threshold must change BOTH the test-status verdict
+    and the report verdict (they read the same physical_validator.test_pass_threshold).
+
+    Proves the setting is wired end-to-end rather than always resolving to the
+    hardcoded 0.8 default: the identical 85% build-green run is a PASS under 0.8
+    but a FAIL under 0.9 on both gates.
+    """
+    metrics = lambda project_dir: _metrics(100, 85, failed=15)  # noqa: E731
+    accomplishments = _accomplishments(100, 85)
+
+    # Default threshold (0.8): 85% is a partial pass / success on both gates.
+    default_validator = PhysicalValidator(project_path="/workspace")
+    assert default_validator.test_pass_threshold == DEFAULT_TEST_PASS_THRESHOLD
+    monkeypatch.setattr(default_validator, "parse_test_reports_with_catalog", metrics)
+    assert default_validator.validate_test_status("demo")["status"] == "PARTIAL"
+    default_report = ReportTool(
+        docker_orchestrator=None, physical_validator=default_validator
+    )
+    assert default_report._determine_actual_status(accomplishments) == "success"
+
+    # Stricter threshold (0.9): the same 85% now fails on both gates.
+    strict_validator = PhysicalValidator(project_path="/workspace", test_pass_threshold=0.9)
+    assert strict_validator.test_pass_threshold == 0.9
+    monkeypatch.setattr(strict_validator, "parse_test_reports_with_catalog", metrics)
+    assert strict_validator.validate_test_status("demo")["status"] == "FAILED"
+    strict_report = ReportTool(
+        docker_orchestrator=None, physical_validator=strict_validator
+    )
+    assert strict_report._determine_actual_status(accomplishments) == "fail"

@@ -2,13 +2,24 @@ from types import SimpleNamespace
 
 from sag.agent.agent import SetupAgent
 from sag.agent.physical_validator import PhysicalValidator
+from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
+from sag.tools.report_tool import ReportTool
 
 
 class FakePhysicalValidator:
-    def __init__(self, build_status, test_status, analysis_status=None):
+    def __init__(
+        self,
+        build_status,
+        test_status,
+        analysis_status=None,
+        test_pass_threshold=DEFAULT_TEST_PASS_THRESHOLD,
+    ):
         self.build_status = build_status
         self.test_status = test_status
         self.analysis_status = analysis_status or {"analyzed": False}
+        # Mirror the real PhysicalValidator attribute so the run-success gate
+        # reads the configured threshold (not a hardcoded default).
+        self.test_pass_threshold = test_pass_threshold
         self.build_project_names = []
         self.test_project_names = []
         self.analysis_project_names = []
@@ -124,7 +135,13 @@ def test_verified_final_status_allows_skipped_tests_without_failures():
     assert agent._get_verified_final_status(react_engine_success=True) is True
 
 
-def test_verified_final_status_rejects_failed_tests():
+def test_verified_final_status_accepts_partial_pass_above_threshold():
+    """A build-green run with failures but pass rate >= threshold is a SUCCESS
+    (partial pass), matching the single verdict policy used by the report.
+
+    Previously this path applied zero tolerance (any failure -> fail); the run
+    gate now delegates to evaluate_run_verdict so it agrees with the report.
+    """
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status={"success": True, "reason": "Build fingerprints found"},
@@ -149,7 +166,133 @@ def test_verified_final_status_rejects_failed_tests():
         )
     )
 
+    assert agent._get_verified_final_status(react_engine_success=True) is True
+
+
+def test_verified_final_status_rejects_below_threshold_tests():
+    """Build green but pass rate below test_pass_threshold -> failure."""
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "Build fingerprints found"},
+            test_status={
+                "has_test_reports": True,
+                "status": "FAILED",
+                "reason": "Tests below threshold",
+                "pass_rate": 50.0,
+                "total_tests": 100,
+                "passed_tests": 50,
+                "failed_tests": 50,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "test_exclusions": [],
+                "modules_without_tests": [],
+            },
+            analysis_status={
+                "analyzed": True,
+                "has_static_test_count": True,
+                "static_test_count": 100,
+            },
+        )
+    )
+
     assert agent._get_verified_final_status(react_engine_success=True) is False
+
+
+def test_verified_final_status_honors_configured_threshold():
+    """The configured test_pass_threshold must change the run-success verdict.
+
+    Proves SAG_TEST_PASS_THRESHOLD / Config.test_pass_threshold is wired through
+    PhysicalValidator into the run gate (not the hardcoded 0.8 default): the same
+    85% build-green run passes under the default 0.8 but fails under a 0.9 gate.
+    """
+
+    def _profile(threshold):
+        return FakePhysicalValidator(
+            build_status={"success": True, "reason": "Build fingerprints found"},
+            test_status={
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "reason": "Tests partially passed",
+                "pass_rate": 85.0,
+                "total_tests": 100,
+                "passed_tests": 85,
+                "failed_tests": 15,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "test_exclusions": [],
+                "modules_without_tests": [],
+            },
+            analysis_status={
+                "analyzed": True,
+                "has_static_test_count": True,
+                "static_test_count": 100,
+            },
+            test_pass_threshold=threshold,
+        )
+
+    default_agent = _agent_with_validator(_profile(0.8))
+    strict_agent = _agent_with_validator(_profile(0.9))
+
+    assert default_agent._get_verified_final_status(react_engine_success=True) is True
+    assert strict_agent._get_verified_final_status(react_engine_success=True) is False
+
+
+def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatch):
+    """commons-vfs (build green, 177/184 = 96.2%, 7 failing) is a SUCCESS on
+    BOTH the run-success gate and the report verdict (no second-gate divergence).
+    """
+    accomplishments = {
+        "repository_cloned": True,
+        "build_success": True,
+        "physical_validation": {
+            "test_analysis": {"total_tests": 184, "passed_tests": 177}
+        },
+    }
+
+    validator = PhysicalValidator(project_path="/workspace")
+    monkeypatch.setattr(
+        validator,
+        "parse_test_reports_with_catalog",
+        lambda project_dir: {
+            "valid": True,
+            "total_tests": 184,
+            "passed_tests": 177,
+            "failed_tests": 5,
+            "error_tests": 2,
+            "skipped_tests": 0,
+            "test_exclusions": [],
+            "modules_without_tests": [],
+            "report_files": [
+                "/workspace/commons-vfs/target/surefire-reports/TEST-Vfs.xml"
+            ],
+            "parsing_errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        validator,
+        "validate_build_status",
+        lambda project_name: {"success": True, "reason": "Build fingerprints found"},
+    )
+    monkeypatch.setattr(
+        validator,
+        "validate_project_analysis_status",
+        lambda project_name: {
+            "analyzed": True,
+            "has_static_test_count": True,
+            "static_test_count": 184,
+        },
+    )
+
+    agent = _agent_with_validator(validator)
+    run_status = agent._get_verified_final_status(react_engine_success=True)
+
+    tool = ReportTool(docker_orchestrator=None, physical_validator=validator)
+    report_verdict = tool._determine_actual_status(accomplishments)
+
+    assert run_status is True
+    assert report_verdict == "success"
+    # The two paths must agree on the same run.
+    assert run_status == (report_verdict == "success")
 
 
 def test_failed_test_validation_carries_evidence_state(monkeypatch):
