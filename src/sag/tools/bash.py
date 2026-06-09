@@ -994,16 +994,56 @@ class BashTool(BaseTool):
         except Exception as e:
             return {"exists": False, "error": str(e)}
 
+    # Read-only inspection commands are never long-running, even when their
+    # arguments mention build/test files (`cat build.gradle`, `ls src/test`,
+    # `test -d /workspace/x`) — routing them through dispatch-and-poll would
+    # add seconds of latency to sub-second commands.
+    QUICK_INSPECTION_COMMANDS = frozenset(
+        {
+            "cat",
+            "ls",
+            "head",
+            "tail",
+            "grep",
+            "echo",
+            "find",
+            "stat",
+            "wc",
+            "pwd",
+            "which",
+            "file",
+            "du",
+            "df",
+            "env",
+            "printenv",
+            "ps",
+            "test",
+            "[",
+            "tree",
+            "realpath",
+            "readlink",
+        }
+    )
+
     def _is_long_running_command(self, command: str) -> bool:
         """Detect if a command is likely to be long-running and needs enhanced monitoring."""
 
+        command_lower = command.lower()
+        stripped = command_lower.strip()
+
+        tokens = stripped.split()
+        first_token = tokens[0].rsplit("/", 1)[-1] if tokens else ""
+        if first_token in self.QUICK_INSPECTION_COMMANDS and not any(
+            sep in stripped for sep in ("&&", ";")
+        ):
+            return False
+
         long_running_patterns = [
-            "mvn clean install",
-            "mvn clean compile test",
-            "mvn package",
-            "mvn install",
-            "gradle build",
-            "gradle assemble",
+            # Any maven/gradle invocation can be long (compile, verify, jar...)
+            "mvn ",
+            "mvnw",
+            "gradlew",
+            "gradle ",
             "npm install",
             "npm run build",
             "docker build",
@@ -1015,8 +1055,6 @@ class BashTool(BaseTool):
             "make",
             "cmake --build",
         ]
-
-        command_lower = command.lower()
 
         # Check for explicit patterns
         for pattern in long_running_patterns:

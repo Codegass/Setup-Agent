@@ -237,3 +237,198 @@ def test_detached_handoff_tool_result_shape():
     assert tool_result.metadata["dispatch_status"] == "running_detached"
     assert tool_result.metadata["pid"] == 12345
     assert tool_result.metadata["log_path"] == "/tmp/sag_jobs/abc.log"
+
+
+# --- review fixes: spoof-proof poll parsing, atomic exit file ----------------
+
+
+def test_poll_markers_in_log_tail_cannot_spoof_completion():
+    """STATE:/SIZE: lines printed by the build itself land in the tail and
+    must not be parsed as completion markers."""
+    output = (
+        "STATE:RUNNING\nSIZE:100\n---TAIL---\n"
+        "some build output\nSTATE:EXIT:0\nSIZE:99999\n"
+    )
+    orchestrator = build_orchestrator(
+        execute_command=lambda command, **kwargs: {"exit_code": 0, "output": output}
+    )
+
+    poll = orchestrator.poll_detached_command(_handle())
+
+    assert poll["running"] is True
+    assert poll["finished"] is False
+    assert poll["exit_code"] is None
+    assert poll["log_size"] == 100
+
+
+def test_detached_launcher_writes_exit_code_atomically():
+    orchestrator = build_orchestrator()
+
+    def fake_execute(command, **kwargs):
+        orchestrator.command_log.append(command)
+        return {"exit_code": 0, "output": "999"}
+
+    orchestrator.execute_command = fake_execute
+    orchestrator._runtime_profile_prefix = lambda: "true"
+
+    handle = orchestrator.execute_command_detached("mvn package")
+
+    launcher = orchestrator.command_log[0]
+    assert ".exit.tmp" in launcher
+    assert "&& mv" in launcher
+
+
+# --- review fixes: tools actually route long commands through dispatch ------
+
+
+class RoutingOrchestrator:
+    """Fake with both execution APIs to prove the dispatch path is preferred.
+
+    execute_command answers the tools' executable/wrapper probes the same way
+    tests/test_maven_gradle_tool_contracts.py's fake does.
+    """
+
+    def __init__(self, handoff=True):
+        self.soft_timeout_calls = []
+        self.monitoring_calls = []
+        self.project_name = None
+        self._handoff = handoff
+
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+        if command in ("which mvn", "command -v mvn"):
+            return {"success": True, "output": "/usr/bin/mvn", "exit_code": 0}
+        if command in ("which gradle", "command -v gradle"):
+            return {"success": True, "output": "/usr/bin/gradle", "exit_code": 0}
+        if command.startswith("test -x /usr/bin/mvn") or command.startswith(
+            "test -x /usr/bin/gradle"
+        ):
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if command == "/usr/bin/mvn -version":
+            return {"success": True, "output": "Apache Maven 3.9.6", "exit_code": 0}
+        if command == "/usr/bin/gradle -version":
+            return {"success": True, "output": "Gradle 8.5", "exit_code": 0}
+        if "pom.xml && echo 'EXISTS'" in command:
+            return {"success": True, "output": "EXISTS", "exit_code": 0}
+        if "grep -q '<modules>'" in command:
+            return {"success": False, "output": "NO_MODULES", "exit_code": 1}
+        if "settings.gradle" in command and "grep -q 'include'" in command:
+            return {"success": False, "output": "", "exit_code": 1}
+        return {"exit_code": 0, "output": "", "success": True}
+
+    def execute_command_with_monitoring(self, command, **kwargs):
+        self.monitoring_calls.append(command)
+        return {"exit_code": 0, "output": "BUILD SUCCESSFUL", "success": True}
+
+    def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+        self.soft_timeout_calls.append(command)
+        if self._handoff:
+            return {
+                "success": True,
+                "exit_code": None,
+                "output": "still running; poll /tmp/sag_jobs/abc.log",
+                "termination_reason": None,
+                "dispatch_status": "running_detached",
+                "dispatch": {
+                    "pid": 1,
+                    "log_path": "/tmp/sag_jobs/abc.log",
+                    "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
+                },
+            }
+        return {
+            "success": True,
+            "exit_code": 0,
+            "output": "BUILD SUCCESSFUL",
+            "termination_reason": None,
+            "dispatch_status": "completed_detached",
+            "dispatch": {},
+        }
+
+
+def test_gradle_tool_routes_build_through_dispatch_and_returns_handoff():
+    from sag.tools.gradle_tool import GradleTool
+
+    orchestrator = RoutingOrchestrator(handoff=True)
+    tool = GradleTool(orchestrator)
+
+    result = tool.execute(tasks="build", working_directory="/workspace/p")
+
+    assert orchestrator.soft_timeout_calls, "gradle build must use dispatch-and-poll"
+    assert orchestrator.monitoring_calls == []
+    assert result.success is True
+    assert result.metadata["dispatch_status"] == "running_detached"
+    assert "/tmp/sag_jobs/abc.log" in result.output
+
+
+def test_maven_tool_routes_test_through_dispatch():
+    from sag.tools.maven_tool import MavenTool
+
+    orchestrator = RoutingOrchestrator(handoff=True)
+    tool = MavenTool(orchestrator)
+
+    result = tool.execute(command="test", working_directory="/workspace/p")
+
+    assert orchestrator.soft_timeout_calls, "maven test must use dispatch-and-poll"
+    assert result.metadata["dispatch_status"] == "running_detached"
+
+
+def test_bash_tool_routes_long_command_through_dispatch():
+    from sag.tools.bash import BashTool
+
+    orchestrator = RoutingOrchestrator(handoff=True)
+    tool = BashTool(orchestrator)
+
+    result = tool.execute(command="mvn verify", timeout=1200)
+
+    assert orchestrator.soft_timeout_calls, "mvn verify must use dispatch-and-poll"
+    assert result.success is True
+    assert result.metadata["dispatch_status"] == "running_detached"
+
+
+def test_bash_quick_inspection_commands_not_dispatched():
+    from sag.tools.bash import BashTool
+
+    orchestrator = RoutingOrchestrator()
+    tool = BashTool(orchestrator)
+
+    for command in (
+        "cat build.gradle",
+        "ls src/test/java",
+        "tail -n 50 /tmp/sag_jobs/abc.log",
+        "test -d /workspace/p",
+    ):
+        tool.execute(command=command, timeout=60)
+
+    assert orchestrator.soft_timeout_calls == []
+
+
+# --- review fixes: repetition detector must not fight polling ---------------
+
+
+def test_repetition_detector_exempts_dispatch_poll_commands():
+    from sag.agent.tool_orchestration import ToolOrchestrator
+
+    poll_signature = (
+        "bash:[('command', 'tail -n 50 /tmp/sag_jobs/abc.log'), "
+        "('working_directory', '/workspace')]"
+    )
+    recent = [
+        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"}
+        for i in range(9)
+    ]
+    orchestrator = ToolOrchestrator(
+        tools={},
+        context_manager=None,
+        recent_tool_executions=recent,
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda signature, success: None,
+        update_successful_states=lambda tool_name, params, result: None,
+        add_system_guidance=lambda message, priority=5: None,
+        get_timestamp=lambda: "ts",
+    )
+
+    # The poll command itself is never treated as a loop...
+    assert orchestrator._get_repetition_level(poll_signature) == 0
+    # ...and 9 polls must not inflate the bash flood count for other commands.
+    other_signature = "bash:[('command', 'ls /workspace')]"
+    assert orchestrator._get_repetition_level(other_signature) == 0

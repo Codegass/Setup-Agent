@@ -163,7 +163,11 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
     if result.success:
         # For successful results, preserve key status information
-        formatted = f"✅ {tool_name} executed successfully"
+        if (result.metadata or {}).get("dispatch_status") == "running_detached":
+            # A handoff is not a completed command — don't announce success.
+            formatted = f"⏳ {tool_name} dispatched — command still running in background"
+        else:
+            formatted = f"✅ {tool_name} executed successfully"
 
         if evidence_lines:
             formatted += "\n" + "\n".join(evidence_lines)
@@ -713,6 +717,11 @@ class ToolOrchestrator:
                 diff[key] = {"before": before_value, "after": after_value}
         return diff
 
+    @staticmethod
+    def _is_dispatch_poll_signature(signature: str) -> bool:
+        """Whether a tool signature polls a detached dispatch job's log/exit file."""
+        return "/tmp/sag_jobs/" in signature
+
     def _recent_signature(self, execution: dict[str, Any] | ToolExecutionRecord) -> str:
         if isinstance(execution, ToolExecutionRecord):
             return execution.signature
@@ -761,7 +770,20 @@ class ToolOrchestrator:
                     return 1
                 return 0
 
-        tool_count = len(self._recent_executions_for_tool(tool_name))
+        # Polling a detached build's log/exit file is PRESCRIBED behavior (the
+        # dispatch-and-poll handoff tells the agent to repeat these commands),
+        # not a loop — never warn/block it, and don't let it inflate the
+        # per-tool flood count for other commands.
+        if self._is_dispatch_poll_signature(tool_signature):
+            return 0
+
+        tool_count = len(
+            [
+                execution
+                for execution in self._recent_executions_for_tool(tool_name)
+                if not self._is_dispatch_poll_signature(self._recent_signature(execution))
+            ]
+        )
 
         if exact_match_count >= 5 or tool_count >= 8:
             return 3

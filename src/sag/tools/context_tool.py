@@ -1349,6 +1349,10 @@ IMPORTANT:
                 continue
             if entry.get("type") != "action" or not entry.get("success"):
                 continue
+            # A dispatch-and-poll handoff (build still running detached) is
+            # success=True but NOT execution evidence — the build may yet fail.
+            if entry.get("dispatch_status") == "running_detached":
+                continue
 
             tool_name = str(entry.get("tool_name") or "").lower()
             if tool_name in build_tools:

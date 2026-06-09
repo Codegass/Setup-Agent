@@ -693,14 +693,21 @@ class ReActEngine(UIEventEmitter):
                                 tool_name=step.tool_name,
                             )
 
+                        history_entry = {
+                            "type": "action",
+                            "tool_name": step.tool_name,
+                            "success": result.success,
+                            "output": output_to_store,
+                        }
+                        # A dispatch-and-poll handoff is success=True but is NOT
+                        # build-execution evidence (the command is still
+                        # running); completion gates must be able to tell.
+                        dispatch_status = (result.metadata or {}).get("dispatch_status")
+                        if dispatch_status:
+                            history_entry["dispatch_status"] = dispatch_status
                         self.context_manager.add_to_branch_history(
                             self.context_manager.current_task_id,
-                            {
-                                "type": "action",
-                                "tool_name": step.tool_name,
-                                "success": result.success,
-                                "output": output_to_store,
-                            },
+                            history_entry,
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log action to branch history: {e}")

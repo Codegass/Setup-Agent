@@ -932,7 +932,11 @@ class DockerOrchestrator:
             inner = f"{runtime_profile_prefix}; cd {shlex.quote(workdir)} && {command}"
         else:
             inner = f"{runtime_profile_prefix}; {command}"
-        wrapped = f"{inner}; echo $? > {shlex.quote(exit_code_path)}"
+        # Write the exit code atomically (tmp + mv) so a poll can never read a
+        # created-but-empty exit file.
+        quoted_exit = shlex.quote(exit_code_path)
+        quoted_exit_tmp = shlex.quote(exit_code_path + ".tmp")
+        wrapped = f"{inner}; echo $? > {quoted_exit_tmp} && mv {quoted_exit_tmp} {quoted_exit}"
         launcher = (
             f"mkdir -p {self.DISPATCH_DIR} && "
             f"nohup bash -c {shlex.quote(wrapped)} > {shlex.quote(log_path)} 2>&1 & echo $!"
@@ -988,11 +992,16 @@ class DockerOrchestrator:
         result = self.execute_command(probe, workdir=None, timeout=60)
         output = result.get("output") or ""
 
+        # Only the head (before ---TAIL---) carries trusted markers; build
+        # output in the tail could itself contain STATE:/SIZE: lines.
+        head, _, tail_section = output.partition("---TAIL---")
+        tail = tail_section.strip()
+
         finished = False
         running = False
         exit_code: Optional[int] = None
         log_size = 0
-        for line in output.splitlines():
+        for line in head.splitlines():
             stripped = line.strip()
             if stripped.startswith("STATE:EXIT:"):
                 finished = True
@@ -1008,7 +1017,6 @@ class DockerOrchestrator:
                     log_size = int(stripped.split(":", 1)[1].strip())
                 except ValueError:
                     log_size = 0
-        tail = output.split("---TAIL---", 1)[1].strip() if "---TAIL---" in output else ""
 
         return {
             "finished": finished,
@@ -1224,7 +1232,19 @@ class DockerOrchestrator:
 
             # For streaming execution, Docker can leave exit_code unknown after the stream ends.
             if exit_code is None:
-                if _has_unknown_exit_failure_marker(full_output):
+                if monitoring_state.get("stream_lost_exit_unknown"):
+                    # The output is partial (stream died mid-run) so a missing
+                    # failure marker proves nothing — fail safe and tell the
+                    # agent to verify rather than report a false success.
+                    logger.warning(
+                        "Stream lost before completion; reporting failure with unknown exit code"
+                    )
+                    exit_code = 1
+                    full_output += (
+                        "\n[output stream was lost mid-run; the command finished with an "
+                        "unknown exit code — verify the build state before relying on this result]"
+                    )
+                elif _has_unknown_exit_failure_marker(full_output):
                     logger.warning("Command failure inferred from unknown-exit output")
                     exit_code = 1
                 else:
@@ -1289,12 +1309,14 @@ class DockerOrchestrator:
             return None
         try:
             probe = (
-                f"ps -eo args | grep -F {shlex.quote(fragment)} | grep -v grep | head -1"
+                f"ps -eo args | grep -F {shlex.quote(fragment)} "
+                f"| grep -v -e grep -e 'ps -eo' | head -1"
             )
             result = self.execute_command(probe, workdir=None, timeout=30)
-            if result.get("exit_code") != 0:
+            output = result.get("output") or ""
+            if result.get("exit_code") != 0 or "command not found" in output.lower():
                 return None
-            return bool((result.get("output") or "").strip())
+            return bool(output.strip())
         except Exception as exc:
             logger.debug(f"Liveness probe failed: {exc}")
             return None
@@ -1329,19 +1351,27 @@ class DockerOrchestrator:
                 monitoring_state["termination_reason"] = "absolute_timeout"
                 self._terminate_container_processes()
                 return
-            if now - last_chunk_time > silent_timeout:
+
+            # Liveness first: a probe-confirmed running process counts as
+            # progress (output is invisible after stream loss, so the silent
+            # timer alone would kill a healthy build).
+            alive = self._command_still_running(fragment)
+            if alive is False:
+                logger.info("📡 Process finished after stream loss; exit code is unknown")
+                monitoring_state["stream_lost_exit_unknown"] = True
+                return
+            if alive is True:
+                last_chunk_time = now
+            elif now - last_chunk_time > silent_timeout:
                 logger.warning(
-                    f"🔇 SILENT TIMEOUT (stream lost): no observed output for {silent_timeout}s"
+                    f"🔇 SILENT TIMEOUT (stream lost): no liveness signal for {silent_timeout}s"
                 )
                 monitoring_state["termination_reason"] = "silent_timeout"
                 self._terminate_container_processes()
                 return
-            if self._command_still_running(fragment) is False:
-                logger.info("📡 Process finished after stream loss; ending monitoring")
-                return
+
             remaining_absolute = absolute_timeout - (now - monitoring_state["start_time"])
-            remaining_silent = silent_timeout - (now - last_chunk_time)
-            time.sleep(max(0.05, min(poll_interval, remaining_absolute, remaining_silent)))
+            time.sleep(max(0.05, min(poll_interval, remaining_absolute)))
 
     def _monitor_cpu_usage(self, monitoring_state: dict, check_interval: int):
         """Monitor CPU usage to detect hung processes."""

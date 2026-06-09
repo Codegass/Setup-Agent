@@ -467,3 +467,26 @@ def test_documents_unmet_requirement_ignores_thought_entries():
     ]
     tool = ContextTool(_branch_cm(history=observation_history))
     assert tool._documents_unmet_requirement("clean summary") is True
+
+
+def test_detached_handoff_is_not_build_execution_evidence():
+    """A dispatch-and-poll handoff (success=True, build still running) must
+    not satisfy the build-tool-execution gate."""
+    handoff_entry = {
+        "type": "action",
+        "tool_name": "gradle",
+        "success": True,
+        "output": "still running; poll /tmp/sag_jobs/abc.log",
+        "dispatch_status": "running_detached",
+    }
+    validator = FakeValidator(build_success=True, build_system="gradle")
+    tool = ContextTool(_branch_cm(history=[handoff_entry], validator=validator))
+
+    result = tool._validate_task_completion(
+        _task("Compile with Gradle"),
+        summary="Gradle build dispatched successfully.",
+        key_results="Build started in background.",
+    )
+
+    assert result["valid"] is False
+    assert "tool execution" in result["reason"].lower()

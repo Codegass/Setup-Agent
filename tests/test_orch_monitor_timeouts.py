@@ -150,6 +150,11 @@ def test_stream_death_after_read_timeout_enters_blind_enforcement():
     assert result["termination_reason"] is None
     assert "partial output" in result["output"]
     assert orchestrator.terminate_calls == []
+    # The exit code is unknown after stream loss — fail safe, never report a
+    # false success from a partial log.
+    assert result["success"] is False
+    assert result["exit_code"] == 1
+    assert "stream was lost" in result["output"]
 
 
 def test_blind_enforcement_terminates_on_absolute_timeout():
@@ -183,3 +188,22 @@ def test_normal_stream_completion_unchanged():
     assert result["success"] is True
     assert result["exit_code"] == 0
     assert "BUILD SUCCESSFUL" in result["output"]
+
+
+def test_blind_enforcement_liveness_refreshes_silent_timer():
+    """A probe-confirmed running process must not be killed by the silent
+    timeout (output is invisible after stream loss); only the absolute cap
+    bounds it."""
+    orchestrator = build_orchestrator()
+    orchestrator._command_still_running = lambda fragment: True
+
+    stream = ScriptedStream([ReadTimeoutLike()])
+    exec_result = SimpleNamespace(output=stream, exit_code=None)
+
+    state = fresh_state(start_offset=0.7, command_fragment="./gradlew compileJava")
+    result = orchestrator._monitor_execution_with_timeouts(
+        exec_result, state, silent_timeout=0.5, absolute_timeout=1
+    )
+
+    assert result["termination_reason"] == "absolute_timeout"
+    assert orchestrator.terminate_calls

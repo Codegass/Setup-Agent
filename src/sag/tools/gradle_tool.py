@@ -182,21 +182,12 @@ class GradleTool(BaseTool):
 
         # Execute the command
         try:
-            # Use extended timeout for Gradle commands which often download dependencies
-            is_long_running = any(
-                task in gradle_cmd
-                for task in [
-                    "build",
-                    "test",
-                    "assemble",
-                    "compileJava",
-                    "compileKotlin",
-                    "publishToMavenLocal",
-                    "publish",
-                    "check",
-                    "integrationTest",
-                ]
-            )
+            # Any real Gradle task can be long (jar, javadoc, custom tasks...);
+            # only known-quick introspection commands stay on the blocking path
+            # with a hard timeout. Everything else goes dispatch-and-poll so a
+            # legitimately long build is never killed mid-run.
+            quick_markers = ("help", "tasks", "projects", "properties", "--version")
+            is_long_running = not any(marker in gradle_cmd for marker in quick_markers)
 
             if is_long_running and hasattr(self.orchestrator, "execute_command_with_soft_timeout"):
                 # Dispatch-and-poll: run detached with a soft window; if still
