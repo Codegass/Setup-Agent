@@ -587,10 +587,82 @@ class AgentStateEvaluator:
                     # Check for completion signal in metadata
                     metadata = getattr(step.tool_result, "metadata", {})
                     if metadata.get("completion_signal") or metadata.get("task_completed"):
+                        # A run cannot be reported complete while a build/test
+                        # task in the plan still has no real build artifacts.
+                        # This closes the "build/compile task closed with 0
+                        # artifacts but the run ended successful" defect.
+                        if not self._run_build_evidence_satisfied():
+                            logger.warning(
+                                "Run-complete signal withheld: a build/test task has no physical build artifacts."
+                            )
+                            return False
                         logger.info("Task completion detected via report tool")
                         return True
 
         return False
+
+    def _is_build_or_test_task(self, task_description: str) -> bool:
+        """Whether a task description names a build/test action AND a tool.
+
+        Mirrors ContextTool._is_build_or_test_task_description so the run-success
+        gate scopes to the same genuine build/test tasks.
+        """
+        desc = (task_description or "").lower()
+        build_terms = ["compile", "build", "package", "install"]
+        test_terms = ["test", "tests", "verify"]
+        tool_terms = ["maven", "mvn", "gradle", "gradlew", "npm", "yarn", "pnpm", "pytest"]
+        return any(term in desc for term in build_terms + test_terms) and any(
+            term in desc for term in tool_terms
+        )
+
+    def _run_build_evidence_satisfied(self) -> bool:
+        """Whether the run may be reported complete w.r.t. build evidence.
+
+        Returns True (no objection) unless: a physical validator is available,
+        the plan contains a genuine build/test task, the project is an
+        artifact-bearing build (maven/gradle), AND that build produced no
+        artifacts. Conservative on every uncertainty (no validator, no build
+        task, non-Java build, or any probe error) so a legitimately-finished
+        run is never trapped.
+        """
+        validator = self.physical_validator
+        if validator is None:
+            return True
+
+        try:
+            trunk = self.context_manager.load_trunk_context()
+        except Exception:
+            return True
+
+        todo = getattr(trunk, "todo_list", None) if trunk is not None else None
+        if not todo:
+            return True
+
+        has_build_task = False
+        for task in todo:
+            if isinstance(task, dict):
+                desc = str(task.get("description") or "")
+            else:
+                desc = str(getattr(task, "description", "") or "")
+            if self._is_build_or_test_task(desc):
+                has_build_task = True
+                break
+        if not has_build_task:
+            return True
+
+        project_name = getattr(self.context_manager, "project_name", None)
+        try:
+            build_status = validator.validate_build_status(project_name)
+        except Exception:
+            return True
+
+        build_system = (build_status.get("evidence") or {}).get("build_system")
+        # Only artifact-bearing builds (maven/gradle) can be judged on .class/JAR
+        # presence; Node/Python/Rust/Go structurally have none, so don't object.
+        if build_system not in ("maven", "gradle"):
+            return True
+
+        return bool(build_status.get("success"))
 
     def _is_run_task_complete(self, steps: List[Any]) -> bool:
         """Check completion for sag run --task requests that are not setup TODO work."""

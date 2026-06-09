@@ -127,7 +127,7 @@ class ContextTool(BaseTool):
             elif action == "compact_context":
                 return self._compact_context(new_context)
             elif action in ["complete_task", "switch_to_trunk"]:
-                return self._complete_task(summary)
+                return self._complete_task(summary, force=force)
             elif action == "complete_with_results":
                 return self._complete_task_with_results(
                     summary,
@@ -458,7 +458,7 @@ class ContextTool(BaseTool):
                 message=f"Failed to compact context: {str(e)}", error_code="COMPACT_ERROR"
             )
 
-    def _complete_task(self, summary: Optional[str]) -> ToolResult:
+    def _complete_task(self, summary: Optional[str], force: bool = False) -> ToolResult:
         """Complete current task with strict validation AND state recovery to prevent task ID confusion"""
         if not summary:
             raise ToolError(
@@ -541,6 +541,28 @@ class ContextTool(BaseTool):
                 ],
                 error_code="TASK_NOT_IN_PROGRESS",
             )
+
+        # CRITICAL: complete_task is NOT an unvalidated escape hatch. Route it
+        # through the SAME build/test completion validation as
+        # complete_with_results so a build/compile task cannot be closed without
+        # real evidence. complete_task carries no key_results, so pass "".
+        validation_result = self._validate_task_completion(current_task, summary, "")
+        if not validation_result["valid"]:
+            if force:
+                logger.warning(
+                    f"⚠️ Force completing task despite validation failure: {validation_result['reason']}"
+                )
+                logger.info("🔧 Using force parameter - validation bypassed")
+            else:
+                raise ToolError(
+                    message=f"Task completion validation failed: {validation_result['reason']}",
+                    suggestions=validation_result["suggestions"]
+                    + [
+                        "⚠️ If you're certain the task was completed correctly, use force=True to override validation",
+                        "Example: manage_context(action='complete_task', summary='...', force=True)",
+                    ],
+                    error_code="TASK_COMPLETION_VALIDATION_FAILED",
+                )
 
         try:
             current_task_id = self.context_manager.current_task_id
@@ -1371,6 +1393,176 @@ IMPORTANT:
             return True
         return re.search(r"(^|\W)errors?(:|\W|$)", normalized) is not None
 
+    def _is_test_task_description(self, task_description: str) -> bool:
+        """A build/test task is a TEST task when it mentions test/verify terms.
+
+        Anything else that qualifies as build/test (compile/build/package/install)
+        is treated as a compile/build task. Callers must first confirm the task is
+        build/test via `_is_build_or_test_task_description`.
+        """
+        return any(term in task_description for term in ("test", "verify"))
+
+    def _documents_unmet_requirement(self, combined_results: str) -> bool:
+        """Whether the task documents a still-unmet toolchain requirement.
+
+        Scans the completion summary/key_results AND the branch-history
+        observations for tight, high-signal phrases (the literal strings a
+        missing JDK/Maven emit). Kept narrow to avoid false positives.
+        """
+        unmet_phrases = (
+            "java_home is not set",
+            "java_home not set",
+            "requires java",
+            "requires maven",
+        )
+        texts = [combined_results or ""]
+        task_id = getattr(self.context_manager, "current_task_id", None)
+        if task_id and hasattr(self.context_manager, "load_branch_history"):
+            try:
+                branch_history = self.context_manager.load_branch_history(task_id)
+            except Exception:
+                branch_history = None
+            for entry in getattr(branch_history, "history", []) or []:
+                if isinstance(entry, dict):
+                    texts.append(
+                        " ".join(
+                            str(entry.get(field) or "")
+                            for field in ("content", "output", "observation")
+                        )
+                    )
+        blob = " ".join(texts).lower()
+        return any(phrase in blob for phrase in unmet_phrases)
+
+    def _has_remediation_action(self) -> bool:
+        """Whether the current branch attempted to provision/repair the toolchain.
+
+        Looks for install/env-setup actions (apt/yum/dnf/apk, JDK packages,
+        JAVA_HOME export, sdkman) or use of the provisioning tools. Markers are
+        deliberately inclusive so a genuine remediation disarms the gate.
+        """
+        task_id = getattr(self.context_manager, "current_task_id", None)
+        if not task_id or not hasattr(self.context_manager, "load_branch_history"):
+            return False
+        try:
+            branch_history = self.context_manager.load_branch_history(task_id)
+        except Exception:
+            return False
+        if branch_history is None:
+            return False
+
+        remediation_tools = {"project_setup", "system"}
+        remediation_markers = (
+            "apt-get",
+            "apt install",
+            "yum install",
+            "dnf install",
+            "apk add",
+            "update-alternatives",
+            "openjdk",
+            "default-jdk",
+            "jdk",
+            "export java_home",
+            "java_home=",
+            "sdk install",
+            "sdkman",
+            "install_dependencies",
+        )
+        for entry in getattr(branch_history, "history", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != "action":
+                continue
+            tool_name = str(entry.get("tool_name") or "").lower()
+            if tool_name in remediation_tools:
+                return True
+            searchable = " ".join(
+                str(entry.get(field) or "")
+                for field in ("command", "content", "tool_input", "output")
+            ).lower()
+            if any(marker in searchable for marker in remediation_markers):
+                return True
+        return False
+
+    def _get_completion_physical_validator(self):
+        """Return a PhysicalValidator for the completion gate, or None.
+
+        Prefers a validator already attached to the context manager (so callers
+        can share/inject one); otherwise builds one from a reachable docker
+        orchestrator. Returns None when neither is available — in that case the
+        physical gate is skipped here and the run-completion path enforces it.
+        """
+        cm = self.context_manager
+        validator = getattr(cm, "physical_validator", None)
+        if validator is not None:
+            return validator
+
+        orchestrator = getattr(cm, "orchestrator", None)
+        if orchestrator is None:
+            return None
+
+        try:
+            from sag.agent.physical_validator import PhysicalValidator
+
+            workspace = getattr(cm, "workspace_path", None)
+            project_path = str(workspace) if workspace else "/workspace"
+            return PhysicalValidator(
+                docker_orchestrator=orchestrator, project_path=project_path
+            )
+        except Exception as exc:
+            logger.warning(f"Could not build PhysicalValidator for completion gate: {exc}")
+            return None
+
+    def _validate_build_test_physical_evidence(
+        self, task_description: str
+    ) -> Optional[Dict[str, Any]]:
+        """Block a build/test completion that lacks physical evidence.
+
+        compile/build task -> require .class/JAR artifacts on disk;
+        test task          -> require parsed test reports on disk.
+
+        Returns a validation-failure dict to block, or None to allow. Never
+        blocks when a validator cannot be reached or a probe errors, so a
+        legitimately-finished task is never trapped.
+        """
+        validator = self._get_completion_physical_validator()
+        if validator is None:
+            return None
+
+        project_name = getattr(self.context_manager, "project_name", None)
+        try:
+            if self._is_test_task_description(task_description):
+                status = validator.validate_test_status(project_name)
+                if not status.get("has_test_reports"):
+                    return {
+                        "valid": False,
+                        "reason": "Test task has no test reports on disk (no physical evidence of executed tests)",
+                        "suggestions": [
+                            "Run the test suite so test reports are produced before completing",
+                            "Confirm test report XML/output exists (e.g. surefire/failsafe or gradle test results)",
+                            "Do not complete a test task without physical test-report evidence",
+                            "Use force=True only when intentionally recording a manually verified exception",
+                        ],
+                    }
+            else:
+                status = validator.validate_build_status(project_name)
+                if not status.get("success"):
+                    reason = status.get("reason") or "no build artifacts found"
+                    return {
+                        "valid": False,
+                        "reason": f"Build/compile task has no physical build artifacts ({reason})",
+                        "suggestions": [
+                            "Produce compiled artifacts (.class files / JARs) before completing this task",
+                            "Re-run the build and verify build/classes and build/libs (or target/) are populated",
+                            "Do not complete a build/compile task with zero artifacts",
+                            "Use force=True only when intentionally recording a manually verified exception",
+                        ],
+                    }
+        except Exception as exc:
+            logger.warning(f"Physical-evidence completion gate skipped due to probe error: {exc}")
+            return None
+
+        return None
+
     def _validate_task_completion(
         self, task: Any, summary: str, key_results: str
     ) -> Dict[str, Any]:
@@ -1389,23 +1581,43 @@ IMPORTANT:
             validation_result = {"valid": True, "reason": "", "suggestions": []}
 
             combined_results = f"{summary_lower}\n{key_results_lower}"
-            if self._is_build_or_test_task_description(
-                task_description
-            ) and self._has_unresolved_failure_signal(combined_results):
-                validation_result.update(
-                    {
-                        "valid": False,
-                        "reason": "Build/test task indicates unresolved failure and cannot be marked completed",
-                        "suggestions": [
-                            "Resolve the build/test blocker before completing this task",
-                            "Only complete build/test tasks after successful execution evidence is available",
-                            "Use force=True only when intentionally recording a manually verified exception",
-                        ],
-                    }
-                )
-                return validation_result
-
             if self._is_build_or_test_task_description(task_description):
+                # Gate order (cheapest/text-based first, physical probe last):
+                #   1. documented unresolved failure
+                #   2. unmet toolchain requirement with no remediation attempted
+                #   3. no successful build/test tool execution recorded
+                #   4. no physical artifacts/test reports on disk
+                if self._has_unresolved_failure_signal(combined_results):
+                    validation_result.update(
+                        {
+                            "valid": False,
+                            "reason": "Build/test task indicates unresolved failure and cannot be marked completed",
+                            "suggestions": [
+                                "Resolve the build/test blocker before completing this task",
+                                "Only complete build/test tasks after successful execution evidence is available",
+                                "Use force=True only when intentionally recording a manually verified exception",
+                            ],
+                        }
+                    )
+                    return validation_result
+
+                if self._documents_unmet_requirement(
+                    combined_results
+                ) and not self._has_remediation_action():
+                    validation_result.update(
+                        {
+                            "valid": False,
+                            "reason": "Build/test task documents an unmet toolchain requirement with no remediation attempted",
+                            "suggestions": [
+                                "Install/provision the missing requirement (e.g. apt-get install the JDK, set JAVA_HOME) before completing",
+                                "Re-run the build or test after the toolchain is provisioned",
+                                "Do not give up on a build/test task while a documented requirement is still unmet",
+                                "Use force=True only when intentionally recording a manually verified exception",
+                            ],
+                        }
+                    )
+                    return validation_result
+
                 has_tool_evidence = self._has_required_build_or_test_tool_execution()
                 if has_tool_evidence is False:
                     validation_result.update(
@@ -1421,6 +1633,10 @@ IMPORTANT:
                         }
                     )
                     return validation_result
+
+                physical_block = self._validate_build_test_physical_evidence(task_description)
+                if physical_block is not None:
+                    return physical_block
 
             # Task-specific validation rules
             if "project_analyzer" in task_description or "analyze project" in task_description:
