@@ -1,6 +1,7 @@
 """Context management system for the agent."""
 
 import json
+import re
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -73,6 +74,11 @@ class TrunkContext(BaseContext):
     todo_list: List[Task] = Field(default_factory=list)
     environment_summary: Dict[str, Any] = Field(default_factory=dict)
     progress_summary: str = ""
+    # Highest numeric task id ever issued. Ids must be unique for the lifetime
+    # of the trunk — NEVER reused — because branch contexts, output refs, and
+    # the webui all join on them. Old persisted trunks (field missing -> 0)
+    # are backfilled from the ids present in todo_list.
+    task_id_seq: int = 0
 
     def __init__(self, **data):
         # Remove context_type from data if it exists to avoid conflicts
@@ -80,9 +86,20 @@ class TrunkContext(BaseContext):
         super().__init__(context_type=ContextType.TRUNK, **data)
 
     @staticmethod
+    def _strip_task_id_prefix(description: str) -> str:
+        """Drop a leading 'task_N:' from a description.
+
+        Ids are assigned by the manager; a model/analyzer-authored prefix is
+        always bogus and desyncs id from description (beam 2026-06-10: the
+        model copied the plan as 'task_4: Compile project using Gradle').
+        """
+        return re.sub(r"^\s*task_\d+\s*:\s*", "", description or "")
+
+    @staticmethod
     def _normalize_task_description(description: str) -> str:
         """Normalize a task description for duplicate detection."""
-        return " ".join((description or "").split()).strip().lower()
+        stripped = TrunkContext._strip_task_id_prefix(description)
+        return " ".join(stripped.split()).strip().lower()
 
     def add_task(self, description: str) -> str:
         """Add a new task to the end of the TODO list.
@@ -99,17 +116,28 @@ class TrunkContext(BaseContext):
         """Insert a new task at `index` (default: append at the end).
 
         Shares add_task's de-duplication: an existing identical task keeps its
-        position and id instead of being duplicated. Inserting in the middle is
-        safe because ids are derived from the list length (which only grows), so
-        they stay unique even after positional inserts.
+        position and id instead of being duplicated. Ids come from a monotonic
+        sequence (never from the list length): the todo list can shrink when a
+        re-plan clears stale pending tasks, and a length-derived id then
+        collides with — or reuses — a surviving task's id, cross-linking branch
+        contexts and outputs (observed on beam 2026-06-10: two task_7/task_8
+        pairs in one trunk).
         """
+        description = self._strip_task_id_prefix(description)
         normalized = self._normalize_task_description(description)
         for existing in self.todo_list:
             if self._normalize_task_description(existing.description) == normalized:
                 logger.info(f"Skipped duplicate task (already present as {existing.id}): {description}")
                 return existing.id
 
-        task_id = f"task_{len(self.todo_list) + 1}"
+        next_num = self.task_id_seq
+        for existing in self.todo_list:
+            suffix = existing.id.rsplit("_", 1)[-1]
+            if suffix.isdigit():
+                next_num = max(next_num, int(suffix))
+        next_num += 1
+        self.task_id_seq = next_num
+        task_id = f"task_{next_num}"
         task = Task(id=task_id, description=description)
         if index is None or index >= len(self.todo_list):
             self.todo_list.append(task)

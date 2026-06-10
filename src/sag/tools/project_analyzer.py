@@ -1419,13 +1419,25 @@ PY"""
 
             # 只有在新计划看起来合理时才替换现有任务
             if len(execution_plan) >= 3:  # 至少3个任务才认为是合理的计划
-                # 清除现有的pending任务（保留已完成的和进行中的）
-                remaining_tasks = [
-                    task for task in trunk_context.todo_list if task.status.value not in ["pending"]
+                # Idempotent plan application: keep completed/in-progress tasks
+                # AND pending tasks that are part of the new plan (so their ids
+                # stay stable across analyzer re-runs); drop only stale pending
+                # tasks the new plan no longer contains. A full clear+re-add
+                # renumbered the same tasks on every re-run (beam 2026-06-10:
+                # plan re-applied 3x in 90s, churning ids and orphaning the
+                # branch contexts/outputs joined on them).
+                normalize = trunk_context._normalize_task_description
+                plan_descriptions = {
+                    normalize(item.get("description", "Unknown task")) for item in execution_plan
+                }
+                trunk_context.todo_list = [
+                    task
+                    for task in trunk_context.todo_list
+                    if task.status.value != "pending"
+                    or normalize(task.description) in plan_descriptions
                 ]
-                trunk_context.todo_list = remaining_tasks
 
-                # 添加新的智能任务
+                # 添加新的智能任务 (add_task dedup keeps already-present ones)
                 for plan_item in execution_plan:
                     task_description = plan_item.get("description", "Unknown task")
                     task_type = plan_item.get("type", "general")
