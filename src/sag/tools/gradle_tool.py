@@ -985,6 +985,11 @@ class GradleTool(BaseTool):
                     "description": "IMPORTANT for multi-module projects: Continue after task failures. For test tasks, adds test.ignoreFailures=true to run ALL tests even if some fail.",
                     "default": False,
                 },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for quick commands. Long builds run detached with a soft window and are never hard-killed.",
+                    "default": 300,
+                },
             },
             "required": [],
         }

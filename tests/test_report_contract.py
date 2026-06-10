@@ -718,3 +718,63 @@ def test_replay_delegates_environment_handling_to_docker_orchestrator():
 
     assert result["success"] is True
     assert orchestrator.commands == ["cd /workspace/demo && mvn test"]
+
+
+def test_report_header_tests_line_uses_snapshot_stats_not_evidence_stats():
+    """The header must consume the same physically-validated numbers as the
+    dashboard. 06-10 eval: every header contradicted its own dashboard
+    (commons-cli: header '977/977 passed, 100%' vs dashboard 420/430)."""
+    tool = ReportTool()
+    snapshot = {
+        "status": {
+            "tests_total": 430,
+            "tests_passed": 420,
+            "tests_failed": 0,
+            "tests_errors": 0,
+            "tests_skipped": 10,
+            "static_test_count": 460,
+            "pass_pct": 97.7,
+        },
+        "evidence_result": {
+            "status": "success",
+            # Model-supplied stats disagree (raw surefire totals) — must lose.
+            "test_stats": {"executed": 977, "passed": 977, "failed": 0, "skipped": 61},
+            "conflicts": [],
+            "evidence_refs": ["output_x"],
+        },
+    }
+
+    lines = tool._render_enhanced_header(
+        "2026-06-10 12:00:00",
+        "success",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+        snapshot=snapshot,
+    )
+
+    tests_lines = [l for l in lines if l.startswith("**Tests:**")]
+    assert tests_lines, lines
+    assert "420" in tests_lines[0] and "430" in tests_lines[0], tests_lines[0]
+    assert "977" not in tests_lines[0], tests_lines[0]
+
+
+def test_report_header_falls_back_to_evidence_stats_without_snapshot_stats():
+    tool = ReportTool()
+    snapshot = {
+        "status": {},
+        "evidence_result": {
+            "status": "partial",
+            "test_stats": {"executed": 10, "passed": 8, "failed": 2, "skipped": 0},
+            "conflicts": [],
+            "evidence_refs": ["output_y"],
+        },
+    }
+
+    lines = tool._render_enhanced_header(
+        "2026-06-10 12:00:00",
+        "partial",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+        snapshot=snapshot,
+    )
+
+    tests_lines = [l for l in lines if l.startswith("**Tests:**")]
+    assert tests_lines and "8" in tests_lines[0]

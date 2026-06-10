@@ -89,3 +89,35 @@ def test_stale_pending_tasks_not_in_new_plan_are_removed():
     analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
 
     assert all(t.id != stale_id for t in trunk.todo_list)
+
+
+def test_unknown_analysis_cannot_overwrite_known_plan():
+    """Evidence hierarchy: once a plan from a KNOWN build system is applied,
+    a later analysis that fails detection (unknown/none) must not replace it
+    (beam 06-10: 25 'unknown'-driven re-plans churned the trunk)."""
+    analyzer, trunk = _analyzer_with_trunk()
+    analyzer._update_trunk_context_with_plan(
+        {"execution_plan": PLAN, "build_system": "Gradle", "project_type": "Java"}
+    )
+    snapshot = _ids_and_descriptions(trunk)
+    assert trunk.environment_summary.get("build_system") == "Gradle"
+
+    fallback_plan = [
+        {"description": "Manually explore and identify project structure", "type": "analysis"},
+        {"description": "Setup environment", "type": "environment"},
+        {"description": "Attempt generic build", "type": "build"},
+    ]
+    result = analyzer._update_trunk_context_with_plan(
+        {"execution_plan": fallback_plan, "build_system": "unknown", "project_type": "unknown"}
+    )
+
+    assert result is True
+    assert _ids_and_descriptions(trunk) == snapshot
+
+
+def test_known_analysis_records_build_system_in_trunk():
+    analyzer, trunk = _analyzer_with_trunk()
+    analyzer._update_trunk_context_with_plan(
+        {"execution_plan": PLAN, "build_system": "Maven", "project_type": "Java"}
+    )
+    assert trunk.environment_summary.get("build_system") == "Maven"

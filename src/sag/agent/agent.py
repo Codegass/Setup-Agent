@@ -39,6 +39,9 @@ class SetupAgent:
         self.context_manager = None
         self.tools = None
         self.react_engine = None
+        # Surfaced run verdict ("success" | "partial" | "failed"); refined by
+        # _get_verified_final_status. "partial" = build verified, tests not.
+        self.final_verdict = "failed"
         # PhysicalValidator is set during _initialize_tools() once orchestrator
         # is available; declared here so attribute access is always safe.
         self.physical_validator = None
@@ -405,8 +408,15 @@ class SetupAgent:
             )
 
             # Step 5: Handle final status
+            final_verdict = getattr(self, "final_verdict", "success" if success else "failed")
             if self.config.ui_mode:
-                if success:
+                if success and final_verdict == "partial":
+                    self._emit(
+                        EventType.SUCCESS,
+                        "Project setup partially completed (build verified, tests not verified)",
+                        level="warning",
+                    )
+                elif success:
                     self._emit(
                         EventType.SUCCESS, "Project setup completed successfully", level="success"
                     )
@@ -416,7 +426,9 @@ class SetupAgent:
             else:
                 self._provide_setup_summary(success)
 
-            cmd_logger.info(f"Project setup completed: success={success}")
+            cmd_logger.info(
+                f"Project setup completed: success={success}, verdict={final_verdict}"
+            )
             return success
 
         except Exception as e:
@@ -907,7 +919,13 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
             return verified_success
 
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
-        """Get the verified final status using separate build and test validation.
+        """Verify the final run status against physical evidence.
+
+        Returns the boolean used for flow control, and records the surfaced
+        verdict in self.final_verdict ("success" | "partial" | "failed"):
+        a build-green run with NO test evidence is PARTIAL — never announced
+        as a full success (beam 2026-06-10 printed 🎉 with zero executed
+        tests and no report).
 
         The test gate delegates to :func:`evaluate_run_verdict` (the single
         verdict policy shared with the report verdict) so the run/test success
@@ -916,6 +934,7 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
         from sag.agent.physical_validator import evaluate_run_verdict
         from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 
+        self.final_verdict = "failed"
         project_name = self._get_project_name_for_validation()
 
         if not project_name:
@@ -988,7 +1007,9 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                         f"{test_status.get('failed_tests', 0)} failed, "
                         f"{test_status.get('error_tests', 0)} errors"
                     )
+                    self.final_verdict = "failed"
                     return False
+                self.final_verdict = "success"
 
                 if pass_rate == 100.0:
                     logger.info(
@@ -1022,12 +1043,19 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                         f"📊 {module_count} modules not tested: {', '.join(test_status['modules_without_tests'][:3])}"
                     )
             else:
+                # No test evidence at all: the build is verified but the run
+                # is at best PARTIAL — it must never be announced as a full
+                # success on build artifacts alone.
+                self.final_verdict = "partial"
                 if tests_expected:
                     logger.error(
                         "❌ Test validation: No test reports found despite detected tests"
                     )
                     return False
-                logger.info("⚠️ Test validation: No test reports found")
+                logger.info(
+                    "⚠️ Test validation: No test reports found — build verified, "
+                    "tests UNVERIFIED; reporting partial setup"
+                )
 
             return True
         else:
@@ -1039,6 +1067,7 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
                     f"📊 Test status (informational): {test_status['passed_tests']}/{test_status['total_tests']} tests, {test_status['pass_rate']:.1f}% pass rate"
                 )
 
+            self.final_verdict = "failed"
             return False
 
     def _get_project_name_for_validation(self) -> Optional[str]:
@@ -1155,7 +1184,16 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
         logger.info(f"Setup summary: {exec_summary}")
 
         # Provide next steps
-        if success:
+        if success and getattr(self, "final_verdict", "success") == "partial":
+            self.console.print(
+                "\n[bold yellow]⚠️ Project setup PARTIALLY completed: build verified, "
+                "tests not verified (no test reports found).[/bold yellow]"
+            )
+            self.console.print(f"[dim]You can connect to the container using:[/dim]")
+            self.console.print(
+                f"  setup-agent connect {context_info.get('project_name', 'project')}"
+            )
+        elif success:
             self.console.print(
                 f"\n[bold green]🎉 Project setup completed successfully![/bold green]"
             )

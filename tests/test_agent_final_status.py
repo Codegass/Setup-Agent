@@ -466,3 +466,91 @@ def test_verified_final_status_uses_project_metadata_over_docker_label():
     assert validator.build_project_names == ["commons-vfs"]
     assert validator.test_project_names == ["commons-vfs"]
     assert validator.analysis_project_names == ["commons-vfs"]
+
+
+# --- tri-state verdict surface (beam 06-10: 🎉 success with 0 tests) ---------
+
+
+def _no_reports_test_status():
+    return {
+        "has_test_reports": False,
+        "status": "WARNING",
+        "reason": "No test reports found",
+        "pass_rate": 0.0,
+        "total_tests": 0,
+        "passed_tests": 0,
+        "failed_tests": 0,
+        "error_tests": 0,
+        "skipped_tests": 0,
+        "test_exclusions": [],
+    }
+
+
+def test_build_green_without_test_evidence_is_partial_not_success():
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "Build fingerprints found"},
+            test_status=_no_reports_test_status(),
+            analysis_status={"analyzed": False},
+        )
+    )
+
+    result = agent._get_verified_final_status(react_engine_success=False)
+
+    assert result is True, "build-green/no-expectation keeps the flow-control bool"
+    assert agent.final_verdict == "partial", "but the surfaced verdict must be partial"
+
+
+def test_build_green_missing_expected_tests_is_partial_and_false():
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "Build fingerprints found"},
+            test_status=_no_reports_test_status(),
+            analysis_status={"analyzed": True, "static_test_count": 13847},
+        )
+    )
+
+    result = agent._get_verified_final_status(react_engine_success=False)
+
+    assert result is False
+    assert agent.final_verdict == "partial"
+
+
+def test_threshold_pass_is_full_success_verdict():
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "Build fingerprints found"},
+            test_status={
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "reason": "",
+                "pass_rate": 96.3,
+                "total_tests": 214,
+                "passed_tests": 206,
+                "failed_tests": 3,
+                "error_tests": 0,
+                "skipped_tests": 5,
+                "test_exclusions": [],
+                "modules_without_tests": [],
+            },
+        )
+    )
+
+    result = agent._get_verified_final_status(react_engine_success=True)
+
+    assert result is True
+    assert agent.final_verdict == "success"
+
+
+def test_build_failure_is_failed_verdict():
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": False, "reason": "no artifacts"},
+            test_status=_no_reports_test_status(),
+        )
+    )
+
+    result = agent._get_verified_final_status(react_engine_success=False)
+
+    assert result is False
+    assert agent.final_verdict == "failed"

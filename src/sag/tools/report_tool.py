@@ -583,7 +583,9 @@ class ReportTool(BaseTool, UIEventEmitter):
             return []
 
         lines = [f"Result: {str(evidence.get('status', 'unknown')).upper()}"]
-        test_stats = self._coerce_report_test_stats(evidence.get("test_stats"))
+        test_stats = self._snapshot_test_stats(snapshot) or self._coerce_report_test_stats(
+            evidence.get("test_stats")
+        )
         if test_stats:
             lines.append(f"Tests: {test_stats.as_summary()}")
         conflicts = evidence.get("conflicts") or []
@@ -594,9 +596,13 @@ class ReportTool(BaseTool, UIEventEmitter):
             lines.append(f"Evidence refs: {'; '.join(refs)}")
         return lines
 
-    def _render_markdown_evidence_details(self, evidence: Dict[str, Any]) -> List[str]:
+    def _render_markdown_evidence_details(
+        self, evidence: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None
+    ) -> List[str]:
         lines: List[str] = []
-        test_stats = self._coerce_report_test_stats(evidence.get("test_stats"))
+        test_stats = self._snapshot_test_stats(snapshot) or self._coerce_report_test_stats(
+            evidence.get("test_stats")
+        )
         if test_stats:
             lines.append(f"**Tests:** {test_stats.as_summary()}")
         conflicts = evidence.get("conflicts") or []
@@ -606,6 +612,31 @@ class ReportTool(BaseTool, UIEventEmitter):
         if refs:
             lines.append(f"**Evidence refs:** {'; '.join(refs)}")
         return lines
+
+    def _snapshot_test_stats(self, snapshot: Optional[Dict[str, Any]]) -> Optional[TestStats]:
+        """Physically-validated test stats from the report snapshot.
+
+        The header MUST consume the same numbers as the dashboard/verdict —
+        the model-supplied evidence stats are a fallback only. (06-10 eval:
+        every report header contradicted its own dashboard, e.g. commons-cli
+        '977/977 passed, 100%' over a dashboard showing 420/430.)
+        """
+        status = (snapshot or {}).get("status") or {}
+        executed = status.get("tests_total")
+        passed = status.get("tests_passed")
+        if not executed or passed is None:
+            return None
+        try:
+            return TestStats(
+                discovered=status.get("static_test_count") or None,
+                executed=int(executed),
+                passed=int(passed),
+                failed=int(status.get("tests_failed", 0) or 0)
+                + int(status.get("tests_errors", 0) or 0),
+                skipped=int(status.get("tests_skipped", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            return None
 
     def _should_render_report_evidence_result(self, evidence: Dict[str, Any]) -> bool:
         if not evidence:
@@ -4468,7 +4499,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "UNKNOWN": "❔",
             }.get(evidence_status, "❔")
             result_msg = f"**Result:** {icon} {evidence_status}"
-            evidence_details = self._render_markdown_evidence_details(evidence_result)
+            evidence_details = self._render_markdown_evidence_details(
+                evidence_result, snapshot=snapshot
+            )
             lines.append(result_msg)
             lines.extend(evidence_details)
             lines.append("")

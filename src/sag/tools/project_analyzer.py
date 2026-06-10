@@ -221,7 +221,11 @@ class ProjectAnalyzerTool(BaseTool):
         # 检查关键文件存在性
         files_to_check = [
             "pom.xml",  # Maven
-            "build.gradle",  # Gradle
+            "build.gradle",  # Gradle (Groovy DSL)
+            "build.gradle.kts",  # Gradle (Kotlin DSL — e.g. apache/beam root)
+            "settings.gradle",  # Gradle multi-project marker
+            "settings.gradle.kts",  # Gradle multi-project marker (Kotlin DSL)
+            "gradlew",  # Gradle wrapper — strong gradle signal even without root build file
             "package.json",  # Node.js
             "requirements.txt",  # Python
             "pyproject.toml",  # Python Poetry
@@ -242,6 +246,9 @@ class ProjectAnalyzerTool(BaseTool):
             if result.get("success") and "exists" in result.get("output", ""):
                 existing_files.append(file)
 
+        gradle_markers = ("build.gradle", "build.gradle.kts", "settings.gradle",
+                          "settings.gradle.kts", "gradlew")
+
         # 检测项目类型
         project_type = "unknown"
         build_system = "unknown"
@@ -249,7 +256,7 @@ class ProjectAnalyzerTool(BaseTool):
         if "pom.xml" in existing_files:
             project_type = "Java"
             build_system = "Maven"
-        elif "build.gradle" in existing_files:
+        elif any(marker in existing_files for marker in gradle_markers):
             project_type = "Java"
             build_system = "Gradle"
         elif "package.json" in existing_files:
@@ -267,11 +274,27 @@ class ProjectAnalyzerTool(BaseTool):
 
         logger.info(f"Detected project type: {project_type}, build system: {build_system}")
 
-        return {
+        structure = {
             "project_type": project_type,
             "build_system": build_system,
             "existing_files": existing_files,
         }
+
+        # An "unknown" verdict must carry its evidence: which markers were
+        # checked and what the project root actually contains — so the model
+        # can see WHY detection failed and correct course, instead of
+        # receiving a bare authoritative "unknown".
+        if project_type == "unknown":
+            structure["detection_checked"] = [
+                f for f in files_to_check if not f.startswith("README")
+            ]
+            listing = self.docker_orchestrator.execute_command(
+                f"ls -1 {project_path} 2>/dev/null | head -30"
+            )
+            if listing.get("success"):
+                structure["root_listing"] = (listing.get("output") or "").strip()
+
+        return structure
 
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
         """分析项目文档，提取关键信息"""
@@ -1402,6 +1425,25 @@ PY"""
                 logger.warning("No execution plan generated, trunk context unchanged")
                 return False
 
+            # Evidence hierarchy: a derived re-analysis must not overwrite a
+            # plan grounded in stronger evidence. If THIS analysis failed to
+            # identify the build system while a previous one succeeded (the
+            # trunk remembers it), keep the existing plan — re-planning from
+            # "unknown" is exactly the loop that burned beam's 06-10 run
+            # (25 re-plans driven by an analyzer blind to the Kotlin DSL).
+            incoming_unknown = str(analysis.get("build_system", "unknown")).lower() in (
+                "unknown",
+                "none",
+                "",
+            )
+            known_system = (trunk_context.environment_summary or {}).get("build_system")
+            if incoming_unknown and known_system:
+                logger.warning(
+                    f"Analyzer returned unknown build system but trunk already has "
+                    f"evidence of '{known_system}'; preserving the existing plan"
+                )
+                return True
+
             # 验证执行计划的质量
             if not self._is_execution_plan_valid(execution_plan):
                 logger.warning(
@@ -1443,6 +1485,13 @@ PY"""
                     task_type = plan_item.get("type", "general")
                     logger.debug(f"Adding task: {task_description} (type: {task_type})")
                     trunk_context.add_task(task_description)
+
+                # Remember the identified build system so weaker future
+                # analyses cannot regress the plan (see guard above).
+                if not incoming_unknown:
+                    trunk_context.environment_summary["build_system"] = analysis.get(
+                        "build_system"
+                    )
 
                 # Store test counting metrics in environment summary if available
                 static_test_count = analysis.get("static_test_count")
@@ -1544,6 +1593,23 @@ PY"""
                 output += f"    ... and {len(existing_files) - 5} more files\n"
         else:
             output += f"⚠️ No project files detected\n"
+
+        # An unknown verdict shows its evidence so the model can judge it
+        # (and override with its own observations) instead of trusting a
+        # bare "unknown" as authoritative.
+        if str(project_type).lower() == "unknown":
+            checked = analysis.get("detection_checked") or []
+            if checked:
+                output += (
+                    f"🔎 Detection evidence: checked for {', '.join(checked)} — none present\n"
+                )
+            root_listing = analysis.get("root_listing")
+            if root_listing:
+                output += f"📁 Project root contains:\n{root_listing}\n"
+            output += (
+                "⚠️ This 'unknown' verdict is a detection result, not ground truth — "
+                "if build evidence exists (wrapper scripts, compiled artifacts), trust that instead.\n"
+            )
 
         if analysis.get("java_version"):
             output += f"☕ Java Version: {analysis['java_version']}\n"
