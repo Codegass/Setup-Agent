@@ -8,14 +8,17 @@ from loguru import logger
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
+from sag.config.settings import effective_phase_floor
 from sag.evidence import EvidenceStatus, coerce_evidence_status
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .agent_state_evaluator import AgentStateEvaluator
-from .context_manager import ContextManager
+from .attempt_ledger import compact_steps
+from .context_manager import ContextManager, TaskStatus
 from .output_storage import OutputStorageManager
+from .phase_machine import PHASE_NAMES, PhaseMachine
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
@@ -28,6 +31,34 @@ from .tool_orchestration import (
     ToolLifecycleEvent,
     ToolOrchestrator,
 )
+
+
+# Per-phase objectives for the setup phase machine (spec §3.1). These
+# prescribe TOOLS, never raw commands — task text outranks prompt guidance
+# (round-4 lesson), so the only safe vocabulary here is the tool surface.
+PHASE_OBJECTIVES = {
+    "provision": (
+        "Get the repository cloned and the toolchain installed: "
+        "project(action='clone', repo_url=...), then project(action='provision', ...) "
+        "for the JDK the project needs. Claim phase(action='done') with what was installed."
+    ),
+    "analyze": (
+        "Understand the project: project(action='analyze'). Record build system, "
+        "test counts, special requirements in key_results. An honest 'unknown' with "
+        "evidence is acceptable."
+    ),
+    "build": (
+        "Make the project compile: build(action='deps') then build(action='compile'). "
+        "Never run mvn/gradle via bash — build resolves the registered toolchain. "
+        "Long builds detach; poll the job ref with search."
+    ),
+    "test": (
+        "Run the test suite: build(action='test'). Partial pass above threshold is a "
+        "valid outcome — report the numbers honestly in key_results. If tests cannot "
+        "run, phase(action='blocked') with evidence."
+    ),
+    "report": "Generate the final report with the report tool, then phase(action='done').",
+}
 
 
 def wall_clock_exceeded(
@@ -90,11 +121,19 @@ class ReActEngine(UIEventEmitter):
         tools: List[BaseTool],
         repository_url: str = None,
         repository_ref: str = None,
+        phase_machine: Optional[PhaseMachine] = None,
+        context_journal=None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
+
+        # Engine-owned phase machine for setup runs (spec §3.1). None keeps the
+        # legacy free-form behavior (`sag run --task` passes neither).
+        self.phase_machine = phase_machine
+        self.context_journal = context_journal
+        self._phase_iterations = 0
         self.prompts = load_react_engine_prompts()
         self.repository_url = repository_url
         self.repository_ref = repository_ref
@@ -293,6 +332,168 @@ class ReActEngine(UIEventEmitter):
             )
         return tripped
 
+    # ------------------------------------------------------------------
+    # Phase-machine wiring (setup mode only; spec §3.1/§3.2/§7)
+    # ------------------------------------------------------------------
+
+    def _phase_budget_numbers(self, phase: str) -> tuple[int, int, int]:
+        """(max_iter, reserved_for_later_phases, remaining_iterations)."""
+        max_iter = (
+            getattr(self, "_run_max_iterations", None)
+            or getattr(self.config, "max_iterations", 150)
+        )
+        later = PHASE_NAMES[PHASE_NAMES.index(phase) + 1 :]
+        floors = getattr(self.config, "phase_min_floors", {}) or {}
+        reserved = sum(effective_phase_floor(floors.get(q, 4), max_iter) for q in later)
+        remaining = max_iter - getattr(self, "current_iteration", 0)
+        return max_iter, reserved, remaining
+
+    def _phase_intro_step(self) -> ReActStep:
+        """The clean-window digest that opens every phase (GTD reset): goal
+        picture so far, the new phase's objective (tools, never raw commands),
+        and the flexible budget note."""
+        machine = self.phase_machine
+        phase = machine.current_phase
+        _, reserved, remaining = self._phase_budget_numbers(phase)
+        budget = max(5, remaining - reserved)
+        lines = [
+            f"=== PHASE: {phase.upper()} ===",
+            "Run picture so far:",
+            *machine.digest_lines(),
+            "",
+            f"Objective: {PHASE_OBJECTIVES[phase]}",
+            f"Budget: flexible — up to ~{budget} iterations available (a small reserve is "
+            f"kept for later phases). When finished, call phase(action='done', "
+            f"key_results=..., evidence=[refs]). If it cannot be finished, "
+            f"phase(action='blocked', reason=..., evidence=[refs]).",
+        ]
+        return ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content="\n".join(lines),
+            timestamp=self._get_timestamp(),
+        )
+
+    def _handle_phase_signals(self, executed_steps) -> Optional[str]:
+        """Advance the machine when the phase tool signalled done/blocked.
+
+        The ENGINE is the single owner of phase state: the tool only emits
+        `metadata.phase_signal`; this method mutates the machine, persists the
+        phase record to the trunk, and performs the window reset."""
+        if getattr(self, "phase_machine", None) is None:
+            return None
+        for step in executed_steps:
+            result = getattr(step, "tool_result", None)
+            metadata = getattr(result, "metadata", None) or {}
+            signal = metadata.get("phase_signal")
+            if not signal:
+                continue
+            machine = self.phase_machine
+            finished = machine.current_phase
+            if signal == "done":
+                machine.mark_done(metadata.get("key_results", ""), metadata.get("evidence", []))
+                self._persist_phase_record(finished, "completed", metadata.get("key_results", ""))
+            else:
+                machine.mark_blocked(metadata.get("reason", ""), metadata.get("evidence", []))
+                self._persist_phase_record(finished, "failed", metadata.get("reason", ""))
+            self._phase_iterations = 0
+            if not machine.is_complete:
+                self.steps = [self._phase_intro_step()]
+                self._start_phase_branch()
+            return signal
+        return None
+
+    def _enforce_phase_floors(self) -> bool:
+        """Force-block the current phase ONLY when continuing would starve the
+        minimum floors of later phases (no per-phase quotas: build may consume
+        everything the easy phases saved)."""
+        machine = getattr(self, "phase_machine", None)
+        if machine is None or machine.is_complete:
+            return False
+        phase = machine.current_phase
+        _, reserved, remaining = self._phase_budget_numbers(phase)
+        if remaining > reserved:
+            return False
+        machine.mark_blocked(
+            f"remaining {remaining} iterations are reserved for later phases "
+            f"({reserved} needed)",
+            [],
+        )
+        self._persist_phase_record(
+            phase, "failed", "remaining iterations reserved for later phases"
+        )
+        self._phase_iterations = 0
+        if not machine.is_complete:
+            self.steps = [self._phase_intro_step()]
+            self._start_phase_branch()
+        return True
+
+    def _persist_phase_record(self, phase_name: str, status: str, text: str) -> None:
+        """Mirror a finished phase into the trunk task `phase_<name>` so phase
+        history persists exactly like task history (the webui keeps rendering).
+        Best-effort: persistence failure must never kill the run."""
+        cm = getattr(self, "context_manager", None)
+        if cm is None:
+            return
+        task_id = f"phase_{phase_name}"
+        try:
+            target = TaskStatus.COMPLETED if status == "completed" else TaskStatus.FAILED
+            updater = getattr(cm, "update_task_status", None)
+            if callable(updater):
+                # Manager-level setter (test fakes / future CM API).
+                updater(task_id, target, text)
+            else:
+                # Real ContextManager: status/key_results live on the trunk.
+                trunk = cm.load_trunk_context()
+                if trunk is None:
+                    return
+                trunk.update_task_status(task_id, target, text)
+                trunk.update_task_key_results(task_id, text)
+                cm._save_trunk_context(trunk)
+            if getattr(cm, "current_task_id", None) == task_id:
+                cm.current_task_id = None
+            builder = getattr(self, "prompt_builder", None)
+            if builder is not None:
+                builder.invalidate_trunk_cache()
+        except Exception as exc:
+            logger.warning(f"Failed to persist phase record '{task_id}' ({status}): {exc}")
+
+    def _start_phase_branch(self) -> None:
+        """Open the branch context for the new current phase (best-effort) so
+        per-phase history persists as phase_<name>.json in the container —
+        context files live in-container by design (agent self-introspection)."""
+        machine = getattr(self, "phase_machine", None)
+        if machine is None or machine.is_complete:
+            return
+        cm = getattr(self, "context_manager", None)
+        starter = getattr(cm, "start_new_branch", None)
+        if not callable(starter):
+            return
+        task_id = f"phase_{machine.current_phase}"
+        try:
+            starter(task_id)
+            return
+        except Exception as exc:
+            # Strict task ordering rejects starting after a FAILED (blocked)
+            # phase; the machine owns phase order, so open the branch directly.
+            logger.debug(f"start_new_branch rejected {task_id} ({exc}); opening directly")
+        try:
+            from .context_manager import BranchContextHistory
+
+            description = PHASE_OBJECTIVES.get(machine.current_phase, "")
+            trunk = cm.load_trunk_context()
+            if trunk is not None:
+                for task in trunk.todo_list:
+                    if task.id == task_id:
+                        description = task.description or description
+                        break
+            history = BranchContextHistory(task_id=task_id, task_description=description)
+            cm._save_branch_history(history, str(cm.contexts_dir / f"{task_id}.json"))
+            if trunk is not None and trunk.update_task_status(task_id, TaskStatus.IN_PROGRESS):
+                cm._save_trunk_context(trunk)
+            cm.current_task_id = task_id
+        except Exception as exc:
+            logger.warning(f"Could not start phase branch context for {task_id}: {exc}")
+
     def run_react_loop(
         self,
         initial_prompt: str,
@@ -301,12 +502,23 @@ class ReActEngine(UIEventEmitter):
     ) -> bool:
         """Run the main ReAct loop."""
         max_iter = max_iterations or self.max_iterations
+        self._run_max_iterations = max_iter
 
         self.agent_logger.info(f"Starting ReAct loop with max {max_iter} iterations")
 
-        # Initialize with the initial prompt
-        self.steps = []
+        # Setup-mode phase machine: the engine drives provision→…→report and the
+        # model signals with the phase tool. None (run-task mode) = legacy path.
+        phase_mode = completion_mode == "setup" and self.phase_machine is not None
+
+        # Initialize with the initial prompt. In phase mode the window opens on
+        # the phase intro digest instead of empty.
         self.current_iteration = 0
+        self._phase_iterations = 0
+        if phase_mode:
+            self.steps = [self._phase_intro_step()]
+            self._start_phase_branch()
+        else:
+            self.steps = []
 
         # PERFORMANCE: Initialize trunk context cache at start
         self.prompt_builder.invalidate_trunk_cache()  # Ensure fresh start
@@ -342,7 +554,15 @@ class ReActEngine(UIEventEmitter):
                     self._export_token_usage_csv()
                     return False
 
+                # FLOOR RESERVATIONS (phase mode): force-block the current
+                # phase only when continuing would starve later phases' floors,
+                # guaranteeing the run always reaches report and ends honestly.
+                if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
+                    self._export_token_usage_csv()
+                    return self.phase_machine.overall_outcome() == "success"
+
                 self.current_iteration += 1
+                self._phase_iterations += 1
                 self.agent_logger.info(f"ReAct iteration {self.current_iteration}/{max_iter}")
 
                 # Update token tracker with current iteration
@@ -379,6 +599,18 @@ class ReActEngine(UIEventEmitter):
 
                 # Execute the steps
                 self._execute_steps(parsed_steps)
+
+                # PHASE SIGNALS (phase mode): a phase tool done/blocked advances
+                # the machine, persists the record, and resets the window. When
+                # the report phase ends, the machine — not the evaluator — ends
+                # the run with its honest overall outcome.
+                if phase_mode:
+                    self._handle_phase_signals(parsed_steps)
+                    if self.phase_machine.is_complete:
+                        outcome = self.phase_machine.overall_outcome()
+                        self.agent_logger.info(f"All phases complete; overall outcome: {outcome}")
+                        self._export_token_usage_csv()
+                        return outcome == "success"
 
                 # CENTRALIZED STATE EVALUATION: Replace all scattered checks
                 state_analysis = self.state_evaluator.evaluate(
@@ -429,6 +661,27 @@ class ReActEngine(UIEventEmitter):
                 # if self._needs_action_guidance():
                 #     self._add_action_guidance()
 
+                # ATTEMPT-LEDGER COMPACTION (phase mode): old steps collapse to
+                # one line each behind the phase intro; exactly one ledger step
+                # exists at a time (position 1, right after the intro).
+                ledger = None
+                n_compacted = 0
+                if phase_mode and len(self.steps) > 1:
+                    tail = self.steps[1:]
+                    ledger, kept = compact_steps(tail, keep_recent=30)
+                    if ledger is not None:
+                        ledger_step = ReActStep(
+                            step_type=StepType.SYSTEM_GUIDANCE,
+                            content=ledger,
+                            timestamp=self._get_timestamp(),
+                        )
+                        kept_clean = [
+                            s for s in kept
+                            if "ATTEMPT LEDGER" not in (getattr(s, "content", "") or "")
+                        ]
+                        n_compacted = len(tail) - len(kept_clean)
+                        self.steps = [self.steps[0], ledger_step] + kept_clean
+
                 # Build prompt for next iteration
                 current_prompt = self.prompt_builder.build_next_prompt(
                     steps=self.steps,
@@ -439,7 +692,24 @@ class ReActEngine(UIEventEmitter):
                     ).supports_function_calling,
                     successful_states=self.successful_states,
                     workflow_mode=completion_mode,
+                    phase_mode=phase_mode,
                 )
+
+                # CONTEXT JOURNAL (phase mode): one in-container line per
+                # iteration describing the window composition (spec §7).
+                if phase_mode and self.context_journal is not None:
+                    intro_len = len(self.steps[0].content) if self.steps else 0
+                    self.context_journal.record(
+                        phase=self.phase_machine.current_phase,
+                        iteration=self.current_iteration,
+                        segments={
+                            "intro": intro_len,
+                            "ledger": len(ledger or ""),
+                            "steps": len(self.steps),
+                        },
+                        delta={"added": len(parsed_steps), "compacted": n_compacted},
+                        total_chars=len(current_prompt),
+                    )
 
                 # Step count is now automatically managed by branch history updates
                 # No manual step increment needed in new design

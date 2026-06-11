@@ -172,6 +172,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         tool_calling_enabled: bool,
         successful_states: dict[str, Any],
         workflow_mode: str = "setup",
+        phase_mode: bool = False,
     ) -> str:
         """Build the prompt for the next iteration."""
         is_run_task = workflow_mode == "run_task"
@@ -183,8 +184,22 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         # Keep the most recent steps, but cap the total length
         max_steps = 7  # Start with fewer steps to stay within context window
 
+        if phase_mode:
+            # Phase machine windows open on the phase intro digest (and the
+            # attempt ledger when present): those leading SYSTEM_GUIDANCE steps
+            # must ALWAYS render, no matter how the tail is truncated.
+            pinned: list[ReActStep] = []
+            rest = list(steps)
+            while rest and len(pinned) < 2 and rest[0].step_type == StepType.SYSTEM_GUIDANCE:
+                pinned.append(rest.pop(0))
+            if len(rest) > max_steps:
+                recent_steps = pinned + rest[-max_steps:]
+                # Prompt: src/sag/config/prompts/react_engine.yaml:318 next_prompt.omitted_steps_notice
+                prompt += self.prompts.get("next_prompt.omitted_steps_notice").rstrip() + "\n\n"
+            else:
+                recent_steps = pinned + rest
         # If we have more steps, take the first few and the most recent ones
-        if len(steps) > max_steps * 2:
+        elif len(steps) > max_steps * 2:
             # Take first 2 steps (usually context and first action) and last max_steps
             recent_steps = steps[:2] + steps[-max_steps:]
             # Prompt: src/sag/config/prompts/react_engine.yaml:318 next_prompt.omitted_steps_notice
@@ -256,6 +271,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             repository_url=repository_url,
             successful_states=successful_states,
             workflow_mode=workflow_mode,
+            phase_mode=phase_mode,
         )
 
         return prompt
@@ -313,6 +329,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         repository_url: str | None,
         successful_states: dict[str, Any],
         workflow_mode: str = "setup",
+        phase_mode: bool = False,
     ) -> str:
         """
         Preserve critical information that should not be forgotten due to context pollution.
@@ -367,7 +384,11 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         if successful_tools:
             critical_info.append(f"✅ Working Tools: {', '.join(successful_tools)}")
 
-        if workflow_mode != "run_task":
+        # Phase mode replaces the task-plan block entirely: the phase intro
+        # digest carries the run picture, the engine owns ordering, and the
+        # binding design rule is NO model-visible task ids (no manage_context
+        # ceremony either — the tool is not registered in setup runs).
+        if workflow_mode != "run_task" and not phase_mode:
             # CRITICAL: Preserve task plan to prevent context pollution from causing hallucinated task IDs
             try:
                 # Use cached trunk context to avoid frequent file I/O
@@ -448,6 +469,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         repository_url: str | None,
         successful_states: dict[str, Any],
         workflow_mode: str = "setup",
+        phase_mode: bool = False,
     ) -> str:
         """
         Inject critical information preservation into prompts to combat context pollution.
@@ -457,6 +479,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             repository_url=repository_url,
             successful_states=successful_states,
             workflow_mode=workflow_mode,
+            phase_mode=phase_mode,
         )
         if critical_memory:
             # Insert critical memory after the initial system prompt but before the current situation
