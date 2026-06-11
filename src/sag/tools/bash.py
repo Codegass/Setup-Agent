@@ -1028,10 +1028,17 @@ class BashTool(BaseTool):
     def _is_long_running_command(self, command: str) -> bool:
         """Detect if a command is likely to be long-running and needs enhanced monitoring."""
 
-        command_lower = command.lower()
-        stripped = command_lower.strip()
+        # Scan only the command line itself — keywords inside a heredoc body
+        # are data, not commands (round 3: python heredocs got dispatched).
+        scan_text = command.split("<<", 1)[0].lower()
+        stripped = scan_text.strip()
 
-        tokens = stripped.split()
+        # Version/usage probes finish in milliseconds regardless of the binary.
+        first_line_tokens = stripped.split()
+        if any(tok in ("-v", "--version", "-version", "-h", "--help") for tok in first_line_tokens):
+            return False
+
+        tokens = first_line_tokens
         first_token = tokens[0].rsplit("/", 1)[-1] if tokens else ""
         if first_token in self.QUICK_INSPECTION_COMMANDS and not any(
             sep in stripped for sep in ("&&", ";")
@@ -1058,13 +1065,13 @@ class BashTool(BaseTool):
 
         # Check for explicit patterns
         for pattern in long_running_patterns:
-            if pattern in command_lower:
+            if pattern in scan_text:
                 return True
 
         # Check for commands that typically take time
         time_consuming_commands = ["compile", "build", "test", "install", "download", "clone"]
         for keyword in time_consuming_commands:
-            if keyword in command_lower:
+            if keyword in scan_text:
                 return True
 
         return False

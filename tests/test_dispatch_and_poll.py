@@ -432,3 +432,33 @@ def test_repetition_detector_exempts_dispatch_poll_commands():
     # ...and 9 polls must not inflate the bash flood count for other commands.
     other_signature = "bash:[('command', 'ls /workspace')]"
     assert orchestrator._get_repetition_level(other_signature) == 0
+
+
+# --- round-3 fix: dispatch routing scans the command line, not heredoc bodies
+
+
+def test_heredoc_body_keywords_do_not_trigger_dispatch():
+    """Round-3 finding: `python - <<'PY' ... import unittest ...` was dispatched
+    because keywords in the heredoc BODY matched. Only the command line before
+    the heredoc marker may be scanned."""
+    from sag.tools.bash import BashTool
+
+    tool = BashTool(RoutingOrchestrator())
+    assert tool._is_long_running_command("python - <<'PY'\nimport subprocess\nsubprocess.run(['mvn','test'])\nPY") is False
+
+
+def test_version_probe_flags_are_quick():
+    from sag.tools.bash import BashTool
+
+    tool = BashTool(RoutingOrchestrator())
+    assert tool._is_long_running_command("./mvnw -v") is False
+    assert tool._is_long_running_command("mvn --version") is False
+    assert tool._is_long_running_command("./gradlew --version") is False
+
+
+def test_real_builds_still_dispatch():
+    from sag.tools.bash import BashTool
+
+    tool = BashTool(RoutingOrchestrator())
+    assert tool._is_long_running_command("mvn clean install") is True
+    assert tool._is_long_running_command("./gradlew compileJava --no-daemon") is True
