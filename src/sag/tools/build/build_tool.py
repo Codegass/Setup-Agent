@@ -15,7 +15,10 @@ class BuildTool(BaseTool):
             name="build",
             description=(
                 "Build the project: action = deps | compile | test | package. "
-                "The build system (maven/gradle) is auto-selected from project files. "
+                "The build system (maven/gradle) is auto-selected from project files, and the "
+                "CORRECT toolchain (registered Maven/JDK versions) is resolved automatically — "
+                "bash mvn/gradle uses the stale system PATH and often picks the wrong version, "
+                "even when project docs show a raw command. "
                 "Long builds run detached and hand back a log ref — never killed."
             ),
         )

@@ -1332,6 +1332,21 @@ class BashTool(BaseTool):
         suggestions = []
         error_type = error_analysis.get("error_type", "general")
 
+        # A failing hand-rolled mvn/gradle invocation is almost always the
+        # wrong path or the wrong (stale PATH) version — the build tool
+        # resolves the registered toolchain automatically. Round-4 eval: the
+        # model retried './bin/mvn' 50x instead of using build(action='test').
+        command_head = command.split("&&")[-1].strip().split()
+        if command_head and any(
+            tok in ("mvn", "gradle") or tok.endswith("/mvn") or tok.endswith("/gradle")
+            or tok.endswith("mvnw") or tok.endswith("gradlew")
+            for tok in command_head[:1]
+        ):
+            suggestions.append(
+                "Use build(action='compile'|'test'|'package') instead of bash — it resolves "
+                "the registered Maven/JDK toolchain automatically (bash uses the stale system PATH)"
+            )
+
         if error_type == "compilation_error":
             compilation_errors = error_analysis.get("compilation_errors", [])
             error_count = error_analysis.get("error_count", 0)

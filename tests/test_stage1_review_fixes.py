@@ -502,3 +502,50 @@ def test_project_clone_failure_recovers_with_injected_repository_url():
             "ref": "rel/1.2.3",
         }
     ]
+
+
+# --- round-4 gate fixes: steer the model to build(), not hand-rolled mvn ----
+
+
+def test_analyzer_test_task_prescribes_build_tool():
+    """Round 4: a task saying 'documented commands: mvn' steered the model into
+    raw bash mvn with a stale PATH (50 wrong-path failures on commons-cli).
+    The task must prescribe build(action='test'); docs are reference only."""
+    from sag.tools.project_analyzer import ProjectAnalyzerTool
+
+    analyzer = ProjectAnalyzerTool(None, None)
+    plan = analyzer._generate_execution_plan(
+        {
+            "project_type": "Java",
+            "build_system": "Maven",
+            "java_version": None,
+            "documentation": {"test_commands": ["mvn"], "build_commands": []},
+            "test_framework": "junit",
+        }
+    )
+
+    test_steps = [s for s in plan if s.get("type") == "test" or s.get("core_step") == "test"]
+    assert test_steps, plan
+    desc = test_steps[0]["description"]
+    assert "build(action='test')" in desc, desc
+    assert "reference" in desc.lower(), desc
+
+
+def test_bash_mvn_failure_suggests_build_tool():
+    from sag.tools.bash import BashTool
+
+    tool = BashTool.__new__(BashTool)
+    suggestions = tool._generate_error_suggestions(
+        {"error_type": "general"}, "cd /workspace/p && ./bin/mvn -q test", 127
+    )
+    assert any("build(action=" in s for s in suggestions), suggestions
+
+
+def test_bash_non_build_failure_has_no_build_nudge():
+    from sag.tools.bash import BashTool
+
+    tool = BashTool.__new__(BashTool)
+    suggestions = tool._generate_error_suggestions(
+        {"error_type": "general"}, "cat /workspace/missing.txt", 1
+    )
+    assert not any("build(action=" in s for s in suggestions), suggestions

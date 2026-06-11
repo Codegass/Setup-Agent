@@ -1194,14 +1194,21 @@ PY"""
         test_commands = documentation.get("test_commands", [])
 
         if test_commands:
-            test_desc = f"Run tests using documented commands: {', '.join(test_commands[:2])}"
+            # The documented command is REFERENCE ONLY: the task must prescribe
+            # the build tool, which resolves the registered toolchain. Round-4
+            # eval: a task saying "documented commands: mvn" steered the model
+            # into raw bash mvn with a stale PATH (50 wrong-path failures).
+            test_desc = (
+                "Run tests with build(action='test') "
+                f"(documented command for reference: {', '.join(test_commands[:2])})"
+            )
         elif project_type == "Java" and build_system == "Maven":
             # Check if this is a multi-module project
             is_multi_module = analysis.get("is_multi_module", False)
             if is_multi_module:
                 test_desc = "Run tests for all modules using Maven (multi-module project)"
                 # Add specific command recommendation
-                test_commands = ["maven(command='test', fail_at_end=True)"]
+                test_commands = ["build(action='test')"]
             else:
                 test_desc = "Run tests using Maven"
             if test_framework != "unknown":
