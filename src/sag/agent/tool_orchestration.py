@@ -163,11 +163,15 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
     if result.success:
         # For successful results, preserve key status information
+        verdict = getattr(result, "verdict", None) or "success"
         if (result.metadata or {}).get("dispatch_status") == "running_detached":
             # A handoff is not a completed command — don't announce success.
             formatted = f"⏳ {tool_name} dispatched — command still running in background"
-        else:
+        elif verdict == "success":
             formatted = f"✅ {tool_name} executed successfully"
+        else:
+            icon = {"partial": "⚠️", "running": "⏳", "unknown": "❔", "skipped": "⏭"}.get(verdict, "✅")
+            formatted = f"{icon} {tool_name} result: {verdict.upper()}"
 
         if evidence_lines:
             formatted += "\n" + "\n".join(evidence_lines)
@@ -179,6 +183,15 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         # Add output (already processed by BaseTool truncation)
         if result.output:
             formatted += f"\n\nOutput: {result.output}"
+
+        # Envelope extras (spec §5): machine-readable facts and retrieval refs.
+        facts = getattr(result, "facts", None)
+        if facts:
+            fact_text = ", ".join(f"{k}={v}" for k, v in list(facts.items())[:10])
+            formatted += f"\nFacts: {fact_text}"
+        refs = getattr(result, "refs", None)
+        if refs:
+            formatted += f"\nFull output refs (use search tool): {', '.join(refs[:5])}"
 
         # Add metadata if available
         if result.metadata:
