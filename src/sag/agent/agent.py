@@ -45,6 +45,10 @@ class SetupAgent:
         # PhysicalValidator is set during _initialize_tools() once orchestrator
         # is available; declared here so attribute access is always safe.
         self.physical_validator = None
+        # Engine-owned phase plan (spec §3.1) — created in setup_project only;
+        # None keeps the legacy free-form path (`sag run --task`, continue).
+        self.phase_machine = None
+        self.context_journal = None
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
@@ -78,8 +82,13 @@ class SetupAgent:
             )
         )
 
-    def _initialize_context_and_tools(self):
-        """Initialize context manager, tools, and react engine after Docker is ready."""
+    def _initialize_context_and_tools(self, workflow_mode: str = "setup"):
+        """Initialize context manager, tools, and react engine after Docker is ready.
+
+        ``workflow_mode`` selects the model-facing tool surface: setup runs get
+        the engine-owned phase machine + `phase` tool; "run_task" keeps the
+        legacy free-form surface with `manage_context` (spec §8.2).
+        """
         if self.context_manager is not None:
             return  # Already initialized
 
@@ -101,10 +110,17 @@ class SetupAgent:
         )
 
         # Initialize tools
-        self.tools = self._initialize_tools()
+        self.tools = self._initialize_tools(workflow_mode=workflow_mode)
 
-        # Initialize ReAct engine (repository URL will be set later)
-        self.react_engine = ReActEngine(context_manager=self.context_manager, tools=self.tools)
+        # Initialize ReAct engine (repository URL will be set later). The phase
+        # machine and in-container context journal are None outside setup runs,
+        # which keeps the legacy loop behavior.
+        self.react_engine = ReActEngine(
+            context_manager=self.context_manager,
+            tools=self.tools,
+            phase_machine=self.phase_machine,
+            context_journal=self.context_journal,
+        )
 
         # Pass UIManager to ReActEngine if in UI mode
         if self.config.ui_mode and self.ui_manager:
@@ -120,8 +136,14 @@ class SetupAgent:
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
 
-    def _initialize_tools(self) -> List:
-        """Initialize all available tools."""
+    def _initialize_tools(self, workflow_mode: str = "setup") -> List:
+        """Initialize all available tools for the given workflow mode.
+
+        Mode-aware registration (spec §8.2): setup runs register the `phase`
+        lifecycle tool and EXCLUDE `manage_context` (the engine owns the phase
+        plan); "run_task" keeps the legacy surface with `manage_context` and
+        no `phase` tool.
+        """
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.build import BuildTool
@@ -133,6 +155,7 @@ class SetupAgent:
         from sag.tools.internal.output_search_tool import OutputSearchTool
         from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
         from sag.tools.internal.project_setup_tool import ProjectSetupTool
+        from sag.tools.phase_tool import PhaseTool
         from sag.tools.project_tool import ProjectTool
         from sag.tools.report_tool import ReportTool
         from sag.tools.search_tool import SearchTool
@@ -168,10 +191,27 @@ class SetupAgent:
             orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir
         )
 
+        # Lifecycle surface is mode-aware: setup runs talk to the engine-owned
+        # phase machine through the `phase` tool (done/blocked/note) and never
+        # see manage_context; run-task keeps the legacy manage_context surface.
+        phase_mode = (
+            workflow_mode == "setup" and getattr(self, "phase_machine", None) is not None
+        )
+        if phase_mode:
+            lifecycle_tool = PhaseTool(
+                machine=self.phase_machine,
+                validator=self.physical_validator,
+                orchestrator=self.orchestrator,
+                project_name=getattr(self, "project_name", None)
+                or getattr(self.orchestrator, "project_name", None),
+            )
+        else:
+            lifecycle_tool = ContextTool(self.context_manager)
+
         tools = [
             BashTool(self.orchestrator, config=bash_config),
             FileIOTool(self.orchestrator),
-            ContextTool(self.context_manager),
+            lifecycle_tool,
             BuildTool(
                 self.orchestrator,
                 maven_tool=maven_tool,
@@ -342,7 +382,21 @@ class SetupAgent:
             )
             self._emit(EventType.STATUS_UPDATE, "Loading tools...", phase=PhaseType.SETUP)
 
-            self._initialize_context_and_tools()
+            # Engine-owned phase plan for setup runs (spec §3.1): the machine
+            # and the in-container context journal exist for the whole run and
+            # are handed to the tools + engine at initialization. The journal
+            # lives INSIDE the container by design (the agent introspects its
+            # own context files).
+            from sag.agent.context_journal import ContextJournal
+            from sag.agent.phase_machine import PhaseMachine
+
+            self.phase_machine = PhaseMachine()
+            self.context_journal = ContextJournal(self.orchestrator)
+            # Actual repo directory name (from URL); the phase gates probe
+            # /workspace/<project_name> with it.
+            self.project_name = project_name
+
+            self._initialize_context_and_tools(workflow_mode="setup")
 
             # Step 1.6: Set repository URL for ReAct engine
             self.react_engine.set_repository_url(project_url, repository_ref=project_ref)
@@ -358,19 +412,18 @@ class SetupAgent:
                 level="success",
             )
 
-            # Step 2: Initialize trunk context with intelligent planning approach
-            # Here we provide the initial steps. Split complex task into clear, executable steps
-            # This ensures each critical step is executed independently and cannot be skipped
-            # 🎯 CORE FOCUS: Build and Test success are the PRIMARY objectives of setup
-            initial_tasks = [
-                "Clone repository and setup basic environment (use the project tool with action='clone')",
-                "CRITICAL: Run project(action='analyze') to analyze project structure, count static tests, and generate intelligent execution plan (MUST use the project tool, do NOT manually read files)",
-                "CORE SETUP: Execute build tasks and ensure compilation success (use the build tool; it auto-selects maven/gradle)",
-                "CORE SETUP: Execute test suite and ensure all tests pass (use the build tool; it auto-selects maven/gradle)",
-                "Generate final completion report with build and test results (use report tool)",
-            ]
+            # Step 2: Initialize trunk context mirroring the engine-owned phase
+            # plan. Trunk tasks use phase_<name> ids so phase history persists
+            # exactly like task history (phase_<name>.json — the webui keeps
+            # rendering); descriptions are the one-line phase objectives
+            # (TOOLS, never raw commands).
+            from sag.agent.phase_machine import PHASE_NAMES
+            from sag.agent.react_engine import PHASE_OBJECTIVES
 
-            logger.info("Creating trunk context with enhanced multi-step planning approach...")
+            initial_tasks = [PHASE_OBJECTIVES[name] for name in PHASE_NAMES]
+            phase_task_ids = [f"phase_{name}" for name in PHASE_NAMES]
+
+            logger.info("Creating trunk context from the engine-owned phase plan...")
             self.agent_logger.info(f"Creating trunk context for project: {project_name}")
 
             try:
@@ -379,6 +432,7 @@ class SetupAgent:
                     project_url=project_url,
                     project_name=project_name,
                     tasks=initial_tasks,
+                    task_ids=phase_task_ids,
                 )
 
                 # Verify trunk context was created successfully
@@ -390,7 +444,8 @@ class SetupAgent:
                     f"✅ Trunk context created successfully: {trunk_context.context_id}"
                 )
                 logger.info(
-                    f"Trunk context created with {len(initial_tasks)} explicit tasks (project analysis runs in task_2)"
+                    f"Trunk context created with {len(initial_tasks)} phase tasks "
+                    f"({' → '.join(PHASE_NAMES)})"
                 )
 
                 # Step 2.5: Save project metadata for future reference
@@ -572,8 +627,10 @@ class SetupAgent:
             if not self._ensure_container_running(project_name):
                 return False
 
-            # Step 1.5: Initialize context manager and tools now that Docker is ready
-            self._initialize_context_and_tools()
+            # Step 1.5: Initialize context manager and tools now that Docker is
+            # ready. run_task keeps the legacy free-form surface: manage_context
+            # registered, no phase machine/tool (spec §8.2).
+            self._initialize_context_and_tools(workflow_mode="run_task")
 
             # Step 2: Load existing trunk context
             logger.info(f"Loading or creating trunk context for project: {project_name}")
@@ -845,47 +902,28 @@ I need to setup the project '{project_name}' from the repository: {project_url}
 
 My goal: {goal}
 
-🧠 INTELLIGENT SETUP WORKFLOW - I should complete this setup using smart analysis:
+PHASED SETUP RUN — the engine drives a fixed phase plan:
+provision → analyze → build → test → report.
+I never pick, reorder, or skip phases; the current phase objective is shown in my context.
 
-1. INITIAL CONTEXT CHECK:
-   - Check my current context using manage_context tool
-   - Understand the current task plan and proceed with task execution
+How I work:
+1. Work freely inside the current phase with the available tools:
+   - project(action='clone'/'provision'/'analyze'/'env') for repository and toolchain work
+   - build(action='deps'/'compile'/'test'/'package') for builds and tests — it auto-selects
+     maven/gradle and resolves the registered toolchain
+   - search(target=...) to inspect stored outputs, files, and background job logs
+   - bash and file_io for everything else
+2. When the phase objective is met, claim it with
+   phase(action='done', key_results=..., evidence=[refs]) — the claim is checked against
+   physical evidence.
+3. If the phase truly cannot finish here, record it honestly with
+   phase(action='blocked', reason=..., evidence=[refs]) — always accepted; the run verdict
+   degrades honestly instead of fighting.
+4. phase(action='note', text=...) records working notes worth keeping.
 
-2. REPOSITORY CLONING (if not done):
-   - Clone the repository from {project_url} using project(action='clone')
-   - Verify the project was cloned successfully
-
-3. 🔍 CRITICAL: INTELLIGENT PROJECT ANALYSIS:
-   - Use project(action='analyze') to comprehensively analyze the cloned project
-   - This will automatically:
-     • Read README.md and documentation files
-     • Analyze build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts, package.json, etc.)
-     • Detect Java version requirements, dependencies, and test frameworks for Maven and Gradle projects
-     • Identify project type and build system (Maven, Gradle, npm, etc.)
-     • Generate optimized execution plan based on project specifics
-     • Update the trunk context with intelligent task list
-
-4. EXECUTE INTELLIGENT PLAN:
-   - After project analysis, the trunk context will be updated with specific tasks
-   - Execute each task in the generated plan systematically
-   - Use appropriate tools for each detected project type:
-     • Maven/Gradle projects: build tool for compile/test (auto-selects maven or gradle)
-     • Node.js projects: bash tool for npm commands
-     • Python projects: bash or project(action='provision') for pip/poetry
-   - Follow the project's own documented setup instructions
-
-5. COMPLETION:
-   - Generate comprehensive report using report tool
-   - Include summary of analysis findings and setup results
-
-🎯 KEY ADVANTAGES OF THIS APPROACH:
-- Reads project documentation BEFORE making assumptions
-- Adapts to specific project requirements automatically
-- Uses project's own recommended build/test commands
-- Generates optimal task sequence for each unique project
-
+The final phase generates the setup report with the report tool.
 The repository URL is already provided: {project_url}
-START by checking context, then clone if needed, then IMMEDIATELY analyze the project!
+START by working toward the current phase objective shown in my context.
 """
 
         if self.config.ui_mode:
@@ -939,6 +977,37 @@ START by checking context, then clone if needed, then IMMEDIATELY analyze the pr
             return verified_success
 
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
+        """Combine physical validation with the phase machine's honest view.
+
+        The machine's overall_outcome() CAPS the verdict (stage-2 Task 8): a
+        machine-failed run (blocked build phase) is failed even if artifacts
+        exist; a machine-partial run is at best partial. Machine success never
+        promotes — physical validation still rules exactly as before. Runs
+        without a machine (`sag run --task`, legacy) are untouched.
+        """
+        physical_ok = self._get_physical_final_status(react_engine_success)
+
+        machine = getattr(getattr(self, "react_engine", None), "phase_machine", None)
+        if machine is None:
+            return physical_ok
+
+        outcome = machine.overall_outcome()
+        if outcome == "failed":
+            if physical_ok:
+                logger.warning(
+                    "Phase machine recorded a blocked build phase; capping verdict "
+                    "to failed despite physical artifacts"
+                )
+            self.final_verdict = "failed"
+            return False
+        if outcome == "partial" and self.final_verdict == "success":
+            logger.info(
+                "Phase machine recorded blocked phases; capping verdict to partial"
+            )
+            self.final_verdict = "partial"
+        return physical_ok
+
+    def _get_physical_final_status(self, react_engine_success: bool) -> bool:
         """Verify the final run status against physical evidence.
 
         Returns the boolean used for flow control, and records the surfaced

@@ -418,9 +418,19 @@ class ContextManager:
             raise RuntimeError(f"Cannot create contexts directory in container: {contexts_path}")
 
     def create_trunk_context(
-        self, goal: str, project_url: str, project_name: str, tasks: List[str] = None
+        self,
+        goal: str,
+        project_url: str,
+        project_name: str,
+        tasks: List[str] = None,
+        task_ids: Optional[List[str]] = None,
     ) -> TrunkContext:
-        """Create the main trunk context with optional task list."""
+        """Create the main trunk context with optional task list.
+
+        ``task_ids`` overrides the legacy ``task_{i}`` ids positionally —
+        setup runs pass ``phase_<name>`` ids so phase history persists exactly
+        like task history (stage-2 phase machine).
+        """
         context_id = f"trunk_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         trunk_context = TrunkContext(
@@ -430,7 +440,9 @@ class ContextManager:
         # If task list is provided, add to TODO list
         if tasks:
             for i, task_desc in enumerate(tasks, 1):
-                task_id = f"task_{i}"
+                task_id = (
+                    task_ids[i - 1] if task_ids and i - 1 < len(task_ids) else f"task_{i}"
+                )
                 task = Task(id=task_id, description=task_desc)
                 trunk_context.todo_list.append(task)
 

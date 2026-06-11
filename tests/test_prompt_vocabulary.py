@@ -73,7 +73,10 @@ def test_default_task_templates_use_consolidated_names():
     assert "use project_analyzer tool" not in source
     assert "MUST use project_analyzer tool" not in source
     assert "use maven/gradle tools" not in source
-    assert "use the build tool" in source
+    # Stage 2: the default trunk templates are the phase objectives; the setup
+    # prompt prescribes the consolidated build/project facades.
+    assert "build(action=" in source
+    assert "project(action=" in source
 
 
 class _BranchHistory:

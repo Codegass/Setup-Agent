@@ -122,7 +122,7 @@ def test_run_task_uses_run_task_completion_without_appending_setup_todo(monkeypa
     agent.react_engine = FakeReActEngine()
     agent.agent_logger = FakeLogger()
     agent._ensure_container_running = lambda project_name: True
-    agent._initialize_context_and_tools = lambda: None
+    agent._initialize_context_and_tools = lambda workflow_mode="setup": None
     agent._emit = lambda *args, **kwargs: None
     agent._provide_task_summary = lambda success, task_description: None
 

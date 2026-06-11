@@ -554,3 +554,81 @@ def test_build_failure_is_failed_verdict():
 
     assert result is False
     assert agent.final_verdict == "failed"
+
+
+# --- phase-machine capping (stage-2 Task 8): the machine's honest outcome ----
+# caps the verdict; it never promotes (physical validation still rules).
+
+
+def _all_green_validator():
+    return FakePhysicalValidator(
+        build_status={"success": True, "reason": "Build fingerprints found"},
+        test_status={
+            "has_test_reports": True,
+            "status": "SUCCESS",
+            "reason": "All tests passed",
+            "pass_rate": 100.0,
+            "total_tests": 100,
+            "passed_tests": 100,
+            "failed_tests": 0,
+            "error_tests": 0,
+            "skipped_tests": 0,
+            "test_exclusions": [],
+            "modules_without_tests": [],
+        },
+        analysis_status={
+            "analyzed": True,
+            "has_static_test_count": True,
+            "static_test_count": 100,
+        },
+    )
+
+
+def _attach_phase_machine(agent, block_phase=None):
+    from sag.agent.phase_machine import PHASE_NAMES, PhaseMachine
+
+    machine = PhaseMachine()
+    for name in PHASE_NAMES:
+        if name == block_phase:
+            machine.mark_blocked(f"{name} blocked", [])
+        else:
+            machine.mark_done("ok", [])
+    agent.react_engine = SimpleNamespace(phase_machine=machine)
+    return machine
+
+
+def test_machine_failed_outcome_caps_physical_success():
+    agent = _agent_with_validator(_all_green_validator())
+    _attach_phase_machine(agent, block_phase="build")
+
+    assert agent._get_verified_final_status(react_engine_success=True) is False
+    assert agent.final_verdict == "failed"
+
+
+def test_machine_partial_outcome_caps_success_verdict_to_partial():
+    agent = _agent_with_validator(_all_green_validator())
+    _attach_phase_machine(agent, block_phase="test")
+
+    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent.final_verdict == "partial"
+
+
+def test_machine_success_still_subject_to_physical_validation():
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": False, "reason": "no artifacts"},
+            test_status=_no_reports_test_status(),
+        )
+    )
+    _attach_phase_machine(agent)  # all phases done
+
+    assert agent._get_verified_final_status(react_engine_success=True) is False
+    assert agent.final_verdict == "failed"
+
+
+def test_machine_success_keeps_physical_success():
+    agent = _agent_with_validator(_all_green_validator())
+    _attach_phase_machine(agent)
+
+    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent.final_verdict == "success"
