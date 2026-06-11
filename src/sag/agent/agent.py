@@ -126,18 +126,18 @@ class SetupAgent:
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.build import BuildTool
         from sag.tools.context_tool import ContextTool
-        from sag.tools.env_tool import EnvTool
+        from sag.tools.internal.env_tool import EnvTool
         from sag.tools.file_io import FileIOTool
-        from sag.tools.gradle_tool import GradleTool
-        from sag.tools.maven_tool import MavenTool
-        from sag.tools.output_search_tool import OutputSearchTool
-        from sag.tools.project_analyzer import ProjectAnalyzerTool
-        from sag.tools.project_setup_tool import ProjectSetupTool
+        from sag.tools.internal.gradle_tool import GradleTool
+        from sag.tools.internal.maven_tool import MavenTool
+        from sag.tools.internal.output_search_tool import OutputSearchTool
+        from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+        from sag.tools.internal.project_setup_tool import ProjectSetupTool
         from sag.tools.project_tool import ProjectTool
         from sag.tools.report_tool import ReportTool
         from sag.tools.search_tool import SearchTool
-        from sag.tools.system_tool import SystemTool
-        from sag.tools.web_search import WebSearchTool
+        from sag.tools.internal.system_tool import SystemTool
+        from sag.tools.internal.web_search import WebSearchTool
 
         # Configure bash tool with enhanced features
         bash_config = BashToolConfig(

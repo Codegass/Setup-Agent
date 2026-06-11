@@ -8,7 +8,7 @@ re-added in a loop). It now re-scans the project root for build files first.
 
 import re
 
-from sag.tools.project_analyzer import ProjectAnalyzerTool
+from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
 
 class FakeOrchestrator:

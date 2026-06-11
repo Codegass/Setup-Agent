@@ -7,7 +7,7 @@ branch contexts/outputs in the webui.
 """
 
 from sag.agent.context_manager import TaskStatus, TrunkContext
-from sag.tools.project_analyzer import ProjectAnalyzerTool
+from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
 
 PLAN = [

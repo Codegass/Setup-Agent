@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolError, ToolResult
-from .build_utils import detached_handoff_tool_result
+from .internal.build_utils import detached_handoff_tool_result
 
 
 @dataclass

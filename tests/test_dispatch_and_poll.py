@@ -8,7 +8,7 @@ the agent gets the log tail + poll instructions and the process keeps running.
 from types import SimpleNamespace
 
 from sag.docker_orch.orch import DockerOrchestrator
-from sag.tools.build_utils import detached_handoff_tool_result
+from sag.tools.internal.build_utils import detached_handoff_tool_result
 
 
 def build_orchestrator(execute_command=None):
@@ -345,7 +345,7 @@ class RoutingOrchestrator:
 
 
 def test_gradle_tool_routes_build_through_dispatch_and_returns_handoff():
-    from sag.tools.gradle_tool import GradleTool
+    from sag.tools.internal.gradle_tool import GradleTool
 
     orchestrator = RoutingOrchestrator(handoff=True)
     tool = GradleTool(orchestrator)
@@ -360,7 +360,7 @@ def test_gradle_tool_routes_build_through_dispatch_and_returns_handoff():
 
 
 def test_maven_tool_routes_test_through_dispatch():
-    from sag.tools.maven_tool import MavenTool
+    from sag.tools.internal.maven_tool import MavenTool
 
     orchestrator = RoutingOrchestrator(handoff=True)
     tool = MavenTool(orchestrator)

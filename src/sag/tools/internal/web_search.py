@@ -7,7 +7,7 @@ from urllib.parse import quote
 import requests
 from loguru import logger
 
-from .base import BaseTool, ToolResult
+from ..base import BaseTool, ToolResult
 
 
 class WebSearchTool(BaseTool):

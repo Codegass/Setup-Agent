@@ -1,5 +1,5 @@
-from sag.tools.env_tool import EnvTool
-from sag.tools.toolchain_manager import (
+from sag.tools.internal.env_tool import EnvTool
+from sag.tools.internal.toolchain_manager import (
     ToolchainManager,
     ToolchainSpec,
     ToolVersionRequirement,

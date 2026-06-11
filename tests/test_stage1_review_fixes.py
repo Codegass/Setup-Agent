@@ -25,7 +25,7 @@ from sag.agent.tool_recovery import ToolRecoveryHandler
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
 from sag.tools.build.build_tool import BuildTool
-from sag.tools.build_utils import detached_handoff_tool_result
+from sag.tools.internal.build_utils import detached_handoff_tool_result
 from sag.tools.project_tool import ProjectTool
 
 
@@ -300,7 +300,7 @@ def test_legacy_maven_alias_carries_properties_into_args():
 
 
 def test_maven_failure_suggestions_use_valid_build_actions():
-    from sag.tools.maven_tool import MavenTool
+    from sag.tools.internal.maven_tool import MavenTool
 
     assert MavenTool._suggested_build_action("dependency:resolve") == "deps"
     assert MavenTool._suggested_build_action("install") == "package"
@@ -511,7 +511,7 @@ def test_analyzer_test_task_prescribes_build_tool():
     """Round 4: a task saying 'documented commands: mvn' steered the model into
     raw bash mvn with a stale PATH (50 wrong-path failures on commons-cli).
     The task must prescribe build(action='test'); docs are reference only."""
-    from sag.tools.project_analyzer import ProjectAnalyzerTool
+    from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
     analyzer = ProjectAnalyzerTool(None, None)
     plan = analyzer._generate_execution_plan(

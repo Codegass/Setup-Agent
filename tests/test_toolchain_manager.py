@@ -1,7 +1,7 @@
 import json
 
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
-from sag.tools.toolchain_manager import (
+from sag.tools.internal.toolchain_manager import (
     ToolchainManager,
     ToolchainSpec,
     ToolExecutableCandidate,

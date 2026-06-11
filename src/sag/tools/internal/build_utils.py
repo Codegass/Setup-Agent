@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from .base import ToolResult
+from ..base import ToolResult
 
 
 def detached_handoff_tool_result(

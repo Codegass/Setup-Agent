@@ -2,7 +2,7 @@ import json
 
 from sag.evidence import EvidenceStatus, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
-from sag.tools.command_tracker import CommandTracker
+from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool
 
 

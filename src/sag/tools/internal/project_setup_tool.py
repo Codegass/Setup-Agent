@@ -9,7 +9,7 @@ from loguru import logger
 
 from sag.runtime import EnvOverlayStore
 
-from .base import BaseTool, ToolError, ToolResult
+from ..base import BaseTool, ToolError, ToolResult
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"

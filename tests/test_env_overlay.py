@@ -7,7 +7,7 @@ from sag.runtime.env_overlay import (
     DEFAULT_OVERLAY_SCRIPT,
     EnvOverlayStore,
 )
-from sag.tools.env_tool import EnvTool
+from sag.tools.internal.env_tool import EnvTool
 
 
 class FakeEnvOverlayOrchestrator:

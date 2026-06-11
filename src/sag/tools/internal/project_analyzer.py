@@ -8,7 +8,7 @@ from loguru import logger
 
 from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
 
-from .base import BaseTool, ToolResult
+from ..base import BaseTool, ToolResult
 
 
 class ProjectAnalyzerTool(BaseTool):

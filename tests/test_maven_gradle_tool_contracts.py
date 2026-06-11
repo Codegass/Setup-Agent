@@ -1,8 +1,8 @@
 from sag.evidence import EvidenceStatus
 from sag.tools.base import ToolResult
-from sag.tools.gradle_tool import GradleTool
-from sag.tools.maven_tool import MavenTool
-from sag.tools.toolchain_manager import (
+from sag.tools.internal.gradle_tool import GradleTool
+from sag.tools.internal.maven_tool import MavenTool
+from sag.tools.internal.toolchain_manager import (
     ResolvedToolExecutable,
     ToolExecutableCandidate,
 )

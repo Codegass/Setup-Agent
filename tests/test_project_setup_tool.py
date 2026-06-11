@@ -1,7 +1,7 @@
 import json
 
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
-from sag.tools.project_setup_tool import ProjectSetupTool
+from sag.tools.internal.project_setup_tool import ProjectSetupTool
 
 JAVA_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
 JAVA_BIN = f"{JAVA_HOME}/bin/java"
