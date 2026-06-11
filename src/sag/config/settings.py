@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -66,6 +66,14 @@ class Config(BaseModel):
     # Global wall-clock cap for a whole run (seconds); the ReAct loop ends with
     # a clear "global time cap" status once exceeded. <=0 disables the cap.
     max_wall_clock_seconds: int = Field(default=7200)
+
+    # Minimum iterations RESERVED for each not-yet-started phase. No phase has
+    # a quota (build may use everything the easy phases saved); the engine
+    # force-blocks the current phase only when continuing would starve these
+    # floors — guaranteeing the run always reaches report and ends honestly.
+    phase_min_floors: Dict[str, int] = Field(
+        default_factory=lambda: {"analyze": 4, "build": 10, "test": 12, "report": 8}
+    )
 
     # Dispatch-and-poll execution for long build/test commands: the command
     # runs detached (output to a container log file). If still running when the
@@ -199,6 +207,16 @@ class Config(BaseModel):
             "opus-4.5",
         )
         return any(marker in model for marker in adaptive_markers)
+
+
+def effective_phase_floor(floor: int, max_iterations: int) -> int:
+    """Scale a floor down for small runs so floors can never exceed the cap.
+
+    Normal-sized runs keep their configured floors verbatim; only tiny runs
+    (where the summed floors would eat the whole iteration budget) clamp each
+    floor to a fraction of the cap.
+    """
+    return max(1, min(int(floor), max(2, max_iterations // 10)))
 
 
 def setup_litellm_environment(config: Config) -> None:

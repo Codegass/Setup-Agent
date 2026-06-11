@@ -37,3 +37,18 @@ def test_config_env_overrides(monkeypatch):
     assert config.max_wall_clock_seconds == 123
     assert config.dispatch_soft_timeout_seconds == 45
     assert config.dispatch_poll_interval_seconds == 7
+
+
+def test_phase_floor_defaults():
+    config = Config()
+    floors = config.phase_min_floors
+    assert set(floors) == {"analyze", "build", "test", "report"}  # provision is first; needs no floor
+    assert floors["report"] >= 5, "report must always get its turn"
+    assert floors["test"] >= 8
+
+
+def test_effective_floor_clamps_for_small_runs():
+    from sag.config.settings import effective_phase_floor
+    assert effective_phase_floor(12, max_iterations=150) == 12
+    assert effective_phase_floor(12, max_iterations=20) <= 3, "tiny runs scale floors down"
+    assert effective_phase_floor(12, max_iterations=20) >= 1
