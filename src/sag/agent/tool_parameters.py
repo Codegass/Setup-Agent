@@ -15,6 +15,38 @@ from sag.tools.base import BaseTool
 class ToolParameterNormalizer:
     """Normalize model-supplied tool parameters against tool schemas and runtime state."""
 
+    # Legacy (pre-stage-1) tool names mapped onto their consolidated successors.
+    # Each entry: legacy name -> (new tool name, params mapper). Applied only
+    # when the legacy name is NOT registered, so direct registrations win.
+    LEGACY_TOOL_ALIASES = {
+        "maven": ("build", lambda p: {"action": p.get("command", "compile"),
+                                      "args": p.get("extra_args"),
+                                      "working_directory": p.get("working_directory", "/workspace")}),
+        "gradle": ("build", lambda p: (
+            {"action": p["tasks"], "working_directory": p.get("working_directory", "/workspace")}
+            if p.get("tasks") in ("deps", "compile", "test", "package")
+            else {"action": "compile", "args": p.get("tasks"),
+                  "working_directory": p.get("working_directory", "/workspace")}
+        )),
+        "web_search": ("search", lambda p: {"target": f"web:{p.get('query', '')}"}),
+        "output_search": ("search", lambda p: {"target": p.get("ref_id", ""),
+                                               "pattern": p.get("grep_pattern", p.get("pattern", "."))}),
+        # Facade verb must win over any legacy sub-action key: ProjectTool routes
+        # on `action` and re-derives the delegate's sub-action itself.
+        "project_setup": ("project", lambda p: {**p, "action": "clone"}),
+        "project_analyzer": ("project", lambda p: {**p, "action": "analyze"}),
+        "system": ("project", lambda p: {**p, "action": "provision"}),
+        "env": ("project", lambda p: {**p, "action": "env"}),
+    }
+
+    def resolve_legacy_alias(self, tool_name, params):
+        """Map a legacy tool name (model drift) to its stage-1 successor."""
+        if tool_name in self.tools or tool_name not in self.LEGACY_TOOL_ALIASES:
+            return tool_name, params
+        new_name, mapper = self.LEGACY_TOOL_ALIASES[tool_name]
+        mapped = {k: v for k, v in mapper(dict(params or {})).items() if v is not None}
+        return new_name, mapped
+
     def __init__(
         self,
         *,
@@ -158,6 +190,8 @@ class ToolParameterNormalizer:
     ) -> Dict[str, Any]:
         """Validate and fix tool parameters with self-healing capability."""
         fixes = parameter_fixes if parameter_fixes is not None else []
+        if tool_name not in self.tools:
+            tool_name, params = self.resolve_legacy_alias(tool_name, params)
         if tool_name not in self.tools:
             self.logger.error(f"Unknown tool: {tool_name}")
             return params

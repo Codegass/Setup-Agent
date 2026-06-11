@@ -1330,7 +1330,7 @@ IMPORTANT:
         if branch_history is None:
             return None
 
-        build_tools = {"maven", "gradle", "npm", "yarn", "pnpm", "pytest"}
+        build_tools = {"build", "maven", "gradle", "npm", "yarn", "pnpm", "pytest"}
         shell_tools = {"bash"}
         shell_build_markers = (
             "mvn",
@@ -1471,7 +1471,7 @@ IMPORTANT:
         if branch_history is None:
             return False
 
-        remediation_tools = {"project_setup", "system", "env"}
+        remediation_tools = {"project", "project_setup", "system", "env"}
         remediation_markers = (
             "apt-get",
             "apt install",

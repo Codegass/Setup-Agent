@@ -292,6 +292,18 @@ class ToolOrchestrator:
 
     def execute(self, call: ToolCall) -> ToolExecution:
         started_at = time.perf_counter()
+        if call.name not in self.tools:
+            # Legacy tool names (model drift) map onto their stage-1 successors
+            # before any lookup, so old names execute instead of failing.
+            resolved_name, resolved_params = self.parameter_normalizer.resolve_legacy_alias(
+                call.name, call.raw_params
+            )
+            if resolved_name != call.name:
+                self.logger.info(
+                    f"Legacy tool alias resolved: {call.name} -> {resolved_name}"
+                )
+                call.name = resolved_name
+                call.raw_params = resolved_params
         start_signature = call.execution_signature or self._execution_signature(
             call.name, call.validated_params or call.raw_params
         )

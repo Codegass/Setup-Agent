@@ -124,6 +124,7 @@ class SetupAgent:
         """Initialize all available tools."""
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
+        from sag.tools.build import BuildTool
         from sag.tools.context_tool import ContextTool
         from sag.tools.env_tool import EnvTool
         from sag.tools.file_io import FileIOTool
@@ -132,7 +133,9 @@ class SetupAgent:
         from sag.tools.output_search_tool import OutputSearchTool
         from sag.tools.project_analyzer import ProjectAnalyzerTool
         from sag.tools.project_setup_tool import ProjectSetupTool
+        from sag.tools.project_tool import ProjectTool
         from sag.tools.report_tool import ReportTool
+        from sag.tools.search_tool import SearchTool
         from sag.tools.system_tool import SystemTool
         from sag.tools.web_search import WebSearchTool
 
@@ -153,19 +156,36 @@ class SetupAgent:
             test_pass_threshold=self.config.test_pass_threshold,
         )
 
+        # Stage-1 surface: the legacy tools below are no longer model-facing;
+        # they live on as backends/delegates of the build/project/search facades.
+        maven_tool = MavenTool(self.orchestrator)
+        gradle_tool = GradleTool(self.orchestrator)
+        setup_tool = ProjectSetupTool(self.orchestrator)
+        system_tool = SystemTool(self.orchestrator)
+        env_tool = EnvTool(self.orchestrator)
+        analyzer_tool = ProjectAnalyzerTool(self.orchestrator, self.context_manager)
+        output_search = OutputSearchTool(
+            orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir
+        )
+
         tools = [
             BashTool(self.orchestrator, config=bash_config),
             FileIOTool(self.orchestrator),
-            WebSearchTool(),
             ContextTool(self.context_manager),
-            MavenTool(self.orchestrator),
-            GradleTool(self.orchestrator),
-            ProjectSetupTool(self.orchestrator),
-            SystemTool(self.orchestrator),
-            EnvTool(self.orchestrator),
-            ProjectAnalyzerTool(self.orchestrator, self.context_manager),
-            OutputSearchTool(
-                orchestrator=self.orchestrator, contexts_dir=self.context_manager.contexts_dir
+            BuildTool(
+                self.orchestrator,
+                maven_tool=maven_tool,
+                gradle_tool=gradle_tool,
+                test_pass_threshold=self.config.test_pass_threshold,
+            ),
+            ProjectTool(
+                setup_tool=setup_tool,
+                analyzer_tool=analyzer_tool,
+                system_tool=system_tool,
+                env_tool=env_tool,
+            ),
+            SearchTool(
+                self.orchestrator, output_search=output_search, web_search=WebSearchTool()
             ),
             ReportTool(
                 self.orchestrator,

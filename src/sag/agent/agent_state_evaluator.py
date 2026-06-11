@@ -614,7 +614,7 @@ class AgentStateEvaluator:
         desc = (task_description or "").lower()
         build_terms = ["compile", "build", "package", "install"]
         test_terms = ["test", "tests", "verify"]
-        tool_terms = ["maven", "mvn", "gradle", "gradlew", "npm", "yarn", "pnpm", "pytest"]
+        tool_terms = ["maven", "mvn", "gradle", "gradlew", "npm", "yarn", "pnpm", "pytest", "build"]
         return any(term in desc for term in build_terms + test_terms) and any(
             term in desc for term in tool_terms
         )
