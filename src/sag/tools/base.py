@@ -61,6 +61,9 @@ class ToolError(Exception):
         )
 
 
+VERDICTS = {"success", "partial", "failed", "running", "unknown", "skipped"}
+
+
 class ToolResult(BaseModel):
     """Result of a tool execution."""
 
@@ -80,6 +83,26 @@ class ToolResult(BaseModel):
     conflicts: List[str] = Field(default_factory=list)
     validator_findings: List[EvidenceFinding] = Field(default_factory=list)
     test_stats: Optional[TestStats] = None
+
+    # Result envelope (spec §5). verdict defaults from `success` so legacy
+    # construction keeps working; facts are machine-readable for gates;
+    # refs are retrieval handles for the search tool ("links, not dumps").
+    verdict: Optional[str] = None
+    facts: Dict[str, Any] = Field(default_factory=dict)
+    refs: List[str] = Field(default_factory=list)
+
+    @field_validator("verdict")
+    @classmethod
+    def _validate_verdict(cls, v):
+        if v is not None and v not in VERDICTS:
+            raise ValueError(f"verdict must be one of {sorted(VERDICTS)}, got {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _default_verdict(self) -> "ToolResult":
+        if self.verdict is None:
+            object.__setattr__(self, "verdict", "success" if self.success else "failed")
+        return self
 
     @staticmethod
     def _status_from_success(success: bool) -> EvidenceStatus:
