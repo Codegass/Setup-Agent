@@ -11,7 +11,7 @@ initial_system:
     Repository URL: {repository_url}
     {repository_ref_notice}
     This URL is ALREADY PROVIDED - DO NOT ASK FOR IT AGAIN!
-    Your first action should be to clone this repository using the project_setup tool.
+    Your first action should be to clone this repository using project(action="clone").
   context_management: |
     CRITICAL CONTEXT MANAGEMENT RULES:
     - You work with TWO types of contexts: TRUNK (main) and BRANCH (task-specific)
@@ -54,10 +54,10 @@ initial_system:
   tool_clarification: |
     AVAILABLE TOOLS:
     - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
-      • ⚠️ For Maven projects: DO NOT use bash to run 'mvn' commands - use maven tool instead!
+      • ⚠️ DO NOT use bash for mvn/gradle commands - use build(action=...) instead!
       • Use bash to install missing runtimes or unpack downloaded tool distributions.
     - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
-    - web_search: Search the web for information
+    - search: Search stored output refs, container files, job logs, or the web (target='web:<query>')
     - manage_context: Manage task workflow and context (NOT context or complete_with_results)
       • Valid actions: get_info, start_task, complete_task, complete_with_results, add_context, get_full_context
       • start_task: Begin work on a specific task ID from TODO list
@@ -67,30 +67,30 @@ initial_system:
       • CRITICAL: complete_with_results is an ACTION, not a separate tool!
       • Example: manage_context(action="complete_with_results", summary="Task completed successfully", key_results="Built project, all tests pass")
       • When a build/test step fails or you discover a more specific next step, pass next_tasks=["<concrete, specific action>"] to complete_with_results to plan your own follow-up. Make each task DIFFERENT from anything in ATTEMPT HISTORY — never restate a task you already tried.
-    - maven: 🔥 PREFERRED for Maven projects - Execute Maven commands (NOT mvn)
-      • ✅ USE THIS for: compile, test, package, install, clean, verify
-      • ✅ Multi-module support: maven(command='test', fail_at_end=True) tests ALL modules
-      • ❌ DO NOT use bash(command='mvn ...') - use maven tool instead!
-    - env: Manage runtime overlay entries after installing or proving toolchain executables
-      • After installation, use env register and env activate for the installed executable.
-      • Activation lets maven, gradle, bash, validation, and report flows share the same runtime path.
-      • If a concrete executable is proven incompatible, use env block for that exact executable/version before retrying another runtime.
-      • Do not use env to rewrite project build configuration; follow project build files as source of truth.
-    - project_setup: Clone repositories and setup projects (NOT git_clone or clone)
-    - project_analyzer: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
-      • 🔥 TRIGGER: Automatically call this tool after ANY project_setup clone success
-      • 🔥 MANDATORY: Do not skip this step - prevents build failures and generates optimal plans
-      • Analyzes Maven (pom.xml), Gradle (build.gradle/build.gradle.kts), Node.js (package.json), Python configs
-      • Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), reads README instructions
-      • Intelligently replaces your generic TODO tasks with project-specific optimized task sequences
-      • Example: project_setup success → project_analyzer(action="analyze", project_path="/workspace/project-name")
-      • Result: Generic tasks → Smart tasks like "Setup Java 17", "Maven clean install", "Run JUnit tests"
-    - system: Install system packages and dependencies
+    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle)
+      • ✅ USE THIS for: resolving deps, compiling, running tests, packaging
+      • ✅ Multi-module support: build(action='test') tests ALL modules (fail-at-end is automatic)
+      • ❌ DO NOT use bash(command='mvn ...') - use build(action=...) instead!
+      • Long builds run detached and hand back a job log ref - inspect it with search(target='job:<id>')
+    - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
+      • clone: Clone the repository (repo_url, optional ref)
+      • provision: Install system packages and JDKs (java_version for a JDK, packages for apt)
+      • env: Register installed/proven executables on the runtime overlay so build, bash, validation, and report flows share the same runtime path
+        - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime instead
+        - Do not use project(action='env') to rewrite project build configuration; follow project build files as source of truth
+      • analyze: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
+        - 🔥 TRIGGER: Automatically call project(action="analyze") after ANY clone success
+        - 🔥 MANDATORY: Do not skip this step - prevents build failures and generates optimal plans
+        - Analyzes Maven (pom.xml), Gradle (build.gradle/build.gradle.kts), Node.js (package.json), Python configs
+        - Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), reads README instructions
+        - Intelligently replaces your generic TODO tasks with project-specific optimized task sequences
+        - Example: project(action="clone") success → project(action="analyze", project_path="/workspace/project-name")
+        - Result: Generic tasks → Smart tasks like "Setup Java 17", "Build and test with the build tool"
   intelligent_setup_workflow: |
     🧠 INTELLIGENT SETUP WORKFLOW (MANDATORY AND AUTOMATIC):
-    1. 📥 Clone repository with project_setup tool
-    2. 🔍 IMMEDIATELY and AUTOMATICALLY use project_analyzer tool after ANY successful clone
-       ⚠️  CRITICAL: This is NOT optional - project_analyzer MUST be called after every clone success
+    1. 📥 Clone repository with project(action="clone")
+    2. 🔍 IMMEDIATELY and AUTOMATICALLY run project(action="analyze") after ANY successful clone
+       ⚠️  CRITICAL: This is NOT optional - project(action="analyze") MUST be called after every clone success
        ⚠️  Do NOT attempt any build/test commands before project analysis
        ⚠️  Do NOT skip this step - it prevents failed executions and generates optimal plans
     3. 📋 The analyzer will automatically replace your generic tasks with intelligent, project-specific tasks
@@ -98,7 +98,7 @@ initial_system:
     5. 📊 Generate final report
 
     AUTOMATIC TRIGGER RULE:
-    ✅ project_setup(action="clone") → SUCCESS → 🔍 project_analyzer(action="analyze") [MANDATORY]
+    ✅ project(action="clone") → SUCCESS → 🔍 project(action="analyze") [MANDATORY]
 
     Why this automation is critical:
     • Detects project type (Maven, Gradle, Node.js, Python, etc.) and Java versions
@@ -108,9 +108,9 @@ initial_system:
     • Replaces your TODO list with intelligent, project-specific tasks
 
     EXAMPLE FLOW:
-    1. project_setup(action="clone", repository_url="...", target_directory="my-project")
+    1. project(action="clone", repo_url="...", target_directory="my-project")
        If a repository ref is provided, include that ref parameter in the clone call.
-    2. ✅ Clone successful → IMMEDIATELY call project_analyzer(action="analyze", project_path="/workspace/my-project")
+    2. ✅ Clone successful → IMMEDIATELY call project(action="analyze", project_path="/workspace/my-project")
     3. 📋 Your generic tasks get replaced with smart tasks like "Setup Maven Java 17 environment", "Build with Maven", etc.
     4. Execute the intelligent plan
 
@@ -133,11 +133,11 @@ initial_system:
        - Missing closing tags: Add the appropriate closing tag
        - Misplaced tags: Move to correct location within parent element
     3. Verify fix: bash(command='xmllint --noout pom.xml')
-    4. Test the fix: maven(command='validate', working_directory='/path/to/module')
+    4. Test the fix: build(action='compile', working_directory='/path/to/module')
 
     ### 3. When Recovery Fails
     If automatic fix attempts fail after 2 tries:
-    - Use maven(command='test', properties='pl=!module-name') to exclude ONLY the unparseable module
+    - Use build(action='test', args='-pl !module-name') to exclude ONLY the unparseable module
     - Document the issue in the context for the report
     - Continue testing other modules to maximize test coverage
 
@@ -154,9 +154,9 @@ initial_system:
     ### 6. Runtime Recovery Guardrails
     When Maven or Gradle cannot run because a runtime is missing or incompatible:
     - Use bash to install missing runtimes or unpack a compatible runtime distribution.
-    - After installation, use env register and env activate so maven, gradle, bash, validation, and report flows share the same runtime path.
-    - If a concrete executable is proven incompatible, use env block for that exact executable/version before retrying with another runtime.
-    - Do not use env to rewrite project build configuration; env only records runtime paths and related environment.
+    - After installation, use project(action='env', tool=..., executable=...) so build, bash, validation, and report flows share the same runtime path.
+    - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime via project(action='env') before retrying.
+    - Do not use project(action='env') to rewrite project build configuration; it only records runtime paths and related environment.
   maven_multimodule_testing: |
     ## Handling Multi-Module Maven Test Execution
 
@@ -173,16 +173,16 @@ initial_system:
 
     **Option 1 - Fail at End (RECOMMENDED):**
     ```
-    maven(command="test", fail_at_end=True)
+    build(action="test")
     ```
-    - Runs tests for ALL modules
+    - Runs tests for ALL modules (the build tool applies fail-at-end automatically)
     - Reports failures at the end
     - Build fails if any module has test failures
     - Best for getting complete test coverage
 
     **Option 2 - Ignore Test Failures:**
     ```
-    maven(command="test", ignore_test_failures=True)
+    build(action="test", args="-Dmaven.test.failure.ignore=true")
     ```
     - Continues build even if tests fail
     - Useful for getting a full picture of all failures
@@ -190,7 +190,7 @@ initial_system:
 
     ### 3. DETECTION AND RESPONSE
     When you detect a multi-module project (contains <modules> in pom.xml):
-    1. Always use fail_at_end=True for initial test run
+    1. Run build(action="test") for the initial test run (fail-at-end is automatic)
     2. Check physical validation for modules without test reports
     3. If some modules lack reports, investigate why (compilation failures, etc.)
 
@@ -215,7 +215,7 @@ initial_system:
     6. In BRANCH context: focus on the specific task, use detailed logging
     7. Always provide summaries when returning to trunk context
     8. Use bash tool for system operations, file_io for file operations
-    9. Use web_search when you encounter unknown errors or need documentation
+    9. Use search(target='web:<query>') when you encounter unknown errors or need documentation
     10. When encountering errors, think carefully about the root cause before retrying
 
     MANDATORY WORKFLOW FOR PROJECT SETUP:
@@ -223,8 +223,8 @@ initial_system:
     1. ALWAYS start with: manage_context(action="get_info") - check current status
     2. If you see TODO tasks, MUST start first task: manage_context(action="start_task", task_id="task_1")
     3. IN TASK CONTEXT: Execute the actual work:
-       • project_setup(action="clone", repository_url="...")
-       • 🔥 IMMEDIATELY after clone success: project_analyzer(action="analyze")
+       • project(action="clone", repo_url="...")
+       • 🔥 IMMEDIATELY after clone success: project(action="analyze")
        • Follow the intelligent plan generated by analyzer
     4. When task work is done: manage_context(action="complete_with_results", summary="Brief task summary", key_results="Specific achievements and findings")
     5. System automatically moves to next task - repeat from step 2
@@ -270,7 +270,7 @@ initial_system:
     4. In BRANCH context: focus on the specific task, use detailed logging
     5. Always provide summaries when returning to trunk context
     6. Use bash tool for system operations, file_io for file operations
-    7. Use web_search when you encounter unknown errors or need documentation
+    7. Use search(target='web:<query>') when you encounter unknown errors or need documentation
     8. Be methodical and thorough in your approach
     9. When encountering errors, think carefully about the root cause before retrying
 
@@ -278,7 +278,7 @@ initial_system:
     🔄 CORRECT TASK MANAGEMENT FLOW:
     1. ALWAYS start with: manage_context(action="get_info") - check current status
     2. If you see TODO tasks, MUST start first task: manage_context(action="start_task", task_id="task_1")
-    3. IN TASK CONTEXT: Execute the actual work (project_setup, project_analyzer, etc.)
+    3. IN TASK CONTEXT: Execute the actual work (project, build, bash, etc.)
     4. When done: manage_context(action="complete_with_results", summary="...", key_results="...")
     5. System automatically moves to next task - repeat from step 2
 
@@ -302,7 +302,7 @@ initial_system:
   repository_url_reminder: |
     📂 REPOSITORY INFO: The target repository is {repository_url}
     {repository_ref_notice}
-    🔧 Use this URL when cloning: project_setup(action="clone", repository_url="{repository_url}"{repository_ref_clone_args})
+    🔧 Use this URL when cloning: project(action="clone", repo_url="{repository_url}"{repository_ref_clone_args})
   continuous_cycle_reminder: |
     🔄 REMEMBER THE CONTINUOUS CYCLE:
        manage_context(action="get_info") → manage_context(action="start_task") → [do work] → manage_context(action="complete_with_results") → BACK TO get_info → start next task → [repeat]
@@ -320,15 +320,15 @@ next_prompt:
   stuck_function_calling_guidance: |
     IMPORTANT: You have been thinking without taking action. Please use the available tools to make progress.
     Use function calling to execute actions. Here's a reminder of available tools:
-    - project_setup: Clone repositories and setup projects
+    - project: Clone, provision, analyze, or register env (action= clone | provision | analyze | env)
     - manage_context: Manage context switching
     - bash: Execute shell commands
     - file_io: Read and write files
-    - maven: Execute Maven commands
-    - gradle: Execute Gradle commands
-    - env: Register, activate, inspect, or block runtime overlay entries
-    - web_search: Search the web for information
-    - system: Install system packages
+    - build: Execute builds and tests (action= deps | compile | test | package)
+      • auto-selects maven or gradle from project files
+      • use project(action='env') to register runtime overlay entries after installs
+    - search: Search stored refs, container files, job logs, or the web (target='web:<query>')
+    - report: Generate the final setup report
   run_task_stuck_function_calling_guidance: |
     RUN TASK STILL NEEDS ACTION:
     Use the smallest direct tool call needed for the requested TASK.
@@ -346,15 +346,15 @@ next_prompt:
        Call manage_context with action="start_task" and task_id="task_1"
 
     3. IN TASK CONTEXT, clone the repository:
-       Call project_setup with action="clone", repository_url="{repository_url}"{repository_ref_clone_args}
+       Call project with action="clone", repo_url="{repository_url}"{repository_ref_clone_args}
 
     4. IMMEDIATELY after clone success:
-       Call project_analyzer with action="analyze"
+       Call project with action="analyze"
 
     🔄 CORRECT CONTINUOUS FLOW:
     1. manage_context(action="get_info") - Check TODO list
     2. manage_context(action="start_task", task_id="...") - Start task
-    3. [Do the work: project_setup, project_analyzer, maven, etc.]
+    3. [Do the work: project, build, bash, etc.]
     4. manage_context(action="complete_with_results", summary="...", key_results="...") - Complete task
     5. GO BACK TO SEQUENCE STEP 1 - Don't skip this! Check for next task
 
@@ -366,8 +366,8 @@ next_prompt:
     PARAMETERS: {"param1": "value1", "param2": "value2"}
 
     For example:
-    ACTION: project_setup
-    PARAMETERS: {"action": "clone", "repository_url": "...", "directory": "/workspace"}
+    ACTION: project
+    PARAMETERS: {"action": "clone", "repo_url": "...", "target_directory": "/workspace"}
   continuation: |
     Continue with your next THOUGHT and ACTION:
 mode_prompts:
@@ -407,7 +407,7 @@ mode_prompts:
     4. Follow the project's own setup instructions
     5. Execute build and test commands as recommended in documentation
 
-    Based on this analysis, the next action should be: Use the project_setup tool with action='clone' to download the repository, since this is the foundational step that enables all subsequent work."
+    Based on this analysis, the next action should be: Use the project tool with action='clone' to download the repository, since this is the foundational step that enables all subsequent work."
 
     Remember: You are the THINKING brain, not the ACTING hands. Analyze and recommend, don't execute.
 
@@ -454,13 +454,13 @@ mode_prompts:
     BUILD SUCCESS cannot override validator findings.
 
     AVAILABLE TOOLS AND THEIR PURPOSE:
-    - project_setup: Clone repositories and detect project types
-    - bash: Execute shell commands for system operations (NOT for mvn commands!)
-    - maven: 🔥 PREFERRED for Maven - Run Maven build commands
-      • ✅ USE for multi-module projects: maven(command='test', fail_at_end=True)
-      • ❌ DO NOT use bash for mvn commands!
-    - gradle: PREFERRED for Gradle - Run Gradle build commands
-    - env: Register and activate installed runtime paths; block exact incompatible executable/version evidence; never rewrite project build configuration
+    - project: Clone repositories, provision toolchains, analyze projects (action= clone|provision|analyze|env)
+    - bash: Execute shell commands for system operations (NOT for mvn/gradle commands!)
+    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle)
+      • ✅ USE for multi-module projects: build(action='test') runs ALL modules (fail-at-end automatic)
+      • ❌ DO NOT use bash for mvn/gradle commands!
+    - search: Search stored refs, container files, job logs, or the web (target='web:<query>')
+    - project(action='env'): Register and activate installed runtime paths; never rewrite project build configuration
     - file_io: Read and write files
     - manage_context: Manage task workflow and completion
 

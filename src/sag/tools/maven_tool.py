@@ -294,8 +294,8 @@ class MavenTool(BaseTool):
                 # Add a warning to the result that will be seen by the agent
                 self._multi_module_warning = (
                     f"WARNING: Multi-module project with {modules_info.get('module_count', 'multiple')} modules. "
-                    f"Without fail_at_end=True, only partial modules will be tested. "
-                    f"Use maven(command='test', fail_at_end=True) to test all modules."
+                    f"Without fail-at-end, only partial modules will be tested. "
+                    f"Use build(action='test') to test all modules (fail-at-end is automatic)."
                 )
 
         # Execute the command
@@ -970,7 +970,7 @@ class MavenTool(BaseTool):
             if suggested_root:
                 root_dir = suggested_root.replace("/pom.xml", "")
                 suggestions.append(
-                    f"\n🎯 RECOMMENDED: maven(command='...', working_directory='{root_dir}')"
+                    f"\n🎯 RECOMMENDED: build(action='...', working_directory='{root_dir}')"
                 )
                 if "<modules>" in suggested_root:
                     suggestions.append("   ^ This is the root of a multi-module project")
@@ -980,7 +980,7 @@ class MavenTool(BaseTool):
                 if pom_path != suggested_root:  # Don't duplicate the root pom
                     pom_dir = pom_path.replace("/pom.xml", "")
                     suggestions.append(
-                        f"\n• Alternative: maven(command='...', working_directory='{pom_dir}')"
+                        f"\n• Alternative: build(action='...', working_directory='{pom_dir}')"
                     )
         else:
             suggestions.extend(
@@ -1528,7 +1528,7 @@ class MavenTool(BaseTool):
             error_suggestions.extend(
                 [
                     f"Java version mismatch: Current version is {current}, but {required} is required",
-                    f"Install Java {required} using: system(action='install_java', java_version='{required}')",
+                    f"Install Java {required} using: project(action='provision', java_version='{required}')",
                     f"Or manually: bash(command='apt-get update && apt-get install -y openjdk-{required}-jdk')",
                     f"After installation, retry the Maven command",
                 ]
@@ -1591,13 +1591,13 @@ class MavenTool(BaseTool):
                 if artifact_id:
                     error_suggestions.append(
                         f"Temporarily exclude module '{artifact_id}' ({module_hint}) and rerun: "
-                        f"maven(command='{command}', fail_at_end=True, properties=['-pl !{artifact_id}','-am'])"
+                        f"build(action='{command}', args='-pl !{artifact_id} -am')"
                     )
                 elif pom_path:
                     module_name = Path(pom_path).parent.name
                     error_suggestions.append(
                         f"Temporarily exclude module '{module_name}' ({module_hint}) and rerun: "
-                        f"maven(command='{command}', fail_at_end=True, properties=['-pl !{module_name}','-am'])"
+                        f"build(action='{command}', args='-pl !{module_name} -am')"
                     )
             error_suggestions.append(
                 "Excluding the failing module lets the remaining reactor modules finish so you still capture their results."
@@ -1609,10 +1609,10 @@ class MavenTool(BaseTool):
                 display_name = display_name.split(":")[0].strip()
                 error_suggestions.append(
                     f"Skip failing test '{display_name}' on the next run: "
-                    f"maven(command='{command}', fail_at_end=True, properties='test=!{display_name}')"
+                    f"build(action='{command}', args='-Dtest=!{display_name}')"
                 )
             error_suggestions.append(
-                "Combine multiple exclusions with commas inside the test property, e.g. properties='test=!TestOne,!TestTwo'."
+                "Combine multiple exclusions with commas inside the test property, e.g. args='-Dtest=!TestOne,!TestTwo'."
             )
 
         if analysis.get("surefire_reports"):
@@ -1669,7 +1669,7 @@ class MavenTool(BaseTool):
                     "Use bash to examine the problematic line in the POM file",
                     "Common issues: orphaned tags, missing closing tags, tags outside proper parent elements",
                     "Try: bash(command='xmllint --noout /path/to/pom.xml') to validate XML structure",
-                    "If unfixable, exclude the module: maven(command='test', properties='pl=!module-name')",
+                    "If unfixable, exclude the module: build(action='test', args='-pl !module-name')",
                 ]
             )
             documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
@@ -1692,17 +1692,16 @@ class MavenTool(BaseTool):
                         f"{raw_requirement}; apt may only provide an older distro package"
                     ),
                     (
-                        "Use env register/activate for the new executable, e.g. "
-                        "env(action='register', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
-                        "version='<version>', path_prepend=['/workspace/apache-maven-<version>/bin'], activate=True)"
+                        "Register the new executable on the runtime overlay, e.g. "
+                        "project(action='env', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
+                        "version='<version>', activate=True)"
                     ),
                     (
-                        f"Retry with maven(command='{command}', "
-                        f"maven_version_requirement='{raw_requirement}')"
+                        f"Retry with build(action='{command}')"
                     ),
                     (
-                        "If an exact Maven executable is proven incompatible, record it with "
-                        "env(action='block', tool='maven', executable='<path>', version='<version>')"
+                        "If an exact Maven executable is proven incompatible, note that "
+                        "executable/version finding and register a compatible one instead"
                     ),
                 ]
             )
@@ -1789,7 +1788,7 @@ class MavenTool(BaseTool):
             error_suggestions.extend(
                 [
                     "Increase JVM memory allocation",
-                    "Try: maven(command='compile', properties='maven.compiler.fork=true,maven.compiler.meminitial=256m,maven.compiler.maxmem=1024m')",
+                    "Try: build(action='compile', args='-Dmaven.compiler.fork=true -Dmaven.compiler.meminitial=256m -Dmaven.compiler.maxmem=1024m')",
                     "Or set MAVEN_OPTS: bash(command='export MAVEN_OPTS=\"-Xmx2048m -XX:MaxPermSize=512m\"')",
                     "Consider building modules separately if project is large",
                 ]
@@ -1806,7 +1805,7 @@ class MavenTool(BaseTool):
                 [
                     "Network connectivity issue detected",
                     "Check Maven repository accessibility: bash(command='curl -I https://repo.maven.apache.org/maven2/')",
-                    "Try with offline mode if dependencies are cached: maven(command='compile', properties='offline=true')",
+                    "Try with offline mode if dependencies are cached: build(action='compile', args='--offline')",
                     "Configure proxy if behind firewall (update ~/.m2/settings.xml)",
                 ]
             )

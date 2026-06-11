@@ -312,7 +312,7 @@ class ProjectSetupTool(BaseTool):
             raise ToolError(
                 message="repository_url is required for clone action",
                 suggestions=[
-                    "Provide a repository URL: project_setup(action='clone', repository_url='https://github.com/user/repo.git')",
+                    "Provide a repository URL: project(action='clone', repo_url='https://github.com/user/repo.git')",
                     "Ensure the URL is accessible and correct",
                     "Use HTTPS URLs for public repositories",
                 ],
@@ -445,10 +445,11 @@ class ProjectSetupTool(BaseTool):
         # Suggest next steps
         output += f"\n📝 Suggested next steps:\n"
         if project_type["type"] == "maven":
-            output += f"• Use maven tool: maven(command='clean compile')\n"
-            output += f"• Run tests: maven(command='test')\n"
+            output += f"• Use build tool: build(action='compile')\n"
+            output += f"• Run tests: build(action='test')\n"
         elif project_type["type"] == "gradle":
-            output += f"• Use gradle tool: gradle(task='build')\n"
+            output += f"• Use build tool: build(action='compile')\n"
+            output += f"• Run tests: build(action='test')\n"
         elif project_type["type"] == "npm":
             output += f"• Use npm tool: npm(command='install')\n"
             output += f"• Run build: npm(command='run build')\n"
@@ -456,7 +457,7 @@ class ProjectSetupTool(BaseTool):
             output += f"• Use uv tool: uv(command='sync')\n"
             output += f"• Run tests: uv(command='run pytest')\n"
         else:
-            output += f"• Analyze project structure: project_setup(action='analyze_structure')\n"
+            output += f"• Analyze project structure: project(action='analyze')\n"
             output += f"• Use bash tool for custom setup commands\n"
 
         return ToolResult(success=True, output=output, metadata=metadata)
@@ -1295,7 +1296,7 @@ class ProjectSetupTool(BaseTool):
                         f"Directory '{target_directory}' already exists and contains conflicting content",
                         "Use a different target directory name",
                         "Remove the existing directory first: bash(command='rm -rf {target_directory}')",
-                        "Or use project_setup with a different target_directory parameter",
+                        "Or retry project(action='clone') with a different target_directory parameter",
                     ]
                 )
 

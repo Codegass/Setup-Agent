@@ -1679,7 +1679,7 @@ IMPORTANT:
                             "reason": "Build/test task missing successful tool execution evidence",
                             "suggestions": [
                                 "Run the relevant build or test tool before completing this task",
-                                "Use maven, gradle, npm, yarn, pnpm, or pytest as appropriate",
+                                "Use the build tool (or npm/yarn/pnpm/pytest via bash) as appropriate",
                                 "Do not complete build/test tasks based only on summary text",
                                 "Use force=True only when intentionally recording a manually verified exception",
                             ],
@@ -1692,16 +1692,16 @@ IMPORTANT:
 
             # Task-specific validation rules
             if "project_analyzer" in task_description or "analyze project" in task_description:
-                # CRITICAL: Ensure project_analyzer tool was actually used
+                # CRITICAL: Ensure the project analysis was actually executed
                 if not self._check_project_analyzer_execution():
                     validation_result.update(
                         {
                             "valid": False,
-                            "reason": "Task requires project_analyzer tool execution but no evidence found",
+                            "reason": "Task requires project(action='analyze') execution but no evidence found",
                             "suggestions": [
-                                "Use project_analyzer tool with action='analyze' before completing this task",
-                                "The project_analyzer tool must be called to generate intelligent execution plan",
-                                "Do not complete this task until project_analyzer has created additional tasks",
+                                "Use project(action='analyze') before completing this task",
+                                "The analyze action must be called to generate the intelligent execution plan",
+                                "Do not complete this task until project(action='analyze') has created additional tasks",
                             ],
                         }
                     )
@@ -1715,9 +1715,9 @@ IMPORTANT:
                             "valid": False,
                             "reason": "Project analysis should generate additional tasks but todo list unchanged",
                             "suggestions": [
-                                "Ensure project_analyzer tool generated additional tasks",
+                                "Ensure project(action='analyze') generated additional tasks",
                                 "The analysis should expand the todo list with specific build/test tasks",
-                                "Check if project_analyzer completed successfully with update_context=True",
+                                "Check if project(action='analyze') completed successfully with update_context=True",
                             ],
                         }
                     )
@@ -1740,7 +1740,7 @@ IMPORTANT:
                             "suggestions": [
                                 "Ensure repository was successfully cloned to workspace",
                                 "Include repository path and project type in key results",
-                                "Use project_setup tool with action='clone' before completing",
+                                "Use project(action='clone') before completing",
                             ],
                         }
                     )
@@ -1759,9 +1759,9 @@ IMPORTANT:
                             "valid": False,
                             "reason": "Build and test task missing evidence of build tool execution",
                             "suggestions": [
-                                "Execute Maven or Gradle commands before completing this task",
+                                "Execute build commands before completing this task",
                                 "Include build results and test outcomes in summary",
-                                "Use maven or gradle tools to perform actual build and test",
+                                "Use the build tool (action='compile' / action='test') to perform the actual build and test",
                             ],
                         }
                     )
@@ -1903,9 +1903,15 @@ IMPORTANT:
                 ],
             }
 
+    # Marker emitted at the top of ProjectAnalyzerTool's success output; the
+    # consolidated `project` facade records its history entries under the
+    # facade name, so analyze evidence is recognised by this output marker
+    # (a `project` clone/provision entry must NOT satisfy the analyzer gate).
+    _ANALYSIS_OUTPUT_MARKER = "PROJECT ANALYSIS COMPLETED"
+
     def _check_project_analyzer_execution(self) -> bool:
         """
-        Check if project_analyzer tool was actually executed by examining multiple sources.
+        Check if the project analysis was actually executed by examining multiple sources.
         Enhanced to check trunk context updates and output storage in addition to branch history.
         """
         try:
@@ -1917,23 +1923,34 @@ IMPORTANT:
                 self.context_manager.current_task_id
             )
             if branch_history:
-                # Check if any history entry indicates project_analyzer usage
+                # Check if any history entry indicates an analyzer execution
                 for entry in branch_history.history:
                     if isinstance(entry, dict):
-                        # Check for action entries that mention project_analyzer
-                        if (
-                            entry.get("type") == "action"
-                            and entry.get("tool_name") == "project_analyzer"
-                        ):
-                            logger.info(
-                                "✅ Found evidence of project_analyzer execution in branch history"
-                            )
-                            return True
+                        # Action entries: legacy analyzer name, or the project
+                        # facade whose output carries the analysis marker.
+                        if entry.get("type") == "action":
+                            tool_name = entry.get("tool_name")
+                            if tool_name == "project_analyzer":
+                                logger.info(
+                                    "✅ Found evidence of analyzer execution in branch history"
+                                )
+                                return True
+                            if tool_name == "project" and (
+                                self._ANALYSIS_OUTPUT_MARKER
+                                in str(entry.get("output", "") or "").upper()
+                            ):
+                                logger.info(
+                                    "✅ Found project(action='analyze') evidence in branch history"
+                                )
+                                return True
 
-                        # Check for content that mentions project_analyzer
+                        # Check for content that mentions the analysis
                         content = str(entry.get("content", "")).lower()
-                        if "project_analyzer" in content:
-                            logger.info("✅ Found reference to project_analyzer in branch history")
+                        if (
+                            "project_analyzer" in content
+                            or self._ANALYSIS_OUTPUT_MARKER.lower() in content
+                        ):
+                            logger.info("✅ Found reference to project analysis in branch history")
                             return True
 
             # Method 2: Check if trunk context was updated with new tasks (evidence of analyzer execution)
@@ -1947,22 +1964,22 @@ IMPORTANT:
                 )
                 return True
 
-            # Method 3: Check output storage for project_analyzer outputs
+            # Method 3: Check output storage for analyzer outputs
             if self._check_output_storage_for_analyzer():
                 logger.warning(
-                    "⚠️ Project analyzer execution not in branch history but found in output storage"
+                    "⚠️ Project analysis execution not in branch history but found in output storage"
                 )
                 logger.info("✅ Accepting based on output storage evidence")
                 return True
 
-            logger.warning("❌ No evidence of project_analyzer execution found in any source")
+            logger.warning("❌ No evidence of project analysis execution found in any source")
             logger.info(
-                "💡 Hint: Use project_analyzer(action='analyze') before completing this task"
+                "💡 Hint: Use project(action='analyze') before completing this task"
             )
             return False
 
         except Exception as e:
-            logger.error(f"Failed to check project_analyzer execution: {e}")
+            logger.error(f"Failed to check project analysis execution: {e}")
             # Be lenient on errors - don't block completion due to validation errors
             return True
 
@@ -2026,14 +2043,22 @@ IMPORTANT:
             ):
                 return False
 
-            # Search for project_analyzer outputs
+            # Search for analyzer outputs: the legacy tool name, then the
+            # project facade filtered to outputs carrying the analysis marker.
             results = self.context_manager.output_storage.search_outputs(
                 tool_name="project_analyzer", task_id=self.context_manager.current_task_id, limit=1
             )
+            if not results:
+                results = self.context_manager.output_storage.search_outputs(
+                    pattern=self._ANALYSIS_OUTPUT_MARKER,
+                    tool_name="project",
+                    task_id=self.context_manager.current_task_id,
+                    limit=1,
+                )
 
             if results:
                 logger.debug(
-                    f"Found project_analyzer output in storage: {results[0].get('ref_id')}"
+                    f"Found project analysis output in storage: {results[0].get('ref_id')}"
                 )
                 return True
 

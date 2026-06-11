@@ -126,7 +126,7 @@ def _format_maven_version_contract(result: ToolResult) -> str:
     if raw_requirement:
         lines.append(
             "Next action: provide or register a Maven executable that satisfies "
-            f'{raw_requirement}, then retry maven(..., maven_version_requirement="{raw_requirement}")'
+            f"{raw_requirement} via project(action='env'), then retry the build"
         )
 
     return "\n".join(lines)
@@ -221,7 +221,7 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
         if result.output and result.output.strip():
             formatted += f"\n\n{result.output}"
 
-        if tool_name == "maven":
+        if tool_name in ("maven", "build"):
             formatted += _format_maven_version_contract(result)
 
         if result.suggestions:
@@ -858,15 +858,15 @@ class ToolOrchestrator:
         if tool_name == "bash":
             if any("update-alternatives" in str(execution) for execution in recent_executions):
                 suggestions.append(
-                    "Use system tool's install_java action instead of manual update-alternatives"
+                    "Use project(action='provision', java_version=...) instead of manual update-alternatives"
                 )
             if any("java" in str(execution) for execution in recent_executions):
                 suggestions.append(
-                    "Try: system(action='verify_java') to check current Java version"
+                    "Try: bash(command='java -version') to check the current Java version"
                 )
             suggestions.append("Use file_io tool to examine files before executing commands")
 
-        elif tool_name == "maven":
+        elif tool_name in ("maven", "build"):
             suggestions.append("Try: bash(command='mvn --version') to verify Maven installation")
             suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
             suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
@@ -874,7 +874,7 @@ class ToolOrchestrator:
         elif tool_name == "system":
             if params.get("action") == "install_java":
                 suggestions.append(
-                    "Java might already be installed - verify with: system(action='verify_java')"
+                    "Java might already be installed - verify with: bash(command='java -version')"
                 )
                 suggestions.append(
                     "Check available Java versions: bash(command='ls /usr/lib/jvm/')"
@@ -1040,12 +1040,12 @@ class ToolOrchestrator:
         """Generate comprehensive feedback for unknown tool requests."""
         # Common tool name mappings
         tool_mappings = {
-            "git": "project_setup",
-            "git_clone": "project_setup",
-            "clone": "project_setup",
-            "setup": "project_setup",
-            "mvn": "maven",
-            "gradle_build": "gradle",
+            "git": "project",
+            "git_clone": "project",
+            "clone": "project",
+            "setup": "project",
+            "mvn": "build",
+            "gradle_build": "build",
             "npm": "bash",
             "pip": "bash",
             "python": "bash",
@@ -1057,18 +1057,15 @@ class ToolOrchestrator:
             "rm": "bash",
             "cp": "bash",
             "mv": "bash",
-            "find": "file_search",
-            "grep": "file_search",
-            "test": "bash",
-            "build": "maven or gradle or bash",
-            "compile": "maven or gradle",
-            "install": "system or bash",
-            "package": "maven or gradle",
-            "analyze": "project_analyzer",
-            "review": "code_review",
+            "find": "search",
+            "grep": "search",
+            "test": "build",
+            "compile": "build",
+            "install": "project or bash",
+            "package": "build",
+            "analyze": "project",
             "report": "report",
             "context": "manage_context",
-            "search": "file_search or web_search",
             "read": "file_io",
             "write": "file_io",
             "edit": "file_io",
@@ -1083,13 +1080,13 @@ class ToolOrchestrator:
             feedback_parts.append(f"\n✅ Did you mean: {suggested}?")
 
             # Add usage example for the suggested tool
-            if suggested == "project_setup":
+            if suggested == "project":
                 feedback_parts.append(
-                    "\n📝 Usage: Use 'project_setup' with action='clone' and repo_url to clone repositories"
+                    "\n📝 Usage: Use 'project' with action='clone' and repo_url to clone repositories"
                 )
-            elif suggested == "maven":
+            elif suggested == "build":
                 feedback_parts.append(
-                    "\n📝 Usage: Use 'maven' with command='compile' or 'test' or 'package'"
+                    "\n📝 Usage: Use 'build' with action='deps' | 'compile' | 'test' | 'package'"
                 )
             elif suggested == "bash":
                 feedback_parts.append(
@@ -1112,17 +1109,11 @@ class ToolOrchestrator:
             tool_descriptions = {
                 "bash": "Execute shell commands",
                 "file_io": "Read, write, and manipulate files",
-                "file_search": "Search for files and content",
-                "web_search": "Search the web for information",
-                "project_setup": "Clone repositories and install dependencies",
-                "project_analyzer": "Analyze project structure and requirements",
-                "maven": "Run Maven build commands",
-                "gradle": "Run Gradle build commands",
-                "system": "Install system packages and configure Java",
+                "build": "Run builds and tests (action= deps|compile|test|package; auto-selects maven/gradle)",
+                "project": "Clone, provision, analyze, and register env (action= clone|provision|analyze|env)",
+                "search": "Search stored outputs, container files, job logs, or the web",
                 "manage_context": "Manage task context and branching",
                 "report": "Generate project reports",
-                "code_review": "Review code quality and security",
-                "output_search": "Search truncated outputs",
             }
 
             for tool in available_tools[:10]:  # Show first 10 tools
@@ -1136,7 +1127,7 @@ class ToolOrchestrator:
         feedback_parts.append("\n\n💡 Tips:")
         feedback_parts.append("• For shell commands, use 'bash' tool with command parameter")
         feedback_parts.append("• For file operations, use 'file_io' tool with action parameter")
-        feedback_parts.append("• For Java projects, use 'maven' or 'gradle' tools")
+        feedback_parts.append("• For builds and tests, use the 'build' tool (auto-selects maven/gradle)")
         feedback_parts.append(
             "• Check tool parameter requirements with action='help' where supported"
         )

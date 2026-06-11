@@ -48,13 +48,13 @@ class ProjectAnalyzerTool(BaseTool):
             return ToolResult(
                 success=False,
                 output=(
-                    f"❌ Invalid parameters for project_analyzer tool: {invalid_params}\n\n"
+                    f"❌ Invalid parameters for project analysis: {invalid_params}\n\n"
                     f"✅ Valid parameters:\n"
                     f"  - action (optional): 'analyze' (default: 'analyze')\n"
                     f"  - project_path (optional): Path to project directory (default: '/workspace')\n"
                     f"  - update_context (optional): Update trunk context (default: True)\n\n"
-                    f"Example: project_analyzer(action='analyze', project_path='/workspace/myproject')\n"
-                    f"Example: project_analyzer()"  # Uses all defaults
+                    f"Example: project(action='analyze', project_path='/workspace/myproject')\n"
+                    f"Example: project(action='analyze')"  # Uses all defaults
                 ),
                 error=f"Invalid parameters: {invalid_params}",
             )
@@ -117,13 +117,12 @@ class ProjectAnalyzerTool(BaseTool):
                 return ToolResult(
                     success=False,
                     output=(
-                        f"❌ Invalid action for project_analyzer tool: '{action}'\n\n"
+                        f"❌ Invalid action for project analysis: '{action}'\n\n"
                         f"✅ Valid actions:\n"
                         f"  - analyze: Perform comprehensive project analysis and generate setup plan\n\n"
                         f"Examples:\n"
-                        f"  project_analyzer(action='analyze')\n"
-                        f"  project_analyzer(action='analyze', project_path='/workspace/myproject')\n"
-                        f"  project_analyzer()  # Uses default action='analyze'"
+                        f"  project(action='analyze')\n"
+                        f"  project(action='analyze', project_path='/workspace/myproject')"
                     ),
                     error=f"Invalid action: {action}",
                     suggestions=[

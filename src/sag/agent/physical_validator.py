@@ -1879,7 +1879,7 @@ class PhysicalValidator:
                 f"📊 Found {result['total_tests']} tests executed, but some modules were skipped"
             )
             logger.info(
-                "💡 RECOMMENDED: Use maven(command='test', fail_at_end=True) at project root to test ALL modules"
+                "💡 RECOMMENDED: Use build(action='test') at project root to test ALL modules"
             )
             logger.info(
                 "💡 Alternative: Run bash(command='cd /workspace/PROJECT && mvn test --fail-at-end')"
@@ -1959,7 +1959,7 @@ class PhysicalValidator:
                         logger.warning("⚠️ Trunk context exists but no static_test_count found")
                         result["missing_analysis_prompt"] = (
                             "⚠️ WARNING: Project analysis appears incomplete. Static test count is missing! "
-                            "Please run project_analyzer(action='analyze', project_path='/workspace/{project}') "
+                            "Please run project(action='analyze', project_path='/workspace/{project}') "
                             "to properly analyze the project and count all test methods. "
                             "This is essential for accurate test coverage reporting."
                         )
@@ -1976,7 +1976,7 @@ class PhysicalValidator:
 
         if not result["analyzed"] and not result["missing_analysis_prompt"]:
             result["missing_analysis_prompt"] = (
-                "📊 REMINDER: Run project_analyzer tool to get accurate static test counts "
+                "📊 REMINDER: Run project(action='analyze') to get accurate static test counts "
                 "for better reporting. This helps track test coverage and execution rates."
             )
 

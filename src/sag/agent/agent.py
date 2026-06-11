@@ -363,10 +363,10 @@ class SetupAgent:
             # This ensures each critical step is executed independently and cannot be skipped
             # 🎯 CORE FOCUS: Build and Test success are the PRIMARY objectives of setup
             initial_tasks = [
-                "Clone repository and setup basic environment (use project_setup tool)",
-                "CRITICAL: Run project_analyzer tool with action='analyze' to analyze project structure, count static tests, and generate intelligent execution plan (MUST use project_analyzer tool, do NOT manually read files)",
-                "CORE SETUP: Execute build tasks and ensure compilation success (use maven/gradle tools)",
-                "CORE SETUP: Execute test suite and ensure all tests pass (use maven/gradle tools)",
+                "Clone repository and setup basic environment (use the project tool with action='clone')",
+                "CRITICAL: Run project(action='analyze') to analyze project structure, count static tests, and generate intelligent execution plan (MUST use the project tool, do NOT manually read files)",
+                "CORE SETUP: Execute build tasks and ensure compilation success (use the build tool; it auto-selects maven/gradle)",
+                "CORE SETUP: Execute test suite and ensure all tests pass (use the build tool; it auto-selects maven/gradle)",
                 "Generate final completion report with build and test results (use report tool)",
             ]
 
@@ -390,7 +390,7 @@ class SetupAgent:
                     f"✅ Trunk context created successfully: {trunk_context.context_id}"
                 )
                 logger.info(
-                    f"Trunk context created with {len(initial_tasks)} explicit tasks (project_analyzer will be called in task_2)"
+                    f"Trunk context created with {len(initial_tasks)} explicit tasks (project analysis runs in task_2)"
                 )
 
                 # Step 2.5: Save project metadata for future reference
@@ -852,11 +852,11 @@ My goal: {goal}
    - Understand the current task plan and proceed with task execution
 
 2. REPOSITORY CLONING (if not done):
-   - Clone the repository from {project_url} using project_setup tool
+   - Clone the repository from {project_url} using project(action='clone')
    - Verify the project was cloned successfully
 
 3. 🔍 CRITICAL: INTELLIGENT PROJECT ANALYSIS:
-   - Use project_analyzer tool to comprehensively analyze the cloned project
+   - Use project(action='analyze') to comprehensively analyze the cloned project
    - This will automatically:
      • Read README.md and documentation files
      • Analyze build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts, package.json, etc.)
@@ -869,9 +869,9 @@ My goal: {goal}
    - After project analysis, the trunk context will be updated with specific tasks
    - Execute each task in the generated plan systematically
    - Use appropriate tools for each detected project type:
-     • Maven projects: maven tool for compile/test
+     • Maven/Gradle projects: build tool for compile/test (auto-selects maven or gradle)
      • Node.js projects: bash tool for npm commands
-     • Python projects: bash/system tools for pip/poetry
+     • Python projects: bash or project(action='provision') for pip/poetry
    - Follow the project's own documented setup instructions
 
 5. COMPLETION:

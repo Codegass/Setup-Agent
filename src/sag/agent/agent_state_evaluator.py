@@ -229,22 +229,25 @@ class AgentStateEvaluator:
 
     def _check_task2_project_analyzer_requirement(self, steps: List[Any]) -> AgentStateAnalysis:
         """
-        Check if agent is working on task_2 but hasn't used project_analyzer tool.
-        Task_2 is critical for static test counting and must use project_analyzer.
+        Check if agent is working on task_2 but hasn't run the project analysis.
+        Task_2 is critical for static test counting and must use project(action='analyze').
         """
         # Check if current task is task_2
         if self.context_manager.current_task_id != "task_2":
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
-        # Check if project_analyzer has been used in this task
+        # Check if the analysis has been run in this task — either the legacy
+        # project_analyzer name or the consolidated project facade with
+        # action='analyze'.
         project_analyzer_used = False
         for step in steps[-20:]:  # Check last 20 steps
-            if (
-                hasattr(step, "tool_name")
-                and step.tool_name == "project_analyzer"
-                and hasattr(step, "tool_result")
-                and step.tool_result.success
-            ):
+            if not (hasattr(step, "tool_name") and hasattr(step, "tool_result")):
+                continue
+            is_analyzer_step = step.tool_name == "project_analyzer" or (
+                step.tool_name == "project"
+                and (getattr(step, "tool_params", None) or {}).get("action") == "analyze"
+            )
+            if is_analyzer_step and step.tool_result.success:
                 project_analyzer_used = True
                 break
 
@@ -263,14 +266,14 @@ class AgentStateEvaluator:
                     status=AgentStatus.STUCK,
                     needs_guidance=True,
                     guidance_message=(
-                        "⚠️ CRITICAL: USE PROJECT_ANALYZER TOOL FOR TASK_2!\n\n"
+                        "⚠️ CRITICAL: USE project(action='analyze') FOR TASK_2!\n\n"
                         "You are attempting to manually analyze the project structure.\n"
-                        "Task_2 REQUIRES using the project_analyzer tool to:\n"
+                        "Task_2 REQUIRES the project tool's analyze action to:\n"
                         "• Analyze project structure comprehensively\n"
                         "• Count static test cases (Java @Test annotations)\n"
                         "• Store static test count in trunk context\n"
                         "• Generate intelligent execution plan\n\n"
-                        "IMMEDIATELY use: project_analyzer(action='analyze', project_path='/workspace/<project>')\n\n"
+                        "IMMEDIATELY use: project(action='analyze', project_path='/workspace/<project>')\n\n"
                         "DO NOT manually read pom.xml or analyze files - the tool does this automatically!"
                     ),
                     guidance_priority=10,  # Highest priority

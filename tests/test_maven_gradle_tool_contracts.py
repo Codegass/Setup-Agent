@@ -802,7 +802,7 @@ def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidan
         "version": "3.8.7",
         "source": "system",
     }
-    assert any("env register" in suggestion for suggestion in result.suggestions)
+    assert any("project(action='env'" in suggestion for suggestion in result.suggestions)
     assert any("bash" in suggestion and "download" in suggestion for suggestion in result.suggestions)
 
 

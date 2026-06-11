@@ -545,7 +545,7 @@ class ReactLLMClient:
                 return "maven", json_obj
             return "bash", json_obj
         elif "query" in json_obj:
-            return "web_search", json_obj
+            return "search", {"target": f"web:{json_obj.get('query', '')}"}
 
         return None, {}
 

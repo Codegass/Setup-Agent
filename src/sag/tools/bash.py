@@ -606,9 +606,9 @@ class BashTool(BaseTool):
                             logger.info(
                                 f"🔧 Prepended cd to project root for build tool: {candidate}"
                             )
-                # Add gentle guidance to prefer dedicated build tools for Maven/Gradle
+                # Add gentle guidance to prefer the dedicated build tool for Maven/Gradle
                 logger.info(
-                    "⚠️ Consider using the maven tool for richer diagnostics, auto fail-at-end, and structured test data."
+                    "⚠️ Consider using the build tool for richer diagnostics, auto fail-at-end, and structured test data."
                 )
             except Exception as _e:
                 logger.debug(f"Bash build-tool workdir fallback skipped: {_e}")

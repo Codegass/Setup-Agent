@@ -265,7 +265,7 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             return ""
         return (
             f"Repository ref: {repository_ref}\n"
-            f'When cloning, call project_setup with ref="{repository_ref}". '
+            f'When cloning, call project(action="clone") with ref="{repository_ref}". '
             "Do not continue on the default branch if checkout fails."
         )
 

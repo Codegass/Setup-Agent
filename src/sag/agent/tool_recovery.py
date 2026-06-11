@@ -228,9 +228,9 @@ class ToolRecoveryHandler:
             "MAVEN VERSION REQUIREMENT: The current Maven runtime does not satisfy "
             f"{raw_requirement}. Current executable: {executable}; version: {version}. "
             "Do not retry the same Maven executable. Use bash to download or unpack a "
-            "compatible Maven distribution, then use env register/activate for its bin/mvn, "
-            f"and retry maven(command='{command}', "
-            f"maven_version_requirement='{raw_requirement}')."
+            "compatible Maven distribution, then register its bin/mvn via "
+            "project(action='env', tool='maven', executable=...), "
+            f"and retry build(action='{command}')."
         )
 
         self.add_system_guidance(guidance, priority="high")
@@ -547,13 +547,13 @@ class ToolRecoveryHandler:
         if "mvn" in command or "maven" in command:
             timeout_guidance = [
                 "Maven command timed out - this is common for large projects",
-                "Consider breaking down into smaller steps: mvn compile, then mvn test",
-                "Use maven tool instead of bash for better timeout handling",
-                "For multi-module projects, use fail_at_end=True to continue despite module failures",
+                "Consider breaking down into smaller steps: build(action='compile'), then build(action='test')",
+                "Use the build tool instead of bash for better timeout handling",
+                "For multi-module projects, build(action='test') continues past module failures (fail-at-end automatic)",
             ]
         elif "gradle" in command:
             timeout_guidance = [
-                "Gradle command timed out - use gradle tool for better timeout handling",
+                "Gradle command timed out - use the build tool for better timeout handling",
                 "Consider breaking down into smaller tasks",
                 "Try with --parallel flag for faster execution",
             ]

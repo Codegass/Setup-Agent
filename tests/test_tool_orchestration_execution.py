@@ -41,12 +41,15 @@ def test_format_tool_result_surfaces_maven_version_contract():
     )
 
     formatted = format_tool_result("maven", result)
+    formatted_for_build = format_tool_result("build", result)
 
     assert "Maven version requirement: [3.9,) (source: build_error)" in formatted
     assert "Current Maven executable: /usr/bin/mvn" in formatted
     assert "Current Maven version: 3.6.3" in formatted
     assert "Compatible Maven candidate: none" in formatted
-    assert 'retry maven(..., maven_version_requirement="[3.9,)")' in formatted
+    assert "via project(action='env'), then retry the build" in formatted
+    # The consolidated build facade surfaces the same contract.
+    assert "Maven version requirement: [3.9,) (source: build_error)" in formatted_for_build
 
 
 def test_orchestrator_executes_successful_tool_and_emits_events():

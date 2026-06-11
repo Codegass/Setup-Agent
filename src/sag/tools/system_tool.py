@@ -94,7 +94,7 @@ class SystemTool(BaseTool):
                         error_code="MISSING_VERSION",
                         suggestions=[
                             "Provide Java version to install (e.g., '17', '21')",
-                            "Example: system(action='install_java', java_version='17')",
+                            "Example: project(action='provision', java_version='17')",
                         ],
                         retryable=True,
                     )
@@ -125,7 +125,7 @@ class SystemTool(BaseTool):
                             error=f"Java version mismatch",
                             error_code="JAVA_VERSION_MISMATCH",
                             suggestions=[
-                                f"Install Java {java_version}: system(action='install_java', java_version='{java_version}')",
+                                f"Install Java {java_version}: project(action='provision', java_version='{java_version}')",
                                 f"Current version is {verification['current_version']}",
                             ],
                             metadata=verification,
@@ -137,7 +137,7 @@ class SystemTool(BaseTool):
                             error="Java not found",
                             error_code="JAVA_NOT_INSTALLED",
                             suggestions=[
-                                f"Install Java {java_version}: system(action='install_java', java_version='{java_version}')"
+                                f"Install Java {java_version}: project(action='provision', java_version='{java_version}')"
                             ],
                             metadata=verification,
                         )

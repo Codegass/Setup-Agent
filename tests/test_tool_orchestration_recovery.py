@@ -785,7 +785,7 @@ def test_maven_version_error_returns_env_overlay_guidance_without_retry():
     assert len(guidance) == 1
     assert guidance[0][1] == "high"
     assert "MAVEN VERSION REQUIREMENT" in guidance[0][0]
-    assert "env register" in guidance[0][0]
+    assert "project(action='env'" in guidance[0][0]
 
 
 def test_maven_timeout_returns_guidance_without_retry():
