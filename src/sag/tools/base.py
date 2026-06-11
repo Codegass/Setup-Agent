@@ -442,7 +442,12 @@ class BaseTool(ABC):
                 retryable=True,
             )
 
-        # Check for unexpected parameters
+        # Check for unexpected parameters — unless the schema explicitly allows
+        # pass-through parameters (facades forward **kwargs to delegates whose
+        # full vocabularies are wider than the documented surface).
+        if self._parameter_schema.get("additionalProperties"):
+            return
+
         expected_params = set(self._parameter_schema.get("properties", {}).keys())
         unexpected_params = provided_params - expected_params
         if unexpected_params:

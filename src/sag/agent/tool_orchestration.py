@@ -744,8 +744,12 @@ class ToolOrchestrator:
 
     @staticmethod
     def _is_dispatch_poll_signature(signature: str) -> bool:
-        """Whether a tool signature polls a detached dispatch job's log/exit file."""
-        return "/tmp/sag_jobs/" in signature
+        """Whether a tool signature polls a detached dispatch job's log/exit file.
+
+        Covers both prescribed polling forms: bash tail/cat on the
+        /tmp/sag_jobs/<id> files and search(target='job:<id>').
+        """
+        return "/tmp/sag_jobs/" in signature or "'target', 'job:" in signature
 
     def _recent_signature(self, execution: dict[str, Any] | ToolExecutionRecord) -> str:
         if isinstance(execution, ToolExecutionRecord):
@@ -871,14 +875,11 @@ class ToolOrchestrator:
             suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
             suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
 
-        elif tool_name == "system":
-            if params.get("action") == "install_java":
-                suggestions.append(
-                    "Java might already be installed - verify with: bash(command='java -version')"
-                )
-                suggestions.append(
-                    "Check available Java versions: bash(command='ls /usr/lib/jvm/')"
-                )
+        elif tool_name == "project" and params.get("action") == "provision":
+            suggestions.append(
+                "Java might already be installed - verify with: bash(command='java -version')"
+            )
+            suggestions.append("Check available Java versions: bash(command='ls /usr/lib/jvm/')")
 
         return "\n• ".join(suggestions) if suggestions else "Try a different tool or approach"
 
@@ -888,8 +889,18 @@ class ToolOrchestrator:
         validated_params: Dict[str, Any],
         recent_executions: list[dict[str, Any] | ToolExecutionRecord],
     ) -> bool:
-        action = str(validated_params.get("action", "")).lower()
-        if tool_name == "system" and action in {"install_java", "verify_java"}:
+        def _is_java_install_call(name: str, call_params: Dict[str, Any]) -> bool:
+            call_action = str(call_params.get("action", "")).lower()
+            if name == "system" and call_action in {"install_java", "verify_java"}:
+                return True
+            # Stage-1 surface: JDK installs go through project(action='provision').
+            return (
+                name == "project"
+                and call_action == "provision"
+                and bool(call_params.get("java_version"))
+            )
+
+        if _is_java_install_call(tool_name, validated_params):
             return True
 
         command_contexts = [str(validated_params.get("command", ""))]
@@ -897,10 +908,8 @@ class ToolOrchestrator:
             signature = self._recent_signature(execution)
             recent_tool_name, _, _ = signature.partition(":")
             recent_params = self._params_from_signature(signature)
-            if recent_tool_name == "system":
-                recent_action = str(recent_params.get("action", "")).lower()
-                if recent_action in {"install_java", "verify_java"}:
-                    return True
+            if _is_java_install_call(recent_tool_name, recent_params):
+                return True
             command_contexts.append(str(recent_params.get("command", "")))
 
         return any(self._has_java_alternatives_marker(context) for context in command_contexts)
@@ -996,12 +1005,21 @@ class ToolOrchestrator:
             return {"action": "install_java", "java_version": java_version}
         return {"action": "verify_java"}
 
+    def _system_delegate(self):
+        """SystemTool by retired direct name or via the project facade."""
+        tool = self.tools.get("system")
+        if tool is None:
+            project = self.tools.get("project")
+            tool = getattr(project, "system_tool", None) if project is not None else None
+        return tool
+
     def _auto_fix_java_configuration(self) -> ToolResult:
         """Automatically fix Java configuration issues."""
         self.logger.info("Attempting automatic Java configuration fix")
 
-        if "system" in self.tools:
-            self.tools["system"].safe_execute(action="verify_java")
+        system_tool = self._system_delegate()
+        if system_tool is not None:
+            system_tool.safe_execute(action="verify_java")
 
             current_context = ""
             if self.context_manager and hasattr(self.context_manager, "get_current_context"):
@@ -1014,7 +1032,7 @@ class ToolOrchestrator:
                 self.logger.info(
                     "Detected Java 17 requirement, using system tool for proper installation"
                 )
-                install_result = self.tools["system"].safe_execute(
+                install_result = system_tool.safe_execute(
                     action="install_java", java_version="17"
                 )
 

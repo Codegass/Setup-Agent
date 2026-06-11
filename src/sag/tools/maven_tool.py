@@ -46,6 +46,24 @@ class MavenTool(BaseTool):
             return self._extract_maven_key_info(output)
         return output
 
+    @staticmethod
+    def _suggested_build_action(command: str) -> str:
+        """Map a raw Maven command onto a valid build(action=...) verb.
+
+        Failure suggestions surface build(action='...') calls; interpolating
+        the raw command produces actions the build tool's enum rejects.
+        """
+        normalized = (command or "").strip().lower()
+        if normalized in ("deps", "compile", "test", "package"):
+            return normalized
+        if normalized.startswith("dependency:"):
+            return "deps"
+        if "test" in normalized:
+            return "test"
+        if any(phase in normalized for phase in ("install", "verify", "package", "deploy")):
+            return "package"
+        return "compile"
+
     def execute(
         self,
         command: str,
@@ -1584,6 +1602,7 @@ class MavenTool(BaseTool):
             )
 
         if analysis.get("failed_modules"):
+            suggested_action = self._suggested_build_action(command)
             for module_info in analysis["failed_modules"][:3]:
                 artifact_id = module_info.get("artifact_id")
                 pom_path = module_info.get("pom_path")
@@ -1591,25 +1610,26 @@ class MavenTool(BaseTool):
                 if artifact_id:
                     error_suggestions.append(
                         f"Temporarily exclude module '{artifact_id}' ({module_hint}) and rerun: "
-                        f"build(action='{command}', args='-pl !{artifact_id} -am')"
+                        f"build(action='{suggested_action}', args='-pl !{artifact_id} -am')"
                     )
                 elif pom_path:
                     module_name = Path(pom_path).parent.name
                     error_suggestions.append(
                         f"Temporarily exclude module '{module_name}' ({module_hint}) and rerun: "
-                        f"build(action='{command}', args='-pl !{module_name} -am')"
+                        f"build(action='{suggested_action}', args='-pl !{module_name} -am')"
                     )
             error_suggestions.append(
                 "Excluding the failing module lets the remaining reactor modules finish so you still capture their results."
             )
 
         if analysis.get("failed_tests"):
+            suggested_action = self._suggested_build_action(command)
             for failed_test in analysis["failed_tests"][:5]:
                 display_name = failed_test.split("(")[0].strip() or failed_test
                 display_name = display_name.split(":")[0].strip()
                 error_suggestions.append(
                     f"Skip failing test '{display_name}' on the next run: "
-                    f"build(action='{command}', args='-Dtest=!{display_name}')"
+                    f"build(action='{suggested_action}', args='-Dtest=!{display_name}')"
                 )
             error_suggestions.append(
                 "Combine multiple exclusions with commas inside the test property, e.g. args='-Dtest=!TestOne,!TestTwo'."

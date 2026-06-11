@@ -796,9 +796,16 @@ class ReActEngine(UIEventEmitter):
                     self.successful_states["working_directory"] = actual_working_dir
                     logger.debug(f"Updated successful working directory: {actual_working_dir}")
 
-            elif tool_name == "maven" and params.get("working_directory"):
-                # Remember successful Maven working directory
-                if "BUILD SUCCESS" in (result.output or ""):
+            elif tool_name in ("maven", "build") and params.get("working_directory"):
+                # Remember successful build working directory. The legacy maven
+                # tool needed the output marker; the consolidated build tool's
+                # success already reflects the backend verdict.
+                build_succeeded = (
+                    result.success
+                    if tool_name == "build"
+                    else "BUILD SUCCESS" in (result.output or "")
+                )
+                if build_succeeded:
                     # Get working_directory parameter (standardized across all tools)
                     maven_workdir = params.get("working_directory", "/workspace")
                     self.successful_states["working_directory"] = maven_workdir
@@ -813,15 +820,17 @@ class ReActEngine(UIEventEmitter):
 
                     logger.info(f"Maven success recorded for directory: {maven_workdir}")
 
-            elif tool_name == "project_setup":
-                # Remember cloned repositories and project type
-                if params.get("repository_url"):
-                    self.successful_states["cloned_repos"].add(params["repository_url"])
-                    logger.debug(f"Recorded cloned repo: {params['repository_url']}")
+            elif tool_name in ("project_setup", "project"):
+                # Remember cloned repositories and project type. The project
+                # facade documents repo_url; its delegate uses repository_url.
+                repo_url = params.get("repository_url") or params.get("repo_url")
+                if repo_url:
+                    self.successful_states["cloned_repos"].add(repo_url)
+                    logger.debug(f"Recorded cloned repo: {repo_url}")
 
                     # Set working directory based on cloned repository
                     if params.get("action") == "clone":
-                        repo_name = params["repository_url"].split("/")[-1].replace(".git", "")
+                        repo_name = repo_url.split("/")[-1].replace(".git", "")
 
                         # PRIORITY: Always try to clone in /workspace first
                         if self.successful_states.get("workspace_fallback"):

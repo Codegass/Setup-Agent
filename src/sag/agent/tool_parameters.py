@@ -11,6 +11,51 @@ from loguru import logger as default_logger
 from sag.agent.tool_orchestration import ParameterFix, ParameterFixSource
 from sag.tools.base import BaseTool
 
+# Common Maven invocations (incl. compound phases the old MavenTool accepted)
+# mapped onto the consolidated build verbs.
+_MAVEN_COMMAND_TO_BUILD_ACTION = {
+    "deps": "deps",
+    "dependency:resolve": "deps",
+    "compile": "compile",
+    "clean compile": "compile",
+    "test": "test",
+    "clean test": "test",
+    "package": "package",
+    "clean package": "package",
+    "install": "package",
+    "clean install": "package",
+    "verify": "package",
+    "clean verify": "package",
+}
+
+
+def _map_legacy_maven_params(p: Dict[str, Any]) -> Dict[str, Any]:
+    """maven(command=...) -> build(action=...).
+
+    Mirrors the gradle alias: known lifecycle phases map onto the build verbs;
+    anything else falls back to compile with the raw command as args.
+    Properties ride along as args so they are not silently dropped.
+    """
+    command = str(p.get("command") or "compile").strip()
+    action = _MAVEN_COMMAND_TO_BUILD_ACTION.get(command.lower())
+    arg_parts = []
+    if action is None:
+        action = "compile"
+        arg_parts.append(command)
+    if p.get("extra_args"):
+        arg_parts.append(str(p["extra_args"]))
+    properties = p.get("properties")
+    if properties:
+        if isinstance(properties, (list, tuple)):
+            arg_parts.extend(str(prop) for prop in properties if prop)
+        else:
+            arg_parts.append(str(properties))
+    return {
+        "action": action,
+        "args": " ".join(arg_parts) or None,
+        "working_directory": p.get("working_directory", "/workspace"),
+    }
+
 
 class ToolParameterNormalizer:
     """Normalize model-supplied tool parameters against tool schemas and runtime state."""
@@ -19,9 +64,7 @@ class ToolParameterNormalizer:
     # Each entry: legacy name -> (new tool name, params mapper). Applied only
     # when the legacy name is NOT registered, so direct registrations win.
     LEGACY_TOOL_ALIASES = {
-        "maven": ("build", lambda p: {"action": p.get("command", "compile"),
-                                      "args": p.get("extra_args"),
-                                      "working_directory": p.get("working_directory", "/workspace")}),
+        "maven": ("build", _map_legacy_maven_params),
         "gradle": ("build", lambda p: (
             {"action": p["tasks"], "working_directory": p.get("working_directory", "/workspace")}
             if p.get("tasks") in ("deps", "compile", "test", "package")
@@ -393,11 +436,11 @@ class ToolParameterNormalizer:
         tool_action_defaults = {
             "file_io": "read",
             "project_setup": "clone",
-            "system": "install_missing",
+            "project": "clone",
             "manage_context": "get_info",
             "maven": "compile",
+            "build": "compile",
             "bash": None,
-            "web_search": None,
         }
         return tool_action_defaults.get(tool_name, "list")
 
@@ -825,19 +868,6 @@ class ToolParameterNormalizer:
                         reason="Added default project_setup action",
                         source="default",
                     )
-        elif tool_name == "web_search":
-            if not fixed_params.get("query"):
-                before = fixed_params.get("query")
-                fixed_params["query"] = "help"
-                self._add_parameter_fix(
-                    fixes,
-                    field="query",
-                    before=before,
-                    after="help",
-                    reason="Added default web_search query",
-                    source="default",
-                )
-
         return fixed_params
 
     def _apply_tool_specific_fixes(
@@ -850,9 +880,15 @@ class ToolParameterNormalizer:
         fixes = parameter_fixes if parameter_fixes is not None else []
         fixed_params = params.copy()
 
-        if tool_name == "project_setup":
+        # The clone fixes apply to the stage-1 'project' facade (whose clone
+        # verb passes parameters through to ProjectSetupTool) and to a directly
+        # registered legacy 'project_setup' tool alike.
+        if tool_name in ("project_setup", "project"):
+            def _clone_url(params_dict: Dict[str, Any]) -> Optional[str]:
+                return params_dict.get("repository_url") or params_dict.get("repo_url")
+
             # Auto-inject repository URL if available and action is clone
-            if fixed_params.get("action") == "clone" and not fixed_params.get("repository_url"):
+            if fixed_params.get("action") == "clone" and not _clone_url(fixed_params):
                 if self.repository_url:
                     before = fixed_params.get("repository_url")
                     fixed_params["repository_url"] = self.repository_url
@@ -897,7 +933,7 @@ class ToolParameterNormalizer:
                     if not fixed_params.get("target_directory"):
                         # Extract project name from URL
                         repo_name = (
-                            fixed_params.get("repository_url", "")
+                            (_clone_url(fixed_params) or "")
                             .split("/")[-1]
                             .replace(".git", "")
                         )
@@ -965,22 +1001,24 @@ class ToolParameterNormalizer:
                         else:
                             self.logger.info(f"✅ Workspace subdirectory clone: {target_dir}")
 
-            # Prevent duplicate cloning
+            # Prevent duplicate cloning. The facade has no detect_project_type
+            # verb — its closest equivalent is analyze.
             cloned_repos = self.successful_states.get("cloned_repos", set())
             if (
                 fixed_params.get("action") == "clone"
-                and fixed_params.get("repository_url") in cloned_repos
+                and _clone_url(fixed_params) in cloned_repos
             ):
                 before = fixed_params.get("action")
+                fallback_action = "analyze" if tool_name == "project" else "detect_project_type"
                 self.logger.warning(
-                    "🔧 Repository already cloned, changing action to detect_project_type"
+                    f"🔧 Repository already cloned, changing action to {fallback_action}"
                 )
-                fixed_params["action"] = "detect_project_type"
+                fixed_params["action"] = fallback_action
                 self._add_parameter_fix(
                     fixes,
                     field="action",
                     before=before,
-                    after="detect_project_type",
+                    after=fallback_action,
                     reason="Avoided duplicate clone for already cloned repository",
                     source="safety_fix",
                 )
@@ -1054,6 +1092,42 @@ class ToolParameterNormalizer:
                 reason="Normalized Maven command alias",
                 source="safety_fix",
             )
+
+        elif tool_name == "build":
+            # The consolidated build tool defaults to /workspace, but clones
+            # land in /workspace/<repo> — inject the known-good or inferred
+            # directory exactly like the legacy maven path did.
+            if "working_directory" not in fixed_params:
+                if self.successful_states.get("working_directory"):
+                    before = fixed_params.get("working_directory")
+                    fixed_params["working_directory"] = self.successful_states["working_directory"]
+                    self._add_parameter_fix(
+                        fixes,
+                        field="working_directory",
+                        before=before,
+                        after=self.successful_states["working_directory"],
+                        reason="Injected working directory from successful state",
+                        source="state_injection",
+                    )
+                    self.logger.info(
+                        f"🔧 Auto-injected successful working directory: {self.successful_states['working_directory']}"
+                    )
+                elif self.repository_url:
+                    repo_name = self.repository_url.split("/")[-1].replace(".git", "")
+                    inferred_workdir = f"/workspace/{repo_name}"
+                    before = fixed_params.get("working_directory")
+                    fixed_params["working_directory"] = inferred_workdir
+                    self._add_parameter_fix(
+                        fixes,
+                        field="working_directory",
+                        before=before,
+                        after=inferred_workdir,
+                        reason="Inferred working directory from repository URL",
+                        source="state_injection",
+                    )
+                    self.logger.info(
+                        f"🔧 Inferred working directory from repo: {inferred_workdir}"
+                    )
 
         elif tool_name == "bash":
             # Ensure bash has a command

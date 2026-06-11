@@ -1033,9 +1033,20 @@ class BashTool(BaseTool):
         scan_text = command.split("<<", 1)[0].lower()
         stripped = scan_text.strip()
 
-        # Version/usage probes finish in milliseconds regardless of the binary.
+        # Version/usage probes finish in milliseconds regardless of the binary —
+        # but only when the WHOLE command is a single short invocation. A probe
+        # flag inside a compound or piped command belongs to one segment only
+        # (`mvn --version && mvn clean install`, `mvn test | grep -v WARNING`)
+        # and must not exempt the long build from dispatch-and-poll.
         first_line_tokens = stripped.split()
-        if any(tok in ("-v", "--version", "-version", "-h", "--help") for tok in first_line_tokens):
+        if (
+            len(first_line_tokens) <= 3
+            and not any(sep in stripped for sep in ("&&", ";", "|"))
+            and any(
+                tok in ("-v", "--version", "-version", "-h", "--help")
+                for tok in first_line_tokens[1:]
+            )
+        ):
             return False
 
         tokens = first_line_tokens

@@ -10,6 +10,7 @@ from loguru import logger as default_logger
 
 from sag.agent.tool_orchestration import RecoveryDecision
 from sag.tools.base import BaseTool, ToolResult
+from sag.tools.build.backends import GradleBackend, MavenBackend
 
 
 class ToolRecoveryHandler:
@@ -46,10 +47,19 @@ class ToolRecoveryHandler:
                 return self._recover_context_management_error(params, failed_result)
             if tool_name == "project_setup":
                 return self._recover_project_setup_error(params, failed_result)
+            if tool_name == "project":
+                # Stage-1 surface: only the clone verb has a recovery strategy.
+                if str(params.get("action", "")).lower() == "clone":
+                    return self._recover_project_setup_error(
+                        self._project_clone_params(params), failed_result
+                    )
+                return self._recover_generic_error(tool_name, params, failed_result)
             if tool_name == "maven":
                 return self._recover_maven_error(params, failed_result)
             if tool_name == "gradle":
                 return self._recover_gradle_error(params, failed_result)
+            if tool_name == "build":
+                return self._recover_build_error(params, failed_result)
             if tool_name == "bash":
                 return self._recover_bash_error(params, failed_result)
             if tool_name == "file_io":
@@ -59,6 +69,94 @@ class ToolRecoveryHandler:
             message = f"Recovery mechanism failed: {exc}"
             self.logger.error(f"Tool recovery itself failed for {tool_name}: {exc}")
             return self._no_strategy("generic_no_strategy", message)
+
+    def _delegate_tool(self, name: str) -> Optional[BaseTool]:
+        """Resolve a backend/delegate tool by its legacy name.
+
+        Direct registrations win when present (tests, transitional setups);
+        otherwise the stage-1 facades' internals are used — the registry no
+        longer carries 'maven'/'gradle'/'project_setup'/'system'.
+        """
+        tool = self.tools.get(name)
+        if tool is not None:
+            return tool
+        if name in ("maven", "gradle"):
+            build = self.tools.get("build")
+            backend = getattr(build, "_backends", {}).get(name) if build is not None else None
+            return getattr(backend, f"{name}_tool", None)
+        project = self.tools.get("project")
+        if project is None:
+            return None
+        attribute = {
+            "project_setup": "setup_tool",
+            "project_analyzer": "analyzer_tool",
+            "system": "system_tool",
+            "env": "env_tool",
+        }.get(name)
+        return getattr(project, attribute, None) if attribute else None
+
+    def _project_clone_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """project(action='clone', repo_url=...) -> ProjectSetupTool vocabulary."""
+        translated = dict(params)
+        repo_url = translated.pop("repo_url", None)
+        if repo_url and not translated.get("repository_url"):
+            translated["repository_url"] = repo_url
+        translated.setdefault("action", "clone")
+        return translated
+
+    def _recover_build_error(
+        self, params: Dict[str, Any], failed_result: ToolResult
+    ) -> RecoveryDecision:
+        """Route consolidated build failures to the backend-specific strategies."""
+        system = (getattr(failed_result, "facts", None) or {}).get("system")
+        if system == "maven":
+            return self._recover_maven_error(
+                self._maven_params_from_build(params), failed_result
+            )
+        if system == "gradle":
+            return self._recover_gradle_error(
+                self._gradle_params_from_build(params), failed_result
+            )
+        return self._no_strategy("build_no_strategy", "No build recovery strategy applicable")
+
+    def _maven_params_from_build(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """build(action=...) -> MavenTool vocabulary (action -> command)."""
+        action = str(params.get("action", "")).strip().lower()
+        translated: Dict[str, Any] = {
+            "command": MavenBackend.VERBS.get(action, action or "compile")
+        }
+        if params.get("args"):
+            translated["extra_args"] = params["args"]
+        if params.get("working_directory"):
+            translated["working_directory"] = params["working_directory"]
+        if params.get("timeout"):
+            translated["timeout"] = params["timeout"]
+        return translated
+
+    @staticmethod
+    def _build_action_for_maven_command(command: str) -> str:
+        """Map a Maven command back onto a valid build(action=...) for guidance."""
+        normalized = str(command or "").strip().lower()
+        reverse = {maven_cmd: verb for verb, maven_cmd in MavenBackend.VERBS.items()}
+        if normalized in reverse:
+            return reverse[normalized]
+        if normalized in ("deps", "compile", "test", "package"):
+            return normalized
+        return "compile"
+
+    def _gradle_params_from_build(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """build(action=...) -> GradleTool vocabulary (action -> tasks)."""
+        action = str(params.get("action", "")).strip().lower()
+        translated: Dict[str, Any] = {
+            "tasks": GradleBackend.VERBS.get(action, action or "compileJava")
+        }
+        if params.get("args"):
+            translated["gradle_args"] = params["args"]
+        if params.get("working_directory"):
+            translated["working_directory"] = params["working_directory"]
+        if params.get("timeout"):
+            translated["timeout"] = params["timeout"]
+        return translated
 
     def _recover_context_management_error(
         self, params: Dict[str, Any], failed_result: ToolResult
@@ -129,12 +227,18 @@ class ToolRecoveryHandler:
     ) -> RecoveryDecision:
         action = params.get("action", "")
 
-        if action == "clone" and not params.get("repository_url") and self.repository_url:
+        setup_tool = self._delegate_tool("project_setup")
+        if (
+            action == "clone"
+            and not params.get("repository_url")
+            and self.repository_url
+            and setup_tool is not None
+        ):
             recovery_params = dict(params)
             recovery_params["repository_url"] = self.repository_url
             if self.repository_ref and not recovery_params.get("ref"):
                 recovery_params["ref"] = self.repository_ref
-            result = self.tools["project_setup"].safe_execute(**recovery_params)
+            result = setup_tool.safe_execute(**recovery_params)
             return self._attempted(
                 strategy="project_setup_repository_url",
                 message=(
@@ -177,12 +281,16 @@ class ToolRecoveryHandler:
             if decision.should_recover:
                 return decision
 
+        maven_tool = self._delegate_tool("maven")
+        if maven_tool is None:
+            return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
+
         if self._is_maven_working_directory_error(error_code, error_msg, analysis):
             if self.successful_states.get("working_directory"):
                 recovery_params = dict(params)
                 recovery_params["working_directory"] = self.successful_states["working_directory"]
 
-                result = self.tools["maven"].safe_execute(**recovery_params)
+                result = maven_tool.safe_execute(**recovery_params)
                 return self._attempted(
                     strategy="maven_known_working_directory",
                     message=(
@@ -198,7 +306,7 @@ class ToolRecoveryHandler:
             recovery_params = dict(params)
             recovery_params["command"] = "compile"
 
-            result = self.tools["maven"].safe_execute(**recovery_params)
+            result = maven_tool.safe_execute(**recovery_params)
             return self._attempted(
                 strategy="maven_compile_before_test",
                 message="Recovered by trying compile before test",
@@ -223,7 +331,7 @@ class ToolRecoveryHandler:
         runtime = (failed_result.metadata or {}).get("maven_runtime", {})
         executable = runtime.get("executable", "the current Maven executable")
         version = runtime.get("version", "unknown")
-        command = params.get("command", "compile")
+        command = self._build_action_for_maven_command(params.get("command", "compile"))
         guidance = (
             "MAVEN VERSION REQUIREMENT: The current Maven runtime does not satisfy "
             f"{raw_requirement}. Current executable: {executable}; version: {version}. "
@@ -259,15 +367,17 @@ class ToolRecoveryHandler:
             f"{required_version} (current: {current_version})"
         )
 
-        if "system" not in self.tools:
+        system_tool = self._delegate_tool("system")
+        maven_tool = self._delegate_tool("maven")
+        if system_tool is None or maven_tool is None:
             self.logger.warning("System tool not available for Java installation")
             return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
-        verify_result = self.tools["system"].safe_execute(
+        verify_result = system_tool.safe_execute(
             action="verify_java", java_version=required_version
         )
         if verify_result.success:
-            result = self.tools["maven"].safe_execute(**params)
+            result = maven_tool.safe_execute(**params)
             return self._attempted(
                 strategy="maven_java_version",
                 message=(
@@ -281,10 +391,10 @@ class ToolRecoveryHandler:
             "action": "install_java",
             "java_version": required_version,
         }
-        install_result = self.tools["system"].safe_execute(**install_params)
+        install_result = system_tool.safe_execute(**install_params)
 
         if install_result.success:
-            result = self.tools["maven"].safe_execute(**params)
+            result = maven_tool.safe_execute(**params)
             return self._attempted(
                 strategy="maven_java_version",
                 message=(f"Recovered by installing Java {required_version} and retrying"),
@@ -330,11 +440,12 @@ class ToolRecoveryHandler:
             if not target_pom and pom_candidates:
                 target_pom = pom_candidates[0]
 
-            if target_pom:
+            maven_tool = self._delegate_tool("maven")
+            if target_pom and maven_tool is not None:
                 recovery_params = dict(params)
                 recovery_params["pom_file"] = target_pom
                 recovery_params["working_directory"] = os.path.dirname(target_pom)
-                result = self.tools["maven"].safe_execute(**recovery_params)
+                result = maven_tool.safe_execute(**recovery_params)
                 return self._attempted(
                     strategy="maven_pom_discovery",
                     message=f"Recovered by targeting detected pom: {target_pom}",
@@ -397,8 +508,9 @@ class ToolRecoveryHandler:
                 recovery_params["properties"] = props
                 new_exclusions = True
 
-        if new_exclusions:
-            result = self.tools["maven"].safe_execute(**recovery_params)
+        maven_tool = self._delegate_tool("maven")
+        if new_exclusions and maven_tool is not None:
+            result = maven_tool.safe_execute(**recovery_params)
             return self._attempted(
                 strategy="maven_exclude_modules_or_tests",
                 message=("Recovered by excluding failing modules/tests and rerunning Maven"),
@@ -468,11 +580,15 @@ class ToolRecoveryHandler:
         if error_code.startswith("TIMEOUT_"):
             return self._gradle_timeout_guidance(params, failed_result)
 
+        gradle_tool = self._delegate_tool("gradle")
+        if gradle_tool is None:
+            return self._no_strategy("gradle_no_strategy", "No Gradle recovery strategy applicable")
+
         if self._is_gradle_working_directory_error(error_code, error_msg):
             if self.successful_states.get("working_directory"):
                 recovery_params = dict(params)
                 recovery_params["working_directory"] = self.successful_states["working_directory"]
-                result = self.tools["gradle"].safe_execute(**recovery_params)
+                result = gradle_tool.safe_execute(**recovery_params)
                 return self._attempted(
                     strategy="gradle_known_working_directory",
                     message=(
@@ -489,7 +605,7 @@ class ToolRecoveryHandler:
             recovery_params.pop("task", None)
             recovery_params.pop("command", None)
             recovery_params["tasks"] = "compileJava"
-            result = self.tools["gradle"].safe_execute(**recovery_params)
+            result = gradle_tool.safe_execute(**recovery_params)
             return self._attempted(
                 strategy="gradle_compile_before_test",
                 message="Recovered by trying compileJava before test",

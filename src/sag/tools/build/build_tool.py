@@ -39,6 +39,19 @@ class BuildTool(BaseTool):
             )
 
         system, checked = self._detect_system(working_directory)
+        if system is None and working_directory in (None, "", "/workspace"):
+            # Standard layout: clone creates /workspace/<repo>. The legacy
+            # MavenTool probed the project subdirectory before giving up; the
+            # facade must too, or build(action=...) without working_directory
+            # always returns verdict=unknown.
+            project_name = getattr(self.docker_orchestrator, "project_name", None)
+            if project_name:
+                candidate = f"/workspace/{project_name}"
+                fallback_system, fallback_checked = self._detect_system(candidate)
+                checked = checked + [f"{candidate}/{marker}" for marker in fallback_checked]
+                if fallback_system is not None:
+                    system = fallback_system
+                    working_directory = candidate
         if system is None:
             return ToolResult(
                 success=False,

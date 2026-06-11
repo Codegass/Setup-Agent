@@ -23,6 +23,11 @@ class ProjectTool(BaseTool):
         self.analyzer_tool = analyzer_tool
         self.system_tool = system_tool
         self.env_tool = env_tool
+        # BaseTool auto-derives the validation schema from execute(action,
+        # **kwargs), which hides every delegated parameter and makes
+        # safe_execute reject repo_url/java_version/... as UNEXPECTED_PARAMETERS.
+        # Validate against the documented facade schema instead.
+        self._parameter_schema = self._get_parameters_schema()
 
     def execute(self, action: str, **kwargs) -> ToolResult:
         verb = (action or "").strip().lower()
@@ -85,4 +90,8 @@ class ProjectTool(BaseTool):
                 "env": {"type": "object", "description": "env: variables to set"},
             },
             "required": ["action"],
+            # The delegates accept more than the documented surface
+            # (target_directory, update_context, version, activate,
+            # path_prepend, ...); pass everything through to them.
+            "additionalProperties": True,
         }

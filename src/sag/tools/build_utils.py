@@ -24,13 +24,18 @@ def detached_handoff_tool_result(
     poll the log tail and detect completion.
     """
     dispatch = result.get("dispatch") or {}
+    job_id = dispatch.get("job_id")
     return ToolResult(
         success=True,
         output=result.get("output", ""),
+        # The prompt promises a job log ref for detached builds; attach it so
+        # search(target='job:<id>') has something real to poll.
+        refs=[f"job:{job_id}"] if job_id else [],
         metadata={
             "dispatch_status": "running_detached",
             "tool": tool_name,
             "command": command,
+            "job_id": job_id,
             "pid": dispatch.get("pid"),
             "log_path": dispatch.get("log_path"),
             "exit_code_path": dispatch.get("exit_code_path"),
