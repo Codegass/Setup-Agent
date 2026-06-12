@@ -30,6 +30,10 @@ from sag.web.models import (
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
 _EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
+# Where ContextJournal writes (sag.agent.context_journal.JOURNAL_DIR) — mirrored
+# here so the web layer never imports the agent stack.
+_JOURNAL_DIR = "/workspace/.setup_agent/contexts/journal"
+_PHASE_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class SessionRegistry:
@@ -96,6 +100,51 @@ class ContainerSessionRegistry:
 
         context = _read_context_map(orchestrator)
         return _session_detail(item, workspace.id, context)
+
+    def list_workspace_phases(self, workspace_id: str) -> list[dict[str, Any]] | None:
+        """Phase history from the trunk's phase_* tasks (spec §8.3).
+
+        Returns None when absent — no reachable trunk, or a legacy run whose
+        trunk has no phase tasks — so the endpoint can 404 cleanly.
+        """
+        try:
+            orchestrator = self._orchestrator(workspace_id)
+        except Exception:
+            logger.debug("No orchestrator for workspace {}", workspace_id)
+            return None
+
+        trunk = _read_latest_trunk(orchestrator)
+        if trunk is None:
+            return None
+
+        _, trunk_data = trunk
+        phases = [
+            {
+                "name": _text(task.get("id"), default="").removeprefix("phase_"),
+                "status": _text(task.get("status"), default="unknown"),
+                "notes": _text(task.get("notes"), default=""),
+                "key_results": _text(task.get("key_results"), default=""),
+            }
+            for task in _raw_task_dicts(trunk_data)
+            if _text(task.get("id"), default="").startswith("phase_")
+        ]
+        return phases or None
+
+    def get_phase_journal(self, workspace_id: str, phase: str) -> list[dict[str, Any]] | None:
+        """Parsed context-journal records for one phase; None when absent."""
+        if not _PHASE_NAME_RE.fullmatch(phase or ""):
+            return None
+
+        try:
+            orchestrator = self._orchestrator(workspace_id)
+        except Exception:
+            logger.debug("No orchestrator for workspace {}", workspace_id)
+            return None
+
+        raw = _read_container_file(orchestrator, f"{_JOURNAL_DIR}/phase_{phase}.journal.jsonl")
+        if raw is None:
+            return None
+        return _parse_journal_lines(raw)
 
     def _orchestrator(self, workspace_id: str) -> Any:
         if self.orchestrator_factory is not None:
@@ -545,7 +594,7 @@ def _read_latest_trunk(orchestrator: Any) -> tuple[str, dict[str, Any]] | None:
 def _context_filenames(orchestrator: Any) -> list[str]:
     command = (
         "find /workspace/.setup_agent/contexts -maxdepth 1 -type f "
-        "\\( -name 'trunk*.json' -o -name 'task_*.json' \\) "
+        "\\( -name 'trunk*.json' -o -name 'task_*.json' -o -name 'phase_*.json' \\) "
         "-printf '%f\\n' 2>/dev/null || true"
     )
     try:
@@ -1309,7 +1358,7 @@ def _find_session_item(raw: str, session_id: str) -> dict[str, Any] | None:
 def _read_context_map(orchestrator: Any) -> ContextMap | None:
     command = (
         "find /workspace/.setup_agent/contexts -maxdepth 1 -type f "
-        "\\( -name 'trunk*.json' -o -name 'task_*.json' \\) "
+        "\\( -name 'trunk*.json' -o -name 'task_*.json' -o -name 'phase_*.json' \\) "
         "-printf '%f\\n' 2>/dev/null || true"
     )
     try:
@@ -1347,11 +1396,36 @@ def _read_context_map(orchestrator: Any) -> ContextMap | None:
         return ContextMapBuilder(contexts_dir).build()
 
 
+def _parse_journal_lines(raw: str) -> list[dict[str, Any]]:
+    """jsonl → list of records; torn/corrupt appends are skipped, not fatal."""
+    records: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _is_context_filename(filename: str) -> bool:
+    """Context artifacts the dashboard may read: trunk snapshots plus the
+    task_*/phase_* branch histories (phase histories persist exactly like
+    task histories — spec §8.3)."""
+    if not filename.endswith(".json"):
+        return False
+    return filename.startswith(("trunk", "task_", "phase_"))
+
+
 def _safe_context_filename(value: str) -> str | None:
     filename = value.strip()
-    if not filename or "/" in filename or not filename.endswith(".json"):
+    if not filename or "/" in filename:
         return None
-    if not (filename.startswith("trunk") or filename.startswith("task_")):
+    if not _is_context_filename(filename):
         return None
     return filename
 
