@@ -97,6 +97,26 @@ def test_no_machine_means_no_phase_behavior():
     assert engine._enforce_phase_floors() is False
 
 
+def test_phase_transition_resets_journal_ledger_memory():
+    """The window reset restarts the ledger; the journal's text-dedupe memory
+    must reset alongside _journal_intro_dirty or the next phase's first ledger
+    could be wrongly suppressed (round-6 review)."""
+    engine = _engine_with_machine()
+    engine._journal_last_ledger = "ATTEMPT LEDGER (older work, compacted):\n✗ x"
+    step = SimpleNamespace(
+        step_type=SimpleNamespace(value="action"), tool_name="phase",
+        tool_result=SimpleNamespace(
+            success=True,
+            metadata={"phase_signal": "done", "key_results": "ok", "evidence": []},
+        ),
+    )
+
+    engine._handle_phase_signals([step])
+
+    assert engine._journal_last_ledger is None
+    assert engine._journal_intro_dirty is True
+
+
 def test_phase_transition_resets_context_switch_counter():
     """No manage_context actions exist in phase mode, so the legacy reset
     never fires; phase transitions are the context switches now."""

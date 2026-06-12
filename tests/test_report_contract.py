@@ -781,6 +781,120 @@ def test_report_result_header_matches_kernel_verdict():
     assert "PARTIAL" in result_lines[0].upper()
 
 
+class PhaseTrunkContextManager:
+    """Context manager whose trunk mirrors a phase-mode run: one phase_<name>
+    task per phase, FAILED where the machine recorded a block."""
+
+    def __init__(self, blocked=()):
+        tasks = [
+            Task(
+                id=f"phase_{name}",
+                description=f"Phase: {name}",
+                status=TaskStatus.FAILED if name in set(blocked) else TaskStatus.COMPLETED,
+            )
+            for name in ("provision", "analyze", "build", "test", "report")
+        ]
+        self.trunk = TrunkContext(
+            context_id="trunk_phase",
+            goal="Set up demo",
+            project_url="https://example.test/demo.git",
+            project_name="demo",
+            todo_list=tasks,
+        )
+
+    def load_trunk_context(self):
+        return self.trunk
+
+
+def _all_green_kernel_snapshot():
+    return {
+        "status": {"overall": "success", "tests_total": 100, "tests_passed": 100,
+                   "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0,
+                   "pass_pct": 100.0},
+        "evidence_result": {"status": "success", "conflicts": [],
+                            "test_stats": None, "evidence_refs": ["output_x"]},
+    }
+
+
+def test_report_result_header_caps_on_blocked_trunk_phase():
+    """The header's kernel call must consume the phase-machine outcome too —
+    a machine-capped run (blocked phase_* trunk task) with green physical
+    evidence rendered '**Result:** ✅ SUCCESS' while the CLI banner said
+    verdict=partial/failed (round-6 review)."""
+    tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"test"}))
+
+    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "partial"
+
+    lines = tool._render_enhanced_header(
+        "2026-06-12 12:00:00", "success",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+        snapshot=_all_green_kernel_snapshot(),
+    )
+    result_lines = [l for l in lines if l.startswith("**Result:**")]
+    assert result_lines and "PARTIAL" in result_lines[0].upper(), result_lines
+
+
+def test_report_result_header_blocked_build_phase_is_failed():
+    tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
+
+    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "failed"
+
+
+def test_report_kernel_verdict_abstains_without_phase_tasks():
+    """Non-phase runs (sag run --task, legacy) have no phase_* trunk tasks:
+    the machine input abstains and physical evidence still rules."""
+    tool = ReportTool(context_manager=FakeReportContextManager())
+
+    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
+
+
+def test_condensed_log_output_matches_kernel_verdict():
+    """Contract mirror of test_report_result_header_matches_kernel_verdict for
+    the condensed log output (round-6 review): the SAME snapshot printed
+    '🎯 SETUP COMPLETED: ✅ SUCCESS' and 'Project ready for development...🎉'
+    while the report header said '**Result:** ⚠️ PARTIAL'. Banner and Next
+    line must read the kernel verdict, never overall/verified_status."""
+    tool = ReportTool()
+    snapshot = {
+        "status": {"overall": "success", "tests_total": 2913, "tests_passed": 2893,
+                   "tests_failed": 15, "tests_errors": 0, "tests_skipped": 5,
+                   "pass_pct": 99.3},
+        "project": {"type": "Gradle Java Project", "build_system": "Gradle"},
+        "phases": {"clone": True, "build": True, "test": True},
+        "evidence_result": {"status": "success", "conflicts": ["test_report_parse_error"],
+                            "test_stats": None, "evidence_refs": []},
+    }
+
+    output = tool._generate_condensed_log_output(
+        "success", "setup-report-test.md", {"build_success": True}, snapshot
+    )
+
+    banner = output.splitlines()[0]
+    assert "PARTIAL" in banner.upper(), banner
+    assert "✅ SUCCESS" not in banner, banner
+    assert "ready for development" not in output, "Next line must not announce 🎉 on partial"
+
+
+def test_condensed_log_output_kernel_success_keeps_celebration():
+    tool = ReportTool()
+    snapshot = {
+        "status": {"overall": "success", "tests_total": 100, "tests_passed": 100,
+                   "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0,
+                   "pass_pct": 100.0},
+        "project": {"type": "Maven Java Project", "build_system": "Maven"},
+        "phases": {"clone": True, "build": True, "test": True},
+        "evidence_result": {"status": "success", "conflicts": [],
+                            "test_stats": None, "evidence_refs": []},
+    }
+
+    output = tool._generate_condensed_log_output(
+        "success", "setup-report-test.md", {"build_success": True}, snapshot
+    )
+
+    assert "✅ SUCCESS" in output.splitlines()[0]
+    assert "ready for development" in output
+
+
 def test_report_header_falls_back_to_evidence_stats_without_snapshot_stats():
     tool = ReportTool()
     snapshot = {

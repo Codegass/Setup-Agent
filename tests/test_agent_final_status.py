@@ -157,6 +157,9 @@ def test_verified_final_status_accepts_partial_pass_above_threshold():
                 "skipped_tests": 9,
                 "test_exclusions": [],
                 "modules_without_tests": [],
+                # The real validator restates counted failures as conflicts;
+                # they must not demote a threshold pass (round-6 review).
+                "conflicts": ["test_failures_detected"],
             },
             analysis_status={
                 "analyzed": True,
@@ -517,6 +520,11 @@ def test_build_green_missing_expected_tests_is_partial_and_false():
 
 
 def test_threshold_pass_is_full_success_verdict():
+    # The real validator ALWAYS emits restated-failure conflicts when
+    # failed_tests > 0 (physical_validator.validate_test_status); omitting the
+    # key here let the suite mask a production demotion to 'partial'
+    # (round-6 review: conflicts double-adjudicated the counted failures the
+    # threshold policy already accepted).
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status={"success": True, "reason": "Build fingerprints found"},
@@ -532,6 +540,7 @@ def test_threshold_pass_is_full_success_verdict():
                 "skipped_tests": 5,
                 "test_exclusions": [],
                 "modules_without_tests": [],
+                "conflicts": ["test_failures_detected"],
             },
         )
     )

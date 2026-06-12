@@ -8,13 +8,14 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
+from sag.agent.phase_machine import CRITICAL_PHASE
 from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.ui.events import EventType, UIEventEmitter
-from sag.verdict import run_verdict
+from sag.verdict import combine_verdicts, run_verdict
 
 from .base import BaseTool, ToolResult
 
@@ -665,20 +666,63 @@ class ReportTool(BaseTool, UIEventEmitter):
         """The run verdict for this report, via the verdict kernel (spec §6).
 
         Combines the same inputs the agent's final status uses — the
-        physically-verified overall status, the evidence status, and the
+        phase-machine outcome (reconstructed from the trunk's phase_* tasks),
+        the physically-verified overall status, the evidence status, and the
         evidence conflicts (which cap at partial). The header Result line and
         the stored snapshot verdict both read this, so the round-5 iceberg
         divergence (report PARTIAL vs CLI success) is impossible by
-        construction.
+        construction — including machine-capped runs (round-6 review: a
+        blocked phase with green physical artifacts rendered ✅ SUCCESS while
+        the CLI banner said verdict=failed).
         """
         snapshot = snapshot or {}
         status = snapshot.get("status") or {}
         evidence = snapshot.get("evidence_result") or {}
         return run_verdict(
-            _coerce_kernel_verdict(status.get("overall")),
+            # The kernel's two-verdict signature is kept; min() is associative,
+            # so folding the machine outcome into the first input is identical
+            # to a three-way combine.
+            combine_verdicts(
+                self._trunk_phase_machine_outcome(),
+                _coerce_kernel_verdict(status.get("overall")),
+            ),
             _coerce_kernel_verdict(evidence.get("status")),
             evidence.get("conflicts") or [],
         )
+
+    def _trunk_phase_machine_outcome(self) -> Optional[str]:
+        """Phase-machine outcome reconstructed from the trunk's phase_* tasks.
+
+        Mirrors the agent's machine input (PhaseMachine.overall_outcome): the
+        engine persists every finished phase as a phase_<name> trunk task —
+        FAILED means blocked — so a blocked build phase fails the run and any
+        other blocked phase caps at partial. Runs without phase_* tasks
+        (`sag run --task`, legacy) abstain with None.
+        """
+        if not self.context_manager:
+            return None
+        try:
+            trunk = self.context_manager.load_trunk_context()
+        except Exception as exc:
+            logger.debug(f"Could not load trunk for phase-machine outcome: {exc}")
+            return None
+        blocked = set()
+        seen_phase_tasks = False
+        for task in getattr(trunk, "todo_list", None) or []:
+            task_id = str(getattr(task, "id", "") or "")
+            if not task_id.startswith("phase_"):
+                continue
+            seen_phase_tasks = True
+            status = getattr(task, "status", None)
+            if str(getattr(status, "value", status)) == "failed":
+                blocked.add(task_id[len("phase_"):])
+        if not seen_phase_tasks:
+            return None
+        if CRITICAL_PHASE in blocked:
+            return "failed"
+        if blocked:
+            return "partial"
+        return "success"
 
     def _should_render_report_evidence_result(self, evidence: Dict[str, Any]) -> bool:
         if not evidence:
@@ -1427,9 +1471,18 @@ class ReportTool(BaseTool, UIEventEmitter):
         """Generate condensed output for logs using the shared rendering utility.
 
         Renders strictly from the validated report snapshot (spec §4: no
-        independent stat computation in the report tool)."""
+        independent stat computation in the report tool). The banner and the
+        Next line consume the kernel verdict (spec §6) — never verified_status
+        or status.overall, which can sit above it (round-6 review: the
+        condensed log announced '✅ SUCCESS ... 🎉' while the report header
+        for the SAME snapshot said '**Result:** ⚠️ PARTIAL')."""
         snapshot = dict(report_snapshot or {})
         snapshot["report_path"] = snapshot.get("report_path") or f"/workspace/{report_filename}"
+
+        status = dict(snapshot.get("status") or {})
+        kernel_verdict = status.get("verdict") or self._snapshot_kernel_verdict(snapshot)
+        status["verdict"] = kernel_verdict
+        snapshot["status"] = status
 
         condensed_lines = render_condensed_summary(snapshot).split("\n")
 
@@ -1438,9 +1491,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "[⚠️ WARNING: No physical validator - using task-based inference only]"
             )
 
-        if verified_status == "success":
+        if kernel_verdict == "success":
             condensed_lines.append("💡 Next: Project ready for development/deployment! 🎉")
-        elif verified_status == "fail":
+        elif kernel_verdict == "failed":
             condensed_lines.append("💡 Next: Review logs and fix build/test failures")
         else:
             condensed_lines.append("💡 Next: Check error logs and retry setup")

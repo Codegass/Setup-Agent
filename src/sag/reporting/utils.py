@@ -74,7 +74,11 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
     attention = snapshot.get("attention", {})
     evidence = snapshot.get("physical_evidence", {})
 
-    icon, label = _status_icon(status.get("overall"))
+    # The kernel verdict stored in the snapshot (spec §6) is the ONLY source
+    # for the banner; 'overall' is the raw physical status and can sit above
+    # the kernel (round-6 review: '🎯 SETUP COMPLETED: ✅ SUCCESS' printed
+    # beside a '**Result:** ⚠️ PARTIAL' report header for the same snapshot).
+    icon, label = _status_icon(status.get("verdict") or status.get("overall"))
     clone_icon = _phase_icon(phases.get("clone"))
     build_icon = _phase_icon(phases.get("build"))
     test_icon = _phase_icon(phases.get("test"))

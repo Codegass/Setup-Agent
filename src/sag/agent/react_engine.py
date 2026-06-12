@@ -139,6 +139,11 @@ class ReActEngine(UIEventEmitter):
         # Window-reset marker: the first journal record after a reset carries
         # the new phase intro text (spec §7 reconstruction).
         self._journal_intro_dirty = False
+        # Last ledger text journaled for the current window: compact_steps
+        # returns the FULL cumulative ledger on every post-compaction
+        # iteration, so records must dedupe on text change (round-6 review:
+        # ~6KB re-recorded per iteration once compaction was active).
+        self._journal_last_ledger = None
         self.prompts = load_react_engine_prompts()
         self.repository_url = repository_url
         self.repository_ref = repository_ref
@@ -414,6 +419,7 @@ class ReActEngine(UIEventEmitter):
                 self._archive_window_steps()
                 self.steps = [self._phase_intro_step()]
                 self._journal_intro_dirty = True
+                self._journal_last_ledger = None
                 self._start_phase_branch()
             return signal
         return None
@@ -442,6 +448,44 @@ class ReActEngine(UIEventEmitter):
                         counts["failed_actions"] += 1
             elif s.step_type == StepType.OBSERVATION:
                 counts["observations"] += 1
+
+    def _record_context_journal(
+        self, ledger: Optional[str], n_compacted: int, added: int, total_chars: int
+    ) -> None:
+        """One in-container journal line for this iteration (spec §7).
+
+        Window texts are deduplicated: the intro only on the first record
+        after a window reset, the ledger only when its text CHANGED since the
+        last journaled one. compact_steps returns the FULL cumulative ledger
+        on every post-compaction iteration, so gating on "a ledger exists"
+        re-records ~6KB per line and stamps every `sag inspect` timeline row
+        with [LEDGER] (round-6 review). The segment SIZES still describe the
+        whole window on every record."""
+        if self.context_journal is None:
+            return
+        intro_len = len(self.steps[0].content) if self.steps else 0
+        intro_text = None
+        if self._journal_intro_dirty and self.steps:
+            intro_text = self.steps[0].content
+            self._journal_intro_dirty = False
+        ledger_text = None
+        if ledger is not None and ledger != self._journal_last_ledger:
+            ledger_text = ledger
+            self._journal_last_ledger = ledger
+        self.context_journal.record(
+            phase=self.phase_machine.current_phase,
+            iteration=self.current_iteration,
+            segments={
+                "intro": intro_len,
+                "ledger": len(ledger or ""),
+                "steps": len(self.steps),
+            },
+            delta={"added": added, "compacted": n_compacted},
+            total_chars=total_chars,
+            intro_text=intro_text,
+            ledger_text=ledger_text,
+            step_span=len(self.steps),
+        )
 
     def _phase_gate_check(self, phase: str) -> Dict[str, Any]:
         """Run the phase-boundary evidence gate from engine context.
@@ -534,6 +578,7 @@ class ReActEngine(UIEventEmitter):
             self._archive_window_steps()
             self.steps = [self._phase_intro_step()]
             self._journal_intro_dirty = True
+            self._journal_last_ledger = None
             self._start_phase_branch()
         return True
 
@@ -640,6 +685,7 @@ class ReActEngine(UIEventEmitter):
         if phase_mode:
             self.steps = [self._phase_intro_step()]
             self._journal_intro_dirty = True
+            self._journal_last_ledger = None
             self._start_phase_branch()
         else:
             self.steps = []
@@ -824,28 +870,9 @@ class ReActEngine(UIEventEmitter):
 
                 # CONTEXT JOURNAL (phase mode): one in-container line per
                 # iteration describing the window composition (spec §7).
-                if phase_mode and self.context_journal is not None:
-                    intro_len = len(self.steps[0].content) if self.steps else 0
-                    # Window texts (spec §7): intro only on the first record
-                    # after a window reset; ledger only when compaction
-                    # produced a new one this iteration.
-                    intro_text = None
-                    if self._journal_intro_dirty and self.steps:
-                        intro_text = self.steps[0].content
-                        self._journal_intro_dirty = False
-                    self.context_journal.record(
-                        phase=self.phase_machine.current_phase,
-                        iteration=self.current_iteration,
-                        segments={
-                            "intro": intro_len,
-                            "ledger": len(ledger or ""),
-                            "steps": len(self.steps),
-                        },
-                        delta={"added": len(parsed_steps), "compacted": n_compacted},
-                        total_chars=len(current_prompt),
-                        intro_text=intro_text,
-                        ledger_text=ledger,
-                        step_span=len(self.steps),
+                if phase_mode:
+                    self._record_context_journal(
+                        ledger, n_compacted, len(parsed_steps), len(current_prompt)
                     )
 
                 # Step count is now automatically managed by branch history updates
