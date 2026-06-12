@@ -73,6 +73,41 @@ export function fetchLaunchQueue(): Promise<LaunchQueueState> {
   return getJson<LaunchQueueState>("/api/project-launches")
 }
 
+// --- phase history + context journal (spec §8.3) ---------------------------
+
+export interface PhaseSummary {
+  name: string
+  status: string
+  notes: string
+  key_results: string
+}
+
+export interface PhaseJournalRecord {
+  iteration: number
+  total_chars: number
+  delta?: { added?: number; compacted?: number }
+  intro_text?: string | null
+  ledger_text?: string | null
+  step_span?: number | null
+}
+
+export async function fetchPhases(workspaceId: string): Promise<PhaseSummary[]> {
+  const body = await getJson<{ phases: PhaseSummary[] }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/phases`,
+  )
+  return body.phases
+}
+
+export async function fetchPhaseJournal(
+  workspaceId: string,
+  phase: string,
+): Promise<PhaseJournalRecord[]> {
+  const body = await getJson<{ records: PhaseJournalRecord[] }>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/phases/${encodeURIComponent(phase)}/journal`,
+  )
+  return body.records
+}
+
 export async function submitProjectBatch(
   payload: LaunchBatchRequestBody,
 ): Promise<LaunchBatchResult> {
