@@ -48,9 +48,11 @@ PHASE_OBJECTIVES = {
         "evidence is acceptable."
     ),
     "build": (
-        "Make the project compile: build(action='deps') then build(action='compile'). "
-        "Never run mvn/gradle via bash — build resolves the registered toolchain. "
-        "Long builds detach; poll the job ref with search."
+        "Make the project compile: build(action='compile'). If compilation fails on "
+        "missing dependencies, build(action='deps') can resolve them — but do not run "
+        "deps first by default (multi-module reactors can fail dependency resolution "
+        "while compiling fine). Never run mvn/gradle via bash — build resolves the "
+        "registered toolchain. Long builds detach; poll the job ref with search."
     ),
     "test": (
         "Run the test suite: build(action='test'). Partial pass above threshold is a "
@@ -406,15 +408,95 @@ class ReActEngine(UIEventEmitter):
             # manage_context actions exist to reset the legacy counter).
             self.steps_since_context_switch = 0
             if not machine.is_complete:
+                self._archive_window_steps()
                 self.steps = [self._phase_intro_step()]
                 self._start_phase_branch()
             return signal
         return None
 
+    def _archive_window_steps(self) -> None:
+        """Accumulate step counters before a window reset so the end-of-run
+        execution summary reflects the WHOLE run, not just the last phase's
+        window (round-5: summaries reported 'total_steps: 7' for 141-iteration
+        runs)."""
+        counts = getattr(self, "_archived_counts", None)
+        if counts is None:
+            counts = {"total_steps": 0, "thoughts": 0, "actions": 0, "observations": 0,
+                      "successful_actions": 0, "failed_actions": 0}
+            self._archived_counts = counts
+        for s in self.steps:
+            counts["total_steps"] += 1
+            if s.step_type == StepType.THOUGHT:
+                counts["thoughts"] += 1
+            elif s.step_type == StepType.ACTION:
+                counts["actions"] += 1
+                result = getattr(s, "tool_result", None)
+                if result is not None:
+                    if getattr(result, "success", False):
+                        counts["successful_actions"] += 1
+                    else:
+                        counts["failed_actions"] += 1
+            elif s.step_type == StepType.OBSERVATION:
+                counts["observations"] += 1
+
+    def _phase_gate_check(self, phase: str) -> Dict[str, Any]:
+        """Run the phase-boundary evidence gate from engine context.
+
+        Fails CLOSED (ok=False) when no validator is wired: the callers
+        (floor auto-done, mid-phase nudge) must only act on positive
+        evidence, never on inability to check."""
+        validator = getattr(self, "physical_validator", None)
+        if validator is None:
+            return {"ok": False, "reason": "no validator available", "suggestions": []}
+        from .phase_gates import check_phase_done
+
+        project_name = None
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            project_name = getattr(trunk, "project_name", None)
+        except Exception:
+            pass
+        return check_phase_done(
+            phase,
+            validator=validator,
+            orchestrator=getattr(validator, "docker_orchestrator", None),
+            project_name=project_name,
+        )
+
+    NUDGE_EVERY = 15
+
+    def _maybe_nudge_phase_done(self) -> bool:
+        """Mid-phase evidence nudge (round-5 vfs lesson): a model deep in a
+        rabbit hole may hold green evidence for dozens of iterations without
+        claiming done. Every NUDGE_EVERY phase-iterations, check the gate;
+        when it would pass, say so — break loops with evidence, not limits."""
+        machine = getattr(self, "phase_machine", None)
+        if machine is None or machine.is_complete:
+            return False
+        if self._phase_iterations <= 0 or self._phase_iterations % self.NUDGE_EVERY != 0:
+            return False
+        gate = self._phase_gate_check(machine.current_phase)
+        if not gate.get("ok"):
+            return False
+        self.steps.append(ReActStep(
+            step_type=StepType.SYSTEM_GUIDANCE,
+            content=(
+                f"EVIDENCE CHECK: the completion gate for phase '{machine.current_phase}' "
+                f"already passes on physical evidence. If you agree the objective is met, "
+                f"claim phase(action='done', key_results=..., evidence=[refs]) now and move on. "
+                f"If you are pursuing something beyond this phase's objective, consider "
+                f"whether it belongs to a later phase or a note."
+            ),
+            timestamp=self._get_timestamp(),
+        ))
+        return True
+
     def _enforce_phase_floors(self) -> bool:
-        """Force-block the current phase ONLY when continuing would starve the
+        """Force-finish the current phase ONLY when continuing would starve the
         minimum floors of later phases (no per-phase quotas: build may consume
-        everything the easy phases saved)."""
+        everything the easy phases saved). Round-5 vfs lesson: consult the
+        evidence gate first — green evidence auto-completes the phase as done;
+        only a failing gate records blocked."""
         machine = getattr(self, "phase_machine", None)
         if machine is None or machine.is_complete:
             return False
@@ -422,17 +504,30 @@ class ReActEngine(UIEventEmitter):
         _, reserved, remaining = self._phase_budget_numbers(phase)
         if remaining > reserved:
             return False
-        machine.mark_blocked(
-            f"remaining {remaining} iterations are reserved for later phases "
-            f"({reserved} needed)",
-            [],
-        )
-        self._persist_phase_record(
-            phase, "failed", "remaining iterations reserved for later phases"
-        )
+
+        gate = self._phase_gate_check(phase)
+        if gate.get("ok"):
+            machine.mark_done(
+                f"auto-completed at floor exhaustion (remaining {remaining} iterations "
+                f"reserved for later phases); evidence gate passed",
+                [],
+            )
+            self._persist_phase_record(
+                phase, "completed", "auto-completed at floor exhaustion; evidence gate passed"
+            )
+        else:
+            machine.mark_blocked(
+                f"remaining {remaining} iterations are reserved for later phases "
+                f"({reserved} needed)",
+                [],
+            )
+            self._persist_phase_record(
+                phase, "failed", "remaining iterations reserved for later phases"
+            )
         self._phase_iterations = 0
         self.steps_since_context_switch = 0
         if not machine.is_complete:
+            self._archive_window_steps()
             self.steps = [self._phase_intro_step()]
             self._start_phase_branch()
         return True
@@ -634,6 +729,9 @@ class ReActEngine(UIEventEmitter):
                         self.agent_logger.info(f"All phases complete; overall outcome: {outcome}")
                         self._export_token_usage_csv()
                         return outcome == "success"
+                    # Mid-phase evidence nudge: when the gate already passes,
+                    # tell the model — break rabbit holes with evidence.
+                    self._maybe_nudge_phase_done()
 
                 # CENTRALIZED STATE EVALUATION: Replace all scattered checks
                 state_analysis = self.state_evaluator.evaluate(
@@ -1490,18 +1588,25 @@ class ReActEngine(UIEventEmitter):
             )
 
     def get_execution_summary(self) -> Dict[str, Any]:
-        """Get a summary of the execution."""
+        """Get a summary of the execution.
+
+        Counts the live window PLUS any windows archived at phase resets, so
+        phase-mode summaries reflect the whole run, not the last phase only."""
         thinking_actions = len([s for s in self.steps if s.model_used and "o1" in s.model_used])
         action_actions = len(
             [s for s in self.steps if s.model_used and "o1" not in (s.model_used or "")]
         )
 
+        archived = getattr(self, "_archived_counts", None) or {}
         return {
-            "total_steps": len(self.steps),
+            "total_steps": len(self.steps) + archived.get("total_steps", 0),
             "iterations": self.current_iteration,
-            "thoughts": len([s for s in self.steps if s.step_type == StepType.THOUGHT]),
-            "actions": len([s for s in self.steps if s.step_type == StepType.ACTION]),
-            "observations": len([s for s in self.steps if s.step_type == StepType.OBSERVATION]),
+            "thoughts": len([s for s in self.steps if s.step_type == StepType.THOUGHT])
+            + archived.get("thoughts", 0),
+            "actions": len([s for s in self.steps if s.step_type == StepType.ACTION])
+            + archived.get("actions", 0),
+            "observations": len([s for s in self.steps if s.step_type == StepType.OBSERVATION])
+            + archived.get("observations", 0),
             "thinking_model_calls": thinking_actions,
             "action_model_calls": action_actions,
             "successful_actions": len(
@@ -1510,7 +1615,8 @@ class ReActEngine(UIEventEmitter):
                     for s in self.steps
                     if s.step_type == StepType.ACTION and s.tool_result and s.tool_result.success
                 ]
-            ),
+            )
+            + archived.get("successful_actions", 0),
             "failed_actions": len(
                 [
                     s
@@ -1519,7 +1625,8 @@ class ReActEngine(UIEventEmitter):
                     and s.tool_result
                     and not s.tool_result.success
                 ]
-            ),
+            )
+            + archived.get("failed_actions", 0),
         }
 
     @staticmethod

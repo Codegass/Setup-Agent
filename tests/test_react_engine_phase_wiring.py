@@ -156,3 +156,85 @@ def test_persist_phase_record_warns_when_trunk_task_missing():
     assert any("phase_build" in m for m in messages), (
         "missing trunk phase task must produce a warning, not a silent no-op"
     )
+
+
+# --- round-5 gate fixes ------------------------------------------------------
+
+
+def test_floor_exhaustion_auto_completes_when_gate_passes():
+    """vfs round 5: the build phase was force-BLOCKED at floor exhaustion while
+    the physical evidence was green (BUILD SUCCESS + 177/184 tests on disk),
+    failing a healthy run. Floor exhaustion must consult the evidence gate:
+    gate passes -> auto-done, only gate-fail -> blocked."""
+    engine = _engine_with_machine()
+    engine.current_iteration = 121  # forces floor starvation in provision
+    engine._phase_gate_check = lambda phase: {"ok": True, "reason": "", "suggestions": []}
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    rec = engine.phase_machine.records[0]
+    assert rec.status == "done", "green evidence at floor exhaustion must auto-complete"
+    assert "auto-completed" in rec.key_results.lower()
+
+
+def test_floor_exhaustion_blocks_when_gate_fails():
+    engine = _engine_with_machine()
+    engine.current_iteration = 121
+    engine._phase_gate_check = lambda phase: {"ok": False, "reason": "no artifacts", "suggestions": []}
+
+    forced = engine._enforce_phase_floors()
+
+    assert forced is True
+    assert engine.phase_machine.records[0].status == "blocked"
+
+
+def test_mid_phase_nudge_when_evidence_green():
+    """vfs round 5: the model held green evidence for ~100 iterations without
+    claiming done. Every NUDGE_EVERY phase-iterations the engine checks the
+    gate and, when green, injects guidance suggesting a done-claim."""
+    engine = _engine_with_machine()
+    engine._phase_iterations = 15
+    engine._phase_gate_check = lambda phase: {"ok": True, "reason": "", "suggestions": []}
+
+    nudged = engine._maybe_nudge_phase_done()
+
+    assert nudged is True
+    assert any("phase(action='done'" in getattr(s, "content", "") for s in engine.steps)
+
+
+def test_no_nudge_when_evidence_not_green():
+    engine = _engine_with_machine()
+    engine._phase_iterations = 15
+    engine._phase_gate_check = lambda phase: {"ok": False, "reason": "x", "suggestions": []}
+
+    assert engine._maybe_nudge_phase_done() is False
+
+
+def test_no_nudge_off_cycle():
+    engine = _engine_with_machine()
+    engine._phase_iterations = 7
+    engine._phase_gate_check = lambda phase: {"ok": True, "reason": "", "suggestions": []}
+
+    assert engine._maybe_nudge_phase_done() is False
+
+
+def test_build_objective_does_not_prescribe_deps_first():
+    """vfs round 5: 'build(action='deps') then compile' steered the model into
+    a structural dependency:resolve failure (reactor test-jar deps) that plain
+    compile never hits. The objective prescribes compile; deps only as remedy."""
+    from sag.agent.react_engine import PHASE_OBJECTIVES
+
+    build_obj = PHASE_OBJECTIVES["build"]
+    assert "build(action='compile')" in build_obj
+    assert "deps') then" not in build_obj, "must not prescribe deps-before-compile"
+    assert "deps" in build_obj, "deps should remain available as a remedy"
+
+
+def test_summary_counts_survive_window_resets():
+    engine = _engine_with_machine()
+    engine.current_iteration = 3
+    engine.token_tracker = None
+    # Simulate: 7 steps in window, then a phase transition archives them.
+    engine._archive_window_steps()
+    assert engine._archived_counts["total_steps"] == 7
