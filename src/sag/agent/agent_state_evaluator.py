@@ -58,6 +58,12 @@ class AgentStateEvaluator:
         self.context_manager = context_manager
         self.physical_validator = physical_validator
         self.completion_mode = completion_mode
+        # Stage 2: armed by the engine when a phase machine drives the run.
+        # In machine mode run completion is machine-driven (the report PHASE's
+        # done signal ends the run); the report tool's completion_signal must
+        # not end the run by itself — it would bypass blocked phases' honest
+        # partial/failed outcome.
+        self.phase_machine_active = False
 
         # Completion signal patterns - used for task completion detection
         # IMPORTANT: Patterns must be unique to their signal type to avoid false positives
@@ -577,6 +583,13 @@ class AgentStateEvaluator:
 
     def _is_task_complete(self, steps: List[Any]) -> bool:
         """Check if the overall task is complete."""
+        # Machine-driven setup runs end when the report PHASE completes — the
+        # engine consults PhaseMachine.overall_outcome(), not this signal. The
+        # evaluator is still consulted every iteration while the machine is
+        # incomplete, so this path must stand down entirely in machine mode.
+        if getattr(self, "phase_machine_active", False):
+            return False
+
         # Check for successful report generation
         for step in reversed(steps[-5:]):
             if hasattr(step, "step_type") and step.step_type == StepType.ACTION:

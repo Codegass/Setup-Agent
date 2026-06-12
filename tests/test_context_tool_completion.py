@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from sag.agent.agent_state_evaluator import AgentStateEvaluator
+from sag.agent.context_manager import TaskStatus
 from sag.agent.react_types import StepType
 from sag.tools.base import ToolError
 from sag.tools.context_tool import ContextTool
@@ -490,3 +491,155 @@ def test_detached_handoff_is_not_build_execution_evidence():
 
     assert result["valid"] is False
     assert "tool execution" in result["reason"].lower()
+
+
+# --- Stage 2: machine-driven run completion (setup phase mode) --------------
+# In phase mode the engine consults the phase machine, not the evaluator's
+# report-signal path; the report PHASE done ends the run. The evaluator IS
+# still consulted every iteration while the machine is incomplete, so its
+# report-tool completion_signal path must be gated off.
+
+
+def test_report_signal_does_not_end_run_when_phase_machine_active():
+    validator = FakeValidator(build_success=True, build_system="gradle")
+    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
+    evaluator.phase_machine_active = True
+
+    assert evaluator._is_task_complete(_report_completion_steps()) is False
+    # Even an honest fail report no longer ends the run by itself in machine
+    # mode (contrast: test_run_gate_lets_failed_report_end_run); the report
+    # phase's done/blocked signal carries the honest outcome instead.
+    assert evaluator._is_task_complete(_report_completion_steps(status="fail")) is False
+    assert validator.build_calls == [], "machine mode must not probe build evidence here"
+
+
+def test_phase_machine_gate_defaults_off():
+    validator = FakeValidator(build_success=True, build_system="gradle")
+    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
+
+    assert evaluator.phase_machine_active is False
+    assert evaluator._is_task_complete(_report_completion_steps()) is True
+
+
+def test_evaluate_never_reports_complete_in_phase_mode():
+    validator = FakeValidator(build_success=True, build_system="gradle")
+    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
+    evaluator.phase_machine_active = True
+
+    analysis = evaluator.evaluate(
+        steps=_report_completion_steps(),
+        current_iteration=5,
+        recent_tool_executions=[],
+        steps_since_context_switch=1,
+    )
+
+    assert analysis.is_task_complete is False
+
+
+class _EngineDummyCM:
+    """Minimal context manager for full ReActEngine construction."""
+
+    contexts_dir = "/workspace/.setup_agent/contexts"
+    orchestrator = None
+    current_task_id = None
+
+    def load_trunk_context(self):
+        return None
+
+    def get_current_context_info(self):
+        return {"context_type": "trunk", "context_id": "trunk"}
+
+
+def test_engine_arms_phase_gate_for_machine_runs(monkeypatch):
+    """The engine, not the evaluator, knows whether a phase machine drives
+    the run; it must arm the evaluator's gate at construction."""
+    from sag.agent.phase_machine import PhaseMachine
+    from sag.agent.react_engine import ReActEngine
+    from sag.agent.react_llm import ReactLLMClient
+
+    monkeypatch.setattr(ReactLLMClient, "setup", lambda self: None)
+
+    machine_engine = ReActEngine(_EngineDummyCM(), [], phase_machine=PhaseMachine())
+    assert machine_engine.state_evaluator.phase_machine_active is True
+
+    legacy_engine = ReActEngine(_EngineDummyCM(), [])
+    assert legacy_engine.state_evaluator.phase_machine_active is False
+
+
+# --- Stage 2: report tool compatibility with phase_* trunk task ids ---------
+# Phase trunk tasks are plain Task entries with ids like phase_build; the
+# report tool's task-progress rendering and final-report matcher must keep
+# working over them (descriptions are the one-line phase objectives).
+
+
+class PhaseTask:
+    def __init__(self, name, description, status="completed", key_results=""):
+        self.id = f"phase_{name}"
+        self.description = description
+        self.status = SimpleNamespace(value=status)
+        self.key_results = key_results
+
+
+class PhaseTrunk:
+    def __init__(self, tasks):
+        self.todo_list = tasks
+        self.environment_summary = {}
+        self.status_updates = []
+        self.key_results_updates = []
+
+    def update_task_status(self, task_id, status, summary=None):
+        self.status_updates.append((task_id, status, summary))
+
+    def update_task_key_results(self, task_id, key_results):
+        self.key_results_updates.append((task_id, key_results))
+
+
+def _phase_trunk():
+    from sag.agent.react_engine import PHASE_OBJECTIVES
+
+    return PhaseTrunk(
+        [
+            PhaseTask("provision", PHASE_OBJECTIVES["provision"], "completed", "JDK 17; repo cloned"),
+            PhaseTask("analyze", PHASE_OBJECTIVES["analyze"], "completed", "maven; 184 tests"),
+            PhaseTask("build", PHASE_OBJECTIVES["build"], "completed", "BUILD SUCCESS"),
+            PhaseTask("test", PHASE_OBJECTIVES["test"], "in_progress"),
+            PhaseTask("report", PHASE_OBJECTIVES["report"], "pending"),
+        ]
+    )
+
+
+def test_task_progress_renders_phase_task_ids():
+    from sag.tools.report_tool import ReportTool
+
+    trunk = _phase_trunk()
+    cm = SimpleNamespace(load_trunk_context=lambda: trunk, current_task_id=None)
+    tool = ReportTool(context_manager=cm)
+
+    rendered = "\n".join(tool._render_task_progress())
+
+    # _render_task_progress swallows errors (returning just the header), so
+    # asserting actual rows proves phase ids/descriptions render cleanly.
+    assert "| 1 |" in rendered and "| 5 |" in rendered
+    assert "✅" in rendered and "🔄" in rendered and "⏳" in rendered
+    assert "BUILD SUCCESS" in rendered
+
+
+def test_final_report_matcher_finds_report_phase_task():
+    from sag.tools.report_tool import ReportTool
+
+    trunk = _phase_trunk()
+    cm = SimpleNamespace(
+        load_trunk_context=lambda: trunk,
+        _save_trunk_context=lambda t: None,
+        current_task_id="phase_report",
+    )
+    tool = ReportTool(context_manager=cm)
+
+    completed = tool._mark_final_report_task_completed("setup-report-x.md", "success")
+
+    assert completed == "phase_report"
+    assert trunk.status_updates == [
+        ("phase_report", TaskStatus.COMPLETED, "Final setup report generated.")
+    ]
+    assert trunk.key_results_updates and trunk.key_results_updates[0][0] == "phase_report"
+    assert cm.current_task_id is None, "report phase task must be released after completion"

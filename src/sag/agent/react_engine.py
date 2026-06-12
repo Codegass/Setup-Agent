@@ -220,6 +220,12 @@ class ReActEngine(UIEventEmitter):
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
+        # Stage 2: in machine-driven setup runs the evaluator must never end
+        # the run from the report tool's completion signal — the report PHASE
+        # done does (run_react_loop returns on machine completion with the
+        # machine's honest overall outcome).
+        self.state_evaluator.phase_machine_active = self.phase_machine is not None
+
         # Initialize token tracker and LLM client for monitoring model usage
         self.token_tracker = TokenTracker()
         self.llm_client = ReactLLMClient(
