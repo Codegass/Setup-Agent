@@ -61,7 +61,7 @@ def test_initial_prompt_explains_evidence_status_rules():
         tool_calling_enabled=True,
     )
 
-    assert "completed means the branch task flow ended" in prompt
+    assert "done means the phase flow ended" in prompt
     assert "BUILD SUCCESS cannot override validator findings" in prompt
     assert "partial, conflict, or unknown" in prompt
     assert "read evidence refs or raw output refs" in prompt

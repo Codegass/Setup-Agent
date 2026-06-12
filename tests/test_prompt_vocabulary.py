@@ -14,7 +14,11 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
+
 from sag.agent.agent_state_evaluator import AgentStateEvaluator, AgentStatus
+from sag.agent.react_prompt_builder import ReActPromptBuilder
+from sag.config.prompt_loader import load_react_engine_prompts
 from sag.tools.context_tool import ContextTool
 
 REPO_SRC = Path(__file__).resolve().parents[1] / "src" / "sag"
@@ -192,3 +196,98 @@ def test_task2_analyzer_guidance_uses_project_vocabulary():
     assert analysis.status == AgentStatus.STUCK
     assert "project(action='analyze'" in analysis.guidance_message
     assert "project_analyzer" not in analysis.guidance_message.lower()
+
+
+# --- Stage 2 (plan Task 9): setup prompts teach the phase vocabulary -------
+#
+# Setup runs talk to the engine-owned phase machine through the `phase` tool;
+# manage_context is not registered there, so no setup-mode section may teach
+# the task ceremony (start_task / complete_with_results / task ids). Run-task
+# mode keeps the legacy manage_context surface untouched.
+
+SETUP_FORBIDDEN_CEREMONY = (
+    "manage_context",
+    "complete_with_results",
+    "start_task",
+    "task_1",
+    "task_id",
+)
+
+
+def _prompt_sections():
+    data = yaml.safe_load(YAML_PATH.read_text())
+    return {
+        f"{group}.{name}": text
+        for group, sections in data.items()
+        for name, text in sections.items()
+    }
+
+
+def test_setup_yaml_sections_drop_task_ceremony():
+    offenders = {
+        key: [pattern for pattern in SETUP_FORBIDDEN_CEREMONY if pattern in text]
+        for key, text in _prompt_sections().items()
+        if not key.split(".", 1)[1].startswith("run_task_")
+        and any(pattern in text for pattern in SETUP_FORBIDDEN_CEREMONY)
+    }
+    assert offenders == {}, f"setup-mode sections still teach task ceremony: {offenders}"
+
+
+def test_setup_yaml_sections_teach_phase_verbs():
+    sections = _prompt_sections()
+    lifecycle = sections["initial_system.context_management"]
+    assert 'phase(action="done"' in lifecycle or "phase(action='done'" in lifecycle
+    assert 'phase(action="blocked"' in lifecycle or "phase(action='blocked'" in lifecycle
+    assert "provision" in lifecycle and "report" in lifecycle, (
+        "phase order must be visible so the model never tries to reorder phases"
+    )
+
+
+def test_run_task_yaml_sections_keep_manage_context_and_no_phase_tool():
+    sections = _prompt_sections()
+    assert "manage_context" in sections["initial_system.run_task_context_management"]
+    assert "manage_context" in sections["initial_system.run_task_tool_clarification"]
+    run_task_text = "\n".join(
+        text
+        for key, text in sections.items()
+        if key.split(".", 1)[1].startswith("run_task_")
+    )
+    assert "phase(action=" not in run_task_text
+
+
+class _PromptCM:
+    def get_current_context_info(self):
+        return {"context_type": "trunk", "context_id": "trunk"}
+
+    def load_trunk_context(self):
+        return None
+
+
+def _initial_prompt(workflow_mode):
+    builder = ReActPromptBuilder(
+        prompts=load_react_engine_prompts(),
+        context_manager=_PromptCM(),
+        tools={},
+    )
+    return builder.build_initial_system_prompt(
+        repository_url="https://example.test/repo.git",
+        repository_ref=None,
+        tool_calling_enabled=True,
+        workflow_mode=workflow_mode,
+    )
+
+
+def test_setup_prompt_teaches_phase_verbs_not_task_ceremony():
+    prompt = _initial_prompt("setup")
+    assert 'phase(action="done"' in prompt or "phase(action='done'" in prompt
+    assert 'phase(action="blocked"' in prompt or "phase(action='blocked'" in prompt
+    assert "complete_with_results" not in prompt
+    assert "manage_context" not in prompt
+    assert "start_task" not in prompt
+
+
+def test_run_task_prompt_keeps_manage_context_surface():
+    prompt = _initial_prompt("run_task")
+    assert "manage_context" in prompt
+    assert "complete_with_results" in prompt
+    assert "phase(action=" not in prompt

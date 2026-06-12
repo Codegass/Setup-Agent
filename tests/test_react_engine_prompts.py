@@ -114,14 +114,14 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
 
     assert "You are SAG (Setup-Agent)" in prompt
     assert "https://example.test/repo.git" in prompt
-    assert "CRITICAL CONTEXT MANAGEMENT RULES" in prompt
+    assert "CRITICAL PHASE WORKFLOW RULES" in prompt
     assert "AVAILABLE TOOLS" in prompt
     assert "dummy: Dummy tool for prompt tests" in prompt
     assert "Usage: dummy()" in prompt
     assert "Handling Maven POM Parsing Errors" in prompt
     assert "Handling Multi-Module Maven Test Execution" in prompt
     assert "RESPONSE FORMAT" in prompt
-    assert "REMEMBER THE CONTINUOUS CYCLE" in prompt
+    assert "REMEMBER THE PHASE CYCLE" in prompt
 
 
 def test_initial_system_prompt_includes_env_overlay_runtime_guidance():
@@ -156,7 +156,8 @@ def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():
     assert "Do not start, continue, or complete setup TODO tasks" in prompt
     assert "INTELLIGENT SETUP WORKFLOW" not in prompt
     assert "MANDATORY WORKFLOW FOR PROJECT SETUP" not in prompt
-    assert "REMEMBER THE CONTINUOUS CYCLE" not in prompt
+    assert "REMEMBER THE PHASE CYCLE" not in prompt
+    assert "phase(action=" not in prompt
     assert "first action should be to clone" not in prompt
 
 

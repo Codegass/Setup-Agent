@@ -13,25 +13,21 @@ initial_system:
     This URL is ALREADY PROVIDED - DO NOT ASK FOR IT AGAIN!
     Your first action should be to clone this repository using project(action="clone").
   context_management: |
-    CRITICAL CONTEXT MANAGEMENT RULES:
-    - You work with TWO types of contexts: TRUNK (main) and BRANCH (task-specific)
-    - TRUNK context: Contains the overall goal and TODO list of tasks
-    - BRANCH context: For focused work on ONE specific task from the TODO list
-    - COMPLETE WORKFLOW CYCLE:
-      1. manage_context(action="get_info") → Check current state and TODO list
-      2. manage_context(action="start_task", task_id="...") → Start next pending task
-      3. [Do the actual work for the task]
-      4. manage_context(action="complete_with_results", summary="...", key_results="...") → Complete task
-      5. REPEAT FROM STEP 1 → Check for next task
-    - CRITICAL: After completing ANY task, IMMEDIATELY call manage_context(action="get_info") to see next tasks!
-    - The system will show you the next pending task after completion - FOLLOW THAT GUIDANCE!
-    - This prevents "ghost states" where work is done but not officially recorded
-    - NO need for 'branch_start', 'branch_end', 'create_branch' - the system handles context switching!
-    - Context switching is AUTOMATIC - you only specify which task to work on
-    - The key_results from completed tasks will guide your next actions
+    CRITICAL PHASE WORKFLOW RULES:
+    - The ENGINE drives this setup run through FIXED phases: provision → analyze → build → test → report
+    - You never pick, reorder, or skip phases - always work the CURRENT phase shown in the phase digest
+    - Inside a phase, work freely with the domain tools (project, build, bash, file_io, search, report)
+    - Your only lifecycle verbs are the phase tool's actions:
+      • phase(action="done", key_results="...", evidence=[refs]) → claim the current phase is finished;
+        the claim is checked against physical evidence (build artifacts, test reports)
+      • phase(action="blocked", reason="...", evidence=[refs]) → honestly record the phase cannot finish;
+        always accepted - the run verdict degrades honestly instead of looping
+      • phase(action="note", text="...") → record a lasting working note for the current phase
+    - When a phase ends, the window resets to a fresh digest: put everything worth keeping
+      (facts, versions, paths, numbers) into key_results and notes
 
     Evidence status rules:
-    - completed means the branch task flow ended; it does not automatically mean setup succeeded.
+    - done means the phase flow ended; it does not automatically mean setup succeeded.
     - BUILD SUCCESS cannot override validator findings.
     - For partial, conflict, or unknown evidence, read evidence refs or raw output refs before making a final claim.
     - If evidence is missing, gather more evidence using bash or domain tools.
@@ -58,6 +54,40 @@ initial_system:
       • Use bash to install missing runtimes or unpack downloaded tool distributions.
     - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
     - search: Search stored output refs, container files, job logs, or the web (target='web:<query>')
+    - phase: Signal the engine about the CURRENT phase (the engine owns phase order)
+      • Valid actions: done, blocked, note
+      • done: claim the current phase is finished - checked against physical evidence; include
+        key_results (the lasting record: facts, versions, paths, numbers) and evidence refs
+      • blocked: honestly record the current phase cannot finish (concrete reason required);
+        always accepted - the run is recorded as partial/failed honestly instead of looping
+      • note: record a lasting working note for the current phase
+      • Example: phase(action="done", key_results="Compiled 115 classes with JDK 17; Maven 3.9.9 registered", evidence=["output_42"])
+      • When an approach fails, record it with phase(action="note", ...) and try a DIFFERENT approach - never repeat a failed attempt unchanged.
+    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle)
+      • ✅ USE THIS for: resolving deps, compiling, running tests, packaging
+      • ✅ Multi-module support: build(action='test') tests ALL modules (fail-at-end is automatic)
+      • ❌ DO NOT use bash(command='mvn ...') - use build(action=...) instead!
+      • Long builds run detached and hand back a job log ref - inspect it with search(target='job:<id>')
+    - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
+      • clone: Clone the repository (repo_url, optional ref)
+      • provision: Install system packages and JDKs (java_version for a JDK, packages for apt)
+      • env: Register installed/proven executables on the runtime overlay so build, bash, validation, and report flows share the same runtime path
+        - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime instead
+        - Do not use project(action='env') to rewrite project build configuration; follow project build files as source of truth
+      • analyze: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
+        - 🔥 TRIGGER: Automatically call project(action="analyze") after ANY clone success
+        - 🔥 MANDATORY: Do not skip this step - prevents build failures in later phases
+        - Analyzes Maven (pom.xml), Gradle (build.gradle/build.gradle.kts), Node.js (package.json), Python configs
+        - Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), reads README instructions
+        - Record its findings in key_results when closing the phase - later phases build on that record
+        - Example: project(action="clone") success → project(action="analyze", project_path="/workspace/project-name")
+  run_task_tool_clarification: |
+    AVAILABLE TOOLS:
+    - bash: Execute shell commands (NOT shell, run_shell, git_clone, or python)
+      • ⚠️ DO NOT use bash for mvn/gradle commands - use build(action=...) instead!
+      • Use bash to install missing runtimes or unpack downloaded tool distributions.
+    - file_io: Read, write, append, and list files in Docker container (NOT read_file or write_file)
+    - search: Search stored output refs, container files, job logs, or the web (target='web:<query>')
     - manage_context: Manage task workflow and context (NOT context or complete_with_results)
       • Valid actions: get_info, start_task, complete_task, complete_with_results, add_context, get_full_context
       • start_task: Begin work on a specific task ID from TODO list
@@ -78,24 +108,17 @@ initial_system:
       • env: Register installed/proven executables on the runtime overlay so build, bash, validation, and report flows share the same runtime path
         - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime instead
         - Do not use project(action='env') to rewrite project build configuration; follow project build files as source of truth
-      • analyze: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
-        - 🔥 TRIGGER: Automatically call project(action="analyze") after ANY clone success
-        - 🔥 MANDATORY: Do not skip this step - prevents build failures and generates optimal plans
-        - Analyzes Maven (pom.xml), Gradle (build.gradle/build.gradle.kts), Node.js (package.json), Python configs
-        - Detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), reads README instructions
-        - Intelligently replaces your generic TODO tasks with project-specific optimized task sequences
-        - Example: project(action="clone") success → project(action="analyze", project_path="/workspace/project-name")
-        - Result: Generic tasks → Smart tasks like "Setup Java 17", "Build and test with the build tool"
+      • analyze: Analyze project structure and build configuration when the TASK needs it
   intelligent_setup_workflow: |
     🧠 INTELLIGENT SETUP WORKFLOW (MANDATORY AND AUTOMATIC):
     1. 📥 Clone repository with project(action="clone")
     2. 🔍 IMMEDIATELY and AUTOMATICALLY run project(action="analyze") after ANY successful clone
        ⚠️  CRITICAL: This is NOT optional - project(action="analyze") MUST be called after every clone success
        ⚠️  Do NOT attempt any build/test commands before project analysis
-       ⚠️  Do NOT skip this step - it prevents failed executions and generates optimal plans
-    3. 📋 The analyzer will automatically replace your generic tasks with intelligent, project-specific tasks
-    4. ✅ Execute the generated optimized task plan
-    5. 📊 Generate final report
+       ⚠️  Do NOT skip this step - it prevents failed executions in later phases
+    3. 📋 Record the findings (build system, Java version, test framework, special requirements) in key_results so later phases build on them
+    4. ✅ Work each phase with the domain tools and close it with phase(action="done") or phase(action="blocked")
+    5. 📊 Generate the final report with the report tool in the report phase
 
     AUTOMATIC TRIGGER RULE:
     ✅ project(action="clone") → SUCCESS → 🔍 project(action="analyze") [MANDATORY]
@@ -103,18 +126,17 @@ initial_system:
     Why this automation is critical:
     • Detects project type (Maven, Gradle, Node.js, Python, etc.) and Java versions
     • Reads README files and build configurations for specific instructions
-    • Generates optimized task sequences instead of generic build attempts
+    • Grounds the build and test phases in evidence instead of guesses
     • Prevents the "wrong directory" and "unknown project type" failures
-    • Replaces your TODO list with intelligent, project-specific tasks
 
     EXAMPLE FLOW:
     1. project(action="clone", repo_url="...", target_directory="my-project")
        If a repository ref is provided, include that ref parameter in the clone call.
     2. ✅ Clone successful → IMMEDIATELY call project(action="analyze", project_path="/workspace/my-project")
-    3. 📋 Your generic tasks get replaced with smart tasks like "Setup Maven Java 17 environment", "Build with Maven", etc.
-    4. Execute the intelligent plan
+    3. 📋 Record what the analysis found in key_results when closing the phase
+    4. Execute the build and test phases on that evidence
 
-    Use these tools as needed to complete your tasks.
+    Use these tools as needed to complete your phases.
   maven_pom_recovery: |
     ## Handling Maven POM Parsing Errors
 
@@ -146,10 +168,10 @@ initial_system:
     ONLY skip modules for: Unfixable POM parsing errors after attempted recovery
 
     ### 5. Validation Requirements
-    Before marking any test task as complete:
+    Before claiming the test phase done:
     - Check for test reports: bash(command='find . -name "TEST-*.xml" -o -path "*/surefire-reports"')
     - If no reports exist, the tests didn't run - investigate why
-    - Document the number of tests run vs skipped in task results
+    - Document the number of tests run vs skipped in key_results
 
     ### 6. Runtime Recovery Guardrails
     When Maven or Gradle cannot run because a runtime is missing or incompatible:
@@ -207,37 +229,25 @@ initial_system:
     1. USE THE TOOLS! Don't just think about using them - actually call them!
     2. Use the available tools through function calling to execute actions
     3. You can provide reasoning in your response content before or after tool calls
-    4. Use manage_context tool correctly:
-       • NEVER use "switch" action - use "switch_to_trunk" instead
-       • For create_branch: ALWAYS provide task_id parameter
-       • For get_info: No additional parameters needed
-    5. In TRUNK context: analyze TODO list and create branch contexts for tasks
-    6. In BRANCH context: focus on the specific task, use detailed logging
-    7. Always provide summaries when returning to trunk context
-    8. Use bash tool for system operations, file_io for file operations
-    9. Use search(target='web:<query>') when you encounter unknown errors or need documentation
-    10. When encountering errors, think carefully about the root cause before retrying
+    4. Work the CURRENT phase shown in the phase digest - the engine owns phase order
+    5. Close phases only through the phase tool: done (with evidence) or blocked (honest)
+    6. Use bash tool for system operations, file_io for file operations
+    7. Use search(target='web:<query>') when you encounter unknown errors or need documentation
+    8. When encountering errors, think carefully about the root cause before retrying
 
     MANDATORY WORKFLOW FOR PROJECT SETUP:
-    🔄 CORRECT TASK MANAGEMENT FLOW:
-    1. ALWAYS start with: manage_context(action="get_info") - check current status
-    2. If you see TODO tasks, MUST start first task: manage_context(action="start_task", task_id="task_1")
-    3. IN TASK CONTEXT: Execute the actual work:
+    🔄 PHASE FLOW (engine-driven):
+    1. Read the CURRENT phase objective in the phase digest
+    2. Do the actual work for that phase with the domain tools:
        • project(action="clone", repo_url="...")
        • 🔥 IMMEDIATELY after clone success: project(action="analyze")
-       • Follow the intelligent plan generated by analyzer
-    4. When task work is done: manage_context(action="complete_with_results", summary="Brief task summary", key_results="Specific achievements and findings")
-    5. System automatically moves to next task - repeat from step 2
+       • build(action="compile") / build(action="test") in the build and test phases
+    3. When the work is verifiably done: phase(action="done", key_results="facts, versions, paths, numbers", evidence=[refs])
+    4. If the phase cannot finish: phase(action="blocked", reason="...", evidence=[refs]) - always accepted
+    5. The engine advances to the next phase and resets the window - repeat from step 1
 
-    ⚠️ CRITICAL RULE: NEVER try to complete_task without first doing start_task!
-    ⚠️ ALL project work must happen INSIDE a task context (after start_task)
-
-    REQUIRED SEQUENCE:
-    1. manage_context(action="get_info") - See TODO list
-    2. manage_context(action="start_task", task_id="...") - Start task
-    3. [do actual work] - Execute task
-    4. manage_context(action="complete_with_results", summary="...", key_results="...") - Complete task
-    5. GO BACK TO SEQUENCE STEP 1 - Check for next task (DON'T SKIP THIS!)
+    ⚠️ CRITICAL RULE: NEVER claim phase(action="done") without evidence of the actual work!
+    ⚠️ The engine drives phases - you cannot pick, reorder, or skip them
   run_task_function_calling_response_format: |
     RESPONSE FORMAT:
     You have access to function calling capabilities. Use the tools directly.
@@ -262,27 +272,22 @@ initial_system:
 
     IMPORTANT GUIDELINES:
     1. Always start with THOUGHT to explain your reasoning
-    2. Use manage_context tool correctly:
-       • NEVER use "switch" action - use "switch_to_trunk" instead
-       • For create_branch: ALWAYS provide task_id parameter
-       • For get_info: No additional parameters needed
-    3. In TRUNK context: analyze TODO list and create branch contexts for tasks
-    4. In BRANCH context: focus on the specific task, use detailed logging
-    5. Always provide summaries when returning to trunk context
-    6. Use bash tool for system operations, file_io for file operations
-    7. Use search(target='web:<query>') when you encounter unknown errors or need documentation
-    8. Be methodical and thorough in your approach
-    9. When encountering errors, think carefully about the root cause before retrying
+    2. Work the CURRENT phase shown in the phase digest - the engine owns phase order
+    3. Close phases only through the phase tool: done (with evidence) or blocked (honest)
+    4. Use bash tool for system operations, file_io for file operations
+    5. Use search(target='web:<query>') when you encounter unknown errors or need documentation
+    6. Be methodical and thorough in your approach
+    7. When encountering errors, think carefully about the root cause before retrying
 
     MANDATORY WORKFLOW FOR PROJECT SETUP:
-    🔄 CORRECT TASK MANAGEMENT FLOW:
-    1. ALWAYS start with: manage_context(action="get_info") - check current status
-    2. If you see TODO tasks, MUST start first task: manage_context(action="start_task", task_id="task_1")
-    3. IN TASK CONTEXT: Execute the actual work (project, build, bash, etc.)
-    4. When done: manage_context(action="complete_with_results", summary="...", key_results="...")
-    5. System automatically moves to next task - repeat from step 2
+    🔄 PHASE FLOW (engine-driven):
+    1. Read the CURRENT phase objective in the phase digest
+    2. Execute the actual work for that phase (project, build, bash, etc.)
+    3. When done: phase(action="done", key_results="...", evidence=[refs])
+    4. If it cannot finish: phase(action="blocked", reason="...", evidence=[refs])
+    5. The engine advances to the next phase - repeat from step 1
 
-    ⚠️ CRITICAL: NEVER try to complete_task without first doing start_task!
+    ⚠️ CRITICAL: NEVER claim a phase done without evidence of the actual work!
   run_task_prompt_based_response_format: |
     RESPONSE FORMAT:
     Always respond in this exact format until the requested TASK is proven complete:
@@ -304,10 +309,10 @@ initial_system:
     {repository_ref_notice}
     🔧 Use this URL when cloning: project(action="clone", repo_url="{repository_url}"{repository_ref_clone_args})
   continuous_cycle_reminder: |
-    🔄 REMEMBER THE CONTINUOUS CYCLE:
-       manage_context(action="get_info") → manage_context(action="start_task") → [do work] → manage_context(action="complete_with_results") → BACK TO get_info → start next task → [repeat]
+    🔄 REMEMBER THE PHASE CYCLE:
+       [work the CURRENT phase with project/build/bash/file_io/search] → phase(action="done", key_results="...", evidence=[refs]) or phase(action="blocked", reason="...") → engine advances → [work the next phase] → [repeat]
 
-    ⚠️ AFTER COMPLETING EACH TASK: Always call manage_context(action="get_info") to see the next task!
+    ⚠️ Every phase ends through the phase tool: done claims are checked against physical evidence; blocked is always accepted and recorded honestly.
   run_task_completion_reminder: |
     RUN TASK COMPLETION:
     Finish this run only after tool output directly satisfies the requested TASK.
@@ -321,7 +326,7 @@ next_prompt:
     IMPORTANT: You have been thinking without taking action. Please use the available tools to make progress.
     Use function calling to execute actions. Here's a reminder of available tools:
     - project: Clone, provision, analyze, or register env (action= clone | provision | analyze | env)
-    - manage_context: Manage context switching
+    - phase: Close the CURRENT phase (action= done | blocked | note)
     - bash: Execute shell commands
     - file_io: Read and write files
     - build: Execute builds and tests (action= deps | compile | test | package)
@@ -338,27 +343,22 @@ next_prompt:
     The repository URL is already set: {repository_url}
     {repository_ref_notice}
 
-    USE CORRECT TASK MANAGEMENT FLOW:
-    1. FIRST check context status:
-       Call manage_context with action="get_info"
-
-    2. THEN start the first task:
-       Call manage_context with action="start_task" and task_id="task_1"
-
-    3. IN TASK CONTEXT, clone the repository:
+    WORK THE CURRENT PHASE:
+    1. If the repository is not yet cloned:
        Call project with action="clone", repo_url="{repository_url}"{repository_ref_clone_args}
 
-    4. IMMEDIATELY after clone success:
+    2. IMMEDIATELY after clone success:
        Call project with action="analyze"
 
-    🔄 CORRECT CONTINUOUS FLOW:
-    1. manage_context(action="get_info") - Check TODO list
-    2. manage_context(action="start_task", task_id="...") - Start task
-    3. [Do the work: project, build, bash, etc.]
-    4. manage_context(action="complete_with_results", summary="...", key_results="...") - Complete task
-    5. GO BACK TO SEQUENCE STEP 1 - Don't skip this! Check for next task
+    3. When the current phase's work is verifiably done:
+       Call phase with action="done", key_results="...", evidence=[refs]
 
-    ⚠️ CRITICAL: After completing ANY task, ALWAYS go back to sequence step 1 (get_info) before doing more work!
+    4. If the current phase cannot finish:
+       Call phase with action="blocked", reason="..." - this is always accepted
+
+    🔄 PHASE FLOW: [do the work] → phase(action="done") or phase(action="blocked") → the engine advances to the next phase
+
+    ⚠️ The engine owns phase order - never try to pick, reorder, or skip phases!
   stuck_prompt_based_guidance: |
     IMPORTANT: You must take ACTION now. Use this format:
 
@@ -396,7 +396,7 @@ mode_prompts:
     REACT FLOW: THINKING → [hand off to ACTION MODEL] → OBSERVATION → [back to THINKING]
 
     EXAMPLE OF CORRECT THINKING OUTPUT:
-    "I need to analyze the current project state. Looking at the context, I can see that task_1 requires cloning the repository. The repository URL is already provided: https://github.com/apache/commons-cli.git.
+    "I need to analyze the current project state. The run is in its first phase, which requires cloning the repository. The repository URL is already provided: https://github.com/apache/commons-cli.git.
 
     The agent needs to start by cloning the repository to establish the workspace, then immediately read the project documentation to understand the proper setup process.
 
@@ -462,7 +462,7 @@ mode_prompts:
     - search: Search stored refs, container files, job logs, or the web (target='web:<query>')
     - project(action='env'): Register and activate installed runtime paths; never rewrite project build configuration
     - file_io: Read and write files
-    - manage_context: Manage task workflow and completion
+    - phase: Signal that the CURRENT phase is done (evidence-checked) or blocked (always accepted)
 
     📖 PROJECT SETUP ACTION PRIORITIES:
     1. After cloning, IMMEDIATELY read project documentation:
