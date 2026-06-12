@@ -757,6 +757,30 @@ def test_report_header_tests_line_uses_snapshot_stats_not_evidence_stats():
     assert "977" not in tests_lines[0], tests_lines[0]
 
 
+def test_report_result_header_matches_kernel_verdict():
+    """Same inputs -> report Result line equals the kernel verdict (round-5
+    iceberg: report PARTIAL vs CLI success can no longer happen)."""
+    from sag.verdict import run_verdict
+
+    tool = ReportTool()
+    snapshot = {
+        "status": {"overall": "success", "tests_total": 2913, "tests_passed": 2893,
+                   "tests_failed": 15, "tests_errors": 0, "tests_skipped": 5,
+                   "pass_pct": 99.3},
+        "evidence_result": {"status": "success", "conflicts": ["test_report_parse_error"],
+                            "test_stats": None, "evidence_refs": []},
+    }
+    lines = tool._render_enhanced_header(
+        "2026-06-12 12:00:00", "success",
+        {"directory": "/workspace/x", "type": "Gradle Java Project", "build_system": "Gradle"},
+        snapshot=snapshot,
+    )
+    result_lines = [l for l in lines if l.startswith("**Result:**")]
+    expected = run_verdict("success", "success", ["test_report_parse_error"])
+    assert expected == "partial"
+    assert "PARTIAL" in result_lines[0].upper()
+
+
 def test_report_header_falls_back_to_evidence_stats_without_snapshot_stats():
     tool = ReportTool()
     snapshot = {

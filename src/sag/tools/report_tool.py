@@ -14,12 +14,35 @@ from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_s
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.ui.events import EventType, UIEventEmitter
+from sag.verdict import run_verdict
 
 from .base import BaseTool, ToolResult
 
 
 MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS = 5
 MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
+
+
+# Local status vocabularies mapped onto the verdict kernel's closed vocabulary
+# (spec §6: failed < partial < success). Statuses outside the map (e.g.
+# "unknown") abstain — the kernel treats them as "no objection raised".
+KERNEL_VERDICT_BY_REPORT_STATUS = {
+    "success": "success",
+    "partial": "partial",
+    "conflict": "partial",
+    "fail": "failed",
+    "failed": "failed",
+    "failure": "failed",
+    "error": "failed",
+    "blocked": "failed",
+}
+
+
+def _coerce_kernel_verdict(status: Optional[str]) -> Optional[str]:
+    """Map a report/evidence status string to the kernel vocabulary."""
+    if status is None:
+        return None
+    return KERNEL_VERDICT_BY_REPORT_STATUS.get(str(status).strip().lower())
 
 
 REPORT_LEGACY_STATUS_TO_EVIDENCE_STATUS = {
@@ -637,6 +660,25 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
         except (TypeError, ValueError):
             return None
+
+    def _snapshot_kernel_verdict(self, snapshot: Optional[Dict[str, Any]]) -> str:
+        """The run verdict for this report, via the verdict kernel (spec §6).
+
+        Combines the same inputs the agent's final status uses — the
+        physically-verified overall status, the evidence status, and the
+        evidence conflicts (which cap at partial). The header Result line and
+        the stored snapshot verdict both read this, so the round-5 iceberg
+        divergence (report PARTIAL vs CLI success) is impossible by
+        construction.
+        """
+        snapshot = snapshot or {}
+        status = snapshot.get("status") or {}
+        evidence = snapshot.get("evidence_result") or {}
+        return run_verdict(
+            _coerce_kernel_verdict(status.get("overall")),
+            _coerce_kernel_verdict(evidence.get("status")),
+            evidence.get("conflicts") or [],
+        )
 
     def _should_render_report_evidence_result(self, evidence: Dict[str, Any]) -> bool:
         if not evidence:
@@ -1487,6 +1529,10 @@ class ReportTool(BaseTool, UIEventEmitter):
             "failed_tests": test_history.get("failed_tests", []),
             "evidence_result": evidence_result or {},
         }
+
+        # Stored verdict comes from the SAME kernel inputs as the header's
+        # Result line (spec §6): header-vs-stored divergence is impossible.
+        status["verdict"] = self._snapshot_kernel_verdict(snapshot)
 
         attention = self._evaluate_attention_flags(snapshot)
         snapshot["attention"] = {
@@ -4490,15 +4536,17 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         evidence_result = (snapshot or {}).get("evidence_result") or {}
         if self._should_render_report_evidence_result(evidence_result):
-            evidence_status = str(evidence_result.get("status", "unknown")).upper()
+            # The Result line consumes the verdict kernel (spec §6) with the
+            # same inputs as the agent's final status — never the raw
+            # evidence status alone (round-5 iceberg: report PARTIAL while
+            # the CLI announced success).
+            verdict = self._snapshot_kernel_verdict(snapshot).upper()
             icon = {
                 "SUCCESS": "✅",
                 "PARTIAL": "⚠️",
-                "BLOCKED": "⛔",
-                "CONFLICT": "⚠️",
-                "UNKNOWN": "❔",
-            }.get(evidence_status, "❔")
-            result_msg = f"**Result:** {icon} {evidence_status}"
+                "FAILED": "❌",
+            }.get(verdict, "❔")
+            result_msg = f"**Result:** {icon} {verdict}"
             evidence_details = self._render_markdown_evidence_details(
                 evidence_result, snapshot=snapshot
             )
