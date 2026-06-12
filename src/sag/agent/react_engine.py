@@ -136,6 +136,9 @@ class ReActEngine(UIEventEmitter):
         self.phase_machine = phase_machine
         self.context_journal = context_journal
         self._phase_iterations = 0
+        # Window-reset marker: the first journal record after a reset carries
+        # the new phase intro text (spec §7 reconstruction).
+        self._journal_intro_dirty = False
         self.prompts = load_react_engine_prompts()
         self.repository_url = repository_url
         self.repository_ref = repository_ref
@@ -410,6 +413,7 @@ class ReActEngine(UIEventEmitter):
             if not machine.is_complete:
                 self._archive_window_steps()
                 self.steps = [self._phase_intro_step()]
+                self._journal_intro_dirty = True
                 self._start_phase_branch()
             return signal
         return None
@@ -529,6 +533,7 @@ class ReActEngine(UIEventEmitter):
         if not machine.is_complete:
             self._archive_window_steps()
             self.steps = [self._phase_intro_step()]
+            self._journal_intro_dirty = True
             self._start_phase_branch()
         return True
 
@@ -634,6 +639,7 @@ class ReActEngine(UIEventEmitter):
         self._phase_iterations = 0
         if phase_mode:
             self.steps = [self._phase_intro_step()]
+            self._journal_intro_dirty = True
             self._start_phase_branch()
         else:
             self.steps = []
@@ -820,6 +826,13 @@ class ReActEngine(UIEventEmitter):
                 # iteration describing the window composition (spec §7).
                 if phase_mode and self.context_journal is not None:
                     intro_len = len(self.steps[0].content) if self.steps else 0
+                    # Window texts (spec §7): intro only on the first record
+                    # after a window reset; ledger only when compaction
+                    # produced a new one this iteration.
+                    intro_text = None
+                    if self._journal_intro_dirty and self.steps:
+                        intro_text = self.steps[0].content
+                        self._journal_intro_dirty = False
                     self.context_journal.record(
                         phase=self.phase_machine.current_phase,
                         iteration=self.current_iteration,
@@ -830,6 +843,9 @@ class ReActEngine(UIEventEmitter):
                         },
                         delta={"added": len(parsed_steps), "compacted": n_compacted},
                         total_chars=len(current_prompt),
+                        intro_text=intro_text,
+                        ledger_text=ledger,
+                        step_span=len(self.steps),
                     )
 
                 # Step count is now automatically managed by branch history updates

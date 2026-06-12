@@ -46,3 +46,20 @@ def test_separate_files_per_phase():
 def test_never_raises_on_orchestrator_error():
     j = ContextJournal(FakeOrchestrator(fail=True))
     j.record(phase="build", iteration=1, segments={}, delta={}, total_chars=1)  # must not raise
+
+
+def test_window_texts_recorded_when_changed():
+    orch = FakeOrchestrator()
+    j = ContextJournal(orch)
+    j.record(phase="build", iteration=1, segments={}, delta={}, total_chars=10,
+             intro_text="=== PHASE: BUILD ===\nobjective...", ledger_text=None, step_span=1)
+    j.record(phase="build", iteration=2, segments={}, delta={}, total_chars=12,
+             intro_text=None, ledger_text="ATTEMPT LEDGER:\n✗ build: ...", step_span=5)
+
+    appends = [c for c in orch.commands if "phase_build.journal.jsonl" in c]
+    assert "PHASE: BUILD" in appends[0]
+    assert "ATTEMPT LEDGER" in appends[1]
+    import json as _json
+    rec2 = _json.loads(appends[1][appends[1].index("{"):appends[1].rindex("}") + 1])
+    assert rec2["step_span"] == 5
+    assert rec2.get("intro_text") is None

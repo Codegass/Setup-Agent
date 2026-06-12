@@ -8,7 +8,7 @@ I/O must never break a run."""
 
 import json
 import shlex
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from loguru import logger
 
@@ -21,12 +21,24 @@ class ContextJournal:
         self._dir_ready = False
 
     def record(self, phase: str, iteration: int, segments: Dict[str, Any],
-               delta: Dict[str, Any], total_chars: int) -> None:
+               delta: Dict[str, Any], total_chars: int,
+               intro_text: Optional[str] = None, ledger_text: Optional[str] = None,
+               step_span: Optional[int] = None) -> None:
         try:
-            line = json.dumps({
+            payload = {
                 "iteration": iteration, "phase": phase,
                 "segments": segments, "delta": delta, "total_chars": total_chars,
-            })
+            }
+            # Window texts (spec §7): carried only when they changed since the
+            # last record, so `sag inspect` can reconstruct what the model saw
+            # without bloating every line.
+            if intro_text is not None:
+                payload["intro_text"] = intro_text
+            if ledger_text is not None:
+                payload["ledger_text"] = ledger_text
+            if step_span is not None:
+                payload["step_span"] = step_span
+            line = json.dumps(payload)
             prefix = "" if self._dir_ready else f"mkdir -p {JOURNAL_DIR} && "
             path = f"{JOURNAL_DIR}/phase_{phase}.journal.jsonl"
             self.orchestrator.execute_command(
