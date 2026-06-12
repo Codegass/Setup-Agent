@@ -660,3 +660,43 @@ def test_final_verdict_uses_kernel_conflict_cap():
     result = agent._get_verified_final_status(react_engine_success=True)
     assert result is True, "flow-control bool unchanged"
     assert agent.final_verdict == "partial", "conflicts must cap the surfaced verdict"
+
+
+def test_partial_reason_for_conflict_capped_run():
+    """Round-6 vfs: a conflict-capped partial printed 'no test reports found'
+    while 96.2% of tests sat in the report. The banner reason must match the
+    actual cause."""
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "fingerprints"},
+            test_status={
+                "has_test_reports": True, "status": "PARTIAL", "reason": "",
+                "pass_rate": 96.2, "total_tests": 184, "passed_tests": 177,
+                "failed_tests": 3, "error_tests": 0, "skipped_tests": 4,
+                "test_exclusions": [], "modules_without_tests": [],
+                "conflicts": ["test_report_parse_error"],
+            },
+        )
+    )
+    agent._get_verified_final_status(react_engine_success=True)
+    assert agent.final_verdict == "partial"
+    assert "conflict" in agent.final_verdict_reason
+    assert "no test reports" not in agent.final_verdict_reason
+
+
+def test_partial_reason_for_missing_test_evidence():
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "fingerprints"},
+            test_status={
+                "has_test_reports": False, "status": "WARNING", "reason": "",
+                "pass_rate": 0.0, "total_tests": 0, "passed_tests": 0,
+                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
+                "test_exclusions": [],
+            },
+            analysis_status={"analyzed": False},
+        )
+    )
+    agent._get_verified_final_status(react_engine_success=False)
+    assert agent.final_verdict == "partial"
+    assert "no test reports" in agent.final_verdict_reason

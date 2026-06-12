@@ -996,11 +996,23 @@ START by working toward the current phase objective shown in my context.
         machine = getattr(getattr(self, "react_engine", None), "phase_machine", None)
         machine_outcome = machine.overall_outcome() if machine is not None else None
 
-        self.final_verdict = run_verdict(
-            machine_outcome,
-            physical_verdict,
-            test_status.get("conflicts", []) if isinstance(test_status, dict) else [],
-        )
+        conflicts = test_status.get("conflicts", []) if isinstance(test_status, dict) else []
+        self.final_verdict = run_verdict(machine_outcome, physical_verdict, conflicts)
+
+        # The banner must explain WHY the verdict is what it is — round 6:
+        # a conflict-capped vfs run printed "no test reports found" while its
+        # 96.2% test results sat right there in the report.
+        if self.final_verdict == "partial":
+            if physical_verdict == "partial":
+                self.final_verdict_reason = "build verified, tests not verified (no test reports found)"
+            elif machine_outcome == "partial":
+                self.final_verdict_reason = "one or more phases were blocked (see report)"
+            else:
+                self.final_verdict_reason = (
+                    f"test evidence carries unresolved conflicts ({', '.join(conflicts[:3])})"
+                )
+        else:
+            self.final_verdict_reason = ""
 
         if machine_outcome == "failed":
             if physical_ok:
@@ -1286,9 +1298,9 @@ START by working toward the current phase objective shown in my context.
 
         # Provide next steps
         if success and getattr(self, "final_verdict", "success") == "partial":
+            reason = getattr(self, "final_verdict_reason", "") or "see report for details"
             self.console.print(
-                "\n[bold yellow]⚠️ Project setup PARTIALLY completed: build verified, "
-                "tests not verified (no test reports found).[/bold yellow]"
+                f"\n[bold yellow]⚠️ Project setup PARTIALLY completed: {reason}.[/bold yellow]"
             )
             self.console.print(f"[dim]You can connect to the container using:[/dim]")
             self.console.print(

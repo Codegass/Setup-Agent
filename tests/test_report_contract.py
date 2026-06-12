@@ -916,3 +916,41 @@ def test_report_header_falls_back_to_evidence_stats_without_snapshot_stats():
 
     tests_lines = [l for l in lines if l.startswith("**Tests:**")]
     assert tests_lines and "8" in tests_lines[0]
+
+
+def test_build_green_no_tests_maps_to_partial_not_failed():
+    """Round-6 beam: legacy status.overall='fail' for 'build green, expected
+    tests missing' rendered ❌ FAILED while the agent honestly said partial.
+    The snapshot mapper must apply the agent's tri-state rule."""
+    tool = ReportTool()
+    snapshot = {
+        "status": {"overall": "fail", "tests_total": 0, "tests_passed": 0, "pass_pct": 0},
+        "phases": {"build": True, "clone": True, "test": False},
+        "evidence_result": {"status": "success", "conflicts": [], "test_stats": None,
+                            "evidence_refs": []},
+    }
+    verdict = tool._snapshot_kernel_verdict(snapshot)
+    assert verdict == "partial", verdict
+
+
+def test_build_failed_still_maps_to_failed():
+    tool = ReportTool()
+    snapshot = {
+        "status": {"overall": "fail", "tests_total": 0, "tests_passed": 0},
+        "phases": {"build": False, "clone": True},
+        "evidence_result": {"status": "success", "conflicts": [], "test_stats": None,
+                            "evidence_refs": []},
+    }
+    assert tool._snapshot_kernel_verdict(snapshot) == "failed"
+
+
+def test_console_result_line_uses_kernel_verdict():
+    tool = ReportTool()
+    snapshot = {
+        "status": {"overall": "fail", "tests_total": 0, "tests_passed": 0},
+        "phases": {"build": True},
+        "evidence_result": {"status": "success", "conflicts": [], "test_stats": None,
+                            "evidence_refs": ["x"]},
+    }
+    lines = tool._render_console_evidence_result(snapshot)
+    assert lines and lines[0] == "Result: PARTIAL", lines

@@ -606,7 +606,9 @@ class ReportTool(BaseTool, UIEventEmitter):
         if not self._should_render_report_evidence_result(evidence):
             return []
 
-        lines = [f"Result: {str(evidence.get('status', 'unknown')).upper()}"]
+        # Console Result reads the same kernel verdict as the header — round 6
+        # beam printed "Result: SUCCESS" beside a FAILED header.
+        lines = [f"Result: {self._snapshot_kernel_verdict(snapshot).upper()}"]
         test_stats = self._snapshot_test_stats(snapshot) or self._coerce_report_test_stats(
             evidence.get("test_stats")
         )
@@ -684,11 +686,31 @@ class ReportTool(BaseTool, UIEventEmitter):
             # to a three-way combine.
             combine_verdicts(
                 self._trunk_phase_machine_outcome(),
-                _coerce_kernel_verdict(status.get("overall")),
+                self._physical_verdict_from_snapshot(status, snapshot),
             ),
             _coerce_kernel_verdict(evidence.get("status")),
             evidence.get("conflicts") or [],
         )
+
+    @staticmethod
+    def _physical_verdict_from_snapshot(
+        status: Dict[str, Any], snapshot: Dict[str, Any]
+    ) -> Optional[str]:
+        """Map the snapshot's physical state to the kernel using the SAME
+        tri-state rule the agent uses (round-6 beam: the legacy 'fail' for
+        'build green, expected tests missing' rendered ❌ FAILED while the
+        agent honestly said partial — two mappers for one physical situation).
+
+        build green + no test results = PARTIAL (build verified, tests not),
+        never failed; everything else keeps the legacy coercion."""
+        coerced = _coerce_kernel_verdict(status.get("overall"))
+        if coerced != "failed":
+            return coerced
+        build_green = bool((snapshot.get("phases") or {}).get("build"))
+        tests_total = status.get("tests_total")
+        if build_green and not tests_total:
+            return "partial"
+        return coerced
 
     def _trunk_phase_machine_outcome(self) -> Optional[str]:
         """Phase-machine outcome reconstructed from the trunk's phase_* tasks.
