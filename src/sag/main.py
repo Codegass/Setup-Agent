@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 from loguru import logger
@@ -15,6 +15,8 @@ from rich.text import Text
 
 from sag import __version__
 from sag.agent.agent import SetupAgent
+from sag.agent.context_journal import JOURNAL_DIR
+from sag.agent.phase_machine import PHASE_NAMES
 from sag.config import (
     Config,
     LogLevel,
@@ -584,6 +586,357 @@ def shell(docker_name, shell):
     except Exception as e:
         logger.error(f"Shell connection failed: {e}")
         console.print(f"[bold red]❌ Connection failed: {e}[/bold red]")
+
+
+# --- sag inspect (spec §7): render context journals + phase history -------
+#
+# Pure render helpers first (unit-tested without click/docker); the command
+# below only chooses a source (live container vs local --record artifact dir)
+# and prints what they return.
+
+_CONTEXTS_DIR_IN_CONTAINER = "/workspace/.setup_agent/contexts"
+
+
+class _InspectError(Exception):
+    """User-facing inspect failure: print the message and exit 1 (no traceback)."""
+
+
+def _coerce_entry_list(value) -> List[Any]:
+    """A JSON value → list of entries (anything non-array → []).
+
+    NOTE: never `isinstance(x, list)` in this module — the module-level `list`
+    click command shadows the builtin.
+    """
+    if value is None or isinstance(value, (str, bytes, dict)):
+        return []
+    try:
+        return [item for item in value]
+    except TypeError:
+        return []
+
+
+def _inspect_sorted_records(records) -> List[Dict[str, Any]]:
+    """Journal records ordered by iteration (defensive: bad records sort last)."""
+    def key(rec):
+        it = rec.get("iteration") if isinstance(rec, dict) else None
+        return (0, it) if isinstance(it, int) else (1, 0)
+
+    return sorted([r for r in records if isinstance(r, dict)], key=key)
+
+
+def _inspect_render_timeline(records) -> str:
+    """One line per journal record: iter, total_chars, delta, step span, and
+    markers for intro/ledger changes (the texts travel only when they changed)."""
+    ordered = _inspect_sorted_records(records)
+    if not ordered:
+        return "no journal records"
+    phase = ordered[0].get("phase", "?")
+    lines = [f"phase: {phase} — {len(ordered)} journal record(s)"]
+    for rec in ordered:
+        delta = rec.get("delta") or {}
+        markers = []
+        if rec.get("intro_text"):
+            markers.append("INTRO")
+        if rec.get("ledger_text"):
+            markers.append("LEDGER")
+        marker_str = f"  [{', '.join(markers)}]" if markers else ""
+        lines.append(
+            f"iter {rec.get('iteration', '?'):>4}  "
+            f"chars={rec.get('total_chars', 0):<7} "
+            f"added={delta.get('added', 0)} compacted={delta.get('compacted', 0)}  "
+            f"span={rec.get('step_span', '?')}{marker_str}"
+        )
+    return "\n".join(lines)
+
+
+def _summarize_history_entry(entry, max_chars: int = 200) -> str:
+    """One-line thought/action/observation summary for a phase-history entry."""
+    if not isinstance(entry, dict):
+        return f"[?] {str(entry)[:max_chars]}"
+    etype = entry.get("type", "?")
+    if etype == "action":
+        status = "ok" if entry.get("success") else "FAILED"
+        text = " ".join(str(entry.get("output") or "").split())
+        return f"[action] {entry.get('tool_name', '?')} ({status}): {text[:max_chars]}"
+    text = " ".join(str(entry.get("content") or entry.get("output") or "").split())
+    return f"[{etype}] {text[:max_chars]}"
+
+
+def _inspect_render_iteration(records, iteration, history_entries) -> str:
+    """Reconstruct what the model saw at one iteration: the nearest intro text
+    at-or-before it, the latest ledger text, the record's manifest, and the
+    phase-history entries around it."""
+    ordered = _inspect_sorted_records(records)
+    target = next(
+        (rec for rec in ordered if rec.get("iteration") == iteration), None
+    )
+    if target is None:
+        known = [rec.get("iteration") for rec in ordered]
+        span = f"{known[0]}..{known[-1]}" if known else "none"
+        return f"No journal record for iteration {iteration} (recorded iterations: {span})"
+
+    intro_text, intro_iter = None, None
+    ledger_text, ledger_iter = None, None
+    for rec in ordered:
+        it = rec.get("iteration")
+        if not isinstance(it, int) or it > iteration:
+            continue
+        if rec.get("intro_text"):
+            intro_text, intro_iter = rec["intro_text"], it
+        if rec.get("ledger_text"):
+            ledger_text, ledger_iter = rec["ledger_text"], it
+
+    lines = [f"=== iteration {iteration} (phase {target.get('phase', '?')}) ==="]
+    manifest = {
+        "segments": target.get("segments"),
+        "delta": target.get("delta"),
+        "total_chars": target.get("total_chars"),
+        "step_span": target.get("step_span"),
+    }
+    lines.append(f"manifest: {json.dumps(manifest)}")
+    if intro_text is not None:
+        lines.append(f"--- intro (recorded at iter {intro_iter}) ---")
+        lines.append(intro_text)
+    else:
+        lines.append("--- intro: none recorded at or before this iteration ---")
+    if ledger_text is not None:
+        lines.append(f"--- ledger (recorded at iter {ledger_iter}) ---")
+        lines.append(ledger_text)
+    history_entries = [e for e in (history_entries or [])]
+    if history_entries:
+        lines.append(f"--- phase history around this iteration ({len(history_entries)} entries) ---")
+        for entry in history_entries:
+            lines.append(_summarize_history_entry(entry))
+    else:
+        lines.append("--- phase history: no entries available ---")
+    return "\n".join(lines)
+
+
+def _inspect_history_window(records, iteration, history, before: int = 8, after: int = 2) -> List[Dict[str, Any]]:
+    """Pick the phase-history entries around an iteration. History entries carry
+    no iteration marker, so the position is estimated from the cumulative
+    journal delta (one `delta.added` ≈ one thought/action entry)."""
+    history = [e for e in (history or []) if isinstance(e, dict)]
+    if not history:
+        return []
+    cumulative = 0
+    for rec in _inspect_sorted_records(records):
+        it = rec.get("iteration")
+        if isinstance(it, int) and it <= iteration:
+            delta = rec.get("delta") or {}
+            added = delta.get("added", 0)
+            if isinstance(added, int):
+                cumulative += added
+    idx = min(cumulative, len(history))
+    return history[max(0, idx - before): min(len(history), idx + after)]
+
+
+def _parse_journal_records(text: Optional[str]) -> List[Dict[str, Any]]:
+    """JSONL → list of dict records; bad lines are skipped, never fatal."""
+    records: List[Dict[str, Any]] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+class _SessionInspectSource:
+    """Reads the local `--record` artifact copy under logs/session_*/."""
+
+    def __init__(self, session_dir: str):
+        base = Path(session_dir)
+        for candidate in (base / ".setup_agent" / "contexts", base / "contexts"):
+            if candidate.is_dir():
+                self.contexts_dir = candidate
+                break
+        else:
+            raise _InspectError(
+                f"No .setup_agent/contexts artifact tree under '{base}' "
+                f"(was the run recorded with --record?)"
+            )
+
+    def _read(self, relative: str) -> Optional[str]:
+        path = self.contexts_dir / relative
+        try:
+            return path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
+        except OSError:
+            return None
+
+    def journal_records(self, phase: str) -> List[Dict[str, Any]]:
+        return _parse_journal_records(self._read(f"journal/phase_{phase}.journal.jsonl"))
+
+    def journal_phases(self) -> List[str]:
+        journal_dir = self.contexts_dir / "journal"
+        if not journal_dir.is_dir():
+            return []
+        names = sorted(p.name for p in journal_dir.glob("phase_*.journal.jsonl"))
+        return [n[len("phase_"):-len(".journal.jsonl")] for n in names]
+
+    def trunk_data(self) -> Optional[Dict[str, Any]]:
+        trunks = sorted(self.contexts_dir.glob("trunk_*.json"))
+        if not trunks:
+            return None
+        try:
+            return json.loads(trunks[-1].read_text(encoding="utf-8", errors="replace"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+
+    def phase_history(self, phase: str) -> List[Any]:
+        text = self._read(f"phase_{phase}.json")
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        return _coerce_entry_list(data.get("history") if isinstance(data, dict) else None)
+
+
+class _ContainerInspectSource:
+    """Reads the live in-container context tree via DockerOrchestrator."""
+
+    def __init__(self, docker_name: str):
+        label = docker_name[4:] if docker_name.startswith("sag-") else docker_name
+        self.orchestrator = DockerOrchestrator(project_name=label)
+        if not self.orchestrator.container_exists():
+            raise _InspectError(
+                f"Docker container '{self.orchestrator.container_name}' not found. "
+                f"Use 'sag list' to see available projects, or pass --session logs/session_X."
+            )
+        if not self.orchestrator.is_container_running():
+            raise _InspectError(
+                f"Container '{self.orchestrator.container_name}' is not running. "
+                f"Start it (e.g. 'sag shell {self.orchestrator.container_name}') "
+                f"or inspect a recorded session with --session logs/session_X."
+            )
+
+    def _run(self, command: str) -> Optional[str]:
+        result = self.orchestrator.execute_command(command)
+        if result.get("exit_code") != 0:
+            return None
+        return result.get("output", "")
+
+    def journal_records(self, phase: str) -> List[Dict[str, Any]]:
+        text = self._run(f"cat {JOURNAL_DIR}/phase_{phase}.journal.jsonl 2>/dev/null")
+        return _parse_journal_records(text)
+
+    def journal_phases(self) -> List[str]:
+        output = self._run(
+            f"find {JOURNAL_DIR} -maxdepth 1 -name 'phase_*.journal.jsonl' -type f 2>/dev/null"
+        )
+        names = sorted(Path(line.strip()).name for line in (output or "").splitlines() if line.strip())
+        return [n[len("phase_"):-len(".journal.jsonl")] for n in names]
+
+    def trunk_data(self) -> Optional[Dict[str, Any]]:
+        newest = self._run(
+            f"find {_CONTEXTS_DIR_IN_CONTAINER} -maxdepth 1 -name 'trunk_*.json' -type f "
+            f"2>/dev/null | sort | tail -1"
+        )
+        newest = (newest or "").strip()
+        if not newest:
+            return None
+        text = self._run(f"cat {newest} 2>/dev/null")
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def phase_history(self, phase: str) -> List[Any]:
+        text = self._run(f"cat {_CONTEXTS_DIR_IN_CONTAINER}/phase_{phase}.json 2>/dev/null")
+        if not text:
+            return []
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        return _coerce_entry_list(data.get("history") if isinstance(data, dict) else None)
+
+
+def _inspect_render_phase_list(source) -> str:
+    """All phases: trunk status (done/blocked) + journal iteration spans."""
+    trunk = source.trunk_data()
+    phase_tasks: Dict[str, Dict[str, Any]] = {}
+    for task in (trunk or {}).get("todo_list", []) or []:
+        task_id = task.get("id", "") if isinstance(task, dict) else ""
+        if task_id.startswith("phase_"):
+            phase_tasks[task_id[len("phase_"):]] = task
+
+    journal_phases = source.journal_phases()
+    ordered = [p for p in PHASE_NAMES if p in phase_tasks or p in journal_phases]
+    ordered += [p for p in sorted(set(phase_tasks) | set(journal_phases)) if p not in ordered]
+    if not ordered:
+        raise _InspectError(
+            "No phases found: neither phase_* trunk tasks nor journal files "
+            "(was this a phase-mode setup run?)"
+        )
+
+    status_names = {"completed": "done", "failed": "blocked"}
+    lines = ["phase        status       iterations   notes"]
+    for phase in ordered:
+        task = phase_tasks.get(phase, {})
+        status = status_names.get(task.get("status"), task.get("status") or "?")
+        records = _inspect_sorted_records(source.journal_records(phase))
+        iters = [r.get("iteration") for r in records if isinstance(r.get("iteration"), int)]
+        span = f"{iters[0]}..{iters[-1]}" if iters else "-"
+        note = " ".join(str(task.get("notes") or task.get("key_results") or "").split())[:80]
+        lines.append(f"{phase:<12} {status:<12} {span:<12} {note}")
+    return "\n".join(lines)
+
+
+@cli.command()
+@click.argument("docker_name")
+@click.option("--phase", default=None, help=f"Phase to inspect ({'/'.join(PHASE_NAMES)})")
+@click.option("--iter", "iteration", default=None, type=int, help="Iteration number within the phase")
+@click.option(
+    "--session",
+    "session_dir",
+    default=None,
+    help="Read from a local --record artifact dir (e.g. logs/session_X) instead of the container",
+)
+def inspect(docker_name, phase, iteration, session_dir):
+    """Inspect recorded context windows: phase timelines and per-iteration views."""
+    try:
+        if iteration is not None and phase is None:
+            raise _InspectError("--iter requires --phase (e.g. --phase build --iter 12)")
+
+        if session_dir:
+            source = _SessionInspectSource(session_dir)
+        else:
+            source = _ContainerInspectSource(docker_name)
+
+        if phase is None:
+            click.echo(_inspect_render_phase_list(source))
+            return
+
+        records = source.journal_records(phase)
+        if not records:
+            raise _InspectError(
+                f"No journal found for phase '{phase}' "
+                f"(expected journal/phase_{phase}.journal.jsonl in the context tree)"
+            )
+        if iteration is None:
+            click.echo(_inspect_render_timeline(records))
+            return
+
+        history = source.phase_history(phase)
+        entries = _inspect_history_window(records, iteration, history)
+        click.echo(_inspect_render_iteration(records, iteration, entries))
+    except _InspectError as exc:
+        console.print(f"[bold red]❌ {exc}[/bold red]")
+        sys.exit(1)
+    except Exception as exc:  # never a traceback for a debugging command
+        logger.debug(f"sag inspect failed: {exc}")
+        console.print(f"[bold red]❌ Inspect failed: {exc}[/bold red]")
+        sys.exit(1)
 
 
 @cli.command()
