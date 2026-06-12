@@ -979,32 +979,40 @@ START by working toward the current phase objective shown in my context.
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
         """Combine physical validation with the phase machine's honest view.
 
-        The machine's overall_outcome() CAPS the verdict (stage-2 Task 8): a
-        machine-failed run (blocked build phase) is failed even if artifacts
-        exist; a machine-partial run is at best partial. Machine success never
-        promotes — physical validation still rules exactly as before. Runs
-        without a machine (`sag run --task`, legacy) are untouched.
+        The surfaced verdict string flows through the verdict kernel (spec §6):
+        ``run_verdict`` takes the MINIMUM of the machine outcome and the
+        physical verdict, with evidence conflicts capping at partial — the
+        machine caps but never promotes (stage-2 Task 8), and physical
+        validation still rules exactly as before. Runs without a machine
+        (`sag run --task`, legacy) are untouched. The returned boolean is
+        flow control and keeps its pre-kernel behavior EXACTLY.
         """
+        from sag.verdict import run_verdict
+
         physical_ok = self._get_physical_final_status(react_engine_success)
+        physical_verdict = self.final_verdict
+        test_status = getattr(self, "_last_test_status", None)
 
         machine = getattr(getattr(self, "react_engine", None), "phase_machine", None)
-        if machine is None:
-            return physical_ok
+        machine_outcome = machine.overall_outcome() if machine is not None else None
 
-        outcome = machine.overall_outcome()
-        if outcome == "failed":
+        self.final_verdict = run_verdict(
+            machine_outcome,
+            physical_verdict,
+            test_status.get("conflicts", []) if isinstance(test_status, dict) else [],
+        )
+
+        if machine_outcome == "failed":
             if physical_ok:
                 logger.warning(
                     "Phase machine recorded a blocked build phase; capping verdict "
                     "to failed despite physical artifacts"
                 )
-            self.final_verdict = "failed"
             return False
-        if outcome == "partial" and self.final_verdict == "success":
+        if machine_outcome == "partial" and physical_verdict == "success":
             logger.info(
                 "Phase machine recorded blocked phases; capping verdict to partial"
             )
-            self.final_verdict = "partial"
         return physical_ok
 
     def _get_physical_final_status(self, react_engine_success: bool) -> bool:
@@ -1024,6 +1032,9 @@ START by working toward the current phase objective shown in my context.
         from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 
         self.final_verdict = "failed"
+        # Surfaced to the verdict-kernel combiner (_get_verified_final_status)
+        # so evidence conflicts from validate_test_status can cap the verdict.
+        self._last_test_status = None
         project_name = self._get_project_name_for_validation()
 
         if not project_name:
@@ -1041,6 +1052,7 @@ START by working toward the current phase objective shown in my context.
 
         # Get TEST status separately so known test suites cannot disappear behind build artifacts.
         test_status = self.physical_validator.validate_test_status(project_name)
+        self._last_test_status = test_status
         analysis_status = {}
         try:
             analysis_status = self.physical_validator.validate_project_analysis_status(

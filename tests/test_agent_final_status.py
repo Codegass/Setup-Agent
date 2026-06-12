@@ -632,3 +632,22 @@ def test_machine_success_keeps_physical_success():
 
     assert agent._get_verified_final_status(react_engine_success=True) is True
     assert agent.final_verdict == "success"
+
+
+def test_final_verdict_uses_kernel_conflict_cap():
+    """Physical success + machine success + evidence conflicts => partial."""
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "reason": "fingerprints"},
+            test_status={
+                "has_test_reports": True, "status": "PARTIAL", "reason": "",
+                "pass_rate": 99.3, "total_tests": 2913, "passed_tests": 2893,
+                "failed_tests": 15, "error_tests": 0, "skipped_tests": 5,
+                "test_exclusions": [], "modules_without_tests": [],
+                "conflicts": ["test_report_parse_error"],
+            },
+        )
+    )
+    result = agent._get_verified_final_status(react_engine_success=True)
+    assert result is True, "flow-control bool unchanged"
+    assert agent.final_verdict == "partial", "conflicts must cap the surfaced verdict"
