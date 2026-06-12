@@ -154,21 +154,29 @@ class AgentStateEvaluator:
 
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
-        # 2. Check if working outside task context (ghost state prevention)
-        ghost_state_analysis = self._check_ghost_state(steps)
-        if ghost_state_analysis.needs_guidance:
-            return ghost_state_analysis
+        # Stage 2: machine-driven setup runs have no task ceremony — the
+        # manage_context tool is not registered and trunk phase ids are engine
+        # internals (never model-visible). Ceremony checks stand down here;
+        # the ones that survive (completion opportunity, idle thinking) speak
+        # phase vocabulary inside their own implementations.
+        phase_mode = bool(getattr(self, "phase_machine_active", False))
 
-        # 2.5. Check if task_2 requires project_analyzer enforcement
-        task2_analysis = self._check_task2_project_analyzer_requirement(steps)
-        if task2_analysis.needs_guidance:
-            return task2_analysis
+        if not phase_mode:
+            # 2. Check if working outside task context (ghost state prevention)
+            ghost_state_analysis = self._check_ghost_state(steps)
+            if ghost_state_analysis.needs_guidance:
+                return ghost_state_analysis
 
-        # 2.6. Check if project analysis is missing (using physical validator)
-        if self.physical_validator:
-            analysis_check = self._check_project_analysis_status()
-            if analysis_check.needs_guidance:
-                return analysis_check
+            # 2.5. Check if task_2 requires project_analyzer enforcement
+            task2_analysis = self._check_task2_project_analyzer_requirement(steps)
+            if task2_analysis.needs_guidance:
+                return task2_analysis
+
+            # 2.6. Check if project analysis is missing (using physical validator)
+            if self.physical_validator:
+                analysis_check = self._check_project_analysis_status()
+                if analysis_check.needs_guidance:
+                    return analysis_check
 
         # 3. Check if task completion opportunity was missed
         if self.context_manager.current_task_id:
@@ -181,8 +189,12 @@ class AgentStateEvaluator:
         if idle_analysis.needs_guidance:
             return idle_analysis
 
-        # 4. Check if context switch is needed
-        if self.context_manager.current_task_id:
+        # 4. Check if context switch is needed. Phase mode has no
+        # manage_context actions, so the counter never resets there — the
+        # reminder would fire every iteration and mandate an unregistered
+        # tool; phase transitions are the context switches now (the engine
+        # resets the counter on them).
+        if not phase_mode and self.context_manager.current_task_id:
             context_analysis = self._check_context_switch_needed(steps_since_context_switch)
             if context_analysis.needs_guidance:
                 return context_analysis
@@ -460,6 +472,30 @@ class AgentStateEvaluator:
                         break
 
         if detected_signals:
+            # Phase mode: manage_context is not registered and phase ids are
+            # never model-visible — speak the phase vocabulary instead, and
+            # only as evidence-qualified options (gates never mandate).
+            if getattr(self, "phase_machine_active", False):
+                guidance = (
+                    f"🚨 COMPLETION SIGNALS DETECTED: {', '.join(set(detected_signals))}\n\n"
+                    f"If the current phase's objective is met, record it now:\n\n"
+                    f"phase(\n"
+                    f"    action='done',\n"
+                    f"    key_results='[numbers/paths the next phase needs]',\n"
+                    f"    evidence=[output refs]\n"
+                    f")\n\n"
+                    f"If the objective cannot be finished, phase(action='blocked', "
+                    f"reason=..., evidence=[refs]) — an honest blocked outcome "
+                    f"beats drifting into unrecorded work."
+                )
+                return AgentStateAnalysis(
+                    status=AgentStatus.TASK_COMPLETE_SIGNAL,
+                    needs_guidance=True,
+                    guidance_message=guidance,
+                    guidance_priority=9,  # Very high priority
+                    detected_signals=list(set(detected_signals)),
+                )
+
             current_task = self.context_manager.current_task_id
             guidance = (
                 f"🚨 TASK COMPLETION SIGNALS DETECTED: {', '.join(set(detected_signals))}\n\n"
@@ -497,16 +533,31 @@ class AgentStateEvaluator:
                     break
 
         if consecutive_thoughts >= 3:
-            guidance = (
-                f"⚠️ IDLE THINKING DETECTED: You have been thinking for {consecutive_thoughts} steps without action.\n\n"
-                f"You MUST take action now. Use one of these tools:\n"
-                f"• manage_context - Check current state or complete tasks\n"
-                f"• bash - Execute commands in the environment\n"
-                f"• maven - Run Maven build commands\n"
-                f"• file_io - Read or write files\n"
-                f"• project_setup - Clone repositories\n\n"
-                f"Stop overthinking and ACT! The tools will handle the execution."
-            )
+            if getattr(self, "phase_machine_active", False):
+                # Phase mode registers build/project/search/phase, never the
+                # legacy manage_context/maven/project_setup surface.
+                guidance = (
+                    f"⚠️ IDLE THINKING DETECTED: You have been thinking for {consecutive_thoughts} steps without action.\n\n"
+                    f"You MUST take action now. Use one of these tools:\n"
+                    f"• bash - Execute commands in the environment\n"
+                    f"• build - Compile or test through the registered toolchain\n"
+                    f"• project - Clone, provision, or analyze the project\n"
+                    f"• file_io - Read or write files\n"
+                    f"• search - Search stored outputs or the web\n"
+                    f"• phase - Record the phase outcome (done/blocked) once it is settled\n\n"
+                    f"Stop overthinking and ACT! The tools will handle the execution."
+                )
+            else:
+                guidance = (
+                    f"⚠️ IDLE THINKING DETECTED: You have been thinking for {consecutive_thoughts} steps without action.\n\n"
+                    f"You MUST take action now. Use one of these tools:\n"
+                    f"• manage_context - Check current state or complete tasks\n"
+                    f"• bash - Execute commands in the environment\n"
+                    f"• maven - Run Maven build commands\n"
+                    f"• file_io - Read or write files\n"
+                    f"• project_setup - Clone repositories\n\n"
+                    f"Stop overthinking and ACT! The tools will handle the execution."
+                )
 
             return AgentStateAnalysis(
                 status=AgentStatus.IDLE_THINKING,

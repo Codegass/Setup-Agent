@@ -6,7 +6,8 @@ tasks and re-added the same plan under fresh ids, churning ids and orphaning
 branch contexts/outputs in the webui.
 """
 
-from sag.agent.context_manager import TaskStatus, TrunkContext
+from sag.agent.context_manager import Task, TaskStatus, TrunkContext
+from sag.agent.phase_machine import PHASE_NAMES
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
 
@@ -121,3 +122,64 @@ def test_known_analysis_records_build_system_in_trunk():
         {"execution_plan": PLAN, "build_system": "Maven", "project_type": "Java"}
     )
     assert trunk.environment_summary.get("build_system") == "Maven"
+
+
+# --- Stage-2 phase machine (spec §3.1) --------------------------------------
+#
+# A phase trunk (phase_<name> task ids) is owned by the engine: the analyzer's
+# execution plan is phase-internal advice surfaced in the tool output, never
+# trunk tasks. Rewriting the trunk deleted pending phase_build/phase_test/
+# phase_report entries, turning every later _persist_phase_record into a
+# silent no-op and orphaning task_N entries in the webui.
+
+
+def _phase_trunk():
+    trunk = TrunkContext(context_id="trunk_p", goal="g", project_url="u", project_name="p")
+    for name in PHASE_NAMES:
+        trunk.todo_list.append(Task(id=f"phase_{name}", description=f"{name} objective"))
+    trunk.todo_list[0].status = TaskStatus.COMPLETED  # phase_provision
+    trunk.todo_list[1].status = TaskStatus.IN_PROGRESS  # phase_analyze
+    return trunk
+
+
+def test_phase_trunk_task_ids_survive_analyzer_plan():
+    trunk = _phase_trunk()
+    analyzer = ProjectAnalyzerTool(None, FakeContextManager(trunk))
+
+    result = analyzer._update_trunk_context_with_plan(
+        {"execution_plan": PLAN, "build_system": "Gradle", "static_test_count": 42}
+    )
+
+    assert result is True
+    assert [t.id for t in trunk.todo_list] == [f"phase_{name}" for name in PHASE_NAMES], (
+        "analyzer must never rewrite a phase trunk: pending phase_* tasks "
+        "must stay intact and no task_N entries may be appended"
+    )
+    # Pending phase tasks remained pending; the in-progress one untouched.
+    assert trunk.todo_list[1].status == TaskStatus.IN_PROGRESS
+    assert all(t.status == TaskStatus.PENDING for t in trunk.todo_list[2:])
+
+
+def test_phase_trunk_still_records_analysis_metrics():
+    """Build system + static test metrics keep flowing to environment_summary
+    (the report/test phases consume them) even though the todo list is
+    untouched."""
+    trunk = _phase_trunk()
+    analyzer = ProjectAnalyzerTool(None, FakeContextManager(trunk))
+
+    analyzer._update_trunk_context_with_plan(
+        {"execution_plan": PLAN, "build_system": "Gradle", "static_test_count": 42}
+    )
+
+    assert trunk.environment_summary.get("build_system") == "Gradle"
+    assert trunk.environment_summary.get("static_test_count") == 42
+
+
+def test_phase_trunk_record_persists_after_analyzer_plan():
+    """End-to-end shape of the original defect: after the analyze phase runs
+    the analyzer, the engine must still be able to mark phase_build done."""
+    trunk = _phase_trunk()
+    analyzer = ProjectAnalyzerTool(None, FakeContextManager(trunk))
+    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
+
+    assert trunk.update_task_status("phase_build", TaskStatus.COMPLETED, "ok") is True

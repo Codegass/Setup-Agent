@@ -402,6 +402,9 @@ class ReActEngine(UIEventEmitter):
                 machine.mark_blocked(metadata.get("reason", ""), metadata.get("evidence", []))
                 self._persist_phase_record(finished, "failed", metadata.get("reason", ""))
             self._phase_iterations = 0
+            # Phase transitions are the context switches of phase mode (no
+            # manage_context actions exist to reset the legacy counter).
+            self.steps_since_context_switch = 0
             if not machine.is_complete:
                 self.steps = [self._phase_intro_step()]
                 self._start_phase_branch()
@@ -428,6 +431,7 @@ class ReActEngine(UIEventEmitter):
             phase, "failed", "remaining iterations reserved for later phases"
         )
         self._phase_iterations = 0
+        self.steps_since_context_switch = 0
         if not machine.is_complete:
             self.steps = [self._phase_intro_step()]
             self._start_phase_branch()
@@ -446,14 +450,27 @@ class ReActEngine(UIEventEmitter):
             updater = getattr(cm, "update_task_status", None)
             if callable(updater):
                 # Manager-level setter (test fakes / future CM API).
-                updater(task_id, target, text)
+                if updater(task_id, target, text) is False:
+                    logger.warning(
+                        f"Phase record '{task_id}' not persisted: context manager "
+                        f"has no such task (phase history may be missing from the trunk)"
+                    )
             else:
                 # Real ContextManager: status/key_results live on the trunk.
                 trunk = cm.load_trunk_context()
                 if trunk is None:
                     return
-                trunk.update_task_status(task_id, target, text)
-                trunk.update_task_key_results(task_id, text)
+                status_ok = trunk.update_task_status(task_id, target, text)
+                results_ok = trunk.update_task_key_results(task_id, text)
+                if not (status_ok and results_ok):
+                    # A missing phase_<name> trunk task means phase history is
+                    # being dropped — never let that pass silently (the silent
+                    # False return hid the analyzer trunk-rewrite defect).
+                    logger.warning(
+                        f"Phase record '{task_id}' not found in trunk todo list "
+                        f"(status_updated={status_ok}, key_results_updated={results_ok}); "
+                        f"phase history may be missing from the trunk"
+                    )
                 cm._save_trunk_context(trunk)
             if getattr(cm, "current_task_id", None) == task_id:
                 cm.current_task_id = None

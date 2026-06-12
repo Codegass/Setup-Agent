@@ -1426,6 +1426,21 @@ PY"""
                 logger.error("No trunk context found to update")
                 return False
 
+            # Stage-2 phase machine (spec §3.1): a phase trunk (phase_<name>
+            # task ids) is owned by the engine — the analyzer's execution plan
+            # is phase-internal advice surfaced in the tool output, never trunk
+            # tasks. Rewriting here deleted the pending phase_build/phase_test/
+            # phase_report entries, turning every later _persist_phase_record
+            # into a silent no-op and orphaning task_N entries in the webui.
+            if any(str(task.id).startswith("phase_") for task in trunk_context.todo_list):
+                self._record_environment_metrics(trunk_context, analysis)
+                self.context_manager._save_trunk_context(trunk_context)
+                logger.info(
+                    "Phase trunk detected: preserved phase_* tasks (analyzer plan "
+                    "stays phase-internal advice; recorded analysis metrics only)"
+                )
+                return True
+
             execution_plan = analysis.get("execution_plan", [])
             if not execution_plan:
                 logger.warning("No execution plan generated, trunk context unchanged")
@@ -1492,40 +1507,9 @@ PY"""
                     logger.debug(f"Adding task: {task_description} (type: {task_type})")
                     trunk_context.add_task(task_description)
 
-                # Remember the identified build system so weaker future
-                # analyses cannot regress the plan (see guard above).
-                if not incoming_unknown:
-                    trunk_context.environment_summary["build_system"] = analysis.get(
-                        "build_system"
-                    )
-
-                # Store test counting metrics in environment summary if available
-                static_test_count = analysis.get("static_test_count")
-                if static_test_count is not None:
-                    trunk_context.environment_summary["static_test_count"] = static_test_count
-                    logger.info(
-                        f"📊 Stored total test count in trunk context: {static_test_count} test cases"
-                    )
-
-                    # Also store method count and parameterized info for detailed reporting
-                    method_count = analysis.get("method_count")
-                    if method_count is not None:
-                        trunk_context.environment_summary["method_count"] = method_count
-                        trunk_context.environment_summary["test_count_method"] = analysis.get(
-                            "test_count_method", "unknown"
-                        )
-
-                    parameterized_info = analysis.get("parameterized_info")
-                    if parameterized_info:
-                        trunk_context.environment_summary["parameterized_info"] = parameterized_info
-
-                    # Store test catalog summary if available
-                    test_catalog = analysis.get("test_catalog")
-                    if test_catalog:
-                        trunk_context.environment_summary["test_catalog_summary"] = {
-                            "total_tests": test_catalog.get("total_count", 0),
-                            "by_module": test_catalog.get("by_module", {}),
-                        }
+                # Remember the identified build system + test metrics so weaker
+                # future analyses cannot regress the plan (see guard above).
+                self._record_environment_metrics(trunk_context, analysis)
 
                 # 保存更新后的context
                 self.context_manager._save_trunk_context(trunk_context)
@@ -1542,6 +1526,46 @@ PY"""
         except Exception as e:
             logger.error(f"Failed to update trunk context: {e}")
             return False
+
+    def _record_environment_metrics(self, trunk_context, analysis: Dict[str, Any]) -> None:
+        """Record build system + static test metrics in environment_summary.
+
+        Shared by the legacy plan-rewrite path and the phase-trunk path (which
+        never touches the todo list but still feeds the report/test phases)."""
+        incoming_unknown = str(analysis.get("build_system", "unknown")).lower() in (
+            "unknown",
+            "none",
+            "",
+        )
+        if not incoming_unknown:
+            trunk_context.environment_summary["build_system"] = analysis.get("build_system")
+
+        static_test_count = analysis.get("static_test_count")
+        if static_test_count is not None:
+            trunk_context.environment_summary["static_test_count"] = static_test_count
+            logger.info(
+                f"📊 Stored total test count in trunk context: {static_test_count} test cases"
+            )
+
+            # Also store method count and parameterized info for detailed reporting
+            method_count = analysis.get("method_count")
+            if method_count is not None:
+                trunk_context.environment_summary["method_count"] = method_count
+                trunk_context.environment_summary["test_count_method"] = analysis.get(
+                    "test_count_method", "unknown"
+                )
+
+            parameterized_info = analysis.get("parameterized_info")
+            if parameterized_info:
+                trunk_context.environment_summary["parameterized_info"] = parameterized_info
+
+            # Store test catalog summary if available
+            test_catalog = analysis.get("test_catalog")
+            if test_catalog:
+                trunk_context.environment_summary["test_catalog_summary"] = {
+                    "total_tests": test_catalog.get("total_count", 0),
+                    "by_module": test_catalog.get("by_module", {}),
+                }
 
     def _is_execution_plan_valid(self, execution_plan: List[Dict[str, str]]) -> bool:
         """验证执行计划是否有效"""

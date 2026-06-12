@@ -18,6 +18,7 @@ import yaml
 
 from sag.agent.agent_state_evaluator import AgentStateEvaluator, AgentStatus
 from sag.agent.react_prompt_builder import ReActPromptBuilder
+from sag.agent.react_types import StepType
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.tools.context_tool import ContextTool
 
@@ -291,3 +292,111 @@ def test_run_task_prompt_keeps_manage_context_surface():
     assert "manage_context" in prompt
     assert "complete_with_results" in prompt
     assert "phase(action=" not in prompt
+
+
+# --- Stage 2: evaluator RUNTIME guidance speaks phase vocabulary -------------
+#
+# manage_context is not registered in machine-driven setup runs, and trunk
+# phase ids are engine internals (never model-visible). Every guidance string
+# the evaluator can inject while phase_machine_active must therefore use the
+# phase vocabulary — ordering the model to call a nonexistent tool (or showing
+# it 'phase_build') re-teaches the very ceremony the prompts dropped.
+
+EVALUATOR_FORBIDDEN_IN_PHASE_MODE = (
+    "manage_context",
+    "complete_with_results",
+    "start_task",
+    "project_setup",
+    "phase_build",
+)
+
+
+class _PhaseModeCM:
+    current_task_id = "phase_build"
+
+    def load_trunk_context(self):
+        return None
+
+
+def _phase_evaluator(cm=None):
+    evaluator = AgentStateEvaluator(cm or _PhaseModeCM())
+    evaluator.phase_machine_active = True
+    return evaluator
+
+
+def _evaluate(evaluator, steps, steps_since_context_switch=0):
+    return evaluator.evaluate(
+        steps=steps,
+        current_iteration=10,
+        recent_tool_executions=[],
+        steps_since_context_switch=steps_since_context_switch,
+    )
+
+
+def test_phase_mode_completion_guidance_uses_phase_vocabulary():
+    evaluator = _phase_evaluator()
+    steps = [
+        SimpleNamespace(
+            step_type=StepType.OBSERVATION,
+            content="BUILD SUCCESS\nTests run: 12, Failures: 0",
+        )
+    ]
+
+    analysis = _evaluate(evaluator, steps)
+
+    assert analysis.needs_guidance is True
+    message = analysis.guidance_message
+    assert "phase(" in message and "done" in message and "blocked" in message
+    offenders = [p for p in EVALUATOR_FORBIDDEN_IN_PHASE_MODE if p in message]
+    assert offenders == [], f"phase-mode completion guidance teaches ceremony: {offenders}"
+
+
+def test_phase_mode_never_emits_context_switch_ceremony():
+    """steps_since_context_switch never resets in phase mode (no manage_context
+    actions exist), so the legacy >=15 reminder would otherwise fire forever."""
+    evaluator = _phase_evaluator()
+    steps = [SimpleNamespace(step_type=StepType.OBSERVATION, content="compiling module core")]
+
+    analysis = _evaluate(evaluator, steps, steps_since_context_switch=42)
+
+    assert "manage_context" not in (analysis.guidance_message or "")
+    assert analysis.status != AgentStatus.CONTEXT_SWITCH_NEEDED
+
+
+def test_phase_mode_idle_thinking_guidance_uses_phase_tools():
+    evaluator = _phase_evaluator()
+    steps = [
+        SimpleNamespace(step_type=StepType.THOUGHT, content="hmm", tool_name=None)
+        for _ in range(3)
+    ]
+
+    analysis = _evaluate(evaluator, steps)
+
+    assert analysis.needs_guidance is True
+    message = analysis.guidance_message
+    offenders = [p for p in EVALUATOR_FORBIDDEN_IN_PHASE_MODE if p in message]
+    assert offenders == [], f"phase-mode idle guidance teaches ceremony: {offenders}"
+    assert "build" in message and "phase" in message
+
+
+def test_phase_mode_stands_down_ghost_state_and_task_ceremony_checks():
+    class _NoTaskCM:
+        current_task_id = None
+
+        def load_trunk_context(self):
+            return {"todo_list": [{"id": "task_1", "status": "pending", "description": "x"}]}
+
+    evaluator = _phase_evaluator(_NoTaskCM())
+    steps = [
+        SimpleNamespace(
+            step_type=StepType.ACTION, tool_name="bash", content="", tool_result=None
+        )
+        for _ in range(3)
+    ]
+
+    analysis = _evaluate(evaluator, steps)
+
+    blob = analysis.guidance_message or ""
+    offenders = [p for p in EVALUATOR_FORBIDDEN_IN_PHASE_MODE if p in blob]
+    assert offenders == [], f"phase-mode ghost-state guidance teaches ceremony: {offenders}"
+    assert "task_1" not in blob, "no model-visible task ids in phase machinery"
