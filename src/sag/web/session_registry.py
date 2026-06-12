@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import time
 import tempfile
 from collections.abc import Callable
 from datetime import datetime
@@ -49,15 +50,24 @@ class SessionRegistry:
 
 
 class ContainerSessionRegistry:
+    # Unresolvable session ids are remembered for this long: the dashboard
+    # polls session details every ~3s, and a stale id (e.g. a removed
+    # container's session) used to trigger a FULL fleet scan — several docker
+    # execs per workspace — on every poll, hammering the docker daemon.
+    NEGATIVE_SESSION_TTL_SECONDS = 15.0
+
     def __init__(
         self,
         orchestrator_factory: Callable[[str], Any] | None = None,
         workspace_registry_factory: Callable[[], Any] | None = None,
         logs_root: Path | None = None,
+        now_fn: Callable[[], float] | None = None,
     ):
         self.orchestrator_factory = orchestrator_factory
         self.workspace_registry_factory = workspace_registry_factory
         self.logs_root = logs_root if logs_root is not None else Path("logs")
+        self._now = now_fn if now_fn is not None else time.monotonic
+        self._missing_sessions: dict[str, float] = {}
 
     def list_workspace_sessions(self, workspace: WorkspaceSummary) -> list[ExecutionSessionSummary]:
         orchestrator = self._orchestrator(workspace.id)
@@ -72,11 +82,24 @@ class ContainerSessionRegistry:
         )
 
     def get_session_detail(self, session_id: str) -> ExecutionSessionDetail:
+        expiry = self._missing_sessions.get(session_id)
+        if expiry is not None:
+            if self._now() < expiry:
+                # Known-missing: answer the 404 instantly, no docker execs.
+                raise KeyError(session_id)
+            del self._missing_sessions[session_id]
+
         for workspace in self._workspaces():
             detail = self.get_workspace_session_detail(workspace, session_id)
             if detail is not None:
+                self._missing_sessions.pop(session_id, None)
                 return detail
 
+        logger.warning(
+            f"Session {session_id} not found in any workspace; suppressing "
+            f"re-scans for {self.NEGATIVE_SESSION_TTL_SECONDS:.0f}s"
+        )
+        self._missing_sessions[session_id] = self._now() + self.NEGATIVE_SESSION_TTL_SECONDS
         raise KeyError(session_id)
 
     def get_workspace_session_detail(

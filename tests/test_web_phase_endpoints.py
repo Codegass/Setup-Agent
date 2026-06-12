@@ -195,3 +195,63 @@ def test_journal_rejects_unsafe_phase_names_without_touching_container():
 
     assert registry.get_phase_journal("sag-commons-cli", "../etc/passwd") is None
     assert fake.commands == []
+
+
+# --- negative session cache (round-6 webui finding) --------------------------
+
+
+def test_missing_session_is_negative_cached():
+    """A stale session id (e.g. removed container) used to trigger a full
+    fleet scan — several docker execs per workspace — on EVERY 3s dashboard
+    poll. Misses are now cached: repeat lookups raise instantly with zero
+    orchestrator work until the TTL expires."""
+    import pytest
+
+    from sag.web.session_registry import ContainerSessionRegistry
+
+    calls = {"workspaces": 0}
+    clock = {"now": 100.0}
+
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda wid: (_ for _ in ()).throw(AssertionError("no orch expected")),
+        now_fn=lambda: clock["now"],
+    )
+
+    def fake_workspaces():
+        calls["workspaces"] += 1
+        return []
+
+    registry._workspaces = fake_workspaces
+
+    with pytest.raises(KeyError):
+        registry.get_session_detail("session_gone")
+    assert calls["workspaces"] == 1
+
+    # Within TTL: instant miss, no new scan.
+    clock["now"] = 105.0
+    with pytest.raises(KeyError):
+        registry.get_session_detail("session_gone")
+    assert calls["workspaces"] == 1
+
+    # After TTL: scans again.
+    clock["now"] = 120.0
+    with pytest.raises(KeyError):
+        registry.get_session_detail("session_gone")
+    assert calls["workspaces"] == 2
+
+
+def test_successful_lookup_clears_negative_entry():
+    from types import SimpleNamespace
+
+    from sag.web.session_registry import ContainerSessionRegistry
+
+    clock = {"now": 100.0}
+    registry = ContainerSessionRegistry(now_fn=lambda: clock["now"])
+    registry._missing_sessions["s1"] = 90.0  # expired entry
+
+    detail = SimpleNamespace(id="s1")
+    registry._workspaces = lambda: [SimpleNamespace(id="w1")]
+    registry.get_workspace_session_detail = lambda ws, sid: detail
+
+    assert registry.get_session_detail("s1") is detail
+    assert "s1" not in registry._missing_sessions
