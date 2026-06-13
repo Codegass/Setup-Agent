@@ -198,12 +198,6 @@ export function Dashboard({
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-white px-2.5 py-1.5">
-            <StatusBadge status={data.docker.status} label="Docker" />
-            {data.docker.version ? (
-              <span className="font-mono text-[11px] text-slate-500">v{data.docker.version}</span>
-            ) : null}
-          </div>
           {onLaunchSetups ? (
             <Button onClick={onLaunchSetups} type="button">
               <Rocket size={14} />

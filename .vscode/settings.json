@@ -1,5 +1,5 @@
 {
     "editor.fontFamily": "'Monaspace Krypton',Menlo, Monaco, 'Courier New', monospace",
-    "workbench.colorTheme": "Solarized Dark",
+    "workbench.colorTheme": "Dracula Dark",
     "python.languageServer": "None"
 }

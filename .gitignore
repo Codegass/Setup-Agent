@@ -182,3 +182,6 @@ website/node_modules
 # SAG web UI frontend
 webui/node_modules/
 webui/dist/
+
+.impeccable/
+.impeccable/critique/2026-06-08T05-54-24Z__webui-src-pages-dashboard-tsx.md
