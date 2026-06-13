@@ -1,5 +1,7 @@
 """build(action: deps|compile|test|package) — one tool over all ecosystems."""
 
+import posixpath
+import shlex
 from typing import Any, Dict, Optional
 
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
@@ -9,8 +11,13 @@ from .backends import BUILD_MARKERS, GradleBackend, MavenBackend
 
 
 class BuildTool(BaseTool):
-    def __init__(self, docker_orchestrator, maven_tool=None, gradle_tool=None,
-                 test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD):
+    def __init__(
+        self,
+        docker_orchestrator,
+        maven_tool=None,
+        gradle_tool=None,
+        test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
+    ):
         super().__init__(
             name="build",
             description=(
@@ -30,13 +37,19 @@ class BuildTool(BaseTool):
         if gradle_tool is not None:
             self._backends["gradle"] = GradleBackend(gradle_tool)
 
-    def execute(self, action: str, args: Optional[str] = None,
-                working_directory: str = "/workspace",
-                timeout: Optional[int] = None) -> ToolResult:
+    def execute(
+        self,
+        action: str,
+        args: Optional[str] = None,
+        working_directory: str = "/workspace",
+        timeout: Optional[int] = None,
+    ) -> ToolResult:
         verb = (action or "").strip().lower()
         if verb not in ("deps", "compile", "test", "package"):
             return ToolResult(
-                success=False, output=f"Unknown build action: {action!r}", verdict="failed",
+                success=False,
+                output=f"Unknown build action: {action!r}",
+                verdict="failed",
                 error="invalid action",
                 suggestions=["Use action= deps | compile | test | package"],
             )
@@ -73,7 +86,9 @@ class BuildTool(BaseTool):
         backend = self._backends.get(system)
         if backend is None:
             return ToolResult(
-                success=False, output=f"No backend for {system}", verdict="failed",
+                success=False,
+                output=f"No backend for {system}",
+                verdict="failed",
                 error="backend unavailable",
             )
 
@@ -85,9 +100,11 @@ class BuildTool(BaseTool):
         for system, markers in BUILD_MARKERS.items():
             for marker in markers:
                 checked.append(marker)
+                marker_path = posixpath.join(working_directory, marker)
                 probe = self.docker_orchestrator.execute_command(
-                    f"test -f {working_directory}/{marker} && echo exists || echo missing",
-                    workdir=None, timeout=30,
+                    f"test -f {shlex.quote(marker_path)} && echo exists || echo missing",
+                    workdir=None,
+                    timeout=30,
                 )
                 if "exists" in (probe.get("output") or ""):
                     return system, checked
@@ -95,20 +112,23 @@ class BuildTool(BaseTool):
 
     def _envelope(self, inner: ToolResult, system: str, verb: str) -> ToolResult:
         facts: Dict[str, Any] = {"system": system, "action": verb}
-        verdict = inner.verdict if inner.verdict in ("running", "skipped") else (
-            "success" if inner.success else "failed"
+        verdict = (
+            inner.verdict
+            if inner.verdict in ("running", "skipped")
+            else ("success" if inner.success else "failed")
         )
         stats = inner.test_stats
         if stats is not None:
             facts.update(
-                executed=stats.executed, passed=stats.passed,
-                failed=stats.failed, skipped=stats.skipped, pass_rate=stats.pass_rate,
+                executed=stats.executed,
+                passed=stats.passed,
+                failed=stats.failed,
+                skipped=stats.skipped,
+                pass_rate=stats.pass_rate,
             )
             if inner.success and stats.failed > 0:
                 verdict = (
-                    "partial"
-                    if stats.pass_rate >= self.test_pass_threshold * 100
-                    else "failed"
+                    "partial" if stats.pass_rate >= self.test_pass_threshold * 100 else "failed"
                 )
         return ToolResult(
             success=inner.success,

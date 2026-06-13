@@ -6,6 +6,7 @@ from project evidence; verbs that don't apply return verdict=skipped.
 Stage 1: backends DELEGATE to the existing MavenTool/GradleTool.
 """
 
+import shlex
 from types import SimpleNamespace
 
 from sag.tools.base import ToolResult
@@ -37,6 +38,24 @@ class MarkerOrchestrator:
         return {"success": True, "output": "missing", "exit_code": 0}
 
 
+class ShellParsingMarkerOrchestrator:
+    """Simulates shell tokenization for `test -f <path>` marker probes."""
+
+    def __init__(self, existing_paths):
+        self.existing_paths = set(existing_paths)
+        self.commands = []
+
+    def execute_command(self, command, **kwargs):
+        self.commands.append(command)
+        tokens = shlex.split(command)
+        try:
+            path = tokens[tokens.index("-f") + 1]
+        except (ValueError, IndexError):
+            path = ""
+        output = "exists" if path in self.existing_paths else "missing"
+        return {"success": True, "output": output, "exit_code": 0}
+
+
 def _tool(markers, maven=None, gradle=None):
     return BuildTool(
         MarkerOrchestrator(markers),
@@ -54,6 +73,18 @@ def test_maven_project_routes_compile_to_maven_backend():
     assert result.success
     assert maven.calls and maven.calls[0]["command"] == "compile"
     assert result.facts["system"] == "maven"
+
+
+def test_build_marker_probe_quotes_working_directory_with_spaces():
+    maven = FakeBackendTool()
+    orchestrator = ShellParsingMarkerOrchestrator({"/workspace/project with spaces/pom.xml"})
+    tool = BuildTool(orchestrator, maven_tool=maven)
+
+    result = tool.execute(action="compile", working_directory="/workspace/project with spaces")
+
+    assert result.success
+    assert result.facts["system"] == "maven"
+    assert maven.calls and maven.calls[0]["working_directory"] == "/workspace/project with spaces"
 
 
 def test_gradle_kts_project_routes_test_to_gradle_backend():
@@ -89,7 +120,8 @@ def test_test_stats_surface_in_facts():
 
     maven = FakeBackendTool(
         result=ToolResult(
-            success=True, output="tests done",
+            success=True,
+            output="tests done",
             test_stats=TestStats(executed=214, passed=206, failed=3, skipped=5),
         )
     )
@@ -108,5 +140,6 @@ def test_args_passthrough():
 
     tool.execute(action="test", args="-Dtest=FooTest", working_directory="/w")
 
-    assert maven.calls[0].get("extra_args") == "-Dtest=FooTest" or \
-        "-Dtest=FooTest" in str(maven.calls[0])
+    assert maven.calls[0].get("extra_args") == "-Dtest=FooTest" or "-Dtest=FooTest" in str(
+        maven.calls[0]
+    )
