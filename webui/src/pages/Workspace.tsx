@@ -31,6 +31,7 @@ import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { TestCard } from "@/components/session/TestCard"
 import { TerminalPanel } from "@/components/terminal/TerminalPanel"
+import { PhaseTimeline } from "@/components/workspace/PhaseTimeline"
 import {
   Dialog,
   DialogContent,
@@ -41,7 +42,7 @@ import {
 } from "@/components/ui/dialog"
 import { cn } from "@/lib/utils"
 
-const workspaceTabs = ["Overview", "Sessions", "Terminal", "Settings"] as const
+const workspaceTabs = ["Overview", "Phases", "Sessions", "Terminal", "Settings"] as const
 type WorkspaceTab = (typeof workspaceTabs)[number]
 
 export interface WorkspaceSessionRow {
@@ -169,6 +170,18 @@ export function Workspace({
             test={displayTest}
             workspace={workspace}
           />
+        ) : null}
+        {tab === "Phases" ? (
+          <Card className="overflow-hidden">
+            <CardHead
+              icon={<GitBranch size={16} className="text-slate-500" />}
+              sub="Engine-driven phases and per-iteration context journal"
+              title="Phase timeline"
+            />
+            <div className="p-5">
+              <PhaseTimeline workspaceId={workspace.id} />
+            </div>
+          </Card>
         ) : null}
         {tab === "Sessions" ? (
           <SessionsTab onOpenSession={onOpenSession} rows={sessions} />
