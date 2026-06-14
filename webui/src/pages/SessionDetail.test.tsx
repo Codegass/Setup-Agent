@@ -228,7 +228,7 @@ describe("SessionDetail", () => {
       />,
     )
 
-    expect(screen.getByText("Trunk - Command Center")).toBeInTheDocument()
+    expect(screen.getByText("Trunk goal")).toBeInTheDocument()
     expect(screen.queryByText("Active Branch Focus")).not.toBeInTheDocument()
   })
 
@@ -295,7 +295,6 @@ describe("SessionDetail", () => {
     expect(screen.queryByText(/maven succeeded/)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: /phase_build compile project using maven/i }))
-    fireEvent.click(screen.getByRole("button", { name: /phase_build\/work compile project using maven/i }))
 
     expect(screen.getByText(/maven succeeded/)).toBeInTheDocument()
     expect(screen.getByText("output_build_success")).toBeInTheDocument()

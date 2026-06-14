@@ -94,15 +94,15 @@ describe("ContextTrace", () => {
     expect(screen.getByText("Done / Total")).toBeInTheDocument()
     expect(screen.getByText("4 / 5")).toBeInTheDocument()
     expect(screen.getAllByRole("progressbar")).toHaveLength(1)
-    expect(screen.getByText("Trunk - Command Center")).toBeInTheDocument()
+    expect(screen.getByText("Trunk goal")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /phase_build build the project/i })).toBeInTheDocument()
   })
 
-  it("expands phase tasks and iterations", () => {
+  it("expands a phase straight to its iteration timeline", () => {
     render(<ContextTrace ctx={context} />)
 
+    // A single-task phase flattens: one click reaches the iterations.
     fireEvent.click(screen.getByRole("button", { name: /phase_build build the project/i }))
-    fireEvent.click(screen.getByRole("button", { name: /phase_build\/work build the project/i }))
 
     expect(screen.getByText("Compilation succeeded.")).toBeInTheDocument()
     expect(screen.getByText("iter 11")).toBeInTheDocument()
@@ -116,11 +116,46 @@ describe("ContextTrace", () => {
     render(<ContextTrace ctx={context} />)
 
     fireEvent.click(screen.getByRole("button", { name: /phase_build build the project/i }))
-    fireEvent.click(screen.getByRole("button", { name: /phase_build\/work build the project/i }))
     fireEvent.click(screen.getAllByRole("button", { name: "output_build_success" })[0])
 
     expect(screen.getByText("Output preview")).toBeInTheDocument()
     expect(screen.getByText(/Full build output/)).toBeInTheDocument()
     expect(screen.getByText(/Tail line/)).toBeInTheDocument()
+  })
+
+  it("explains iterations that only have journal window metadata", () => {
+    const sparseContext: ContextTraceModel = {
+      ...context,
+      phases: [
+        {
+          ...context.phases[0],
+          tasks: [
+            {
+              ...context.phases[0].tasks[0],
+              iterations: [
+                {
+                  iteration: 35,
+                  sequence: 1,
+                  thoughts: [],
+                  actions: [],
+                  window: {
+                    totalChars: 4264,
+                    stepSpan: 4,
+                    segments: { intro: 1177, ledger: 0, steps: 4 },
+                    delta: { added: 1, compacted: 0 },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    }
+
+    render(<ContextTrace ctx={sparseContext} />)
+
+    fireEvent.click(screen.getByRole("button", { name: /phase_build build the project/i }))
+
+    expect(screen.getByText("No branch trace was recorded for this iteration.")).toBeInTheDocument()
   })
 })

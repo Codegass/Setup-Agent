@@ -193,7 +193,7 @@ describe("Workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Phases" }))
 
     expect(screen.getByText("Context trace")).toBeInTheDocument()
-    expect(screen.getByText("Trunk - Command Center")).toBeInTheDocument()
+    expect(screen.getByText("Trunk goal")).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /phase_build build the project/i })).toBeInTheDocument()
   })
 })
