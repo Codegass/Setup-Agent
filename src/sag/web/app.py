@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from loguru import logger
 
+from sag import __version__
 from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
 from sag.web.read_model import ReadModelBuilder
@@ -66,7 +67,7 @@ def create_app(
                     with contextlib.suppress(Exception):
                         await asyncio.to_thread(close)
 
-    app = FastAPI(title="SAG Workbench", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="SAG Workbench", version=__version__, lifespan=lifespan)
 
     @app.get("/api/workspaces")
     def get_workspaces() -> dict:
