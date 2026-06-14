@@ -1,4 +1,5 @@
 from click.testing import CliRunner
+from loguru import logger
 
 import sag.config as config_module
 import sag.config.logger as logger_module
@@ -40,6 +41,50 @@ def test_ui_command_uses_localhost_ephemeral_port_and_live_data_by_default(monke
 
     assert result.exit_code == 0
     assert calls == {"host": "127.0.0.1", "port": 0, "demo": False}
+    assert not (tmp_path / "logs").exists()
+
+
+def test_ui_command_replaces_existing_debug_log_sink_without_session_logs(monkeypatch, tmp_path):
+    reset_config_state(monkeypatch)
+    stale_log_messages = []
+    logger.remove()
+    logger.add(lambda message: stale_log_messages.append(str(message)), level="DEBUG")
+
+    def fake_run_server(**kwargs):
+        logger.debug("docker debug noise")
+        logger.info("docker info noise")
+
+    monkeypatch.setattr("sag.main.run_web_server", fake_run_server)
+    monkeypatch.chdir(tmp_path)
+
+    try:
+        result = CliRunner().invoke(cli, ["ui"])
+    finally:
+        logger.remove()
+
+    assert result.exit_code == 0
+    assert stale_log_messages == []
+    assert "docker debug noise" not in result.output
+    assert "docker info noise" not in result.output
+    assert not (tmp_path / "logs").exists()
+
+
+def test_ui_command_respects_explicit_log_level_without_session_logs(monkeypatch, tmp_path):
+    reset_config_state(monkeypatch)
+
+    def fake_run_server(**kwargs):
+        logger.info("explicit info log")
+
+    monkeypatch.setattr("sag.main.run_web_server", fake_run_server)
+    monkeypatch.chdir(tmp_path)
+
+    try:
+        result = CliRunner().invoke(cli, ["--log-level", "INFO", "ui"])
+    finally:
+        logger.remove()
+
+    assert result.exit_code == 0
+    assert "explicit info log" in result.output
     assert not (tmp_path / "logs").exists()
 
 

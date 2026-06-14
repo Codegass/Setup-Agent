@@ -225,6 +225,53 @@ def setup_session_logging(config) -> SessionLogger:
         return _session_logger
 
 
+def setup_console_logging(config, *, quiet_default: bool = False) -> None:
+    """Configure console-only logging without opening a session directory."""
+    logger.remove()
+
+    if config.ui_mode:
+        return
+
+    console_level = "DEBUG" if config.verbose else config.log_level.value
+    if quiet_default and not config.verbose and console_level in {"DEBUG", "INFO"}:
+        console_level = "WARNING"
+
+    logger.add(
+        sys.stderr,
+        level=console_level,
+        format=_get_console_format(config),
+        colorize=True,
+        filter=lambda record: _console_filter(config, record),
+    )
+
+
+def _get_console_format(config) -> str:
+    """Get console log format based on verbose setting."""
+    if config.verbose:
+        return (
+            "<green>{time:HH:mm:ss.SSS}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+            "<level>{message}</level>"
+        )
+    return (
+        "<green>{time:HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<level>{message}</level>"
+    )
+
+
+def _console_filter(config, record) -> bool:
+    """Filter console output based on verbose setting."""
+    if record["level"].no >= 20:
+        return True
+
+    if config.verbose and record["level"].no >= 10:
+        return True
+
+    return False
+
+
 def get_session_logger() -> Optional[SessionLogger]:
     """Get the current session logger."""
     return _session_logger

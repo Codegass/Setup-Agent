@@ -7,6 +7,7 @@ from .logger import (
     create_command_logger,
     create_verbose_logger,
     get_session_logger,
+    setup_console_logging,
     setup_session_logging,
     suppress_console_logging,
 )
@@ -41,12 +42,16 @@ def get_config() -> Config:
     return _config
 
 
-def set_config(config: Config, *, initialize_logging: bool = True) -> None:
+def set_config(
+    config: Config, *, initialize_logging: bool = True, quiet_console: bool = False
+) -> None:
     """Set the global configuration instance."""
     global _config
     _config = config
     if initialize_logging:
         setup_logging(config)
+    else:
+        setup_console_logging(config, quiet_default=quiet_console)
     setup_litellm_environment(config)
 
 
@@ -57,6 +62,7 @@ __all__ = [
     "get_config",
     "set_config",
     "ensure_session_logging",
+    "setup_console_logging",
     "setup_logging",
     "setup_litellm_environment",
     "create_agent_logger",

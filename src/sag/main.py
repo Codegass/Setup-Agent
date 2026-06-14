@@ -255,7 +255,7 @@ def cli(ctx, log_level, log_file, verbose, ui):
     # Set global config without opening a session log. Session logs are for
     # agent executions only; read-only CLI commands should not create
     # logs/session_* directories.
-    set_config(config, initialize_logging=False)
+    set_config(config, initialize_logging=False, quiet_console=log_level is None)
 
     # Ensure context object exists
     ctx.ensure_object(dict)
