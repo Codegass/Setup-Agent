@@ -1122,6 +1122,7 @@ class ReActEngine(UIEventEmitter):
                 if self.config.verbose:
                     self._log_react_step_verbose(step)
 
+                branch_task_id = getattr(self.context_manager, "current_task_id", None)
                 call = self._build_tool_call_from_step(step)
                 execution = self._get_tool_orchestrator().execute(call)
                 result = execution.result
@@ -1149,7 +1150,7 @@ class ReActEngine(UIEventEmitter):
                     )
 
                 # Log to branch context if we're in one
-                if self.context_manager.current_task_id:
+                if branch_task_id:
                     # Add action result to branch history using new context management system
                     try:
                         output_to_store = result.output if result.output else ""
@@ -1203,7 +1204,7 @@ class ReActEngine(UIEventEmitter):
                         if dispatch_status:
                             history_entry["dispatch_status"] = dispatch_status
                         self.context_manager.add_to_branch_history(
-                            self.context_manager.current_task_id,
+                            branch_task_id,
                             history_entry,
                         )
                     except Exception as e:

@@ -406,6 +406,49 @@ def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
     assert entry["output_refs"] == ["output_build"]
 
 
+def test_execute_steps_records_action_even_if_tool_clears_current_task(monkeypatch):
+    context = RecordingBranchContext()
+    result = ToolResult(success=True, output="Final setup report generated.")
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: report",
+        tool_name="report",
+        tool_params={"summary": "done"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="report", raw_params={"summary": "done"}),
+        result=result,
+        status="success",
+        raw_params={"summary": "done"},
+        validated_params={"summary": "done"},
+        executed_params={"summary": "done"},
+        observation_text="report generated",
+        attempted_execution=True,
+    )
+    engine = _engine_with_context(context=context)
+    engine.tools = {}
+    engine.current_iteration = 35
+
+    class FakeOrchestrator:
+        def execute(self, call):
+            context.current_task_id = None
+            return execution
+
+    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
+
+    assert engine._execute_steps([step]) is True
+
+    assert context.entries[0][0] == "phase_build"
+    entry = context.entries[0][1]
+    assert entry["type"] == "action"
+    assert entry["iteration"] == 35
+    assert entry["tool_name"] == "report"
+    assert entry["output"] == "Final setup report generated."
+    assert entry["observation"] == "report generated"
+
+
 def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator():
     engine = _engine_with_context()
     engine.tools = {"echo": EchoTool()}

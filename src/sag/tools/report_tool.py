@@ -19,7 +19,6 @@ from sag.verdict import combine_verdicts, run_verdict
 
 from .base import BaseTool, ToolResult
 
-
 MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS = 5
 MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
 
@@ -737,7 +736,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             seen_phase_tasks = True
             status = getattr(task, "status", None)
             if str(getattr(status, "value", status)) == "failed":
-                blocked.add(task_id[len("phase_"):])
+                blocked.add(task_id[len("phase_") :])
         if not seen_phase_tasks:
             return None
         if CRITICAL_PHASE in blocked:
@@ -784,7 +783,9 @@ class ReportTool(BaseTool, UIEventEmitter):
         trunk_context.update_task_key_results(target.id, key_results)
         self.context_manager._save_trunk_context(trunk_context)
 
-        if getattr(self.context_manager, "current_task_id", None) == target.id:
+        if getattr(self.context_manager, "current_task_id", None) == target.id and not str(
+            target.id
+        ).startswith("phase_"):
             self.context_manager.current_task_id = None
 
         logger.info(f"Marked final report task complete: {target.id}")
