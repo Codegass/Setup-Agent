@@ -21,7 +21,7 @@
   <a class="gc nav-link" href="https://github.com/Codegass/Setup-Agent" target="_blank" rel="noopener noreferrer">GitHub</a>
   <a class="gc nav-link" href="https://doi.org/10.1145/3786582.3786818" target="_blank" rel="noopener noreferrer">Paper</a>
   <div class="gc nav-end">
-    <small>SAG v0.2.0</small>
+    <small>SAG v0.3.0</small>
   </div>
 </header>
 
@@ -122,20 +122,20 @@
         <p>SAG operates entirely within Docker containers — not generating Dockerfiles, but interactively exploring and configuring inside them. Zero host pollution, fully reproducible.</p>
       </div>
       <div class="feat-item">
-        <small class="feat-title">File-Based Validation</small>
-        <p>Examines concrete evidence on disk — .class files after compilation, surefire XML test reports, build artifacts. Prevents hallucinations where the agent believes it succeeded without actual completion.</p>
+        <small class="feat-title">Evidence-Based Validation</small>
+        <p>Examines concrete evidence on disk — .class files, surefire XML test reports, build artifacts — under a single verdict shared by the CLI, the report, and the exit code. Prevents hallucinations where the agent believes it succeeded without actual completion.</p>
       </div>
       <div class="feat-item">
-        <small class="feat-title">Trunk &amp; Branch Context</small>
-        <p>Trunk Context maintains global state and task lists. Branch contexts capture subtask details. When a subtask ends, results merge back to Trunk — enabling complex chains without context loss.</p>
+        <small class="feat-title">Phase-Based Setup</small>
+        <p>A project setup runs as an engine-driven sequence — provision, analyze, build, test, report. The agent works inside one phase at a time with a clean context window, and the engine advances only on real build evidence.</p>
       </div>
       <div class="feat-item">
-        <small class="feat-title">Hierarchical Tool-Belt</small>
-        <p>Layered tools from low-level (Bash) through build specialists (Maven, Gradle) to high-level orchestrators (Project Analyzer). Graceful fallback when specialized tools encounter unexpected scenarios.</p>
+        <small class="feat-title">Focused Tool Set</small>
+        <p>Six intent-driven tools — build, project, search, bash, files, report — behind verb-based actions. Long build output becomes a retrievable reference instead of flooding the agent's context window.</p>
       </div>
       <div class="feat-item">
-        <small class="feat-title">Agent State Evaluator</small>
-        <p>Analyzes Agent Memory to detect problematic patterns — repeated identical actions indicating the agent is stuck in a loop. Provides corrective feedback to break cycles autonomously.</p>
+        <small class="feat-title">Reliability Guards</small>
+        <p>Completion gates reject work without real artifacts, long builds run detached instead of timing out, and a global iteration and wall-clock cap bound every run. Repeated-action detection breaks stuck loops.</p>
       </div>
     </div>
   </div>
@@ -524,7 +524,7 @@
 <footer class="g footer">
   <div class="gc">
     <small>Setup Agent</small>
-    <small class="version">v0.2.0</small>
+    <small class="version">v0.3.0</small>
   </div>
   <div class="gc"></div>
   <div class="gc">
