@@ -187,11 +187,12 @@ header.g {
 .install-step { display: flex; flex-direction: column; gap: 4px; }
 
 .install-note {
-  margin: 0;
-  font-size: 0.8125rem;
-  line-height: 1.6;
+  margin: 4px 0 0;
+  font-family: var(--mono);
+  font-size: 0.6875rem;
+  line-height: 1.7;
+  letter-spacing: 0.01em;
   color: var(--fg-dim);
-  font-weight: 300;
 }
 
 .install-head {
