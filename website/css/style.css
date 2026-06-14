@@ -186,6 +186,14 @@ header.g {
 
 .install-step { display: flex; flex-direction: column; gap: 4px; }
 
+.install-note {
+  margin: 0;
+  font-size: 0.8125rem;
+  line-height: 1.6;
+  color: var(--fg-dim);
+  font-weight: 300;
+}
+
 .install-head {
   display: flex;
   align-items: center;
