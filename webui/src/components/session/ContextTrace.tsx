@@ -329,6 +329,11 @@ function IterationStep({
   )
 }
 
+// Render iterations in batches: a stuck test phase can hold 100+ steps, and
+// mounting them all at once janks the expand. Most phases fall under one batch
+// and render whole; longer ones reveal on demand without a virtualization dep.
+const ITERATION_BATCH = 40
+
 function IterationTimeline({
   iterations,
   onOpenRef,
@@ -336,19 +341,37 @@ function IterationTimeline({
   iterations: PhaseIteration[]
   onOpenRef: (ref: ContextRef) => void
 }) {
+  const [shown, setShown] = useState(ITERATION_BATCH)
   if (!iterations.length) {
     return <p className="text-[12px] leading-relaxed text-slate-500">No iteration records.</p>
   }
+  const visible = iterations.length <= shown ? iterations : iterations.slice(0, shown)
+  const remaining = iterations.length - visible.length
   return (
     <ol className="mt-1">
-      {iterations.map((iteration, index) => (
+      {visible.map((iteration, index) => (
         <IterationStep
           iteration={iteration}
           key={`${iteration.sequence}-${iteration.iteration ?? index}`}
-          last={index === iterations.length - 1}
+          // The rail keeps flowing while a "show more" node sits below.
+          last={index === visible.length - 1 && remaining === 0}
           onOpenRef={onOpenRef}
         />
       ))}
+      {remaining > 0 ? (
+        <li className="relative grid grid-cols-[14px_1fr] gap-x-3">
+          <div className="relative flex justify-center">
+            <span className="relative z-10 mt-1 h-2 w-2 rounded-full border border-slate-300 bg-white ring-2 ring-white" />
+          </div>
+          <button
+            className="min-w-0 self-start py-0.5 text-left font-mono text-[11px] text-blue-700 transition-colors hover:text-blue-800"
+            onClick={() => setShown((value) => value + ITERATION_BATCH)}
+            type="button"
+          >
+            Show {Math.min(ITERATION_BATCH, remaining)} more · {remaining} remaining
+          </button>
+        </li>
+      ) : null}
     </ol>
   )
 }

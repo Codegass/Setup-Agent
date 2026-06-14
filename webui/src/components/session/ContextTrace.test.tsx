@@ -158,4 +158,40 @@ describe("ContextTrace", () => {
 
     expect(screen.getByText("No branch trace was recorded for this iteration.")).toBeInTheDocument()
   })
+
+  it("paginates very long iteration timelines on demand", () => {
+    const manyIterations = Array.from({ length: 95 }, (_, index) => ({
+      iteration: index + 1,
+      sequence: index + 1,
+      thoughts: [`step ${index + 1}`],
+      actions: [],
+      window: null,
+    }))
+    const longContext: ContextTraceModel = {
+      ...context,
+      phases: [
+        {
+          ...context.phases[0],
+          tasks: [{ ...context.phases[0].tasks[0], iterations: manyIterations }],
+        },
+      ],
+    }
+
+    render(<ContextTrace ctx={longContext} />)
+    fireEvent.click(screen.getByRole("button", { name: /phase_build build the project/i }))
+
+    // First batch only: iter 40 shown, iter 41 hidden behind "show more".
+    expect(screen.getByText("iter 40")).toBeInTheDocument()
+    expect(screen.queryByText("iter 41")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /Show 40 more · 55 remaining/i })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /Show 40 more/i }))
+    expect(screen.getByText("iter 41")).toBeInTheDocument()
+    expect(screen.getByText("iter 80")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /Show 15 more · 15 remaining/i })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /Show 15 more/i }))
+    expect(screen.getByText("iter 95")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /Show .* more/i })).not.toBeInTheDocument()
+  })
 })
