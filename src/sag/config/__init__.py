@@ -19,6 +19,14 @@ def setup_logging(config: Config):
     return setup_session_logging(config)
 
 
+def ensure_session_logging(config: Config, *, force_new: bool = False):
+    """Create a session logger for agent work if one does not already exist."""
+    current = get_session_logger()
+    if current is not None and not force_new:
+        return current
+    return setup_logging(config)
+
+
 # Global configuration instance
 _config: Optional[Config] = None
 
@@ -33,11 +41,12 @@ def get_config() -> Config:
     return _config
 
 
-def set_config(config: Config) -> None:
+def set_config(config: Config, *, initialize_logging: bool = True) -> None:
     """Set the global configuration instance."""
     global _config
     _config = config
-    setup_logging(config)
+    if initialize_logging:
+        setup_logging(config)
     setup_litellm_environment(config)
 
 
@@ -47,6 +56,7 @@ __all__ = [
     "LogLevel",
     "get_config",
     "set_config",
+    "ensure_session_logging",
     "setup_logging",
     "setup_litellm_environment",
     "create_agent_logger",

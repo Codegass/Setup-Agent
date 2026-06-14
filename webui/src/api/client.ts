@@ -91,6 +91,30 @@ export interface PhaseJournalRecord {
   step_span?: number | null
 }
 
+export interface PhaseWindowMeta {
+  total: number
+  truncated: boolean
+  limit: number
+  max_text: number
+}
+
+export interface PhaseJournalResponse extends PhaseWindowMeta {
+  records: PhaseJournalRecord[]
+}
+
+export interface PhaseHistoryEntry {
+  type?: string
+  tool_name?: string
+  success?: boolean
+  parameters?: unknown
+  content?: string
+  output?: string
+}
+
+export interface PhaseHistoryResponse extends PhaseWindowMeta {
+  entries: PhaseHistoryEntry[]
+}
+
 export async function fetchPhases(workspaceId: string): Promise<PhaseSummary[]> {
   const body = await getJson<{ phases: PhaseSummary[] }>(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/phases`,
@@ -101,11 +125,19 @@ export async function fetchPhases(workspaceId: string): Promise<PhaseSummary[]> 
 export async function fetchPhaseJournal(
   workspaceId: string,
   phase: string,
-): Promise<PhaseJournalRecord[]> {
-  const body = await getJson<{ records: PhaseJournalRecord[] }>(
+): Promise<PhaseJournalResponse> {
+  return getJson<PhaseJournalResponse>(
     `/api/workspaces/${encodeURIComponent(workspaceId)}/phases/${encodeURIComponent(phase)}/journal`,
   )
-  return body.records
+}
+
+export async function fetchPhaseHistory(
+  workspaceId: string,
+  phase: string,
+): Promise<PhaseHistoryResponse> {
+  return getJson<PhaseHistoryResponse>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/phases/${encodeURIComponent(phase)}/history`,
+  )
 }
 
 export async function submitProjectBatch(

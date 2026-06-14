@@ -31,6 +31,7 @@ from sag.web.models import (
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
 _EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
+_CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
 # Where ContextJournal writes (sag.agent.context_journal.JOURNAL_DIR) — mirrored
 # here so the web layer never imports the agent stack.
 _JOURNAL_DIR = "/workspace/.setup_agent/contexts/journal"
@@ -153,7 +154,14 @@ class ContainerSessionRegistry:
         ]
         return phases or None
 
-    def get_phase_journal(self, workspace_id: str, phase: str) -> list[dict[str, Any]] | None:
+    def get_phase_journal(
+        self,
+        workspace_id: str,
+        phase: str,
+        *,
+        limit: int = 100,
+        max_text: int = 4000,
+    ) -> dict[str, Any] | None:
         """Parsed context-journal records for one phase; None when absent."""
         if not _PHASE_NAME_RE.fullmatch(phase or ""):
             return None
@@ -167,7 +175,51 @@ class ContainerSessionRegistry:
         raw = _read_container_file(orchestrator, f"{_JOURNAL_DIR}/phase_{phase}.journal.jsonl")
         if raw is None:
             return None
-        return _parse_journal_lines(raw)
+        return _bounded_phase_payload(
+            _parse_journal_lines(raw),
+            item_key="records",
+            limit=limit,
+            max_text=max_text,
+        )
+
+    def get_phase_history(
+        self,
+        workspace_id: str,
+        phase: str,
+        *,
+        limit: int = 100,
+        max_text: int = 4000,
+    ) -> dict[str, Any] | None:
+        """Raw branch history for one phase; None when absent or malformed."""
+        if not _PHASE_NAME_RE.fullmatch(phase or ""):
+            return None
+
+        try:
+            orchestrator = self._orchestrator(workspace_id)
+        except Exception:
+            logger.debug("No orchestrator for workspace {}", workspace_id)
+            return None
+
+        raw = _read_container_file(orchestrator, f"{_CONTEXTS_DIR}/phase_{phase}.json")
+        if raw is None:
+            return None
+
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        history = data.get("history")
+        if not isinstance(history, list):
+            return None
+        return _bounded_phase_payload(
+            history,
+            item_key="entries",
+            limit=limit,
+            max_text=max_text,
+        )
 
     def _orchestrator(self, workspace_id: str) -> Any:
         if self.orchestrator_factory is not None:
@@ -764,7 +816,9 @@ def _evidence_status_from_json_value(value: Any) -> str | None:
             if status is not None:
                 return status
     elif isinstance(value, list):
-        return _aggregate_evidence_status(_evidence_status_from_json_value(child) for child in value)
+        return _aggregate_evidence_status(
+            _evidence_status_from_json_value(child) for child in value
+        )
     return None
 
 
@@ -1433,6 +1487,57 @@ def _parse_journal_lines(raw: str) -> list[dict[str, Any]]:
         if isinstance(record, dict):
             records.append(record)
     return records
+
+
+def _bounded_phase_payload(
+    items: list[Any],
+    *,
+    item_key: str,
+    limit: int,
+    max_text: int,
+) -> dict[str, Any]:
+    total = len(items)
+    safe_limit = max(1, min(int(limit), 200))
+    safe_max_text = max(200, min(int(max_text), 20000))
+    window = items[-safe_limit:] if total > safe_limit else items
+    entries: list[Any] = []
+    text_truncated = False
+    for item in window:
+        bounded, changed = _bound_json_text(item, safe_max_text)
+        entries.append(bounded)
+        text_truncated = text_truncated or changed
+    return {
+        item_key: entries,
+        "total": total,
+        "truncated": total > len(entries) or text_truncated,
+        "limit": safe_limit,
+        "max_text": safe_max_text,
+    }
+
+
+def _bound_json_text(value: Any, max_text: int) -> tuple[Any, bool]:
+    if isinstance(value, str):
+        if len(value) <= max_text:
+            return value, False
+        omitted = len(value) - max_text
+        return f"{value[:max_text]}\n... [truncated {omitted} chars]", True
+    if isinstance(value, list):
+        changed = False
+        bounded_items: list[Any] = []
+        for item in value:
+            bounded, item_changed = _bound_json_text(item, max_text)
+            bounded_items.append(bounded)
+            changed = changed or item_changed
+        return bounded_items, changed
+    if isinstance(value, dict):
+        changed = False
+        bounded_dict: dict[str, Any] = {}
+        for key, item in value.items():
+            bounded, item_changed = _bound_json_text(item, max_text)
+            bounded_dict[key] = bounded
+            changed = changed or item_changed
+        return bounded_dict, changed
+    return value, False
 
 
 def _is_context_filename(filename: str) -> bool:

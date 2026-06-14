@@ -145,7 +145,7 @@ def test_agent_task_launcher_starts_daemon_thread_with_generated_session(monkeyp
 
     monkeypatch.setattr(task_runner_module.uuid, "uuid4", lambda: FakeUuid())
     monkeypatch.setattr(task_runner_module, "Thread", FakeThread)
-    launcher = AgentTaskLauncher()
+    launcher = AgentTaskLauncher(session_store=FakeSessionStore())
     monkeypatch.setattr(launcher, "_run_agent", lambda *args: None)
 
     session_id = launcher.run("sag-commons-cli", "Run formatter tests", "CC-3")
@@ -227,12 +227,20 @@ def test_agent_task_launcher_marks_session_finished_after_agent_run(monkeypatch)
     monkeypatch.setattr("sag.docker_orch.orch.DockerOrchestrator", FakeDockerOrchestrator)
     monkeypatch.setattr("sag.agent.agent.SetupAgent", FakeSetupAgent)
     monkeypatch.setattr("sag.config.get_config", lambda: "config")
+    monkeypatch.setattr(
+        "sag.config.ensure_session_logging",
+        lambda config, *, force_new=False: calls.setdefault(
+            "session_logging_config", (config, force_new)
+        ),
+        raising=False,
+    )
 
     launcher = AgentTaskLauncher(session_store=store)
 
     launcher._run_agent("UI-12345678", "sag-commons-cli", "Run formatter tests", None)
 
     assert calls["project_name"] == "commons-cli"
+    assert calls["session_logging_config"] == ("config", True)
     assert calls["run_task"] == ("commons-cli", "Run formatter tests")
     assert store.finished == [
         {
@@ -242,6 +250,47 @@ def test_agent_task_launcher_marks_session_finished_after_agent_run(monkeypatch)
             "outcome": "Task completed: Run formatter tests",
         }
     ]
+
+
+def test_agent_task_launcher_requests_fresh_log_session_for_each_run(monkeypatch):
+    store = FakeSessionStore()
+    logging_calls = []
+
+    class FakeDockerOrchestrator:
+        def __init__(self, project_name):
+            self.project_name = project_name
+
+        def container_exists(self):
+            return True
+
+        def is_container_running(self):
+            return True
+
+        def execute_command(self, command):
+            return {"exit_code": 0, "output": '{"project_name": "commons-cli"}'}
+
+    class FakeSetupAgent:
+        def __init__(self, *, config, orchestrator):
+            pass
+
+        def run_task(self, *, project_name, task_description):
+            return True
+
+    monkeypatch.setattr("sag.docker_orch.orch.DockerOrchestrator", FakeDockerOrchestrator)
+    monkeypatch.setattr("sag.agent.agent.SetupAgent", FakeSetupAgent)
+    monkeypatch.setattr("sag.config.get_config", lambda: "config")
+    monkeypatch.setattr(
+        "sag.config.ensure_session_logging",
+        lambda config, *, force_new=False: logging_calls.append((config, force_new)),
+        raising=False,
+    )
+
+    launcher = AgentTaskLauncher(session_store=store)
+
+    launcher._run_agent("UI-1", "sag-commons-cli", "First task", None)
+    launcher._run_agent("UI-2", "sag-commons-cli", "Second task", None)
+
+    assert logging_calls == [("config", True), ("config", True)]
 
 
 def test_agent_task_launcher_project_name_falls_back_on_bad_metadata():

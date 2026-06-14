@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -104,14 +104,34 @@ def create_app(
         return {"workspace_id": workspace_id, "phases": items}
 
     @app.get("/api/workspaces/{workspace_id}/phases/{phase}/journal")
-    def get_workspace_phase_journal(workspace_id: str, phase: str) -> dict:
-        records = phases.get_phase_journal(workspace_id, phase)
-        if records is None:
+    def get_workspace_phase_journal(
+        workspace_id: str,
+        phase: str,
+        limit: int = Query(default=100, ge=1, le=200),
+        max_text: int = Query(default=4000, ge=200, le=20000),
+    ) -> dict:
+        payload = phases.get_phase_journal(workspace_id, phase, limit=limit, max_text=max_text)
+        if payload is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"No context journal for phase: {phase}",
             )
-        return {"workspace_id": workspace_id, "phase": phase, "records": records}
+        return {"workspace_id": workspace_id, "phase": phase, **payload}
+
+    @app.get("/api/workspaces/{workspace_id}/phases/{phase}/history")
+    def get_workspace_phase_history(
+        workspace_id: str,
+        phase: str,
+        limit: int = Query(default=100, ge=1, le=200),
+        max_text: int = Query(default=4000, ge=200, le=20000),
+    ) -> dict:
+        payload = phases.get_phase_history(workspace_id, phase, limit=limit, max_text=max_text)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No branch history for phase: {phase}",
+            )
+        return {"workspace_id": workspace_id, "phase": phase, **payload}
 
     @app.post("/api/project-launches/batch")
     def submit_project_batch(request: LaunchBatchRequest) -> JSONResponse:

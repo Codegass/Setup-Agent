@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from threading import Thread
+from threading import Lock, Thread
 from typing import Annotated, Any
 
 from pydantic import BaseModel, StringConstraints
@@ -18,6 +18,8 @@ class TaskRequest(BaseModel):
 
 
 class AgentTaskLauncher:
+    _agent_run_lock = Lock()
+
     def __init__(self, session_store: ContainerSessionStore | None = None):
         self.session_store = session_store if session_store is not None else ContainerSessionStore()
 
@@ -51,7 +53,7 @@ class AgentTaskLauncher:
         outcome = f"Task failed: {task}"
         try:
             from sag.agent.agent import SetupAgent
-            from sag.config import get_config
+            from sag.config import ensure_session_logging, get_config
             from sag.docker_orch.orch import DockerOrchestrator
 
             docker_label = workspace_id.removeprefix("sag-")
@@ -65,8 +67,11 @@ class AgentTaskLauncher:
 
             project_name = self._read_project_name(orchestrator, fallback=docker_label)
             task_text = self._task_with_source_session(task, source_session)
-            agent = SetupAgent(config=get_config(), orchestrator=orchestrator)
-            success = agent.run_task(project_name=project_name, task_description=task_text)
+            with self._agent_run_lock:
+                config = get_config()
+                ensure_session_logging(config, force_new=True)
+                agent = SetupAgent(config=config, orchestrator=orchestrator)
+                success = agent.run_task(project_name=project_name, task_description=task_text)
             outcome = f"Task completed: {task}" if success else f"Task incomplete: {task}"
         except Exception:
             outcome = f"Task failed: {task}"

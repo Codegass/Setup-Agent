@@ -4,6 +4,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from threading import RLock
 from typing import Optional
 
 from loguru import logger
@@ -201,25 +202,27 @@ class SessionLogger:
 
 # Global session logger instance
 _session_logger: Optional[SessionLogger] = None
+_session_logger_lock = RLock()
 
 
 def setup_session_logging(config) -> SessionLogger:
     """Setup session-based logging system."""
     global _session_logger
 
-    _session_logger = SessionLogger(config)
+    with _session_logger_lock:
+        _session_logger = SessionLogger(config)
 
-    # Enable LiteLLM verbose logging if verbose mode is enabled
-    if config.verbose:
-        try:
-            import litellm
+        # Enable LiteLLM verbose logging if verbose mode is enabled
+        if config.verbose:
+            try:
+                import litellm
 
-            litellm.set_verbose = True
-            logger.info("LiteLLM verbose logging enabled")
-        except ImportError:
-            logger.warning("LiteLLM not available for verbose logging")
+                litellm.set_verbose = True
+                logger.info("LiteLLM verbose logging enabled")
+            except ImportError:
+                logger.warning("LiteLLM not available for verbose logging")
 
-    return _session_logger
+        return _session_logger
 
 
 def get_session_logger() -> Optional[SessionLogger]:

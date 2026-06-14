@@ -14,6 +14,8 @@ from sag.web.session_registry import (
 )
 
 CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
+LONG_LEDGER = "ATTEMPT LEDGER:\n" + ("enforcer violation detail " * 20)
+LONG_HISTORY_OUTPUT = "BUILD FAILED: enforcer\n" + ("stack trace detail " * 25)
 
 TRUNK = {
     "context_id": "trunk_20260612_010101",
@@ -59,6 +61,7 @@ JOURNAL_LINES = "\n".join(
                 "delta": {"added": 2, "compacted": 0},
                 "total_chars": 5200,
                 "step_span": 3,
+                "ledger_text": LONG_LEDGER,
             }
         ),
     ]
@@ -97,7 +100,21 @@ class FakeOrchestrator:
 def files_with_phases():
     return {
         f"{CONTEXTS_DIR}/trunk_20260612_010101.json": json.dumps(TRUNK),
-        f"{CONTEXTS_DIR}/phase_build.json": json.dumps({"task_id": "phase_build"}),
+        f"{CONTEXTS_DIR}/phase_build.json": json.dumps(
+            {
+                "task_id": "phase_build",
+                "history": [
+                    {"type": "thought", "content": "Need to inspect Maven output."},
+                    {
+                        "type": "action",
+                        "tool_name": "bash",
+                        "success": False,
+                        "parameters": {"command": "mvn test"},
+                        "output": LONG_HISTORY_OUTPUT,
+                    },
+                ],
+            }
+        ),
         f"{CONTEXTS_DIR}/journal/phase_build.journal.jsonl": JOURNAL_LINES,
     }
 
@@ -176,10 +193,28 @@ def test_journal_endpoint_parses_jsonl_and_skips_bad_lines():
     response = client.get("/api/workspaces/sag-commons-cli/phases/build/journal")
 
     assert response.status_code == 200
-    records = response.json()["records"]
+    body = response.json()
+    records = body["records"]
     assert [r["iteration"] for r in records] == [1, 2]
     assert records[0]["intro_text"] == "=== PHASE: BUILD ==="
     assert records[1]["step_span"] == 3
+    assert body["total"] == 2
+    assert body["truncated"] is False
+
+
+def test_journal_endpoint_bounds_records_and_text():
+    client, _, _ = phase_setup(files_with_phases())
+
+    response = client.get(
+        "/api/workspaces/sag-commons-cli/phases/build/journal?limit=1&max_text=200"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["truncated"] is True
+    assert [r["iteration"] for r in body["records"]] == [2]
+    assert len(body["records"][0]["ledger_text"]) < len(LONG_LEDGER)
 
 
 def test_journal_endpoint_404_when_absent():
@@ -194,6 +229,57 @@ def test_journal_rejects_unsafe_phase_names_without_touching_container():
     _, registry, fake = phase_setup(files_with_phases())
 
     assert registry.get_phase_journal("sag-commons-cli", "../etc/passwd") is None
+    assert fake.commands == []
+
+
+# --- phase history endpoint ------------------------------------------------
+
+
+def test_phase_history_endpoint_returns_branch_entries():
+    client, _, _ = phase_setup(files_with_phases())
+
+    response = client.get("/api/workspaces/sag-commons-cli/phases/build/history")
+
+    assert response.status_code == 200
+    body = response.json()
+    entries = body["entries"]
+    assert entries[0]["content"] == "Need to inspect Maven output."
+    assert entries[1]["tool_name"] == "bash"
+    assert entries[1]["parameters"] == {"command": "mvn test"}
+    assert entries[1]["output"].startswith("BUILD FAILED: enforcer")
+    assert body["total"] == 2
+    assert body["truncated"] is False
+
+
+def test_phase_history_endpoint_bounds_entries_and_text():
+    client, _, _ = phase_setup(files_with_phases())
+
+    response = client.get(
+        "/api/workspaces/sag-commons-cli/phases/build/history?limit=1&max_text=200"
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["truncated"] is True
+    assert len(body["entries"]) == 1
+    assert body["entries"][0]["tool_name"] == "bash"
+    assert body["entries"][0]["output"].startswith("BUILD FAIL")
+    assert len(body["entries"][0]["output"]) < len(LONG_HISTORY_OUTPUT)
+
+
+def test_phase_history_endpoint_404_when_absent():
+    client, _, _ = phase_setup(files_with_phases())
+
+    response = client.get("/api/workspaces/sag-commons-cli/phases/test/history")
+
+    assert response.status_code == 404
+
+
+def test_phase_history_rejects_unsafe_phase_names_without_touching_container():
+    _, registry, fake = phase_setup(files_with_phases())
+
+    assert registry.get_phase_history("sag-commons-cli", "../etc/passwd") is None
     assert fake.commands == []
 
 

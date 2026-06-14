@@ -1,6 +1,13 @@
 from click.testing import CliRunner
 
+import sag.config as config_module
+import sag.config.logger as logger_module
 import sag.main as main_module
+
+
+def reset_config_state(monkeypatch):
+    monkeypatch.setattr(config_module, "_config", None)
+    monkeypatch.setattr(logger_module, "_session_logger", None)
 
 
 class FakeProjectOrchestrator:
@@ -33,6 +40,7 @@ class RecordingSetupAgent:
 
 
 def test_project_command_returns_nonzero_when_setup_fails(monkeypatch, tmp_path):
+    reset_config_state(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_module, "DockerOrchestrator", FakeProjectOrchestrator)
     monkeypatch.setattr(main_module, "SetupAgent", FailingSetupAgent)
@@ -47,6 +55,7 @@ def test_project_command_returns_nonzero_when_setup_fails(monkeypatch, tmp_path)
 
 
 def test_project_command_returns_nonzero_when_ui_setup_fails(monkeypatch, tmp_path):
+    reset_config_state(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_module, "DockerOrchestrator", FakeProjectOrchestrator)
     monkeypatch.setattr(main_module, "SetupAgent", FailingSetupAgent)
@@ -60,6 +69,7 @@ def test_project_command_returns_nonzero_when_ui_setup_fails(monkeypatch, tmp_pa
 
 
 def test_project_command_passes_ref_to_setup_agent(monkeypatch, tmp_path):
+    reset_config_state(monkeypatch)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(main_module, "DockerOrchestrator", FakeProjectOrchestrator)
     monkeypatch.setattr(main_module, "SetupAgent", RecordingSetupAgent)
@@ -77,3 +87,19 @@ def test_project_command_passes_ref_to_setup_agent(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert RecordingSetupAgent.calls[0]["project_ref"] == "rel/commons-cli-1.11.0"
+
+
+def test_project_command_initializes_agent_session_logs(monkeypatch, tmp_path):
+    reset_config_state(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main_module, "DockerOrchestrator", FakeProjectOrchestrator)
+    monkeypatch.setattr(main_module, "SetupAgent", RecordingSetupAgent)
+    RecordingSetupAgent.calls = []
+
+    result = CliRunner().invoke(
+        main_module.cli,
+        ["project", "https://github.com/apache/commons-cli.git"],
+    )
+
+    assert result.exit_code == 0
+    assert list((tmp_path / "logs").glob("session_*"))
