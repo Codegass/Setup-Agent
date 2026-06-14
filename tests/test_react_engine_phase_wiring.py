@@ -32,7 +32,8 @@ def _engine_with_machine():
 def test_phase_done_signal_advances_and_resets_window():
     engine = _engine_with_machine()
     step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"), tool_name="phase",
+        step_type=SimpleNamespace(value="action"),
+        tool_name="phase",
         tool_result=SimpleNamespace(
             success=True,
             metadata={"phase_signal": "done", "key_results": "cloned + JDK", "evidence": []},
@@ -52,7 +53,8 @@ def test_phase_done_signal_advances_and_resets_window():
 def test_phase_blocked_signal_records_and_advances():
     engine = _engine_with_machine()
     step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"), tool_name="phase",
+        step_type=SimpleNamespace(value="action"),
+        tool_name="phase",
         tool_result=SimpleNamespace(
             success=True,
             metadata={"phase_signal": "blocked", "reason": "no network", "evidence": []},
@@ -63,6 +65,77 @@ def test_phase_blocked_signal_records_and_advances():
 
     assert engine.phase_machine.records[0].status == "blocked"
     assert engine.phase_machine.current_phase == "analyze"
+
+
+def test_phase_note_signal_persists_without_advancing():
+    from sag.agent.context_manager import Task, TrunkContext
+
+    class _CM:
+        current_task_id = "phase_provision"
+
+        def __init__(self, trunk):
+            self.trunk = trunk
+            self.saved = False
+
+        def load_trunk_context(self):
+            return self.trunk
+
+        def _save_trunk_context(self, trunk):
+            self.saved = True
+
+    trunk = TrunkContext(context_id="t", goal="g", project_url="u", project_name="p")
+    trunk.todo_list.append(Task(id="phase_provision", description="Provision"))
+    engine = _engine_with_machine()
+    engine.context_manager = _CM(trunk)
+    engine.steps_since_context_switch = 9
+    step = SimpleNamespace(
+        step_type=SimpleNamespace(value="action"),
+        tool_name="phase",
+        tool_result=SimpleNamespace(
+            success=True,
+            metadata={"phase_signal": "note", "text": "Maven 3.8 is incompatible; use 3.9"},
+        ),
+    )
+
+    signal = engine._handle_phase_signals([step])
+
+    assert signal == "note"
+    assert engine.phase_machine.current_phase == "provision"
+    assert len(engine.steps) == 7, "note should not reset the phase window"
+    assert engine.steps_since_context_switch == 9
+    assert trunk.todo_list[0].notes == "Maven 3.8 is incompatible; use 3.9"
+    assert engine.context_manager.saved is True
+
+
+def test_persist_phase_record_preserves_existing_phase_notes():
+    from sag.agent.context_manager import Task, TrunkContext
+
+    class _CM:
+        current_task_id = "phase_provision"
+
+        def __init__(self, trunk):
+            self.trunk = trunk
+
+        def load_trunk_context(self):
+            return self.trunk
+
+        def _save_trunk_context(self, trunk):
+            pass
+
+    trunk = TrunkContext(context_id="t", goal="g", project_url="u", project_name="p")
+    trunk.todo_list.append(
+        Task(id="phase_provision", description="Provision", notes="Downloaded Maven 3.9.9")
+    )
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.context_manager = _CM(trunk)
+    engine.prompt_builder = None
+
+    engine._persist_phase_record("provision", "completed", "Repository cloned and analyzed")
+
+    task = trunk.todo_list[0]
+    assert task.notes == "Downloaded Maven 3.9.9"
+    assert task.key_results == "Repository cloned and analyzed"
+    assert task.status.value == "completed"
 
 
 def test_floor_starvation_forces_blocked():
@@ -104,7 +177,8 @@ def test_phase_transition_resets_journal_ledger_memory():
     engine = _engine_with_machine()
     engine._journal_last_ledger = "ATTEMPT LEDGER (older work, compacted):\n✗ x"
     step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"), tool_name="phase",
+        step_type=SimpleNamespace(value="action"),
+        tool_name="phase",
         tool_result=SimpleNamespace(
             success=True,
             metadata={"phase_signal": "done", "key_results": "ok", "evidence": []},
@@ -123,7 +197,8 @@ def test_phase_transition_resets_context_switch_counter():
     engine = _engine_with_machine()
     engine.steps_since_context_switch = 23
     step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"), tool_name="phase",
+        step_type=SimpleNamespace(value="action"),
+        tool_name="phase",
         tool_result=SimpleNamespace(
             success=True,
             metadata={"phase_signal": "done", "key_results": "ok", "evidence": []},
@@ -173,9 +248,9 @@ def test_persist_phase_record_warns_when_trunk_task_missing():
     finally:
         loguru_logger.remove(handler_id)
 
-    assert any("phase_build" in m for m in messages), (
-        "missing trunk phase task must produce a warning, not a silent no-op"
-    )
+    assert any(
+        "phase_build" in m for m in messages
+    ), "missing trunk phase task must produce a warning, not a silent no-op"
 
 
 # --- round-5 gate fixes ------------------------------------------------------
@@ -201,7 +276,11 @@ def test_floor_exhaustion_auto_completes_when_gate_passes():
 def test_floor_exhaustion_blocks_when_gate_fails():
     engine = _engine_with_machine()
     engine.current_iteration = 121
-    engine._phase_gate_check = lambda phase: {"ok": False, "reason": "no artifacts", "suggestions": []}
+    engine._phase_gate_check = lambda phase: {
+        "ok": False,
+        "reason": "no artifacts",
+        "suggestions": [],
+    }
 
     forced = engine._enforce_phase_floors()
 

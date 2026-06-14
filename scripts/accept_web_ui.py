@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 ACCEPTANCE_SCRIPT_TEST = Path("tests/test_web_acceptance_script.py")
 
@@ -22,7 +21,7 @@ BACKEND_FILES = [
     "src/sag/web/session_registry.py",
     "src/sag/web/read_model.py",
     "src/sag/web/evidence.py",
-    "src/sag/web/context_map.py",
+    "src/sag/web/context_trace.py",
     "src/sag/web/file_tracker.py",
     "src/sag/web/task_runner.py",
     "src/sag/web/terminal.py",
@@ -41,7 +40,7 @@ FRONTEND_FILES = [
     "webui/src/components/session/BuildCard.tsx",
     "webui/src/components/session/TestCard.tsx",
     "webui/src/components/session/EvidenceTimeline.tsx",
-    "webui/src/components/session/ContextMap.tsx",
+    "webui/src/components/session/ContextTrace.tsx",
     "webui/src/components/session/FilesDigest.tsx",
     "webui/src/components/session/ReportDoc.tsx",
     "webui/src/components/session/LogsView.tsx",
@@ -58,7 +57,7 @@ FRONTEND_SESSION_FILES = [
     "webui/src/components/session/BuildCard.tsx",
     "webui/src/components/session/TestCard.tsx",
     "webui/src/components/session/EvidenceTimeline.tsx",
-    "webui/src/components/session/ContextMap.tsx",
+    "webui/src/components/session/ContextTrace.tsx",
     "webui/src/components/session/FilesDigest.tsx",
     "webui/src/components/session/ReportDoc.tsx",
     "webui/src/components/session/LogsView.tsx",
@@ -78,7 +77,7 @@ PRODUCT_BOUNDARY_PATTERNS = {
     "terminal websocket route": ("src/sag/web/app.py", "/api/workspaces/{workspace_id}/terminal"),
     "xterm import": ("webui/src/components/terminal/TerminalPanel.tsx", "@xterm/xterm"),
     "session detail tabs": ("webui/src/pages/SessionDetail.tsx", "Evidence"),
-    "context map trunk": ("webui/src/components/session/ContextMap.tsx", "Trunk"),
+    "context trace trunk": ("webui/src/components/session/ContextTrace.tsx", "Trunk"),
     "file digest snapshot": ("webui/src/components/session/FilesDigest.tsx", "snapshot"),
 }
 
@@ -108,7 +107,10 @@ TERMINAL_PATTERNS = {
         "webui/src/components/terminal/TerminalPanel.tsx",
         "@xterm/addon-fit",
     ),
-    "terminal panel websocket": ("webui/src/components/terminal/TerminalPanel.tsx", "new WebSocket"),
+    "terminal panel websocket": (
+        "webui/src/components/terminal/TerminalPanel.tsx",
+        "new WebSocket",
+    ),
     "workspace uses terminal panel": ("webui/src/pages/Workspace.tsx", "TerminalPanel"),
 }
 
@@ -137,12 +139,25 @@ def main() -> int:
 
     if not args.skip_commands:
         if args.phase == "terminal":
-            run(["uv", "run", "pytest", "tests/test_web_terminal.py", "tests/test_web_api.py", "-v"], failures)
+            run(
+                [
+                    "uv",
+                    "run",
+                    "pytest",
+                    "tests/test_web_terminal.py",
+                    "tests/test_web_api.py",
+                    "-v",
+                ],
+                failures,
+            )
         if args.phase in {"backend", "final"}:
             backend_tests = backend_web_test_paths(failures)
             if backend_tests:
                 run(["uv", "run", "pytest", *backend_tests, "-v"], failures)
-        if args.phase in {"terminal", "frontend", "final"} and (ROOT / "webui/package.json").exists():
+        if (
+            args.phase in {"terminal", "frontend", "final"}
+            and (ROOT / "webui/package.json").exists()
+        ):
             run(["npm", "test"], failures, cwd=ROOT / "webui")
             run(["npm", "run", "build"], failures, cwd=ROOT / "webui")
 

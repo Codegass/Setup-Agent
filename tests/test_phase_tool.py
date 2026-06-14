@@ -1,5 +1,5 @@
 # tests/test_phase_tool.py
-"""phase(action: done|blocked|note) — the model's entire lifecycle surface."""
+"""phase(action: done|blocked|note) - the model's entire lifecycle surface."""
 
 from types import SimpleNamespace
 
@@ -19,8 +19,11 @@ class GateRecorder:
 def _tool(gate, phase="build"):
     machine = SimpleNamespace(current_phase=phase, is_complete=False)
     return PhaseTool(
-        machine=machine, validator=None, orchestrator=None,
-        project_name="demo", gate_fn=gate,
+        machine=machine,
+        validator=None,
+        orchestrator=None,
+        project_name="demo",
+        gate_fn=gate,
     )
 
 
@@ -53,7 +56,9 @@ def test_blocked_always_accepted():
     gate = GateRecorder(ok=False, reason="would reject done")
     tool = _tool(gate)
 
-    result = tool.execute(action="blocked", reason="develocity plugin unresolvable", evidence=["job:a"])
+    result = tool.execute(
+        action="blocked", reason="develocity plugin unresolvable", evidence=["job:a"]
+    )
 
     assert result.success is True
     assert result.metadata["phase_signal"] == "blocked"
@@ -66,15 +71,23 @@ def test_blocked_requires_reason():
     assert result.success is False
 
 
-def test_note_recorded_no_signal():
+def test_note_signals_engine_for_durable_phase_notes():
     result = _tool(GateRecorder()).execute(action="note", text="trying maven 3.9.9 next")
     assert result.success is True
-    assert "phase_signal" not in result.metadata
+    assert result.metadata == {
+        "phase_signal": "note",
+        "text": "trying maven 3.9.9 next",
+    }
 
 
 def test_machine_complete_rejects_actions():
     machine = SimpleNamespace(current_phase=None, is_complete=True)
-    tool = PhaseTool(machine=machine, validator=None, orchestrator=None,
-                     project_name="demo", gate_fn=GateRecorder())
+    tool = PhaseTool(
+        machine=machine,
+        validator=None,
+        orchestrator=None,
+        project_name="demo",
+        gate_fn=GateRecorder(),
+    )
     result = tool.execute(action="done", key_results="x")
     assert result.success is False

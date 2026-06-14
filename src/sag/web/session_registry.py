@@ -14,11 +14,10 @@ from typing import Any
 
 from loguru import logger
 
-from sag.web.context_map import ContextMapBuilder
+from sag.web.context_trace import ContextTraceBuilder
 from sag.web.models import (
     BuildSummary,
-    ContextMap,
-    ContextReference,
+    ContextTrace,
     EvidenceGroup,
     EvidenceRecord,
     ExecutionSessionDetail,
@@ -32,10 +31,6 @@ SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
 _EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
 _CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
-# Where ContextJournal writes (sag.agent.context_journal.JOURNAL_DIR) — mirrored
-# here so the web layer never imports the agent stack.
-_JOURNAL_DIR = "/workspace/.setup_agent/contexts/journal"
-_PHASE_NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
 class SessionRegistry:
@@ -122,104 +117,8 @@ class ContainerSessionRegistry:
             if item is None or item.get("id") != session_id:
                 return None
 
-        context = _read_context_map(orchestrator)
+        context = _read_context_trace(orchestrator)
         return _session_detail(item, workspace.id, context)
-
-    def list_workspace_phases(self, workspace_id: str) -> list[dict[str, Any]] | None:
-        """Phase history from the trunk's phase_* tasks (spec §8.3).
-
-        Returns None when absent — no reachable trunk, or a legacy run whose
-        trunk has no phase tasks — so the endpoint can 404 cleanly.
-        """
-        try:
-            orchestrator = self._orchestrator(workspace_id)
-        except Exception:
-            logger.debug("No orchestrator for workspace {}", workspace_id)
-            return None
-
-        trunk = _read_latest_trunk(orchestrator)
-        if trunk is None:
-            return None
-
-        _, trunk_data = trunk
-        phases = [
-            {
-                "name": _text(task.get("id"), default="").removeprefix("phase_"),
-                "status": _text(task.get("status"), default="unknown"),
-                "notes": _text(task.get("notes"), default=""),
-                "key_results": _text(task.get("key_results"), default=""),
-            }
-            for task in _raw_task_dicts(trunk_data)
-            if _text(task.get("id"), default="").startswith("phase_")
-        ]
-        return phases or None
-
-    def get_phase_journal(
-        self,
-        workspace_id: str,
-        phase: str,
-        *,
-        limit: int = 100,
-        max_text: int = 4000,
-    ) -> dict[str, Any] | None:
-        """Parsed context-journal records for one phase; None when absent."""
-        if not _PHASE_NAME_RE.fullmatch(phase or ""):
-            return None
-
-        try:
-            orchestrator = self._orchestrator(workspace_id)
-        except Exception:
-            logger.debug("No orchestrator for workspace {}", workspace_id)
-            return None
-
-        raw = _read_container_file(orchestrator, f"{_JOURNAL_DIR}/phase_{phase}.journal.jsonl")
-        if raw is None:
-            return None
-        return _bounded_phase_payload(
-            _parse_journal_lines(raw),
-            item_key="records",
-            limit=limit,
-            max_text=max_text,
-        )
-
-    def get_phase_history(
-        self,
-        workspace_id: str,
-        phase: str,
-        *,
-        limit: int = 100,
-        max_text: int = 4000,
-    ) -> dict[str, Any] | None:
-        """Raw branch history for one phase; None when absent or malformed."""
-        if not _PHASE_NAME_RE.fullmatch(phase or ""):
-            return None
-
-        try:
-            orchestrator = self._orchestrator(workspace_id)
-        except Exception:
-            logger.debug("No orchestrator for workspace {}", workspace_id)
-            return None
-
-        raw = _read_container_file(orchestrator, f"{_CONTEXTS_DIR}/phase_{phase}.json")
-        if raw is None:
-            return None
-
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return None
-        if not isinstance(data, dict):
-            return None
-
-        history = data.get("history")
-        if not isinstance(history, list):
-            return None
-        return _bounded_phase_payload(
-            history,
-            item_key="entries",
-            limit=limit,
-            max_text=max_text,
-        )
 
     def _orchestrator(self, workspace_id: str) -> Any:
         if self.orchestrator_factory is not None:
@@ -397,14 +296,12 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
 def _session_detail(
     item: dict[str, Any],
     workspace_id: str,
-    context: ContextMap | None,
+    context: ContextTrace | None,
 ) -> ExecutionSessionDetail:
     summary = _session_summary(item, workspace_id)
     outcome = _text(item.get("outcome"), default=summary.title)
     build = _build_summary(item.get("build"))
     report_doc = _report_document(item)
-    if context is not None and report_doc is not None:
-        context = _backfill_completed_report_task(context, report_doc)
 
     return ExecutionSessionDetail(
         id=summary.id,
@@ -426,67 +323,6 @@ def _session_detail(
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
-    )
-
-
-def _backfill_completed_report_task(
-    context: ContextMap,
-    report_doc: ReportDocument,
-) -> ContextMap:
-    tasks = []
-    changed = False
-    report_ref = report_doc.path or report_doc.title
-    for task in context.tasks:
-        if _is_incomplete_final_report_context_task(task):
-            refs = [*task.refs]
-            if report_ref and report_ref not in {ref.ref for ref in refs}:
-                refs.append(
-                    ContextReference(
-                        ref=report_ref,
-                        label=report_ref,
-                        kind="report",
-                    )
-                )
-            tasks.append(
-                task.model_copy(
-                    update={
-                        "status": "completed",
-                        "summary": task.summary
-                        or f"Final setup report generated: {report_doc.title}",
-                        "refs": refs,
-                    }
-                )
-            )
-            changed = True
-        else:
-            tasks.append(task)
-
-    if not changed:
-        return context
-
-    done = sum(1 for task in tasks if task.status.strip().lower() == "completed")
-    total = len(tasks)
-    state = "completed" if total and done == total else context.trunk.state
-    return context.model_copy(
-        update={
-            "tasks": tasks,
-            "trunk": context.trunk.model_copy(
-                update={
-                    "state": state,
-                    "progress": {"done": done, "total": total},
-                }
-            ),
-        }
-    )
-
-
-def _is_incomplete_final_report_context_task(task: Any) -> bool:
-    status = str(getattr(task, "status", "")).strip().lower()
-    if status == "completed":
-        return False
-    title = str(getattr(task, "title", "")).lower()
-    return "report" in title and any(
-        marker in title for marker in ("final", "completion", "comprehensive", "setup")
     )
 
 
@@ -668,9 +504,10 @@ def _read_latest_trunk(orchestrator: Any) -> tuple[str, dict[str, Any]] | None:
 
 def _context_filenames(orchestrator: Any) -> list[str]:
     command = (
-        "find /workspace/.setup_agent/contexts -maxdepth 1 -type f "
-        "\\( -name 'trunk*.json' -o -name 'task_*.json' -o -name 'phase_*.json' \\) "
-        "-printf '%f\\n' 2>/dev/null || true"
+        "find /workspace/.setup_agent/contexts -maxdepth 2 -type f "
+        "\\( -name 'trunk*.json' -o -name 'phase_*.json' "
+        "-o -name 'full_outputs.jsonl' -o -path '*/journal/phase_*.journal.jsonl' \\) "
+        "-printf '%P\\n' 2>/dev/null || true"
     )
     try:
         result = orchestrator.execute_command(command, timeout=5)
@@ -1432,11 +1269,12 @@ def _find_session_item(raw: str, session_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _read_context_map(orchestrator: Any) -> ContextMap | None:
+def _read_context_trace(orchestrator: Any) -> ContextTrace | None:
     command = (
-        "find /workspace/.setup_agent/contexts -maxdepth 1 -type f "
-        "\\( -name 'trunk*.json' -o -name 'task_*.json' -o -name 'phase_*.json' \\) "
-        "-printf '%f\\n' 2>/dev/null || true"
+        "find /workspace/.setup_agent/contexts -maxdepth 2 -type f "
+        "\\( -name 'trunk*.json' -o -name 'phase_*.json' "
+        "-o -name 'full_outputs.jsonl' -o -path '*/journal/phase_*.journal.jsonl' \\) "
+        "-printf '%P\\n' 2>/dev/null || true"
     )
     try:
         result = orchestrator.execute_command(command, timeout=5)
@@ -1461,97 +1299,34 @@ def _read_context_map(orchestrator: Any) -> ContextMap | None:
         contexts_dir = Path(temp_dir) / "contexts"
         contexts_dir.mkdir()
 
-        for filename in filenames[:50]:
+        for filename in filenames[:100]:
             raw = _read_container_file(
                 orchestrator,
                 f"/workspace/.setup_agent/contexts/{filename}",
             )
             if raw is None:
                 continue
-            (contexts_dir / filename).write_text(raw, encoding="utf-8")
+            target = contexts_dir / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(raw, encoding="utf-8")
 
-        return ContextMapBuilder(contexts_dir).build()
-
-
-def _parse_journal_lines(raw: str) -> list[dict[str, Any]]:
-    """jsonl → list of records; torn/corrupt appends are skipped, not fatal."""
-    records: list[dict[str, Any]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def _bounded_phase_payload(
-    items: list[Any],
-    *,
-    item_key: str,
-    limit: int,
-    max_text: int,
-) -> dict[str, Any]:
-    total = len(items)
-    safe_limit = max(1, min(int(limit), 200))
-    safe_max_text = max(200, min(int(max_text), 20000))
-    window = items[-safe_limit:] if total > safe_limit else items
-    entries: list[Any] = []
-    text_truncated = False
-    for item in window:
-        bounded, changed = _bound_json_text(item, safe_max_text)
-        entries.append(bounded)
-        text_truncated = text_truncated or changed
-    return {
-        item_key: entries,
-        "total": total,
-        "truncated": total > len(entries) or text_truncated,
-        "limit": safe_limit,
-        "max_text": safe_max_text,
-    }
-
-
-def _bound_json_text(value: Any, max_text: int) -> tuple[Any, bool]:
-    if isinstance(value, str):
-        if len(value) <= max_text:
-            return value, False
-        omitted = len(value) - max_text
-        return f"{value[:max_text]}\n... [truncated {omitted} chars]", True
-    if isinstance(value, list):
-        changed = False
-        bounded_items: list[Any] = []
-        for item in value:
-            bounded, item_changed = _bound_json_text(item, max_text)
-            bounded_items.append(bounded)
-            changed = changed or item_changed
-        return bounded_items, changed
-    if isinstance(value, dict):
-        changed = False
-        bounded_dict: dict[str, Any] = {}
-        for key, item in value.items():
-            bounded, item_changed = _bound_json_text(item, max_text)
-            bounded_dict[key] = bounded
-            changed = changed or item_changed
-        return bounded_dict, changed
-    return value, False
+        return ContextTraceBuilder(contexts_dir).build()
 
 
 def _is_context_filename(filename: str) -> bool:
-    """Context artifacts the dashboard may read: trunk snapshots plus the
-    task_*/phase_* branch histories (phase histories persist exactly like
-    task histories — spec §8.3)."""
+    """Context artifacts the dashboard may read for the phase trace model."""
+    if filename == "full_outputs.jsonl":
+        return True
+    if filename.startswith("journal/"):
+        return bool(re.fullmatch(r"journal/phase_[A-Za-z0-9_-]+\.journal\.jsonl", filename))
     if not filename.endswith(".json"):
         return False
-    return filename.startswith(("trunk", "task_", "phase_"))
+    return filename.startswith(("trunk", "phase_"))
 
 
 def _safe_context_filename(value: str) -> str | None:
     filename = value.strip()
-    if not filename or "/" in filename:
+    if not filename or filename.startswith("/") or ".." in Path(filename).parts:
         return None
     if not _is_context_filename(filename):
         return None

@@ -196,23 +196,29 @@ describe("SessionDetail", () => {
               progress: { done: 1, total: 1 },
               summary: "",
             },
-            tasks: [
+            phases: [
               {
-                id: "task_1",
+                id: "phase_provision",
+                name: "provision",
                 title: "Clone repository",
                 status: "completed",
-                summary: "",
+                notes: "",
+                keyResults: "",
+                evidenceStatus: "unknown",
+                evidenceRefs: [],
+                conflicts: [],
                 refs: [],
-                recovered: false,
+                progress: { iterations: 0, thoughts: 0, actions: 0 },
+                tasks: [
+                  {
+                    id: "phase_provision/work",
+                    title: "Clone repository",
+                    status: "completed",
+                    iterations: [],
+                  },
+                ],
               },
             ],
-            activeBranch: {
-              task: "",
-              why: "",
-              memory: [],
-              lastRefs: [],
-              pressure: 0,
-            },
             debug: {},
           },
         }}
@@ -238,23 +244,45 @@ describe("SessionDetail", () => {
               progress: { done: 1, total: 1 },
               summary: "",
             },
-            tasks: [
+            phases: [
               {
-                id: "task_4",
+                id: "phase_build",
+                name: "build",
                 title: "Compile project using Maven",
                 status: "completed",
-                summary: "Previous task: Java 8 verified.\nmaven succeeded: BUILD SUCCESS",
-                refs: ["output_build_success"],
-                recovered: false,
+                notes: "",
+                keyResults: "Maven compile passed.",
+                evidenceStatus: "unknown",
+                evidenceRefs: [],
+                conflicts: [],
+                refs: [],
+                progress: { iterations: 1, thoughts: 1, actions: 1 },
+                tasks: [
+                  {
+                    id: "phase_build/work",
+                    title: "Compile project using Maven",
+                    status: "completed",
+                    iterations: [
+                      {
+                        iteration: 12,
+                        sequence: 1,
+                        thoughts: ["Previous task: Java 8 verified."],
+                        actions: [
+                          {
+                            toolName: "maven",
+                            success: true,
+                            parameters: {},
+                            observation: "maven succeeded: BUILD SUCCESS",
+                            output: "Full output ref: output_build_success",
+                            refs: ["output_build_success"],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
               },
             ],
-            activeBranch: {
-              task: "",
-              why: "",
-              memory: [],
-              lastRefs: [],
-              pressure: 0,
-            },
             debug: {},
           },
         }}
@@ -266,7 +294,8 @@ describe("SessionDetail", () => {
 
     expect(screen.queryByText(/maven succeeded/)).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole("button", { name: /task_4 compile project using maven/i }))
+    fireEvent.click(screen.getByRole("button", { name: /phase_build compile project using maven/i }))
+    fireEvent.click(screen.getByRole("button", { name: /phase_build\/work compile project using maven/i }))
 
     expect(screen.getByText(/maven succeeded/)).toBeInTheDocument()
     expect(screen.getByText("output_build_success")).toBeInTheDocument()

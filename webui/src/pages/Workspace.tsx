@@ -26,12 +26,11 @@ import { Card, CardHead } from "@/components/common/Card"
 import { Tabs } from "@/components/common/Tabs"
 import { TestBar } from "@/components/common/TestBar"
 import { BuildCard } from "@/components/session/BuildCard"
-import { ContextMap } from "@/components/session/ContextMap"
+import { ContextTrace } from "@/components/session/ContextTrace"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { TestCard } from "@/components/session/TestCard"
 import { TerminalPanel } from "@/components/terminal/TerminalPanel"
-import { PhaseTimeline } from "@/components/workspace/PhaseTimeline"
 import {
   Dialog,
   DialogContent,
@@ -140,6 +139,7 @@ export function Workspace({
         className="mt-5"
         tabs={[
           "Overview",
+          "Phases",
           { id: "Sessions", label: "Sessions", count: sessions.length },
           "Terminal",
           "Settings",
@@ -175,11 +175,17 @@ export function Workspace({
           <Card className="overflow-hidden">
             <CardHead
               icon={<GitBranch size={16} className="text-slate-500" />}
-              sub="Engine-driven phases and per-iteration context journal"
-              title="Phase timeline"
+              sub="Trunk phases, work units, iterations, actions, and output refs"
+              title="Context trace"
             />
             <div className="p-5">
-              <PhaseTimeline workspaceId={workspace.id} />
+              {latest?.context ? (
+                <ContextTrace ctx={latest.context} />
+              ) : (
+                <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-8 text-center text-[13px] text-slate-500">
+                  Context trace unavailable for the latest session.
+                </div>
+              )}
             </div>
           </Card>
         ) : null}
@@ -357,7 +363,7 @@ function OverviewTab({
         <div>
           <div className="mb-2 flex items-center justify-between">
             <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
-              Context map - trunk / branch
+              Context trace - trunk / phase
             </div>
             <Button
               onClick={() => onOpenSession(latest.id, "Context")}
@@ -369,7 +375,7 @@ function OverviewTab({
               <ArrowRight size={13} />
             </Button>
           </div>
-          <ContextMap ctx={latest.context} preview />
+          <ContextTrace ctx={latest.context} preview />
         </div>
       ) : null}
     </div>

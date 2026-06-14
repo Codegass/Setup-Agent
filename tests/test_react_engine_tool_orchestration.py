@@ -19,6 +19,17 @@ class ContextWithoutForceNextTask:
     current_task_id = None
 
 
+class RecordingBranchContext:
+    current_task_id = "phase_build"
+
+    def __init__(self):
+        self.entries = []
+
+    def add_to_branch_history(self, task_id, entry):
+        self.entries.append((task_id, entry))
+        return {"success": True}
+
+
 class FakeAgentLogger:
     def __init__(self):
         self.messages = []
@@ -350,6 +361,49 @@ def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypa
         for s in engine.steps
     )
     assert engine._force_thinking_after_success is True
+
+
+def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
+    context = RecordingBranchContext()
+    result = ToolResult(success=True, output="Full output ref: output_build")
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: build",
+        tool_name="build",
+        tool_params={"action": "compile"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="build", raw_params={"action": "compile"}),
+        result=result,
+        status="success",
+        raw_params={"action": "compile"},
+        validated_params={"action": "compile"},
+        executed_params={"action": "compile"},
+        observation_text="build succeeded",
+        attempted_execution=True,
+    )
+    engine = _engine_with_context(context=context)
+    engine.tools = {}
+    engine.current_iteration = 12
+
+    class FakeOrchestrator:
+        def execute(self, call):
+            return execution
+
+    monkeypatch.setattr(engine, "_get_tool_orchestrator", lambda: FakeOrchestrator())
+
+    assert engine._execute_steps([step]) is True
+
+    assert context.entries[0][0] == "phase_build"
+    entry = context.entries[0][1]
+    assert entry["type"] == "action"
+    assert entry["iteration"] == 12
+    assert entry["tool_name"] == "build"
+    assert entry["parameters"] == {"action": "compile"}
+    assert entry["observation"] == "build succeeded"
+    assert entry["output_refs"] == ["output_build"]
 
 
 def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator():

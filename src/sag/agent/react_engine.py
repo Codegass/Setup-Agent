@@ -1,6 +1,7 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
 import json
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +32,6 @@ from .tool_orchestration import (
     ToolLifecycleEvent,
     ToolOrchestrator,
 )
-
 
 # Per-phase objectives for the setup phase machine (spec §3.1). These
 # prescribe TOOLS, never raw commands — task text outranks prompt guidance
@@ -354,9 +354,8 @@ class ReActEngine(UIEventEmitter):
 
     def _phase_budget_numbers(self, phase: str) -> tuple[int, int, int]:
         """(max_iter, reserved_for_later_phases, remaining_iterations)."""
-        max_iter = (
-            getattr(self, "_run_max_iterations", None)
-            or getattr(self.config, "max_iterations", 150)
+        max_iter = getattr(self, "_run_max_iterations", None) or getattr(
+            self.config, "max_iterations", 150
         )
         later = PHASE_NAMES[PHASE_NAMES.index(phase) + 1 :]
         floors = getattr(self.config, "phase_min_floors", {}) or {}
@@ -405,6 +404,9 @@ class ReActEngine(UIEventEmitter):
                 continue
             machine = self.phase_machine
             finished = machine.current_phase
+            if signal == "note":
+                self._persist_phase_note(finished, metadata.get("text", ""))
+                return signal
             if signal == "done":
                 machine.mark_done(metadata.get("key_results", ""), metadata.get("evidence", []))
                 self._persist_phase_record(finished, "completed", metadata.get("key_results", ""))
@@ -431,8 +433,14 @@ class ReActEngine(UIEventEmitter):
         runs)."""
         counts = getattr(self, "_archived_counts", None)
         if counts is None:
-            counts = {"total_steps": 0, "thoughts": 0, "actions": 0, "observations": 0,
-                      "successful_actions": 0, "failed_actions": 0}
+            counts = {
+                "total_steps": 0,
+                "thoughts": 0,
+                "actions": 0,
+                "observations": 0,
+                "successful_actions": 0,
+                "failed_actions": 0,
+            }
             self._archived_counts = counts
         for s in self.steps:
             counts["total_steps"] += 1
@@ -526,17 +534,19 @@ class ReActEngine(UIEventEmitter):
         gate = self._phase_gate_check(machine.current_phase)
         if not gate.get("ok"):
             return False
-        self.steps.append(ReActStep(
-            step_type=StepType.SYSTEM_GUIDANCE,
-            content=(
-                f"EVIDENCE CHECK: the completion gate for phase '{machine.current_phase}' "
-                f"already passes on physical evidence. If you agree the objective is met, "
-                f"claim phase(action='done', key_results=..., evidence=[refs]) now and move on. "
-                f"If you are pursuing something beyond this phase's objective, consider "
-                f"whether it belongs to a later phase or a note."
-            ),
-            timestamp=self._get_timestamp(),
-        ))
+        self.steps.append(
+            ReActStep(
+                step_type=StepType.SYSTEM_GUIDANCE,
+                content=(
+                    f"EVIDENCE CHECK: the completion gate for phase '{machine.current_phase}' "
+                    f"already passes on physical evidence. If you agree the objective is met, "
+                    f"claim phase(action='done', key_results=..., evidence=[refs]) now and move on. "
+                    f"If you are pursuing something beyond this phase's objective, consider "
+                    f"whether it belongs to a later phase or a note."
+                ),
+                timestamp=self._get_timestamp(),
+            )
+        )
         return True
 
     def _enforce_phase_floors(self) -> bool:
@@ -605,7 +615,12 @@ class ReActEngine(UIEventEmitter):
                 trunk = cm.load_trunk_context()
                 if trunk is None:
                     return
-                status_ok = trunk.update_task_status(task_id, target, text)
+                existing_notes = ""
+                for task in trunk.todo_list:
+                    if task.id == task_id:
+                        existing_notes = task.notes
+                        break
+                status_ok = trunk.update_task_status(task_id, target, existing_notes)
                 results_ok = trunk.update_task_key_results(task_id, text)
                 if not (status_ok and results_ok):
                     # A missing phase_<name> trunk task means phase history is
@@ -624,6 +639,38 @@ class ReActEngine(UIEventEmitter):
                 builder.invalidate_trunk_cache()
         except Exception as exc:
             logger.warning(f"Failed to persist phase record '{task_id}' ({status}): {exc}")
+
+    def _persist_phase_note(self, phase_name: str, text: str) -> None:
+        """Append a model-authored phase note to the trunk task without
+        advancing the phase machine. Notes are durable UI/context material;
+        action history still records the exact tool call."""
+        note = (text or "").strip()
+        if not note:
+            return
+        cm = getattr(self, "context_manager", None)
+        if cm is None:
+            return
+        task_id = f"phase_{phase_name}"
+        try:
+            trunk = cm.load_trunk_context()
+            if trunk is None:
+                return
+            for task in trunk.todo_list:
+                if task.id != task_id:
+                    continue
+                task.notes = f"{task.notes.rstrip()}\n{note}".strip() if task.notes else note
+                trunk.update_timestamp()
+                cm._save_trunk_context(trunk)
+                builder = getattr(self, "prompt_builder", None)
+                if builder is not None:
+                    builder.invalidate_trunk_cache()
+                return
+            logger.warning(
+                f"Phase note for '{task_id}' not persisted: context manager "
+                f"has no such task (phase notes may be missing from the trunk)"
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to persist phase note '{task_id}': {exc}")
 
     def _start_phase_branch(self) -> None:
         """Open the branch context for the new current phase (best-effort) so
@@ -849,7 +896,8 @@ class ReActEngine(UIEventEmitter):
                             timestamp=self._get_timestamp(),
                         )
                         kept_clean = [
-                            s for s in kept
+                            s
+                            for s in kept
                             if "ATTEMPT LEDGER" not in (getattr(s, "content", "") or "")
                         ]
                         n_compacted = len(tail) - len(kept_clean)
@@ -1044,7 +1092,11 @@ class ReActEngine(UIEventEmitter):
                     try:
                         self.context_manager.add_to_branch_history(
                             self.context_manager.current_task_id,
-                            {"type": "thought", "content": step.content},
+                            {
+                                "type": "thought",
+                                "iteration": self.current_iteration,
+                                "content": step.content,
+                            },
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log thought to branch history: {e}")
@@ -1106,7 +1158,8 @@ class ReActEngine(UIEventEmitter):
                         timestamp = datetime.now().isoformat()
 
                         # Store full output and get reference if output is large
-                        if len(output_to_store) > 800:
+                        stored_output_refs = []
+                        if len(output_to_store) > 800 and self.output_storage is not None:
                             # Store the full output
                             ref_id = self.output_storage.store_output(
                                 task_id=self.context_manager.current_task_id,
@@ -1118,6 +1171,7 @@ class ReActEngine(UIEventEmitter):
                                     "iteration": self.current_iteration,
                                 },
                             )
+                            stored_output_refs.append(ref_id)
 
                             # Get truncated version with reference
                             output_to_store = self.output_storage.get_truncation_with_reference(
@@ -1129,9 +1183,18 @@ class ReActEngine(UIEventEmitter):
 
                         history_entry = {
                             "type": "action",
+                            "iteration": self.current_iteration,
                             "tool_name": step.tool_name,
+                            "parameters": step.tool_params or {},
                             "success": result.success,
                             "output": output_to_store,
+                            "observation": execution.observation_text,
+                            "output_refs": self._dedupe_strings(
+                                [
+                                    *stored_output_refs,
+                                    *self._output_refs_from_text(output_to_store),
+                                ]
+                            ),
                         }
                         # A dispatch-and-poll handoff is success=True but is NOT
                         # build-execution evidence (the command is still
@@ -1147,6 +1210,19 @@ class ReActEngine(UIEventEmitter):
                         logger.warning(f"Failed to log action to branch history: {e}")
 
         return True
+
+    def _output_refs_from_text(self, value: str) -> List[str]:
+        return re.findall(r"\boutput_[A-Za-z0-9_-]+\b", value or "")
+
+    def _dedupe_strings(self, values: List[str]) -> List[str]:
+        deduped = []
+        seen = set()
+        for value in values:
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        return deduped
 
     def _update_successful_states(self, tool_name: str, params: Dict[str, Any], result: ToolResult):
         """Update successful states based on tool execution results."""

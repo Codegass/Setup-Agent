@@ -7,7 +7,7 @@ import { Button } from "@/components/common/Button"
 import { Card, CardHead } from "@/components/common/Card"
 import { Tabs } from "@/components/common/Tabs"
 import { BuildCard } from "@/components/session/BuildCard"
-import { ContextMap } from "@/components/session/ContextMap"
+import { ContextTrace } from "@/components/session/ContextTrace"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { LogsView } from "@/components/session/LogsView"
@@ -174,12 +174,12 @@ function ContextTab({ detail }: { detail: ExecutionSessionDetail }) {
   if (!detail.context) {
     return (
       <Card className="px-4 py-10 text-center text-[13px] text-slate-500">
-        Context map unavailable for this session.
+        Context trace unavailable for this session.
       </Card>
     )
   }
 
-  return <ContextMap ctx={detail.context} />
+  return <ContextTrace ctx={detail.context} />
 }
 
 function FilesTab({ detail }: { detail: ExecutionSessionDetail }) {

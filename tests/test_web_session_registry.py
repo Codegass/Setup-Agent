@@ -4,7 +4,11 @@ from datetime import datetime
 from pathlib import Path
 
 from sag.web.models import DockerSummary, WorkspaceSummary
-from sag.web.session_registry import ContainerSessionRegistry, ContainerSessionStore, SessionRegistry
+from sag.web.session_registry import (
+    ContainerSessionRegistry,
+    ContainerSessionStore,
+    SessionRegistry,
+)
 
 
 class FakeOrchestrator:
@@ -508,7 +512,11 @@ def test_container_session_registry_returns_setup_artifact_detail():
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Setup and configure the commons-cli project to be runnable",
                 "todo_list": [
-                    {"id": "task_1", "description": "Clone repository", "status": "completed"},
+                    {
+                        "id": "phase_provision",
+                        "description": "Provision repository",
+                        "status": "completed",
+                    },
                 ],
             }
         ),
@@ -545,9 +553,10 @@ def test_container_session_registry_returns_setup_artifact_detail():
     assert detail.build.note == "115 classes, 0 JARs"
     assert detail.context is not None
     assert detail.context.trunk.progress == {"done": 1, "total": 1}
+    assert detail.context.phases[0].id == "phase_provision"
 
 
-def test_setup_artifact_detail_backfills_final_report_task_from_report_file():
+def test_setup_artifact_detail_uses_trunk_report_phase_without_backfill():
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
             {
@@ -556,13 +565,13 @@ def test_setup_artifact_detail_backfills_final_report_task_from_report_file():
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Setup and configure the commons-cli project to be runnable",
                 "todo_list": [
-                    {"id": "task_1", "description": "Run tests", "status": "completed"},
+                    {"id": "phase_test", "description": "Run tests", "status": "completed"},
                     {
-                        "id": "task_2",
-                        "description": "Generate comprehensive setup completion report",
-                        "status": "pending",
+                        "id": "phase_report",
+                        "description": "Generate final setup report",
+                        "status": "completed",
                         "notes": "",
-                        "key_results": "",
+                        "key_results": "Final setup report generated.",
                     },
                 ],
             }
@@ -584,10 +593,11 @@ def test_setup_artifact_detail_backfills_final_report_task_from_report_file():
 
     assert detail is not None
     assert detail.context is not None
-    report_task = detail.context.tasks[1]
-    assert report_task.status == "completed"
-    assert report_task.summary == "Final setup report generated: setup-report-20260606-213509.md"
-    assert [ref.ref for ref in report_task.refs] == ["setup-report-20260606-213509.md"]
+    report_phase = detail.context.phases[1]
+    assert report_phase.id == "phase_report"
+    assert report_phase.status == "completed"
+    assert report_phase.key_results == "Final setup report generated."
+    assert report_phase.refs == []
     assert detail.context.trunk.progress == {"done": 2, "total": 2}
 
 

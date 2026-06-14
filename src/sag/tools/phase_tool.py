@@ -31,48 +31,70 @@ class PhaseTool(BaseTool):
         self.project_name = project_name
         self.gate_fn = gate_fn
 
-    def execute(self, action: str, key_results: str = "", reason: str = "",
-                evidence: Optional[List[str]] = None, text: str = "") -> ToolResult:
+    def execute(
+        self,
+        action: str,
+        key_results: str = "",
+        reason: str = "",
+        evidence: Optional[List[str]] = None,
+        text: str = "",
+    ) -> ToolResult:
         if self.machine.is_complete:
             return ToolResult(
-                success=False, verdict="failed",
-                output="All phases already complete.", error="machine complete",
+                success=False,
+                verdict="failed",
+                output="All phases already complete.",
+                error="machine complete",
             )
         verb = (action or "").strip().lower()
         phase = self.machine.current_phase
 
         if verb == "note":
             if not text:
-                return ToolResult(success=False, verdict="failed",
-                                  output="note requires text", error="missing text")
-            return ToolResult(success=True, output=f"Noted ({phase}): {text}",
-                              facts={"phase": phase})
+                return ToolResult(
+                    success=False,
+                    verdict="failed",
+                    output="note requires text",
+                    error="missing text",
+                )
+            return ToolResult(
+                success=True,
+                output=f"Noted ({phase}): {text}",
+                facts={"phase": phase},
+                metadata={"phase_signal": "note", "text": text},
+            )
 
         if verb == "blocked":
             if not (reason or "").strip():
                 return ToolResult(
-                    success=False, verdict="failed",
+                    success=False,
+                    verdict="failed",
                     output="blocked requires a concrete reason (and evidence refs if available)",
                     error="missing reason",
                 )
             return ToolResult(
                 success=True,
                 output=f"Phase '{phase}' recorded as BLOCKED: {reason}. The run will reflect "
-                       "this honestly; moving to the next phase.",
+                "this honestly; moving to the next phase.",
                 verdict="partial",
                 facts={"phase": phase},
-                metadata={"phase_signal": "blocked", "reason": reason,
-                          "evidence": list(evidence or [])},
+                metadata={
+                    "phase_signal": "blocked",
+                    "reason": reason,
+                    "evidence": list(evidence or []),
+                },
             )
 
         if verb == "done":
             gate = self.gate_fn(phase, self.validator, self.orchestrator, self.project_name)
             if not gate["ok"]:
                 return ToolResult(
-                    success=False, verdict="failed",
+                    success=False,
+                    verdict="failed",
                     output=f"Phase '{phase}' done-claim rejected: {gate['reason']}",
                     error=gate["reason"],
-                    suggestions=list(gate["suggestions"]) + [
+                    suggestions=list(gate["suggestions"])
+                    + [
                         "If the phase truly cannot finish, use phase(action='blocked', "
                         "reason=..., evidence=[...]) — that is always accepted and recorded honestly",
                     ],
@@ -81,13 +103,18 @@ class PhaseTool(BaseTool):
                 success=True,
                 output=f"Phase '{phase}' complete. Advancing.",
                 facts={"phase": phase},
-                metadata={"phase_signal": "done", "key_results": key_results,
-                          "evidence": list(evidence or [])},
+                metadata={
+                    "phase_signal": "done",
+                    "key_results": key_results,
+                    "evidence": list(evidence or []),
+                },
             )
 
         return ToolResult(
-            success=False, verdict="failed",
-            output=f"Unknown phase action: {action!r}", error="invalid action",
+            success=False,
+            verdict="failed",
+            output=f"Unknown phase action: {action!r}",
+            error="invalid action",
             suggestions=["Use action= done | blocked | note"],
         )
 
@@ -96,11 +123,16 @@ class PhaseTool(BaseTool):
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["done", "blocked", "note"]},
-                "key_results": {"type": "string",
-                                "description": "done: lasting record of this phase (facts, versions, paths)"},
+                "key_results": {
+                    "type": "string",
+                    "description": "done: lasting record of this phase (facts, versions, paths)",
+                },
                 "reason": {"type": "string", "description": "blocked: why the phase cannot finish"},
-                "evidence": {"type": "array", "items": {"type": "string"},
-                             "description": "refs supporting the claim (output_*, job:*, file:*)"},
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "refs supporting the claim (output_*, job:*, file:*)",
+                },
                 "text": {"type": "string", "description": "note: working note"},
             },
             "required": ["action"],

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from sag.web.models import (
-    ActiveBranchSummary,
     BuildSummary,
-    ContextMap,
-    ContextTask,
+    ContextTrace,
+    ContextTraceAction,
+    ContextTraceIteration,
+    ContextTracePhase,
+    ContextTraceTask,
+    ContextTraceTrunk,
     DashboardResponse,
     DockerSummary,
     EvidenceGroup,
@@ -19,10 +22,8 @@ from sag.web.models import (
     ReportDocument,
     TerminalConnectionState,
     TestSummary,
-    TrunkSummary,
     WorkspaceSummary,
 )
-
 
 _COMMONS_WORKSPACE_ID = "sag-commons-cli"
 _COMMONS_SESSION_ID = "CC-3"
@@ -102,48 +103,83 @@ def _commons_evidence() -> list[EvidenceGroup]:
     ]
 
 
-def _commons_context() -> ContextMap:
-    return ContextMap(
-        trunk=TrunkSummary(
+def _commons_context() -> ContextTrace:
+    return ContextTrace(
+        trunk=ContextTraceTrunk(
             goal="Prepare commons-cli workspace for reproducible setup and validation.",
             state="in_progress",
-            progress={"complete": 2, "active": 1, "blocked": 0},
+            progress={"done": 2, "total": 5},
             summary="Workspace analysis and environment setup are complete; test validation is active.",
         ),
-        tasks=[
-            ContextTask(
-                id="CC-1",
+        phases=[
+            ContextTracePhase(
+                id="phase_analyze",
+                name="analyze",
                 title="Analyze project and dependency graph",
-                status="complete",
+                status="completed",
                 evidence_status="success",
-                summary="Captured commons-cli 1.6.0 coordinates and JDK 11 toolchain requirements.",
-                refs=["pom.xml", ".setup_agent/env_overlay.json"],
+                key_results="Captured commons-cli 1.6.0 coordinates and JDK 11 toolchain requirements.",
+                progress={"iterations": 2, "thoughts": 1, "actions": 1},
+                tasks=[
+                    ContextTraceTask(
+                        id="phase_analyze/work",
+                        title="Analyze project and dependency graph",
+                        status="completed",
+                        iterations=[
+                            ContextTraceIteration(
+                                iteration=1,
+                                sequence=1,
+                                thoughts=["Read project metadata and dependency graph."],
+                            ),
+                            ContextTraceIteration(
+                                iteration=2,
+                                sequence=2,
+                                actions=[
+                                    ContextTraceAction(
+                                        tool_name="project",
+                                        success=True,
+                                        parameters={"action": "analyze"},
+                                        observation="Project analysis completed.",
+                                    )
+                                ],
+                            ),
+                        ],
+                    )
+                ],
             ),
-            ContextTask(
-                id="CC-3",
+            ContextTracePhase(
+                id="phase_test",
+                name="test",
                 title="Run full test suite and summarize HelpFormatter failures",
-                status="active",
+                status="in_progress",
                 evidence_status="partial",
-                evidence_refs=["target/surefire-reports"],
                 conflicts=["HelpFormatter expected width 74 but observed wrapping at width 80."],
-                summary="Maven tests ran with HelpFormatter line wrapping at width 80 instead of expected width 74.",
-                refs=["target/surefire-reports"],
+                key_results="Maven tests ran with HelpFormatter line wrapping at width 80 instead of expected width 74.",
+                progress={"iterations": 1, "thoughts": 1, "actions": 1},
+                tasks=[
+                    ContextTraceTask(
+                        id="phase_test/work",
+                        title="Run full test suite and summarize HelpFormatter failures",
+                        status="in_progress",
+                        iterations=[
+                            ContextTraceIteration(
+                                iteration=7,
+                                sequence=1,
+                                thoughts=["Run the test lifecycle and preserve failing evidence."],
+                                actions=[
+                                    ContextTraceAction(
+                                        tool_name="build",
+                                        success=True,
+                                        parameters={"action": "test"},
+                                        observation="320 tests observed with 8 HelpFormatter failures.",
+                                    )
+                                ],
+                            )
+                        ],
+                    )
+                ],
             ),
         ],
-        active_branch=ActiveBranchSummary(
-            task="CC-3",
-            why="The current evidence bundle is centered on the latest validation run.",
-            memory=[
-                "Use JDK 11 for local Maven commands.",
-                "Maven 3.9.6 produced the current HelpFormatter failure evidence.",
-                "Keep generated setup state under .setup_agent.",
-            ],
-            last_refs=[
-                {"label": "Project descriptor", "path": "pom.xml"},
-                {"label": "Environment overlay", "path": ".setup_agent/env_overlay.json"},
-            ],
-            pressure=0.42,
-        ),
         debug={"container": _COMMONS_WORKSPACE_ID, "entry": "CLI"},
     )
 

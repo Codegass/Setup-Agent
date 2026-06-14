@@ -9,7 +9,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,7 +18,6 @@ from loguru import logger
 from sag.web.launch_queue import WorkspaceBusyError
 from sag.web.launch_service import LaunchBatchRequest, LaunchService, LaunchValidationError
 from sag.web.read_model import ReadModelBuilder
-from sag.web.session_registry import ContainerSessionRegistry
 from sag.web.task_runner import TaskRequest, TaskRunner
 from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
 from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
@@ -36,7 +35,6 @@ def create_app(
     static_dir: Path | None = None,
     launch_service: LaunchService | None = None,
     workspace_service: WorkspaceService | None = None,
-    phase_registry: Any | None = None,
 ) -> FastAPI:
     builder = read_model if read_model is not None else ReadModelBuilder()
     runner = task_runner if task_runner is not None else TaskRunner()
@@ -50,9 +48,6 @@ def create_app(
         if workspace_service is not None
         else WorkspaceService(store=getattr(launches, "_store", None))
     )
-    # Phase histories + context journals (spec §8.3). The registry only talks
-    # to Docker when a request arrives, so the default is safe to construct.
-    phases = phase_registry if phase_registry is not None else ContainerSessionRegistry()
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -92,46 +87,6 @@ def create_app(
             # Surface a meaningful detail (not an opaque 500) so the client can
             # keep the dialog open and tell the user what to retry.
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-    @app.get("/api/workspaces/{workspace_id}/phases")
-    def get_workspace_phases(workspace_id: str) -> dict:
-        items = phases.list_workspace_phases(workspace_id)
-        if items is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No phase history for workspace: {workspace_id}",
-            )
-        return {"workspace_id": workspace_id, "phases": items}
-
-    @app.get("/api/workspaces/{workspace_id}/phases/{phase}/journal")
-    def get_workspace_phase_journal(
-        workspace_id: str,
-        phase: str,
-        limit: int = Query(default=100, ge=1, le=200),
-        max_text: int = Query(default=4000, ge=200, le=20000),
-    ) -> dict:
-        payload = phases.get_phase_journal(workspace_id, phase, limit=limit, max_text=max_text)
-        if payload is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No context journal for phase: {phase}",
-            )
-        return {"workspace_id": workspace_id, "phase": phase, **payload}
-
-    @app.get("/api/workspaces/{workspace_id}/phases/{phase}/history")
-    def get_workspace_phase_history(
-        workspace_id: str,
-        phase: str,
-        limit: int = Query(default=100, ge=1, le=200),
-        max_text: int = Query(default=4000, ge=200, le=20000),
-    ) -> dict:
-        payload = phases.get_phase_history(workspace_id, phase, limit=limit, max_text=max_text)
-        if payload is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No branch history for phase: {phase}",
-            )
-        return {"workspace_id": workspace_id, "phase": phase, **payload}
 
     @app.post("/api/project-launches/batch")
     def submit_project_batch(request: LaunchBatchRequest) -> JSONResponse:

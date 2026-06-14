@@ -103,7 +103,7 @@ export interface ExecutionSessionDetail {
   blocker?: { code: string; title: string; detail: string; hint: string } | null
   evidence: EvidenceGroup[]
   files?: FileChangeDigest | null
-  context?: ContextMap | null
+  context?: ContextTrace | null
   logs: string[]
   partial?: boolean
 }
@@ -121,31 +121,53 @@ export interface FileChangeDigest {
   }>
 }
 
-export interface ContextMap {
+export interface ContextTrace {
   trunk: {
     goal: string
     state: string
     progress: Record<string, number>
     summary: string
   }
-  tasks: Array<{
+  phases: Array<{
     id: string
+    name: string
     title: string
     status: string
+    notes?: string
+    keyResults?: string
     evidenceStatus?: string | null
-    summary: string
-    refs: Array<ContextReference | string>
     evidenceRefs?: Array<ContextReference | string> | null
     conflicts?: string[] | null
-    recovered: boolean
+    refs: Array<ContextReference | string>
+    progress: Record<string, number>
+    tasks: Array<{
+      id: string
+      title: string
+      status: string
+      iterations: Array<{
+        iteration?: number | null
+        sequence: number
+        thoughts: string[]
+        actions: Array<{
+          toolName: string
+          success?: boolean | null
+          parameters?: Record<string, unknown>
+          output: string
+          observation: string
+          refs: Array<ContextReference | string>
+          dispatchStatus?: string | null
+        }>
+        window?: {
+          totalChars: number
+          stepSpan?: number | null
+          segments: Record<string, unknown>
+          delta: Record<string, unknown>
+          introText?: string | null
+          ledgerText?: string | null
+        } | null
+      }>
+    }>
   }>
-  activeBranch: {
-    task: string
-    why: string
-    memory: string[]
-    lastRefs: Array<Record<string, string>>
-    pressure: number
-  }
   debug: Record<string, unknown>
 }
 

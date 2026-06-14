@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 class WebModel(BaseModel):
@@ -103,10 +103,47 @@ class ContextReference(WebModel):
     content_length: int | None = Field(default=None, serialization_alias="contentLength")
 
 
-class ContextTask(WebModel):
+class ContextTraceWindow(WebModel):
+    total_chars: int = Field(default=0, serialization_alias="totalChars")
+    step_span: int | None = Field(default=None, serialization_alias="stepSpan")
+    segments: dict[str, Any] = Field(default_factory=dict)
+    delta: dict[str, Any] = Field(default_factory=dict)
+    intro_text: str | None = Field(default=None, serialization_alias="introText")
+    ledger_text: str | None = Field(default=None, serialization_alias="ledgerText")
+
+
+class ContextTraceAction(WebModel):
+    tool_name: str = Field(serialization_alias="toolName")
+    success: bool | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    output: str = ""
+    observation: str = ""
+    refs: list[ContextReference] = Field(default_factory=list)
+    dispatch_status: str | None = Field(default=None, serialization_alias="dispatchStatus")
+
+
+class ContextTraceIteration(WebModel):
+    iteration: int | None = None
+    sequence: int
+    thoughts: list[str] = Field(default_factory=list)
+    actions: list[ContextTraceAction] = Field(default_factory=list)
+    window: ContextTraceWindow | None = None
+
+
+class ContextTraceTask(WebModel):
     id: str
     title: str
     status: str
+    iterations: list[ContextTraceIteration] = Field(default_factory=list)
+
+
+class ContextTracePhase(WebModel):
+    id: str
+    name: str
+    title: str
+    status: str
+    notes: str = ""
+    key_results: str = Field(default="", serialization_alias="keyResults")
     evidence_status: str = Field(
         default="unknown",
         validation_alias=AliasChoices("evidence_status", "evidenceStatus"),
@@ -118,44 +155,21 @@ class ContextTask(WebModel):
         serialization_alias="evidenceRefs",
     )
     conflicts: list[str] = Field(default_factory=list)
-    summary: str = ""
     refs: list[ContextReference] = Field(default_factory=list)
-    recovered: bool = False
-
-    @field_validator("refs", "evidence_refs", mode="before")
-    @classmethod
-    def _coerce_refs(cls, value: Any) -> Any:
-        if not isinstance(value, list):
-            return value
-        return [
-            {"ref": str(ref), "label": str(ref), "kind": "reference"}
-            if isinstance(ref, str)
-            else ref
-            for ref in value
-        ]
+    progress: dict[str, int] = Field(default_factory=dict)
+    tasks: list[ContextTraceTask] = Field(default_factory=list)
 
 
-class TrunkSummary(WebModel):
+class ContextTraceTrunk(WebModel):
     goal: str
     state: str
     progress: dict[str, int]
     summary: str = ""
 
 
-class ActiveBranchSummary(WebModel):
-    task: str = ""
-    why: str = ""
-    memory: list[str] = Field(default_factory=list)
-    last_refs: list[dict[str, str]] = Field(default_factory=list, serialization_alias="lastRefs")
-    pressure: float = 0.0
-
-
-class ContextMap(WebModel):
-    trunk: TrunkSummary
-    tasks: list[ContextTask] = Field(default_factory=list)
-    active_branch: ActiveBranchSummary = Field(
-        default_factory=ActiveBranchSummary, serialization_alias="activeBranch"
-    )
+class ContextTrace(WebModel):
+    trunk: ContextTraceTrunk
+    phases: list[ContextTracePhase] = Field(default_factory=list)
     debug: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -240,7 +254,7 @@ class ExecutionSessionDetail(WebModel):
     blocker: BlockerSummary | None = None
     evidence: list[EvidenceGroup] = Field(default_factory=list)
     files: FileChangeDigest | None = None
-    context: ContextMap | None = None
+    context: ContextTrace | None = None
     logs: list[str] = Field(default_factory=list)
     partial: bool = False
 

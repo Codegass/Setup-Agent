@@ -44,7 +44,38 @@ const latest: ExecutionSessionDetail = {
   reportDoc: null,
   evidence: [],
   files: null,
-  context: null,
+  context: {
+    trunk: {
+      goal: "Setup commons-cli",
+      state: "completed",
+      progress: { done: 1, total: 1 },
+      summary: "",
+    },
+    phases: [
+      {
+        id: "phase_build",
+        name: "build",
+        title: "Build the project",
+        status: "completed",
+        notes: "",
+        keyResults: "Build succeeded.",
+        evidenceStatus: "success",
+        evidenceRefs: [],
+        conflicts: [],
+        refs: [],
+        progress: { iterations: 1, thoughts: 0, actions: 1 },
+        tasks: [
+          {
+            id: "phase_build/work",
+            title: "Build the project",
+            status: "completed",
+            iterations: [],
+          },
+        ],
+      },
+    ],
+    debug: {},
+  },
   logs: [],
 }
 
@@ -145,5 +176,24 @@ describe("Workspace", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sessions 1" }))
 
     expect(screen.getAllByText("Blocked")).not.toHaveLength(0)
+  })
+
+  it("renders the latest session context trace in the phases tab", () => {
+    render(
+      <Workspace
+        latest={latest}
+        onBack={() => {}}
+        onOpenSession={() => {}}
+        onSubmitTask={vi.fn()}
+        sessions={sessions}
+        workspace={workspace}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "Phases" }))
+
+    expect(screen.getByText("Context trace")).toBeInTheDocument()
+    expect(screen.getByText("Trunk - Command Center")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /phase_build build the project/i })).toBeInTheDocument()
   })
 })
