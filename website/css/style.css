@@ -91,11 +91,11 @@ header.g {
 }
 
 .nav-brand h2 {
-  font-family: var(--sans);
-  font-size: 1.75rem;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: 0.03em;
+  font-family: var(--display);
+  font-size: 1.6rem;
+  font-weight: 900;
+  line-height: 0.95;
+  letter-spacing: -0.01em;
 }
 
 .nav-link {
