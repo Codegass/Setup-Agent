@@ -132,7 +132,7 @@ function RefChips({ refs, onOpen }: { refs: ContextRef[]; onOpen: (ref: ContextR
           </button>
         ) : (
           <span
-            className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-500"
+            className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600"
             key={refKey(ref)}
           >
             {refLabel(ref)}
@@ -197,11 +197,13 @@ function ActionRow({
       {action.output ? (
         <div>
           <button
-            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+            aria-expanded={showOutput}
+            className="inline-flex items-center gap-1 py-0.5 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
             onClick={() => setShowOutput((value) => !value)}
             type="button"
           >
             <ChevronRight
+              aria-hidden
               className={cn("transition-transform", showOutput && "rotate-90")}
               size={11}
             />
@@ -234,11 +236,12 @@ function WindowPanel({
   return (
     <div className="rounded bg-slate-50">
       <button
-        className="flex w-full items-center gap-1.5 px-2 py-1.5 text-left transition-colors hover:bg-slate-100"
+        aria-expanded={open}
+        className="flex w-full items-center gap-1.5 px-2 py-2 text-left transition-colors hover:bg-slate-100"
         onClick={() => setOpen((value) => !value)}
         type="button"
       >
-        <ChevronRight className={cn("text-slate-400 transition-transform", open && "rotate-90")} size={11} />
+        <ChevronRight aria-hidden className={cn("text-slate-400 transition-transform", open && "rotate-90")} size={11} />
         {icon}
         <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">{label}</span>
         <span className="ml-auto font-mono text-[10px] text-slate-500">
@@ -367,6 +370,7 @@ function TaskGroup({
         type="button"
       >
         <ChevronDown
+          aria-hidden
           className={cn("shrink-0 text-slate-300 transition-transform", !open && "-rotate-90")}
           size={13}
         />
@@ -428,6 +432,7 @@ function PhaseRow({
           type="button"
         >
           <ChevronDown
+            aria-hidden
             className={cn("shrink-0 text-slate-300 transition-transform", !open && "-rotate-90")}
             size={14}
           />
@@ -572,6 +577,7 @@ export function ContextTrace({
 
           <Card className="overflow-hidden">
             <button
+              aria-expanded={debugOpen}
               className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-50"
               onClick={() => setDebugOpen((value) => !value)}
               type="button"
@@ -581,6 +587,7 @@ export function ContextTrace({
                 Debug drawer · raw trace files
               </span>
               <ChevronDown
+                aria-hidden
                 className={cn("text-slate-300 transition-transform", debugOpen && "rotate-180")}
                 size={14}
               />
