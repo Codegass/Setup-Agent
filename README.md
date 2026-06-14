@@ -10,11 +10,12 @@
 **SAG (Setup-Agent)** is an advanced AI agent designed to fully automate the initial setup, configuration, and ongoing tasks for any software project. It operates within an isolated Docker environment, intelligently interacting with project files, shell commands, and web resources to transform hours—or even days—of manual setup into a process that takes just a few minutes.
 
 ## 🔦 Highlights
-- **Container-native execution** powered by `src/sag/docker_orch/`, ensuring each project is built inside an isolated Docker workspace with disposable volumes.
-- **Dual-model ReAct loop** in `src/sag/agent/react_engine.py` with live token telemetry from `src/sag/agent/token_tracker.py` and agent-state evaluation for resilient planning.
-- **Fact-based validation** through `src/sag/agent/physical_validator.py`, combining build artifact inspection with the structured test catalog in `src/sag/testcases/catalog.py` for accurate pass/fail reporting.
-- **Rich automation toolkit** (`src/sag/tools/`) spanning foundational helpers (`bash`, `file_io`, `context_tool`, `web_search`) and higher-level orchestrators like `project_analyzer`, `report_tool`, `output_search_tool`, and language-specific build runners that translate intent into reproducible actions.
-- **Centralized diagnostics** via `src/sag/agent/error_logger.py` and `src/sag/agent/output_storage.py`, making every action, log, and generated report searchable across runs.
+- **Container-native execution** powered by `src/sag/docker_orch/`, ensuring each project is built inside an isolated Docker workspace; all context, logs, and reports live inside the container so the agent can inspect and manage them itself.
+- **Engine-owned phase machine** (`src/sag/agent/phase_machine.py`): a `sag project` run advances through a fixed sequence — provision → analyze → build → test → report — with a clean context window per phase, evidence-gated transitions, and an honest `blocked` escape valve that degrades the verdict instead of looping.
+- **Dual-model ReAct loop** in `src/sag/agent/react_engine.py` with live token telemetry (`src/sag/agent/token_tracker.py`); long builds run **detached** (dispatch-and-poll) instead of being killed by a per-command timeout, bounded by a global wall-clock cap.
+- **One verdict everywhere** via the kernel in `src/sag/verdict.py`: the report header, CLI banner, and exit code derive from a single policy and can no longer disagree.
+- **Six intent-driven tools** (`src/sag/tools/`): `bash`, `files`, `build` (Maven/Gradle behind one verb set), `project` (clone/provision/analyze/env), `search` (refs/files/job-logs/web), and `report`, all returning a uniform result envelope where large output becomes a retrievable reference ("links, not dumps").
+- **Evidence-based validation** through `src/sag/agent/physical_validator.py` plus a per-iteration **context journal**, inspectable with `sag inspect` and the Workbench context trace.
 
 ---
 
@@ -25,9 +26,9 @@ In software development, configuring a new project—especially a large open-sou
 **SAG's core mission is to solve this problem.** It aims to be an intelligent "Project Initialization Specialist" by adhering to these core principles:
 
 - **Complete Isolation**: All operations occur within Docker containers, ensuring the host machine is never polluted. This guarantees a clean, reproducible setup every time.
-- **Intelligent Planning & Execution**: SAG doesn't just execute commands; it analyzes, plans (by creating a TODO list), and systematically solves problems like a human expert.
-- **Hierarchical Context Management**: With an innovative "Trunk/Branch" context system, SAG can handle complex task chains, from high-level goals to low-level operations, without getting lost in long-running processes.
-- **Dual-Model Collaboration**: It leverages the strengths of different LLMs—one for deep thinking and planning (e.g., `o1-preview`) and another for fast action and tool use (e.g., `gpt-4o`)—to achieve a balance of efficiency and effectiveness.
+- **Phase-Structured Execution**: A project setup runs as an engine-owned sequence of phases (provision → analyze → build → test → report). The agent works freely inside a phase; the engine validates real evidence before advancing, so the run cannot drift or quietly give up.
+- **Evidence Over Assertion**: Build and test verdicts come from physical artifacts (`.class`/JAR counts, surefire/Gradle reports), routed through a single verdict policy so the CLI, report, and exit code always agree.
+- **Dual-Model Collaboration**: It can leverage two LLM roles — one for deeper thinking and planning, one for fast action and tool use — to balance efficiency and effectiveness. Both roles are configurable and may use the same model; see the configuration section.
 
 ## ✨ Core Concepts
 
@@ -35,116 +36,107 @@ In software development, configuring a new project—especially a large open-sou
 
 The "brain" of SAG is an enhanced ReAct (Reasoning-Acting) engine. By separating the "thinking" and "acting" phases and using different models for each, it achieves more effective decision-making:
 
-- **Thinking Model**: Responsible for analyzing complex problems, creating high-level plans, and learning from errors. It thinks deeper and sees further. Supports advanced reasoning features like OpenAI's `o1` models and Anthropic's Claude thinking capabilities.
-- **Action Model**: Responsible for precisely executing the plan laid out by the thinking model, whether that's calling a tool, generating code, or running a command. It's focused on "doing."
+- **Thinking Model**: Responsible for analyzing complex problems, creating high-level plans, and learning from errors. It thinks deeper and sees further, and can use reasoning-capable models.
+- **Action Model**: Responsible for precisely executing the plan, whether that's calling a tool, generating code, or running a command. It's focused on "doing."
 
-This architecture allows SAG to be both thoughtful and agile when tackling unfamiliar projects.
+Both roles are configurable and may point at the same model. For a `sag project` run, this loop runs *inside* an engine-owned phase machine (below); for free-form `sag run --task` work, it runs against a model-managed task list.
 
-### 2. Hierarchical Context Management (Trunk & Branch)
+### 2. Phase Machine & Context Journal
 
-To solve the problem of context loss in complex tasks, SAG implements a hierarchical context management system:
+A project setup is the same shape every time, so the **engine** owns that shape instead of asking the model to manage it:
 
-- **Trunk Context**:
-  - Stores the project's overall goal, the complete TODO list, and high-level progress.
-  - Acts as the "command center" for the entire setup task.
+- **Trunk → Phase → Iteration.** The trunk holds the goal and the phase record; each phase (provision → analyze → build → test → report) is a context branch with its own history. The model's entire lifecycle surface is one tool — `phase` with `done` / `blocked` / `note`.
+- **Clean window per phase.** When the engine advances, it rebuilds the context window from scratch: goal digest + prior phases' key results + the new phase's objective, and nothing else. Each phase gets the full window for its own work.
+- **Evidence-gated, never trapped.** A `done` claim is validated against physical evidence (artifacts, test reports). A phase that genuinely cannot finish is recorded with `blocked`, which is always accepted and degrades the run verdict honestly instead of looping to the iteration cap.
+- **Iteration floors, not quotas.** No phase has a fixed budget; a phase is only cut short when continuing would starve the minimum needs of later phases, so a hard build can use the iterations an easy clone saved while the run still always reaches the report phase.
+- **Context journal.** Every iteration records what composed its prompt (segments, token counts, deltas, the window intro and the attempt-ledger compaction) to an in-container journal — replayable with `sag inspect` or the Workbench context trace.
 
-- **Branch Context**:
-  - Created for each specific task on the TODO list.
-  - Contains all the details, logs, and the current focus for that sub-task.
-  - The agent works within a branch context to solve one problem at a time before returning to the trunk.
+`sag run --task` keeps a lighter model-managed flow with the `manage_context` tool for arbitrary follow-up work.
 
-This system enables SAG to switch between high-level planning and low-level execution seamlessly, ensuring stability and coherence throughout long-running tasks.
+### 3. Focused Tool Set
 
-### 3. Hierarchical Tool-belt Design
+A single `bash` tool could handle every interaction, but it would force the agent to manage immense complexity — command syntax, output parsing, toolchain selection — which is inefficient and error-prone. SAG gives the model a small set of **intent-driven** tools instead, each returning the same result envelope (`verdict` / `facts` / `output` / `suggestions` / `refs`):
 
-At first glance, a single `bash` tool could handle all system interactions. However, relying solely on a low-level tool would force the AI agent to manage immense complexity, from remembering command syntax to parsing raw text output—a process that is both inefficient and error-prone.
+- **`bash`** — the granular fallback for anything without a specialized tool; long-running commands dispatch detached and hand back a pollable log.
+- **`files`** — safe, container-aware file read/write/list.
+- **`build`** — one tool over Maven and Gradle behind verb actions (`deps` / `compile` / `test` / `package`); it auto-selects the build system and resolves the registered toolchain, so the model never hand-rolls `mvn`/`gradlew` against a stale PATH.
+- **`project`** — `clone` / `provision` / `analyze` / `env` for repository and toolchain setup.
+- **`search`** — one retrieval tool over stored output refs, container files, background-job logs, and the web. Large tool output is stored and referenced rather than dumped into the window ("links, not dumps").
+- **`report`** — renders the final setup report from the validated evidence snapshot.
 
-SAG adopts a hierarchical tool-belt design to address this, creating layers of abstraction that empower the agent to work more intelligently:
-
--   **Low-Level Foundational Tools**: At the base is the `BashTool`. It provides unrestricted, granular control, much like an assembly language for system operations. It is the ultimate fallback for tasks that have no specialized tool.
-
--   **Mid-Level Specialized Tools**: These tools encapsulate domain-specific knowledge. For example:
-    -   `SystemTool` understands system package management (`apt-get`), abstracting away the need to manually form `install` or `update` commands.
-    -   `MavenTool` is an expert in Java's Maven build system. It knows about goals, profiles, and properties, and can intelligently parse Maven's verbose output to determine if a build succeeded, failed, or had test errors.
-
--   **High-Level Workflow Tools**: At the top layer, tools like `ProjectSetupTool` orchestrate complex, multi-step workflows. Its `clone` action doesn't just run `git clone`; it also automatically detects the project type (Maven, Node.js, Python), suggests the next appropriate actions, and can even trigger dependency installation, compressing a long chain of human-like reasoning into a single, intent-driven command.
-
-This layered approach allows the agent to delegate complexity. Instead of figuring out *how* to do something with basic commands, it can focus on *what* it needs to achieve, leading to faster, more reliable, and more sophisticated automation.
+The implementation delegates (Maven/Gradle/system/env/analyzer runners) live under `src/sag/tools/internal/` and are never exposed to the model directly. This lets the agent focus on *what* it needs, not *how* to drive each command.
 
 ## 🏗️ System Architecture
 
 SAG is composed of several core components:
 
-1. **CLI (`src/sag/main.py`)**: Entry point for user commands such as `project`, `run`, and `list`, with optional artifact recording for post-run inspection.
-2. **Configuration Layer (`src/sag/config/`)**: Loads `.env` settings, provider credentials, and model presets, and wires logging streams used across the agent.
-3. **Setup Agent & Contexts (`src/sag/agent/agent.py`, `src/sag/agent/context_manager.py`)**: Orchestrates the workflow, persists trunk/branch contexts inside the container workspace, and initializes the full tool-suite.
-4. **ReAct Engine & State Evaluation (`src/sag/agent/react_engine.py`, `src/sag/agent/agent_state_evaluator.py`)**: Dual-model reasoning loop with completion sign detection, retry guards, and live token telemetry.
-5. **Physical Validation & Diagnostics (`src/sag/agent/physical_validator.py`, `src/sag/agent/output_storage.py`, `src/sag/agent/error_logger.py`, `src/sag/agent/token_tracker.py`)**: Verifies build/test results from artifacts, snapshots execution outputs, and centralizes structured error logs.
-6. **Automation Tool-belt (`src/sag/tools/`)**: Intent-driven helpers including `project_analyzer`, `project_setup_tool`, `gradle_tool`, `maven_tool`, `system_tool`, and the cross-run `output_search_tool`.
-7. **Reporting & Test Intelligence (`src/sag/tools/report_tool.py`, `src/sag/testcases/catalog.py`, `src/sag/reporting/`)**: Generates markdown setup reports, merges runtime and static test metadata, and tracks annotation-level metrics.
-8. **Docker Orchestrator (`src/sag/docker_orch/orch.py`)**: Guarantees container lifecycle management, volume persistence, and shell connectivity for every project.
-9. **Knowledge Base & Regression Suites (`docs/`, `examples/`, `tests/`, `student_tasks/`)**: Documentation and executable scenarios that codify best practices and guard against regressions.
+1. **CLI (`src/sag/main.py`)**: Entry point for `project`, `run`, `list`, `shell`, `remove`, `ui`, and `inspect`, with optional artifact recording for post-run inspection.
+2. **Configuration Layer (`src/sag/config/`)**: Loads `.env` settings, provider credentials, model presets, and run bounds (iteration cap, wall-clock cap, dispatch windows), and wires logging streams.
+3. **Setup Agent & Contexts (`src/sag/agent/agent.py`, `src/sag/agent/context_manager.py`)**: Orchestrates the workflow, persists trunk/phase contexts inside the container workspace, and initializes the mode-aware tool set.
+4. **Phase Machine (`src/sag/agent/phase_machine.py`, `src/sag/agent/phase_gates.py`, `src/sag/agent/attempt_ledger.py`, `src/sag/agent/context_journal.py`)**: Drives the provision → analyze → build → test → report sequence, gates each transition on physical evidence, compacts long phases, and journals every iteration's context window.
+5. **ReAct Engine & State Evaluation (`src/sag/agent/react_engine.py`, `src/sag/agent/agent_state_evaluator.py`)**: Dual-model reasoning loop with phase-signal handling, clean-window resets, dispatch-and-poll for long builds, a global wall-clock cap, and live token telemetry.
+6. **Verdict & Validation (`src/sag/verdict.py`, `src/sag/agent/physical_validator.py`)**: One verdict kernel feeding the report, CLI, and exit code; artifact and test-report inspection grounding every decision in physical evidence.
+7. **Tool Set (`src/sag/tools/`)**: Six model-facing tools (`bash`, `files`, `build`, `project`, `search`, `report`) over delegates in `src/sag/tools/internal/`.
+8. **Reporting & Test Intelligence (`src/sag/tools/report_tool.py`, `src/sag/testcases/catalog.py`, `src/sag/reporting/`)**: Renders markdown setup reports from the validated snapshot and merges runtime and static test metadata.
+9. **Docker Orchestrator (`src/sag/docker_orch/orch.py`)**: Container lifecycle, volume persistence, detached dispatch, and shell connectivity for every project.
+10. **Web Workbench (`src/sag/web/`, `webui/`)**: A FastAPI + React dashboard for managing workspaces, reading reports/evidence, and inspecting the phase timeline and context journal.
 
-## 🧠 Advanced Automation Tooling
-- **Foundation Utilities** (`src/sag/tools/bash.py`, `src/sag/tools/file_io.py`, `src/sag/tools/context_tool.py`, `src/sag/tools/web_search.py`): Provide container-aware shell execution, safe file interactions, context updates, and web lookups for knowledge gaps.
-- **Project Analyzer** (`src/sag/tools/project_analyzer.py`): Performs static scanning to classify project types, detect build tools, and enumerate unit, integration, and parameterized tests before execution.
-- **Report Tool** (`src/sag/tools/report_tool.py`): Produces `setup-report-*.md` summaries that combine physical validator evidence, execution history, and actionable remediation guidance.
-- **Output Search Tool** (`src/sag/tools/output_search_tool.py`): Indexes prior observations and context files to let the agent recall log snippets or stack traces across iterations.
-- **Build & Dependency Helpers** (`src/sag/tools/maven_tool.py`, `src/sag/tools/gradle_tool.py`, `src/sag/tools/system_tool.py`): Provide domain-specific command wrappers with structured output parsing and retry logic.
-- **Project Setup Tool** (`src/sag/tools/project_setup_tool.py`): Encapsulates cloning, environment bootstrapping, and language-specific install steps into a single orchestrated action.
+## 🧠 The Tool Set
+Six model-facing tools, each returning the uniform envelope (`verdict` / `facts` / `output` / `suggestions` / `refs`):
+
+- **`bash`** (`src/sag/tools/bash.py`): container-aware shell for anything without a specialized tool; long-running commands dispatch detached and return a pollable in-container log instead of being hard-killed.
+- **`files`** (`src/sag/tools/file_io.py`): safe file read/write/list inside the container.
+- **`build`** (`src/sag/tools/build/`): one tool over Maven and Gradle — `build(action='deps'|'compile'|'test'|'package')`. Auto-selects the build system and resolves the registered toolchain (correct Maven/JDK), with a backend per ecosystem.
+- **`project`** (`src/sag/tools/project_tool.py`): `clone` / `provision` / `analyze` / `env` — repository cloning, JDK/Maven provisioning, project analysis, and runtime-overlay registration.
+- **`search`** (`src/sag/tools/search_tool.py`): one retrieval tool over stored output refs, container files, background-job logs, and the web.
+- **`report`** (`src/sag/tools/report_tool.py`): renders `setup-report-*.md` from the validated evidence snapshot.
+
+Delegates (`maven_tool`, `gradle_tool`, `project_setup_tool`, `project_analyzer`, `system_tool`, `env_tool`, `output_search_tool`, `web_search`, `toolchain_manager`) live under `src/sag/tools/internal/`.
 
 ## ✅ Validation & Observability
-- **Physical Validator** (`src/sag/agent/physical_validator.py`): Inspects build artifacts, XML test reports, and compilation timestamps to ground decisions in physical evidence.
-- **Test Case Catalog** (`src/sag/testcases/catalog.py`): Normalizes runtime results, parameterized expansions, and Groovy/Kotlin discovery to keep counts consistent across tools.
-- **Error Logger** (`src/sag/agent/error_logger.py`): Aggregates issues from every tool call with canonical error codes, making retrospectives and reports actionable.
-- **Output Storage Manager** (`src/sag/agent/output_storage.py`): Persists observations, plan snapshots, and generated artifacts under `.setup_agent/` inside the container workspace.
-- **Token Tracker** (`src/sag/agent/token_tracker.py`): Captures prompt, completion, and reasoning token usage per ReAct step for cost and performance analysis.
+- **Verdict Kernel** (`src/sag/verdict.py`): the single source for the run outcome (failed < partial < success), consumed by the report header, CLI banner, and exit code so they can never diverge.
+- **Physical Validator** (`src/sag/agent/physical_validator.py`): inspects build artifacts, XML test reports, and compilation timestamps to ground decisions in physical evidence.
+- **Context Journal** (`src/sag/agent/context_journal.py`): records each iteration's window composition (segments, token counts, deltas, intro/ledger text) to `/workspace/.setup_agent/contexts/journal/` — replayable via `sag inspect`.
+- **Test Case Catalog** (`src/sag/testcases/catalog.py`): normalizes runtime results, parameterized expansions, and Groovy/Kotlin discovery to keep counts consistent.
+- **Output Storage & Token Tracker** (`src/sag/agent/output_storage.py`, `src/sag/agent/token_tracker.py`): persist verbose tool output under `.setup_agent/` (referenced via `search`), and capture per-step token usage for cost analysis.
 
 ## 🧭 End-to-End Flow
 
 ```mermaid
 flowchart TD
-    CLI["CLI (`src/sag/main.py`)<br/>`sag project` / `sag run`"]
-    Config["Load configuration & session logging<br/>`src/sag/config/__init__.py`"]
+    CLI["CLI (`src/sag/main.py`)<br/>`sag project <url>`"]
+    Config["Load configuration & session logging<br/>`src/sag/config/`"]
     Docker["Docker orchestrator provisions container + volume<br/>`src/sag/docker_orch/orch.py`"]
-    AgentInit["SetupAgent constructed<br/>`src/sag/agent/agent.py`"]
-    ToolsInit["Context & tool initialization<br/>• ErrorLogger (`src/sag/agent/error_logger.py`)<br/>• ContextManager + `manage_context` tool<br/>• Bash/FileIO/WebSearch helpers<br/>• ProjectSetup/Analyzer/System/Maven/Gradle tools<br/>• OutputStorageManager + OutputSearch<br/>• ReportTool + PhysicalValidator"]
-    Trunk["Create trunk context & TODO list<br/>Tasks persisted via ContextManager"]
-    LoopStart["Kick off ReAct loop<br/>`src/sag/agent/react_engine.py`"]
+    AgentInit["SetupAgent + PhaseMachine constructed<br/>`src/sag/agent/agent.py`, `phase_machine.py`"]
+    PhaseStart["Enter next phase<br/>Engine rebuilds a clean window:<br/>goal digest + prior key results + phase objective"]
 
-    subgraph ReActIteration[ReAct Iteration]
-        Think["THOUGHT: Thinking model plans next step<br/>TokenTracker absorbs usage"]
-        ActionDecision{Action needed?}
-        Act["ACTION: Action model decides tool call"]
-        CtxSwitch["manage_context updates trunk↔branch state<br/>Branch history written to .setup_agent/contexts"]
-        ToolExec["Domain tools run inside container<br/>• `project_analyzer`, `maven`, `gradle`, `project_setup`, `system`, etc."]
-        OutputPersist["Observations shortened for context<br/>Full logs stored via OutputStorageManager"]
-        Observation["OBSERVATION: Summaries + ref IDs recorded"]
-        StateEval["AgentStateEvaluator + PhysicalValidator validate progress<br/>Detect completion, retries, or missing evidence"]
-        Guidance{Guidance or retry needed?}
+    subgraph PhaseWork[Work inside one phase]
+        Think["THOUGHT: thinking model plans"]
+        Act["ACTION: action model calls a tool<br/>bash · files · build · project · search · report"]
+        Dispatch["Long build? dispatch detached,<br/>poll the in-container log"]
+        Observe["OBSERVATION: envelope (verdict/facts/refs)<br/>large output stored, referenced via `search`"]
+        Journal["Context journal records the iteration window<br/>compaction → attempt ledger when long"]
     end
 
-    Report["ReportTool generates `setup-report-*.md`<br/>Combines execution history + physical validation"]
-    Completion["Setup summary & optional artifact export<br/>`_provide_setup_summary`, `_save_setup_artifacts`"]
-    OutputSearch["When logs exceed context, `output_search` fetches by ref ID
-for follow-up reasoning"]
+    Claim{"model: phase(done | blocked | note)"}
+    Gate["Evidence gate (`phase_gates.py`)<br/>artifacts / test reports present?"]
+    Advance["Mark phase done/blocked in trunk<br/>advance: provision→analyze→build→test→report"]
+    Verdict["Verdict kernel (`src/sag/verdict.py`)<br/>failed < partial < success"]
+    Report["`report` renders setup-report-*.md<br/>from the validated snapshot"]
+    Completion["CLI banner + exit code from the same verdict<br/>optional `--record` artifact export"]
 
-    CLI --> Config --> Docker --> AgentInit --> ToolsInit --> Trunk --> LoopStart
-    LoopStart --> Think --> ActionDecision
-    ActionDecision -- "No (keep thinking)" --> Think
-    ActionDecision -- "Yes" --> Act --> ToolExec --> OutputPersist --> Observation --> StateEval
-    Act --> CtxSwitch
-    CtxSwitch --> OutputPersist
-    OutputPersist --> OutputSearch
-    OutputSearch --> Think
-    StateEval --> Guidance
-    Guidance -- "Request guidance" --> Think
-    Guidance -- "No guidance" --> ActionDecision
-    StateEval -->|"Success"| Report --> Completion
-    StateEval -->|"More work"| Think
+    CLI --> Config --> Docker --> AgentInit --> PhaseStart --> Think
+    Think --> Act --> Dispatch --> Observe --> Journal --> Claim
+    Claim -- "note / keep working" --> Think
+    Claim -- "done" --> Gate
+    Gate -- "evidence missing" --> Think
+    Gate -- "evidence present" --> Advance
+    Claim -- "blocked (honest)" --> Advance
+    Advance -- "more phases" --> PhaseStart
+    Advance -- "report phase done" --> Verdict --> Report --> Completion
 ```
 
-This flow illustrates how the CLI bootstraps an isolated Docker workspace, how `SetupAgent` wires every tool, and how the ReAct loop alternates thinking and action. `manage_context` safeguards trunk/branch transitions, OutputStorage captures verbose tool outputs (with `output_search` replaying them on demand), and `AgentStateEvaluator` works with `PhysicalValidator` to gate completion before `ReportTool` finalizes the run.
+The CLI bootstraps an isolated Docker workspace, and the **phase machine** drives a fixed provision → analyze → build → test → report sequence. The model works freely inside each phase (any tool, any order) and signals with one `phase` verb; the engine validates `done` against physical evidence, accepts `blocked` honestly, rebuilds a clean window for the next phase, and journals every iteration. A single verdict kernel then drives the report, CLI banner, and exit code. (`sag run --task` uses a lighter model-managed loop for arbitrary follow-up work.)
 
 ## 🚀 Quick Start
 
@@ -160,7 +152,7 @@ This flow illustrates how the CLI bootstraps an isolated Docker workspace, how `
 pip install uv
 
 # 1. Clone the repository
-git clone https://github.com/your-org/Setup-Agent.git
+git clone https://github.com/Codegass/Setup-Agent.git
 cd Setup-Agent
 
 # 2. Install dependencies with uv (this will also create a virtual environment)
@@ -205,9 +197,13 @@ uv run sag ui --port 8765
 The Web UI is the recommended way to inspect SAG-managed workspaces after setup.
 It provides:
 
-- A dashboard of all SAG Docker workspaces and their current container state.
+- A dashboard of all SAG Docker workspaces and their current container state,
+  with one-click workspace deletion (including stopped or already-gone containers).
 - Workspace detail pages with current status, latest evidence, reports, build/test
-  summaries, context snapshots, and changed files.
+  summaries, and changed files.
+- A **Phases** tab: a context trace of the run — trunk goal → phases → iterations
+  → tool actions, with thoughts, observations, output refs, and the per-iteration
+  context journal.
 - Session detail pages for setup results and later task runs.
 - A workspace terminal tab for running an interactive shell inside a running SAG
   container.
@@ -260,19 +256,34 @@ uv run sag project https://github.com/example/repo.git --record
 uv run sag --verbose project https://github.com/example/repo.git --record
 ```
 
-#### Inspect Container Context Files
+#### Inspect the Run
 
-The agent stores execution context inside the container under `/workspace/.setup_agent/`:
+The easiest way to see what the agent did is `sag inspect` (reads the live
+container or a `--record` session):
 
 ```bash
-# List all context files
+# List the phases and their iteration spans
+sag inspect sag-<project>
+
+# Replay one phase, then drill into a specific iteration's context window
+sag inspect sag-<project> --phase build
+sag inspect sag-<project> --phase build --iter 23
+```
+
+The underlying context lives inside the container under `/workspace/.setup_agent/`:
+
+```bash
+# List all context files (trunk + phase_* for setups, task_* for run --task)
 docker exec sag-<project> ls -la /workspace/.setup_agent/contexts/
 
-# Read the trunk context (main task list and overall status)
+# Read the trunk context (goal, phase records, overall status)
 docker exec sag-<project> cat /workspace/.setup_agent/contexts/trunk_*.json | python3 -m json.tool
 
-# Check specific task contexts for detailed execution history
-docker exec sag-<project> cat /workspace/.setup_agent/contexts/task_*.json | python3 -m json.tool
+# A specific phase's branch history (e.g. the build phase)
+docker exec sag-<project> cat /workspace/.setup_agent/contexts/phase_build.json | python3 -m json.tool
+
+# Per-iteration context journals
+docker exec sag-<project> ls /workspace/.setup_agent/contexts/journal/
 
 # Search for errors across all context files
 docker exec sag-<project> grep -r "error\|failed\|ERROR" /workspace/.setup_agent/contexts/
@@ -311,7 +322,7 @@ grep -r "BUILD FAILURE\|compilation error" logs/session_<timestamp>/
 | Java version mismatch | `docker exec sag-<project> java -version` and check for `RequireJavaVersion` in logs |
 | Missing dependencies | `docker exec sag-<project> which mvn npm gradle` |
 | Empty tool outputs | Check if stderr is captured in context files |
-| Agent stuck in loop | Review trunk context TODO list for repetitive patterns |
+| Agent stuck in loop | `sag inspect sag-<project> --phase <phase>` to replay the iterations |
 
 #### Interactive Debugging
 
@@ -340,6 +351,7 @@ SAG provides a clean and powerful set of CLI commands.
 | `sag shell <name>` | Connects to an interactive shell inside the specified project's container. | `sag shell sag-flask` |
 | `sag ui` | Starts the local SAG Workbench web UI. | `sag ui --port 8765` |
 | `sag remove <name>` | Permanently deletes a project, including its container and data volume. | `sag remove sag-flask --force` |
+| `sag inspect <name>` | Replays a run's phase timeline and per-iteration context windows from the container or a recorded session. | `sag inspect sag-flask --phase build` |
 | `sag version` | Displays SAG's version information. | `sag version` |
 | `sag --help` | Shows the help message. | `sag --help` |
 
@@ -403,6 +415,14 @@ sag project https://github.com/apache/commons-cli.git --ref rel/commons-cli-1.11
 |---|---|
 | `--force` | Force removal without confirmation prompt. |
 
+#### `sag inspect <name>`
+
+| Option | Description |
+|---|---|
+| `--phase <name>` | Phase to inspect (`provision`/`analyze`/`build`/`test`/`report`). With no phase, lists all phases and their iteration spans. |
+| `--iter <n>` | Show the reconstructed context window at a specific iteration (the intro/ledger the model saw, plus the surrounding actions). |
+| `--session <dir>` | Read from a local `--record` artifact directory (e.g. `logs/session_X`) instead of the live container. |
+
 ## ✅ Running Tests Locally
 
 ```bash
@@ -418,31 +438,30 @@ uv run pytest tests/test_report_contract.py
 All configuration is managed through the `.env` file in the project's root directory.
 
 **Key Configuration Options:**
-- `SAG_THINKING_MODEL`: The "thinking model" for planning and analysis. A powerful model is recommended (e.g., `o1-preview`, `claude-sonnet-4-20250514`).
-- `SAG_ACTION_MODEL`: The "action model" for task execution. A fast and cost-effective model is recommended (e.g., `gpt-4o`, `claude-3-5-sonnet-20240620`).
-- `SAG_THINKING_PROVIDER`: The provider for the thinking model (`openai`, `anthropic`, etc.).
-- `SAG_REASONING_EFFORT`: For thinking models, controls reasoning depth (`low`, `medium`, `high`).
-- `SAG_THINKING_BUDGET_TOKENS`: For Claude models, controls thinking budget (1024, 2048, 4096).
+- `SAG_THINKING_MODEL`: The "thinking model" for planning and analysis. A capable, reasoning-strong model is recommended. The paper's most cost-effective configuration pairs a reasoning thinking model with a smaller action model.
+- `SAG_ACTION_MODEL`: The "action model" for tool execution. A fast, function-calling model is recommended. It may be the same model as the thinking model.
+- `SAG_THINKING_PROVIDER` / `SAG_ACTION_PROVIDER`: The provider per role (`openai`, `anthropic`, etc.).
+- `SAG_REASONING_EFFORT`: For reasoning models, controls reasoning depth (`low`, `medium`, `high`).
+- `SAG_THINKING_BUDGET_TOKENS`: For Claude models, controls the thinking budget (e.g. 1024, 2048, 4096).
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.: API keys for the respective LLM providers.
-- `SAG_LOG_LEVEL`: Sets the logging verbosity. `DEBUG` mode is highly detailed and includes LiteLLM's internal logs.
-- `SAG_MAX_ITERATIONS`: The maximum number of iterations for a single `run` or `project` command to prevent infinite loops.
+- `SAG_LOG_LEVEL`: Logging verbosity. `DEBUG` is highly detailed and includes LiteLLM's internal logs.
+- `SAG_MAX_ITERATIONS`: Maximum iterations for a single `run` or `project` command.
+- `SAG_MAX_WALL_CLOCK_SECONDS`: Global wall-clock cap for a whole run (default `7200`); the run ends with a clear status once exceeded, independent of per-command behavior.
+- `SAG_TEST_PASS_THRESHOLD`: Minimum test pass rate (fraction, default `0.8`) for a build-green run to count as a full success.
+- `SAG_DISPATCH_SOFT_TIMEOUT_SECONDS`: Soft window before a long build is handed back as a pollable detached job (default `900`).
 
 ## 🔍 How It Works: A Look Under the Hood
 
-When you run `sag project <url>`, a sophisticated sequence of events is triggered:
+When you run `sag project <url>`, the phase machine drives the run:
 
 1.  **Environment Initialization**: SAG's Docker Orchestrator spins up an isolated Docker container and a persistent data volume.
-2.  **Project Cloning**: The agent uses its `bash` tool inside the container to clone the specified Git repository.
-3.  **Context Establishment**: A **Trunk Context** is created with the high-level goal (e.g., "Set up this project to be runnable").
-4.  **Intelligent Analysis & Planning**: The **Thinking Model** is engaged to analyze the project structure (e.g., `README.md`, `package.json`, `pyproject.toml`) and generate a comprehensive TODO list, which is stored in the Trunk Context.
-5.  **Task Loop Initiation**:
-    a. The agent picks the first task from the Trunk Context's TODO list.
-    b. A **Branch Context** is created to focus exclusively on this task (e.g., "Install project dependencies").
-    c. The **Action Model** executes the necessary steps within the Branch Context (e.g., runs `npm install`).
-    d. The result is observed. If an error occurs, the **Thinking Model** is re-engaged to analyze the cause and find a solution (e.g., using the `web_search` tool to look up the error message).
-    e. Once the task is complete, the agent records a summary in the Trunk Context, marks the task as "completed," and destroys the Branch Context.
-6.  **Rinse and Repeat**: Step 5 is repeated until all tasks in the TODO list are completed.
-7.  **Completion**: The agent exits, leaving behind a fully configured and runnable project environment in the Docker container.
+2.  **Trunk & Phases**: A **Trunk Context** is created with the goal and the five phases — provision → analyze → build → test → report.
+3.  **Provision**: The agent clones the repository and installs the toolchain the project needs (e.g. the detected JDK for a Gradle project, a Maven that satisfies the pom's enforced minimum), then claims the phase done.
+4.  **Analyze**: `project(action='analyze')` detects the build system, counts tests, and records special requirements. An honest "unknown" with evidence is acceptable.
+5.  **Build**: `build(action='compile')` compiles via the registered toolchain. Long builds run detached; the agent polls the in-container log instead of the build being killed.
+6.  **Test**: `build(action='test')` runs the suite. A partial pass above the threshold is a valid outcome; if tests genuinely cannot run, the agent records `phase(action='blocked')` with evidence.
+7.  **Per-phase mechanics**: For each phase the engine opens a clean context window (goal digest + prior phases' key results + the phase objective), validates the model's `done` claim against physical evidence, advances on success, accepts `blocked` honestly, and journals every iteration. A phase is only cut short if continuing would starve the iterations later phases need.
+8.  **Report & Verdict**: `report` renders `setup-report-*.md` from the validated snapshot, and the verdict kernel produces one outcome (success / partial / failed) shared by the report, CLI banner, and exit code. The container is left fully configured for follow-up `sag run --task` work.
 
 ## 🎯 Use Cases
 
