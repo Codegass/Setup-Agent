@@ -105,6 +105,36 @@ export interface EvidenceGroup {
   records: EvidenceRecord[]
 }
 
+export interface ModuleSummary {
+  name: string
+  path: string
+  buildStatus: "success" | "failure" | "skipped" | "unknown"
+  buildSource: "reactor" | "artifacts" | "partial" | "none"
+  classCount?: number | null
+  jarCount?: number | null
+  buildWarnings?: number | null
+  buildErrorSamples?: string[]
+  testsTotal?: number | null
+  testsPassed?: number | null
+  testsFailed?: number | null
+  testsErrors?: number | null
+  testsSkipped?: number | null
+  testSource: "runner_xml" | "partial" | "none"
+  failingNames?: string[]
+  failingCount?: number | null
+  evidenceRefs?: string[]
+}
+
+export interface ModuleRollup {
+  modulesTotal: number
+  modulesBuilt: number
+  modulesFailed: number
+  modulesSkipped: number
+  modulesWithTestFailures: number
+  buildSystems: string[]
+  singleModule: boolean
+}
+
 export interface ExecutionSessionDetail {
   id: string
   workspace: string
@@ -117,6 +147,8 @@ export interface ExecutionSessionDetail {
   evidenceStatus?: string | null
   build: BuildSummary
   test: TestSummary
+  modules?: ModuleSummary[]
+  moduleSummary?: ModuleRollup | null
   report: string
   reportDoc?: ReportDocument | null
   blocker?: { code: string; title: string; detail: string; hint: string } | null

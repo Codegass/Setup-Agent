@@ -19,6 +19,8 @@ from sag.web.models import (
     FileChangeDigest,
     FileChangeItem,
     FileSnapshotRef,
+    ModuleRollup,
+    ModuleSummary,
     ReportDocument,
     TerminalConnectionState,
     TestSummary,
@@ -126,6 +128,75 @@ def _commons_evidence() -> list[EvidenceGroup]:
             ],
         ),
     ]
+
+
+def _commons_modules() -> list[ModuleSummary]:
+    return [
+        ModuleSummary(
+            name="connect:runtime",
+            path="connect/runtime",
+            build_status="failure",
+            build_source="reactor",
+            class_count=None,
+            jar_count=None,
+            build_error_samples=[
+                "[ERROR] WorkerSinkTask.java:[412,7] cannot find symbol",
+            ],
+            test_source="none",
+            failing_names=[],
+            failing_count=None,
+            evidence_refs=["/workspace/connect/runtime/target"],
+        ),
+        ModuleSummary(
+            name="streams",
+            path="streams",
+            build_status="success",
+            build_source="reactor",
+            class_count=2610,
+            jar_count=18,
+            tests_total=1240,
+            tests_passed=1238,
+            tests_failed=2,
+            tests_errors=0,
+            tests_skipped=0,
+            test_source="runner_xml",
+            failing_names=[
+                "org.apache.kafka.streams.StreamThreadTest.shouldShutdown",
+                "org.apache.kafka.streams.state.RocksDBStoreTest.shouldFlush",
+            ],
+            failing_count=2,
+            evidence_refs=["/workspace/streams/build/test-results"],
+        ),
+        ModuleSummary(
+            name="clients",
+            path="clients",
+            build_status="success",
+            build_source="reactor",
+            class_count=3140,
+            jar_count=22,
+            tests_total=1420,
+            tests_passed=1420,
+            tests_failed=0,
+            tests_errors=0,
+            tests_skipped=0,
+            test_source="runner_xml",
+            failing_names=[],
+            failing_count=0,
+            evidence_refs=["/workspace/clients/build/test-results"],
+        ),
+    ]
+
+
+def _commons_module_summary() -> ModuleRollup:
+    return ModuleRollup(
+        modules_total=3,
+        modules_built=2,
+        modules_failed=1,
+        modules_skipped=0,
+        modules_with_test_failures=1,
+        build_systems=["maven"],
+        single_module=False,
+    )
 
 
 def _commons_context() -> ContextTrace:
@@ -307,6 +378,8 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
         outcome="Test suite completed with HelpFormatter line-wrapping failures: expected width 74, observed width 80.",
         build=_commons_build_summary(),
         test=_commons_test_summary(),
+        modules=_commons_modules(),
+        module_summary=_commons_module_summary(),
         report="ready",
         report_doc=_commons_report(),
         evidence=_commons_evidence(),

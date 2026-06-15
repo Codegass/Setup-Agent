@@ -44,3 +44,14 @@ def test_demo_session_locks_local_ui_demo_facts():
     assert "HelpFormatter" in evidence_text
     assert detail.report_doc is not None
     assert detail.report_doc.title == "setup-report-2026-06-06T0216.md"
+
+
+def test_demo_session_detail_has_modules():
+    detail = get_demo_session("CC-3")
+    assert detail.modules, "demo detail should include modules"
+    assert detail.module_summary is not None
+    assert detail.module_summary.modules_total >= 2
+    by_path = {m.path: m for m in detail.modules}
+    assert by_path["connect/runtime"].build_status == "failure"
+    assert by_path["streams"].failing_count == 2
+    assert detail.module_summary.modules_with_test_failures == 1
