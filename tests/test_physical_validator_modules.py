@@ -104,3 +104,58 @@ def test_parse_module_test_reports_handles_gradle_attribute_order():
 def test_parse_module_test_reports_empty_when_no_dirs():
     v = PhysicalValidator(docker_orchestrator=object())
     assert v.parse_module_test_reports("/w/m", []) == {}
+
+
+def test_parse_module_test_reports_surefire_attribute_order():
+    """Surefire emits <testcase name=... classname=...> (name BEFORE classname)
+    plus self-closing passing cases. Failing-name extraction must be
+    attribute-order-independent, and failing_count must equal failures+errors
+    from the testsuite attrs (not the count of extracted names).
+
+    Live commons-vfs run: tests_failed=3 but failing_count=0 because the
+    testcase regex assumed classname-first while surefire is name-first.
+    """
+    surefire_xml = (
+        '<testsuite name="com.x.BarTest" tests="3" skipped="0" failures="2" errors="0">'
+        '<testcase name="ok" classname="com.x.BarTest" time="0.1"/>'
+        '<testcase name="bad1" classname="com.x.BarTest" time="0.2">'
+        '<failure message="boom">stack</failure></testcase>'
+        '<testcase name="bad2" classname="com.x.BarTest"><failure/></testcase>'
+        '</testsuite>'
+    )
+
+    class Orch:
+        def execute_command(self, command, **kwargs):
+            if "cat" in command and "surefire" in command:
+                return {"success": True, "exit_code": 0, "output": surefire_xml}
+            if "find" in command and "surefire" in command:
+                return {"success": True, "exit_code": 0,
+                        "output": "/w/m/target/surefire-reports/TEST-com.x.BarTest.xml"}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    v = PhysicalValidator(docker_orchestrator=Orch())
+    res = v.parse_module_test_reports("/w/m", ["/w/m/target/surefire-reports"])
+    assert res["tests_total"] == 3
+    assert res["tests_failed"] == 2
+    assert res["failing_count"] == 2  # authoritative: failures + errors
+    assert sorted(res["failing_names"]) == ["com.x.BarTest.bad1", "com.x.BarTest.bad2"]
+
+
+def test_failing_count_uses_attrs_when_names_unextractable():
+    """failing_count reflects failures+errors even when no per-case names parse
+    (e.g. an aggregated suite element carrying only counts)."""
+    xml = '<testsuite tests="10" failures="3" errors="1" skipped="0"></testsuite>'
+
+    class Orch:
+        def execute_command(self, command, **kwargs):
+            if "cat" in command:
+                return {"success": True, "exit_code": 0, "output": xml}
+            if "find" in command:
+                return {"success": True, "exit_code": 0, "output": "/w/m/r/TEST-x.xml"}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    v = PhysicalValidator(docker_orchestrator=Orch())
+    res = v.parse_module_test_reports("/w/m", ["/w/m/r"])
+    assert res["tests_failed"] == 3 and res["tests_errors"] == 1
+    assert res["failing_count"] == 4  # 3 failures + 1 error
+    assert res["failing_names"] == []

@@ -2672,20 +2672,34 @@ PY"""
                         m = _re.search(rf'\b{attr}="(\d+)"', tag)
                         if m:
                             totals[key] += int(m.group(1))
+                # Failing testcases: match a testcase WITH a body (self-closing
+                # passing cases are skipped), then read name/classname from the
+                # open tag INDEPENDENTLY. Surefire emits name-before-classname,
+                # Gradle classname-before-name -- a positional regex misses one
+                # writer (live commons-vfs: failures counted but no names).
+                # The `[^/]` before `>` excludes self-closing <testcase .../>
+                # (passing cases); otherwise a self-closing tag would be read as
+                # an open tag and swallow the next sibling's <failure> body.
                 for case in _re.finditer(
-                    r'<testcase[^>]*classname="([^"]*)"[^>]*name="([^"]*)"[^>]*>(.*?)</testcase>',
-                    content,
-                    _re.DOTALL,
+                    r"<testcase\b([^>]*[^/])>(.*?)</testcase>", content, _re.DOTALL
                 ):
-                    body = case.group(3)
+                    attrs, body = case.group(1), case.group(2)
                     if "<failure" in body or "<error" in body:
-                        failing.append(f"{case.group(1)}.{case.group(2)}")
+                        name_m = _re.search(r'\bname="([^"]*)"', attrs)
+                        cls_m = _re.search(r'\bclassname="([^"]*)"', attrs)
+                        nm = name_m.group(1) if name_m else "(unknown)"
+                        cls = cls_m.group(1) if cls_m else ""
+                        failing.append(f"{cls}.{nm}" if cls else nm)
 
         passed = max(
             totals["tests_total"] - totals["tests_failed"]
             - totals["tests_errors"] - totals["tests_skipped"],
             0,
         )
+        # failing_count is authoritative (failures + errors from the testsuite
+        # attrs), independent of how many per-case names we could extract. The
+        # name list is best-effort; the count must never collapse to 0 when
+        # tests actually failed.
         return {
             "tests_total": totals["tests_total"],
             "tests_passed": passed,
@@ -2693,7 +2707,7 @@ PY"""
             "tests_errors": totals["tests_errors"],
             "tests_skipped": totals["tests_skipped"],
             "failing_names": failing,
-            "failing_count": len(failing),
+            "failing_count": totals["tests_failed"] + totals["tests_errors"],
             "evidence_refs": list(report_dirs),
         }
 
