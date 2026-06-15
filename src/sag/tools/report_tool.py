@@ -14,6 +14,7 @@ from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
+from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metrics
 from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import combine_verdicts, run_verdict
 
@@ -966,6 +967,18 @@ class ReportTool(BaseTool, UIEventEmitter):
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"Skipped report metrics artifact: {exc}")
 
+        try:
+            module_metrics = self._build_module_metrics(
+                (execution_metrics or {}).get("test_history")
+                or self._load_test_history()
+                or {},
+                generated_at=timestamp,
+            )
+            if module_metrics:
+                self._persist_module_metrics(module_metrics)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"module metrics step skipped: {exc}")
+
         return (
             console_report,
             verified_status,
@@ -1045,6 +1058,8 @@ class ReportTool(BaseTool, UIEventEmitter):
         excluded_tests: set[str] = set()
         excluded_modules: set[str] = set()
         failed_tests: set[str] = set()
+        reactor_records: List[Dict[str, Any]] = []
+        failed_modules: List[str] = []
         modules_expected: Optional[int] = None
 
         def normalize_tests(source: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -1111,6 +1126,18 @@ class ReportTool(BaseTool, UIEventEmitter):
                 continue
 
             event_type = entry.get("event") or "legacy_session"
+
+            # Collect reactor + module-failure evidence from any entry shape so
+            # the returned history can surface per-module build status for the
+            # submodule metrics assembler.
+            reactor_summary = entry.get("reactor_summary")
+            if isinstance(reactor_summary, list):
+                reactor_records.extend(
+                    rec for rec in reactor_summary if isinstance(rec, dict)
+                )
+            entry_failed_modules = entry.get("failed_modules")
+            if isinstance(entry_failed_modules, list):
+                failed_modules.extend(str(mod) for mod in entry_failed_modules if mod)
 
             if event_type == "test_module_summary":
                 module_name = entry.get("module") or entry.get("module_name")
@@ -1211,6 +1238,8 @@ class ReportTool(BaseTool, UIEventEmitter):
         history["exclusions"]["tests"] = sorted(excluded_tests)
         history["exclusions"]["modules"] = sorted(excluded_modules)
         history["failed_tests"] = sorted(failed_tests)
+        history["reactor_records"] = reactor_records
+        history["failed_modules"] = sorted(dict.fromkeys(failed_modules))
         history["flags"]["fail_at_end"] = (
             history["last_cmd"].get("fail_at_end") if history["last_cmd"] else None
         )
@@ -3035,6 +3064,79 @@ class ReportTool(BaseTool, UIEventEmitter):
             self.docker_orchestrator.execute_command(command)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning(f"Failed to persist report metrics: {exc}")
+
+    def _reactor_status_from_history(self, test_history: dict) -> dict:
+        """Flatten reactor_summary records from test history into {label: status}."""
+        status: dict = {}
+        records = (test_history or {}).get("reactor_records") or []
+        for rec in records:
+            label = str(rec.get("module") or "").strip()
+            state = str(rec.get("status") or "").strip().lower()
+            if label and state:
+                # Match by full label and by last path/label segment so reactor
+                # labels line up with module names (e.g. "connect:api" or "api").
+                status[label] = state
+                status[label.split(":")[-1]] = state
+        return status
+
+    def _build_module_metrics(self, test_history: dict, *, generated_at: str):
+        """Assemble the per-module metrics dict, or None when unavailable."""
+        validator = getattr(self, "physical_validator", None)
+        if validator is None:
+            return None
+        project_info = self._get_project_info() or {}
+        project_dir = project_info.get("directory") or "/workspace"
+        build_system = str(project_info.get("build_system") or "").strip().lower()
+        if build_system not in ("maven", "gradle"):
+            build_system = "maven"
+        try:
+            modules = validator.scan_modules(project_dir, build_system)
+        except Exception as exc:
+            logger.debug(f"scan_modules failed: {exc}")
+            return None
+        if not modules:
+            return None
+
+        tests: dict = {}
+        for m in modules:
+            try:
+                parsed = validator.parse_module_test_reports(
+                    f"{project_dir}/{m['path']}" if m["path"] != "." else project_dir,
+                    m.get("report_dirs") or [],
+                )
+            except Exception as exc:
+                logger.debug(f"parse_module_test_reports failed for {m.get('path')}: {exc}")
+                parsed = {}
+            if parsed:
+                tests[m["path"]] = parsed
+
+        reactor_status = self._reactor_status_from_history(test_history)
+        build_error_samples: dict = {}  # populated by Maven error parsing when available
+        return assemble_module_metrics(
+            modules=modules,
+            reactor_status=reactor_status,
+            tests=tests,
+            build_systems=[build_system],
+            build_error_samples=build_error_samples,
+            generated_at=generated_at,
+        )
+
+    def _persist_module_metrics(self, metrics: dict) -> None:
+        """Best-effort write of module_metrics.json (never blocks report gen)."""
+        if not metrics or not self.docker_orchestrator:
+            return
+        try:
+            import json as _json
+
+            payload = _json.dumps(metrics, indent=2)
+            delimiter = "SAG_MODULE_METRICS_EOF"
+            cmd = (
+                f"mkdir -p /workspace/.setup_agent && "
+                f"cat > {MODULE_METRICS_PATH} <<'{delimiter}'\n{payload}\n{delimiter}"
+            )
+            self.docker_orchestrator.execute_command(cmd)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Failed to persist module metrics: {exc}")
 
     def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
         """Save markdown report to workspace using here-doc for safe handling."""
