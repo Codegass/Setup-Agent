@@ -39,6 +39,47 @@ def test_build_module_metrics_reconciles_scan_and_reactor(monkeypatch):
     assert metrics["module_summary"]["modules_with_test_failures"] == 1
 
 
+def test_build_module_metrics_detects_gradle_physically(monkeypatch):
+    """The build system must be detected physically (via _detect_build_system),
+    not from project_info.build_system which is often 'Unknown' at report time.
+    Live caffeine run: a Gradle multi-project collapsed to 1 maven module / 0
+    classes because the build system defaulted to maven."""
+    tool = ReportTool()
+    monkeypatch.setattr(tool, "_get_project_info", lambda: {
+        "directory": "/workspace/caffeine", "build_system": "Unknown"})
+
+    seen = {}
+
+    class V:
+        def _detect_build_system(self, project_dir):
+            return "gradle"
+
+        def scan_modules(self, project_dir, build_system):
+            seen["build_system"] = build_system
+            return [
+                {"path": "caffeine", "name": "caffeine", "class_count": 200, "jar_count": 1,
+                 "report_dirs": ["/workspace/caffeine/caffeine/build/test-results/test"]},
+                {"path": "guava", "name": "guava", "class_count": 30, "jar_count": 1,
+                 "report_dirs": []},
+            ]
+
+        def parse_module_test_reports(self, module_dir, report_dirs):
+            if report_dirs:
+                return {"tests_total": 500, "tests_passed": 500, "tests_failed": 0,
+                        "tests_errors": 0, "tests_skipped": 0,
+                        "failing_names": [], "failing_count": 0, "evidence_refs": report_dirs}
+            return {}
+
+    tool.physical_validator = V()
+    metrics = tool._build_module_metrics({}, generated_at="t")
+    assert seen["build_system"] == "gradle"            # physical detection won
+    assert metrics["module_summary"]["build_systems"] == ["gradle"]
+    assert metrics["module_summary"]["modules_total"] == 2
+    by_path = {m["path"]: m for m in metrics["modules"]}
+    assert by_path["caffeine"]["build_status"] == "success"  # artifacts present
+    assert by_path["caffeine"]["tests_total"] == 500
+
+
 def test_build_module_metrics_matches_descriptive_reactor_labels(monkeypatch):
     # Real Maven reactor summaries carry the module <name> display label, not the
     # path-derived key scan_modules produces. The end-to-end producer -> assembler

@@ -3098,9 +3098,22 @@ class ReportTool(BaseTool, UIEventEmitter):
             return None
         project_info = self._get_project_info() or {}
         project_dir = project_info.get("directory") or "/workspace"
-        build_system = str(project_info.get("build_system") or "").strip().lower()
+        # Detect the build system PHYSICALLY (presence of pom.xml vs
+        # build.gradle[.kts]). project_info.build_system is often "Unknown" at
+        # report time; trusting it defaulted Gradle projects to maven, so
+        # scan_modules looked for pom.xml/target and found nothing (live caffeine
+        # run: a Gradle multi-project collapsed to 1 maven module, 0 classes).
+        build_system = ""
+        detect = getattr(validator, "_detect_build_system", None)
+        if callable(detect):
+            try:
+                build_system = str(detect(project_dir) or "").strip().lower()
+            except Exception as exc:
+                logger.debug(f"_detect_build_system failed: {exc}")
         if build_system not in ("maven", "gradle"):
-            build_system = "maven"
+            # Fall back to the reported build system, then maven as last resort.
+            reported = str(project_info.get("build_system") or "").strip().lower()
+            build_system = reported if reported in ("maven", "gradle") else "maven"
         try:
             modules = validator.scan_modules(project_dir, build_system)
         except Exception as exc:
