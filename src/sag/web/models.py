@@ -73,6 +73,58 @@ class TestSummary(WebModel):
         serialization_alias="executionRate",
     )
     note: str = ""
+    errors: int = 0
+    report_file_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("report_file_count", "reportFileCount"),
+        serialization_alias="reportFileCount",
+    )
+    unique_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("unique_total", "uniqueTotal"),
+        serialization_alias="uniqueTotal",
+    )
+    unique_passed: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("unique_passed", "uniquePassed"),
+        serialization_alias="uniquePassed",
+    )
+    unique_failed: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("unique_failed", "uniqueFailed"),
+        serialization_alias="uniqueFailed",
+    )
+    unique_errors: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("unique_errors", "uniqueErrors"),
+        serialization_alias="uniqueErrors",
+    )
+    unique_skipped: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("unique_skipped", "uniqueSkipped"),
+        serialization_alias="uniqueSkipped",
+    )
+    declared_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("declared_total", "declaredTotal"),
+        serialization_alias="declaredTotal",
+    )
+    method_execution_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("method_execution_rate", "methodExecutionRate"),
+        serialization_alias="methodExecutionRate",
+    )
+    failing_names: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("failing_names", "failingNames"),
+        serialization_alias="failingNames",
+    )
+    conflicts: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
+        serialization_alias="evidenceRefs",
+    )
 
 
 class EvidenceRecord(WebModel):
