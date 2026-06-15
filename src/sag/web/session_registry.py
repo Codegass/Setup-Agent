@@ -22,6 +22,8 @@ from sag.web.models import (
     EvidenceRecord,
     ExecutionSessionDetail,
     ExecutionSessionSummary,
+    ModuleRollup,
+    ModuleSummary,
     ReportDocument,
     TestSummary,
     WorkspaceSummary,
@@ -327,6 +329,11 @@ def _session_detail(
         outcome=outcome,
         build=build,
         test=summary.test,
+        modules=[ModuleSummary.model_validate(m) for m in (item.get("modules") or [])],
+        module_summary=(
+            ModuleRollup.model_validate(item["module_summary"])
+            if item.get("module_summary") else None
+        ),
         report=summary.report,
         report_doc=report_doc,
         blocker=None,
@@ -458,6 +465,7 @@ def _setup_artifact_item(
     tasks = _raw_task_dicts(trunk_data)
     status = _setup_status(tasks, report_path)
     metrics = _read_report_metrics(orchestrator)
+    module_metrics = _read_module_metrics(orchestrator)
     test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
     build_payload = _build_payload_from_metrics(metrics) or _build_payload_from_report(report_raw)
     evidence_status = _setup_evidence_status(trunk_data, tasks, report_raw)
@@ -482,6 +490,8 @@ def _setup_artifact_item(
         ),
         "build": build_payload,
         "test": test,
+        "modules": _modules_payload_from_metrics(module_metrics),
+        "module_summary": _module_rollup_from_metrics(module_metrics),
         "report": "ready" if report_path else "none",
         "files": len(tasks),
         "evidence": len(tasks) + (1 if report_path else 0),
@@ -771,6 +781,34 @@ def _read_report_metrics(orchestrator: Any) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _read_module_metrics(orchestrator: Any) -> dict[str, Any] | None:
+    """Read module_metrics.json from the container, or None when absent/invalid."""
+    from sag.tools.module_metrics import MODULE_METRICS_PATH
+
+    raw = _read_container_file(orchestrator, MODULE_METRICS_PATH)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _modules_payload_from_metrics(metrics: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(metrics, dict):
+        return []
+    modules = metrics.get("modules")
+    return [m for m in modules if isinstance(m, dict)] if isinstance(modules, list) else []
+
+
+def _module_rollup_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(metrics, dict):
+        return None
+    summary = metrics.get("module_summary")
+    return summary if isinstance(summary, dict) else None
 
 
 def _test_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
