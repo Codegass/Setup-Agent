@@ -32,6 +32,7 @@ export function TestDetails({ test }: { test: TestSummary }) {
         <CalcRow label="Runner executions" value={fmt(test.total)} source="Runner XML" />
         <CalcRow label="Passed executions" value={fmt(test.pass)} />
         <CalcRow label="Failed executions" value={fmt(test.fail)} />
+        {test.errors != null ? <CalcRow label="Errored executions" value={fmt(test.errors)} /> : null}
         <CalcRow label="Skipped executions" value={fmt(test.skip)} />
         <CalcRow label="Unique methods" value={fmt(test.uniqueTotal)} source="Normalized runtime methods" />
         <CalcRow label="Declared methods" value={fmt(test.declaredTotal)} source="Static catalog" />

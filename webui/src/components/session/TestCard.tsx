@@ -21,6 +21,12 @@ function pct(n?: number | null): string | null {
 export function TestCard({ test }: { test: TestSummary }) {
   const [open, setOpen] = useState(false)
   const hasTests = test.total > 0
+  const errors = test.errors ?? 0
+  // Errors are failures for display purposes: fold them into the red bar and the
+  // "failed" line so the card body never contradicts a non-success badge. The
+  // markdown read path already folds errors into fail; this keeps both paths in
+  // agreement. Errors are also surfaced explicitly below.
+  const failed = test.fail + errors
   const passRate = pct(test.passRate) ?? (hasTests ? `${((test.pass / test.total) * 100).toFixed(1)}%` : null)
   const methodCoverage = pct(test.methodExecutionRate)
   const uniqueTotal = num(test.uniqueTotal)
@@ -51,13 +57,14 @@ export function TestCard({ test }: { test: TestSummary }) {
 
       <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-slate-100" aria-label="runner pass rate">
         <div className="h-full bg-emerald-500" style={{ width: barWidth(test.pass, test.total) }} />
-        <div className="h-full bg-red-500" style={{ width: barWidth(test.fail, test.total) }} />
+        <div className="h-full bg-red-500" style={{ width: barWidth(failed, test.total) }} />
       </div>
 
       <div className="mt-2.5 space-y-1 font-mono text-[11px] text-slate-600">
         <div>{test.pass.toLocaleString()} / {test.total.toLocaleString()} runner executions passed</div>
         <div>
-          <span className={test.fail ? "text-red-600" : ""}>{test.fail} failed</span>
+          <span className={failed ? "text-red-600" : ""}>{failed} failed</span>
+          {errors ? <span className="text-red-600">{" · "}{errors} errors</span> : null}
           {" · "}{test.skip} skipped
           {test.reportFileCount != null ? <> · {test.reportFileCount.toLocaleString()} XML reports</> : null}
         </div>

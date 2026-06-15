@@ -1848,24 +1848,37 @@ PY"""
 
         project_dir = f"{self.project_path}/{project_name}" if project_name else self.project_path
 
-        # Collect build evidence only (no test-related checks)
+        # Collect build evidence only (no test-related checks).
+        # tool / module_output_count / artifact_samples / warnings are surfaced
+        # here because report_metrics.assemble_report_metrics reads them straight
+        # off this evidence dict; leaving them unset makes those UI fields dead.
         evidence = {
             "build_system": None,
+            "tool": None,
             "has_artifacts": False,
             "artifact_count": 0,
             "has_build_fingerprints": False,
             "fingerprint_details": {},
+            "module_output_count": None,
+            "artifact_samples": [],
+            "warnings": [],
         }
 
         # Detect build system
         build_system = self._detect_build_system(project_dir)
         evidence["build_system"] = build_system
+        # "tool" mirrors the detected build system. The metrics layer reads
+        # build_evidence["tool"]; without this it always name-drifted to None.
+        evidence["tool"] = build_system if build_system != "unknown" else None
         logger.info(f"Detected build system: {build_system}")
 
         # Check 1: Build artifacts
         artifacts_result = self._check_build_artifacts_complete(project_dir)
         evidence["has_artifacts"] = artifacts_result["exist"]
         evidence["artifact_count"] = artifacts_result["count"]
+        evidence["artifact_samples"] = self._collect_artifact_samples(
+            project_dir, artifacts_result
+        )
         if evidence["has_artifacts"]:
             logger.info(
                 f"✅ Found {artifacts_result['count']} build artifacts (JARs: {artifacts_result['jar_count']}, Classes: {artifacts_result['class_count']})"
@@ -1878,6 +1891,8 @@ PY"""
             fingerprints = self._validate_maven_fingerprints(project_dir)
             evidence["has_build_fingerprints"] = fingerprints["valid"]
             evidence["fingerprint_details"] = fingerprints["details"]
+            # Modules that actually produced build output (target/maven-status).
+            evidence["module_output_count"] = len(fingerprints.get("modules") or [])
             if fingerprints["valid"]:
                 logger.info(f"✅ Maven build fingerprints found: {fingerprints['details']}")
                 if fingerprints["modules"]:
@@ -1886,6 +1901,8 @@ PY"""
             cache = self._validate_gradle_cache(project_dir)
             evidence["has_build_fingerprints"] = cache["valid"]
             evidence["fingerprint_details"] = cache["details"]
+            # Subprojects that actually produced build output (build/ dir).
+            evidence["module_output_count"] = len(cache.get("subprojects") or [])
             if cache["valid"]:
                 logger.info(f"✅ Gradle build cache found: {cache['details']}")
                 if cache["subprojects"]:
@@ -1956,6 +1973,28 @@ PY"""
         if artifacts_result.get("jar_count", 0) > 0:
             refs.extend((self._check_jar_files(project_dir).get("paths") or [])[:5])
         return list(dict.fromkeys(refs)) or [project_dir]
+
+    def _collect_artifact_samples(
+        self, project_dir: str, artifacts_result: Dict[str, any], limit: int = 10
+    ) -> List[str]:
+        """Real build-output paths (jars first, then classes) for the metrics card.
+
+        Paths are made relative to the project dir for compact display. The
+        gradle wrapper jar is never collected: _check_jar_files only matches
+        target/build output dirs, so the repo-shipped wrapper jar is excluded.
+        """
+        samples: List[str] = []
+        if artifacts_result.get("jar_count", 0) > 0:
+            samples.extend(self._check_jar_files(project_dir).get("paths") or [])
+        if artifacts_result.get("class_count", 0) > 0:
+            samples.extend(self._check_class_files(project_dir).get("paths") or [])
+
+        prefix = project_dir.rstrip("/") + "/"
+        relative = [
+            sample[len(prefix):] if sample.startswith(prefix) else sample
+            for sample in dict.fromkeys(samples)
+        ]
+        return relative[:limit]
 
     def validate_test_status(self, project_name: str) -> Dict[str, any]:
         """

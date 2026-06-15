@@ -38,6 +38,35 @@ KERNEL_VERDICT_BY_REPORT_STATUS = {
 }
 
 
+def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a parser test_analysis dict onto the stored physical_validation shape.
+
+    Carries the exact keys assemble_report_metrics consumes -- the singular
+    ``report_file_count`` and ``failing_test_names`` -- alongside the legacy
+    plural ``report_files_count`` alias that markdown rendering still reads.
+    Without the singular keys, metrics.test.report_file_count / failing_names
+    were dead (always None / []) from real runs.
+    """
+    report_files = test_analysis.get("report_files") or []
+    report_file_count = test_analysis.get("report_file_count")
+    if not isinstance(report_file_count, int):
+        report_file_count = len(report_files)
+    return {
+        "total_tests": test_analysis.get("total_tests"),
+        "passed_tests": test_analysis.get("passed_tests"),
+        "failed_tests": test_analysis.get("failed_tests"),
+        "error_tests": test_analysis.get("error_tests"),
+        "skipped_tests": test_analysis.get("skipped_tests"),
+        # Legacy plural alias (markdown consumers) + the singular key the
+        # report_metrics contract actually reads.
+        "report_files_count": len(report_files),
+        "report_file_count": report_file_count,
+        "failing_test_names": list(test_analysis.get("failing_test_names") or []),
+        "test_exclusions": test_analysis.get("test_exclusions", []),
+        "modules_without_tests": test_analysis.get("modules_without_tests", []),
+    }
+
+
 def _coerce_kernel_verdict(status: Optional[str]) -> Optional[str]:
     """Map a report/evidence status string to the kernel vocabulary."""
     if status is None:
@@ -2021,16 +2050,9 @@ class ReportTool(BaseTool, UIEventEmitter):
 
                 if test_analysis.get("valid"):
                     actual_accomplishments["test_success"] = test_analysis["test_success"]
-                    actual_accomplishments["physical_validation"]["test_analysis"] = {
-                        "total_tests": test_analysis["total_tests"],
-                        "passed_tests": test_analysis["passed_tests"],
-                        "failed_tests": test_analysis["failed_tests"],
-                        "error_tests": test_analysis["error_tests"],
-                        "skipped_tests": test_analysis["skipped_tests"],
-                        "report_files_count": len(test_analysis["report_files"]),
-                        "test_exclusions": test_analysis.get("test_exclusions", []),
-                        "modules_without_tests": test_analysis.get("modules_without_tests", []),
-                    }
+                    actual_accomplishments["physical_validation"]["test_analysis"] = (
+                        build_stored_test_analysis(test_analysis)
+                    )
 
                     # Log if tests were excluded
                     if test_analysis.get("test_exclusions"):

@@ -260,6 +260,63 @@ def test_validate_build_status_maven_unaffected():
 
 
 # ===========================================================================
+# Build evidence surfaced for the metrics read model (report_metrics contract)
+# ===========================================================================
+def test_validate_build_status_evidence_populates_metrics_fields_gradle():
+    """validate_build_status must surface tool/module_output_count/artifact_samples/
+    warnings so report_metrics.assemble does not read keys the producer never sets.
+
+    Gradle multi-project: two subprojects with real compiled outputs.
+    """
+    orch = FakeBuildOrchestrator(
+        files={
+            BUILD_GRADLE,
+            "/workspace/demo/settings.gradle",
+            APP_CLASS,
+            APP_JAR,
+            WRAPPER_JAR,
+            "/workspace/demo/core/build.gradle",
+            "/workspace/demo/core/build/classes/java/main/com/example/Core.class",
+            "/workspace/demo/web/build.gradle",
+            "/workspace/demo/web/build/classes/java/main/com/example/Web.class",
+            "/workspace/demo/web/build/libs/web.jar",
+        },
+        dirs={"/workspace/demo/.gradle"},
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    evidence = validator.validate_build_status("demo")["evidence"]
+
+    # tool mirrors the detected build system (no longer name-drifts to a never-set key)
+    assert evidence["tool"] == "gradle"
+    # module_output_count reflects subprojects that produced output
+    assert evidence["module_output_count"] == 2
+    # artifact_samples lists real build outputs (never the wrapper jar)
+    assert evidence["artifact_samples"], "expected at least one artifact sample"
+    assert all("gradle/wrapper" not in sample for sample in evidence["artifact_samples"])
+    assert any(sample.endswith(".jar") or sample.endswith(".class")
+               for sample in evidence["artifact_samples"])
+    # warnings is an explicit list (honest empty when nothing was collected)
+    assert evidence["warnings"] == []
+
+
+def test_validate_build_status_evidence_populates_metrics_fields_maven():
+    """Maven single-module: tool + artifact_samples surfaced; no module fan-out."""
+    orch = FakeBuildOrchestrator(
+        files={"/workspace/mvn/pom.xml", "/workspace/mvn/target/foo-1.0.jar"},
+        dirs={"/workspace/mvn/target/classes"},
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    evidence = validator.validate_build_status("mvn")["evidence"]
+
+    assert evidence["tool"] == "maven"
+    assert "module_output_count" in evidence
+    assert any(sample.endswith(".jar") for sample in evidence["artifact_samples"])
+    assert evidence["warnings"] == []
+
+
+# ===========================================================================
 # TASK 2.2 - Single test-verdict policy (evaluate_run_verdict)
 # ===========================================================================
 def test_settings_test_pass_threshold_default():

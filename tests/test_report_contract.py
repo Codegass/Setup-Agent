@@ -3,7 +3,7 @@ import json
 from sag.evidence import EvidenceStatus, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.tools.internal.command_tracker import CommandTracker
-from sag.tools.report_tool import ReportTool
+from sag.tools.report_tool import ReportTool, build_stored_test_analysis
 
 
 class FakeReplayOrchestrator:
@@ -1028,3 +1028,52 @@ def test_console_result_line_uses_kernel_verdict():
     }
     lines = tool._render_console_evidence_result(snapshot)
     assert lines and lines[0] == "Result: PARTIAL", lines
+
+
+def test_stored_test_analysis_preserves_metrics_contract_keys():
+    """The stored physical_validation.test_analysis must carry the singular
+    report_file_count and failing_test_names that assemble_report_metrics reads.
+
+    Regression: the store previously wrote report_files_count (plural) and
+    dropped failing_test_names, so metrics.test.report_file_count / failing_names
+    were always None/[] from real runs.
+    """
+    source = {
+        "valid": True,
+        "test_success": False,
+        "total_tests": 214,
+        "passed_tests": 206,
+        "failed_tests": 3,
+        "error_tests": 0,
+        "skipped_tests": 5,
+        "report_files": ["a.xml", "b.xml", "c.xml"],
+        "report_file_count": 3,
+        "failing_test_names": ["com.x.FooTest.testA", "com.x.BarTest.testB"],
+        "test_exclusions": [],
+        "modules_without_tests": [],
+    }
+
+    stored = build_stored_test_analysis(source)
+
+    # The exact keys assemble_report_metrics consumes:
+    assert stored["report_file_count"] == 3
+    assert stored["failing_test_names"] == ["com.x.FooTest.testA", "com.x.BarTest.testB"]
+    # Existing markdown consumers keep the legacy plural alias too.
+    assert stored["report_files_count"] == 3
+    assert stored["total_tests"] == 214 and stored["failed_tests"] == 3
+
+
+def test_stored_test_analysis_falls_back_when_source_lacks_counts():
+    """When the parser omits the singular count, derive it from report_files."""
+    stored = build_stored_test_analysis(
+        {
+            "total_tests": 1,
+            "passed_tests": 1,
+            "failed_tests": 0,
+            "error_tests": 0,
+            "skipped_tests": 0,
+            "report_files": ["only.xml"],
+        }
+    )
+    assert stored["report_file_count"] == 1
+    assert stored["failing_test_names"] == []

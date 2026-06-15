@@ -40,4 +40,20 @@ describe("TestCard", () => {
     expect(screen.getByText("No test evidence")).toBeInTheDocument()
     expect(screen.queryByText("0% passed")).not.toBeInTheDocument()
   })
+
+  it("counts errors as failures so the body agrees with a non-success badge", () => {
+    render(
+      <TestCard
+        test={{ state: "partial", pass: 97, fail: 0, skip: 0, total: 100, errors: 3 }}
+      />,
+    )
+    // failed line folds errors in (0 failures + 3 errors -> 3 failed)
+    expect(screen.getByText("3 failed")).toBeInTheDocument()
+    // errors are surfaced explicitly, not hidden
+    expect(screen.getByText(/3 errors/)).toBeInTheDocument()
+    // the red bar must not be empty when only errors are present
+    const bar = screen.getByLabelText("runner pass rate")
+    const red = bar.querySelector(".bg-red-500") as HTMLElement
+    expect(red.style.width).not.toBe("0%")
+  })
 })
