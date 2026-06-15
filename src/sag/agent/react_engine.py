@@ -440,6 +440,10 @@ class ReActEngine(UIEventEmitter):
                 "observations": 0,
                 "successful_actions": 0,
                 "failed_actions": 0,
+                # Per-tool breakdown must survive window resets too, else the
+                # end-of-run report shows only the last phase's tools.
+                "tools_used": {},
+                "tool_failures": {},
             }
             self._archived_counts = counts
         for s in self.steps:
@@ -448,12 +452,19 @@ class ReActEngine(UIEventEmitter):
                 counts["thoughts"] += 1
             elif s.step_type == StepType.ACTION:
                 counts["actions"] += 1
+                tool_name = getattr(s, "tool_name", None)
+                if tool_name:
+                    counts["tools_used"][tool_name] = counts["tools_used"].get(tool_name, 0) + 1
                 result = getattr(s, "tool_result", None)
                 if result is not None:
                     if getattr(result, "success", False):
                         counts["successful_actions"] += 1
                     else:
                         counts["failed_actions"] += 1
+                        if tool_name:
+                            counts["tool_failures"][tool_name] = (
+                                counts["tool_failures"].get(tool_name, 0) + 1
+                            )
             elif s.step_type == StepType.OBSERVATION:
                 counts["observations"] += 1
 
@@ -1718,7 +1729,25 @@ class ReActEngine(UIEventEmitter):
         )
 
         archived = getattr(self, "_archived_counts", None) or {}
+
+        # Cumulative per-tool usage: archived windows + the live window. Without
+        # this the report's Tool Usage reflects only the post-compaction window.
+        tools_used = dict(archived.get("tools_used", {}))
+        tool_failures = dict(archived.get("tool_failures", {}))
+        for s in self.steps:
+            if s.step_type != StepType.ACTION:
+                continue
+            tool_name = getattr(s, "tool_name", None)
+            if not tool_name:
+                continue
+            tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
+            result = getattr(s, "tool_result", None)
+            if result is not None and not getattr(result, "success", False):
+                tool_failures[tool_name] = tool_failures.get(tool_name, 0) + 1
+
         return {
+            "tools_used": tools_used,
+            "tool_failures": tool_failures,
             "total_steps": len(self.steps) + archived.get("total_steps", 0),
             "iterations": self.current_iteration,
             "thoughts": len([s for s in self.steps if s.step_type == StepType.THOUGHT])

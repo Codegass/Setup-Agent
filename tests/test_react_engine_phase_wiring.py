@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 from sag.agent.phase_machine import PhaseMachine
 from sag.agent.react_engine import ReActEngine
+from sag.agent.react_types import StepType
 
 
 def _engine_with_machine():
@@ -337,3 +338,51 @@ def test_summary_counts_survive_window_resets():
     # Simulate: 7 steps in window, then a phase transition archives them.
     engine._archive_window_steps()
     assert engine._archived_counts["total_steps"] == 7
+
+
+def _action(tool_name, success=True, model="gpt-action"):
+    return SimpleNamespace(
+        step_type=StepType.ACTION,
+        tool_name=tool_name,
+        tool_result=SimpleNamespace(success=success),
+        model_used=model,
+        content="",
+    )
+
+
+def test_archive_accumulates_per_tool_usage_across_windows():
+    """Per-tool usage must survive window resets so the end-of-run report shows
+    every tool, not just the last phase's. Regression: archived counts tracked
+    aggregate actions but dropped the tool breakdown -> 'Tool Usage: Report (1)'
+    for a 19-action run."""
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.context_journal = None
+
+    # Window 1 (e.g. build phase): bash x2 (one failed), build x1
+    engine.steps = [_action("bash"), _action("bash", success=False), _action("build")]
+    engine._archive_window_steps()
+    # Window 2 (test phase): bash x1, test_runner x1
+    engine.steps = [_action("bash"), _action("test_runner")]
+    engine._archive_window_steps()
+
+    counts = engine._archived_counts
+    assert counts["tools_used"] == {"bash": 3, "build": 1, "test_runner": 1}
+    assert counts["tool_failures"] == {"bash": 1}
+
+
+def test_execution_summary_merges_archived_and_live_tool_usage():
+    engine = ReActEngine.__new__(ReActEngine)
+    engine.context_journal = None
+    engine.current_iteration = 26
+    # Two archived windows, then the live (report) window holds just `report`.
+    engine.steps = [_action("bash"), _action("build", success=False)]
+    engine._archive_window_steps()
+    engine.steps = [_action("search"), _action("search")]
+    engine._archive_window_steps()
+    engine.steps = [_action("report")]
+
+    summary = engine.get_execution_summary()
+
+    assert summary["actions"] == 5
+    assert summary["tools_used"] == {"bash": 1, "build": 1, "search": 2, "report": 1}
+    assert summary["tool_failures"] == {"build": 1}

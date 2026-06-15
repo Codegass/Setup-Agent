@@ -1967,6 +1967,14 @@ class ReportTool(BaseTool, UIEventEmitter):
                         "action_model_calls", metrics["action_model_calls"]
                     )
 
+                    # Per-tool usage from the summary is the whole-run truth.
+                    # The per-step loop above only saw the live (post-compaction)
+                    # window, so in phase mode it holds just the report phase.
+                    if summary_snapshot.get("tools_used"):
+                        metrics["tools_used"] = dict(summary_snapshot["tools_used"])
+                    if summary_snapshot.get("tool_failures") is not None:
+                        metrics["tool_failures"] = dict(summary_snapshot["tool_failures"])
+
                     if summary_snapshot.get("actions"):
                         try:
                             metrics["success_rate"] = (

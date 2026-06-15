@@ -1079,6 +1079,41 @@ def test_stored_test_analysis_falls_back_when_source_lacks_counts():
     assert stored["failing_test_names"] == []
 
 
+def test_tool_usage_reflects_whole_run_not_just_live_window():
+    """Phase-mode compacts each phase's step window, so by report time the live
+    `steps` hold only the report phase (one `report` action). The cumulative
+    per-tool counts live in the engine summary. _collect_execution_metrics must
+    surface the summary's tools_used / tool_failures, not the live window only.
+
+    Regression: a kafka run with 19 actions rendered 'Tool Usage: Report (1)'
+    because tools_used was built solely from the post-compaction live window.
+    """
+    summary = {
+        "actions": 19,
+        "successful_actions": 16,
+        "failed_actions": 3,
+        "thoughts": 12,
+        "iterations": 26,
+        "tools_used": {"bash": 9, "build": 4, "search": 3, "files": 2, "report": 1},
+        "tool_failures": {"bash": 2, "build": 1},
+    }
+    payload = {
+        "steps": [
+            {"step_type": "action", "tool_name": "report", "tool_result": {"success": True}},
+        ],
+        "summary": summary,
+        "current_iteration": 26,
+    }
+    tool = ReportTool(execution_history_callback=lambda: payload)
+
+    metrics = tool._collect_execution_metrics()
+
+    assert metrics["total_actions"] == 19
+    # The whole-run per-tool breakdown, not just {"report": 1}
+    assert metrics["tools_used"] == {"bash": 9, "build": 4, "search": 3, "files": 2, "report": 1}
+    assert metrics["tool_failures"] == {"bash": 2, "build": 1}
+
+
 def test_stored_test_analysis_preserves_unique_and_raw_metrics():
     """The stored projection must carry the unique-normalized and raw runner
     counts the snapshot reads (test_analysis.get('unique_tests') /
