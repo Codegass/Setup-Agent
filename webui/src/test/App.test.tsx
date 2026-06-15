@@ -417,7 +417,7 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
     expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
-    expect(screen.getByText("430")).toBeInTheDocument()
+    expect(screen.getByText(/430 \/ 430 runner executions passed/)).toBeInTheDocument()
   }, 8000)
 
   it("does not mount the terminal panel when the workspace container is not running", async () => {

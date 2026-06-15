@@ -72,7 +72,7 @@ describe("SessionDetail", () => {
 
     expect(screen.getByText("Outcome")).toBeInTheDocument()
     expect(screen.getByText("Build project and execute full test suite")).toBeInTheDocument()
-    expect(screen.getByText("312")).toBeInTheDocument()
+    expect(screen.getByText(/312 \/ 320 runner executions passed/)).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "Status" })).toBeInTheDocument()
     expect(screen.getAllByText("Flow")).not.toHaveLength(0)
     expect(screen.getAllByText("Evidence status")).not.toHaveLength(0)
