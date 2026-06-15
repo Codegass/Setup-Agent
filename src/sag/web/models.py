@@ -26,6 +26,34 @@ class BuildSummary(WebModel):
     time: str = "—"
     artifact: str | None = None
     note: str = ""
+    # Structured build evidence (spec data contract). None = uncomputable.
+    system: str | None = None
+    class_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("class_count", "classCount"),
+        serialization_alias="classCount",
+    )
+    jar_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("jar_count", "jarCount"),
+        serialization_alias="jarCount",
+    )
+    module_output_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("module_output_count", "moduleOutputCount"),
+        serialization_alias="moduleOutputCount",
+    )
+    artifact_samples: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("artifact_samples", "artifactSamples"),
+        serialization_alias="artifactSamples",
+    )
+    warnings: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
+        serialization_alias="evidenceRefs",
+    )
 
 
 class TestSummary(WebModel):
