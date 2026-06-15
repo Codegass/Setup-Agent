@@ -13,8 +13,20 @@ export interface TestSummary {
   fail: number
   skip: number
   total: number
+  errors?: number
   passRate?: number | null
   executionRate?: number | null
+  reportFileCount?: number | null
+  uniqueTotal?: number | null
+  uniquePassed?: number | null
+  uniqueFailed?: number | null
+  uniqueErrors?: number | null
+  uniqueSkipped?: number | null
+  declaredTotal?: number | null
+  methodExecutionRate?: number | null
+  failingNames?: string[]
+  conflicts?: string[]
+  evidenceRefs?: string[]
   note?: string
 }
 
@@ -24,6 +36,13 @@ export interface BuildSummary {
   time: string
   artifact?: string | null
   note: string
+  system?: string | null
+  classCount?: number | null
+  jarCount?: number | null
+  moduleOutputCount?: number | null
+  artifactSamples?: string[]
+  warnings?: string[]
+  evidenceRefs?: string[]
 }
 
 export interface WorkspaceSummary {
