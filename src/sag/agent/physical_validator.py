@@ -2632,6 +2632,66 @@ PY"""
             })
         return modules
 
+    def parse_module_test_reports(
+        self, module_dir: str, report_dirs: List[str]
+    ) -> Dict[str, any]:
+        """Parse one module's JUnit XML report dirs into counts + failing names.
+
+        Returns {} when the module has no report dirs (test_source -> none).
+        Sums testsuite attributes across the module's XML files; failing names
+        are testcases containing a <failure> or <error> child.
+        """
+        if not self.docker_orchestrator or not report_dirs:
+            return {}
+
+        import re as _re
+
+        totals = {"tests_total": 0, "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0}
+        failing: List[str] = []
+        for rd in report_dirs:
+            find_cmd = f"find {rd} -name 'TEST-*.xml' -o -name '*.xml' -path '*{rd}*' 2>/dev/null"
+            listing = self._execute_command_with_logging(find_cmd, f"listing reports {rd}")
+            files = [f for f in (listing.get("output") or "").splitlines() if f.strip().endswith(".xml")]
+            for xml_file in files:
+                cat = self._execute_command_with_logging(
+                    f"cat '{xml_file}'", f"reading {xml_file}"
+                )
+                content = cat.get("output") or ""
+                suite = _re.search(
+                    r'<testsuite[^>]*tests="(\d+)"[^>]*failures="(\d+)"'
+                    r'[^>]*errors="(\d+)"[^>]*skipped="(\d+)"',
+                    content,
+                )
+                if suite:
+                    totals["tests_total"] += int(suite.group(1))
+                    totals["tests_failed"] += int(suite.group(2))
+                    totals["tests_errors"] += int(suite.group(3))
+                    totals["tests_skipped"] += int(suite.group(4))
+                for case in _re.finditer(
+                    r'<testcase[^>]*classname="([^"]*)"[^>]*name="([^"]*)"[^>]*>(.*?)</testcase>',
+                    content,
+                    _re.DOTALL,
+                ):
+                    body = case.group(3)
+                    if "<failure" in body or "<error" in body:
+                        failing.append(f"{case.group(1)}.{case.group(2)}")
+
+        passed = max(
+            totals["tests_total"] - totals["tests_failed"]
+            - totals["tests_errors"] - totals["tests_skipped"],
+            0,
+        )
+        return {
+            "tests_total": totals["tests_total"],
+            "tests_passed": passed,
+            "tests_failed": totals["tests_failed"],
+            "tests_errors": totals["tests_errors"],
+            "tests_skipped": totals["tests_skipped"],
+            "failing_names": failing,
+            "failing_count": len(failing),
+            "evidence_refs": list(report_dirs),
+        }
+
     def _validate_maven_fingerprints(self, project_dir: str) -> Dict[str, any]:
         """
         Validate Maven build fingerprints without executing mvn commands.

@@ -37,3 +37,36 @@ def test_scan_modules_single_module_returns_root():
     v = PhysicalValidator(docker_orchestrator=FakeOrch({"-name 'pom.xml'": {"output": ""}}))
     modules = v.scan_modules("/w/solo", "maven")
     assert len(modules) == 1 and modules[0]["path"] == "."
+
+
+def test_parse_module_test_reports_counts_per_module():
+    surefire_xml = (
+        '<testsuite tests="3" failures="1" errors="0" skipped="1">'
+        '<testcase classname="com.x.FooTest" name="ok"/>'
+        '<testcase classname="com.x.FooTest" name="bad"><failure/></testcase>'
+        '<testcase classname="com.x.FooTest" name="ign"><skipped/></testcase>'
+        '</testsuite>'
+    )
+
+    class Orch:
+        def execute_command(self, command, **kwargs):
+            if "cat" in command and "surefire" in command:
+                return {"success": True, "exit_code": 0, "output": surefire_xml}
+            if "find" in command and "surefire" in command:
+                return {"success": True, "exit_code": 0,
+                        "output": "/w/m/target/surefire-reports/TEST-com.x.FooTest.xml"}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    v = PhysicalValidator(docker_orchestrator=Orch())
+    res = v.parse_module_test_reports("/w/m", ["/w/m/target/surefire-reports"])
+    assert res["tests_total"] == 3
+    assert res["tests_failed"] == 1
+    assert res["tests_skipped"] == 1
+    assert res["failing_count"] == 1
+    assert any("FooTest" in n for n in res["failing_names"])
+    assert res["evidence_refs"] == ["/w/m/target/surefire-reports"]
+
+
+def test_parse_module_test_reports_empty_when_no_dirs():
+    v = PhysicalValidator(docker_orchestrator=object())
+    assert v.parse_module_test_reports("/w/m", []) == {}
