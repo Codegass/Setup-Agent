@@ -44,6 +44,11 @@ export function BuildDetailPage({
         <Tile label="Classes" value={fmtNum(b.classCount)} />
         <Tile label="JARs" value={fmtNum(b.jarCount)} />
       </div>
+      {!single && (s?.buildSystems ?? []).includes("gradle") ? (
+        <div className="font-mono text-[10px] text-slate-500">
+          Gradle has no reactor summary — per-module build status is inferred from build outputs (best-effort).
+        </div>
+      ) : null}
       <Card className="p-4">
         {single ? (
           <div className="font-mono text-[12px] text-slate-500">Single module project — see the project-level build summary on Overview.</div>

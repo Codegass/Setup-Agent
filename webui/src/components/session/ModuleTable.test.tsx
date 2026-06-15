@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ModuleSummary } from "@/api/types"
 
@@ -38,6 +38,34 @@ describe("ModuleTable (test variant)", () => {
       failingNames: ["x.T.a"], failingCount: 600, evidenceRefs: ["/w/m"] }]} />)
     fireEvent.click(screen.getByRole("button", { name: /view 600 failures/i }))
     expect(screen.getByText(/\+599 more/)).toBeInTheDocument()
-    expect(screen.getByText(/\/w\/m/)).toBeInTheDocument()
+    // path appears in both the toolbar ("report:") and the truncation pointer
+    expect(screen.getAllByText(/\/w\/m/).length).toBeGreaterThanOrEqual(1)
+  })
+
+  it("flags partial build evidence and tolerates a missing buildStatus", () => {
+    render(<ModuleTable variant="build" modules={[
+      { name: "a", path: "a", buildStatus: "success", buildSource: "partial",
+        testSource: "none" },
+      { name: "b", path: "b", buildSource: "artifacts", testSource: "none" } as never,
+    ]} />)
+    expect(screen.getByText("partial")).toBeInTheDocument()
+    // a record missing buildStatus must not crash; it renders UNKNOWN
+    expect(screen.getByText("UNKNOWN")).toBeInTheDocument()
+  })
+
+  it("offers copy-all and the report path in the expanded failing list", () => {
+    const writeText = vi.fn()
+    Object.assign(navigator, { clipboard: { writeText } })
+    render(<ModuleTable variant="test" modules={[{
+      name: "streams", path: "streams", buildStatus: "success", buildSource: "reactor",
+      testSource: "runner_xml", testsFailed: 2,
+      failingNames: ["a.StreamTest.shouldX", "b.StateTest.shouldY"], failingCount: 2,
+      evidenceRefs: ["/workspace/streams/build/test-results"] }]} />)
+    fireEvent.click(screen.getByRole("button", { name: /view 2 failures/i }))
+    // report path surfaced so the user can find the full source
+    expect(screen.getByText(/\/workspace\/streams\/build\/test-results/)).toBeInTheDocument()
+    // copy-all copies the full newline-joined list
+    fireEvent.click(screen.getByRole("button", { name: /copy all/i }))
+    expect(writeText).toHaveBeenCalledWith("a.StreamTest.shouldX\nb.StateTest.shouldY")
   })
 })

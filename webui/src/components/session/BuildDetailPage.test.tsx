@@ -18,6 +18,16 @@ it("renders build tiles and per-module table", () => {
   expect(screen.getByText("connect:runtime")).toBeInTheDocument()
 })
 
+it("notes Gradle best-effort status when the build system is gradle", () => {
+  render(<BuildDetailPage onBack={() => {}} detail={{
+    build: { state: "success", system: "gradle", classCount: 1063, jarCount: 1 },
+    moduleSummary: { modulesTotal: 11, modulesBuilt: 5, modulesFailed: 0, modulesSkipped: 0,
+                     modulesWithTestFailures: 0, buildSystems: ["gradle"], singleModule: false },
+    modules: [{ name: "guava", path: "guava", buildStatus: "success", buildSource: "artifacts" }],
+  } as any} />)
+  expect(screen.getByText(/inferred from build outputs/i)).toBeInTheDocument()
+})
+
 it("renders '—' for absent counts instead of a fake zero", () => {
   render(<BuildDetailPage onBack={() => {}} detail={{
     build: { state: "unknown", system: "maven", classCount: null, jarCount: null },

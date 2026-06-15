@@ -69,9 +69,14 @@ export function ModuleTable({
               <tr className="border-b border-slate-100 font-mono text-[12px] tabular-nums">
                 <td className="px-2 py-2" style={{ paddingLeft: 8 + depth * 14 }}>{m.name}</td>
                 <td className="px-2 py-2">
-                  <span className={cn("rounded px-2 py-0.5 text-[10px]", statusClass(m.buildStatus))}>
-                    {m.buildStatus.toUpperCase()}
+                  <span className={cn("rounded px-2 py-0.5 text-[10px]", statusClass(m.buildStatus ?? "unknown"))}>
+                    {(m.buildStatus ?? "unknown").toUpperCase()}
                   </span>
+                  {m.buildSource === "partial" ? (
+                    <span className="ml-1.5 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-700">
+                      partial
+                    </span>
+                  ) : null}
                 </td>
                 {variant === "build" ? (
                   <>
@@ -109,6 +114,20 @@ export function ModuleTable({
               {isOpen ? (
                 <tr className="bg-red-50/60">
                   <td colSpan={variant === "build" ? 5 : 6} className="px-3 py-2">
+                    <div className="mb-1.5 flex flex-wrap items-center gap-3 font-mono text-[10px] text-slate-500">
+                      {variant === "test" && failing.length ? (
+                        <button
+                          className="rounded border border-slate-300 px-1.5 py-0.5 hover:bg-white"
+                          onClick={() => navigator.clipboard?.writeText(failing.join("\n"))}
+                          type="button"
+                        >
+                          Copy all
+                        </button>
+                      ) : null}
+                      {(m.evidenceRefs ?? [])[0] ? (
+                        <span>report: <span className="text-slate-600">{(m.evidenceRefs ?? [])[0]}</span></span>
+                      ) : null}
+                    </div>
                     <div className="max-h-48 overflow-auto font-mono text-[11px] text-red-700">
                       {(variant === "test" ? failing : errs).map((line) => (
                         <div key={line} className="py-0.5">{line}</div>
