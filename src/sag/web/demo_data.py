@@ -39,6 +39,21 @@ def _commons_test_summary() -> TestSummary:
         pass_rate=97.5,
         execution_rate=100.0,
         note="312 passing, 8 HelpFormatter line-wrapping failures in the local Maven suite.",
+        errors=0,
+        report_file_count=42,
+        unique_total=180,
+        unique_passed=176,
+        unique_failed=2,
+        unique_errors=0,
+        unique_skipped=2,
+        declared_total=210,
+        method_execution_rate=85.7,
+        failing_names=[
+            "com.demo.FlakyTest.testRetry",
+            "com.demo.NetTest.testTimeout",
+        ],
+        conflicts=[],
+        evidence_refs=["output_demo_tests"],
     )
 
 
@@ -49,6 +64,16 @@ def _commons_build_summary() -> BuildSummary:
         time="47.2s",
         artifact="target/commons-cli-1.6.0.jar",
         note="Compiled with Maven 3.9.6 and JDK 11 inside the workspace container.",
+        system="maven",
+        class_count=180,
+        jar_count=2,
+        module_output_count=1,
+        artifact_samples=[
+            "target/classes/com/demo/App.class",
+            "target/demo-1.0.jar",
+        ],
+        warnings=[],
+        evidence_refs=["output_demo_build"],
     )
 
 

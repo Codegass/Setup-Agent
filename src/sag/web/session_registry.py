@@ -286,6 +286,18 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
             execution_rate=_to_float_or_none(
                 _value_for_keys(test, "execution_rate", "executionRate")
             ),
+            errors=_to_int(test.get("errors")),
+            report_file_count=test.get("report_file_count"),
+            unique_total=test.get("unique_total"),
+            unique_passed=test.get("unique_passed"),
+            unique_failed=test.get("unique_failed"),
+            unique_errors=test.get("unique_errors"),
+            unique_skipped=test.get("unique_skipped"),
+            declared_total=test.get("declared_total"),
+            method_execution_rate=_to_float_or_none(test.get("method_execution_rate")),
+            failing_names=test.get("failing_names") or [],
+            conflicts=test.get("conflicts") or [],
+            evidence_refs=test.get("evidence_refs") or [],
         ),
         report=_text(item.get("report"), default="none"),
         files=_to_int(item.get("files")),
