@@ -1077,3 +1077,117 @@ def test_stored_test_analysis_falls_back_when_source_lacks_counts():
     )
     assert stored["report_file_count"] == 1
     assert stored["failing_test_names"] == []
+
+
+def test_stored_test_analysis_preserves_unique_and_raw_metrics():
+    """The stored projection must carry the unique-normalized and raw runner
+    counts the snapshot reads (test_analysis.get('unique_tests') /
+    .get('raw_total_tests') ...). Regression: a live Maven run produced
+    report_metrics.json with every unique_* field null because the projection
+    dropped these keys, even though parse_test_reports computed them. That
+    silently defeated the feature's central claim -- runner executions and
+    unique normalized methods as separate facts."""
+    source = {
+        "valid": True,
+        "test_success": True,
+        "total_tests": 977,
+        "passed_tests": 916,
+        "failed_tests": 0,
+        "error_tests": 0,
+        "skipped_tests": 61,
+        "raw_total_tests": 977,
+        "raw_passed_tests": 916,
+        "raw_failed_tests": 0,
+        "raw_error_tests": 0,
+        "raw_skipped_tests": 61,
+        "unique_tests": 612,
+        "unique_passed_tests": 580,
+        "unique_failed_tests": 0,
+        "unique_error_tests": 0,
+        "unique_skipped_tests": 32,
+        "report_files": ["a.xml"],
+    }
+
+    stored = build_stored_test_analysis(source)
+
+    assert stored["unique_tests"] == 612
+    assert stored["unique_passed_tests"] == 580
+    assert stored["unique_failed_tests"] == 0
+    assert stored["unique_error_tests"] == 0
+    assert stored["unique_skipped_tests"] == 32
+    assert stored["raw_total_tests"] == 977
+    assert stored["raw_passed_tests"] == 916
+    assert stored["raw_failed_tests"] == 0
+    assert stored["raw_error_tests"] == 0
+    assert stored["raw_skipped_tests"] == 61
+
+
+def test_unique_counts_flow_parser_to_metrics_end_to_end():
+    """Mirror the exact production chain that the live Maven run exercised:
+    parser dict -> build_stored_test_analysis -> physical_validation ->
+    _build_report_snapshot -> assemble_report_metrics. unique_total MUST land
+    in the metrics artifact, not null. This is the test that would have caught
+    the dropped-projection bug; the layer tests passed in isolation while the
+    real chain produced unique_total=null."""
+    from sag.tools.report_metrics import assemble_report_metrics
+
+    parser_analysis = {
+        "valid": True,
+        "test_success": True,
+        "total_tests": 18839,
+        "passed_tests": 18805,
+        "failed_tests": 5,
+        "error_tests": 0,
+        "skipped_tests": 29,
+        "pass_rate": 99.8,
+        "raw_total_tests": 18839,
+        "raw_passed_tests": 18805,
+        "raw_failed_tests": 5,
+        "raw_error_tests": 0,
+        "raw_skipped_tests": 29,
+        "unique_tests": 9497,
+        "unique_passed_tests": 9470,
+        "unique_failed_tests": 5,
+        "unique_error_tests": 0,
+        "unique_skipped_tests": 22,
+        "report_files": ["TEST-a.xml", "TEST-b.xml"],
+        "report_file_count": 2,
+        "failing_test_names": ["com.x.FooTest.testA"],
+    }
+
+    stored_analysis = build_stored_test_analysis(parser_analysis)
+    tool = ReportTool()
+    snapshot = tool._build_report_snapshot(
+        "success",
+        "setup-report-test.md",
+        {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
+        {
+            "repository_cloned": True,
+            "build_success": True,
+            "test_success": True,
+            "physical_validation": {
+                "class_files": 56,
+                "jar_files": 0,
+                "test_analysis": stored_analysis,
+            },
+        },
+        {},
+    )
+
+    # Runner executions and unique methods are distinct facts in the snapshot.
+    assert snapshot["status"]["tests_total"] == 18839
+    assert snapshot["status"]["tests_unique"] == 9497
+
+    metrics = assemble_report_metrics(
+        snapshot=snapshot,
+        build_evidence={"build_system": "maven", "tool": "maven"},
+        test_analysis=stored_analysis,
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-06-15 00:00:00",
+    )
+
+    assert metrics["test"]["total"] == 18839, "runner executions"
+    assert metrics["test"]["unique_total"] == 9497, "unique normalized methods"
+    assert metrics["test"]["unique_passed"] == 9470
+    assert metrics["test"]["unique_failed"] == 5

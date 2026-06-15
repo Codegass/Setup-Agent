@@ -41,11 +41,17 @@ KERNEL_VERDICT_BY_REPORT_STATUS = {
 def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
     """Project a parser test_analysis dict onto the stored physical_validation shape.
 
-    Carries the exact keys assemble_report_metrics consumes -- the singular
-    ``report_file_count`` and ``failing_test_names`` -- alongside the legacy
-    plural ``report_files_count`` alias that markdown rendering still reads.
+    Carries the exact keys downstream consumers read: the singular
+    ``report_file_count`` and ``failing_test_names`` that assemble_report_metrics
+    reads (alongside the legacy plural ``report_files_count`` alias markdown
+    rendering still uses), AND the unique-normalized / raw runner counts that
+    _build_report_snapshot folds into status.tests_unique / tests_total_raw.
+
     Without the singular keys, metrics.test.report_file_count / failing_names
-    were dead (always None / []) from real runs.
+    were dead (always None / []) from real runs. Without the unique_*/raw_*
+    keys, every metrics.test.unique_* field was null from real runs even though
+    parse_test_reports computed them -- the projection silently dropped them,
+    defeating the runner-executions-vs-unique-methods distinction.
     """
     report_files = test_analysis.get("report_files") or []
     report_file_count = test_analysis.get("report_file_count")
@@ -57,6 +63,21 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
         "failed_tests": test_analysis.get("failed_tests"),
         "error_tests": test_analysis.get("error_tests"),
         "skipped_tests": test_analysis.get("skipped_tests"),
+        # Raw runner executions (parameterized/dynamic expansions counted) --
+        # _build_report_snapshot reads these into status.tests_*_raw and uses
+        # raw vs unique to detect parameterized expansion.
+        "raw_total_tests": test_analysis.get("raw_total_tests"),
+        "raw_passed_tests": test_analysis.get("raw_passed_tests"),
+        "raw_failed_tests": test_analysis.get("raw_failed_tests"),
+        "raw_error_tests": test_analysis.get("raw_error_tests"),
+        "raw_skipped_tests": test_analysis.get("raw_skipped_tests"),
+        # Unique normalized methods (parameterized/dynamic folded) -- these feed
+        # status.tests_unique / tests_*_unique that the metrics contract reads.
+        "unique_tests": test_analysis.get("unique_tests"),
+        "unique_passed_tests": test_analysis.get("unique_passed_tests"),
+        "unique_failed_tests": test_analysis.get("unique_failed_tests"),
+        "unique_error_tests": test_analysis.get("unique_error_tests"),
+        "unique_skipped_tests": test_analysis.get("unique_skipped_tests"),
         # Legacy plural alias (markdown consumers) + the singular key the
         # report_metrics contract actually reads.
         "report_files_count": len(report_files),
