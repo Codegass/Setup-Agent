@@ -43,3 +43,35 @@ def test_build_module_metrics_returns_none_without_validator():
     tool = ReportTool()
     tool.physical_validator = None
     assert tool._build_module_metrics({}, generated_at="t") is None
+
+
+def test_submodule_breakdown_section_renders_failures_first():
+    from sag.tools.report_tool import ReportTool
+    tool = ReportTool()
+    metrics = {
+        "module_summary": {"modules_total": 3, "modules_built": 1, "modules_failed": 1,
+                           "modules_skipped": 1, "modules_with_test_failures": 1,
+                           "build_systems": ["maven"], "single_module": False},
+        "modules": [
+            {"name": "api", "path": "api", "build_status": "success",
+             "tests_total": 10, "tests_passed": 10, "tests_failed": 0, "failing_count": 0},
+            {"name": "runtime", "path": "runtime", "build_status": "failure",
+             "tests_total": None, "failing_count": None},
+            {"name": "core", "path": "core", "build_status": "success",
+             "tests_total": 20, "tests_passed": 18, "tests_failed": 2, "failing_count": 2},
+        ],
+    }
+    lines = tool._render_submodule_breakdown(metrics)
+    body = "\n".join(lines)
+    assert "Submodule Breakdown" in body
+    assert "3 modules" in body and "1 failed" in body
+    # failed/test-failing modules listed before all-green ones
+    assert body.index("runtime") < body.index("api")
+
+
+def test_submodule_breakdown_empty_for_single_module():
+    from sag.tools.report_tool import ReportTool
+    tool = ReportTool()
+    assert tool._render_submodule_breakdown(
+        {"module_summary": {"single_module": True}, "modules": [{"name": ".", "path": "."}]}
+    ) == []

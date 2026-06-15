@@ -2674,6 +2674,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             if test_analysis_section:
                 report_lines.extend(test_analysis_section)
 
+            # Add per-submodule build/test breakdown (multi-module projects only)
+            try:
+                mm = self._build_module_metrics(
+                    self._load_test_history() or {},
+                    generated_at=timestamp,
+                )
+                report_lines.extend(self._render_submodule_breakdown(mm or {}))
+            except Exception as exc:
+                logger.debug(f"submodule breakdown skipped: {exc}")
+
             # Add issues and recommendations
             issues_section = self._render_issues_recommendations(report_snapshot)
             if issues_section:
@@ -3137,6 +3147,57 @@ class ReportTool(BaseTool, UIEventEmitter):
             self.docker_orchestrator.execute_command(cmd)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"Failed to persist module metrics: {exc}")
+
+    def _render_submodule_breakdown(self, module_metrics: dict) -> List[str]:
+        """Markdown 'Submodule Breakdown' section; [] for single-module projects."""
+        if not module_metrics:
+            return []
+        summary = module_metrics.get("module_summary") or {}
+        modules = module_metrics.get("modules") or []
+        if summary.get("single_module") or len(modules) <= 1:
+            return []
+
+        def rank(m):
+            if m.get("build_status") == "failure":
+                return 0
+            if (m.get("failing_count") or 0) > 0:
+                return 1
+            if m.get("build_status") == "skipped":
+                return 2
+            return 3
+
+        lines = ["", "## 🧩 Submodule Breakdown", ""]
+        lines.append(
+            f"{summary.get('modules_total', 0)} modules · "
+            f"{summary.get('modules_built', 0)} built · "
+            f"{summary.get('modules_failed', 0)} failed · "
+            f"{summary.get('modules_skipped', 0)} skipped · "
+            f"test failures in {summary.get('modules_with_test_failures', 0)}"
+        )
+        lines.append("")
+        lines.append("| Module | Build | Tests (pass/fail/skip) |")
+        lines.append("|---|---|---|")
+        ordered = sorted(modules, key=rank)
+        shown = ordered[:20]
+        for m in shown:
+            tp = m.get("tests_passed")
+            tf = m.get("tests_failed")
+            ts = m.get("tests_skipped")
+            tests = (
+                f"{tp if tp is not None else '—'}/"
+                f"{tf if tf is not None else '—'}/"
+                f"{ts if ts is not None else '—'}"
+            )
+            lines.append(
+                f"| `{m.get('name')}` | {str(m.get('build_status', 'unknown')).upper()} | {tests} |"
+            )
+        if len(ordered) > len(shown):
+            lines.append("")
+            lines.append(
+                f"_+{len(ordered) - len(shown)} more modules — full per-module data in "
+                f"`/workspace/.setup_agent/module_metrics.json`_"
+            )
+        return lines
 
     def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
         """Save markdown report to workspace using here-doc for safe handling."""
