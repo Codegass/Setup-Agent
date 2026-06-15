@@ -313,6 +313,126 @@ class BlockerSummary(WebModel):
     hint: str
 
 
+class ModuleSummary(WebModel):
+    name: str = ""
+    path: str = ""
+    build_status: str = Field(
+        default="unknown",
+        validation_alias=AliasChoices("build_status", "buildStatus"),
+        serialization_alias="buildStatus",
+    )
+    build_source: str = Field(
+        default="none",
+        validation_alias=AliasChoices("build_source", "buildSource"),
+        serialization_alias="buildSource",
+    )
+    class_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("class_count", "classCount"),
+        serialization_alias="classCount",
+    )
+    jar_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("jar_count", "jarCount"),
+        serialization_alias="jarCount",
+    )
+    build_warnings: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("build_warnings", "buildWarnings"),
+        serialization_alias="buildWarnings",
+    )
+    build_error_samples: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("build_error_samples", "buildErrorSamples"),
+        serialization_alias="buildErrorSamples",
+    )
+    tests_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tests_total", "testsTotal"),
+        serialization_alias="testsTotal",
+    )
+    tests_passed: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tests_passed", "testsPassed"),
+        serialization_alias="testsPassed",
+    )
+    tests_failed: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tests_failed", "testsFailed"),
+        serialization_alias="testsFailed",
+    )
+    tests_errors: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tests_errors", "testsErrors"),
+        serialization_alias="testsErrors",
+    )
+    tests_skipped: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("tests_skipped", "testsSkipped"),
+        serialization_alias="testsSkipped",
+    )
+    test_source: str = Field(
+        default="none",
+        validation_alias=AliasChoices("test_source", "testSource"),
+        serialization_alias="testSource",
+    )
+    failing_names: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("failing_names", "failingNames"),
+        serialization_alias="failingNames",
+    )
+    failing_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("failing_count", "failingCount"),
+        serialization_alias="failingCount",
+    )
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
+        serialization_alias="evidenceRefs",
+    )
+
+
+class ModuleRollup(WebModel):
+    modules_total: int = Field(
+        default=0,
+        validation_alias=AliasChoices("modules_total", "modulesTotal"),
+        serialization_alias="modulesTotal",
+    )
+    modules_built: int = Field(
+        default=0,
+        validation_alias=AliasChoices("modules_built", "modulesBuilt"),
+        serialization_alias="modulesBuilt",
+    )
+    modules_failed: int = Field(
+        default=0,
+        validation_alias=AliasChoices("modules_failed", "modulesFailed"),
+        serialization_alias="modulesFailed",
+    )
+    modules_skipped: int = Field(
+        default=0,
+        validation_alias=AliasChoices("modules_skipped", "modulesSkipped"),
+        serialization_alias="modulesSkipped",
+    )
+    modules_with_test_failures: int = Field(
+        default=0,
+        validation_alias=AliasChoices(
+            "modules_with_test_failures", "modulesWithTestFailures"
+        ),
+        serialization_alias="modulesWithTestFailures",
+    )
+    build_systems: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("build_systems", "buildSystems"),
+        serialization_alias="buildSystems",
+    )
+    single_module: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("single_module", "singleModule"),
+        serialization_alias="singleModule",
+    )
+
+
 class ExecutionSessionDetail(WebModel):
     id: str
     workspace: str
@@ -329,6 +449,12 @@ class ExecutionSessionDetail(WebModel):
     outcome: str
     build: BuildSummary
     test: TestSummary
+    modules: list[ModuleSummary] = Field(default_factory=list)
+    module_summary: ModuleRollup | None = Field(
+        default=None,
+        validation_alias=AliasChoices("module_summary", "moduleSummary"),
+        serialization_alias="moduleSummary",
+    )
     report: str
     report_doc: ReportDocument | None = Field(default=None, serialization_alias="reportDoc")
     blocker: BlockerSummary | None = None
