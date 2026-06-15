@@ -1,12 +1,8 @@
-import { ChevronDown } from "lucide-react"
-import { useState } from "react"
-
 import type { TestSummary } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
-import { cn } from "@/lib/utils"
 
-import { TestDetails, isValidCoverage } from "./TestDetails"
+import { isValidCoverage } from "./TestDetails"
 
 function barWidth(value: number, total: number): string {
   return `${Math.max(0, Math.min(100, (value / total) * 100))}%`
@@ -18,8 +14,13 @@ function pct(n?: number | null): string | null {
   return typeof n === "number" && Number.isFinite(n) ? `${n.toFixed(1)}%` : null
 }
 
-export function TestCard({ test }: { test: TestSummary }) {
-  const [open, setOpen] = useState(false)
+export function TestCard({
+  test,
+  onOpenDetail,
+}: {
+  test: TestSummary
+  onOpenDetail?: () => void
+}) {
   const hasTests = test.total > 0
   const errors = test.errors ?? 0
   // Errors are failures for display purposes: fold them into the red bar and the
@@ -86,16 +87,16 @@ export function TestCard({ test }: { test: TestSummary }) {
         </div>
       ) : null}
 
-      <button
-        aria-expanded={open}
-        className="mt-3 inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
-        onClick={() => setOpen((v) => !v)}
-        type="button"
-      >
-        <ChevronDown aria-hidden className={cn("transition-transform", open && "rotate-180")} size={12} />
-        {open ? "Hide details" : "Details"}
-      </button>
-      {open ? <div className="mt-2 border-t border-slate-100 pt-3"><TestDetails test={test} /></div> : null}
+      {onOpenDetail ? (
+        <button
+          aria-label="Open test details"
+          className="mt-3 inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+          onClick={onOpenDetail}
+          type="button"
+        >
+          Details <span aria-hidden>→</span>
+        </button>
+      ) : null}
     </Card>
   )
 }

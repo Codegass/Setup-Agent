@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { TestSummary } from "@/api/types"
 
@@ -26,13 +26,11 @@ describe("TestCard", () => {
     expect(screen.getByText(/760 XML reports/)).toBeInTheDocument()
   })
 
-  it("expands to a calculation table and failing list", () => {
-    render(<TestCard test={test} />)
-    fireEvent.click(screen.getByRole("button", { name: /details/i }))
-    expect(screen.getByText("Calculation")).toBeInTheDocument()
-    expect(screen.getByText("Runner executions")).toBeInTheDocument()
-    expect(screen.getByText("com.x.FooTest.testA")).toBeInTheDocument()
-    expect(screen.getByText(/parse_error/i)).toBeInTheDocument()
+  it("opens the detail page when Details is clicked", () => {
+    const onOpenDetail = vi.fn()
+    render(<TestCard test={test} onOpenDetail={onOpenDetail} />)
+    fireEvent.click(screen.getByRole("button", { name: /open test details/i }))
+    expect(onOpenDetail).toHaveBeenCalled()
   })
 
   it("renders an unavailable state without fake zeroes", () => {
@@ -56,11 +54,6 @@ describe("TestCard", () => {
     expect(screen.getByText(/584 unique methods/)).toBeInTheDocument()
     expect(screen.queryByText(/method coverage/)).not.toBeInTheDocument()
     expect(screen.queryByText(/12[67]/)).not.toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole("button", { name: /details/i }))
-    expect(screen.getByText("Method execution")).toBeInTheDocument()
-    expect(screen.getByText(/catalog incomplete/i)).toBeInTheDocument()
-    expect(screen.queryByText(/126\.9/)).not.toBeInTheDocument()
   })
 
   it("counts errors as failures so the body agrees with a non-success badge", () => {

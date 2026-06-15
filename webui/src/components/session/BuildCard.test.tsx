@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { BuildSummary } from "@/api/types"
 
@@ -22,11 +22,16 @@ describe("BuildCard", () => {
     expect(screen.getByText(/maven/i)).toBeInTheDocument()
   })
 
-  it("expands to artifact summary and evidence samples", () => {
+  it("opens the detail page when Details is clicked", () => {
+    const onOpenDetail = vi.fn()
+    render(<BuildCard build={build} onOpenDetail={onOpenDetail} />)
+    fireEvent.click(screen.getByRole("button", { name: /open build details/i }))
+    expect(onOpenDetail).toHaveBeenCalled()
+  })
+
+  it("omits the Details affordance when no handler is provided", () => {
     render(<BuildCard build={build} />)
-    fireEvent.click(screen.getByRole("button", { name: /details/i }))
-    expect(screen.getByText("Artifact Summary")).toBeInTheDocument()
-    expect(screen.getByText("target/classes/Foo.class")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /open build details/i })).not.toBeInTheDocument()
   })
 
   it("does not overclaim when no artifacts", () => {

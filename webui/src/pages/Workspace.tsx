@@ -26,10 +26,12 @@ import { Card, CardHead } from "@/components/common/Card"
 import { Tabs } from "@/components/common/Tabs"
 import { TestBar } from "@/components/common/TestBar"
 import { BuildCard } from "@/components/session/BuildCard"
+import { BuildDetailPage } from "@/components/session/BuildDetailPage"
 import { ContextTrace } from "@/components/session/ContextTrace"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { TestCard } from "@/components/session/TestCard"
+import { TestDetailPage } from "@/components/session/TestDetailPage"
 import { TerminalPanel } from "@/components/terminal/TerminalPanel"
 import {
   Dialog,
@@ -82,11 +84,13 @@ export function Workspace({
   initialTaskSourceSession,
 }: WorkspaceProps) {
   const [tab, setTab] = useState<WorkspaceTab>("Overview")
+  const [detail, setDetail] = useState<"build" | "test" | null>(null)
   const [modal, setModal] = useState<{ sourceSession?: string } | null>(null)
   const [submitted, setSubmitted] = useState<SubmitTaskResponse | null>(null)
 
   useEffect(() => {
     setTab("Overview")
+    setDetail(null)
     setSubmitted(null)
     setModal(initialTaskSourceSession ? { sourceSession: initialTaskSourceSession } : null)
   }, [workspace.id, initialTaskSourceSession])
@@ -135,6 +139,16 @@ export function Workspace({
         </div>
       </div>
 
+      {detail && latest ? (
+        <div className="mt-5">
+          {detail === "build" ? (
+            <BuildDetailPage detail={latest} onBack={() => setDetail(null)} />
+          ) : (
+            <TestDetailPage detail={latest} onBack={() => setDetail(null)} />
+          )}
+        </div>
+      ) : (
+        <>
       <Tabs
         className="mt-5"
         tabs={[
@@ -166,6 +180,7 @@ export function Workspace({
           <OverviewTab
             build={displayBuild}
             latest={latest}
+            onOpenDetail={(kind) => setDetail(kind)}
             onOpenSession={onOpenSession}
             test={displayTest}
             workspace={workspace}
@@ -195,6 +210,8 @@ export function Workspace({
         {tab === "Terminal" ? <TerminalTab workspace={workspace} /> : null}
         {tab === "Settings" ? <SettingsTab latest={latest} workspace={workspace} /> : null}
       </div>
+        </>
+      )}
 
       {modal ? (
         <NewTaskModal
@@ -217,12 +234,14 @@ function OverviewTab({
   latest,
   build,
   test,
+  onOpenDetail,
   onOpenSession,
 }: {
   workspace: WorkspaceSummary
   latest?: ExecutionSessionDetail | null
   build: BuildSummary
   test: TestSummary
+  onOpenDetail: (kind: "build" | "test") => void
   onOpenSession: (sessionId: string, tab?: string) => void
 }) {
   return (
@@ -288,8 +307,8 @@ function OverviewTab({
       </Card>
 
       <div className="grid gap-4 md:grid-cols-2">
-        <BuildCard build={build} />
-        <TestCard test={test} />
+        <BuildCard build={build} onOpenDetail={() => onOpenDetail("build")} />
+        <TestCard test={test} onOpenDetail={() => onOpenDetail("test")} />
       </div>
 
       {latest?.report === "ready" && latest.reportDoc ? (
