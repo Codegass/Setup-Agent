@@ -886,6 +886,29 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Save markdown report to workspace with consistent filename
         self._save_markdown_report(markdown_report, timestamp, report_filename)
+        try:
+            from sag.tools.report_metrics import assemble_report_metrics
+
+            physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
+            build_status = physical_validation.get("build_status", {}) or {}
+            # Build system / fingerprint details live under build_status["evidence"];
+            # there is no dedicated "build_evidence" key (verified against the
+            # physical validator + report snapshot shapes).
+            build_evidence = build_status.get("evidence", {}) or {}
+            test_analysis = physical_validation.get("test_analysis", {}) or {}
+
+            self._persist_report_metrics(
+                assemble_report_metrics(
+                    snapshot=report_snapshot,
+                    build_evidence=build_evidence,
+                    test_analysis=test_analysis,
+                    conflicts=list(report_evidence_result.get("conflicts") or []),
+                    evidence_refs=list(report_evidence_result.get("evidence_refs") or []),
+                    generated_at=timestamp,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Skipped report metrics artifact: {exc}")
 
         return (
             console_report,
@@ -2933,6 +2956,28 @@ class ReportTool(BaseTool, UIEventEmitter):
             section_lines.append("")
 
         return section_lines
+
+    def _persist_report_metrics(self, metrics: dict) -> None:
+        """Write the structured metrics artifact for the web read model.
+        Best-effort: never fail report generation on a metrics write error."""
+        if not self.docker_orchestrator:
+            return
+        try:
+            import json as _json
+            import os as _os
+
+            from sag.tools.report_metrics import METRICS_PATH
+
+            parent = _os.path.dirname(METRICS_PATH)
+            if parent:
+                self.docker_orchestrator.execute_command(f"mkdir -p {parent}")
+
+            body = _json.dumps(metrics, indent=2)
+            delimiter = f"EOF_METRICS_{abs(hash(body)) % 10000}"
+            command = f"cat > {METRICS_PATH} << '{delimiter}'\n{body}\n{delimiter}"
+            self.docker_orchestrator.execute_command(command)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(f"Failed to persist report metrics: {exc}")
 
     def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
         """Save markdown report to workspace using here-doc for safe handling."""
