@@ -445,7 +445,9 @@ def _setup_artifact_item(
     finish = _report_generated_at(report_raw) or updated
     tasks = _raw_task_dicts(trunk_data)
     status = _setup_status(tasks, report_path)
-    test = _test_payload_from_report(report_raw)
+    metrics = _read_report_metrics(orchestrator)
+    test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
+    build_payload = _build_payload_from_metrics(metrics) or _build_payload_from_report(report_raw)
     evidence_status = _setup_evidence_status(trunk_data, tasks, report_raw)
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     project_name = _text(
@@ -466,7 +468,7 @@ def _setup_artifact_item(
             _normalize_timestamp(created) or created,
             _normalize_timestamp(finish) or finish,
         ),
-        "build": _build_payload_from_report(report_raw),
+        "build": build_payload,
         "test": test,
         "report": "ready" if report_path else "none",
         "files": len(tasks),
@@ -743,6 +745,69 @@ def _setup_session_id(context_id: str, created: str, workspace_id: str) -> str:
         return f"SETUP-{label}-{parsed.strftime('%Y%m%d-%H%M%S')}"
 
     return f"SETUP-{label}-latest"
+
+
+def _read_report_metrics(orchestrator: Any) -> dict[str, Any] | None:
+    """Read the structured metrics artifact, or None when absent/invalid."""
+    from sag.tools.report_metrics import METRICS_PATH
+
+    raw = _read_container_file(orchestrator, METRICS_PATH)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _test_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(metrics, dict):
+        return None
+    test = metrics.get("test")
+    if not isinstance(test, dict):
+        return None
+    return {
+        "state": _text(test.get("state"), default="none"),
+        "pass": _to_int(test.get("passed")),
+        "fail": _to_int(test.get("failed")),
+        "skip": _to_int(test.get("skipped")),
+        "total": _to_int(test.get("total")),
+        "errors": _to_int(test.get("errors")),
+        "pass_rate": _to_float_or_none(test.get("pass_rate")),
+        "execution_rate": _to_float_or_none(test.get("method_execution_rate")),
+        "report_file_count": test.get("report_file_count"),
+        "unique_total": test.get("unique_total"),
+        "unique_passed": test.get("unique_passed"),
+        "unique_failed": test.get("unique_failed"),
+        "unique_errors": test.get("unique_errors"),
+        "unique_skipped": test.get("unique_skipped"),
+        "declared_total": test.get("declared_total"),
+        "method_execution_rate": _to_float_or_none(test.get("method_execution_rate")),
+        "failing_names": test.get("failing_names") or [],
+        "conflicts": test.get("conflicts") or [],
+        "evidence_refs": test.get("evidence_refs") or [],
+    }
+
+
+def _build_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(metrics, dict):
+        return None
+    build = metrics.get("build")
+    if not isinstance(build, dict):
+        return None
+    return {
+        "state": _text(build.get("state"), default="none"),
+        "system": build.get("system"),
+        "tool": _text(build.get("tool"), default="—") if build.get("tool") else "—",
+        "time": "—",
+        "class_count": build.get("class_count"),
+        "jar_count": build.get("jar_count"),
+        "module_output_count": build.get("module_output_count"),
+        "artifact_samples": build.get("artifact_samples") or [],
+        "warnings": build.get("warnings") or [],
+        "evidence_refs": build.get("evidence_refs") or [],
+    }
 
 
 def _test_payload_from_report(report_raw: str | None) -> dict[str, Any]:
