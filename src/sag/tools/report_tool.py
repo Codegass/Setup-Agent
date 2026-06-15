@@ -833,6 +833,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         trunk_context.update_task_key_results(target.id, key_results)
         self.context_manager._save_trunk_context(trunk_context)
 
+        # Do NOT release current_task_id for phase tasks: in phase mode the report
+        # phase is closed by an explicit phase(action='done') call, not by writing
+        # the report artifact. The phase machine / ReActEngine owns the phase
+        # lifecycle (see test_final_report_does_not_close_active_phase_branch_before_phase_done).
+        # Non-phase runs (legacy branch/trunk) still release here so the trunk
+        # doesn't carry a stale current_task_id.
         if getattr(self.context_manager, "current_task_id", None) == target.id and not str(
             target.id
         ).startswith("phase_"):

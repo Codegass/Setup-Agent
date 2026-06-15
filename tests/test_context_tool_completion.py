@@ -625,6 +625,12 @@ def test_task_progress_renders_phase_task_ids():
 
 
 def test_final_report_matcher_finds_report_phase_task():
+    """The final-report matcher resolves the phase_report task and marks it
+    COMPLETED. It must NOT release current_task_id for a phase task: in phase
+    mode the report phase is closed by an explicit phase(action='done') call,
+    not by writing the report artifact (see the companion contract test
+    test_final_report_does_not_close_active_phase_branch_before_phase_done).
+    """
     from sag.tools.report_tool import ReportTool
 
     trunk = _phase_trunk()
@@ -642,4 +648,5 @@ def test_final_report_matcher_finds_report_phase_task():
         ("phase_report", TaskStatus.COMPLETED, "Final setup report generated.")
     ]
     assert trunk.key_results_updates and trunk.key_results_updates[0][0] == "phase_report"
-    assert cm.current_task_id is None, "report phase task must be released after completion"
+    # Phase tasks stay current until phase(action='done') closes them.
+    assert cm.current_task_id == "phase_report"
