@@ -39,6 +39,41 @@ def test_build_module_metrics_reconciles_scan_and_reactor(monkeypatch):
     assert metrics["module_summary"]["modules_with_test_failures"] == 1
 
 
+def test_build_module_metrics_matches_descriptive_reactor_labels(monkeypatch):
+    # Real Maven reactor summaries carry the module <name> display label, not the
+    # path-derived key scan_modules produces. The end-to-end producer -> assembler
+    # path must still line them up (e.g. "Apache Kafka :: Connect :: API" -> connect/api).
+    tool = ReportTool()
+    monkeypatch.setattr(tool, "_get_project_info", lambda: {
+        "directory": "/workspace/p", "build_system": "Maven"})
+
+    class V:
+        def scan_modules(self, project_dir, build_system):
+            return [
+                {"path": "connect/api", "name": "connect:api", "class_count": 0,
+                 "jar_count": 0, "report_dirs": []},
+                {"path": "connect/runtime", "name": "connect:runtime", "class_count": 0,
+                 "jar_count": 0, "report_dirs": []},
+            ]
+
+        def parse_module_test_reports(self, module_dir, report_dirs):
+            return {}
+
+    tool.physical_validator = V()
+    test_history = {
+        "reactor_records": [
+            {"module": "Apache Kafka :: Connect :: API", "status": "SUCCESS"},
+            {"module": "Apache Kafka :: Connect :: Runtime", "status": "FAILURE"},
+        ],
+    }
+    metrics = tool._build_module_metrics(test_history, generated_at="t")
+    by_path = {m["path"]: m for m in metrics["modules"]}
+    assert by_path["connect/api"]["build_status"] == "success"
+    assert by_path["connect/runtime"]["build_status"] == "failure"
+    assert by_path["connect/runtime"]["build_source"] == "reactor"
+    assert metrics["module_summary"]["modules_failed"] == 1
+
+
 def test_build_module_metrics_returns_none_without_validator():
     tool = ReportTool()
     tool.physical_validator = None

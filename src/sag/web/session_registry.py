@@ -307,6 +307,31 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
     )
 
 
+def _module_summaries(value: Any) -> list[ModuleSummary]:
+    """Validate per-module records, dropping any that are malformed.
+
+    A present-but-partially-malformed module_metrics.json (e.g. class_count as a
+    non-numeric string from a hand-edit or version skew) must not crash the whole
+    detail endpoint; mirror _build_summary and degrade gracefully.
+    """
+    out: list[ModuleSummary] = []
+    for m in value if isinstance(value, list) else []:
+        try:
+            out.append(ModuleSummary.model_validate(m))
+        except Exception:
+            continue
+    return out
+
+
+def _module_rollup(value: Any) -> ModuleRollup | None:
+    if not value:
+        return None
+    try:
+        return ModuleRollup.model_validate(value)
+    except Exception:
+        return None
+
+
 def _session_detail(
     item: dict[str, Any],
     workspace_id: str,
@@ -329,11 +354,8 @@ def _session_detail(
         outcome=outcome,
         build=build,
         test=summary.test,
-        modules=[ModuleSummary.model_validate(m) for m in (item.get("modules") or [])],
-        module_summary=(
-            ModuleRollup.model_validate(item["module_summary"])
-            if item.get("module_summary") else None
-        ),
+        modules=_module_summaries(item.get("modules")),
+        module_summary=_module_rollup(item.get("module_summary")),
         report=summary.report,
         report_doc=report_doc,
         blocker=None,

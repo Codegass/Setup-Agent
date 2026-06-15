@@ -2657,16 +2657,21 @@ PY"""
                     f"cat '{xml_file}'", f"reading {xml_file}"
                 )
                 content = cat.get("output") or ""
-                suite = _re.search(
-                    r'<testsuite[^>]*tests="(\d+)"[^>]*failures="(\d+)"'
-                    r'[^>]*errors="(\d+)"[^>]*skipped="(\d+)"',
-                    content,
-                )
-                if suite:
-                    totals["tests_total"] += int(suite.group(1))
-                    totals["tests_failed"] += int(suite.group(2))
-                    totals["tests_errors"] += int(suite.group(3))
-                    totals["tests_skipped"] += int(suite.group(4))
+                # Parse each <testsuite ...> open tag, reading attributes
+                # independently. Surefire and Gradle emit them in different orders
+                # (Gradle: name, tests, skipped, failures, errors), so a single
+                # positional regex would silently miss one writer's reports.
+                for open_tag in _re.finditer(r"<testsuite\b[^>]*>", content):
+                    tag = open_tag.group(0)
+                    for key, attr in (
+                        ("tests_total", "tests"),
+                        ("tests_failed", "failures"),
+                        ("tests_errors", "errors"),
+                        ("tests_skipped", "skipped"),
+                    ):
+                        m = _re.search(rf'\b{attr}="(\d+)"', tag)
+                        if m:
+                            totals[key] += int(m.group(1))
                 for case in _re.finditer(
                     r'<testcase[^>]*classname="([^"]*)"[^>]*name="([^"]*)"[^>]*>(.*?)</testcase>',
                     content,

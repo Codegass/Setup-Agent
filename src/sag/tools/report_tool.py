@@ -3076,17 +3076,19 @@ class ReportTool(BaseTool, UIEventEmitter):
             logger.warning(f"Failed to persist report metrics: {exc}")
 
     def _reactor_status_from_history(self, test_history: dict) -> dict:
-        """Flatten reactor_summary records from test history into {label: status}."""
+        """Flatten reactor_summary records from test history into {label: status}.
+
+        Labels are the raw Maven reactor display names (the module <name>, e.g.
+        "Apache Kafka :: Connect :: API"); the metrics assembler normalizes both
+        sides so these reconcile with the path-derived scan keys.
+        """
         status: dict = {}
         records = (test_history or {}).get("reactor_records") or []
         for rec in records:
             label = str(rec.get("module") or "").strip()
             state = str(rec.get("status") or "").strip().lower()
             if label and state:
-                # Match by full label and by last path/label segment so reactor
-                # labels line up with module names (e.g. "connect:api" or "api").
                 status[label] = state
-                status[label.split(":")[-1]] = state
         return status
 
     def _build_module_metrics(self, test_history: dict, *, generated_at: str):

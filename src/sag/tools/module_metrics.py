@@ -35,6 +35,55 @@ def _norm_status(value: Any) -> Optional[str]:
     return low if low in _BUILD_STATES else None
 
 
+def _norm_key(value: Any) -> str:
+    """Collapse a module name / path / reactor label to a comparable key.
+
+    Maven reactor labels use the descriptive <name> (e.g.
+    "Apache Kafka :: Connect :: API") while scan_modules derives keys from the
+    directory path ("connect:api" / "connect/api"). Lowercasing and replacing
+    every '::', ':' and '/' separator with a single space lets the two line up.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.lower()
+    for sep in ("::", ":", "/"):
+        text = text.replace(sep, " ")
+    return " ".join(text.split())
+
+
+def _build_reactor_index(reactor_status: Dict[str, str]) -> Dict[str, str]:
+    """Normalized index of reactor keys -> status (last write wins)."""
+    index: Dict[str, str] = {}
+    for label, status in reactor_status.items():
+        norm = _norm_key(label)
+        if not norm:
+            continue
+        index[norm] = status
+        # Also index the trailing segment (e.g. "...:: Connect :: API" -> "api")
+        # so a descriptive label still matches a single-segment module name.
+        tail = norm.rsplit(" ", 1)[-1]
+        index.setdefault(tail, status)
+    return index
+
+
+def _lookup_reactor(
+    index: Dict[str, str], name: str, path: str
+) -> Optional[str]:
+    """Find a reactor status for a scanned module by normalized name/path.
+
+    Tries the full normalized name and path first, then the trailing path
+    segment (e.g. "connect/api" -> "api") so descriptive Maven <name> labels
+    that were indexed by tail still resolve.
+    """
+    for candidate in (_norm_key(name), _norm_key(path)):
+        if candidate and candidate in index:
+            return index[candidate]
+    tail = _norm_key(path).rsplit(" ", 1)[-1]
+    if tail and tail in index:
+        return index[tail]
+    return None
+
+
 def assemble_module_metrics(
     *,
     modules: List[Dict[str, Any]],
@@ -50,6 +99,7 @@ def assemble_module_metrics(
     out_modules: List[Dict[str, Any]] = []
 
     any_failure = any(_norm_status(v) == "failure" for v in reactor_status.values())
+    reactor_index = _build_reactor_index(reactor_status)
 
     for scan in modules or []:
         path = str(scan.get("path") or "")
@@ -57,8 +107,9 @@ def assemble_module_metrics(
         class_count = _int_or_none(scan.get("class_count"))
         jar_count = _int_or_none(scan.get("jar_count"))
 
-        # Build status: reactor (by name) wins; else infer from artifacts.
-        reactor = _norm_status(reactor_status.get(name)) or _norm_status(reactor_status.get(path))
+        # Build status: reactor wins; match descriptive Maven <name> labels by
+        # normalizing both sides (name, path, trailing path segment).
+        reactor = _norm_status(_lookup_reactor(reactor_index, name, path))
         if reactor is not None:
             build_status, build_source = reactor, "reactor"
             # Conflict guard: reactor says success but nothing was produced.

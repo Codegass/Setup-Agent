@@ -67,6 +67,40 @@ def test_parse_module_test_reports_counts_per_module():
     assert res["evidence_refs"] == ["/w/m/target/surefire-reports"]
 
 
+def test_parse_module_test_reports_handles_gradle_attribute_order():
+    # Gradle's JUnit XML writer emits attributes in the order
+    # name, tests, skipped, failures, errors -- i.e. skipped BEFORE failures/errors.
+    # A positional regex (tests..failures..errors..skipped) fails to match this,
+    # leaving every count at 0 even though tests ran.
+    gradle_xml = (
+        '<testsuite name="com.x.BarTest" tests="4" skipped="1" failures="1" '
+        'errors="1" time="0.5">'
+        '<testcase classname="com.x.BarTest" name="ok"/>'
+        '<testcase classname="com.x.BarTest" name="bad"><failure/></testcase>'
+        '<testcase classname="com.x.BarTest" name="boom"><error/></testcase>'
+        '<testcase classname="com.x.BarTest" name="ign"><skipped/></testcase>'
+        '</testsuite>'
+    )
+
+    class Orch:
+        def execute_command(self, command, **kwargs):
+            if "cat" in command and "test-results" in command:
+                return {"success": True, "exit_code": 0, "output": gradle_xml}
+            if "find" in command and "test-results" in command:
+                return {"success": True, "exit_code": 0,
+                        "output": "/w/m/build/test-results/test/TEST-com.x.BarTest.xml"}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    v = PhysicalValidator(docker_orchestrator=Orch())
+    res = v.parse_module_test_reports("/w/m", ["/w/m/build/test-results/test"])
+    assert res["tests_total"] == 4
+    assert res["tests_failed"] == 1
+    assert res["tests_errors"] == 1
+    assert res["tests_skipped"] == 1
+    assert res["tests_passed"] == 1
+    assert res["failing_count"] == 2  # one <failure> + one <error>
+
+
 def test_parse_module_test_reports_empty_when_no_dirs():
     v = PhysicalValidator(docker_orchestrator=object())
     assert v.parse_module_test_reports("/w/m", []) == {}
