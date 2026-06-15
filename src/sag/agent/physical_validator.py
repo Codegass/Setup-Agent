@@ -2560,6 +2560,78 @@ PY"""
         self._cache_result(cache_key, result)
         return result
 
+    def scan_modules(self, project_dir: str, build_system: str) -> List[Dict[str, any]]:
+        """Enumerate submodules and scan each for artifacts + test report dirs.
+
+        Backbone of the per-module metrics: physical evidence of which modules
+        exist and what each produced. Returns a flat list of module records.
+        Single-module projects return one record with path '.'.
+        """
+        if not self.docker_orchestrator:
+            return []
+
+        if build_system == "gradle":
+            find_cmd = (
+                f"find {project_dir} -mindepth 2 -maxdepth 3 "
+                f"\\( -name 'build.gradle' -o -name 'build.gradle.kts' \\) 2>/dev/null"
+            )
+            classes_glob = "build/classes"
+            jars_glob = "build/libs"
+            report_subdirs = ["build/test-results/test", "build/test-results"]
+            sep = ":"
+        else:
+            find_cmd = (
+                f"find {project_dir} -mindepth 2 -maxdepth 3 -name 'pom.xml' -type f 2>/dev/null"
+            )
+            classes_glob = "target/classes"
+            jars_glob = "target"
+            report_subdirs = ["target/surefire-reports", "target/failsafe-reports"]
+            sep = ":"
+
+        found = self._execute_command_with_logging(find_cmd, "enumerating submodules")
+        lines = [l for l in (found.get("output") or "").splitlines() if l.strip()]
+        module_dirs = sorted({l.rsplit("/", 1)[0] for l in lines})
+
+        # Single-module project: scan the root itself.
+        if not module_dirs:
+            module_dirs = [project_dir]
+
+        modules: List[Dict[str, any]] = []
+        for module_dir in module_dirs:
+            rel = module_dir[len(project_dir):].strip("/") or "."
+            name = "." if rel == "." else rel.replace("/", sep)
+
+            class_cmd = (
+                f"find '{module_dir}/{classes_glob}' -name '*.class' -type f 2>/dev/null | wc -l"
+            )
+            cc = self._execute_command_with_logging(class_cmd, f"counting classes in {rel}")
+            class_count = int((cc.get("output") or "0").strip() or 0) if cc.get("success") else 0
+
+            jar_cmd = (
+                f"find '{module_dir}/{jars_glob}' -name '*.jar' -type f "
+                f"-not -path '*/gradle/wrapper/*' 2>/dev/null | wc -l"
+            )
+            jc = self._execute_command_with_logging(jar_cmd, f"counting jars in {rel}")
+            jar_count = int((jc.get("output") or "0").strip() or 0) if jc.get("success") else 0
+
+            report_dirs: List[str] = []
+            for sub in report_subdirs:
+                rd = f"{module_dir}/{sub}"
+                chk = self._execute_command_with_logging(
+                    f"test -d {rd} && echo EXISTS", f"checking reports {rel}"
+                )
+                if "EXISTS" in (chk.get("output") or ""):
+                    report_dirs.append(rd)
+
+            modules.append({
+                "path": rel,
+                "name": name,
+                "class_count": class_count,
+                "jar_count": jar_count,
+                "report_dirs": report_dirs,
+            })
+        return modules
+
     def _validate_maven_fingerprints(self, project_dir: str) -> Dict[str, any]:
         """
         Validate Maven build fingerprints without executing mvn commands.
