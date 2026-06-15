@@ -41,6 +41,28 @@ describe("TestCard", () => {
     expect(screen.queryByText("0% passed")).not.toBeInTheDocument()
   })
 
+  it("does not show a >100% method coverage when the static catalog undercounts", () => {
+    // Real commons-cli Maven run: 584 unique methods actually ran but only 460
+    // were detected by static analysis, so unique/declared = 126.96%. A
+    // "127% method coverage" reads as a bug; present the discrepancy instead.
+    const undercounted: TestSummary = {
+      state: "success", pass: 916, fail: 0, skip: 61, total: 977, errors: 0,
+      passRate: 100, reportFileCount: 47,
+      uniqueTotal: 584, uniquePassed: 523, uniqueFailed: 0, uniqueErrors: 0, uniqueSkipped: 61,
+      declaredTotal: 460, methodExecutionRate: 126.96,
+      failingNames: [], conflicts: [], evidenceRefs: [],
+    }
+    render(<TestCard test={undercounted} />)
+    expect(screen.getByText(/584 unique methods/)).toBeInTheDocument()
+    expect(screen.queryByText(/method coverage/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/12[67]/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /details/i }))
+    expect(screen.getByText("Method execution")).toBeInTheDocument()
+    expect(screen.getByText(/catalog incomplete/i)).toBeInTheDocument()
+    expect(screen.queryByText(/126\.9/)).not.toBeInTheDocument()
+  })
+
   it("counts errors as failures so the body agrees with a non-success badge", () => {
     render(
       <TestCard

@@ -7,6 +7,14 @@ function pct(n?: number | null): string {
   return typeof n === "number" && Number.isFinite(n) ? `${n.toFixed(1)}%` : "—"
 }
 
+// Method coverage = executed methods / declared methods. It is only a valid
+// coverage figure when the static catalog is a complete denominator (rate
+// in (0, 100]). When more unique methods ran than were statically declared the
+// rate exceeds 100% -- a sign the catalog undercounts, not real >100% coverage.
+export function isValidCoverage(rate?: number | null): rate is number {
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 && rate <= 100
+}
+
 function CalcRow({ label, value, source }: { label: string; value: string; source?: string }) {
   return (
     <div className="flex items-baseline justify-between gap-3 py-1">
@@ -36,7 +44,13 @@ export function TestDetails({ test }: { test: TestSummary }) {
         <CalcRow label="Skipped executions" value={fmt(test.skip)} />
         <CalcRow label="Unique methods" value={fmt(test.uniqueTotal)} source="Normalized runtime methods" />
         <CalcRow label="Declared methods" value={fmt(test.declaredTotal)} source="Static catalog" />
-        <CalcRow label="Method execution" value={pct(test.methodExecutionRate)} />
+        {isValidCoverage(test.methodExecutionRate) ? (
+          <CalcRow label="Method execution" value={pct(test.methodExecutionRate)} />
+        ) : test.methodExecutionRate != null ? (
+          <CalcRow label="Method execution" value="—" source="static catalog incomplete" />
+        ) : (
+          <CalcRow label="Method execution" value="—" />
+        )}
       </section>
 
       {(failing.length || conflicts.length) ? (

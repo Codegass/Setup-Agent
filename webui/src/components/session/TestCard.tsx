@@ -6,7 +6,7 @@ import { StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 import { cn } from "@/lib/utils"
 
-import { TestDetails } from "./TestDetails"
+import { TestDetails, isValidCoverage } from "./TestDetails"
 
 function barWidth(value: number, total: number): string {
   return `${Math.max(0, Math.min(100, (value / total) * 100))}%`
@@ -28,7 +28,12 @@ export function TestCard({ test }: { test: TestSummary }) {
   // agreement. Errors are also surfaced explicitly below.
   const failed = test.fail + errors
   const passRate = pct(test.passRate) ?? (hasTests ? `${((test.pass / test.total) * 100).toFixed(1)}%` : null)
-  const methodCoverage = pct(test.methodExecutionRate)
+  // "Method coverage" is only a meaningful figure when the static catalog is a
+  // complete denominator (rate <= 100). When more unique methods ran than were
+  // statically declared (e.g. parameterized/inherited tests the catalog missed),
+  // the rate exceeds 100% and reads as a bug -- so we omit it on the card and
+  // explain the discrepancy in the details panel instead.
+  const methodCoverage = isValidCoverage(test.methodExecutionRate) ? pct(test.methodExecutionRate) : null
   const uniqueTotal = num(test.uniqueTotal)
 
   if (!hasTests) {
