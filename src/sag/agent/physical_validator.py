@@ -725,10 +725,35 @@ class PhysicalValidator:
             "test_success": False,
             "failing_test_names": [],
             "report_files": [],
+            "report_file_count": 0,
+            "report_dirs": [],
             "parsing_errors": [],
         }
 
         try:
+            compact_result = self._parse_test_reports_compact_in_container(project_dir)
+            if compact_result:
+                test_result.update(compact_result)
+                test_result.setdefault("report_files", [])
+                test_result.setdefault("report_dirs", [])
+                test_result.setdefault(
+                    "report_file_count", len(test_result.get("report_files") or [])
+                )
+
+                modules_without_tests = self._check_modules_without_tests(
+                    project_dir, test_result.get("report_dirs") or []
+                )
+                if modules_without_tests:
+                    test_result["modules_without_tests"] = modules_without_tests
+                    logger.warning(
+                        f"⚠️ Multi-module project: {len(modules_without_tests)} modules lack test reports: "
+                        f"{', '.join(modules_without_tests[:5])}"
+                        f"{'...' if len(modules_without_tests) > 5 else ''}"
+                    )
+
+                self._cache_result(cache_key, test_result)
+                return test_result
+
             # Step 1: Discover report directories first to avoid massive single-command outputs
             # Include Maven Surefire, Maven Failsafe, and Gradle test-results
             dirs_cmd = (
@@ -936,14 +961,11 @@ class PhysicalValidator:
                 )
 
                 # Switch primary metrics to deduplicated values for downstream reporting
-                if test_result["unique_tests"] > 0:
-                    test_result["total_tests"] = test_result["unique_tests"]
-                    test_result["passed_tests"] = test_result["unique_passed_tests"]
-                    test_result["failed_tests"] = test_result["unique_failed_tests"]
-                    test_result["error_tests"] = test_result["unique_error_tests"]
-                    test_result["skipped_tests"] = test_result["unique_skipped_tests"]
+                # Keep primary metrics as raw runner XML executions. Unique
+                # method-level metrics remain available under unique_* for UI
+                # and report labeling without hiding parameterized invocations.
 
-                # Recalculate success flag using deduplicated metrics
+                # Recalculate success flag using the primary raw runner metrics.
                 test_result["test_success"] = (
                     test_result["failed_tests"] == 0
                     and test_result["error_tests"] == 0
@@ -1016,6 +1038,206 @@ class PhysicalValidator:
         # Cache the result
         self._cache_result(cache_key, test_result)
         return test_result
+
+    def _parse_test_reports_compact_in_container(
+        self, project_dir: str
+    ) -> Optional[Dict[str, any]]:
+        """Parse Maven/Gradle test XML inside the container and return compact JSON.
+
+        The normal orchestrator output path intentionally truncates large text
+        outputs. That is appropriate for logs, but corrupts XML facts when a
+        validator does ``find`` followed by ``cat``. This parser keeps all XML
+        reading local to the container and only returns aggregate metrics.
+        """
+        project_dir_json = json.dumps(project_dir)
+        command = f"""python3 - <<'PY'
+# SAG_COMPACT_TEST_REPORT_PARSER
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+project_dir = {project_dir_json}
+
+def is_report_file(path):
+    s = str(path)
+    if not path.name.endswith(".xml"):
+        return False
+    return (
+        "/target/surefire-reports/" in s
+        or "/target/failsafe-reports/" in s
+        or "/build/test-results/" in s
+    )
+
+def normalize_method_name(method_name):
+    if not method_name:
+        return ""
+    name = method_name.strip()
+    if "[" in name:
+        name = name.split("[")[0]
+    if "(" in name:
+        name = name.split("(")[0]
+    if " #" in name:
+        name = name.split(" #")[0]
+    return name.strip()
+
+def normalize_key(classname, name, file_path=None):
+    method_name = normalize_method_name(name)
+    if not method_name:
+        return None
+    if classname:
+        classname = classname.replace("$", ".").strip()
+    elif file_path:
+        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "").strip(".")
+    else:
+        return method_name
+    return f"{{classname}}::{{method_name}}"
+
+def testcase_status(testcase):
+    if testcase.find("error") is not None:
+        return "error"
+    if testcase.find("failure") is not None:
+        return "failed"
+    if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
+        return "skipped"
+    return "passed"
+
+def merge_status(current, new):
+    severity = {{"passed": 0, "skipped": 1, "failed": 2, "error": 3}}
+    return new if severity.get(new, 0) > severity.get(current, 0) else current
+
+def int_attr(node, name):
+    try:
+        return int(float(node.get(name, 0) or 0))
+    except Exception:
+        return 0
+
+root = Path(project_dir)
+report_files = sorted(str(path) for path in root.rglob("*.xml") if is_report_file(path))
+report_dirs = sorted({{str(Path(path).parent) for path in report_files}})
+
+groovy_classes = set()
+for groovy in root.rglob("src/test/groovy/**/*.groovy"):
+    try:
+        text = groovy.read_text(errors="ignore")
+    except Exception:
+        continue
+    if "@Test" in text:
+        groovy_classes.add(groovy.stem)
+
+raw = {{"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}}
+unique = {{}}
+parsing_errors = []
+
+for report_file in report_files:
+    try:
+        tree = ET.parse(report_file)
+        xml_root = tree.getroot()
+    except Exception as exc:
+        parsing_errors.append(f"Error parsing {{report_file}}: {{exc}}")
+        continue
+
+    testcases = list(xml_root.iter("testcase"))
+    if testcases:
+        for testcase in testcases:
+            classname = (testcase.get("classname") or "").strip()
+            simple_classname = classname.split(".")[-1] if classname else ""
+            if simple_classname in groovy_classes:
+                continue
+            status = testcase_status(testcase)
+            raw["total"] += 1
+            if status == "error":
+                raw["error"] += 1
+            elif status == "failed":
+                raw["failed"] += 1
+            elif status == "skipped":
+                raw["skipped"] += 1
+            else:
+                raw["passed"] += 1
+
+            file_attr = testcase.get("file") or report_file
+            key = normalize_key(classname, testcase.get("name"), file_attr)
+            if key:
+                unique[key] = merge_status(unique[key], status) if key in unique else status
+        continue
+
+    suites = [xml_root] if xml_root.tag == "testsuite" else list(xml_root.iter("testsuite"))
+    for suite in suites:
+        total = int_attr(suite, "tests")
+        failed = int_attr(suite, "failures")
+        error = int_attr(suite, "errors")
+        skipped = int_attr(suite, "skipped")
+        raw["total"] += total
+        raw["failed"] += failed
+        raw["error"] += error
+        raw["skipped"] += skipped
+        raw["passed"] += max(0, total - failed - error - skipped)
+
+unique_counts = {{"passed": 0, "failed": 0, "error": 0, "skipped": 0}}
+for status in unique.values():
+    unique_counts[status] = unique_counts.get(status, 0) + 1
+
+result = {{
+    "valid": bool(report_files),
+    "total_tests": raw["total"],
+    "passed_tests": raw["passed"],
+    "failed_tests": raw["failed"],
+    "error_tests": raw["error"],
+    "skipped_tests": raw["skipped"],
+    "raw_total_tests": raw["total"],
+    "raw_passed_tests": raw["passed"],
+    "raw_failed_tests": raw["failed"],
+    "raw_error_tests": raw["error"],
+    "raw_skipped_tests": raw["skipped"],
+    "unique_tests": len(unique),
+    "unique_passed_tests": unique_counts.get("passed", 0),
+    "unique_failed_tests": unique_counts.get("failed", 0),
+    "unique_error_tests": unique_counts.get("error", 0),
+    "unique_skipped_tests": unique_counts.get("skipped", 0),
+    "test_success": raw["total"] > 0 and raw["failed"] == 0 and raw["error"] == 0,
+    "failing_test_names": sorted(
+        key for key, status in unique.items() if status in ("failed", "error")
+    )[:50],
+    "report_files": report_files[:200],
+    "report_file_count": len(report_files),
+    "report_dirs": report_dirs,
+    "parsing_errors": parsing_errors[:50],
+}}
+print(json.dumps(result, separators=(",", ":")))
+PY"""
+        result = self.docker_orchestrator.execute_command(command)
+        if result.get("exit_code") != 0 or not result.get("output"):
+            return None
+
+        output = result.get("output", "").strip()
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            start = output.find("{")
+            end = output.rfind("}")
+            if start < 0 or end <= start:
+                logger.debug("Compact test report parser returned non-JSON output")
+                return None
+            try:
+                parsed = json.loads(output[start : end + 1])
+            except json.JSONDecodeError:
+                logger.debug("Compact test report parser JSON was not parseable")
+                return None
+
+        if not isinstance(parsed, dict) or not parsed.get("valid"):
+            return None
+
+        logger.info(
+            "📊 Compact test report analysis: "
+            f"{parsed.get('total_tests', 0)} total, "
+            f"{parsed.get('passed_tests', 0)} passed, "
+            f"{parsed.get('failed_tests', 0)} failed, "
+            f"{parsed.get('error_tests', 0)} errors, "
+            f"{parsed.get('skipped_tests', 0)} skipped "
+            f"from {parsed.get('report_file_count', len(parsed.get('report_files') or []))} XML files"
+        )
+        return parsed
 
     def _parse_single_test_xml(
         self, xml_content: str, file_path: str, groovy_test_classes: set = None
@@ -1771,9 +1993,7 @@ class PhysicalValidator:
         # rather than an implicit "any pass > 0" rule.
         threshold_pct = self.test_pass_threshold * 100.0
         tests_pass_threshold = (
-            evaluate_run_verdict(
-                True, pass_rate, test_pass_threshold=self.test_pass_threshold
-            )
+            evaluate_run_verdict(True, pass_rate, test_pass_threshold=self.test_pass_threshold)
             == "success"
         )
 
@@ -1860,6 +2080,17 @@ class PhysicalValidator:
             "status": status,
             "reason": reason,
             "report_files": report_files,
+            "report_file_count": test_metrics.get("report_file_count", len(report_files or [])),
+            "raw_total_tests": test_metrics.get("raw_total_tests"),
+            "raw_passed_tests": test_metrics.get("raw_passed_tests"),
+            "raw_failed_tests": test_metrics.get("raw_failed_tests"),
+            "raw_error_tests": test_metrics.get("raw_error_tests"),
+            "raw_skipped_tests": test_metrics.get("raw_skipped_tests"),
+            "unique_tests": test_metrics.get("unique_tests"),
+            "unique_passed_tests": test_metrics.get("unique_passed_tests"),
+            "unique_failed_tests": test_metrics.get("unique_failed_tests"),
+            "unique_error_tests": test_metrics.get("unique_error_tests"),
+            "unique_skipped_tests": test_metrics.get("unique_skipped_tests"),
             "parsing_errors": test_metrics.get("parsing_errors", []),
             "evidence_status": evidence_status,
             "test_stats": test_stats,
@@ -2768,9 +2999,7 @@ class PhysicalValidator:
         class_result = self._execute_command_with_logging(
             class_cmd, "counting Gradle compiled classes"
         )
-        class_count = (
-            int(class_result["output"].strip() or 0) if class_result["success"] else 0
-        )
+        class_count = int(class_result["output"].strip() or 0) if class_result["success"] else 0
         if class_count > 0:
             result["details"]["class_count"] = class_count
 

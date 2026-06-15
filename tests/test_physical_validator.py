@@ -10,6 +10,7 @@ Covers:
 """
 
 import fnmatch
+import json
 import os
 import re
 
@@ -43,10 +44,10 @@ class FakeBuildOrchestrator:
         c = command.strip()
         for op, pool in (("test -d ", self.dirs), ("test -f ", self.files)):
             if c.startswith(op):
-                path = c[len(op):].split()[0]
+                path = c[len(op) :].split()[0]
                 return {"exit_code": 0 if path in pool else 1, "output": ""}
         if c.startswith("test -e "):
-            path = c[len("test -e "):].split()[0]
+            path = c[len("test -e ") :].split()[0]
             exists = path in self.files or path in self.dirs
             return {"exit_code": 0 if exists else 1, "output": ""}
         if c.startswith("find "):
@@ -74,7 +75,7 @@ class FakeBuildOrchestrator:
         for entry in sorted(pool):
             if entry != root_norm and not entry.startswith(root_norm + "/"):
                 continue
-            rel = entry[len(root_norm):].lstrip("/")
+            rel = entry[len(root_norm) :].lstrip("/")
             depth = len(rel.split("/")) if rel else 0
             if mindepth is not None and depth < mindepth:
                 continue
@@ -122,6 +123,30 @@ class FakeReportOrchestrator:
         return {"exit_code": 1, "output": ""}
 
 
+class FakeCompactReportOrchestrator(FakeReportOrchestrator):
+    """Simulates truncated shell output plus a compact in-container parser."""
+
+    def __init__(self, report_dir, xml_files, compact_result):
+        super().__init__(report_dir, xml_files)
+        self.compact_result = compact_result
+
+    def execute_command(self, command):
+        self.commands.append(command)
+        c = command.strip()
+        if "SAG_COMPACT_TEST_REPORT_PARSER" in c:
+            return {"exit_code": 0, "output": json.dumps(self.compact_result)}
+        if "-name '*.xml'" in c and self.report_dir in c:
+            # Old path would lose files when orchestrator truncates large find output.
+            return {"exit_code": 0, "output": "\n".join(list(self.xml_files.keys())[:1])}
+        if c.startswith("cat "):
+            # Old path would parse a truncated XML body and undercount testcases.
+            m = re.search(r"cat '([^']+)'", c)
+            if m and m.group(1) in self.xml_files:
+                return {"exit_code": 0, "output": self.xml_files[m.group(1)][:120]}
+            return {"exit_code": 1, "output": ""}
+        return super().execute_command(command)
+
+
 WRAPPER_JAR = "/workspace/demo/gradle/wrapper/gradle-wrapper.jar"
 APP_CLASS = "/workspace/demo/build/classes/java/main/com/example/App.class"
 APP_JAR = "/workspace/demo/build/libs/app.jar"
@@ -133,9 +158,7 @@ BUILD_GRADLE = "/workspace/demo/build.gradle"
 # ===========================================================================
 def test_gradle_cache_only_dir_is_not_valid():
     """A bare .gradle/ dir (no compiled outputs) must NOT validate."""
-    orch = FakeBuildOrchestrator(
-        files={BUILD_GRADLE}, dirs={"/workspace/demo/.gradle"}
-    )
+    orch = FakeBuildOrchestrator(files={BUILD_GRADLE}, dirs={"/workspace/demo/.gradle"})
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
     cache = validator._validate_gradle_cache("/workspace/demo")
@@ -174,9 +197,7 @@ def test_gradle_cache_wrapper_jar_only_is_not_valid():
 
 def test_validate_build_status_gradle_cache_only_fails():
     """End-to-end: gradle workspace with only .gradle/ -> build NOT valid."""
-    orch = FakeBuildOrchestrator(
-        files={BUILD_GRADLE}, dirs={"/workspace/demo/.gradle"}
-    )
+    orch = FakeBuildOrchestrator(files={BUILD_GRADLE}, dirs={"/workspace/demo/.gradle"})
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
     result = validator.validate_build_status("demo")
@@ -255,12 +276,12 @@ def test_settings_test_pass_threshold_from_env(monkeypatch):
 @pytest.mark.parametrize(
     "build_green,pass_rate,expected",
     [
-        (False, 100.0, "failed"),   # build not green -> always failed
+        (False, 100.0, "failed"),  # build not green -> always failed
         (False, 0.0, "failed"),
-        (True, 100.0, "success"),   # perfect pass
-        (True, 96.2, "success"),    # commons-vfs: build green, >=80%
-        (True, 80.0, "success"),    # boundary: >= threshold is success
-        (True, 79.9, "failed"),     # just below threshold
+        (True, 100.0, "success"),  # perfect pass
+        (True, 96.2, "success"),  # commons-vfs: build green, >=80%
+        (True, 80.0, "success"),  # boundary: >= threshold is success
+        (True, 79.9, "failed"),  # just below threshold
         (True, 0.0, "failed"),
     ],
 )
@@ -342,6 +363,38 @@ def test_validate_test_status_all_pass_success(monkeypatch):
     assert result["failing_test_names"] == []
 
 
+def test_validate_test_status_exposes_raw_unique_and_report_file_counts(monkeypatch):
+    validator = PhysicalValidator(project_path="/workspace")
+    metrics = _metrics(10, 9, failed=1)
+    metrics.update(
+        {
+            "raw_total_tests": 18,
+            "raw_passed_tests": 17,
+            "raw_failed_tests": 1,
+            "raw_error_tests": 0,
+            "raw_skipped_tests": 0,
+            "unique_tests": 10,
+            "unique_passed_tests": 9,
+            "unique_failed_tests": 1,
+            "unique_error_tests": 0,
+            "unique_skipped_tests": 0,
+            "report_file_count": 3,
+        }
+    )
+    monkeypatch.setattr(
+        validator,
+        "parse_test_reports_with_catalog",
+        lambda project_dir: metrics,
+    )
+
+    result = validator.validate_test_status("demo")
+
+    assert result["raw_total_tests"] == 18
+    assert result["unique_tests"] == 10
+    assert result["report_file_count"] == 3
+    assert result["test_stats"]["executed"] == 10
+
+
 # ---------------------------------------------------------------------------
 # TASK 2.2(a) - failing_test_names enumerated from parsed records
 # ---------------------------------------------------------------------------
@@ -398,6 +451,103 @@ def test_parse_test_reports_no_failures_has_empty_failing_names():
     assert result["failing_test_names"] == []
 
 
+def test_parse_test_reports_uses_compact_parser_for_large_maven_xml():
+    """Maven XML parsing must not depend on truncated cat output."""
+    report_dir = "/workspace/demo/module-a/target/surefire-reports"
+    xml_path = f"{report_dir}/TEST-com.example.BigTest.xml"
+    xml = (
+        '<testsuite name="big" tests="3" failures="0" errors="0" skipped="1">'
+        '<testcase classname="com.example.BigTest" name="testA"/>'
+        '<testcase classname="com.example.BigTest" name="testB"/>'
+        '<testcase classname="com.example.BigTest" name="testC">'
+        "<skipped/></testcase>"
+        "</testsuite>"
+    )
+    compact = {
+        "valid": True,
+        "total_tests": 3,
+        "passed_tests": 2,
+        "failed_tests": 0,
+        "error_tests": 0,
+        "skipped_tests": 1,
+        "raw_total_tests": 3,
+        "raw_passed_tests": 2,
+        "raw_failed_tests": 0,
+        "raw_error_tests": 0,
+        "raw_skipped_tests": 1,
+        "unique_tests": 3,
+        "unique_passed_tests": 2,
+        "unique_failed_tests": 0,
+        "unique_error_tests": 0,
+        "unique_skipped_tests": 1,
+        "test_success": True,
+        "failing_test_names": [],
+        "report_files": [xml_path],
+        "report_dirs": [report_dir],
+        "parsing_errors": [],
+    }
+    orch = FakeCompactReportOrchestrator(report_dir, {xml_path: xml}, compact)
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    result = validator.parse_test_reports("/workspace/demo")
+
+    assert result["valid"] is True
+    assert result["total_tests"] == 3
+    assert result["passed_tests"] == 2
+    assert result["skipped_tests"] == 1
+    assert result["raw_total_tests"] == 3
+    assert result["unique_tests"] == 3
+    assert any("SAG_COMPACT_TEST_REPORT_PARSER" in c for c in orch.commands)
+
+
+def test_parse_test_reports_uses_compact_parser_for_many_gradle_xml_files():
+    """Gradle report discovery must not lose files when find output is truncated."""
+    report_dir = "/workspace/demo/lib/build/test-results/test"
+    xml_paths = [f"{report_dir}/TEST-com.example.Test{i}.xml" for i in range(3)]
+    xml_files = {
+        path: (
+            f'<testsuite name="s{i}" tests="1" failures="{1 if i == 2 else 0}" '
+            'errors="0" skipped="0">'
+            f'<testcase classname="com.example.Test{i}" name="case{i}">'
+            + ("<failure/>" if i == 2 else "")
+            + "</testcase></testsuite>"
+        )
+        for i, path in enumerate(xml_paths)
+    }
+    compact = {
+        "valid": True,
+        "total_tests": 3,
+        "passed_tests": 2,
+        "failed_tests": 1,
+        "error_tests": 0,
+        "skipped_tests": 0,
+        "raw_total_tests": 3,
+        "raw_passed_tests": 2,
+        "raw_failed_tests": 1,
+        "raw_error_tests": 0,
+        "raw_skipped_tests": 0,
+        "unique_tests": 3,
+        "unique_passed_tests": 2,
+        "unique_failed_tests": 1,
+        "unique_error_tests": 0,
+        "unique_skipped_tests": 0,
+        "test_success": False,
+        "failing_test_names": ["com.example.Test2::case2"],
+        "report_files": xml_paths,
+        "report_dirs": [report_dir],
+        "parsing_errors": [],
+    }
+    orch = FakeCompactReportOrchestrator(report_dir, xml_files, compact)
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    result = validator.parse_test_reports("/workspace/demo")
+
+    assert result["total_tests"] == 3
+    assert result["passed_tests"] == 2
+    assert result["failed_tests"] == 1
+    assert result["failing_test_names"] == ["com.example.Test2::case2"]
+
+
 # ===========================================================================
 # TASK 2.2(c) - report verdict reads the SAME single policy (no divergence)
 # ===========================================================================
@@ -414,9 +564,7 @@ def _accomplishments(total, passed, build_success=True):
     return {
         "repository_cloned": True,
         "build_success": build_success,
-        "physical_validation": {
-            "test_analysis": {"total_tests": total, "passed_tests": passed}
-        },
+        "physical_validation": {"test_analysis": {"total_tests": total, "passed_tests": passed}},
     }
 
 
@@ -426,8 +574,8 @@ def _accomplishments(total, passed, build_success=True):
         (184, 177, "success"),  # commons-vfs 96.2% -> success (was failed pre-fix)
         (977, 916, "success"),  # commons-cli 93.8% -> remains success
         (184, 184, "success"),  # 100% -> success
-        (100, 80, "success"),   # boundary >= 80%
-        (100, 50, "fail"),      # < 80% -> fail
+        (100, 80, "success"),  # boundary >= 80%
+        (100, 50, "fail"),  # < 80% -> fail
     ],
 )
 def test_report_determine_actual_status_uses_policy(total, passed, expected):
@@ -490,9 +638,7 @@ def test_test_pass_threshold_feeds_both_report_and_run_verdict(monkeypatch):
     assert default_validator.test_pass_threshold == DEFAULT_TEST_PASS_THRESHOLD
     monkeypatch.setattr(default_validator, "parse_test_reports_with_catalog", metrics)
     assert default_validator.validate_test_status("demo")["status"] == "PARTIAL"
-    default_report = ReportTool(
-        docker_orchestrator=None, physical_validator=default_validator
-    )
+    default_report = ReportTool(docker_orchestrator=None, physical_validator=default_validator)
     assert default_report._determine_actual_status(accomplishments) == "success"
 
     # Stricter threshold (0.9): the same 85% now fails on both gates.
@@ -500,7 +646,5 @@ def test_test_pass_threshold_feeds_both_report_and_run_verdict(monkeypatch):
     assert strict_validator.test_pass_threshold == 0.9
     monkeypatch.setattr(strict_validator, "parse_test_reports_with_catalog", metrics)
     assert strict_validator.validate_test_status("demo")["status"] == "FAILED"
-    strict_report = ReportTool(
-        docker_orchestrator=None, physical_validator=strict_validator
-    )
+    strict_report = ReportTool(docker_orchestrator=None, physical_validator=strict_validator)
     assert strict_report._determine_actual_status(accomplishments) == "fail"

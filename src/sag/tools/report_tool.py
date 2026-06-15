@@ -1219,6 +1219,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         raw_failed_tests = test_analysis.get("raw_failed_tests")
         raw_error_tests = test_analysis.get("raw_error_tests")
         raw_skipped_tests = test_analysis.get("raw_skipped_tests")
+        unique_total_tests = test_analysis.get("unique_tests")
+        unique_passed_tests = test_analysis.get("unique_passed_tests")
+        unique_failed_tests = test_analysis.get("unique_failed_tests")
+        unique_error_tests = test_analysis.get("unique_error_tests")
+        unique_skipped_tests = test_analysis.get("unique_skipped_tests")
 
         if tests_total is None:
             tests_total = aggregate_total
@@ -1281,21 +1286,27 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         executed_tests = to_int(tests_total)
         raw_executed_tests = to_int(raw_total_tests)
+        unique_executed_tests = to_int(unique_total_tests)
+        coverage_executed_tests = unique_executed_tests or executed_tests
 
-        if static_test_count and executed_tests is not None:
+        if static_test_count and coverage_executed_tests is not None:
             try:
-                execution_rate = (executed_tests / static_test_count) * 100
+                execution_rate = (coverage_executed_tests / static_test_count) * 100
                 logger.info(
-                    f"📊 Test Coverage: {execution_rate:.1f}% ({executed_tests} of {static_test_count} tests executed)"
+                    f"📊 Test Coverage: {execution_rate:.1f}% ({coverage_executed_tests} of {static_test_count} tests executed)"
                 )
             except (TypeError, ZeroDivisionError):
                 execution_rate = None
 
-        if raw_executed_tests and executed_tests and raw_executed_tests > executed_tests:
+        if (
+            raw_executed_tests
+            and unique_executed_tests
+            and raw_executed_tests > unique_executed_tests
+        ):
             try:
-                expansion_factor = raw_executed_tests / executed_tests
+                expansion_factor = raw_executed_tests / unique_executed_tests
                 logger.info(
-                    f"📊 Parameterized expansion detected: {raw_executed_tests} raw runs vs {executed_tests} deduplicated"
+                    f"📊 Parameterized expansion detected: {raw_executed_tests} raw runs vs {unique_executed_tests} unique methods"
                 )
                 logger.info(f"   - Average expansions per test: {expansion_factor:.2f}x")
             except ZeroDivisionError:
@@ -1322,6 +1333,11 @@ class ReportTool(BaseTool, UIEventEmitter):
             "tests_errors_raw": to_int(raw_error_tests),
             "tests_skipped": to_int(tests_skipped),
             "tests_skipped_raw": to_int(raw_skipped_tests),
+            "tests_unique": to_int(unique_total_tests),
+            "tests_passed_unique": to_int(unique_passed_tests),
+            "tests_failed_unique": to_int(unique_failed_tests),
+            "tests_errors_unique": to_int(unique_error_tests),
+            "tests_skipped_unique": to_int(unique_skipped_tests),
             "pass_pct": pass_pct,
             "static_test_count": static_test_count,
             "method_count": method_count,  # Original method annotations
@@ -3178,6 +3194,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         method_count = status.get("method_count", 0)
         executed = status.get("tests_total", 0)
         raw_executed = status.get("tests_total_raw", 0)
+        unique_executed = status.get("tests_unique", 0)
         passed = status.get("tests_passed", 0)
         exec_rate = status.get("execution_rate")
         pass_rate = status.get("pass_pct")
@@ -3189,24 +3206,37 @@ class ReportTool(BaseTool, UIEventEmitter):
                 f"| **Total Test Methods** | {static_count} | @Test-style annotations discovered | 📊 |"
             )
 
-        # Highlight raw executions when we detected parameterization at runtime
-        if raw_executed and raw_executed > executed and expansion_factor and expansion_factor > 1:
+        lines.append(
+            f"| **Tests Executed** | {executed} | Runner XML count | {'✅' if pass_rate and pass_rate >= 95 else '⚠️' if pass_rate and pass_rate >= 80 else '❌' if pass_rate is not None else '📊'} |"
+        )
+
+        # Highlight method-level deduplication when parameterized/dynamic tests expand at runtime.
+        if unique_executed and unique_executed != executed:
             lines.append(
-                f"| **Raw Test Executions** | {raw_executed} | Reported by test runner (~{expansion_factor:.1f}x) | 🔄 |"
+                f"| **Unique Test Methods** | {unique_executed} | Normalized runtime method count | 📊 |"
             )
 
-        lines.append(
-            f"| **Tests Executed** | {executed} | Deduplicated runtime count | {'✅' if exec_rate and exec_rate >= 95 else '⚠️' if exec_rate and exec_rate >= 80 else '❌' if exec_rate else '📊'} |"
-        )
-        lines.append(f"| **Tests Passed** | {passed} | Successful test count | ✅ |")
+        if (
+            raw_executed
+            and unique_executed
+            and raw_executed > unique_executed
+            and expansion_factor
+            and expansion_factor > 1
+        ):
+            lines.append(
+                f"| **Parameterized Expansion** | ~{expansion_factor:.1f}x | {raw_executed} runner executions / {unique_executed} methods | 🔄 |"
+            )
+
+        lines.append(f"| **Tests Passed** | {passed} | Successful runner count | ✅ |")
 
         # Execution rate now measures coverage of declared test methods
         if exec_rate is not None and static_count:
             # Handle case where executed tests exceed static count (e.g., dynamically generated tests)
-            if executed > static_count:
+            coverage_count = unique_executed or executed
+            if coverage_count > static_count:
                 exec_icon = "✅"  # More tests run than expected is generally good
                 lines.append(
-                    f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} tests run (exceeded {static_count} expected) | {exec_icon} |"
+                    f"| **Execution Rate** | {format_percentage(exec_rate)} | {coverage_count} tests run (exceeded {static_count} expected) | {exec_icon} |"
                 )
                 lines.append(
                     f"| | *Note:* | *Runtime discovered more tests than static analysis* | 📊 |"
@@ -3215,7 +3245,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 exec_icon = "✅" if exec_rate >= 95 else "⚠️" if exec_rate >= 80 else "❌"
                 actual_tests_run = int(exec_rate * static_count / 100)
                 lines.append(
-                    f"| **Execution Rate** | {format_percentage(exec_rate)} | {executed} of {static_count} tests run | {exec_icon} |"
+                    f"| **Execution Rate** | {format_percentage(exec_rate)} | {coverage_count} of {static_count} tests run | {exec_icon} |"
                 )
                 if exec_rate < 100:
                     skipped_est = static_count - actual_tests_run

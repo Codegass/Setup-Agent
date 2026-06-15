@@ -132,10 +132,7 @@ def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
     monkeypatch.setattr(
         tool,
         "_generate_condensed_log_output",
-        lambda verified_status,
-        report_filename,
-        actual_accomplishments,
-        report_snapshot: "condensed",
+        lambda verified_status, report_filename, actual_accomplishments, report_snapshot: "condensed",
     )
 
     result = tool.execute(action="generate", summary="done", status="success")
@@ -177,10 +174,7 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     monkeypatch.setattr(
         tool,
         "_generate_condensed_log_output",
-        lambda verified_status,
-        report_filename,
-        actual_accomplishments,
-        report_snapshot: "condensed",
+        lambda verified_status, report_filename, actual_accomplishments, report_snapshot: "condensed",
     )
 
     result = tool.execute(
@@ -315,10 +309,7 @@ def test_report_failed_legacy_status_maps_to_blocked(monkeypatch):
     monkeypatch.setattr(
         tool,
         "_generate_condensed_log_output",
-        lambda verified_status,
-        report_filename,
-        actual_accomplishments,
-        report_snapshot: "condensed",
+        lambda verified_status, report_filename, actual_accomplishments, report_snapshot: "condensed",
     )
 
     result = tool.execute(action="generate", summary="blocked", status="fail")
@@ -550,10 +541,7 @@ def test_report_tool_marks_final_report_task_completed(monkeypatch):
     monkeypatch.setattr(
         tool,
         "_generate_condensed_log_output",
-        lambda verified_status,
-        report_filename,
-        actual_accomplishments,
-        report_snapshot: "condensed",
+        lambda verified_status, report_filename, actual_accomplishments, report_snapshot: "condensed",
     )
 
     result = tool.execute(action="generate", summary="done", status="success")
@@ -612,8 +600,14 @@ def test_markdown_report_includes_runtime_env_overlay_evidence():
     assert "## Runtime Environment Overlay Evidence" in report
     assert "runtime command evidence, not project source configuration" in report
     assert "| maven | `/opt/apache-maven-3.9.9/bin/mvn` | 3.9.9 | agent_registered |" in report
-    assert "| maven | `/usr/bin/mvn` | 3.6.3 | [3.9,) | Project requires Maven 3.9+ | build_error |" in report
-    assert "| gradle | `/usr/bin/gradle` | 7.4 | >=8 | Wrapper requires Gradle 8+ | build_error |" in report
+    assert (
+        "| maven | `/usr/bin/mvn` | 3.6.3 | [3.9,) | Project requires Maven 3.9+ | build_error |"
+        in report
+    )
+    assert (
+        "| gradle | `/usr/bin/gradle` | 7.4 | >=8 | Wrapper requires Gradle 8+ | build_error |"
+        in report
+    )
 
 
 def test_markdown_report_skips_inactive_only_runtime_env_overlay_evidence():
@@ -757,6 +751,32 @@ def test_report_header_tests_line_uses_snapshot_stats_not_evidence_stats():
     assert "977" not in tests_lines[0], tests_lines[0]
 
 
+def test_detailed_test_analysis_distinguishes_runner_and_unique_counts():
+    tool = ReportTool()
+    snapshot = {
+        "status": {
+            "tests_total": 18839,
+            "tests_total_raw": 18839,
+            "tests_unique": 9497,
+            "tests_passed": 18805,
+            "tests_failed": 5,
+            "tests_errors": 0,
+            "tests_skipped": 29,
+            "static_test_count": 20523,
+            "execution_rate": 46.3,
+            "expansion_factor": 2.0,
+            "pass_pct": 99.8,
+        }
+    }
+
+    lines = tool._render_detailed_test_analysis(snapshot)
+    body = "\n".join(lines)
+
+    assert "| **Tests Executed** | 18839 | Runner XML count |" in body
+    assert "| **Unique Test Methods** | 9497 | Normalized runtime method count |" in body
+    assert "Deduplicated runtime count" not in body
+
+
 def test_report_result_header_matches_kernel_verdict():
     """Same inputs -> report Result line equals the kernel verdict (round-5
     iceberg: report PARTIAL vs CLI success can no longer happen)."""
@@ -764,14 +784,25 @@ def test_report_result_header_matches_kernel_verdict():
 
     tool = ReportTool()
     snapshot = {
-        "status": {"overall": "success", "tests_total": 2913, "tests_passed": 2893,
-                   "tests_failed": 15, "tests_errors": 0, "tests_skipped": 5,
-                   "pass_pct": 99.3},
-        "evidence_result": {"status": "success", "conflicts": ["test_report_parse_error"],
-                            "test_stats": None, "evidence_refs": []},
+        "status": {
+            "overall": "success",
+            "tests_total": 2913,
+            "tests_passed": 2893,
+            "tests_failed": 15,
+            "tests_errors": 0,
+            "tests_skipped": 5,
+            "pass_pct": 99.3,
+        },
+        "evidence_result": {
+            "status": "success",
+            "conflicts": ["test_report_parse_error"],
+            "test_stats": None,
+            "evidence_refs": [],
+        },
     }
     lines = tool._render_enhanced_header(
-        "2026-06-12 12:00:00", "success",
+        "2026-06-12 12:00:00",
+        "success",
         {"directory": "/workspace/x", "type": "Gradle Java Project", "build_system": "Gradle"},
         snapshot=snapshot,
     )
@@ -808,11 +839,21 @@ class PhaseTrunkContextManager:
 
 def _all_green_kernel_snapshot():
     return {
-        "status": {"overall": "success", "tests_total": 100, "tests_passed": 100,
-                   "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0,
-                   "pass_pct": 100.0},
-        "evidence_result": {"status": "success", "conflicts": [],
-                            "test_stats": None, "evidence_refs": ["output_x"]},
+        "status": {
+            "overall": "success",
+            "tests_total": 100,
+            "tests_passed": 100,
+            "tests_failed": 0,
+            "tests_errors": 0,
+            "tests_skipped": 0,
+            "pass_pct": 100.0,
+        },
+        "evidence_result": {
+            "status": "success",
+            "conflicts": [],
+            "test_stats": None,
+            "evidence_refs": ["output_x"],
+        },
     }
 
 
@@ -826,7 +867,8 @@ def test_report_result_header_caps_on_blocked_trunk_phase():
     assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "partial"
 
     lines = tool._render_enhanced_header(
-        "2026-06-12 12:00:00", "success",
+        "2026-06-12 12:00:00",
+        "success",
         {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
         snapshot=_all_green_kernel_snapshot(),
     )
@@ -856,13 +898,23 @@ def test_condensed_log_output_matches_kernel_verdict():
     line must read the kernel verdict, never overall/verified_status."""
     tool = ReportTool()
     snapshot = {
-        "status": {"overall": "success", "tests_total": 2913, "tests_passed": 2893,
-                   "tests_failed": 15, "tests_errors": 0, "tests_skipped": 5,
-                   "pass_pct": 99.3},
+        "status": {
+            "overall": "success",
+            "tests_total": 2913,
+            "tests_passed": 2893,
+            "tests_failed": 15,
+            "tests_errors": 0,
+            "tests_skipped": 5,
+            "pass_pct": 99.3,
+        },
         "project": {"type": "Gradle Java Project", "build_system": "Gradle"},
         "phases": {"clone": True, "build": True, "test": True},
-        "evidence_result": {"status": "success", "conflicts": ["test_report_parse_error"],
-                            "test_stats": None, "evidence_refs": []},
+        "evidence_result": {
+            "status": "success",
+            "conflicts": ["test_report_parse_error"],
+            "test_stats": None,
+            "evidence_refs": [],
+        },
     }
 
     output = tool._generate_condensed_log_output(
@@ -878,13 +930,23 @@ def test_condensed_log_output_matches_kernel_verdict():
 def test_condensed_log_output_kernel_success_keeps_celebration():
     tool = ReportTool()
     snapshot = {
-        "status": {"overall": "success", "tests_total": 100, "tests_passed": 100,
-                   "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0,
-                   "pass_pct": 100.0},
+        "status": {
+            "overall": "success",
+            "tests_total": 100,
+            "tests_passed": 100,
+            "tests_failed": 0,
+            "tests_errors": 0,
+            "tests_skipped": 0,
+            "pass_pct": 100.0,
+        },
         "project": {"type": "Maven Java Project", "build_system": "Maven"},
         "phases": {"clone": True, "build": True, "test": True},
-        "evidence_result": {"status": "success", "conflicts": [],
-                            "test_stats": None, "evidence_refs": []},
+        "evidence_result": {
+            "status": "success",
+            "conflicts": [],
+            "test_stats": None,
+            "evidence_refs": [],
+        },
     }
 
     output = tool._generate_condensed_log_output(
@@ -926,8 +988,12 @@ def test_build_green_no_tests_maps_to_partial_not_failed():
     snapshot = {
         "status": {"overall": "fail", "tests_total": 0, "tests_passed": 0, "pass_pct": 0},
         "phases": {"build": True, "clone": True, "test": False},
-        "evidence_result": {"status": "success", "conflicts": [], "test_stats": None,
-                            "evidence_refs": []},
+        "evidence_result": {
+            "status": "success",
+            "conflicts": [],
+            "test_stats": None,
+            "evidence_refs": [],
+        },
     }
     verdict = tool._snapshot_kernel_verdict(snapshot)
     assert verdict == "partial", verdict
@@ -938,8 +1004,12 @@ def test_build_failed_still_maps_to_failed():
     snapshot = {
         "status": {"overall": "fail", "tests_total": 0, "tests_passed": 0},
         "phases": {"build": False, "clone": True},
-        "evidence_result": {"status": "success", "conflicts": [], "test_stats": None,
-                            "evidence_refs": []},
+        "evidence_result": {
+            "status": "success",
+            "conflicts": [],
+            "test_stats": None,
+            "evidence_refs": [],
+        },
     }
     assert tool._snapshot_kernel_verdict(snapshot) == "failed"
 
@@ -949,8 +1019,12 @@ def test_console_result_line_uses_kernel_verdict():
     snapshot = {
         "status": {"overall": "fail", "tests_total": 0, "tests_passed": 0},
         "phases": {"build": True},
-        "evidence_result": {"status": "success", "conflicts": [], "test_stats": None,
-                            "evidence_refs": ["x"]},
+        "evidence_result": {
+            "status": "success",
+            "conflicts": [],
+            "test_stats": None,
+            "evidence_refs": ["x"],
+        },
     }
     lines = tool._render_console_evidence_result(snapshot)
     assert lines and lines[0] == "Result: PARTIAL", lines
