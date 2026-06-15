@@ -17,3 +17,17 @@ it("renders build tiles and per-module table", () => {
   expect(screen.getByText(/built/i)).toBeInTheDocument()
   expect(screen.getByText("connect:runtime")).toBeInTheDocument()
 })
+
+it("renders '—' for absent counts instead of a fake zero", () => {
+  render(<BuildDetailPage onBack={() => {}} detail={{
+    build: { state: "unknown", system: "maven", classCount: null, jarCount: null },
+    moduleSummary: { modulesTotal: 3, modulesBuilt: 2, modulesFailed: 0, modulesSkipped: 0,
+                     modulesWithTestFailures: 0, buildSystems: ["maven"], singleModule: false },
+    modules: [{ name: "a", path: "a", buildStatus: "success", buildSource: "artifacts" }],
+  } as any} />)
+  // Classes/JARs are absent -> "—", not "0"
+  const dashes = screen.getAllByText("—")
+  expect(dashes.length).toBeGreaterThanOrEqual(2)
+  // A real zero is still shown as 0 (modulesFailed = 0)
+  expect(screen.getAllByText("0").length).toBeGreaterThanOrEqual(1)
+})

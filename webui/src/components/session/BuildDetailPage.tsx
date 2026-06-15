@@ -8,6 +8,11 @@ import { Card } from "@/components/common/Card"
 
 import { ModuleTable } from "./ModuleTable"
 
+function fmtNum(n?: number | null): string {
+  // Real 0 stays "0"; a genuinely-absent value renders "—" (no fake zeroes).
+  return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : "—"
+}
+
 function Tile({ label, value, tone }: { label: string; value: React.ReactNode; tone?: string }) {
   return (
     <div className="rounded-lg border border-slate-200 px-3 py-2">
@@ -32,12 +37,12 @@ export function BuildDetailPage({
         <StatusBadge status={b.state} />
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
-        <Tile label="Modules" value={s?.modulesTotal ?? "—"} />
-        <Tile label="Built" value={s?.modulesBuilt ?? "—"} tone="text-emerald-700" />
-        <Tile label="Failed" value={s?.modulesFailed ?? "—"} tone="text-red-600" />
-        <Tile label="Skipped" value={s?.modulesSkipped ?? "—"} />
-        <Tile label="Classes" value={(b.classCount ?? 0).toLocaleString()} />
-        <Tile label="JARs" value={(b.jarCount ?? 0).toLocaleString()} />
+        <Tile label="Modules" value={fmtNum(s?.modulesTotal)} />
+        <Tile label="Built" value={fmtNum(s?.modulesBuilt)} tone="text-emerald-700" />
+        <Tile label="Failed" value={fmtNum(s?.modulesFailed)} tone="text-red-600" />
+        <Tile label="Skipped" value={fmtNum(s?.modulesSkipped)} />
+        <Tile label="Classes" value={fmtNum(b.classCount)} />
+        <Tile label="JARs" value={fmtNum(b.jarCount)} />
       </div>
       <Card className="p-4">
         {single ? (

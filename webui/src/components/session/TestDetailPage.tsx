@@ -8,6 +8,11 @@ import { Card } from "@/components/common/Card"
 
 import { ModuleTable } from "./ModuleTable"
 
+function fmtNum(n?: number | null): string {
+  // Real 0 stays "0"; a genuinely-absent value renders "—" (no fake zeroes).
+  return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : "—"
+}
+
 function Tile({ label, value, tone, dashed }: {
   label: string; value: React.ReactNode; tone?: string; dashed?: boolean
 }) {
@@ -34,12 +39,12 @@ export function TestDetailPage({
         <StatusBadge status={t.state} />
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
-        <Tile label="Runner exec" value={(t.total ?? 0).toLocaleString()} />
-        <Tile label="Passed" value={(t.pass ?? 0).toLocaleString()} tone="text-emerald-700" />
-        <Tile label="Failed" value={(t.fail ?? 0).toLocaleString()} tone="text-red-600" />
-        <Tile label="Skipped" value={(t.skip ?? 0).toLocaleString()} />
-        <Tile label="Unique methods" value={(t.uniqueTotal ?? "—").toLocaleString?.() ?? "—"} />
-        <Tile label="Modules w/ fails" value={s?.modulesWithTestFailures ?? "—"} tone="text-red-600" />
+        <Tile label="Runner exec" value={fmtNum(t.total)} />
+        <Tile label="Passed" value={fmtNum(t.pass)} tone="text-emerald-700" />
+        <Tile label="Failed" value={fmtNum(t.fail)} tone="text-red-600" />
+        <Tile label="Skipped" value={fmtNum(t.skip)} />
+        <Tile label="Unique methods" value={fmtNum(t.uniqueTotal)} />
+        <Tile label="Modules w/ fails" value={fmtNum(s?.modulesWithTestFailures)} tone="text-red-600" />
         <Tile label="Coverage" value={<>— <span className="rounded bg-amber-50 px-1 font-mono text-[9px] text-amber-700">Feature B</span></>} dashed />
       </div>
       <Card className="p-4">
