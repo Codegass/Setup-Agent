@@ -212,6 +212,9 @@ class ProjectAnalyzerTool(BaseTool):
             analysis["build_recommendation"] = self._recommend_build_approach(
                 project_path, analysis
             )
+            # Tests can live in different modules / a different build system than
+            # the main build (Bigtop: Maven build module, Gradle test modules).
+            self._recommend_test_approach(project_path, analysis["build_recommendation"])
         except Exception as exc:
             logger.warning(f"Build-approach recommendation failed: {exc}")
 
@@ -1218,6 +1221,69 @@ PY"""
 
         return rec
 
+    def _recommend_test_approach(self, project_path: str, build_rec: Dict[str, Any]) -> None:
+        """Recommend WHERE to run tests — they often live in different modules (and
+        a different build system) than the main build.
+
+        Bigtop: the 6 compiled classes are the Maven/Groovy bigtop-test-framework,
+        but ~49 of 57 tests are in the Gradle bigtop-data-generators modules — so
+        `mvn test` in the build module ran zero tests. This finds the test-bearing
+        modules, picks the dominant cluster, and records test_root/test_system on
+        the recommendation (falling back to the build target when tests are
+        co-located).
+        """
+        orch = self.docker_orchestrator
+        build_rec.setdefault("test_root", build_rec.get("build_root", project_path))
+        build_rec.setdefault("test_system", build_rec.get("build_system"))
+        build_rec.setdefault("test_modules", [])
+        if not orch:
+            return
+
+        def exists(path: str) -> bool:
+            result = orch.execute_command(f"test -e {path} && echo yes || echo no")
+            return "yes" in (result.get("output") or "")
+
+        find_cmd = (
+            f"find {project_path} -maxdepth 6 -type d "
+            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' \\) "
+            f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
+        )
+        found = orch.execute_command(find_cmd)
+        test_module_dirs = []
+        for line in (found.get("output") or "").splitlines():
+            line = line.strip()
+            if "/src/test/" not in line:
+                continue
+            module_dir = line.rsplit("/src/test/", 1)[0]
+            if module_dir not in test_module_dirs:
+                test_module_dirs.append(module_dir)
+        if not test_module_dirs:
+            return
+        build_rec["test_modules"] = [
+            d[len(project_path):].lstrip("/") or "." for d in test_module_dirs
+        ]
+
+        # Group test modules by their first path segment under the project root and
+        # pick the segment that owns the most test modules (where the tests cluster).
+        seg_counts: Dict[str, int] = {}
+        for module_dir in test_module_dirs:
+            rel = module_dir[len(project_path):].lstrip("/")
+            top = rel.split("/")[0] if rel else ""
+            seg_counts[top] = seg_counts.get(top, 0) + 1
+        top_seg = max(seg_counts.items(), key=lambda kv: kv[1])[0]
+        test_root = f"{project_path}/{top_seg}" if top_seg else project_path
+
+        # The test cluster's own build system can differ from the main build's.
+        if exists(f"{test_root}/settings.gradle") or exists(f"{test_root}/build.gradle"):
+            test_system = "gradle"
+        elif exists(f"{test_root}/pom.xml"):
+            test_system = "maven"
+        else:
+            test_system = build_rec.get("build_system")
+
+        build_rec["test_root"] = test_root
+        build_rec["test_system"] = test_system
+
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
         Generate intelligent execution plan based on THREE CORE STEPS:
@@ -1787,6 +1853,16 @@ PY"""
                         f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6]
                     )
                     output += f"   • Source modules: {mods}\n"
+            # Tests may live in a different module / build system than the build.
+            test_root = rec.get("test_root")
+            if test_root and (
+                test_root != rec.get("build_root")
+                or rec.get("test_system") != rec.get("build_system")
+            ):
+                output += (
+                    f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "
+                    f"— the test suite lives here, not in the build module.\n"
+                )
 
         # 显示发现的文件
         existing_files = analysis.get("existing_files", [])

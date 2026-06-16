@@ -60,10 +60,12 @@ PHASE_OBJECTIVES = {
         "registered toolchain. Long builds detach; poll the job ref with search."
     ),
     "test": (
-        "Run the test suite: build(action='test') at the same build root the compile "
-        "used. Partial pass above threshold is a valid outcome — report the numbers "
-        "honestly in key_results. If tests cannot run (e.g. nothing compiled), "
-        "phase(action='blocked') with evidence."
+        "Run the test suite: build(action='test'). Run it in the analyzer's "
+        "Recommended Tests target (the tests can live in a different module — and "
+        "even a different build system — than the build, e.g. Gradle test modules "
+        "beside a Maven build); otherwise use the build root. Partial pass above "
+        "threshold is a valid outcome — report the numbers honestly in key_results. "
+        "If tests genuinely cannot run, phase(action='blocked') with evidence."
     ),
     "report": "Generate the final report with the report tool, then phase(action='done').",
 }
@@ -393,7 +395,7 @@ class ReActEngine(UIEventEmitter):
         # forward in analyze key_results (Bigtop: compile the right reactor/module,
         # or block honestly on a meta-project — don't compile an empty root).
         if phase in ("build", "test"):
-            rec_line = self._recommended_build_line()
+            rec_line = self._recommended_build_line(phase)
             if rec_line:
                 lines.insert(lines.index(f"Objective: {PHASE_OBJECTIVES[phase]}") + 1, rec_line)
         return ReActStep(
@@ -402,9 +404,9 @@ class ReActEngine(UIEventEmitter):
             timestamp=self._get_timestamp(),
         )
 
-    def _recommended_build_line(self) -> Optional[str]:
-        """One-line build recommendation from the analyzer, read from the trunk's
-        environment_summary. Best-effort: any failure yields no line."""
+    def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
+        """One-line build/test recommendation from the analyzer, read from the
+        trunk's environment_summary. Best-effort: any failure yields no line."""
         try:
             trunk = self.context_manager.load_trunk_context()
             rec = (getattr(trunk, "environment_summary", None) or {}).get("build_recommendation")
@@ -412,6 +414,19 @@ class ReActEngine(UIEventEmitter):
             return None
         if not rec:
             return None
+        if phase == "test":
+            test_root = rec.get("test_root")
+            if not test_root:
+                return None
+            # Only worth calling out when the tests are NOT where we built.
+            if test_root == rec.get("build_root") and rec.get("test_system") == rec.get(
+                "build_system"
+            ):
+                return None
+            return (
+                f"Recommended Tests: run {rec.get('test_system')} 'test' in {test_root} "
+                "— the test suite lives here, not in the build module."
+            )
         if rec.get("is_aggregator_only"):
             return (
                 f"Recommended Build: NONE — {rec.get('rationale', '')} "

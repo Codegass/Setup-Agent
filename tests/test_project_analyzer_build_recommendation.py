@@ -15,12 +15,15 @@ class FakeOrchestrator:
     """Answers `test -e` existence probes, the packaging grep, and the source-dir
     `find` used to locate compilable modules."""
 
-    def __init__(self, paths, packaging="jar", source_dirs=()):
+    def __init__(self, paths, packaging="jar", source_dirs=(), test_dirs=()):
         self.paths = set(paths)
         self.packaging = packaging
         self.source_dirs = list(source_dirs)
+        self.test_dirs = list(test_dirs)
 
     def execute_command(self, command, **kwargs):
+        if command.startswith("find ") and "src/test" in command:
+            return {"success": True, "output": "\n".join(self.test_dirs), "exit_code": 0}
         if command.startswith("find ") and "src/main" in command:
             return {"success": True, "output": "\n".join(self.source_dirs), "exit_code": 0}
         m = re.search(r"test -e (\S+)", command)
@@ -118,3 +121,53 @@ def test_gradle_only_project_recommends_gradle_build():
     )
     assert rec["build_system"] == "gradle"
     assert rec["goal"] == "build"
+
+
+def _test_rec(build_rec, test_dirs, paths, path="/workspace/bigtop"):
+    orch = FakeOrchestrator(paths, test_dirs=test_dirs)
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    analyzer._recommend_test_approach(path, build_rec)
+    return build_rec
+
+
+def test_test_approach_targets_gradle_test_cluster_not_the_build_module():
+    # Bigtop: build module is Maven bigtop-test-framework, but the tests cluster in
+    # the Gradle bigtop-data-generators modules -> `mvn test` in the build module
+    # ran zero tests.
+    rec = _test_rec(
+        build_rec={
+            "build_root": "/workspace/bigtop/bigtop-test-framework",
+            "build_system": "maven",
+        },
+        test_dirs=[
+            "/workspace/bigtop/bigtop-data-generators/bigpetstore-data-generator/src/test/java",
+            "/workspace/bigtop/bigtop-data-generators/bigtop-samplers/src/test/java",
+            "/workspace/bigtop/bigtop-test-framework/src/test/groovy",
+        ],
+        paths={"/workspace/bigtop/bigtop-data-generators/build.gradle"},
+    )
+    assert rec["test_root"] == "/workspace/bigtop/bigtop-data-generators"
+    assert rec["test_system"] == "gradle"
+    assert len(rec["test_modules"]) == 3
+
+
+def test_test_approach_keeps_build_target_when_tests_are_co_located():
+    rec = _test_rec(
+        build_rec={"build_root": "/workspace/p", "build_system": "maven"},
+        test_dirs=["/workspace/p/src/test/java"],
+        paths={"/workspace/p/pom.xml"},
+        path="/workspace/p",
+    )
+    assert rec["test_root"] == "/workspace/p"
+    assert rec["test_system"] == "maven"
+
+
+def test_test_approach_no_tests_falls_back_to_build_target():
+    rec = _test_rec(
+        build_rec={"build_root": "/workspace/p/mod", "build_system": "maven"},
+        test_dirs=[],
+        paths=set(),
+        path="/workspace/p",
+    )
+    assert rec["test_root"] == "/workspace/p/mod"
+    assert rec["test_system"] == "maven"

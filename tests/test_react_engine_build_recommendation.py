@@ -47,6 +47,32 @@ def test_recommended_build_line_absent_returns_none():
     assert _engine_with_recommendation(None)._recommended_build_line() is None
 
 
+def test_test_phase_line_points_at_separate_test_target():
+    engine = _engine_with_recommendation(
+        {
+            "build_root": "/workspace/bigtop/bigtop-test-framework",
+            "build_system": "maven",
+            "test_root": "/workspace/bigtop/bigtop-data-generators",
+            "test_system": "gradle",
+        }
+    )
+    line = engine._recommended_build_line("test")
+    assert "gradle" in line
+    assert "/workspace/bigtop/bigtop-data-generators" in line
+
+
+def test_test_phase_line_suppressed_when_tests_co_located():
+    engine = _engine_with_recommendation(
+        {
+            "build_root": "/workspace/p",
+            "build_system": "maven",
+            "test_root": "/workspace/p",
+            "test_system": "maven",
+        }
+    )
+    assert engine._recommended_build_line("test") is None
+
+
 def test_recommended_build_line_swallows_errors():
     engine = ReActEngine.__new__(ReActEngine)
 
