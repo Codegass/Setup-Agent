@@ -95,6 +95,28 @@ def test_build_module_metrics_reconciles_scan_and_reactor(monkeypatch):
     assert metrics["module_summary"]["modules_with_test_failures"] == 1
 
 
+def test_get_project_info_finds_gradle_kotlin_dsl_project():
+    """The fallback probe must locate a Gradle Kotlin-DSL project (build.gradle.kts
+    / settings.gradle.kts) instead of collapsing to /workspace. Live caffeine
+    regression: the per-type `||` chain short-circuited on the first `find|head`
+    (exit 0 even when empty), so any non-Maven project resolved to /workspace ->
+    wrong build system + a single '.' module."""
+
+    class Orch:
+        def execute_command(self, command, **kwargs):
+            # the combined probe now searches for build.gradle.kts too
+            if "find /workspace -maxdepth 2" in command and "build.gradle.kts" in command:
+                return {"success": True, "exit_code": 0, "output": "/workspace/caffeine"}
+            if command.startswith("ls -la /workspace/caffeine"):
+                return {"success": True, "exit_code": 0,
+                        "output": "build.gradle.kts\nsettings.gradle.kts\ngradlew\n"}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    info = ReportTool(docker_orchestrator=Orch())._get_project_info()
+    assert info["directory"] == "/workspace/caffeine"
+    assert info["build_system"] == "Gradle"
+
+
 def test_build_module_metrics_detects_gradle_physically(monkeypatch):
     """The build system must be detected physically (via _detect_build_system),
     not from project_info.build_system which is often 'Unknown' at report time.

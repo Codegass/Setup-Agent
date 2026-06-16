@@ -2570,11 +2570,18 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # Fallback: if still /workspace, try to probe a likely project directory
                 if project_dir == "/workspace":
                     try:
-                        # IMPORTANT: Exclude setup-report files from being treated as project directories
+                        # IMPORTANT: Exclude setup-report files from being treated as project directories.
+                        # One find across all build-file types (incl. Gradle Kotlin DSL
+                        # build.gradle.kts / settings.gradle[.kts]); `grep .` makes an empty
+                        # result exit non-zero so `||` actually falls through to the
+                        # last-resort directory probe. The previous per-type `||` chain
+                        # short-circuited on the first `find | head` (which exits 0 even when
+                        # empty), so any non-Maven project resolved to /workspace.
                         probe_cmd = (
-                            "(find /workspace -maxdepth 2 -type f -name pom.xml ! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1) || "
-                            "(find /workspace -maxdepth 2 -type f -name build.gradle ! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1) || "
-                            "(find /workspace -maxdepth 2 -type f -name package.json ! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1) || "
+                            "(find /workspace -maxdepth 2 -type f "
+                            "\\( -name pom.xml -o -name build.gradle -o -name build.gradle.kts "
+                            "-o -name settings.gradle -o -name settings.gradle.kts -o -name package.json \\) "
+                            "! -path '*/setup-report-*' -printf '%h\\n' 2>/dev/null | head -1 | grep .) || "
                             "(find /workspace -mindepth 1 -maxdepth 1 -type d ! -name '.setup_agent' ! -name 'setup-report-*' -printf '%p\\n' 2>/dev/null | head -1)"
                         )
                         result = self.docker_orchestrator.execute_command(probe_cmd)
