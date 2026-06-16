@@ -704,11 +704,26 @@ class ReportTool(BaseTool, UIEventEmitter):
         status = (snapshot or {}).get("status") or {}
         executed = status.get("tests_total")
         passed = status.get("tests_passed")
-        if not executed or passed is None:
+        discovered = status.get("static_test_count") or None
+        # Detected-but-not-executed: when a static suite was discovered but nothing
+        # ran, still surface it (executed=0) so the report says "0 of N detected
+        # tests executed" instead of dropping to None and falling back to a bare
+        # "0/0 passed" (Bigtop: 57 detected, 0 executed). Without a discovered count
+        # there is genuinely nothing to report, so keep returning None.
+        if not executed:
+            if discovered:
+                try:
+                    return TestStats(
+                        discovered=int(discovered), executed=0, passed=0, failed=0, skipped=0
+                    )
+                except (TypeError, ValueError):
+                    return None
+            return None
+        if passed is None:
             return None
         try:
             return TestStats(
-                discovered=status.get("static_test_count") or None,
+                discovered=discovered,
                 executed=int(executed),
                 passed=int(passed),
                 failed=int(status.get("tests_failed", 0) or 0)
