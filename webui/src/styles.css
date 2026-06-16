@@ -80,7 +80,7 @@
   --status-failed: oklch(0.55 0.2 27);
   --status-failed-soft: oklch(0.97 0.03 27);
   --status-failed-border: oklch(0.9 0.06 27);
-  --status-attention: oklch(0.62 0.13 75);
+  --status-attention: oklch(0.54 0.13 70);
   --status-attention-soft: oklch(0.97 0.05 85);
   --status-attention-border: oklch(0.9 0.08 85);
 
