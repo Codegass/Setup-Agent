@@ -52,6 +52,6 @@ def test_demo_session_detail_has_modules():
     assert detail.module_summary is not None
     assert detail.module_summary.modules_total >= 2
     by_path = {m.path: m for m in detail.modules}
-    assert by_path["connect/runtime"].build_status == "failure"
-    assert by_path["streams"].failing_count == 2
+    assert by_path["validator"].build_status == "failure"
+    assert by_path["core"].failing_count == 2
     assert detail.module_summary.modules_with_test_failures == 1

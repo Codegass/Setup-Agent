@@ -131,29 +131,34 @@ def _commons_evidence() -> list[EvidenceGroup]:
 
 
 def _commons_modules() -> list[ModuleSummary]:
+    # A coherent multi-module Maven demo for the commons-cli workspace: one
+    # module with test failures, one clean, one that failed to build. Names,
+    # FQNs, and evidence paths are all commons-cli + Maven (target/) so the
+    # --demo view reads as a single, consistent project (not Kafka under
+    # commons-cli).
     return [
         ModuleSummary(
-            name="connect:runtime",
-            path="connect/runtime",
+            name="commons-cli-validator",
+            path="validator",
             build_status="failure",
             build_source="reactor",
             class_count=None,
             jar_count=None,
             build_error_samples=[
-                "[ERROR] WorkerSinkTask.java:[412,7] cannot find symbol",
+                "[ERROR] OptionValidator.java:[88,21] cannot find symbol: requireNonBlank",
             ],
             test_source="none",
             failing_names=[],
             failing_count=None,
-            evidence_refs=["/workspace/connect/runtime/target"],
+            evidence_refs=["/workspace/commons-cli/validator/target"],
         ),
         ModuleSummary(
-            name="streams",
-            path="streams",
+            name="commons-cli-core",
+            path="core",
             build_status="success",
             build_source="reactor",
-            class_count=2610,
-            jar_count=18,
+            class_count=261,
+            jar_count=1,
             tests_total=1240,
             tests_passed=1238,
             tests_failed=2,
@@ -161,28 +166,28 @@ def _commons_modules() -> list[ModuleSummary]:
             tests_skipped=0,
             test_source="runner_xml",
             failing_names=[
-                "org.apache.kafka.streams.StreamThreadTest.shouldShutdown",
-                "org.apache.kafka.streams.state.RocksDBStoreTest.shouldFlush",
+                "org.apache.commons.cli.DefaultParserTest.testLongOptionWithEqualsSign",
+                "org.apache.commons.cli.HelpFormatterTest.testWrappedColumns",
             ],
             failing_count=2,
-            evidence_refs=["/workspace/streams/build/test-results"],
+            evidence_refs=["/workspace/commons-cli/core/target/surefire-reports"],
         ),
         ModuleSummary(
-            name="clients",
-            path="clients",
+            name="commons-cli-help",
+            path="help",
             build_status="success",
             build_source="reactor",
-            class_count=3140,
-            jar_count=22,
-            tests_total=1420,
-            tests_passed=1420,
+            class_count=140,
+            jar_count=1,
+            tests_total=420,
+            tests_passed=420,
             tests_failed=0,
             tests_errors=0,
             tests_skipped=0,
             test_source="runner_xml",
             failing_names=[],
             failing_count=0,
-            evidence_refs=["/workspace/clients/build/test-results"],
+            evidence_refs=["/workspace/commons-cli/help/target/surefire-reports"],
         ),
     ]
 

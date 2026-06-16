@@ -2,7 +2,12 @@ import type { TestSummary } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
 
-import { isValidCoverage } from "./TestDetails"
+// Method coverage = executed / declared methods. Only a valid coverage figure
+// when the static catalog is a complete denominator (rate in (0, 100]); a rate
+// above 100% means the catalog undercounts, not real >100% coverage.
+function isValidCoverage(rate?: number | null): rate is number {
+  return typeof rate === "number" && Number.isFinite(rate) && rate >= 0 && rate <= 100
+}
 
 function barWidth(value: number, total: number): string {
   return `${Math.max(0, Math.min(100, (value / total) * 100))}%`
