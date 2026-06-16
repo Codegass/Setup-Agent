@@ -138,6 +138,31 @@ def test_retrieve_returns_none_for_genuinely_missing_ref():
     assert storage.retrieve_output("output_does_not_exist") is None
 
 
+def test_second_writer_does_not_clobber_first_writers_index_entry():
+    """Two manager instances append to the shared store; the second's _save_index
+    (a full overwrite) must not drop the first's ref.
+
+    Reproduces the Bigtop run: the maven compile log was stored, then the build
+    tool's separate manager saved its stale index and wiped the maven ref, so the
+    agent got 'No output found' when it searched the build output and could not
+    diagnose the failure.
+    """
+    orchestrator = FakeOutputStorageOrchestrator()
+    # Both managers are constructed up front (the real ordering: each tool builds
+    # its own manager at init), so both start with an empty in-memory index.
+    mgr_a = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    mgr_b = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+
+    ref_a = mgr_a.store_output(task_id="maven", tool_name="maven", output="A" * 50)
+    ref_b = mgr_b.store_output(task_id="build", tool_name="build", output="B" * 50)
+    assert ref_a and ref_b and ref_a != ref_b
+
+    # A fresh reader must find BOTH refs — neither writer clobbered the other.
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    assert reader.retrieve_output(ref_a) == "A" * 50
+    assert reader.retrieve_output(ref_b) == "B" * 50
+
+
 def test_store_and_retrieve_large_output_uses_chunked_write_and_round_trips():
     """A multi-hundred-KB output (e.g. a full Maven build log) must store and
     retrieve intact. A single heredoc would exceed the kernel's per-arg limit

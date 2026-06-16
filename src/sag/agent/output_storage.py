@@ -257,6 +257,16 @@ class OutputStorageManager:
             logger.error(f"Failed to store output to {self.storage_file}: {e}")
             return ""
 
+        # Reload-and-merge before saving: _save_index() overwrites the shared
+        # container index file from this instance's in-memory copy. Other
+        # OutputStorageManager instances (each tool builds its own) append to the
+        # SAME jsonl/index, so saving a stale cache would clobber their refs — e.g.
+        # the build tool's manager wiping the maven compile-log ref, after which the
+        # agent's output_search returns "No output found" and it cannot diagnose the
+        # build. Refresh from disk so we add to the union, never overwrite it. The
+        # jsonl is global/append-only, so the line_number below stays valid.
+        self.current_index = self._load_index()
+
         # Update index with searchable metadata
         self.current_index[ref_id] = {
             "task_id": task_id,
