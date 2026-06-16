@@ -43,21 +43,27 @@ PHASE_OBJECTIVES = {
         "for the JDK the project needs. Claim phase(action='done') with what was installed."
     ),
     "analyze": (
-        "Understand the project: project(action='analyze'). Record build system, "
-        "test counts, special requirements in key_results. An honest 'unknown' with "
-        "evidence is acceptable."
+        "Understand the project: project(action='analyze'). Record build system, the "
+        "analyzer's Recommended Build (target dir + goal), test counts, and special "
+        "requirements in key_results. An honest 'unknown' with evidence is acceptable."
     ),
     "build": (
-        "Make the project compile: build(action='compile'). If compilation fails on "
-        "missing dependencies, build(action='deps') can resolve them — but do not run "
-        "deps first by default (multi-module reactors can fail dependency resolution "
-        "while compiling fine). Never run mvn/gradle via bash — build resolves the "
+        "Make the project compile: build(action='compile'). Follow the analyzer's "
+        "Recommended Build when it differs from a plain root compile — an aggregator "
+        "root over Groovy modules needs build(action='package'/'install'), and a "
+        "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
+        "compile target (a packaging/meta-project), phase(action='blocked') with that "
+        "evidence instead of forcing a compile. If compilation fails on missing "
+        "dependencies, build(action='deps') can resolve them — but do not run deps "
+        "first by default (multi-module reactors can fail dependency resolution while "
+        "compiling fine). Never run mvn/gradle via bash — build resolves the "
         "registered toolchain. Long builds detach; poll the job ref with search."
     ),
     "test": (
-        "Run the test suite: build(action='test'). Partial pass above threshold is a "
-        "valid outcome — report the numbers honestly in key_results. If tests cannot "
-        "run, phase(action='blocked') with evidence."
+        "Run the test suite: build(action='test') at the same build root the compile "
+        "used. Partial pass above threshold is a valid outcome — report the numbers "
+        "honestly in key_results. If tests cannot run (e.g. nothing compiled), "
+        "phase(action='blocked') with evidence."
     ),
     "report": "Generate the final report with the report tool, then phase(action='done').",
 }
@@ -382,10 +388,38 @@ class ReActEngine(UIEventEmitter):
             f"key_results=..., evidence=[refs]). If it cannot be finished, "
             f"phase(action='blocked', reason=..., evidence=[refs]).",
         ]
+        # Surface the analyzer's build recommendation directly in the build/test
+        # intro so the target/goal is present even if the model didn't carry it
+        # forward in analyze key_results (Bigtop: compile the right reactor/module,
+        # or block honestly on a meta-project — don't compile an empty root).
+        if phase in ("build", "test"):
+            rec_line = self._recommended_build_line()
+            if rec_line:
+                lines.insert(lines.index(f"Objective: {PHASE_OBJECTIVES[phase]}") + 1, rec_line)
         return ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
             content="\n".join(lines),
             timestamp=self._get_timestamp(),
+        )
+
+    def _recommended_build_line(self) -> Optional[str]:
+        """One-line build recommendation from the analyzer, read from the trunk's
+        environment_summary. Best-effort: any failure yields no line."""
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            rec = (getattr(trunk, "environment_summary", None) or {}).get("build_recommendation")
+        except Exception:
+            return None
+        if not rec:
+            return None
+        if rec.get("is_aggregator_only"):
+            return (
+                f"Recommended Build: NONE — {rec.get('rationale', '')} "
+                "Use phase(action='blocked') with this evidence rather than forcing a compile."
+            )
+        return (
+            f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
+            f"{rec.get('build_root')} — {rec.get('rationale', '')}"
         )
 
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:
