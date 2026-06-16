@@ -1426,6 +1426,13 @@ PY"""
                 logger.error("No trunk context found to update")
                 return False
 
+            # ALWAYS record environment metrics (like static test count) unconditionally
+            # This ensures we don't lose test counts if the execution plan is rejected
+            self._record_environment_metrics(trunk_context, analysis)
+            
+            # Save the metrics immediately in case we return early
+            self.context_manager._save_trunk_context(trunk_context)
+
             # Stage-2 phase machine (spec §3.1): a phase trunk (phase_<name>
             # task ids) is owned by the engine — the analyzer's execution plan
             # is phase-internal advice surfaced in the tool output, never trunk
@@ -1433,8 +1440,6 @@ PY"""
             # phase_report entries, turning every later _persist_phase_record
             # into a silent no-op and orphaning task_N entries in the webui.
             if any(str(task.id).startswith("phase_") for task in trunk_context.todo_list):
-                self._record_environment_metrics(trunk_context, analysis)
-                self.context_manager._save_trunk_context(trunk_context)
                 logger.info(
                     "Phase trunk detected: preserved phase_* tasks (analyzer plan "
                     "stays phase-internal advice; recorded analysis metrics only)"
@@ -1509,7 +1514,7 @@ PY"""
 
                 # Remember the identified build system + test metrics so weaker
                 # future analyses cannot regress the plan (see guard above).
-                self._record_environment_metrics(trunk_context, analysis)
+                # (Metrics already recorded unconditionally at the top of method)
 
                 # 保存更新后的context
                 self.context_manager._save_trunk_context(trunk_context)

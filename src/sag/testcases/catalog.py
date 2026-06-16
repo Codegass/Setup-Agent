@@ -304,6 +304,13 @@ def extract_test_methods(content):
                         methods.append(method_name)
                     break
 
+    # Tertiary pattern for JUnit 3 style tests (methods starting with "test" and returning void)
+    junit3_pattern = r'public\\s+void\\s+(test[a-zA-Z0-9_]*)\\s*\\('
+    for match in re.finditer(junit3_pattern, content):
+        method_name = match.group(1)
+        if method_name not in methods:
+            methods.append(method_name)
+
     # Remove duplicates while preserving order
     seen = set()
     unique_methods = []
