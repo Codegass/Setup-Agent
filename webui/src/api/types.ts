@@ -274,6 +274,7 @@ export interface LaunchProjectRowInput {
   ref?: string | null
   goal?: string | null
   record?: boolean
+  coverage?: boolean
 }
 
 export interface LaunchBatchRequestBody {

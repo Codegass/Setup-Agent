@@ -3,13 +3,14 @@ import { describe, expect, it } from "vitest"
 import { emptyLaunchRow, parsePastedRepoLines } from "./launchRows"
 
 describe("emptyLaunchRow", () => {
-  it("creates a blank row with record off", () => {
+  it("creates a blank row with record and coverage off", () => {
     expect(emptyLaunchRow()).toEqual({
       repoUrl: "",
       name: "",
       ref: "",
       goal: "",
       record: false,
+      coverage: false,
     })
   })
 })

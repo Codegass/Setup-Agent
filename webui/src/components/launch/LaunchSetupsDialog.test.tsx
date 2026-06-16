@@ -110,6 +110,7 @@ describe("LaunchSetupsDialog", () => {
           ref: "v1.0",
           goal: null,
           record: true,
+          coverage: false,
         },
       ],
     })
@@ -194,5 +195,52 @@ describe("LaunchSetupsDialog", () => {
     expect(screen.getByLabelText("Version help")).toContainElement(
       screen.getByRole("tooltip", { hidden: true }),
     )
+  })
+
+  it("check-all toggles coverage for every row", () => {
+    renderDialog()
+
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }))
+    expect(screen.getByLabelText("Coverage row 2")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /select all coverage/i }))
+    const boxes = screen.getAllByRole("checkbox", { name: /coverage row/i })
+    expect(boxes.length).toBeGreaterThanOrEqual(2)
+    expect(boxes.every((b) => (b as HTMLInputElement).checked)).toBe(true)
+  })
+
+  it("check-all toggles record for every row", () => {
+    renderDialog()
+
+    fireEvent.click(screen.getByRole("button", { name: "Add row" }))
+    fireEvent.click(screen.getByRole("button", { name: /select all record/i }))
+    const boxes = screen.getAllByRole("checkbox", { name: /record row/i })
+    expect(boxes.length).toBeGreaterThanOrEqual(2)
+    expect(boxes.every((b) => (b as HTMLInputElement).checked)).toBe(true)
+  })
+
+  it("submits the coverage flag per row", async () => {
+    const { onSubmit, onSubmitted } = renderDialog()
+
+    fireEvent.change(screen.getByLabelText("Repository URL row 1"), {
+      target: { value: "https://github.com/apache/commons-cli.git" },
+    })
+    fireEvent.click(screen.getByLabelText("Coverage row 1"))
+    fireEvent.click(screen.getByRole("button", { name: "Launch setups" }))
+
+    await waitFor(() => expect(onSubmitted).toHaveBeenCalled())
+    expect(onSubmit).toHaveBeenCalledWith({
+      concurrency: 2,
+      projects: [
+        {
+          repo_url: "https://github.com/apache/commons-cli.git",
+          name: null,
+          ref: null,
+          goal: null,
+          record: false,
+          coverage: true,
+        },
+      ],
+    })
   })
 })

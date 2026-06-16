@@ -36,7 +36,8 @@ function isRowEmpty(row: LaunchRowDraft): boolean {
     !row.name.trim() &&
     !row.ref.trim() &&
     !row.goal.trim() &&
-    !row.record
+    !row.record &&
+    !row.coverage
   )
 }
 
@@ -69,6 +70,13 @@ export function LaunchSetupsDialog({
   }
 
   const addRow = () => setRows((current) => [...current, emptyLaunchRow()])
+
+  const setAllFlag = (key: "record" | "coverage") => {
+    setRows((current) => {
+      const target = !current.every((row) => row[key])
+      return current.map((row) => ({ ...row, [key]: target }))
+    })
+  }
 
   const removeRow = (index: number) => {
     setRows((current) => {
@@ -145,6 +153,7 @@ export function LaunchSetupsDialog({
           ref: row.ref.trim() || null,
           goal: row.goal.trim() || null,
           record: row.record,
+          coverage: row.coverage,
         }
       }),
     }
@@ -215,10 +224,10 @@ export function LaunchSetupsDialog({
               </span>
             </div>
 
-            <div className="mt-3 grid grid-cols-[2.2fr_1fr_1.2fr_1.6fr_56px_36px] items-center gap-2">
-              {["Repo URL", "Name", "Version", "Goal", "Record", ""].map((header) => (
+            <div className="mt-3 grid grid-cols-[2.2fr_1fr_1.2fr_1.6fr_56px_56px_36px] items-center gap-2">
+              {["Repo URL", "Name", "Version", "Goal"].map((header) => (
                 <div
-                  key={header || "actions"}
+                  key={header}
                   className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
                 >
                   {header}
@@ -239,6 +248,29 @@ export function LaunchSetupsDialog({
                   ) : null}
                 </div>
               ))}
+              <div className="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                Record
+                <button
+                  aria-label="Select all record"
+                  className="text-[9px] normal-case tracking-normal text-blue-600 underline"
+                  onClick={() => setAllFlag("record")}
+                  type="button"
+                >
+                  all
+                </button>
+              </div>
+              <div className="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                Coverage
+                <button
+                  aria-label="Select all coverage"
+                  className="text-[9px] normal-case tracking-normal text-blue-600 underline"
+                  onClick={() => setAllFlag("coverage")}
+                  type="button"
+                >
+                  all
+                </button>
+              </div>
+              <div />
               {rows.map((row, index) => (
                 <RowCells
                   key={index}
@@ -347,6 +379,15 @@ function RowCells({
           type="checkbox"
         />
       </div>
+      <div className="flex justify-center">
+        <input
+          aria-label={`Coverage row ${rowLabel}`}
+          checked={row.coverage}
+          className="h-4 w-4 accent-blue-600"
+          onChange={(event) => onChange({ coverage: event.target.checked })}
+          type="checkbox"
+        />
+      </div>
       <button
         aria-label={`Remove row ${rowLabel}`}
         className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:opacity-40"
@@ -356,7 +397,7 @@ function RowCells({
         <X size={14} />
       </button>
       {error ? (
-        <div className="col-span-6 -mt-1 text-[12px] text-red-600">{error}</div>
+        <div className="col-span-7 -mt-1 text-[12px] text-red-600">{error}</div>
       ) : null}
     </>
   )

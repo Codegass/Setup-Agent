@@ -4,10 +4,11 @@ export interface LaunchRowDraft {
   ref: string
   goal: string
   record: boolean
+  coverage: boolean
 }
 
 export function emptyLaunchRow(): LaunchRowDraft {
-  return { repoUrl: "", name: "", ref: "", goal: "", record: false }
+  return { repoUrl: "", name: "", ref: "", goal: "", record: false, coverage: false }
 }
 
 /**
