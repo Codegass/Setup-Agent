@@ -41,3 +41,18 @@ def test_no_coverage_leaves_rollup_null():
     s = out["module_summary"]
     assert s["line_rate"] is None and s["branch_rate"] is None
     assert s["coverage_source"] is None
+
+
+def test_remerge_clears_stale_coverage_on_dropped_modules():
+    """A second merge must reflect only the new map: a module that had coverage
+    but is absent from the new map gets its coverage nulled (no stale values)."""
+    metrics = merge_coverage_into_metrics(_metrics(), {
+        "core": {"line_covered": 80, "line_total": 100, "line_rate": 80.0,
+                 "branch_covered": 0, "branch_total": 0, "branch_rate": None,
+                 "coverage_source": "jacoco-injected"},
+    })
+    assert {m["path"]: m for m in metrics["modules"]}["core"]["line_rate"] == 80.0
+    remerged = merge_coverage_into_metrics(metrics, {})  # empty map
+    core = {m["path"]: m for m in remerged["modules"]}["core"]
+    assert core["line_rate"] is None and core["coverage_source"] is None
+    assert remerged["module_summary"]["line_rate"] is None

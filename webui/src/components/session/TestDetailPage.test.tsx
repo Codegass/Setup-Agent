@@ -53,6 +53,19 @@ describe("TestDetailPage", () => {
     expect(screen.getByText(/68% branch/i)).toBeInTheDocument()
   })
 
+  it("headlines branch coverage when only branch is present (no red 'line —')", () => {
+    render(<TestDetailPage onBack={() => {}} detail={{
+      test: { state: "success", pass: 100, fail: 0, skip: 0, total: 100, passRate: 100 },
+      moduleSummary: { modulesTotal: 1, modulesBuilt: 1, modulesFailed: 0, modulesSkipped: 0,
+                       modulesWithTestFailures: 0, buildSystems: ["maven"], singleModule: false,
+                       branchRate: 88, coverageSource: "jacoco-existing" },
+      modules: [{ name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
+                  testSource: "runner_xml", branchRate: 88 }],
+    } as any} />)
+    expect(screen.getByText(/coverage · branch/i)).toBeInTheDocument()
+    expect(screen.getAllByText("88%").length).toBeGreaterThan(0)
+  })
+
   it("shows coverage unavailable when no coverage data", () => {
     render(<TestDetailPage onBack={() => {}} detail={{
       test: { state: "success", pass: 100, fail: 0, skip: 0, total: 100, passRate: 100 },

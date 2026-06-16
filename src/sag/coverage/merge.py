@@ -16,7 +16,8 @@ def merge_coverage_into_metrics(
     metrics: Dict[str, Any], coverage_map: Dict[str, Dict[str, Any]]
 ) -> Dict[str, Any]:
     """Set per-module coverage fields by reactor path and recompute the
-    lines-weighted rollup. Modules absent from coverage_map keep null coverage.
+    lines-weighted rollup. Coverage is cleared first, so a re-merge reflects only
+    the current coverage_map (no stale values linger on modules that dropped out).
     Returns the same dict (mutated) for convenience."""
     coverage_map = coverage_map or {}
     modules = metrics.get("modules") or []
@@ -26,6 +27,9 @@ def merge_coverage_into_metrics(
     for module in modules:
         cov = coverage_map.get(module.get("path"))
         if not cov:
+            # Clear any stale coverage from a previous merge.
+            for field in _COV_FIELDS:
+                module[field] = None
             continue
         for field in _COV_FIELDS:
             module[field] = cov.get(field)

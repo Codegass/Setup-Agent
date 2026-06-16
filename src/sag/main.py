@@ -232,29 +232,28 @@ def _detect_coverage_build_system(orchestrator, project_dir: str):
 def _run_coverage_pass(orchestrator, project_name: str) -> bool:
     """Isolated, best-effort coverage pass AFTER the setup verdict is locked.
 
-    Never raises; never changes the setup result. Warns if the project source
-    tree changed (pollution guard)."""
-    project_dir = f"/workspace/{project_name}"
-    build_system = _detect_coverage_build_system(orchestrator, project_dir)
-    if build_system is None:
-        logger.info("Coverage: no maven/gradle build detected; skipping.")
-        return False
+    Never raises; never changes the setup result. The entire body is guarded so
+    that even an unexpected error here cannot reach the command's outer handler
+    (which would sys.exit(1) and fail an already-successful setup). Warns if the
+    project source tree changed (pollution guard)."""
     try:
+        project_dir = f"/workspace/{project_name}"
+        build_system = _detect_coverage_build_system(orchestrator, project_dir)
+        if build_system is None:
+            logger.info("Coverage: no maven/gradle build detected; skipping.")
+            return False
         wrote = apply_coverage(orchestrator, project_dir, build_system)
-    except Exception as exc:  # defensive; apply_coverage is already best-effort
-        logger.warning(f"Coverage pass failed (best-effort, ignored): {exc}")
-        return False
-    # Pollution guard (warn-only): tracked source files must be unchanged.
-    try:
+        # Pollution guard (warn-only): tracked source files must be unchanged.
         dirty = orchestrator.execute_command(
             f"cd {project_dir} && git status --porcelain 2>/dev/null "
             f"| grep -vE 'target/|build/|\\.setup_agent' | head -5"
         )
         if (dirty.get("output") or "").strip():
             logger.warning(f"Coverage pass left source-tree changes:\n{dirty['output']}")
-    except Exception:
-        pass
-    return wrote
+        return wrote
+    except Exception as exc:  # never propagate into the command's success/exit path
+        logger.warning(f"Coverage pass failed (best-effort, ignored): {exc}")
+        return False
 
 
 @click.group()
