@@ -51,7 +51,7 @@
   --card-foreground: var(--foreground);
   --popover: oklch(1 0 0);
   --popover-foreground: var(--foreground);
-  --primary: oklch(0.55 0.2 255);
+  --primary: oklch(0.546 0.215 263);
   --primary-foreground: oklch(0.985 0.003 247);
   --secondary: oklch(0.955 0.008 247);
   --secondary-foreground: oklch(0.24 0.04 265);
@@ -63,7 +63,7 @@
   --destructive-foreground: oklch(0.985 0.003 247);
   --border: oklch(0.89 0.012 247);
   --input: oklch(0.89 0.012 247);
-  --ring: oklch(0.55 0.2 255);
+  --ring: oklch(0.546 0.215 263);
   --radius: 0.5rem;
 
   /* Semantic state palette (one vocabulary for badges, nav, callouts).
