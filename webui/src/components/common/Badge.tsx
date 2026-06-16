@@ -103,7 +103,7 @@ export function LabeledStatus({
 
   return (
     <span className="inline-flex items-center gap-1.5">
-      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
         {label}
       </span>
       <StatusBadge status={normalized} />

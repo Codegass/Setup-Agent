@@ -119,7 +119,7 @@ export function ModuleTable({
                           <ChevronDown className={cn("ml-1 inline", isOpen && "rotate-180")} size={12} />
                         </button>
                       ) : m.buildStatus === "skipped" ? (
-                        <span className="text-slate-400">upstream failed</span>
+                        <span className="text-slate-500">upstream failed</span>
                       ) : <span className="text-slate-300">—</span>}
                     </td>
                   </>

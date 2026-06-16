@@ -54,7 +54,7 @@ export function BuildCard({
         <div className="mt-2 flex flex-wrap gap-3 font-mono text-[11px] text-slate-600">
           {build.classCount != null ? <span>{build.classCount.toLocaleString()} classes</span> : null}
           {build.jarCount != null ? <span>{build.jarCount.toLocaleString()} JARs</span> : null}
-          <span className="text-slate-400">Physical artifact scan</span>
+          <span className="text-slate-500">Physical artifact scan</span>
         </div>
       ) : null}
 

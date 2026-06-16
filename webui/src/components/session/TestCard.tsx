@@ -50,7 +50,7 @@ export function TestCard({
           <StatusBadge status={test.state} />
         </div>
         <div className="mt-2 text-[14px] font-semibold text-slate-700">No test evidence</div>
-        <div className="mt-1 font-mono text-[11px] text-slate-400">Runner XML not found</div>
+        <div className="mt-1 font-mono text-[11px] text-slate-500">Runner XML not found</div>
       </Card>
     )
   }
