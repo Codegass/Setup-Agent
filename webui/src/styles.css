@@ -83,6 +83,13 @@
   --status-attention: oklch(0.62 0.13 75);
   --status-attention-soft: oklch(0.97 0.05 85);
   --status-attention-border: oklch(0.9 0.08 85);
+
+  /* Semantic z-index scale (low -> high). */
+  --z-sticky: 30;     /* app bar, sticky section-nav */
+  --z-dropdown: 40;
+  --z-overlay: 50;    /* modal backdrop */
+  --z-modal: 60;
+  --z-tooltip: 70;
 }
 
 .dark {

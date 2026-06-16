@@ -209,7 +209,7 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-[#fbfbfc] text-slate-900">
-      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/85 backdrop-blur">
+      <header className="sticky top-0 z-[var(--z-sticky)] border-b border-slate-200 bg-white/85 backdrop-blur">
         <div className="mx-auto flex min-h-12 max-w-[1180px] flex-wrap items-center gap-3 px-4 py-2 sm:px-6 lg:h-12 lg:px-8 lg:py-0">
           <button
             className="flex items-center gap-2"
