@@ -3,6 +3,7 @@ import re
 from pathlib import Path
 
 from sag.agent.output_storage import OutputStorageManager
+from sag.utils.container_io import DEFAULT_MAX_CMD_CHARS
 
 INDEX_PATH = "/workspace/.setup_agent/contexts/output_index.json"
 STORAGE_PATH = "/workspace/.setup_agent/contexts/full_outputs.jsonl"
@@ -173,12 +174,12 @@ def test_store_and_retrieve_large_output_uses_chunked_write_and_round_trips():
     storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
 
     big = "[INFO] Downloading from central: progress line\n" * 6000
-    assert len(big) > storage._MAX_CMD_CHARS
+    assert len(big) > DEFAULT_MAX_CMD_CHARS
 
     ref_id = storage.store_output(task_id="maven_build", tool_name="maven", output=big)
     assert ref_id
 
     # No single command argument blew past the per-arg cap (the regression cause).
-    assert max(len(cmd) for cmd in orchestrator.commands) <= storage._MAX_CMD_CHARS + 200
+    assert max(len(cmd) for cmd in orchestrator.commands) <= DEFAULT_MAX_CMD_CHARS + 200
 
     assert storage.retrieve_output(ref_id) == big

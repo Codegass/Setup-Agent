@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.utils.container_io import write_container_text
+
 
 class OutputStorageManager:
     """Manages storage of full outputs with indexing for efficient retrieval."""
@@ -128,68 +130,11 @@ class OutputStorageManager:
         except Exception as e:
             logger.error(f"Failed to save output index: {e}")
 
-    def _heredoc_delimiter(self, content: str) -> str:
-        digest = hashlib.md5(content.encode()).hexdigest()[:12]
-        delimiter = f"SAG_OUTPUT_EOF_{digest}"
-        while f"\n{delimiter}\n" in f"\n{content}\n":
-            digest = hashlib.md5(f"{content}{delimiter}".encode()).hexdigest()[:12]
-            delimiter = f"SAG_OUTPUT_EOF_{digest}"
-        return delimiter
-
-    # Linux caps a single argv element at MAX_ARG_STRLEN (~128 KB). A heredoc that
-    # embeds the whole payload in one command therefore fails with "argument list
-    # too long" once content gets large — which regressed when we began storing
-    # full (untruncated) detached build logs, whose Maven download spam runs to
-    # megabytes. Keep the fast single-command heredoc for small content; stream
-    # large content as length-bounded base64 chunks.
-    _MAX_CMD_CHARS = 60000
-
     def _write_container_text(self, path: str, content: str, *, append: bool = False) -> bool:
-        if len(content) > self._MAX_CMD_CHARS:
-            return self._write_container_text_chunked(path, content, append=append)
-        delimiter = self._heredoc_delimiter(content)
-        operator = ">>" if append else ">"
-        command = f"cat {operator} {path} <<'{delimiter}'\n{content}\n{delimiter}"
-        result = self.orchestrator.execute_command(command)
-        if result.get("exit_code") == 0 or result.get("success"):
-            return True
-        logger.error(f"Failed to write container file {path}: {result.get('output')}")
-        return False
-
-    def _write_container_text_chunked(self, path: str, content: str, *, append: bool) -> bool:
-        """Write large content without exceeding the kernel's per-arg length limit.
-
-        The payload is base64-encoded (its alphabet is single-quote safe), appended
-        to a temp file in <=_MAX_CMD_CHARS chunks, then decoded into the target with
-        the same trailing newline the heredoc path produces. Each record stays one
-        JSONL line so retrieve_output's ``sed -n '<line>p'`` keeps working.
-        """
-        import base64
-
-        encoded = base64.b64encode(content.encode("utf-8", errors="replace")).decode("ascii")
-        tmp = f"{path}.b64.{hashlib.md5(encoded.encode()).hexdigest()[:8]}.tmp"
-
-        reset = self.orchestrator.execute_command(f"rm -f {tmp}")
-        if not (reset.get("exit_code") == 0 or reset.get("success")):
-            logger.error(f"Failed to reset temp file {tmp}: {reset.get('output')}")
-            return False
-
-        for i in range(0, len(encoded), self._MAX_CMD_CHARS):
-            chunk = encoded[i : i + self._MAX_CMD_CHARS]
-            res = self.orchestrator.execute_command(f"printf '%s' '{chunk}' >> {tmp}")
-            if not (res.get("exit_code") == 0 or res.get("success")):
-                logger.error(f"Failed to append chunk to {tmp}: {res.get('output')}")
-                self.orchestrator.execute_command(f"rm -f {tmp}")
-                return False
-
-        operator = ">>" if append else ">"
-        finalize = f"base64 -d {tmp} {operator} {path} && printf '\\n' >> {path} && rm -f {tmp}"
-        res = self.orchestrator.execute_command(finalize)
-        if res.get("exit_code") == 0 or res.get("success"):
-            return True
-        logger.error(f"Failed to finalize chunked write to {path}: {res.get('output')}")
-        self.orchestrator.execute_command(f"rm -f {tmp}")
-        return False
+        # Delegate to the shared writer: it keeps the fast single-command heredoc
+        # for small content and streams large content as base64 chunks, so a big
+        # payload never trips the kernel per-arg limit ("argument list too long").
+        return write_container_text(self.orchestrator, path, content, append=append)
 
     def store_output(
         self,
