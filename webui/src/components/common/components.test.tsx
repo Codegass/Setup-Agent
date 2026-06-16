@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react"
 import { describe, expect, it, vi } from "vitest"
 
-import { StatusBadge } from "./Badge"
+import { Badge, StatusBadge } from "./Badge"
 import { Tabs } from "./Tabs"
 import { TestBar } from "./TestBar"
 
@@ -10,6 +10,11 @@ describe("common components", () => {
     render(<StatusBadge status="passed" />)
 
     expect(screen.getByText("Passed")).toBeInTheDocument()
+  })
+
+  it("renders status tones from the semantic token utilities", () => {
+    render(<Badge tone="green">ok</Badge>)
+    expect(screen.getByText("ok")).toHaveClass("text-status-success")
   })
 
   it("renders an empty glyph when a test bar has no total", () => {

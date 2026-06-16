@@ -6,19 +6,19 @@ import { cn } from "@/lib/utils"
 import { isUsefulEvidenceStatus, statusMeta } from "./status"
 
 const toneClasses: Record<Tone, string> = {
-  neutral: "border-slate-200 bg-slate-100 text-slate-600",
-  blue: "border-blue-200 bg-blue-50 text-blue-700",
-  green: "border-emerald-200 bg-emerald-50 text-emerald-700",
-  red: "border-red-200 bg-red-50 text-red-700",
-  amber: "border-amber-200 bg-amber-50 text-amber-700",
+  neutral: "border-status-idle-border bg-status-idle-soft text-status-idle",
+  blue: "border-status-running-border bg-status-running-soft text-status-running",
+  green: "border-status-success-border bg-status-success-soft text-status-success",
+  red: "border-status-failed-border bg-status-failed-soft text-status-failed",
+  amber: "border-status-attention-border bg-status-attention-soft text-status-attention",
 }
 
 const dotClasses: Record<Tone, string> = {
-  neutral: "bg-slate-400",
-  blue: "bg-blue-500",
-  green: "bg-emerald-500",
-  red: "bg-red-500",
-  amber: "bg-amber-500",
+  neutral: "bg-status-idle",
+  blue: "bg-status-running",
+  green: "bg-status-success",
+  red: "bg-status-failed",
+  amber: "bg-status-attention",
 }
 
 export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {

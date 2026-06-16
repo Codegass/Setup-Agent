@@ -23,6 +23,21 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-status-idle: var(--status-idle);
+  --color-status-idle-soft: var(--status-idle-soft);
+  --color-status-idle-border: var(--status-idle-border);
+  --color-status-running: var(--status-running);
+  --color-status-running-soft: var(--status-running-soft);
+  --color-status-running-border: var(--status-running-border);
+  --color-status-success: var(--status-success);
+  --color-status-success-soft: var(--status-success-soft);
+  --color-status-success-border: var(--status-success-border);
+  --color-status-failed: var(--status-failed);
+  --color-status-failed-soft: var(--status-failed-soft);
+  --color-status-failed-border: var(--status-failed-border);
+  --color-status-attention: var(--status-attention);
+  --color-status-attention-soft: var(--status-attention-soft);
+  --color-status-attention-border: var(--status-attention-border);
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -50,6 +65,24 @@
   --input: oklch(0.89 0.012 247);
   --ring: oklch(0.55 0.2 255);
   --radius: 0.5rem;
+
+  /* Semantic state palette (one vocabulary for badges, nav, callouts).
+     status.ts maps statuses -> these tones. */
+  --status-idle: oklch(0.45 0.03 264);        /* neutral text */
+  --status-idle-soft: oklch(0.968 0.005 247); /* neutral bg */
+  --status-idle-border: oklch(0.9 0.012 247);
+  --status-running: oklch(0.5 0.18 258);
+  --status-running-soft: oklch(0.97 0.03 255);
+  --status-running-border: oklch(0.9 0.06 255);
+  --status-success: oklch(0.52 0.13 158);
+  --status-success-soft: oklch(0.97 0.04 158);
+  --status-success-border: oklch(0.9 0.07 158);
+  --status-failed: oklch(0.55 0.2 27);
+  --status-failed-soft: oklch(0.97 0.03 27);
+  --status-failed-border: oklch(0.9 0.06 27);
+  --status-attention: oklch(0.62 0.13 75);
+  --status-attention-soft: oklch(0.97 0.05 85);
+  --status-attention-border: oklch(0.9 0.08 85);
 }
 
 .dark {
