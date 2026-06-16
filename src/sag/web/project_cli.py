@@ -15,6 +15,7 @@ class ProjectCliCommand:
     ref: str | None = None
     goal: str | None = None
     record: bool = False
+    coverage: bool = False
 
     def project_args(self) -> list[str]:
         """Arguments exactly as a user would type them after ``sag``."""
@@ -28,6 +29,8 @@ class ProjectCliCommand:
             args.extend(["--goal", self.goal])
         if self.record:
             args.append("--record")
+        if self.coverage:
+            args.append("--coverage")
         return args
 
     def argv(self) -> list[str]:

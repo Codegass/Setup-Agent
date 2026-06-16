@@ -42,6 +42,20 @@ def test_record_flag_is_included():
     assert command.project_args() == ["project", REPO, "--record"]
 
 
+def test_coverage_flag_appended_when_set():
+    args = ProjectCliCommand(
+        repo_url=REPO, record=True, coverage=True
+    ).project_args()
+
+    assert "--coverage" in args and "--record" in args
+
+
+def test_coverage_flag_absent_when_unset():
+    args = ProjectCliCommand(repo_url=REPO).project_args()
+
+    assert "--coverage" not in args
+
+
 def test_all_options_together_match_manual_sag_project_invocation():
     command = ProjectCliCommand(
         repo_url=REPO,

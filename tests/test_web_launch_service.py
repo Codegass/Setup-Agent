@@ -100,6 +100,36 @@ def test_stored_command_matches_manual_sag_project_invocation(tmp_path):
     ]
 
 
+def test_coverage_flag_threads_into_stored_command(tmp_path):
+    service, store, _ = make_service(tmp_path)
+
+    service.submit_batch(
+        request_for({"repo_url": REPO, "ref": "v1.0", "record": True, "coverage": True})
+    )
+
+    claimed = store.claim_next(global_cap=8, now="2026-06-07T10:00:00")
+    assert claimed.command == [
+        sys.executable,
+        "-m",
+        "sag.main",
+        "project",
+        REPO,
+        "--ref",
+        "v1.0",
+        "--record",
+        "--coverage",
+    ]
+
+
+def test_coverage_flag_absent_from_command_when_unset(tmp_path):
+    service, store, _ = make_service(tmp_path)
+
+    service.submit_batch(request_for({"repo_url": REPO, "ref": "v1.0"}))
+
+    claimed = store.claim_next(global_cap=8, now="2026-06-07T10:00:00")
+    assert "--coverage" not in claimed.command
+
+
 def test_optional_fields_are_trimmed_and_blank_becomes_none(tmp_path):
     service, store, _ = make_service(tmp_path)
 

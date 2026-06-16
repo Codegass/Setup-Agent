@@ -30,6 +30,7 @@ class LaunchProjectRow(BaseModel):
     ref: str | None = None
     goal: str | None = None
     record: bool = False
+    coverage: bool = False
 
     @field_validator("name", "ref", "goal")
     @classmethod
@@ -172,6 +173,7 @@ class LaunchService:
                 ref=row.ref,
                 goal=row.goal,
                 record=row.record,
+                coverage=row.coverage,
             ).argv()
             process_log = PROCESS_LOG_ROOT / batch_id / f"{launch_id}.log"
             items.append(
