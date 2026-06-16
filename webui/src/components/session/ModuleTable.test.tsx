@@ -53,6 +53,21 @@ describe("ModuleTable (test variant)", () => {
     expect(screen.getByText("UNKNOWN")).toBeInTheDocument()
   })
 
+  it("shows a rate column and stacked coverage bars (test variant)", () => {
+    render(<ModuleTable variant="test" modules={[
+      { name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
+        testSource: "runner_xml", testsPassed: 998, testsFailed: 2, testsSkipped: 0,
+        failingNames: [], failingCount: 0,
+        lineRate: 82, branchRate: 71 },
+      { name: "examples", path: "examples", buildStatus: "unknown", buildSource: "none",
+        testSource: "none", failingNames: [], failingCount: 0 },
+    ]} />)
+    expect(screen.getByText("99.8%")).toBeInTheDocument()   // 998/(998+2)
+    expect(screen.getByText("82%")).toBeInTheDocument()      // line coverage
+    expect(screen.getByText("71%")).toBeInTheDocument()      // branch coverage
+    expect(screen.getByText(/not measured/i)).toBeInTheDocument()  // examples
+  })
+
   it("offers copy-all and the report path in the expanded failing list", () => {
     const writeText = vi.fn()
     Object.assign(navigator, { clipboard: { writeText } })
