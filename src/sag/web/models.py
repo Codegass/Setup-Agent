@@ -391,6 +391,41 @@ class ModuleSummary(WebModel):
         validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
         serialization_alias="evidenceRefs",
     )
+    line_covered: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("line_covered", "lineCovered"),
+        serialization_alias="lineCovered",
+    )
+    line_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("line_total", "lineTotal"),
+        serialization_alias="lineTotal",
+    )
+    line_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("line_rate", "lineRate"),
+        serialization_alias="lineRate",
+    )
+    branch_covered: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("branch_covered", "branchCovered"),
+        serialization_alias="branchCovered",
+    )
+    branch_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("branch_total", "branchTotal"),
+        serialization_alias="branchTotal",
+    )
+    branch_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("branch_rate", "branchRate"),
+        serialization_alias="branchRate",
+    )
+    coverage_source: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("coverage_source", "coverageSource"),
+        serialization_alias="coverageSource",
+    )
 
 
 class ModuleRollup(WebModel):
@@ -430,6 +465,41 @@ class ModuleRollup(WebModel):
         default=False,
         validation_alias=AliasChoices("single_module", "singleModule"),
         serialization_alias="singleModule",
+    )
+    line_covered: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("line_covered", "lineCovered"),
+        serialization_alias="lineCovered",
+    )
+    line_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("line_total", "lineTotal"),
+        serialization_alias="lineTotal",
+    )
+    line_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("line_rate", "lineRate"),
+        serialization_alias="lineRate",
+    )
+    branch_covered: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("branch_covered", "branchCovered"),
+        serialization_alias="branchCovered",
+    )
+    branch_total: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("branch_total", "branchTotal"),
+        serialization_alias="branchTotal",
+    )
+    branch_rate: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("branch_rate", "branchRate"),
+        serialization_alias="branchRate",
+    )
+    coverage_source: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("coverage_source", "coverageSource"),
+        serialization_alias="coverageSource",
     )
 
 
