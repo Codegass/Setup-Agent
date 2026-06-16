@@ -1136,14 +1136,34 @@ PY"""
             match = re.search(r"<packaging>\s*([^<\s]+)\s*</packaging>", pkg.get("output") or "")
             packaging = match.group(1).strip().lower() if match else "jar"
 
-        # Which declared modules actually carry compilable main sources.
+        # Find source-bearing modules DIRECTLY rather than trusting the root
+        # pom's <modules> — Bigtop declares its modules inside a profile, so the
+        # parsed list is empty and the Groovy iTest framework was missed. Scan for
+        # both Java and Groovy main-source dirs, excluding build output.
         source_modules = []
-        for module in analysis.get("maven_modules") or []:
-            module_dir = f"{project_path}/{module}"
-            if exists(f"{module_dir}/src/main/java"):
-                source_modules.append({"module": module, "lang": "java"})
-            elif exists(f"{module_dir}/src/main/groovy"):
-                source_modules.append({"module": module, "lang": "groovy"})
+        find_cmd = (
+            f"find {project_path} -maxdepth 5 -type d "
+            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' \\) "
+            f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
+        )
+        found = orch.execute_command(find_cmd)
+        seen_dirs = set()
+        for line in (found.get("output") or "").splitlines():
+            line = line.strip()
+            if not line or "/src/main/" not in line:
+                continue
+            lang = "groovy" if line.endswith("/src/main/groovy") else "java"
+            module_dir = line.rsplit("/src/main/", 1)[0]
+            if module_dir == project_path or module_dir in seen_dirs:
+                continue
+            seen_dirs.add(module_dir)
+            source_modules.append(
+                {
+                    "module": module_dir[len(project_path):].lstrip("/"),
+                    "dir": module_dir,
+                    "lang": lang,
+                }
+            )
         rec["source_modules"] = source_modules
 
         # 1) Plain Maven module with its own sources: compile at the root.
@@ -1154,15 +1174,25 @@ PY"""
 
         # 2) Aggregator root (packaging=pom): compiling the root produces nothing.
         if has_pom and packaging == "pom":
-            groovy_modules = [m["module"] for m in source_modules if m["lang"] == "groovy"]
+            groovy_modules = [m for m in source_modules if m["lang"] == "groovy"]
             if source_modules:
                 # Groovy is compiled by a plugin bound to a later phase, so a bare
                 # `compile` frequently yields no target/classes; `install` runs it.
                 goal = "install" if groovy_modules else "compile"
-                rec.update(build_system="maven", build_root=project_path, goal=goal)
+                # If the root pom declares modules, the reactor builds them — build
+                # at root. If it does NOT (Bigtop: profile-gated modules), building
+                # the root compiles nothing, so target the source module directly.
+                if analysis.get("maven_modules"):
+                    build_root = project_path
+                    scope = "the reactor at the root"
+                else:
+                    preferred = (groovy_modules or source_modules)[0]
+                    build_root = preferred["dir"]
+                    scope = f"module {preferred['module']} directly"
+                rec.update(build_system="maven", build_root=build_root, goal=goal)
                 rec["rationale"] = (
                     f"Aggregator root over {len(source_modules)} source module(s) "
-                    f"({len(groovy_modules)} Groovy); build the reactor with '{goal}'."
+                    f"({len(groovy_modules)} Groovy); build {scope} with '{goal}'."
                 )
                 return rec
             if rec["has_gradle"]:
