@@ -45,7 +45,20 @@ export function TestDetailPage({
         <Tile label="Skipped" value={fmtNum(t.skip)} />
         <Tile label="Unique methods" value={fmtNum(t.uniqueTotal)} />
         <Tile label="Modules w/ fails" value={fmtNum(s?.modulesWithTestFailures)} tone="text-red-600" />
-        <Tile label="Coverage" value={<>— <span className="rounded bg-amber-50 px-1 font-mono text-[9px] text-amber-700">Feature B</span></>} dashed />
+        {s?.lineRate != null || s?.branchRate != null ? (
+          <Tile
+            label="Coverage · line"
+            tone={s!.lineRate != null && s!.lineRate >= 80 ? "text-emerald-700"
+              : s!.lineRate != null && s!.lineRate >= 50 ? "text-amber-600" : "text-red-600"}
+            value={<>{s?.lineRate != null ? `${Math.round(s.lineRate)}%` : "—"}
+              <span className="block font-mono text-[10px] font-normal text-slate-500">
+                {s?.branchRate != null ? `${Math.round(s.branchRate)}% branch` : "branch —"}
+                {s?.coverageSource ? " · jacoco" : ""}
+              </span></>}
+          />
+        ) : (
+          <Tile label="Coverage" value={<span className="text-slate-400">— not measured</span>} dashed />
+        )}
       </div>
       <Card className="p-4">
         {single ? (

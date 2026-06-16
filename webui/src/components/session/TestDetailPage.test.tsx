@@ -37,4 +37,32 @@ describe("TestDetailPage", () => {
     } as any} />)
     expect(screen.getByText(/single module/i)).toBeInTheDocument()
   })
+
+  it("shows real coverage in the tile when present", () => {
+    render(<TestDetailPage onBack={() => {}} detail={{
+      test: { state: "success", pass: 100, fail: 0, skip: 0, total: 100, passRate: 100 },
+      moduleSummary: { modulesTotal: 2, modulesBuilt: 2, modulesFailed: 0, modulesSkipped: 0,
+                       modulesWithTestFailures: 0, buildSystems: ["gradle"], singleModule: false,
+                       lineRate: 81, branchRate: 68 },
+      modules: [{ name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
+                  testSource: "runner_xml", lineRate: 81, branchRate: 68 }],
+    } as any} />)
+    // "81%" also appears in the ModuleTable coverage bar; the tile-specific
+    // "68% branch" string is unique to the Coverage tile.
+    expect(screen.getAllByText("81%").length).toBeGreaterThan(0)
+    expect(screen.getByText(/68% branch/i)).toBeInTheDocument()
+  })
+
+  it("shows coverage unavailable when no coverage data", () => {
+    render(<TestDetailPage onBack={() => {}} detail={{
+      test: { state: "success", pass: 100, fail: 0, skip: 0, total: 100, passRate: 100 },
+      moduleSummary: { modulesTotal: 1, modulesBuilt: 1, modulesFailed: 0, modulesSkipped: 0,
+                       modulesWithTestFailures: 0, buildSystems: ["maven"], singleModule: false },
+      modules: [{ name: "core", path: "core", buildStatus: "success", buildSource: "reactor",
+                  testSource: "runner_xml" }],
+    } as any} />)
+    // The dashed Coverage tile renders "— not measured" (the ModuleTable also
+    // shows it for the uncovered module), so assert at least one is present.
+    expect(screen.getAllByText(/not measured/i).length).toBeGreaterThan(0)
+  })
 })
