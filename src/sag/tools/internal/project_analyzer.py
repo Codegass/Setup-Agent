@@ -206,6 +206,15 @@ class ProjectAnalyzerTool(BaseTool):
             else:
                 logger.debug("No test methods discovered in Java project")
 
+        # Step 4.6: Recommend where/how to build so the build phase targets the
+        # real reactor/module instead of an empty aggregator root.
+        try:
+            analysis["build_recommendation"] = self._recommend_build_approach(
+                project_path, analysis
+            )
+        except Exception as exc:
+            logger.warning(f"Build-approach recommendation failed: {exc}")
+
         # Step 5: 生成智能执行计划
         execution_plan = self._generate_execution_plan(analysis)
         analysis["execution_plan"] = execution_plan
@@ -1079,6 +1088,106 @@ PY"""
 
         return frameworks
 
+    def _recommend_build_approach(
+        self, project_path: str, analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Recommend WHERE and HOW to build so the build phase does not compile an
+        empty aggregator root.
+
+        Bigtop's root pom is ``packaging=pom`` aggregating Groovy/Gradle modules,
+        so ``mvn compile`` at the root returns BUILD SUCCESS with zero
+        ``target/classes/*.class``. This inspects the real layout — root packaging,
+        root/module main-source dirs (Java AND Groovy), and any Gradle build — and
+        returns a concrete recommendation the build phase can target:
+
+            {build_system, build_root, goal, is_aggregator_only, has_gradle,
+             source_modules, rationale}
+        """
+        rec: Dict[str, Any] = {
+            "build_system": analysis.get("build_system"),
+            "build_root": project_path,
+            "goal": "compile",
+            "is_aggregator_only": False,
+            "has_gradle": False,
+            "source_modules": [],
+            "rationale": "",
+        }
+        orch = self.docker_orchestrator
+        if not orch:
+            return rec
+
+        def exists(path: str) -> bool:
+            result = orch.execute_command(f"test -e {path} && echo yes || echo no")
+            return "yes" in (result.get("output") or "")
+
+        has_pom = exists(f"{project_path}/pom.xml")
+        has_gradlew = exists(f"{project_path}/gradlew")
+        has_build_gradle = exists(f"{project_path}/build.gradle") or exists(
+            f"{project_path}/build.gradle.kts"
+        )
+        rec["has_gradle"] = has_gradlew or has_build_gradle
+
+        root_main_java = exists(f"{project_path}/src/main/java")
+        root_main_groovy = exists(f"{project_path}/src/main/groovy")
+
+        packaging = None
+        if has_pom:
+            pkg = orch.execute_command(f"grep -m1 '<packaging>' {project_path}/pom.xml 2>/dev/null")
+            match = re.search(r"<packaging>\s*([^<\s]+)\s*</packaging>", pkg.get("output") or "")
+            packaging = match.group(1).strip().lower() if match else "jar"
+
+        # Which declared modules actually carry compilable main sources.
+        source_modules = []
+        for module in analysis.get("maven_modules") or []:
+            module_dir = f"{project_path}/{module}"
+            if exists(f"{module_dir}/src/main/java"):
+                source_modules.append({"module": module, "lang": "java"})
+            elif exists(f"{module_dir}/src/main/groovy"):
+                source_modules.append({"module": module, "lang": "groovy"})
+        rec["source_modules"] = source_modules
+
+        # 1) Plain Maven module with its own sources: compile at the root.
+        if has_pom and (root_main_java or root_main_groovy):
+            rec.update(build_system="maven", build_root=project_path, goal="compile")
+            rec["rationale"] = "Root Maven module has main sources; compile at the root."
+            return rec
+
+        # 2) Aggregator root (packaging=pom): compiling the root produces nothing.
+        if has_pom and packaging == "pom":
+            groovy_modules = [m["module"] for m in source_modules if m["lang"] == "groovy"]
+            if source_modules:
+                # Groovy is compiled by a plugin bound to a later phase, so a bare
+                # `compile` frequently yields no target/classes; `install` runs it.
+                goal = "install" if groovy_modules else "compile"
+                rec.update(build_system="maven", build_root=project_path, goal=goal)
+                rec["rationale"] = (
+                    f"Aggregator root over {len(source_modules)} source module(s) "
+                    f"({len(groovy_modules)} Groovy); build the reactor with '{goal}'."
+                )
+                return rec
+            if rec["has_gradle"]:
+                rec.update(build_system="gradle", build_root=project_path, goal="build")
+                rec["rationale"] = (
+                    "Maven root is an aggregator with no compilable modules, but a "
+                    "Gradle build is present and is likely the primary build."
+                )
+                return rec
+            # Nothing to compile anywhere and no Gradle: packaging/meta-project.
+            rec["is_aggregator_only"] = True
+            rec["rationale"] = (
+                "Root is a Maven aggregator with no module main sources and no Gradle "
+                "build — there is no standard Java compile target (packaging/meta-project)."
+            )
+            return rec
+
+        # 3) Gradle-only project.
+        if not has_pom and rec["has_gradle"]:
+            rec.update(build_system="gradle", build_root=project_path, goal="build")
+            rec["rationale"] = "Gradle build detected (no root pom)."
+            return rec
+
+        return rec
+
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
         Generate intelligent execution plan based on THREE CORE STEPS:
@@ -1545,6 +1654,15 @@ PY"""
         if not incoming_unknown:
             trunk_context.environment_summary["build_system"] = analysis.get("build_system")
 
+        build_recommendation = analysis.get("build_recommendation")
+        if build_recommendation:
+            trunk_context.environment_summary["build_recommendation"] = build_recommendation
+            logger.info(
+                "📊 Stored build recommendation: "
+                f"{build_recommendation.get('build_system')} '{build_recommendation.get('goal')}' "
+                f"at {build_recommendation.get('build_root')}"
+            )
+
         static_test_count = analysis.get("static_test_count")
         if static_test_count is not None:
             trunk_context.environment_summary["static_test_count"] = static_test_count
@@ -1619,6 +1737,26 @@ PY"""
         build_system = analysis.get("build_system", "Unknown")
         output += f"📂 Project Type: {project_type}\n"
         output += f"🔧 Build System: {build_system}\n"
+
+        # Recommended build target — steer the build phase away from compiling an
+        # empty aggregator root (e.g. Bigtop's packaging=pom over Groovy/Gradle).
+        rec = analysis.get("build_recommendation") or {}
+        if rec.get("rationale"):
+            if rec.get("is_aggregator_only"):
+                output += (
+                    f"🧭 Recommended Build: NONE — {rec['rationale']} "
+                    f"Consider phase(action='blocked') with this evidence rather than forcing a compile.\n"
+                )
+            else:
+                output += (
+                    f"🧭 Recommended Build: {rec.get('build_system')} "
+                    f"'{rec.get('goal')}' in {rec.get('build_root')} — {rec['rationale']}\n"
+                )
+                if rec.get("source_modules"):
+                    mods = ", ".join(
+                        f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6]
+                    )
+                    output += f"   • Source modules: {mods}\n"
 
         # 显示发现的文件
         existing_files = analysis.get("existing_files", [])
