@@ -39,6 +39,43 @@ def test_reuses_existing_reports_without_running_build():
     assert not any("jacocoTestReport" in c and "gradle" in c for c in orch.commands)
 
 
+def test_maven_reuses_own_jacoco_via_report_only():
+    """A Maven project shipping its own JaCoCo has jacoco.exec but no XML after
+    setup. The runner must materialize the report with a report-only goal (no
+    second prepare-agent agent -> avoids the double-agent StackOverflowError seen
+    live on commons-cli) and treat the result as existing coverage."""
+    report = ('<report name="m"><counter type="LINE" missed="10" covered="90"/>'
+              '<counter type="BRANCH" missed="0" covered="0"/></report>')
+    state = {"xml_finds": 0}
+
+    class Orch:
+        def __init__(self):
+            self.commands = []
+
+        def execute_command(self, command, **kwargs):
+            self.commands.append(command)
+            if "find" in command and "jacoco.xml" in command:
+                state["xml_finds"] += 1
+                # no XML before report-only; XML present after it runs
+                if state["xml_finds"] == 1:
+                    return {"success": True, "exit_code": 0, "output": ""}
+                return {"success": True, "exit_code": 0,
+                        "output": "/w/p/target/site/jacoco/jacoco.xml"}
+            if "find" in command and "jacoco.exec" in command:
+                return {"success": True, "exit_code": 0, "output": "/w/p/target/jacoco.exec"}
+            if command.startswith("cat "):
+                return {"success": True, "exit_code": 0, "output": report}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    orch = Orch()
+    cov = run_coverage(orch, "/w/p", build_system="maven")
+    assert cov["."]["coverage_source"] == "jacoco-existing"
+    assert cov["."]["line_rate"] == 90.0
+    # report-only goal used; NO prepare-agent injected (no second agent)
+    assert any(":report" in c for c in orch.commands)
+    assert not any("prepare-agent" in c for c in orch.commands)
+
+
 def test_injects_and_runs_when_no_existing_report_maven():
     # First listing (existing) empty -> inject+run, then second listing finds the produced report.
     calls = {"n": 0}
@@ -57,7 +94,10 @@ def test_injects_and_runs_when_no_existing_report_maven():
     orch = Orch(files={"/w/p/core/target/site/jacoco/jacoco.xml": REPORT})
     cov = run_coverage(orch, "/w/p", build_system="maven")
     assert cov["core"]["coverage_source"] == "jacoco-injected"
-    assert any(f"jacoco-maven-plugin:{JACOCO_VERSION}:prepare-agent" in c for c in orch.commands)
+    mvn_cmd = next(c for c in orch.commands if "prepare-agent" in c)
+    assert f"jacoco-maven-plugin:{JACOCO_VERSION}:prepare-agent" in mvn_cmd
+    # uses the provisioned toolchain by sourcing the setup's env overlay
+    assert "env_overlay.sh" in mvn_cmd
     # never edits project files
     assert not any("pom.xml" in c and (">" in c or "sed" in c) for c in orch.commands)
 

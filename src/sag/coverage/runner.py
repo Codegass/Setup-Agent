@@ -18,6 +18,13 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH
 JACOCO_VERSION = "0.8.12"
 COVERAGE_TIMEOUT_SEC = 1800
 
+# Source the setup's env overlay so the coverage build uses the SAME provisioned
+# toolchain the setup used (e.g. a provisioned Maven 3.9.x on PATH + the right
+# JAVA_HOME). Without this, plain `mvn` resolves to the system Maven, which an
+# enforcer-gated project rejects fast (live commons-cli: BUILD FAILURE in ~11s).
+_ENV_OVERLAY = "/workspace/.setup_agent/env_overlay.sh"
+_OVERLAY_PREFIX = f"[ -f {_ENV_OVERLAY} ] && . {_ENV_OVERLAY} 2>/dev/null; "
+
 # Gradle init script: apply jacoco to all projects + force an XML report. No
 # build.gradle edits; passed via --init-script only.
 _GRADLE_INIT = """allprojects { p ->
@@ -44,6 +51,26 @@ def _module_path(project_dir: str, xml_path: str, build_system: str) -> str:
     return rel or "."
 
 
+def _has_jacoco_exec(orchestrator: Any, project_dir: str) -> bool:
+    """True when the setup's test run already produced JaCoCo exec data (the
+    project configures its own JaCoCo). Then we materialize a report instead of
+    injecting a conflicting second agent."""
+    res = orchestrator.execute_command(
+        f"find {project_dir} -name 'jacoco.exec' -type f 2>/dev/null | head -1"
+    )
+    return bool((res.get("output") or "").strip())
+
+
+def _maven_report_only(orchestrator: Any, project_dir: str) -> None:
+    """Generate JaCoCo XML from existing exec data (no prepare-agent, no re-run)."""
+    plugin = f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}"
+    cmd = (
+        f"{_OVERLAY_PREFIX}cd {project_dir} && mvn -B {plugin}:report "
+        f"-Dmaven.test.failure.ignore=true"
+    )
+    orchestrator.execute_command(cmd, timeout=COVERAGE_TIMEOUT_SEC)
+
+
 def _inject_and_run(orchestrator: Any, project_dir: str, build_system: str) -> None:
     if build_system == "gradle":
         init_path = f"{project_dir}/.setup_agent_jacoco.init.gradle"
@@ -52,14 +79,14 @@ def _inject_and_run(orchestrator: Any, project_dir: str, build_system: str) -> N
             f"cat > {init_path} <<'{delim}'\n{_GRADLE_INIT}\n{delim}"
         )
         cmd = (
-            f"cd {project_dir} && (./gradlew --no-daemon --continue "
+            f"{_OVERLAY_PREFIX}cd {project_dir} && (./gradlew --no-daemon --continue "
             f"--init-script {init_path} test jacocoTestReport "
             f"|| gradle --no-daemon --continue --init-script {init_path} test jacocoTestReport)"
         )
     else:
         plugin = f"org.jacoco:jacoco-maven-plugin:{JACOCO_VERSION}"
         cmd = (
-            f"cd {project_dir} && mvn -B {plugin}:prepare-agent test {plugin}:report "
+            f"{_OVERLAY_PREFIX}cd {project_dir} && mvn -B {plugin}:prepare-agent test {plugin}:report "
             f"-Dmaven.test.failure.ignore=true"
         )
     orchestrator.execute_command(cmd, timeout=COVERAGE_TIMEOUT_SEC)
@@ -74,6 +101,14 @@ def run_coverage(
             return {}
         existing = _find_reports(orchestrator, project_dir, build_system)
         source = "jacoco-existing"
+        if not existing and build_system == "maven" and _has_jacoco_exec(orchestrator, project_dir):
+            # The project configures its OWN JaCoCo: the setup's test run already
+            # produced jacoco.exec but no XML. Materialize the XML from that exec
+            # data with a report-only goal. Do NOT inject a second prepare-agent:
+            # two -javaagent JaCoCo agents collide and crash tests with a
+            # StackOverflowError (live commons-cli, which ships jacoco 0.8.15).
+            _maven_report_only(orchestrator, project_dir)
+            existing = _find_reports(orchestrator, project_dir, build_system)
         if not existing:
             _inject_and_run(orchestrator, project_dir, build_system)
             existing = _find_reports(orchestrator, project_dir, build_system)
