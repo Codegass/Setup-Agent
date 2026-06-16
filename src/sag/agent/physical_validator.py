@@ -2605,14 +2605,17 @@ PY"""
                 f"find '{module_dir}/{classes_glob}' -name '*.class' -type f 2>/dev/null | wc -l"
             )
             cc = self._execute_command_with_logging(class_cmd, f"counting classes in {rel}")
-            class_count = int((cc.get("output") or "0").strip() or 0) if cc.get("success") else 0
+            # None (not 0) when the count command fails: "couldn't measure" must
+            # not masquerade as "zero classes" (which would also wrongly suppress
+            # the artifact-based build inference downstream).
+            class_count = int((cc.get("output") or "0").strip() or 0) if cc.get("success") else None
 
             jar_cmd = (
                 f"find '{module_dir}/{jars_glob}' -name '*.jar' -type f "
                 f"-not -path '*/gradle/wrapper/*' 2>/dev/null | wc -l"
             )
             jc = self._execute_command_with_logging(jar_cmd, f"counting jars in {rel}")
-            jar_count = int((jc.get("output") or "0").strip() or 0) if jc.get("success") else 0
+            jar_count = int((jc.get("output") or "0").strip() or 0) if jc.get("success") else None
 
             report_dirs: List[str] = []
             for sub in report_subdirs:

@@ -15,6 +15,10 @@ from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_s
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metrics
+
+# Sentinel for memoizing _build_module_metrics (the result can legitimately be
+# None, so None cannot double as "not computed yet").
+_MODULE_METRICS_UNSET = object()
 from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import combine_verdicts, run_verdict
 
@@ -3092,7 +3096,20 @@ class ReportTool(BaseTool, UIEventEmitter):
         return status
 
     def _build_module_metrics(self, test_history: dict, *, generated_at: str):
-        """Assemble the per-module metrics dict, or None when unavailable."""
+        """Assemble the per-module metrics dict, or None when unavailable.
+
+        Memoized per report run: it is called once for persistence and again for
+        the markdown breakdown; each call would otherwise re-scan every module in
+        the container. ReportTool is created per report, so caching on self is
+        safe (the result is identical within one generation)."""
+        cached = getattr(self, "_module_metrics_cache", _MODULE_METRICS_UNSET)
+        if cached is not _MODULE_METRICS_UNSET:
+            return cached
+        result = self._compute_module_metrics(test_history, generated_at=generated_at)
+        self._module_metrics_cache = result
+        return result
+
+    def _compute_module_metrics(self, test_history: dict, *, generated_at: str):
         validator = getattr(self, "physical_validator", None)
         if validator is None:
             return None

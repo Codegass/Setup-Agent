@@ -1,5 +1,61 @@
 # tests/test_report_module_metrics.py
+import json
+
 from sag.tools.report_tool import ReportTool
+
+
+def test_load_test_history_aggregates_reactor_records_and_failed_modules():
+    """The reactor status feeding module metrics comes from test_summary.jsonl;
+    _load_test_history must aggregate reactor_summary + failed_modules across
+    every line (this is the data source for per-module build status)."""
+    line1 = json.dumps({
+        "tests_total": 10, "tests_failures": 1, "tests_skipped": 0,
+        "reactor_summary": [{"module": "core", "status": "success"}],
+        "failed_modules": [],
+    })
+    line2 = json.dumps({
+        "tests_total": 5, "tests_failures": 0, "tests_skipped": 0,
+        "reactor_summary": [{"module": "api", "status": "failure"}],
+        "failed_modules": ["api"],
+    })
+
+    class Orch:
+        def execute_command(self, command, **kwargs):
+            if "test_summary.jsonl" in command:
+                return {"exit_code": 0, "output": f"{line1}\n{line2}"}
+            return {"exit_code": 0, "output": ""}
+
+    tool = ReportTool(docker_orchestrator=Orch())
+    history = tool._load_test_history()
+    labels = {r["module"]: r["status"] for r in history["reactor_records"]}
+    assert labels == {"core": "success", "api": "failure"}
+    assert "api" in history["failed_modules"]
+
+
+def test_build_module_metrics_is_memoized_per_run():
+    """_build_module_metrics is called for both persistence and the markdown
+    breakdown; it must scan the container at most once per report run."""
+    tool = ReportTool()
+    tool._get_project_info = lambda: {"directory": "/workspace/p", "build_system": "Maven"}
+    calls = {"scan": 0}
+
+    class V:
+        def _detect_build_system(self, project_dir):
+            return "maven"
+
+        def scan_modules(self, project_dir, build_system):
+            calls["scan"] += 1
+            return [{"path": "core", "name": "core", "class_count": 1, "jar_count": 0,
+                     "report_dirs": []}]
+
+        def parse_module_test_reports(self, module_dir, report_dirs):
+            return {}
+
+    tool.physical_validator = V()
+    a = tool._build_module_metrics({}, generated_at="t")
+    b = tool._build_module_metrics({}, generated_at="t")
+    assert a is b               # same cached object
+    assert calls["scan"] == 1   # scanned only once
 
 
 def test_build_module_metrics_reconciles_scan_and_reactor(monkeypatch):
