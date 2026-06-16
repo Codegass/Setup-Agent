@@ -325,8 +325,12 @@ Append to `webui/src/pages/Dashboard.test.tsx` (inside the `describe("Dashboard"
       <Dashboard data={twoWorkspaces} onOpenWorkspace={() => {}} onOpenSession={() => {}} />,
     )
 
-    const broken = screen.getByLabelText("Open workspace owner/broken")
-    const healthy = screen.getByLabelText("Open workspace owner/healthy")
+    // NOTE: Dashboard renders BOTH a desktop row and a mobile card with the same
+    // aria-label; jsdom ignores the responsive hide/show, so use getAllByLabelText
+    // and assert on the first (desktop) match — mirroring the "highlights newly
+    // launched workspaces" test. Singular getByLabelText throws "multiple elements".
+    const broken = screen.getAllByLabelText("Open workspace owner/broken")[0]
+    const healthy = screen.getAllByLabelText("Open workspace owner/healthy")[0]
     expect(broken.className).toContain("bg-status-failed-soft")
     expect(healthy.className).not.toContain("bg-status-failed-soft")
   })
@@ -508,21 +512,22 @@ Append to `webui/src/pages/Dashboard.test.tsx`:
       <Dashboard data={twoWorkspaces} onOpenWorkspace={() => {}} onOpenSession={() => {}} />,
     )
 
-    // Both visible initially.
-    expect(screen.getByLabelText("Open workspace owner/healthy")).toBeInTheDocument()
-    expect(screen.getByLabelText("Open workspace owner/broken")).toBeInTheDocument()
+    // Both visible initially. Use queryAllByLabelText (count > 0) because each
+    // workspace renders in both the desktop and mobile trees in jsdom.
+    expect(screen.queryAllByLabelText("Open workspace owner/healthy").length).toBeGreaterThan(0)
+    expect(screen.queryAllByLabelText("Open workspace owner/broken").length).toBeGreaterThan(0)
 
     const tile = screen.getByRole("button", { name: /filter: need attention/i })
     fireEvent.click(tile)
 
-    // Healthy hidden, failing kept.
-    expect(screen.queryByLabelText("Open workspace owner/healthy")).not.toBeInTheDocument()
-    expect(screen.getByLabelText("Open workspace owner/broken")).toBeInTheDocument()
+    // Healthy hidden (zero matches in either tree), failing kept.
+    expect(screen.queryAllByLabelText("Open workspace owner/healthy")).toHaveLength(0)
+    expect(screen.queryAllByLabelText("Open workspace owner/broken").length).toBeGreaterThan(0)
     expect(tile).toHaveAttribute("aria-pressed", "true")
 
     // Toggle back.
     fireEvent.click(tile)
-    expect(screen.getByLabelText("Open workspace owner/healthy")).toBeInTheDocument()
+    expect(screen.queryAllByLabelText("Open workspace owner/healthy").length).toBeGreaterThan(0)
     expect(tile).toHaveAttribute("aria-pressed", "false")
   })
 
