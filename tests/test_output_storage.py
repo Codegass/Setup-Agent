@@ -1,3 +1,5 @@
+import base64
+import re
 from pathlib import Path
 
 from sag.agent.output_storage import OutputStorageManager
@@ -48,6 +50,29 @@ class FakeOutputStorageOrchestrator:
                 self.files[path] = self.files.get(path, "") + payload + "\n"
             else:
                 self.files[path] = payload + "\n"
+            return {"success": True, "output": "", "exit_code": 0}
+
+        # --- chunked (base64) write path ---
+        if command.startswith("rm -f "):
+            self.files.pop(command[len("rm -f ") :].split()[0], None)
+            return {"success": True, "output": "", "exit_code": 0}
+
+        m = re.match(r"printf '%s' '(.*)' >> (\S+)$", command, re.DOTALL)
+        if m:
+            chunk, target = m.group(1), m.group(2)
+            self.files[target] = self.files.get(target, "") + chunk
+            return {"success": True, "output": "", "exit_code": 0}
+
+        m = re.match(r"base64 -d (\S+) (>>|>) (\S+) && printf '\\n' >> \S+ && rm -f \S+$", command)
+        if m:
+            tmp, operator, path = m.group(1), m.group(2), m.group(3)
+            decoded = base64.b64decode(self.files.get(tmp, "")).decode("utf-8", "replace")
+            payload = decoded + "\n"
+            if operator == ">>":
+                self.files[path] = self.files.get(path, "") + payload
+            else:
+                self.files[path] = payload
+            self.files.pop(tmp, None)
             return {"success": True, "output": "", "exit_code": 0}
 
         return {"success": True, "output": "", "exit_code": 0}
@@ -111,3 +136,24 @@ def test_retrieve_returns_none_for_genuinely_missing_ref():
     orchestrator = FakeOutputStorageOrchestrator()
     storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
     assert storage.retrieve_output("output_does_not_exist") is None
+
+
+def test_store_and_retrieve_large_output_uses_chunked_write_and_round_trips():
+    """A multi-hundred-KB output (e.g. a full Maven build log) must store and
+    retrieve intact. A single heredoc would exceed the kernel's per-arg limit
+    ('argument list too long', the Fix 2b regression); the chunked base64 path
+    must round-trip it, and no single command may exceed the char cap.
+    """
+    orchestrator = FakeOutputStorageOrchestrator()
+    storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+
+    big = "[INFO] Downloading from central: progress line\n" * 6000
+    assert len(big) > storage._MAX_CMD_CHARS
+
+    ref_id = storage.store_output(task_id="maven_build", tool_name="maven", output=big)
+    assert ref_id
+
+    # No single command argument blew past the per-arg cap (the regression cause).
+    assert max(len(cmd) for cmd in orchestrator.commands) <= storage._MAX_CMD_CHARS + 200
+
+    assert storage.retrieve_output(ref_id) == big
