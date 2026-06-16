@@ -263,6 +263,34 @@ def test_validate_build_status_maven_unaffected():
     assert result["success"] is True
 
 
+def test_validate_build_status_maven_vendored_jar_only_is_not_green():
+    """Bigtop-B regression: an empty/aggregator root pom whose ``mvn compile``
+    produced ZERO .class files (no target/classes, no maven-status fingerprints,
+    no parseable expected artifacts) must NOT be reported green just because a
+    single vendored/checked-in JAR exists somewhere in the tree.
+
+    This is the exact false positive from the Bigtop run: build validation said
+    'SUCCESS - Found 1 build artifacts' off one stray JAR with class_count == 0.
+    """
+    orch = FakeBuildOrchestrator(
+        files={
+            "/workspace/bigtop/pom.xml",
+            "/workspace/bigtop/build-tools/vendored.jar",
+        },
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    result = validator.validate_build_status("bigtop")
+
+    assert result["evidence"]["build_system"] == "maven"
+    # The stray JAR is still counted as an artifact...
+    assert result["evidence"]["has_artifacts"] is True
+    assert result["evidence"]["artifact_count"] >= 1
+    # ...but a JVM build with zero compiled classes is NOT green.
+    assert result["success"] is False
+    assert "class" in result["reason"].lower()
+
+
 # ===========================================================================
 # Build evidence surfaced for the metrics read model (report_metrics contract)
 # ===========================================================================

@@ -1950,15 +1950,29 @@ PY"""
                     success = False
                     reason = f"Missing expected build artifacts: {', '.join(actual_vs_expected['missing'])}"
             else:
-                # Cannot determine expected artifacts, fall back to existence check
-                # For Java projects, at least having classes indicates compilation occurred
-                if (
-                    build_system in ["maven", "gradle"]
-                    and artifacts_result.get("class_count", 0) > 0
-                ):
-                    success = True
-                    reason = f"Found {artifacts_result['class_count']} compiled classes (build appears successful)"
+                # Cannot determine expected artifacts (e.g. an aggregator/empty
+                # root pom with no parseable modules or sources).
+                class_count = artifacts_result.get("class_count", 0)
+                if build_system in ["maven", "gradle"]:
+                    # SINGLE build-green policy: a JVM build is green only with
+                    # compiled .class evidence (or the build fingerprints handled
+                    # in Priority 1). A stray/checked-in/vendored JAR is NOT proof
+                    # the project compiled — Bigtop reported "build success" off one
+                    # such JAR with zero .class files while the real modules never
+                    # built. Require the compiled-class delta the user mandated.
+                    if class_count > 0:
+                        success = True
+                        reason = f"Found {class_count} compiled classes (build appears successful)"
+                    else:
+                        success = False
+                        reason = (
+                            f"No compiled .class files found for {build_system} build "
+                            f"({evidence['artifact_count']} non-class artifact(s) such as vendored "
+                            f"JARs are not evidence the project compiled)"
+                        )
                 else:
+                    # Non-JVM builds have no .class/JAR contract; existence of the
+                    # detected artifacts is the best available signal.
                     success = True
                     reason = f"Found {evidence['artifact_count']} build artifacts"
 
