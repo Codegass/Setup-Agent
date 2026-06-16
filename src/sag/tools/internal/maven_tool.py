@@ -383,8 +383,11 @@ class MavenTool(BaseTool):
             ):
                 analysis["maven_version_requirement"] = requested_requirement_metadata
 
-            # Store full output if large
-            full_output = result["output"]
+            # Store full output if large. For detached builds the orchestrator
+            # hands back a complete `full_output` (untruncated log) alongside the
+            # bounded inline `output`; persist the complete log so output_search
+            # can surface the real failure, not just a 50-line tail.
+            full_output = result.get("full_output") or result["output"]
             ref_id = None
             if len(full_output) > 800:
                 if not self.output_storage:

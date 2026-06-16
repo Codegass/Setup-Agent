@@ -488,6 +488,7 @@ class DockerOrchestrator:
         capture_stderr: bool = True,
         environment: Optional[Dict[str, str]] = None,
         timeout: Optional[int] = None,
+        truncate_output: bool = True,
     ) -> Dict[str, Any]:
         """
         Execute a command in the container.
@@ -498,6 +499,11 @@ class DockerOrchestrator:
             capture_stderr: Whether to capture stderr separately.
             environment: Additional environment variables.
             timeout: Optional maximum total execution time in seconds.
+            truncate_output: When True (default) large output is truncated to
+                protect the agent's context window. Set False only when the
+                caller needs the complete output for durable storage (e.g.
+                persisting a finished detached build log to the output store);
+                the full log is never fed straight into the model context.
 
         Returns:
             A dictionary with the result of the command execution.
@@ -577,7 +583,7 @@ class DockerOrchestrator:
 
             # IMPROVED: Content-aware truncation logic
             original_length = len(output)
-            if original_length > 10000:  # ~100 lines threshold
+            if truncate_output and original_length > 10000:  # ~100 lines threshold
                 lines = output.split("\n")
                 if len(lines) > 100:
                     # Check if this is JSON content that needs protection
@@ -1117,21 +1123,35 @@ class DockerOrchestrator:
         self, handle: Dict[str, Any], poll: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Build an execute_command-shaped result for a finished detached command."""
+        # Read the complete log (truncate_output=False): a finished build log is
+        # exactly what the agent needs to diagnose a failure, and the orchestrator's
+        # emergency truncation would otherwise gut the middle of it (only first/last
+        # 25 lines survive), hiding the real compiler/reactor error. The full text
+        # goes into `full_output` for the build tools to persist to the output store;
+        # the inline `output` stays bounded so it never floods the model context.
         log_result = self.execute_command(
-            f"cat {shlex.quote(handle['log_path'])}", workdir=None, timeout=120
+            f"cat {shlex.quote(handle['log_path'])}",
+            workdir=None,
+            timeout=120,
+            truncate_output=False,
         )
-        output = log_result.get("output") or poll.get("tail") or ""
+        full_output = log_result.get("output") or poll.get("tail") or ""
 
         exit_code = poll.get("exit_code")
         if exit_code is None:
             # Process gone without an exit file (crashed/killed) — fail safe.
             exit_code = 1
-            output += "\n[detached command ended without recording an exit code]"
+            full_output += "\n[detached command ended without recording an exit code]"
+
+        inline_output = full_output
+        if len(inline_output) > 10000:
+            inline_output = self._truncate_output_smartly(full_output)
 
         return {
             "success": exit_code == 0,
             "exit_code": exit_code,
-            "output": output,
+            "output": inline_output,
+            "full_output": full_output,
             "termination_reason": None,
             "dispatch_status": "completed_detached",
             "dispatch": handle,

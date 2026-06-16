@@ -223,8 +223,10 @@ class GradleTool(BaseTool):
             # Analyze the output
             analysis = self._analyze_gradle_output(result["output"], result["exit_code"])
 
-            # Store full output if large
-            full_output = result["output"]
+            # Store full output if large. Detached builds hand back a complete
+            # `full_output` (untruncated log) next to the bounded inline `output`;
+            # persist the complete log so output_search surfaces the real failure.
+            full_output = result.get("full_output") or result["output"]
             ref_id = None
             if len(full_output) > 800:
                 if not self.output_storage:
