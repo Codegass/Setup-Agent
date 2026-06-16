@@ -55,3 +55,11 @@ def test_demo_session_detail_has_modules():
     assert by_path["validator"].build_status == "failure"
     assert by_path["core"].failing_count == 2
     assert detail.module_summary.modules_with_test_failures == 1
+
+
+def test_demo_modules_carry_coverage():
+    detail = get_demo_session("CC-3")
+    by_path = {m.path: m for m in detail.modules}
+    assert by_path["core"].line_rate is not None
+    assert by_path["core"].branch_rate is not None
+    assert detail.module_summary.line_rate is not None

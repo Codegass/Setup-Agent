@@ -123,6 +123,13 @@ export interface ModuleSummary {
   failingNames?: string[]
   failingCount?: number | null
   evidenceRefs?: string[]
+  lineCovered?: number | null
+  lineTotal?: number | null
+  lineRate?: number | null
+  branchCovered?: number | null
+  branchTotal?: number | null
+  branchRate?: number | null
+  coverageSource?: string | null
 }
 
 export interface ModuleRollup {
@@ -133,6 +140,13 @@ export interface ModuleRollup {
   modulesWithTestFailures: number
   buildSystems: string[]
   singleModule: boolean
+  lineCovered?: number | null
+  lineTotal?: number | null
+  lineRate?: number | null
+  branchCovered?: number | null
+  branchTotal?: number | null
+  branchRate?: number | null
+  coverageSource?: string | null
 }
 
 export interface ExecutionSessionDetail {

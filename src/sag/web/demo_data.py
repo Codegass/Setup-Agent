@@ -170,6 +170,13 @@ def _commons_modules() -> list[ModuleSummary]:
                 "org.apache.commons.cli.HelpFormatterTest.testWrappedColumns",
             ],
             failing_count=2,
+            line_covered=2040,
+            line_total=2480,
+            line_rate=82.3,
+            branch_covered=520,
+            branch_total=720,
+            branch_rate=72.2,
+            coverage_source="jacoco-injected",
             evidence_refs=["/workspace/commons-cli/core/target/surefire-reports"],
         ),
         ModuleSummary(
@@ -187,6 +194,13 @@ def _commons_modules() -> list[ModuleSummary]:
             test_source="runner_xml",
             failing_names=[],
             failing_count=0,
+            line_covered=410,
+            line_total=520,
+            line_rate=78.8,
+            branch_covered=90,
+            branch_total=140,
+            branch_rate=64.3,
+            coverage_source="jacoco-injected",
             evidence_refs=["/workspace/commons-cli/help/target/surefire-reports"],
         ),
     ]
@@ -201,6 +215,13 @@ def _commons_module_summary() -> ModuleRollup:
         modules_with_test_failures=1,
         build_systems=["maven"],
         single_module=False,
+        line_covered=2450,
+        line_total=3000,
+        line_rate=81.7,
+        branch_covered=610,
+        branch_total=860,
+        branch_rate=70.9,
+        coverage_source="jacoco-injected",
     )
 
 
