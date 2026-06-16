@@ -323,4 +323,134 @@ describe("Dashboard", () => {
     const highlighted = rows.filter((row) => row.className.includes("bg-blue-50/60"))
     expect(highlighted.length).toBeGreaterThan(0)
   })
+
+  const twoWorkspaces: DashboardResponse = {
+    docker: { status: "connected", version: "27.1.1" },
+    workspaces: [
+      {
+        id: "sag-healthy",
+        project: "owner/healthy",
+        container: "sag-healthy",
+        stack: "Java · Maven",
+        docker: { status: "running", image: "sag/base" },
+        task: "All good",
+        build: { state: "success", tool: "Maven", time: "1s", note: "" },
+        test: { state: "pass", pass: 10, fail: 0, skip: 0, total: 10 },
+        report: "ready",
+        changed: 0,
+        updated: "just now",
+      },
+      {
+        id: "sag-broken",
+        project: "owner/broken",
+        container: "sag-broken",
+        stack: "Java · Gradle",
+        docker: { status: "running", image: "sag/base" },
+        task: "Build failed",
+        build: { state: "failure", tool: "Gradle", time: "2s", note: "" },
+        test: { state: "pending", pass: 0, fail: 0, skip: 0, total: 0 },
+        report: "none",
+        changed: 0,
+        updated: "just now",
+      },
+    ],
+  }
+
+  it("orders attention-needing workspaces ahead of healthy ones", () => {
+    render(
+      <Dashboard data={twoWorkspaces} onOpenWorkspace={() => {}} onOpenSession={() => {}} />,
+    )
+
+    const rows = screen.getAllByLabelText(/open workspace owner\//i)
+    // The failing workspace row renders before the healthy one in the DOM.
+    const brokenIndex = rows.findIndex((r) => r.getAttribute("aria-label")?.includes("owner/broken"))
+    const healthyIndex = rows.findIndex((r) => r.getAttribute("aria-label")?.includes("owner/healthy"))
+    expect(brokenIndex).toBeGreaterThanOrEqual(0)
+    expect(brokenIndex).toBeLessThan(healthyIndex)
+  })
+
+  it("tints rows that need attention and leaves healthy rows quiet", () => {
+    render(
+      <Dashboard data={twoWorkspaces} onOpenWorkspace={() => {}} onOpenSession={() => {}} />,
+    )
+
+    const broken = screen.getAllByLabelText("Open workspace owner/broken")[0]
+    const healthy = screen.getAllByLabelText("Open workspace owner/healthy")[0]
+    expect(broken.className).toContain("bg-status-failed-soft")
+    expect(healthy.className).not.toContain("bg-status-failed-soft")
+  })
+
+  it("filters to attention-only when the Need attention tile is clicked, and clears on toggle", () => {
+    render(
+      <Dashboard data={twoWorkspaces} onOpenWorkspace={() => {}} onOpenSession={() => {}} />,
+    )
+
+    // Both visible initially.
+    expect(screen.getAllByLabelText("Open workspace owner/healthy").length).toBeGreaterThan(0)
+    expect(screen.getAllByLabelText("Open workspace owner/broken").length).toBeGreaterThan(0)
+
+    const tile = screen.getByRole("button", { name: /filter: need attention/i })
+    fireEvent.click(tile)
+
+    // Healthy hidden, failing kept.
+    expect(screen.queryByLabelText("Open workspace owner/healthy")).not.toBeInTheDocument()
+    expect(screen.getAllByLabelText("Open workspace owner/broken").length).toBeGreaterThan(0)
+    expect(tile).toHaveAttribute("aria-pressed", "true")
+
+    // Toggle back.
+    fireEvent.click(tile)
+    expect(screen.getAllByLabelText("Open workspace owner/healthy").length).toBeGreaterThan(0)
+    expect(tile).toHaveAttribute("aria-pressed", "false")
+  })
+
+  it("does not make the Need attention tile a filter when nothing needs attention", () => {
+    const allHealthy: DashboardResponse = {
+      docker: { status: "connected" },
+      workspaces: [twoWorkspaces.workspaces[0]],
+    }
+    render(
+      <Dashboard data={allHealthy} onOpenWorkspace={() => {}} onOpenSession={() => {}} />,
+    )
+    expect(screen.queryByRole("button", { name: /filter: need attention/i })).not.toBeInTheDocument()
+  })
+
+  it("shows the paste-many hint in the empty state", () => {
+    render(
+      <Dashboard
+        data={{ docker: { status: "connected" }, workspaces: [] }}
+        onLaunchSetups={() => {}}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+    expect(screen.getByText(/paste a list of repo URLs/i)).toBeInTheDocument()
+  })
+
+  it("shows an 'Updated just now' stamp when given a fresh timestamp", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        lastUpdatedAt={Date.now()}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+      />,
+    )
+    expect(screen.getByText(/updated just now/i)).toBeInTheDocument()
+  })
+
+  it("shows a quiet inline indicator when polling fails", () => {
+    render(
+      <Dashboard
+        data={dashboard}
+        lastUpdatedAt={Date.now()}
+        onOpenSession={() => {}}
+        onOpenWorkspace={() => {}}
+        pollError="Error: refresh down"
+        pollFailed
+      />,
+    )
+    expect(screen.getByText(/couldn't refresh/i)).toBeInTheDocument()
+    // The full-page "unavailable" state must NOT appear when data is present.
+    expect(screen.queryByText(/dashboard unavailable/i)).not.toBeInTheDocument()
+  })
 })

@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import type { KeyboardEvent, ReactNode } from "react"
 import {
   Activity,
@@ -28,6 +28,10 @@ import {
   DeleteWorkspaceDialog,
   type DeleteWorkspaceTarget,
 } from "@/components/workspace/DeleteWorkspaceDialog"
+import { formatAgo } from "@/lib/relativeTime"
+import { cn } from "@/lib/utils"
+
+import { needsAttention, sortByAttentionFirst } from "./dashboardAttention"
 
 interface DashboardProps {
   data: DashboardResponse
@@ -39,6 +43,9 @@ interface DashboardProps {
   onDeleteWorkspace?: (workspaceId: string) => Promise<void>
   launchQueue?: LaunchQueueState | null
   highlightedWorkspaces?: string[]
+  lastUpdatedAt?: number | null
+  pollFailed?: boolean
+  pollError?: string | null
 }
 
 interface BuildDetails {
@@ -82,23 +89,6 @@ function buildMeta(build: WorkspaceSummary["build"]): string | null {
   const parts = [details.tool, details.time].filter(Boolean)
 
   return parts.length ? parts.join(" · ") : null
-}
-
-function needsAttention(workspace: WorkspaceSummary): boolean {
-  const buildState = normalize(buildDetails(workspace.build).state)
-  const testState = normalize(workspace.test.state)
-  const dockerState = normalize(workspace.docker.status)
-
-  const buildFailed = buildState === "failure" || buildState === "failed"
-  const testFailed =
-    testState === "fail" ||
-    testState === "failed" ||
-    (testState === "partial" && workspace.test.fail > 0)
-  // Any container that isn't running or freshly created has stopped unexpectedly.
-  const containerDown =
-    dockerState !== "" && dockerState !== "running" && dockerState !== "created"
-
-  return buildFailed || testFailed || containerDown
 }
 
 function launchProjectName(item: LaunchQueueItem): string {
@@ -173,15 +163,33 @@ export function Dashboard({
   onDeleteWorkspace,
   launchQueue = null,
   highlightedWorkspaces = [],
+  lastUpdatedAt = null,
+  pollFailed = false,
+  pollError = null,
 }: DashboardProps) {
   const [deleteTarget, setDeleteTarget] = useState<DeleteWorkspaceTarget | null>(null)
+  const [attentionOnly, setAttentionOnly] = useState(false)
   const workspaces = data.workspaces
+  const orderedWorkspaces = sortByAttentionFirst(workspaces)
   const running = workspaces.filter((w) => normalize(w.docker.status) === "running").length
   const pendingLaunches = pendingLaunchItems(launchQueue, workspaces)
   const failedLaunches = pendingLaunches.filter(
     (item) => normalize(item.status) === "failed",
   ).length
   const attention = workspaces.filter(needsAttention).length + failedLaunches
+  const filterActive = attentionOnly && attention > 0
+  const visibleWorkspaces = filterActive
+    ? orderedWorkspaces.filter(needsAttention)
+    : orderedWorkspaces
+  const visiblePending = filterActive
+    ? pendingLaunches.filter((item) => normalize(item.status) === "failed")
+    : pendingLaunches
+
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   return (
     <div className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
@@ -228,10 +236,14 @@ export function Dashboard({
           sub="active containers"
         />
         <SummaryCard
-          icon={attention ? <AlertTriangle size={14} className="text-red-500" /> : null}
+          active={filterActive}
+          icon={attention ? <AlertTriangle size={14} className="text-status-failed" /> : null}
+          interactive={attention > 0}
           label="Need attention"
-          value={attention}
+          onClick={attention > 0 ? () => setAttentionOnly((value) => !value) : undefined}
           sub="failed, partial, or stopped"
+          value={attention}
+          valueTone={attention > 0 ? "text-status-failed" : undefined}
         />
       </div>
 
@@ -252,16 +264,17 @@ export function Dashboard({
                 </div>
               ))}
             </div>
-            {pendingLaunches.map((item) => (
+            {visiblePending.map((item) => (
               <PendingLaunchRow
                 key={`pending-${item.id}`}
                 item={item}
                 onDelete={setDeleteTarget}
               />
             ))}
-            {workspaces.map((workspace) => (
+            {visibleWorkspaces.map((workspace) => (
               <WorkspaceRow
                 key={workspace.id}
+                attention={needsAttention(workspace)}
                 highlighted={highlightedWorkspaces.includes(workspace.id)}
                 onDelete={setDeleteTarget}
                 onOpenSession={onOpenSession}
@@ -272,16 +285,17 @@ export function Dashboard({
           </Card>
 
           <div className="mt-5 grid gap-3 lg:hidden">
-            {pendingLaunches.map((item) => (
+            {visiblePending.map((item) => (
               <PendingLaunchCard
                 key={`pending-${item.id}`}
                 item={item}
                 onDelete={setDeleteTarget}
               />
             ))}
-            {workspaces.map((workspace) => (
+            {visibleWorkspaces.map((workspace) => (
               <WorkspaceCard
                 key={workspace.id}
+                attention={needsAttention(workspace)}
                 highlighted={highlightedWorkspaces.includes(workspace.id)}
                 onDelete={setDeleteTarget}
                 onOpenSession={onOpenSession}
@@ -293,9 +307,31 @@ export function Dashboard({
         </>
       )}
 
-      <p className="mt-3 px-1 font-mono text-[10px] text-slate-500">
-        Refreshes automatically · or use Refresh
-      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 px-1 font-mono text-[10px] text-slate-500">
+        <span>
+          {lastUpdatedAt != null ? `Updated ${formatAgo(now - lastUpdatedAt)}` : "Updating…"}
+        </span>
+        {pollFailed ? (
+          <span
+            className="inline-flex items-center gap-1 text-status-attention"
+            title={pollError ?? undefined}
+          >
+            <span aria-hidden="true" className="inline-block h-1.5 w-1.5 rounded-full bg-status-attention" />
+            couldn't refresh
+          </span>
+        ) : null}
+        {filterActive ? (
+          <button
+            className="underline decoration-dotted hover:text-slate-700"
+            onClick={() => setAttentionOnly(false)}
+            type="button"
+          >
+            · Showing {visibleWorkspaces.length} needing attention · Show all
+          </button>
+        ) : (
+          <span>· refreshes automatically</span>
+        )}
+      </div>
 
       {deleteTarget ? (
         <DeleteWorkspaceDialog
@@ -314,13 +350,13 @@ export function Dashboard({
 function EmptyState({ onLaunchSetups }: { onLaunchSetups?: () => void }) {
   return (
     <Card className="mt-5 flex flex-col items-center px-6 py-14 text-center">
-      <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-400">
+      <div className="flex h-11 w-11 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500">
         <GitBranch size={20} />
       </div>
       <h2 className="mt-4 text-[15px] font-semibold text-slate-800">No workspaces yet</h2>
-      <p className="mt-1.5 max-w-[420px] text-[13px] leading-relaxed text-slate-500">
-        A workspace is a SAG-managed container set up from a repository. Launch one or
-        more setups to get started; paste a list of repo URLs to queue many at once.
+      <p className="mt-1.5 max-w-[440px] text-[13px] leading-relaxed text-slate-500">
+        A workspace is a SAG-managed container set up from a repository — its build,
+        tests, evidence, and report in one place. Launch one to get started.
       </p>
       {onLaunchSetups ? (
         <Button className="mt-5" onClick={onLaunchSetups} type="button">
@@ -328,6 +364,9 @@ function EmptyState({ onLaunchSetups }: { onLaunchSetups?: () => void }) {
           Launch your first setup
         </Button>
       ) : null}
+      <p className="mt-4 font-mono text-[11px] text-slate-500">
+        Tip: paste a list of repo URLs to queue many setups at once.
+      </p>
     </Card>
   )
 }
@@ -337,14 +376,45 @@ function SummaryCard({
   value,
   sub,
   icon,
+  onClick,
+  active = false,
+  interactive = false,
+  valueTone,
 }: {
   label: string
   value: number
   sub: string
   icon?: ReactNode
+  onClick?: () => void
+  active?: boolean
+  interactive?: boolean
+  valueTone?: string
 }) {
+  const clickable = interactive && Boolean(onClick)
   return (
-    <Card className="px-4 py-3.5">
+    <Card
+      aria-label={clickable ? `Filter: ${label}` : undefined}
+      aria-pressed={clickable ? active : undefined}
+      className={cn(
+        "px-4 py-3.5",
+        clickable &&
+          "cursor-pointer transition-colors hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-failed-border",
+        active && "bg-status-failed-soft/50 ring-1 ring-status-failed-border",
+      )}
+      onClick={clickable ? onClick : undefined}
+      onKeyDown={
+        clickable
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault()
+                onClick?.()
+              }
+            }
+          : undefined
+      }
+      role={clickable ? "button" : undefined}
+      tabIndex={clickable ? 0 : undefined}
+    >
       <div className="flex items-center justify-between gap-3">
         <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
           {label}
@@ -352,7 +422,9 @@ function SummaryCard({
         {icon}
       </div>
       <div className="mt-1.5 flex items-baseline gap-2">
-        <span className="text-[26px] font-semibold tabular-nums text-slate-900">{value}</span>
+        <span className={cn("text-[26px] font-semibold tabular-nums text-slate-900", valueTone)}>
+          {value}
+        </span>
         <span className="min-w-0 text-[12px] text-slate-500">{sub}</span>
       </div>
     </Card>
@@ -365,12 +437,14 @@ function WorkspaceRow({
   onOpenSession,
   onDelete,
   highlighted = false,
+  attention = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
   onDelete: (target: DeleteWorkspaceTarget) => void
   highlighted?: boolean
+  attention?: boolean
 }) {
   const openWorkspace = () => onOpenWorkspace(workspace.id)
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -387,9 +461,13 @@ function WorkspaceRow({
   return (
     <div
       aria-label={`Open workspace ${workspace.project}`}
-      className={`group grid ${tableColumns} cursor-pointer items-center gap-3 border-b border-slate-100 px-4 py-3 text-left transition-colors duration-700 last:border-b-0 hover:bg-slate-50/70 focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 ${
-        highlighted ? "bg-blue-50/60" : ""
-      }`}
+      className={cn(
+        "group grid",
+        tableColumns,
+        "cursor-pointer items-center gap-3 border-b border-slate-100 px-4 py-3 text-left transition-colors duration-700 last:border-b-0 hover:bg-slate-50/70 focus-visible:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30",
+        attention && "bg-status-failed-soft/50",
+        highlighted && "bg-blue-50/60",
+      )}
       onClick={openWorkspace}
       onKeyDown={handleKeyDown}
       role="button"
@@ -418,19 +496,23 @@ function WorkspaceCard({
   onOpenSession,
   onDelete,
   highlighted = false,
+  attention = false,
 }: {
   workspace: WorkspaceSummary
   onOpenWorkspace: (workspaceId: string) => void
   onOpenSession: (workspaceId: string, sessionId: string, tab?: string) => void
   onDelete: (target: DeleteWorkspaceTarget) => void
   highlighted?: boolean
+  attention?: boolean
 }) {
   return (
     <Card
       aria-label={`Open workspace ${workspace.project}`}
-      className={`cursor-pointer p-4 transition-colors duration-700 hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 ${
-        highlighted ? "border-blue-200 bg-blue-50/60" : ""
-      }`}
+      className={cn(
+        "cursor-pointer p-4 transition-colors duration-700 hover:bg-slate-50/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30",
+        attention && "border-status-failed-border bg-status-failed-soft/50",
+        highlighted && "border-blue-200 bg-blue-50/60",
+      )}
       onClick={() => onOpenWorkspace(workspace.id)}
       onKeyDown={(event) => {
         if (event.target !== event.currentTarget) {

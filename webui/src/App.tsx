@@ -23,6 +23,7 @@ import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
 import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
 import { Dashboard } from "@/pages/Dashboard"
+import { DashboardSkeleton } from "@/pages/DashboardSkeleton"
 import { SessionDetail } from "@/pages/SessionDetail"
 import { Workspace, type WorkspaceSessionRow } from "@/pages/Workspace"
 
@@ -47,6 +48,7 @@ export function App() {
   const [launchDialogOpen, setLaunchDialogOpen] = useState(false)
   const [launchNotice, setLaunchNotice] = useState<string | null>(null)
   const [highlightedWorkspaces, setHighlightedWorkspaces] = useState<string[]>([])
+  const [lastUpdatedAt, setLastUpdatedAt] = useState<number | null>(null)
   const highlightTimers = useRef<number[]>([])
 
   const loadLaunchQueue = useCallback(async () => {
@@ -72,6 +74,7 @@ export function App() {
     try {
       const nextDashboard = await fetchDashboard()
       setDashboard(nextDashboard)
+      setLastUpdatedAt(Date.now())
     } catch (err) {
       setDashboardError(String(err))
     } finally {
@@ -252,13 +255,7 @@ export function App() {
         </div>
       </header>
 
-      {loading && !dashboard ? (
-        <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
-          <Card className="inline-flex px-3 py-2 text-[13px] text-slate-500">
-            Loading workspaces...
-          </Card>
-        </main>
-      ) : null}
+      {loading && !dashboard ? <DashboardSkeleton /> : null}
 
       {!dashboard && !loading && dashboardError ? (
         <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
@@ -275,20 +272,6 @@ export function App() {
             </Button>
           </Card>
         </main>
-      ) : null}
-
-      {dashboard && dashboardError ? (
-        <div className="mx-auto max-w-[1180px] px-4 pt-5 sm:px-6 lg:px-8">
-          <Card className="flex flex-col gap-3 border-red-100 bg-red-50/50 px-4 py-3 text-[13px] sm:flex-row sm:items-center sm:justify-between">
-            <div>
-              <div className="font-semibold text-red-700">Refresh failed</div>
-              <div className="mt-0.5 font-mono text-[12px] text-red-600">{dashboardError}</div>
-            </div>
-            <Button onClick={() => void loadDashboard()} type="button" variant="outline">
-              Retry
-            </Button>
-          </Card>
-        </div>
       ) : null}
 
       {dashboard && routeError ? (
@@ -315,12 +298,15 @@ export function App() {
         <Dashboard
           data={dashboard}
           highlightedWorkspaces={highlightedWorkspaces}
+          lastUpdatedAt={lastUpdatedAt}
           launchQueue={launchQueue}
           onDeleteWorkspace={deleteWorkspace}
           onLaunchSetups={() => setLaunchDialogOpen(true)}
           onOpenSession={openSession}
           onOpenWorkspace={openWorkspace}
           onRefresh={() => void loadDashboard()}
+          pollError={dashboardError}
+          pollFailed={Boolean(dashboardError)}
           refreshing={loading}
         />
       ) : null}

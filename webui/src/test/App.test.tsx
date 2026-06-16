@@ -93,7 +93,7 @@ describe("App", () => {
 
     render(<App />)
 
-    expect(screen.getByText("Loading workspaces...")).toBeInTheDocument()
+    expect(screen.getByRole("status", { name: /loading workspaces/i })).toBeInTheDocument()
     expect(await screen.findAllByText("apache/commons-cli")).not.toHaveLength(0)
     expect(screen.getByText("docker · connected")).toBeInTheDocument()
   })
@@ -125,8 +125,7 @@ describe("App", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh dashboard" }))
 
-    expect(await screen.findByText("Refresh failed")).toBeInTheDocument()
-    expect(screen.getByText("Error: refresh down")).toBeInTheDocument()
+    expect(await screen.findByText(/couldn't refresh/i)).toBeInTheDocument()
     expect(screen.getAllByText("apache/commons-cli")).not.toHaveLength(0)
     expect(screen.queryByText("Dashboard unavailable")).not.toBeInTheDocument()
   })
