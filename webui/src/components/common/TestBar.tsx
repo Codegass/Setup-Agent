@@ -30,7 +30,7 @@ export function TestBar({ pass, fail, total, className, ...props }: TestBarProps
       <span className="font-mono text-[11px] text-slate-500">
         <span className="text-emerald-600">{pass}</span>
         {fail ? <span className="text-red-600"> / {fail}</span> : null}{" "}
-        <span className="text-slate-400">· {total}</span>
+        <span className="text-slate-500">· {total}</span>
       </span>
     </div>
   )

@@ -131,7 +131,7 @@ export function ModuleTable({
                     <td className="px-2 py-2">{passRate(m.testsPassed, m.testsFailed)}</td>
                     <td className="px-2 py-2" style={{ minWidth: 150 }}>
                       {m.lineRate == null && m.branchRate == null ? (
-                        <span className="text-slate-400">— not measured</span>
+                        <span className="text-slate-500">— not measured</span>
                       ) : (
                         <div className="space-y-0.5">
                           {m.lineRate != null ? <CoverageBar label="L" rate={m.lineRate} /> : null}
