@@ -17,6 +17,7 @@ from rich.text import Text
 
 from sag import __version__
 from sag.agent.agent import SetupAgent
+from sag.coverage.runner import apply_coverage
 from sag.agent.context_journal import JOURNAL_DIR
 from sag.agent.phase_machine import PHASE_NAMES
 from sag.config import (
@@ -216,6 +217,46 @@ def _save_setup_artifacts(orchestrator: DockerOrchestrator, project_name: str) -
         console.print(f"[yellow]⚠️ Could not save artifacts: {e}[/yellow]")
 
 
+def _detect_coverage_build_system(orchestrator, project_dir: str):
+    """Detect maven/gradle physically for the coverage pass (or None)."""
+    try:
+        from sag.agent.physical_validator import PhysicalValidator
+
+        bs = PhysicalValidator(docker_orchestrator=orchestrator)._detect_build_system(project_dir)
+        return bs if bs in ("maven", "gradle") else None
+    except Exception as exc:
+        logger.debug(f"coverage build-system detect failed: {exc}")
+        return None
+
+
+def _run_coverage_pass(orchestrator, project_name: str) -> bool:
+    """Isolated, best-effort coverage pass AFTER the setup verdict is locked.
+
+    Never raises; never changes the setup result. Warns if the project source
+    tree changed (pollution guard)."""
+    project_dir = f"/workspace/{project_name}"
+    build_system = _detect_coverage_build_system(orchestrator, project_dir)
+    if build_system is None:
+        logger.info("Coverage: no maven/gradle build detected; skipping.")
+        return False
+    try:
+        wrote = apply_coverage(orchestrator, project_dir, build_system)
+    except Exception as exc:  # defensive; apply_coverage is already best-effort
+        logger.warning(f"Coverage pass failed (best-effort, ignored): {exc}")
+        return False
+    # Pollution guard (warn-only): tracked source files must be unchanged.
+    try:
+        dirty = orchestrator.execute_command(
+            f"cd {project_dir} && git status --porcelain 2>/dev/null "
+            f"| grep -vE 'target/|build/|\\.setup_agent' | head -5"
+        )
+        if (dirty.get("output") or "").strip():
+            logger.warning(f"Coverage pass left source-tree changes:\n{dirty['output']}")
+    except Exception:
+        pass
+    return wrote
+
+
 @click.group()
 @click.option(
     "--log-level",
@@ -335,6 +376,9 @@ def list():
 @click.option(
     "--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs"
 )
+@click.option(
+    "--coverage", is_flag=True, help="Run an isolated JaCoCo coverage pass after setup (best-effort)"
+)
 @click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.option(
     "--ref",
@@ -342,7 +386,7 @@ def list():
     help="Git ref to set up, such as a branch, tag, release tag, short commit, or full commit.",
 )
 @click.pass_context
-def project(ctx, repo_url, name, goal, record, ui, project_ref):
+def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
     """Initial setup for a new project from repository URL."""
 
     config = ctx.obj["config"]
@@ -422,6 +466,9 @@ def project(ctx, repo_url, name, goal, record, ui, project_ref):
         if record:
             _save_setup_artifacts(orchestrator, project_name)
 
+        if coverage:
+            _run_coverage_pass(orchestrator, project_name)
+
         # Only show completion messages in non-UI mode (UI manager handles this)
         if not config.ui_mode:
             if success:
@@ -454,9 +501,12 @@ def project(ctx, repo_url, name, goal, record, ui, project_ref):
 @click.option(
     "--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs"
 )
+@click.option(
+    "--coverage", is_flag=True, help="Run an isolated JaCoCo coverage pass after setup (best-effort)"
+)
 @click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.pass_context
-def run(ctx, docker_name, task, max_iterations, record, ui):
+def run(ctx, docker_name, task, max_iterations, record, coverage, ui):
     """Run a specific task on an existing SAG project."""
 
     config = ctx.obj["config"]
@@ -549,6 +599,9 @@ def run(ctx, docker_name, task, max_iterations, record, ui):
         # Save artifacts if recording is enabled
         if record:
             _save_setup_artifacts(orchestrator, actual_project_name)
+
+        if coverage:
+            _run_coverage_pass(orchestrator, actual_project_name)
 
         # Only show completion messages in non-UI mode (UI manager handles this)
         if not config.ui_mode:
