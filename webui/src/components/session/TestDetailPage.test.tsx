@@ -21,7 +21,8 @@ describe("TestDetailPage", () => {
   it("renders tiles, a back button, and the per-module table", () => {
     const onBack = vi.fn()
     render(<TestDetailPage detail={detail} onBack={onBack} />)
-    expect(screen.getByText("3,841")).toBeInTheDocument()      // runner exec tile
+    expect(screen.getByText(/99\.9% pass/i)).toBeInTheDocument()  // conclusion rate badge
+    expect(screen.getByText("/ 3,841")).toBeInTheDocument()       // runner-exec total in headline
     expect(screen.getByText(/modules w\/ fails/i)).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: /back/i }))
     expect(onBack).toHaveBeenCalled()
@@ -35,7 +36,8 @@ describe("TestDetailPage", () => {
       moduleSummary: { ...detail.moduleSummary, modulesTotal: 1, singleModule: true },
       modules: [],
     } as any} />)
-    expect(screen.getByText(/single module/i)).toBeInTheDocument()
+    expect(screen.getByText(/single-module project/i)).toBeInTheDocument()
+    expect(screen.queryByText(/Overview/i)).not.toBeInTheDocument()
   })
 
   it("shows real coverage in the tile when present", () => {
