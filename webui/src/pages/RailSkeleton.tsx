@@ -1,11 +1,13 @@
+import { cn } from "@/lib/utils"
+
 const ROW_KEYS = ["r1", "r2", "r3", "r4", "r5", "r6"]
 
 /** First-load placeholder shaped like the workspace rail. */
-export function RailSkeleton() {
+export function RailSkeleton({ className }: { className?: string }) {
   return (
     <aside
       aria-label="Loading workspaces"
-      className="flex h-full w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white"
+      className={cn("flex h-full w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white", className)}
       role="status"
     >
       <div className="space-y-3 border-b border-slate-200 px-4 pb-3 pt-4">

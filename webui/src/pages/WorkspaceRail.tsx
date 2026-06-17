@@ -157,9 +157,11 @@ export function WorkspaceRail({
   onLaunchSetups,
   launchQueue = null,
   onRemoveLaunch,
+  onAfterSelect,
   highlightedWorkspaces = [],
   lastUpdatedAt = null,
   pollFailed = false,
+  className,
 }: {
   data: DashboardResponse
   selectedId: string | null
@@ -167,11 +169,18 @@ export function WorkspaceRail({
   onLaunchSetups: () => void
   launchQueue?: LaunchQueueState | null
   onRemoveLaunch?: (workspaceId: string) => Promise<void>
+  onAfterSelect?: () => void
   highlightedWorkspaces?: string[]
   lastUpdatedAt?: number | null
   pollFailed?: boolean
+  className?: string
 }) {
   const [query, setQuery] = useState("")
+  // Selecting a workspace also runs onAfterSelect (used to close the mobile drawer).
+  const handleSelect = (id: string) => {
+    onSelect(id)
+    onAfterSelect?.()
+  }
   const [removeTarget, setRemoveTarget] = useState<DeleteWorkspaceTarget | null>(null)
   const ordered = sortByAttentionFirst(data.workspaces)
   const q = query.trim().toLowerCase()
@@ -189,7 +198,11 @@ export function WorkspaceRail({
   const dockerDot = DOT_TONE[statusMeta(data.docker.status).tone] ?? DOT_TONE.neutral
 
   return (
-    <aside className="flex h-full min-h-0 w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white">
+    <aside
+      aria-label="Workspaces"
+      className={cn("flex h-full min-h-0 w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white", className)}
+      id="workspace-rail"
+    >
       <div className="border-b border-slate-200 px-4 pb-3 pt-4">
         <div className="flex items-center gap-2">
           <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-900 font-mono text-[11px] font-bold text-white">S</span>
@@ -238,7 +251,7 @@ export function WorkspaceRail({
               <RailRow
                 key={w.id}
                 highlighted={highlightedWorkspaces.includes(w.id)}
-                onSelect={onSelect}
+                onSelect={handleSelect}
                 selected={w.id === selectedId}
                 workspace={w}
               />

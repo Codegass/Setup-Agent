@@ -66,6 +66,15 @@ describe("WorkspaceRail", () => {
     expect(onSelect).toHaveBeenCalledWith("sag-broken")
   })
 
+  it("calls onAfterSelect after selecting a workspace (drawer close hook)", () => {
+    const onSelect = vi.fn()
+    const onAfterSelect = vi.fn()
+    render(<WorkspaceRail {...props} onAfterSelect={onAfterSelect} onSelect={onSelect} />)
+    fireEvent.click(screen.getByRole("button", { name: /owner\/broken/ }))
+    expect(onSelect).toHaveBeenCalledWith("sag-broken")
+    expect(onAfterSelect).toHaveBeenCalled()
+  })
+
   it("filters rows by the query input", () => {
     render(<WorkspaceRail {...props} />)
     fireEvent.change(screen.getByPlaceholderText(/filter/i), { target: { value: "broken" } })
