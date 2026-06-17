@@ -3,6 +3,7 @@
 import json
 import re
 import shlex
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -334,6 +335,7 @@ class MavenTool(BaseTool):
                 ]
             )
 
+            _build_t0 = time.monotonic()
             if is_long_running and hasattr(self.orchestrator, "execute_command_with_soft_timeout"):
                 # Dispatch-and-poll: run detached with a soft window; if still
                 # running when it closes, hand the log tail back to the agent
@@ -356,6 +358,7 @@ class MavenTool(BaseTool):
             else:
                 # Use regular version for quick commands like help, version, etc.
                 result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+            _build_elapsed = time.monotonic() - _build_t0
 
             if result.get("dispatch_status") == "running_detached":
                 return detached_handoff_tool_result("maven", maven_cmd, result)
@@ -422,6 +425,7 @@ class MavenTool(BaseTool):
                         working_dir=working_directory,
                         exit_code=result["exit_code"],
                         output=result["output"],
+                        duration=_build_elapsed,
                     )
                 logger.debug(f"Tracked Maven command: {maven_cmd[:100]}...")
 
