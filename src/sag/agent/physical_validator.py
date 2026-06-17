@@ -79,6 +79,18 @@ def evaluate_run_verdict(
     return "success" if pass_rate >= test_pass_threshold * 100.0 else "failed"
 
 
+def _format_build_duration(seconds: float) -> str:
+    """Human-friendly build duration.
+
+    ``"47.2s"`` for under a minute (one decimal place); ``"3m 12s"`` otherwise,
+    with the seconds component zero-padded to two digits.
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, secs = divmod(int(round(seconds)), 60)
+    return f"{minutes}m {secs:02d}s"
+
+
 class PhysicalValidator:
     """
     Validates build/test status based on physical evidence.
@@ -1948,6 +1960,24 @@ PY"""
         else:
             success = False
             reason = "No build evidence found (no artifacts or build fingerprints)"
+
+        # Surface the build command + timed duration (if a command tracker with a
+        # recorded build is attached) and the primary artifact for the metrics
+        # read model. validate_build_status itself does not execute the build, so
+        # the duration is whatever maven_tool timed and stored on the tracker.
+        command_tracker = getattr(self, "command_tracker", None)
+        last_build = command_tracker.get_last_build_command() if command_tracker else None
+        if last_build:
+            command = last_build.get("command")
+            if command:
+                evidence["build_command"] = command
+            dur = last_build.get("duration")
+            if isinstance(dur, (int, float)):
+                evidence["build_time"] = _format_build_duration(dur)
+        # Primary artifact: first of the collected build-output samples.
+        samples = evidence.get("artifact_samples") or []
+        if samples:
+            evidence.setdefault("artifact", samples[0])
 
         conflicts = [] if success else ["build_validation_failed"]
         result = {

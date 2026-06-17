@@ -16,7 +16,11 @@ import re
 
 import pytest
 
-from sag.agent.physical_validator import PhysicalValidator, evaluate_run_verdict
+from sag.agent.physical_validator import (
+    PhysicalValidator,
+    _format_build_duration,
+    evaluate_run_verdict,
+)
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD, Config
 from sag.tools.report_tool import ReportTool
 
@@ -314,6 +318,89 @@ def test_validate_build_status_evidence_populates_metrics_fields_maven():
     assert "module_output_count" in evidence
     assert any(sample.endswith(".jar") for sample in evidence["artifact_samples"])
     assert evidence["warnings"] == []
+
+
+# ===========================================================================
+# Build time / command / artifact surfaced in evidence (Plan 3 - Task 3)
+# ===========================================================================
+class _StubCommandTracker:
+    """Minimal CommandTracker stand-in returning a recorded last build command."""
+
+    def __init__(self, last_build):
+        self._last_build = last_build
+
+    def get_last_build_command(self):
+        return self._last_build
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (47.2, "47.2s"),
+        (0.0, "0.0s"),
+        (59.94, "59.9s"),
+        (60, "1m 00s"),
+        (192, "3m 12s"),
+        (192.4, "3m 12s"),
+        (3600, "60m 00s"),
+    ],
+)
+def test_format_build_duration(seconds, expected):
+    assert _format_build_duration(seconds) == expected
+
+
+def test_validate_build_status_surfaces_build_time_command_artifact():
+    """When a command_tracker with a timed build is attached, validate_build_status
+    threads build_command + a formatted build_time into evidence, and exposes the
+    primary artifact (first artifact sample)."""
+    orch = FakeBuildOrchestrator(
+        files={"/workspace/mvn/pom.xml", "/workspace/mvn/target/foo-1.0.jar"},
+        dirs={"/workspace/mvn/target/classes"},
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+    validator.command_tracker = _StubCommandTracker(
+        {"command": "mvn -q clean package", "duration": 47.2}
+    )
+
+    evidence = validator.validate_build_status("mvn")["evidence"]
+
+    assert evidence["build_command"] == "mvn -q clean package"
+    assert evidence["build_time"] == "47.2s"
+    # Primary artifact is the first collected sample.
+    assert evidence["artifact"] == evidence["artifact_samples"][0]
+
+
+def test_validate_build_status_artifact_without_tracker():
+    """No command_tracker: build_time/build_command stay absent, but the primary
+    artifact is still surfaced from artifact_samples (no regression)."""
+    orch = FakeBuildOrchestrator(
+        files={"/workspace/mvn/pom.xml", "/workspace/mvn/target/foo-1.0.jar"},
+        dirs={"/workspace/mvn/target/classes"},
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    evidence = validator.validate_build_status("mvn")["evidence"]
+
+    assert "build_time" not in evidence
+    assert "build_command" not in evidence
+    assert evidence["artifact"] == evidence["artifact_samples"][0]
+
+
+def test_validate_build_status_command_without_duration():
+    """A tracked build command with no duration surfaces the command but no time."""
+    orch = FakeBuildOrchestrator(
+        files={"/workspace/mvn/pom.xml", "/workspace/mvn/target/foo-1.0.jar"},
+        dirs={"/workspace/mvn/target/classes"},
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+    validator.command_tracker = _StubCommandTracker(
+        {"command": "mvn install", "duration": None}
+    )
+
+    evidence = validator.validate_build_status("mvn")["evidence"]
+
+    assert evidence["build_command"] == "mvn install"
+    assert "build_time" not in evidence
 
 
 # ===========================================================================
