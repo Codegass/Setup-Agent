@@ -101,6 +101,24 @@ describe("App", () => {
     expect(screen.getByText(/docker 27\.1\.1/i)).toBeInTheDocument()
   })
 
+  it("exposes a workspace-rail toggle that opens and closes the drawer", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+      if (url === "/api/project-launches") return Promise.resolve(jsonResponse(emptyLaunchQueue))
+      if (url.startsWith("/api/sessions/")) return Promise.resolve(jsonResponse(sessionDetail))
+      return Promise.resolve(jsonResponse(dashboard))
+    })
+
+    render(<App />)
+
+    const toggle = await screen.findByRole("button", { name: /workspaces menu/i })
+    expect(toggle).toHaveAttribute("aria-expanded", "false")
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute("aria-expanded", "true")
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute("aria-expanded", "false")
+  })
+
   it("shows an unavailable state when dashboard fetch fails", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"))
 

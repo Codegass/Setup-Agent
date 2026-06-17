@@ -1,3 +1,4 @@
+import { Menu } from "lucide-react"
 import { useCallback, useEffect, useRef, useState } from "react"
 
 import {
@@ -22,6 +23,7 @@ import { RailSkeleton } from "@/pages/RailSkeleton"
 import { WorkspaceRail } from "@/pages/WorkspaceRail"
 import { sortByAttentionFirst } from "@/pages/dashboardAttention"
 import { DetailPane } from "@/pages/detail/DetailPane"
+import { cn } from "@/lib/utils"
 
 const DASHBOARD_POLL_MS = 5000
 const SESSION_DETAIL_POLL_MS = 3000
@@ -42,6 +44,7 @@ export function App() {
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null)
   const [selectedSessionId, setSelectedSessionIdState] = useState<string | undefined>(undefined)
   const [selectedFacet, setSelectedFacet] = useState<string | undefined>(undefined)
+  const [railOpen, setRailOpen] = useState(false)
   const highlightTimers = useRef<number[]>([])
 
   const loadLaunchQueue = useCallback(async () => {
@@ -153,6 +156,20 @@ export function App() {
     return () => window.clearInterval(interval)
   }, [ensureSessionDetail, sessionId, sessionDetails])
 
+  // Esc closes the mobile rail drawer.
+  useEffect(() => {
+    if (!railOpen) {
+      return
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setRailOpen(false)
+      }
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [railOpen])
+
   const selectWorkspace = (id: string) => {
     setSelectedWorkspaceId(id)
     setSelectedSessionIdState(undefined) // fall back to that workspace's latest session
@@ -215,14 +232,30 @@ export function App() {
 
   return (
     <div className="flex h-screen min-h-0 w-full overflow-hidden bg-[#fbfbfc] text-slate-900">
+      {/* Mobile-only backdrop behind the rail drawer. */}
+      {railOpen ? (
+        <button
+          aria-label="Close workspaces menu"
+          className="fixed inset-0 z-[var(--z-overlay)] bg-slate-900/30 lg:hidden"
+          onClick={() => setRailOpen(false)}
+          type="button"
+        />
+      ) : null}
+
       {loading && !dashboard ? (
-        <RailSkeleton />
+        <RailSkeleton className="hidden lg:flex" />
       ) : dashboard ? (
         <WorkspaceRail
+          className={cn(
+            // Persistent column at lg+, slide-in drawer below lg.
+            "fixed inset-y-0 left-0 z-[var(--z-modal)] transition-transform lg:static lg:z-auto lg:translate-x-0",
+            railOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0",
+          )}
           data={dashboard}
           highlightedWorkspaces={highlightedWorkspaces}
           lastUpdatedAt={lastUpdatedAt}
           launchQueue={launchQueue}
+          onAfterSelect={() => setRailOpen(false)}
           onLaunchSetups={() => setLaunchDialogOpen(true)}
           onRemoveLaunch={deleteWorkspace}
           onSelect={selectWorkspace}
@@ -231,7 +264,25 @@ export function App() {
         />
       ) : null}
 
-      <main className="min-h-0 flex-1 overflow-hidden bg-white">
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
+        {/* Mobile top bar: opens the workspace rail drawer (hidden at lg+). */}
+        <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-2 lg:hidden">
+          <button
+            aria-controls="workspace-rail"
+            aria-expanded={railOpen}
+            aria-label="Workspaces menu"
+            className="rounded-md border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+            onClick={() => setRailOpen((value) => !value)}
+            type="button"
+          >
+            <Menu size={16} />
+          </button>
+          <span className="truncate font-mono text-[12px] font-semibold text-slate-700">
+            {selectedWorkspace ? selectedWorkspace.project : "SAG Workbench"}
+          </span>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-hidden">
         {!dashboard && !loading && dashboardError ? (
           <div className="p-6">
             <Card className="max-w-xl p-5">
@@ -275,6 +326,7 @@ export function App() {
             </div>
           </div>
         ) : null}
+        </div>
       </main>
 
       {launchNotice ? (
