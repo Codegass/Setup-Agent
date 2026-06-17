@@ -9,6 +9,7 @@ from sag.web.session_registry import (
     ContainerSessionRegistry,
     ContainerSessionStore,
     SessionRegistry,
+    _build_payload_from_metrics,
     _matching_log_session_dir,
     _setup_logs,
 )
@@ -769,3 +770,24 @@ def test_same_second_setup_sessions_resolve_to_their_own_workspace():
     detail = registry.get_session_detail(dubbo_id)
     assert detail.workspace == "sag-dubbo"
     assert detail.title == "Setup dubbo"
+
+
+def test_build_payload_surfaces_time_note_artifact():
+    payload = _build_payload_from_metrics({
+        "build": {
+            "state": "success", "system": "maven", "tool": "Maven 3.9.6",
+            "class_count": 115, "jar_count": 1,
+            "time": "47.2s", "note": "clean package", "artifact": "target/x.jar",
+        }
+    })
+    assert payload is not None
+    assert payload["time"] == "47.2s"
+    assert payload["note"] == "clean package"
+    assert payload["artifact"] == "target/x.jar"
+
+
+def test_build_payload_time_falls_back_to_dash():
+    payload = _build_payload_from_metrics({"build": {"state": "success", "tool": "maven"}})
+    assert payload is not None
+    assert payload["time"] == "—"
+    assert payload.get("note") in (None, "", "—")
