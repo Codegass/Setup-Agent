@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import time
@@ -47,6 +48,35 @@ class SessionRegistry:
         return parse_session_index(raw, workspace_id)
 
 
+def _resolve_logs_root() -> Path:
+    """Locate the host `logs/` dir independent of the launch CWD.
+
+    The CLI (`sag project`) writes logs to `<cwd>/logs/`, but the web UI is
+    often launched from a subdirectory (e.g. `webui/`). A plain relative
+    `Path("logs")` then resolves to `webui/logs/` (empty) and the Logs facet
+    shows "No raw logs captured". Honour SAG_LOG_DIR, else walk up from CWD for
+    a `logs/` dir that actually contains session logs, else fall back to `logs`.
+    """
+    env = os.environ.get("SAG_LOG_DIR")
+    if env:
+        return Path(env)
+    cwd = Path.cwd()
+    bases = (cwd, *cwd.parents)
+    # Prefer a logs/ that holds real project build logs. Launching `sag ui` from
+    # a subdir first creates an (empty) `<subdir>/logs/session_<now>/` for the UI
+    # process itself, which must not shadow the CLI's logs one level up.
+    for base in bases:
+        candidate = base / "logs"
+        if candidate.is_dir() and any(candidate.glob("session_*/command_project_*.log")):
+            return candidate
+    # Fallback: the nearest logs/ with any session dir.
+    for base in bases:
+        candidate = base / "logs"
+        if candidate.is_dir() and any(candidate.glob("session_*")):
+            return candidate
+    return Path("logs")
+
+
 class ContainerSessionRegistry:
     # Unresolvable session ids are remembered for this long: the dashboard
     # polls session details every ~3s, and a stale id (e.g. a removed
@@ -63,7 +93,7 @@ class ContainerSessionRegistry:
     ):
         self.orchestrator_factory = orchestrator_factory
         self.workspace_registry_factory = workspace_registry_factory
-        self.logs_root = logs_root if logs_root is not None else Path("logs")
+        self.logs_root = logs_root if logs_root is not None else _resolve_logs_root()
         self._now = now_fn if now_fn is not None else time.monotonic
         self._missing_sessions: dict[str, float] = {}
 

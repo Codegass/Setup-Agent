@@ -791,3 +791,44 @@ def test_build_payload_time_falls_back_to_dash():
     assert payload is not None
     assert payload["time"] == "—"
     assert payload.get("note") in (None, "", "—")
+
+
+def test_resolve_logs_root_walks_up_from_subdir(tmp_path, monkeypatch):
+    from sag.web.session_registry import _resolve_logs_root
+
+    (tmp_path / "logs" / "session_20260101_000000").mkdir(parents=True)
+    sub = tmp_path / "webui"
+    sub.mkdir()
+    monkeypatch.delenv("SAG_LOG_DIR", raising=False)
+    monkeypatch.chdir(sub)
+    assert _resolve_logs_root() == tmp_path / "logs"
+
+
+def test_resolve_logs_root_honors_env(tmp_path, monkeypatch):
+    from sag.web.session_registry import _resolve_logs_root
+
+    monkeypatch.setenv("SAG_LOG_DIR", str(tmp_path / "custom"))
+    assert _resolve_logs_root() == tmp_path / "custom"
+
+
+def test_resolve_logs_root_falls_back_to_relative(tmp_path, monkeypatch):
+    from sag.web.session_registry import _resolve_logs_root
+
+    monkeypatch.delenv("SAG_LOG_DIR", raising=False)
+    empty = tmp_path / "nowhere"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+    assert _resolve_logs_root() == Path("logs")
+
+
+def test_resolve_logs_root_skips_empty_subdir_logs(tmp_path, monkeypatch):
+    from sag.web.session_registry import _resolve_logs_root
+
+    # Real project build log one level up.
+    (tmp_path / "logs" / "session_A").mkdir(parents=True)
+    (tmp_path / "logs" / "session_A" / "command_project_demo.log").write_text("x")
+    # The UI process's own empty session dir in the launch subdir must not win.
+    (tmp_path / "webui" / "logs" / "session_B").mkdir(parents=True)
+    monkeypatch.delenv("SAG_LOG_DIR", raising=False)
+    monkeypatch.chdir(tmp_path / "webui")
+    assert _resolve_logs_root() == tmp_path / "logs"
