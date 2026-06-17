@@ -12,7 +12,7 @@ import {
 } from "@/components/workspace/DeleteWorkspaceDialog"
 
 import { DetailHeader } from "./DetailHeader"
-import { SectionNav } from "./SectionNav"
+import { FacetTabs } from "./FacetTabs"
 import { SummaryBand } from "./SummaryBand"
 import { buildDetailFacets, FacetBody, type FacetId } from "./facets"
 import { useScrollSpy } from "./scrollSpy"
@@ -43,7 +43,7 @@ export function DetailPane({
   const [deleteTarget, setDeleteTarget] = useState<DeleteWorkspaceTarget | null>(null)
 
   return (
-    <div className="mx-auto flex h-[calc(100vh-3rem)] max-w-[1180px] flex-col">
+    <div className="flex h-full min-h-0 flex-col">
       <DetailHeader
         detail={detail}
         onDelete={() =>
@@ -57,34 +57,29 @@ export function DetailPane({
         workspace={workspace}
       />
 
-      <div className="flex min-h-0 flex-1">
-        {/* Left section-nav (sticky within the flex row) */}
-        <aside className="hidden w-44 shrink-0 overflow-y-auto border-r border-slate-200 px-3 py-6 lg:block">
-          <SectionNav active={active} facets={facets} onJump={(id: FacetId) => jump(id)} />
-        </aside>
+      <FacetTabs active={active} facets={facets} onJump={(id: FacetId) => jump(id)} />
 
-        {/* Right continuous scroll. `relative` makes this the offsetParent so
-            section positions are measured within the scroll container. */}
-        <div
-          ref={containerRef}
-          className="relative min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7"
-          onScroll={onScroll}
-        >
-          <SummaryBand detail={detail} />
-          <div className="mt-7 space-y-7">
-            {facets.map((f) => (
-              <section key={f.id} className="scroll-mt-[150px]" id={`facet-${f.id}`}>
-                <div className="mb-2.5 flex items-center gap-2">
-                  <f.icon className="text-slate-400" size={14} />
-                  <h3 className="text-[13px] font-semibold tracking-tight text-slate-700">{f.label}</h3>
-                  <div className="ml-1 h-px flex-1 bg-slate-100" />
-                </div>
-                <FacetBody detail={detail} id={f.id} />
-              </section>
-            ))}
-          </div>
-          <div className="h-16" />
+      {/* Single continuous scroll. `relative` makes this the offsetParent so
+          section positions are measured within the scroll container. */}
+      <div
+        ref={containerRef}
+        className="relative min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7"
+        onScroll={onScroll}
+      >
+        <SummaryBand detail={detail} />
+        <div className="mt-7 space-y-7">
+          {facets.map((f) => (
+            <section key={f.id} className="scroll-mt-[120px]" id={`facet-${f.id}`}>
+              <div className="mb-2.5 flex items-center gap-2">
+                <f.icon className="text-slate-400" size={14} />
+                <h3 className="text-[13px] font-semibold tracking-tight text-slate-700">{f.label}</h3>
+                <div className="ml-1 h-px flex-1 bg-slate-100" />
+              </div>
+              <FacetBody detail={detail} id={f.id} />
+            </section>
+          ))}
         </div>
+        <div className="h-16" />
       </div>
 
       {panel ? (

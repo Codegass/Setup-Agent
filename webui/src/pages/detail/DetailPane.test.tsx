@@ -66,6 +66,9 @@ describe("DetailPane", () => {
     expect(screen.getByRole("heading", { name: "owner/x" })).toBeInTheDocument()
     expect(screen.getByText("All good.")).toBeInTheDocument()
     expect(screen.getByRole("navigation", { name: /detail sections/i })).toBeInTheDocument()
+    // Top pills (one per facet) are buttons in the nav.
+    expect(screen.getByRole("button", { name: /^Build/ })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /^Logs/ })).toBeInTheDocument()
     for (const id of ["build", "test", "flow", "evidence", "files", "report", "logs"]) {
       expect(document.getElementById(`facet-${id}`)).toBeTruthy()
     }
