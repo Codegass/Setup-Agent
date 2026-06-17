@@ -50,6 +50,7 @@ class CommandTracker:
         working_dir: str = "/workspace",
         exit_code: int = None,
         output: str = None,
+        duration: float | None = None,
     ) -> None:
         """
         Store build command for later validation.
@@ -60,6 +61,7 @@ class CommandTracker:
             working_dir: Working directory for the command
             exit_code: Exit code of the command
             output: Command output
+            duration: Wall-clock duration of the build command in seconds
         """
         entry = {
             "command": command,
@@ -69,6 +71,7 @@ class CommandTracker:
             "exit_code": exit_code,
             "output_snippet": output[:500] if output else None,  # Store snippet
             "build_success": self._detect_build_success(tool, output) if output else None,
+            "duration": duration,
         }
 
         self.build_commands.append(entry)
