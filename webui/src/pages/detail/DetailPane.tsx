@@ -21,6 +21,7 @@ export function DetailPane({
   workspace,
   detail,
   sessionId,
+  initialFacet,
   onSession,
   onSubmitTask,
   onDelete,
@@ -28,13 +29,14 @@ export function DetailPane({
   workspace: WorkspaceSummary
   detail: ExecutionSessionDetail
   sessionId: string
+  initialFacet?: string
   onSession: (sessionId: string) => void
   onSubmitTask: (workspaceId: string, task: string, sourceSession?: string) => Promise<SubmitTaskResponse>
   onDelete: (workspaceId: string) => Promise<void>
 }) {
   const facets = useMemo(() => buildDetailFacets(detail), [detail])
   const ids = useMemo(() => facets.map((f) => f.id), [facets])
-  const { containerRef, active, onScroll, jump } = useScrollSpy(ids)
+  const { containerRef, active, onScroll, jump } = useScrollSpy(ids, sessionId, { initialFacet })
 
   const [panel, setPanel] = useState<WorkspacePanelKind | null>(null)
   const [taskOpen, setTaskOpen] = useState(false)
@@ -43,6 +45,7 @@ export function DetailPane({
   return (
     <div className="mx-auto flex h-[calc(100vh-3rem)] max-w-[1180px] flex-col">
       <DetailHeader
+        detail={detail}
         onDelete={() =>
           setDeleteTarget({ workspaceId: workspace.id, label: workspace.project, kind: "workspace" })
         }
@@ -60,8 +63,13 @@ export function DetailPane({
           <SectionNav active={active} facets={facets} onJump={(id: FacetId) => jump(id)} />
         </aside>
 
-        {/* Right continuous scroll */}
-        <div ref={containerRef} className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7" onScroll={onScroll}>
+        {/* Right continuous scroll. `relative` makes this the offsetParent so
+            section positions are measured within the scroll container. */}
+        <div
+          ref={containerRef}
+          className="relative min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7"
+          onScroll={onScroll}
+        >
           <SummaryBand detail={detail} />
           <div className="mt-7 space-y-7">
             {facets.map((f) => (

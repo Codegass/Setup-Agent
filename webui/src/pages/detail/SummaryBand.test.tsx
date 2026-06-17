@@ -34,6 +34,17 @@ describe("SummaryBand", () => {
     expect(screen.getByText("Report")).toBeInTheDocument()
   })
 
+  it("surfaces a partial-discovery callout only when detail.partial is set", () => {
+    const { rerender } = render(<SummaryBand detail={detail()} />)
+    expect(screen.queryByText("Partially discovered session")).not.toBeInTheDocument()
+
+    rerender(<SummaryBand detail={detail({ partial: true })} />)
+    expect(screen.getByText("Partially discovered session")).toBeInTheDocument()
+    expect(
+      screen.getByText(/evidence, context, or file digests may be\s+incomplete/i),
+    ).toBeInTheDocument()
+  })
+
   it("renders the Why callout only when a blocker is present", () => {
     const { rerender } = render(<SummaryBand detail={detail()} />)
     expect(screen.queryByText(/^Why ·/)).not.toBeInTheDocument()

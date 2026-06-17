@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, Clock, Shield, Sparkles, X } from "lucide-react"
+import { AlertTriangle, Check, Clock, Shield, ShieldAlert, Sparkles, X } from "lucide-react"
 import type * as React from "react"
 
 import type { ExecutionSessionDetail } from "@/api/types"
@@ -51,6 +51,22 @@ export function SummaryBand({ detail }: { detail: ExecutionSessionDetail }) {
 
   return (
     <div className="space-y-3">
+      {/* Partial discovery — runtime artifacts were recovered but data may be incomplete */}
+      {detail.partial ? (
+        <div className="flex items-start gap-2.5 rounded-xl border border-status-attention-border bg-status-attention-soft/50 px-4 py-3.5">
+          <ShieldAlert size={15} className="mt-0.5 shrink-0 text-status-attention" />
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold text-status-attention">
+              Partially discovered session
+            </div>
+            <p className="mt-0.5 text-[12.5px] leading-relaxed text-slate-600">
+              Some runtime artifacts were recovered, but evidence, context, or file digests may be
+              incomplete.
+            </p>
+          </div>
+        </div>
+      ) : null}
+
       {/* Outcome */}
       <div className={cn("flex items-start gap-3 rounded-xl border px-4 py-3.5", callout)}>
         <div className={cn("mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full", iconWrap)}>

@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { WorkspaceSummary } from "@/api/types"
+import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
 
 import { DetailHeader } from "./DetailHeader"
 
@@ -26,6 +26,25 @@ const workspace: WorkspaceSummary = {
 
 const actions = { onNewTask: () => {}, onTerminal: () => {}, onSettings: () => {}, onDelete: () => {} }
 
+function makeDetail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionSessionDetail {
+  return {
+    id: "CC-1",
+    workspace: "sag-x",
+    title: "first",
+    status: "running",
+    entry: "SAG",
+    start: "now",
+    duration: "1m",
+    outcome: "Working.",
+    build: { state: "success", tool: "Maven", time: "1s", note: "" },
+    test: { state: "pass", pass: 1, fail: 0, skip: 0, total: 1 },
+    report: "ready",
+    evidence: [],
+    logs: [],
+    ...overrides,
+  }
+}
+
 describe("DetailHeader", () => {
   afterEach(() => {
     cleanup()
@@ -43,6 +62,42 @@ describe("DetailHeader", () => {
     render(<DetailHeader workspace={workspace} sessionId="CC-1" onSession={onSession} {...actions} />)
     fireEvent.click(screen.getByRole("button", { name: /CC-2/ }))
     expect(onSession).toHaveBeenCalledWith("CC-2")
+  })
+
+  it("shows the session Flow status when detail is provided", () => {
+    render(
+      <DetailHeader
+        workspace={workspace}
+        detail={makeDetail({ status: "running" })}
+        sessionId="CC-1"
+        onSession={() => {}}
+        {...actions}
+      />,
+    )
+    expect(screen.getByText("Flow")).toBeInTheDocument()
+  })
+
+  it("shows a partial-discovery badge when the session is partial", () => {
+    const { rerender } = render(
+      <DetailHeader
+        workspace={workspace}
+        detail={makeDetail({ partial: false })}
+        sessionId="CC-1"
+        onSession={() => {}}
+        {...actions}
+      />,
+    )
+    expect(screen.queryByText("partial discovery")).not.toBeInTheDocument()
+    rerender(
+      <DetailHeader
+        workspace={workspace}
+        detail={makeDetail({ partial: true })}
+        sessionId="CC-1"
+        onSession={() => {}}
+        {...actions}
+      />,
+    )
+    expect(screen.getByText("partial discovery")).toBeInTheDocument()
   })
 
   it("hides the session switcher when there is a single session", () => {

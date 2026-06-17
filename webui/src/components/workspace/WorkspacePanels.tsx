@@ -6,6 +6,7 @@ import { TerminalPanel } from "@/components/terminal/TerminalPanel"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -29,12 +30,19 @@ export function WorkspacePanel({
   return (
     <Dialog open onOpenChange={(open) => (!open ? onClose() : undefined)}>
       <DialogContent className="w-[calc(100vw-2rem)] max-w-[760px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
-        <DialogHeader className="flex flex-row items-center justify-between border-b border-slate-100 px-4 py-3">
-          <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-slate-800">
-            {kind === "terminal" ? <TerminalIcon className="text-slate-500" size={16} /> : null}
-            {kind === "terminal" ? "Terminal" : "Settings"}
-          </DialogTitle>
-          {kind === "terminal" ? <StatusBadge status={workspace.docker.status} /> : null}
+        <DialogHeader className="space-y-1 border-b border-slate-100 px-4 py-3">
+          <div className="flex flex-row items-center justify-between">
+            <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-slate-800">
+              {kind === "terminal" ? <TerminalIcon className="text-slate-500" size={16} /> : null}
+              {kind === "terminal" ? "Terminal" : "Settings"}
+            </DialogTitle>
+            {kind === "terminal" ? <StatusBadge status={workspace.docker.status} /> : null}
+          </div>
+          <DialogDescription className="font-mono text-[11px] text-slate-500">
+            {kind === "terminal"
+              ? `Interactive shell for ${workspace.container}`
+              : `Workspace settings for ${workspace.container}`}
+          </DialogDescription>
         </DialogHeader>
         <div className="max-h-[70vh] overflow-auto p-4">
           {kind === "settings" ? (

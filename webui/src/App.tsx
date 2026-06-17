@@ -37,6 +37,7 @@ export function App() {
   const [dashboardError, setDashboardError] = useState<string | null>(null)
   const [routeError, setRouteError] = useState<string | null>(null)
   const [sessionDetails, setSessionDetails] = useState<Record<string, ExecutionSessionDetail>>({})
+  const [sessionErrors, setSessionErrors] = useState<Record<string, string>>({})
   const [loading, setLoading] = useState(true)
   const [launchQueue, setLaunchQueue] = useState<LaunchQueueState | null>(null)
   const [launchDialogOpen, setLaunchDialogOpen] = useState(false)
@@ -101,8 +102,17 @@ export function App() {
       try {
         const detail = await fetchSession(sessionId)
         setSessionDetails((current) => ({ ...current, [sessionId]: detail }))
+        setSessionErrors((current) => {
+          if (!(sessionId in current)) {
+            return current
+          }
+          const next = { ...current }
+          delete next[sessionId]
+          return next
+        })
       } catch (err) {
         setRouteError(String(err))
+        setSessionErrors((current) => ({ ...current, [sessionId]: String(err) }))
       }
     },
     [],
@@ -163,6 +173,13 @@ export function App() {
     await deleteWorkspaceRequest(workspaceId)
     await loadDashboard()
     await loadLaunchQueue()
+  }
+
+  // Delete initiated from the Detail Pane: after success the workspace is gone,
+  // so return to the dashboard instead of the "Workspace not found" dead-end.
+  const deleteWorkspaceFromDetail = async (workspaceId: string): Promise<void> => {
+    await deleteWorkspace(workspaceId)
+    openDashboard()
   }
 
   const handleBatchSubmitted = (result: LaunchBatchResult) => {
@@ -296,13 +313,38 @@ export function App() {
         selectedWorkspace ? (
           selectedSessionId && sessionDetails[selectedSessionId] ? (
             <DetailPane
+              key={selectedSessionId}
               detail={sessionDetails[selectedSessionId]}
-              onDelete={deleteWorkspace}
+              initialFacet={route.facet}
+              onDelete={deleteWorkspaceFromDetail}
               onSession={(sid) => openDetail(route.workspaceId, sid)}
               onSubmitTask={submitWorkspaceTask}
               sessionId={selectedSessionId}
               workspace={selectedWorkspace}
             />
+          ) : selectedSessionId && sessionErrors[selectedSessionId] ? (
+            <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+              <Card className="max-w-xl p-5">
+                <div className="text-[15px] font-semibold text-slate-900">
+                  Session {selectedSessionId} unavailable
+                </div>
+                <div className="mt-2 font-mono text-[12px] text-red-600">
+                  {sessionErrors[selectedSessionId]}
+                </div>
+                <div className="mt-4 flex gap-2">
+                  <Button
+                    onClick={() => void ensureSessionDetail(selectedSessionId)}
+                    type="button"
+                    variant="outline"
+                  >
+                    Retry
+                  </Button>
+                  <Button onClick={openDashboard} type="button" variant="ghost">
+                    Back to dashboard
+                  </Button>
+                </div>
+              </Card>
+            </main>
           ) : (
             <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
               <Card className="inline-flex px-3 py-2 text-[13px] text-slate-500">

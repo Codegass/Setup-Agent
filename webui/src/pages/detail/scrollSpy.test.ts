@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest"
+import { act, renderHook } from "@testing-library/react"
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
 
-import { pickActiveSection } from "./scrollSpy"
+import { pickActiveSection, useScrollSpy } from "./scrollSpy"
 
 const positions = [
   { id: "build", top: 0 },
@@ -22,5 +23,50 @@ describe("pickActiveSection", () => {
   it("never returns past the last section and tolerates an empty list", () => {
     expect(pickActiveSection(positions, 99999, 170)).toBe("flow")
     expect(pickActiveSection([], 100, 170)).toBeNull()
+  })
+})
+
+describe("useScrollSpy", () => {
+  const ids = ["build", "test", "flow"]
+
+  beforeAll(() => {
+    // jsdom has no layout; stub so jump() doesn't throw.
+    Element.prototype.scrollIntoView = vi.fn()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    document.body.innerHTML = ""
+  })
+
+  it("resets the active section to the first when the session changes", () => {
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useScrollSpy(ids, sessionId),
+      { initialProps: { sessionId: "CC-1" } },
+    )
+    expect(result.current.active).toBe("build")
+
+    act(() => result.current.jump("flow"))
+    expect(result.current.active).toBe("flow")
+
+    // A re-render that keeps the same session must NOT reset (regression guard).
+    rerender({ sessionId: "CC-1" })
+    expect(result.current.active).toBe("flow")
+
+    // Switching the session resets to the first section.
+    rerender({ sessionId: "CC-2" })
+    expect(result.current.active).toBe("build")
+  })
+
+  it("jumps to the requested initialFacet on mount / session change", () => {
+    const el = document.createElement("section")
+    el.id = "facet-report"
+    document.body.appendChild(el)
+
+    const { result } = renderHook(() =>
+      useScrollSpy(["build", "report"], "CC-1", { initialFacet: "report" }),
+    )
+    expect(result.current.active).toBe("report")
+    expect(el.scrollIntoView).toHaveBeenCalled()
   })
 })

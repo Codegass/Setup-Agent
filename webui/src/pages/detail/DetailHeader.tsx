@@ -1,8 +1,8 @@
 import { GitBranch, Plus, Settings as SettingsIcon, Terminal, Trash2 } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
 
-import type { WorkspaceSummary } from "@/api/types"
-import { Badge, StatusBadge } from "@/components/common/Badge"
+import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
+import { Badge, LabeledStatus, StatusBadge } from "@/components/common/Badge"
 import { statusMeta } from "@/components/common/status"
 import { cn } from "@/lib/utils"
 
@@ -51,6 +51,7 @@ function HeaderButton({
 
 export function DetailHeader({
   workspace,
+  detail,
   sessionId,
   onSession,
   onNewTask,
@@ -59,6 +60,7 @@ export function DetailHeader({
   onDelete,
 }: {
   workspace: WorkspaceSummary
+  detail?: ExecutionSessionDetail
   sessionId: string
   onSession: (sessionId: string) => void
   onNewTask: () => void
@@ -89,6 +91,9 @@ export function DetailHeader({
                     {workspace.release}
                   </Badge>
                 ) : null}
+                {detail?.partial ? (
+                  <Badge tone="amber">partial discovery</Badge>
+                ) : null}
               </div>
               <div className="mt-0.5 truncate font-mono text-[10.5px] text-slate-500">
                 <span className="text-slate-600">{workspace.container}</span>
@@ -98,6 +103,7 @@ export function DetailHeader({
           </div>
         </div>
         <div className="flex items-center gap-1.5">
+          {detail ? <LabeledStatus label="Flow" status={detail.status} /> : null}
           <StatusBadge status={workspace.docker.status} />
           <div className="mx-1 h-5 w-px bg-slate-200" />
           <HeaderButton icon={Plus} label="New task" onClick={onNewTask} primary />
