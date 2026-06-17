@@ -521,7 +521,7 @@ def _setup_artifact_item(
         "updated": _normalize_timestamp(finish) or finish or "unknown",
         "report_path": report_path,
         "report_raw": report_raw,
-        "logs": _setup_logs(logs_root or Path("logs"), project_name, created),
+        "logs": _setup_logs(logs_root or Path("logs"), project_name),
     }
 
 
@@ -1199,55 +1199,39 @@ def _normalize_timestamp(value: str) -> str:
         return text
 
 
-def _setup_logs(logs_root: Path, project_name: str, created: str) -> list[str]:
-    session_dir = _matching_log_session_dir(logs_root, project_name, created)
+def _setup_logs(logs_root: Path, project_name: str) -> list[str]:
+    session_dir = _matching_log_session_dir(logs_root, project_name)
     if session_dir is None:
         return []
     return _read_log_file(session_dir / "agent_execution.log", max_lines=500)
 
 
-def _matching_log_session_dir(
-    logs_root: Path,
-    project_name: str,
-    created: str,
-) -> Path | None:
+def _matching_log_session_dir(logs_root: Path, project_name: str) -> Path | None:
+    # Pick the most recent host log session that ran this project, identified by
+    # its per-project command log. Ordering is by that file's mtime — an absolute
+    # epoch — rather than by parsing the session-dir name string. The dir name is
+    # host-local time while the setup's `created_at` is written inside the
+    # container (commonly UTC), so a name-vs-created comparison wrongly skips
+    # every dir on hosts east of UTC. mtime is timezone-independent.
     if not logs_root.exists():
         return None
 
-    setup_time = _timestamp_for_match(created)
     candidates: list[tuple[float, Path]] = []
-    for session_dir in sorted(logs_root.glob("session_*")):
+    for session_dir in logs_root.glob("session_*"):
         if not session_dir.is_dir():
             continue
         command_log = session_dir / f"command_project_{project_name}.log"
         if not command_log.exists():
             continue
-        session_time = _timestamp_for_match(session_dir.name.removeprefix("session_"))
-        if setup_time is not None and session_time is not None and session_time > setup_time:
+        try:
+            mtime = command_log.stat().st_mtime
+        except OSError:
             continue
-        candidates.append((session_time or 0.0, session_dir))
+        candidates.append((mtime, session_dir))
 
     if not candidates:
         return None
     return max(candidates, key=lambda candidate: candidate[0])[1]
-
-
-def _timestamp_for_match(value: str) -> float | None:
-    normalized = _normalize_timestamp(value.replace("_", "T", 1))
-    try:
-        return datetime.fromisoformat(normalized).timestamp()
-    except ValueError:
-        pass
-
-    # Session dirs carry a uniqueness suffix (e.g. 20260607_173245_85955);
-    # match on the leading timestamp.
-    match = re.match(r"(\d{8}_\d{6})", value)
-    if match is None:
-        return None
-    try:
-        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").timestamp()
-    except ValueError:
-        return None
 
 
 def _read_log_file(path: Path, max_lines: int) -> list[str]:

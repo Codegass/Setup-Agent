@@ -1,4 +1,5 @@
 import json
+import os
 import shlex
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +9,47 @@ from sag.web.session_registry import (
     ContainerSessionRegistry,
     ContainerSessionStore,
     SessionRegistry,
+    _matching_log_session_dir,
+    _setup_logs,
 )
+
+
+def _make_session_dir(logs: Path, name: str, project: str, agent_line: str, mtime: float) -> Path:
+    session_dir = logs / name
+    session_dir.mkdir(parents=True)
+    command_log = session_dir / f"command_project_{project}.log"
+    command_log.write_text("setup command output\n", encoding="utf-8")
+    (session_dir / "agent_execution.log").write_text(agent_line + "\n", encoding="utf-8")
+    os.utime(command_log, (mtime, mtime))
+    return session_dir
+
+
+def test_setup_logs_matches_latest_run_by_mtime_ignoring_dir_name_timezone(tmp_path: Path):
+    # Two runs of the same project. The "newer" dir's NAME uses a host-local time
+    # that would look "in the future" versus a container-UTC created_at, which the
+    # old name-vs-created filter wrongly skipped. mtime-based matching must still
+    # pick the most recent run regardless of the dir-name timezone.
+    logs = tmp_path / "logs"
+    _make_session_dir(logs, "session_20260101_000000_111", "commons-cli", "OLD run", 1_000_000)
+    newer = _make_session_dir(logs, "session_20260616_134219_222", "commons-cli", "NEW run", 2_000_000)
+
+    assert _matching_log_session_dir(logs, "commons-cli") == newer
+    assert _setup_logs(logs, "commons-cli") == ["NEW run"]
+
+
+def test_setup_logs_empty_without_matching_command_log(tmp_path: Path):
+    logs = tmp_path / "logs"
+    session_dir = logs / "session_20260616_000000_333"
+    session_dir.mkdir(parents=True)
+    # agent_execution.log present, but no command_project_<project>.log → no match.
+    (session_dir / "agent_execution.log").write_text("orphan\n", encoding="utf-8")
+
+    assert _matching_log_session_dir(logs, "commons-cli") is None
+    assert _setup_logs(logs, "commons-cli") == []
+
+
+def test_setup_logs_empty_when_logs_root_missing(tmp_path: Path):
+    assert _setup_logs(tmp_path / "nope", "commons-cli") == []
 
 
 class FakeOrchestrator:
@@ -728,13 +769,3 @@ def test_same_second_setup_sessions_resolve_to_their_own_workspace():
     detail = registry.get_session_detail(dubbo_id)
     assert detail.workspace == "sag-dubbo"
     assert detail.title == "Setup dubbo"
-
-
-def test_timestamp_for_match_tolerates_unique_session_dir_suffixes():
-    from sag.web.session_registry import _timestamp_for_match
-
-    base = _timestamp_for_match("20260607_173245")
-    suffixed = _timestamp_for_match("20260607_173245_85955")
-
-    assert base is not None
-    assert suffixed == base
