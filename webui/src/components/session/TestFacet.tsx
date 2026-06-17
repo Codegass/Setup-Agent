@@ -65,17 +65,18 @@ export function TestFacet({ detail }: { detail: ExecutionSessionDetail }) {
     <div className="space-y-4">
       <TestConclusionCard test={detail.test} />
       <FailingCard names={failing} />
-      {!single ? (
-        <button
-          className="font-mono text-[11px] text-status-running hover:underline"
-          onClick={() => setOpen(true)}
-          type="button"
-        >
-          View per-module breakdown ({moduleCount} modules) →
-        </button>
-      ) : null}
+      <button
+        className="font-mono text-[11px] text-status-running hover:underline"
+        onClick={() => setOpen(true)}
+        type="button"
+      >
+        {single ? "View test details →" : `View per-module breakdown (${moduleCount} modules) →`}
+      </button>
       {open ? (
-        <ModuleBreakdownDialog onClose={() => setOpen(false)} title="Per-module test breakdown">
+        <ModuleBreakdownDialog
+          onClose={() => setOpen(false)}
+          title={single ? "Test details" : "Per-module test breakdown"}
+        >
           <TestDetailPage detail={detail} />
         </ModuleBreakdownDialog>
       ) : null}

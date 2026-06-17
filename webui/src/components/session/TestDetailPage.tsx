@@ -69,9 +69,17 @@ export function TestDetailPage({ detail }: { detail: ExecutionSessionDetail }) {
         <Tile label="Modules w/ fails" value={fmtNum(s?.modulesWithTestFailures)} tone="text-status-failed" />
         <CoverageTile summary={s} />
       </div>
-      <Card className="overflow-hidden">
-        <ModuleTable modules={detail.modules ?? []} variant="test" />
-      </Card>
+      {(detail.modules?.length ?? 0) > 0 ? (
+        <Card className="overflow-hidden">
+          <ModuleTable modules={detail.modules ?? []} variant="test" />
+        </Card>
+      ) : (
+        <Card className="p-4">
+          <div className="font-mono text-[12px] text-slate-500">
+            Single-module project — the coverage and counts above are project-wide.
+          </div>
+        </Card>
+      )}
     </div>
   )
 }

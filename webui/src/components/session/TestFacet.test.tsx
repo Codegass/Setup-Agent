@@ -21,12 +21,16 @@ const multi = {
 } as any
 
 describe("TestFacet", () => {
-  it("shows conclusion + FAILING for single-module, with no breakdown button", () => {
+  it("shows conclusion + FAILING + a 'View test details' detail for single-module", () => {
     render(<TestFacet detail={single} />)
     expect(screen.getByText(/97\.5% pass/i)).toBeInTheDocument()
     expect(screen.getByText(/Failing · 2/)).toBeInTheDocument()
     expect(screen.getByText("HelpFormatterTest.testWrappedWidth")).toBeInTheDocument()
+    // Single-module gets a "View test details" affordance (not "per-module breakdown").
     expect(screen.queryByRole("button", { name: /per-module breakdown/i })).not.toBeInTheDocument()
+    const btn = screen.getByRole("button", { name: /view test details/i })
+    fireEvent.click(btn)
+    expect(screen.getByRole("dialog", { name: /test details/i })).toBeInTheDocument()
   })
 
   it("opens the per-module breakdown modal for a multi-module project", () => {

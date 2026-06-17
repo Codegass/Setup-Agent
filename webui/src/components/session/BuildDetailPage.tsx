@@ -44,9 +44,17 @@ export function BuildDetailPage({ detail }: { detail: ExecutionSessionDetail }) 
           Gradle has no reactor summary — per-module build status is inferred from build outputs (best-effort).
         </div>
       ) : null}
-      <Card className="overflow-hidden">
-        <ModuleTable modules={detail.modules ?? []} variant="build" />
-      </Card>
+      {(detail.modules?.length ?? 0) > 0 ? (
+        <Card className="overflow-hidden">
+          <ModuleTable modules={detail.modules ?? []} variant="build" />
+        </Card>
+      ) : (
+        <Card className="p-4">
+          <div className="font-mono text-[12px] text-slate-500">
+            Single-module project — the conclusion and outputs cover the whole build.
+          </div>
+        </Card>
+      )}
     </div>
   )
 }

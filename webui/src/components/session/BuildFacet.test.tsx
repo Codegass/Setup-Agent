@@ -21,7 +21,7 @@ const multi = {
 } as any
 
 describe("BuildFacet", () => {
-  it("shows the two-card summary for single-module, with no breakdown button", () => {
+  it("shows the two-card summary + a 'View build details' detail for single-module", () => {
     render(<BuildFacet detail={single} />)
     expect(screen.getByText("Success")).toBeInTheDocument()
     expect(screen.getByText("Outputs")).toBeInTheDocument()
@@ -29,6 +29,8 @@ describe("BuildFacet", () => {
     expect(screen.getByText(/clean package/)).toBeInTheDocument()
     expect(screen.getByText(/HelpFormatter\.java/)).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /per-module breakdown/i })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /view build details/i }))
+    expect(screen.getByRole("dialog", { name: /build details/i })).toBeInTheDocument()
   })
 
   it("opens the per-module breakdown modal for a multi-module project", () => {

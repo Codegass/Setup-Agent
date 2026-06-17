@@ -116,17 +116,18 @@ export function BuildFacet({ detail }: { detail: ExecutionSessionDetail }) {
         <ConclusionCard build={detail.build} />
         <OutputsCard build={detail.build} />
       </div>
-      {!single ? (
-        <button
-          className="font-mono text-[11px] text-status-running hover:underline"
-          onClick={() => setOpen(true)}
-          type="button"
-        >
-          View per-module breakdown ({moduleCount} modules) →
-        </button>
-      ) : null}
+      <button
+        className="font-mono text-[11px] text-status-running hover:underline"
+        onClick={() => setOpen(true)}
+        type="button"
+      >
+        {single ? "View build details →" : `View per-module breakdown (${moduleCount} modules) →`}
+      </button>
       {open ? (
-        <ModuleBreakdownDialog onClose={() => setOpen(false)} title="Per-module build breakdown">
+        <ModuleBreakdownDialog
+          onClose={() => setOpen(false)}
+          title={single ? "Build details" : "Per-module build breakdown"}
+        >
           <BuildDetailPage detail={detail} />
         </ModuleBreakdownDialog>
       ) : null}
