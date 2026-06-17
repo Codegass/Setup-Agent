@@ -130,7 +130,7 @@ describe("App", () => {
     expect(screen.queryByText("Dashboard unavailable")).not.toBeInTheDocument()
   })
 
-  it("opens workspace overview, submits a workspace task, and fetches session detail", async () => {
+  it("opens the detail pane, submits a workspace task, and renders facet sections", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
       const url = String(input)
 
@@ -164,13 +164,14 @@ describe("App", () => {
       }))[0],
     )
 
+    // Merged detail pane: header heading + summary band + section nav.
     expect(await screen.findByRole("heading", { name: "apache/commons-cli" })).toBeInTheDocument()
+    expect(screen.getByRole("navigation", { name: /detail sections/i })).toBeInTheDocument()
+    expect(screen.getByText("Build succeeds and tests are partial.")).toBeInTheDocument()
+    expect(screen.getByText("Project builds.")).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole("button", { name: "Shell" }))
-    expect(screen.getByText("Independent workspace shell")).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole("button", { name: /^new task$/i }))
-    expect(screen.getByRole("dialog", { name: "New task" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "New task" }))
+    expect(screen.getByRole("dialog", { name: /new task/i })).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText("Task description"), {
       target: { value: "Fix HelpFormatter line wrapping" },
     })
@@ -182,21 +183,12 @@ describe("App", () => {
         expect.objectContaining({
           body: JSON.stringify({
             task: "Fix HelpFormatter line wrapping",
-            source_session: null,
+            source_session: "CC-3",
           }),
           method: "POST",
         }),
       )
     })
-
-    fireEvent.click(screen.getByRole("button", { name: "Overview" }))
-    fireEvent.click(screen.getByRole("button", { name: /open session detail/i }))
-
-    expect(await screen.findByText("Build project and execute full test suite")).toBeInTheDocument()
-
-    fireEvent.click(screen.getByRole("button", { name: "Report" }))
-
-    expect(screen.getByText("Project builds.")).toBeInTheDocument()
   })
 
   it("refreshes dashboard after submitting a workspace task", async () => {
@@ -205,9 +197,9 @@ describe("App", () => {
       workspaces: [
         {
           ...dashboard.workspaces[0],
-          task: "No current task",
-          activeSession: null,
-          latestSession: null,
+          task: "Build project and run full test suite",
+          activeSession: "CC-3",
+          latestSession: "CC-3",
         },
       ],
     }
@@ -254,6 +246,10 @@ describe("App", () => {
         )
       }
 
+      if (url === "/api/sessions/CC-3") {
+        return Promise.resolve(jsonResponse(sessionDetail))
+      }
+
       if (url === "/api/sessions/UI-12345678") {
         return Promise.resolve(jsonResponse(uiSessionDetail))
       }
@@ -268,7 +264,7 @@ describe("App", () => {
         name: /open workspace apache\/commons-cli/i,
       }))[0],
     )
-    fireEvent.click(screen.getByRole("button", { name: /^new task$/i }))
+    fireEvent.click(await screen.findByRole("button", { name: "New task" }))
     fireEvent.change(screen.getByLabelText("Task description"), {
       target: { value: "Give me a report of all tests" },
     })
@@ -287,10 +283,9 @@ describe("App", () => {
       expect(dashboardFetches).toHaveLength(2)
     })
 
-    fireEvent.click(screen.getByRole("button", { name: /sessions/i }))
-
-    expect((await screen.findAllByText("UI-12345678")).length).toBeGreaterThan(0)
-    expect(screen.getByText("Give me a report of all tests")).toBeInTheDocument()
+    // The refreshed dashboard moves the latest session to UI-12345678; the
+    // detail pane follows the workspace's latest session and renders its outcome.
+    expect(await screen.findByText("Task is running.")).toBeInTheDocument()
   })
 
   it("lists completed setup sessions alongside active workspace tasks", async () => {
@@ -367,11 +362,11 @@ describe("App", () => {
         name: /open workspace apache\/commons-cli/i,
       }))[0],
     )
-    fireEvent.click(screen.getByRole("button", { name: /sessions/i }))
 
-    expect(await screen.findByText("SETUP-20260606-213241")).toBeInTheDocument()
+    // The detail header's session switcher lists every session as a chip.
+    expect(await screen.findByRole("button", { name: /SETUP-20260606-213241/ })).toBeInTheDocument()
     expect(screen.getByText("Setup and configure the commons-cli project to be runnable")).toBeInTheDocument()
-    expect(screen.getByText("UI-12345678")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /UI-12345678/ })).toBeInTheDocument()
     expect(screen.getByText("Run formatter tests")).toBeInTheDocument()
   })
 
@@ -394,8 +389,11 @@ describe("App", () => {
         const sessionFetches = fetchSpy.mock.calls.filter(
           ([calledInput]) => String(calledInput) === "/api/sessions/CC-3",
         )
+        // First fetch is the mount load (running); the first poll returns the
+        // completed detail. The merged detail pane fetches once on open, so the
+        // running snapshot is served only to the initial request.
         return Promise.resolve(
-          jsonResponse(sessionFetches.length <= 2 ? sessionDetail : updatedSessionDetail),
+          jsonResponse(sessionFetches.length <= 1 ? sessionDetail : updatedSessionDetail),
         )
       }
 
@@ -409,14 +407,14 @@ describe("App", () => {
         name: /open workspace apache\/commons-cli/i,
       }))[0],
     )
-    fireEvent.click(screen.getByRole("button", { name: /open session detail/i }))
 
     expect(await screen.findByText("Build succeeds and tests are partial.")).toBeInTheDocument()
 
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
     expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
-    expect(screen.getByText(/430 \/ 430 runner executions passed/)).toBeInTheDocument()
+    // The Test facet's tiles reflect the freshly polled 430/430 totals.
+    expect(screen.getAllByText("430").length).toBeGreaterThanOrEqual(2)
   }, 8000)
 
   it("does not mount the terminal panel when the workspace container is not running", async () => {
@@ -429,13 +427,19 @@ describe("App", () => {
         },
       ],
     }
-    vi.spyOn(globalThis, "fetch").mockImplementation((input) =>
-      Promise.resolve(
-        String(input) === "/api/project-launches"
-          ? jsonResponse(emptyLaunchQueue)
-          : jsonResponse(stoppedDashboard),
-      ),
-    )
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+
+      if (url === "/api/project-launches") {
+        return Promise.resolve(jsonResponse(emptyLaunchQueue))
+      }
+
+      if (url === "/api/sessions/CC-3") {
+        return Promise.resolve(jsonResponse(sessionDetail))
+      }
+
+      return Promise.resolve(jsonResponse(stoppedDashboard))
+    })
 
     render(<App />)
 
@@ -444,7 +448,7 @@ describe("App", () => {
         name: /open workspace apache\/commons-cli/i,
       }))[0],
     )
-    fireEvent.click(screen.getByRole("button", { name: "Shell" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Terminal" }))
 
     expect(
       screen.getByText("Start the workspace container before opening an interactive shell."),

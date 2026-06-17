@@ -9,14 +9,11 @@ import {
   submitTask,
 } from "@/api/client"
 import type {
-  BuildSummary,
   DashboardResponse,
   ExecutionSessionDetail,
-  ExecutionSessionSummary,
   LaunchBatchResult,
   LaunchQueueState,
   SubmitTaskResponse,
-  WorkspaceSummary,
 } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
@@ -24,8 +21,7 @@ import { Card } from "@/components/common/Card"
 import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
 import { Dashboard } from "@/pages/Dashboard"
 import { DashboardSkeleton } from "@/pages/DashboardSkeleton"
-import { SessionDetail } from "@/pages/SessionDetail"
-import { Workspace, type WorkspaceSessionRow } from "@/pages/Workspace"
+import { DetailPane } from "@/pages/detail/DetailPane"
 
 const DASHBOARD_POLL_MS = 5000
 const SESSION_DETAIL_POLL_MS = 3000
@@ -33,8 +29,7 @@ const LAUNCH_HIGHLIGHT_MS = 8000
 
 type Route =
   | { view: "dashboard" }
-  | { view: "workspace"; workspaceId: string; newTaskSourceSession?: string | null }
-  | { view: "session"; workspaceId: string; sessionId: string; tab?: string }
+  | { view: "detail"; workspaceId: string; sessionId?: string; facet?: string }
 
 export function App() {
   const [route, setRoute] = useState<Route>({ view: "dashboard" })
@@ -42,7 +37,6 @@ export function App() {
   const [dashboardError, setDashboardError] = useState<string | null>(null)
   const [routeError, setRouteError] = useState<string | null>(null)
   const [sessionDetails, setSessionDetails] = useState<Record<string, ExecutionSessionDetail>>({})
-  const [sessionLoading, setSessionLoading] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [launchQueue, setLaunchQueue] = useState<LaunchQueueState | null>(null)
   const [launchDialogOpen, setLaunchDialogOpen] = useState(false)
@@ -98,73 +92,60 @@ export function App() {
     return () => window.clearInterval(interval)
   }, [loadDashboard, loadLaunchQueue])
 
-  const ensureSessionDetail = useCallback(async (sessionId: string, options?: { silent?: boolean }) => {
-    if (!options?.silent) {
-      setSessionLoading(sessionId)
-    }
-    setRouteError(null)
-
-    try {
-      const detail = await fetchSession(sessionId)
-      setSessionDetails((current) => ({ ...current, [sessionId]: detail }))
-    } catch (err) {
-      setRouteError(String(err))
-    } finally {
+  const ensureSessionDetail = useCallback(
+    async (sessionId: string, options?: { silent?: boolean }) => {
       if (!options?.silent) {
-        setSessionLoading((current) => (current === sessionId ? null : current))
+        setRouteError(null)
       }
-    }
-  }, [])
+
+      try {
+        const detail = await fetchSession(sessionId)
+        setSessionDetails((current) => ({ ...current, [sessionId]: detail }))
+      } catch (err) {
+        setRouteError(String(err))
+      }
+    },
+    [],
+  )
+
+  const selectedWorkspace =
+    route.view === "detail" ? dashboard?.workspaces.find((w) => w.id === route.workspaceId) : undefined
+  const selectedSessionId =
+    route.view === "detail" ? route.sessionId ?? selectedWorkspace?.latestSession ?? undefined : undefined
 
   useEffect(() => {
-    if (!dashboard) {
+    if (!dashboard || route.view !== "detail" || !selectedSessionId) {
       return
     }
-
-    if (route.view === "session") {
-      void ensureSessionDetail(route.sessionId)
-      return
-    }
-
-    if (route.view === "workspace") {
-      const workspace = dashboard.workspaces.find((candidate) => candidate.id === route.workspaceId)
-      if (workspace?.latestSession) {
-        void ensureSessionDetail(workspace.latestSession)
-      }
-    }
-  }, [dashboard, ensureSessionDetail, route])
+    void ensureSessionDetail(selectedSessionId)
+  }, [dashboard, ensureSessionDetail, route.view, selectedSessionId])
 
   useEffect(() => {
-    if (route.view !== "session") {
+    if (route.view !== "detail" || !selectedSessionId) {
       return
     }
-
-    const detail = sessionDetails[route.sessionId]
+    const detail = sessionDetails[selectedSessionId]
     if (detail && !isLiveSessionStatus(detail.status)) {
       return
     }
-
     const interval = window.setInterval(() => {
-      void ensureSessionDetail(route.sessionId, { silent: true })
+      void ensureSessionDetail(selectedSessionId, { silent: true })
     }, SESSION_DETAIL_POLL_MS)
-
     return () => window.clearInterval(interval)
-  }, [ensureSessionDetail, route, sessionDetails])
+  }, [ensureSessionDetail, route.view, selectedSessionId, sessionDetails])
 
   const openDashboard = () => {
     setRouteError(null)
     setRoute({ view: "dashboard" })
   }
-  const openWorkspace = (workspaceId: string) => {
+  const openDetail = (workspaceId: string, sessionId?: string, facet?: string) => {
     setRouteError(null)
-    setRoute({ view: "workspace", workspaceId })
+    setRoute({ view: "detail", workspaceId, sessionId, facet })
   }
+  // Dashboard row → detail (latest session). Dashboard report action → detail at that session.
+  const openWorkspace = (workspaceId: string) => openDetail(workspaceId)
   const openSession = (workspaceId: string, sessionId: string, tab?: string) =>
-    setRoute({ view: "session", workspaceId, sessionId, tab })
-  const openTaskFromSession = (workspaceId: string, sourceSession: string) => {
-    setRouteError(null)
-    setRoute({ view: "workspace", workspaceId, newTaskSourceSession: sourceSession })
-  }
+    openDetail(workspaceId, sessionId, tab)
 
   const submitWorkspaceTask = async (
     workspaceId: string,
@@ -311,26 +292,34 @@ export function App() {
         />
       ) : null}
 
-      {dashboard && route.view === "workspace" ? (
-        <WorkspaceRoute
-          dashboard={dashboard}
-          initialTaskSourceSession={route.newTaskSourceSession}
-          onBack={openDashboard}
-          onOpenSession={(sessionId, tab) => openSession(route.workspaceId, sessionId, tab)}
-          onSubmitTask={submitWorkspaceTask}
-          route={route}
-          sessionDetails={sessionDetails}
-        />
-      ) : null}
-
-      {dashboard && route.view === "session" ? (
-        <SessionRoute
-          detail={sessionDetails[route.sessionId]}
-          loading={sessionLoading === route.sessionId}
-          onBack={() => openWorkspace(route.workspaceId)}
-          onNewTask={(sourceSession) => openTaskFromSession(route.workspaceId, sourceSession)}
-          route={route}
-        />
+      {dashboard && route.view === "detail" ? (
+        selectedWorkspace ? (
+          selectedSessionId && sessionDetails[selectedSessionId] ? (
+            <DetailPane
+              detail={sessionDetails[selectedSessionId]}
+              onDelete={deleteWorkspace}
+              onSession={(sid) => openDetail(route.workspaceId, sid)}
+              onSubmitTask={submitWorkspaceTask}
+              sessionId={selectedSessionId}
+              workspace={selectedWorkspace}
+            />
+          ) : (
+            <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+              <Card className="inline-flex px-3 py-2 text-[13px] text-slate-500">
+                {selectedSessionId
+                  ? `Loading session ${selectedSessionId}...`
+                  : "This workspace has no execution session yet."}
+              </Card>
+            </main>
+          )
+        ) : (
+          <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
+            <Card className="p-5">
+              <div className="text-[15px] font-semibold text-slate-900">Workspace not found</div>
+              <div className="mt-1 font-mono text-[12px] text-slate-500">{route.workspaceId}</div>
+            </Card>
+          </main>
+        )
       ) : null}
 
       {launchDialogOpen ? (
@@ -345,186 +334,18 @@ export function App() {
   )
 }
 
-function WorkspaceRoute({
-  dashboard,
-  route,
-  sessionDetails,
-  initialTaskSourceSession,
-  onBack,
-  onOpenSession,
-  onSubmitTask,
-}: {
-  dashboard: DashboardResponse
-  route: Extract<Route, { view: "workspace" }>
-  sessionDetails: Record<string, ExecutionSessionDetail>
-  initialTaskSourceSession?: string | null
-  onBack: () => void
-  onOpenSession: (sessionId: string, tab?: string) => void
-  onSubmitTask: (
-    workspaceId: string,
-    task: string,
-    sourceSession?: string,
-  ) => Promise<SubmitTaskResponse>
-}) {
-  const workspace = dashboard.workspaces.find((candidate) => candidate.id === route.workspaceId)
-
-  if (!workspace) {
-    return (
-      <PlaceholderView
-        detail="Workspace was not returned by /api/workspaces."
-        label="workspace"
-        title={route.workspaceId}
-      />
-    )
-  }
-
-  const latest = workspace.latestSession ? sessionDetails[workspace.latestSession] : null
-  const sessions = sessionRows(workspace, sessionDetails)
-
-  return (
-    <Workspace
-      initialTaskSourceSession={initialTaskSourceSession}
-      latest={latest}
-      onBack={onBack}
-      onOpenSession={onOpenSession}
-      onSubmitTask={onSubmitTask}
-      sessions={sessions}
-      workspace={workspace}
-    />
-  )
-}
-
-function SessionRoute({
-  route,
-  detail,
-  loading,
-  onBack,
-  onNewTask,
-}: {
-  route: Extract<Route, { view: "session" }>
-  detail?: ExecutionSessionDetail
-  loading: boolean
-  onBack: () => void
-  onNewTask: (sourceSession: string) => void
-}) {
-  if (!detail) {
-    return (
-      <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
-        <Card className="inline-flex px-3 py-2 text-[13px] text-slate-500">
-          {loading ? `Loading session ${route.sessionId}...` : `Session ${route.sessionId} unavailable`}
-        </Card>
-      </main>
-    )
-  }
-
-  return (
-    <SessionDetail
-      detail={detail}
-      initialTab={route.tab}
-      onBack={onBack}
-      onNewTask={onNewTask}
-    />
-  )
-}
-
-function sessionRows(
-  workspace: WorkspaceSummary,
-  sessionDetails: Record<string, ExecutionSessionDetail>,
-): WorkspaceSessionRow[] {
-  const summaries = workspace.sessions?.length
-    ? workspace.sessions
-    : fallbackSessionSummaries(workspace)
-
-  return summaries.map((summary) => {
-    const detail = sessionDetails[summary.id]
-
-    if (detail) {
-      return {
-        id: summary.id,
-        title: detail.title,
-        status: detail.status,
-        evidenceStatus: detail.evidenceStatus ?? summary.evidenceStatus ?? "unknown",
-        entry: detail.entry,
-        start: detail.start,
-        duration: detail.duration,
-        build: detail.build,
-        test: detail.test,
-        evidenceCount: detail.evidence.length,
-        filesCount: detail.files?.items.length ?? null,
-      }
-    }
-
-    return {
-      id: summary.id,
-      title: summary.title,
-      status: summary.status,
-      evidenceStatus: summary.evidenceStatus ?? "unknown",
-      entry: summary.entry,
-      start: summary.start,
-      duration: summary.duration,
-      build: normalizeSummaryBuild(summary.build),
-      test: summary.test,
-      evidenceCount: summary.evidence,
-      filesCount: summary.files,
-    }
-  })
-}
-
-function fallbackSessionSummaries(workspace: WorkspaceSummary): ExecutionSessionSummary[] {
-  const ids = [workspace.activeSession, workspace.latestSession].filter(
-    (value, index, values): value is string => Boolean(value) && values.indexOf(value) === index,
-  )
-
-  return ids.map((id) => ({
-    id,
-    workspace: workspace.id,
-    title: workspace.task,
-    status: workspace.activeSession === id ? "active" : "latest",
-    evidenceStatus: workspace.evidenceStatus ?? "unknown",
-    entry: "SAG",
-    start: workspace.updated,
-    finish: null,
-    duration: "unknown",
-    build: normalizeWorkspaceBuild(workspace.build).state,
-    test: workspace.test,
-    report: workspace.report,
-    files: workspace.changed,
-    evidence: 0,
-  }))
-}
-
-function normalizeSummaryBuild(build: string): BuildSummary {
-  return { state: build, tool: "", time: "", note: "" }
-}
-
-function normalizeWorkspaceBuild(build: WorkspaceSummary["build"]): BuildSummary {
-  if (typeof build === "string") {
-    return { state: build, tool: "", time: "", note: "" }
-  }
-
-  return build
-}
-
 function isLiveSessionStatus(status: string): boolean {
   return ["active", "pending", "queued", "running", "in_progress"].includes(
     status.trim().toLowerCase(),
   )
 }
 
-function Breadcrumb({
-  route,
-  onDashboard,
-}: {
-  route: Route
-  onDashboard: () => void
-}) {
+function Breadcrumb({ route, onDashboard }: { route: Route; onDashboard: () => void }) {
   return (
     <nav className="flex min-w-0 items-center gap-2">
       <button
         className={`whitespace-nowrap text-[12.5px] ${
-          route.view === "dashboard"
-            ? "font-medium text-slate-700"
-            : "text-slate-500 hover:text-slate-700"
+          route.view === "dashboard" ? "font-medium text-slate-700" : "text-slate-500 hover:text-slate-700"
         }`}
         disabled={route.view === "dashboard"}
         onClick={onDashboard}
@@ -532,50 +353,12 @@ function Breadcrumb({
       >
         dashboard
       </button>
-      {route.view === "workspace" ? (
+      {route.view === "detail" ? (
         <>
           <span className="text-slate-200">/</span>
-          <span className="truncate text-[12.5px] font-medium text-slate-700">
-            {route.workspaceId}
-          </span>
-        </>
-      ) : null}
-      {route.view === "session" ? (
-        <>
-          <span className="text-slate-200">/</span>
-          <span className="max-w-[32vw] truncate text-[12.5px] text-slate-500 sm:max-w-none">
-            {route.workspaceId}
-          </span>
-          <span className="text-slate-200">/</span>
-          <span className="truncate text-[12.5px] font-medium text-slate-700">
-            {route.sessionId}
-          </span>
+          <span className="truncate text-[12.5px] font-medium text-slate-700">{route.workspaceId}</span>
         </>
       ) : null}
     </nav>
-  )
-}
-
-function PlaceholderView({
-  label,
-  title,
-  detail,
-}: {
-  label: string
-  title: string
-  detail: string
-}) {
-  return (
-    <main className="mx-auto max-w-[1180px] px-4 py-5 sm:px-6 lg:px-8 lg:py-7">
-      <Card className="p-5">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">
-          {label}
-        </div>
-        <h1 className="mt-1.5 text-[22px] font-semibold tracking-tight text-slate-900">
-          {title}
-        </h1>
-        <p className="mt-1 font-mono text-[12px] text-slate-500">{detail}</p>
-      </Card>
-    </main>
   )
 }
