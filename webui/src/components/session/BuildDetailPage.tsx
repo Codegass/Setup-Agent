@@ -24,18 +24,20 @@ function Tile({ label, value, tone }: { label: string; value: React.ReactNode; t
 
 export function BuildDetailPage({
   detail, onBack,
-}: { detail: ExecutionSessionDetail; onBack: () => void }) {
+}: { detail: ExecutionSessionDetail; onBack?: () => void }) {
   const b = detail.build
   const s = detail.moduleSummary
   const single = s?.singleModule ?? (detail.modules?.length ?? 0) <= 1
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <Button onClick={onBack} size="sm" type="button" variant="ghost">
-          <ArrowLeft size={14} /> Back
-        </Button>
-        <StatusBadge status={b.state} />
-      </div>
+      {onBack ? (
+        <div className="flex items-center justify-between">
+          <Button onClick={onBack} size="sm" type="button" variant="ghost">
+            <ArrowLeft size={14} /> Back
+          </Button>
+          <StatusBadge status={detail.build.state} />
+        </div>
+      ) : null}
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
         <Tile label="Modules" value={fmtNum(s?.modulesTotal)} />
         <Tile label="Built" value={fmtNum(s?.modulesBuilt)} tone="text-emerald-700" />

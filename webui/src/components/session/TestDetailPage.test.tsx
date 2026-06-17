@@ -78,4 +78,9 @@ describe("TestDetailPage", () => {
     // shows it for the uncovered module), so assert at least one is present.
     expect(screen.getAllByText(/not measured/i).length).toBeGreaterThan(0)
   })
+
+  it("omits the back button when onBack is not provided (embedded mode)", () => {
+    render(<TestDetailPage detail={detail} />)
+    expect(screen.queryByRole("button", { name: /back/i })).not.toBeInTheDocument()
+  })
 })

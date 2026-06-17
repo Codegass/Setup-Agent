@@ -62,18 +62,20 @@ function CoverageTile({ summary }: { summary?: ModuleRollup | null }) {
 
 export function TestDetailPage({
   detail, onBack,
-}: { detail: ExecutionSessionDetail; onBack: () => void }) {
+}: { detail: ExecutionSessionDetail; onBack?: () => void }) {
   const t = detail.test
   const s = detail.moduleSummary
   const single = s?.singleModule ?? (detail.modules?.length ?? 0) <= 1
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <Button onClick={onBack} size="sm" type="button" variant="ghost">
-          <ArrowLeft size={14} /> Back
-        </Button>
-        <StatusBadge status={t.state} />
-      </div>
+      {onBack ? (
+        <div className="flex items-center justify-between">
+          <Button onClick={onBack} size="sm" type="button" variant="ghost">
+            <ArrowLeft size={14} /> Back
+          </Button>
+          <StatusBadge status={t.state} />
+        </div>
+      ) : null}
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
         <Tile label="Runner exec" value={fmtNum(t.total)} />
         <Tile label="Passed" value={fmtNum(t.pass)} tone="text-emerald-700" />
