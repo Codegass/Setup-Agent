@@ -31,27 +31,28 @@ Out of scope (explicitly):
 
 ## Information Architecture
 
-Two levels (down from three):
+> **Correction (2026-06-16):** the original spec read "two-pane" as *Dashboard page ↔ Detail page (with a left facet rail)*. The actual prototype (`workbench/app.jsx` + `workbench/detail.jsx`) is a **master-detail workbench**, and that is the target. Phase 3 built the separate-page reading; Phase 3b realigns to this.
 
-1. **Dashboard** (`view: "dashboard"`) — the workspaces list. Entry point; answers "is anything wrong?" first.
-2. **Detail Pane** (`view: "detail"`, parameterized by workspace + optional session) — merges the old Workspace and Session views into one screen. Selecting a workspace row opens it; a session switcher within the pane changes which execution session the facets reflect.
+**One workbench screen, two panes** (`workbench/app.jsx`):
 
-The current three-view router (`dashboard` / `workspace` / `session` in `webui/src/App.tsx`) collapses to `dashboard` / `detail`. The detail pane is fed by the existing `ExecutionSessionDetail` payload (already fetched as `latest`) plus the workspace summary and session list.
+1. **Left — Workspace Rail** (persistent, ~320px, `workbench/app.jsx Rail`): the workspace list *is* the dashboard. Header carries the logo + docker version, a **Launch setups** button, summary chips (Workspaces · Running · Attention), and a filter input; below is the scrollable list of compact workspace rows (status dot, project + release, stack/commit, build glyph + test mini-bar, attention/selected indicator). Selecting a row sets the active workspace.
+2. **Right — Detail Pane** (`workbench/detail.jsx DetailPane`): the selected workspace's detail — header, session switcher, Summary Band, **top facet pill nav**, and the single continuous facet scroll.
+
+There is **no separate full-width Dashboard page** and **no top app bar/breadcrumb** — the rail header owns the global chrome. At narrow widths the rail collapses to a horizontal strip above the detail (`workbench/app.jsx` `horizontal` Rail / `stacked` layout). The detail pane is fed by the existing `ExecutionSessionDetail` payload plus the workspace summary and session list.
 
 ## Detail Pane
 
 A single component composed of:
 
-1. **Sticky header** — project name + container + `StatusBadge`, the release/commit chip, and an actions cluster (New task, Terminal, Settings, Delete). Breadcrumb stays in the top app bar.
+1. **Sticky header** — project name + container + `StatusBadge`, the release/commit chip, and an actions cluster (New task, Terminal, Settings, Delete).
 2. **Session switcher** — a horizontal row of session chips (id + status dot + title) when a workspace has more than one session; selecting one re-points the facets. Mirrors `workbench/detail.jsx DetailHeader`.
 3. **Summary Band (always visible)** — the reachability win:
    - **Outcome callout**: the run's verdict in one sentence, color-earned (emerald/amber/red), from `detail.outcome` + `evidence_status`.
    - **Signal tiles**: Build · Tests · Evidence · Report, from `detail.build` / `detail.test` / `detail.evidence_status` / `detail.report`.
    - **"Why" callout**: rendered from `detail.blocker` (code, title, detail, suggested fix) when present. Note: the read model currently sets `blocker=None`, so this is dormant until a backend follow-up populates it; it must render nothing (not an empty box) when absent.
-4. **Two-pane body**:
-   - **Left section-nav** (sticky): vertical list of facets (Build · Test · Flow · Evidence · Files · Report · Logs) with a count/▪ where relevant; the active facet is highlighted via **scroll-spy** as the right pane scrolls, and clicking a nav item smooth-scrolls to that section.
-   - **Right content** (single continuous scroll): the Summary Band followed by each facet section in order, with regular spacing and comfortable rows. Each section has an `id` anchor for the scroll-spy.
-   - At narrow widths the left nav collapses to a sticky top pill row (the workbench's alternate nav), preserving the one-scroll body.
+4. **Facet body** (`workbench/detail.jsx`, `detailStyle: "scroll"`):
+   - **Top facet pill nav** (sticky, horizontal): Build · Test · Flow · Evidence · Files · Report · Logs with a count where relevant; the active facet is highlighted via **scroll-spy** as the body scrolls, and clicking a pill smooth-scrolls to that section.
+   - **Single continuous scroll**: the Summary Band followed by each facet section in order. Each section has an `id` anchor for the scroll-spy.
 
 ## Facets (sections) and data mapping
 
