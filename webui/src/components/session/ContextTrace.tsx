@@ -36,10 +36,10 @@ type PhaseAction = PhaseIteration["actions"][number]
 // the dot fill carries hue, the surrounding ring stays neutral.
 const nodeFill: Record<Tone, string> = {
   neutral: "bg-slate-300",
-  blue: "bg-blue-500",
-  green: "bg-emerald-500",
-  red: "bg-red-500",
-  amber: "bg-amber-500",
+  blue: "bg-status-running",
+  green: "bg-status-success",
+  red: "bg-status-failed",
+  amber: "bg-status-attention",
 }
 
 function progressWidth(value: number): string {
@@ -120,7 +120,7 @@ function RefChips({ refs, onOpen }: { refs: ContextRef[]; onOpen: (ref: ContextR
       {items.map((ref) =>
         refContent(ref) ? (
           <button
-            className="rounded bg-blue-50 px-1.5 py-0.5 font-mono text-[10px] text-blue-700 transition-colors hover:bg-blue-100"
+            className="rounded bg-status-running-soft px-1.5 py-0.5 font-mono text-[10px] text-status-running transition-colors hover:bg-status-running-border"
             key={refKey(ref)}
             onClick={(event) => {
               event.stopPropagation()
@@ -187,7 +187,7 @@ function ActionRow({
         <div
           className={cn(
             "rounded px-2 py-1.5 text-[12px] leading-relaxed",
-            tone === "red" ? "bg-red-50/60 text-slate-700" : "bg-emerald-50/50 text-slate-700",
+            tone === "red" ? "bg-status-failed-soft/60 text-slate-700" : "bg-status-success-soft/50 text-slate-700",
           )}
         >
           {action.observation}
@@ -364,7 +364,7 @@ function IterationTimeline({
             <span className="relative z-10 mt-1 h-2 w-2 rounded-full border border-slate-300 bg-white ring-2 ring-white" />
           </div>
           <button
-            className="min-w-0 self-start py-0.5 text-left font-mono text-[11px] text-blue-700 transition-colors hover:text-blue-800"
+            className="min-w-0 self-start py-0.5 text-left font-mono text-[11px] text-status-running transition-colors hover:text-status-running"
             onClick={() => setShown((value) => value + ITERATION_BATCH)}
             type="button"
           >
@@ -476,13 +476,13 @@ function PhaseRow({
               <p className="text-[12.5px] leading-relaxed text-slate-600">{phase.keyResults}</p>
             ) : null}
             {phase.notes ? (
-              <div className="rounded bg-amber-50/50 px-2.5 py-2 text-[12px] leading-relaxed text-slate-700">
+              <div className="rounded bg-status-attention-soft/50 px-2.5 py-2 text-[12px] leading-relaxed text-slate-700">
                 {phase.notes}
               </div>
             ) : null}
             {conflicts.length ? (
-              <div className="rounded bg-red-50/50 px-2.5 py-2">
-                <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-red-600">
+              <div className="rounded bg-status-failed-soft/50 px-2.5 py-2">
+                <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-status-failed">
                   Conflicts
                 </span>
                 <ul className="mt-1 space-y-0.5">
@@ -532,7 +532,7 @@ export function ContextTrace({
         <div className="border-b border-slate-100 bg-slate-50/70 px-4 py-3.5">
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
-              <Target aria-hidden className="text-blue-600" size={15} />
+              <Target aria-hidden className="text-status-running" size={15} />
               <span className="truncate text-[13px] font-semibold text-slate-800">Trunk goal</span>
             </div>
             <StatusBadge status={trunk.state} />
@@ -551,7 +551,7 @@ export function ContextTrace({
                 className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200"
                 role="progressbar"
               >
-                <div className="h-full rounded-full bg-blue-500" style={{ width: progressWidth(progress.percent) }} />
+                <div className="h-full rounded-full bg-status-running" style={{ width: progressWidth(progress.percent) }} />
               </div>
               <span className="shrink-0 text-right font-mono text-[11px] text-slate-500">
                 {progress.done} / {progress.total}
