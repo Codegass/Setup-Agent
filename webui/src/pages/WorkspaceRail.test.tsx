@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
@@ -73,6 +73,30 @@ describe("WorkspaceRail", () => {
     fireEvent.click(screen.getByRole("button", { name: /owner\/broken/ }))
     expect(onSelect).toHaveBeenCalledWith("sag-broken")
     expect(onAfterSelect).toHaveBeenCalled()
+  })
+
+  it("renders a workspace in a non-interactive deleting state", () => {
+    const onSelect = vi.fn()
+    render(<WorkspaceRail {...props} deletingIds={new Set(["sag-broken"])} onSelect={onSelect} />)
+    const row = screen.getByRole("button", { name: /owner\/broken/ })
+    expect(row).toBeDisabled()
+    expect(screen.getByText(/deleting/i)).toBeInTheDocument()
+    fireEvent.click(row)
+    expect(onSelect).not.toHaveBeenCalled()
+  })
+
+  it("batch-deletes selected workspaces via select mode", async () => {
+    const onDeleteMany = vi.fn().mockResolvedValue(undefined)
+    render(<WorkspaceRail {...props} onDeleteMany={onDeleteMany} />)
+    fireEvent.click(screen.getByRole("button", { name: /^select$/i }))
+    fireEvent.click(screen.getByRole("checkbox", { name: /owner\/healthy/i }))
+    fireEvent.click(screen.getByRole("checkbox", { name: /owner\/broken/i }))
+    fireEvent.click(screen.getByRole("button", { name: /delete 2 selected/i }))
+    fireEvent.click(screen.getByRole("button", { name: /delete 2 workspaces/i }))
+    await waitFor(() => expect(onDeleteMany).toHaveBeenCalled())
+    expect(onDeleteMany.mock.calls[0][0]).toEqual(
+      expect.arrayContaining(["sag-healthy", "sag-broken"]),
+    )
   })
 
   it("filters rows by the query input", () => {

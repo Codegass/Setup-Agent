@@ -23,19 +23,22 @@ interface DeleteWorkspaceDialogProps {
   target: DeleteWorkspaceTarget
   onCancel: () => void
   onConfirm: (workspaceId: string) => Promise<void>
+  count?: number
 }
 
 export function DeleteWorkspaceDialog({
   target,
   onCancel,
   onConfirm,
+  count = 1,
 }: DeleteWorkspaceDialogProps) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const isWorkspace = target.kind === "workspace"
-  const title = isWorkspace ? "Delete workspace" : "Remove launch"
-  const confirmLabel = isWorkspace ? "Delete workspace" : "Remove launch"
+  const batch = count > 1
+  const title = batch ? `Delete ${count} workspaces` : isWorkspace ? "Delete workspace" : "Remove launch"
+  const confirmLabel = title
 
   const handleConfirm = async () => {
     setSubmitting(true)
@@ -67,7 +70,7 @@ export function DeleteWorkspaceDialog({
             {title}
           </DialogTitle>
           <DialogDescription className="font-mono text-[11px] text-slate-500">
-            DELETE /api/workspaces/{target.workspaceId}
+            {batch ? `${count} workspaces selected` : `DELETE /api/workspaces/${target.workspaceId}`}
           </DialogDescription>
         </DialogHeader>
 
