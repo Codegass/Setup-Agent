@@ -1,7 +1,7 @@
 import { ArrowLeft, Check, Clock, X } from "lucide-react"
 import type * as React from "react"
 
-import type { BuildSummary, ExecutionSessionDetail } from "@/api/types"
+import type { BuildSummary, ExecutionSessionDetail, ModuleRollup } from "@/api/types"
 import { Badge, StatusBadge } from "@/components/common/Badge"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
@@ -13,6 +13,14 @@ import { ModuleTable } from "./ModuleTable"
 function fmtNum(n?: number | null): string {
   // Real 0 stays "0"; a genuinely-absent value renders "—" (no fake zeroes).
   return typeof n === "number" && Number.isFinite(n) ? n.toLocaleString() : "—"
+}
+
+function MonoLabel({ children, className }: { children: React.ReactNode; className?: string }) {
+  return (
+    <div className={cn("font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500", className)}>
+      {children}
+    </div>
+  )
 }
 
 function KV({ k, v }: { k: string; v?: string | null }) {
@@ -62,7 +70,7 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
           </Badge>
         ) : null}
       </div>
-      <div className="mt-2 grid gap-x-6 sm:grid-cols-2">
+      <div className="mt-2">
         <KV k="Tool" v={build.tool} />
         <KV k="Time" v={build.time} />
         <KV k="Command" v={build.note} />
@@ -70,6 +78,37 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
       </div>
     </Card>
   )
+}
+
+function OutputsCard({ build }: { build: BuildSummary }) {
+  const warnings = build.warnings ?? []
+  return (
+    <Card className="p-4">
+      <MonoLabel>Outputs</MonoLabel>
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <Stat label="classes" value={fmtNum(build.classCount)} />
+        <Stat label="JARs" value={fmtNum(build.jarCount)} />
+      </div>
+      {warnings.length ? (
+        <div className="mt-3">
+          <MonoLabel className="text-status-attention">
+            {warnings.length} warning{warnings.length > 1 ? "s" : ""}
+          </MonoLabel>
+          <ul className="mt-1.5 space-y-1">
+            {warnings.map((w) => (
+              <li key={w} className="text-[12px] text-slate-500">· {w}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+    </Card>
+  )
+}
+
+function successRate(s?: ModuleRollup | null): number | null {
+  const total = s?.modulesTotal ?? 0
+  const built = s?.modulesBuilt ?? 0
+  return total > 0 ? Math.round((built / total) * 100) : null
 }
 
 export function BuildDetailPage({
@@ -82,6 +121,7 @@ export function BuildDetailPage({
   const b = detail.build
   const s = detail.moduleSummary
   const single = s?.singleModule ?? (detail.modules?.length ?? 0) <= 1
+  const rate = successRate(s)
 
   return (
     <div className="space-y-4">
@@ -94,26 +134,10 @@ export function BuildDetailPage({
         </div>
       ) : null}
 
-      <ConclusionCard build={b} />
-
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-        {!single ? (
-          <>
-            <Stat label="Modules" value={fmtNum(s?.modulesTotal)} />
-            <Stat label="Built" value={fmtNum(s?.modulesBuilt)} tone="text-status-success" />
-            <Stat label="Failed" value={fmtNum(s?.modulesFailed)} tone="text-status-failed" />
-            <Stat label="Skipped" value={fmtNum(s?.modulesSkipped)} />
-          </>
-        ) : null}
-        <Stat label="Classes" value={fmtNum(b.classCount)} />
-        <Stat label="JARs" value={fmtNum(b.jarCount)} />
+      <div className="grid gap-4 sm:grid-cols-2">
+        <ConclusionCard build={b} />
+        <OutputsCard build={b} />
       </div>
-
-      {!single && (s?.buildSystems ?? []).includes("gradle") ? (
-        <div className="font-mono text-[10px] text-slate-500">
-          Gradle has no reactor summary — per-module build status is inferred from build outputs (best-effort).
-        </div>
-      ) : null}
 
       {single ? (
         <Card className="p-4">
@@ -122,9 +146,23 @@ export function BuildDetailPage({
           </div>
         </Card>
       ) : (
-        <Card className="overflow-hidden">
-          <ModuleTable modules={detail.modules ?? []} variant="build" />
-        </Card>
+        <>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            <Stat label="Modules" value={fmtNum(s?.modulesTotal)} />
+            <Stat label="Built" value={fmtNum(s?.modulesBuilt)} tone="text-status-success" />
+            <Stat label="Failed" value={fmtNum(s?.modulesFailed)} tone="text-status-failed" />
+            <Stat label="Skipped" value={fmtNum(s?.modulesSkipped)} />
+            <Stat label="Success rate" value={rate != null ? `${rate}%` : "—"} />
+          </div>
+          {(s?.buildSystems ?? []).includes("gradle") ? (
+            <div className="font-mono text-[10px] text-slate-500">
+              Gradle has no reactor summary — per-module build status is inferred from build outputs (best-effort).
+            </div>
+          ) : null}
+          <Card className="overflow-hidden">
+            <ModuleTable modules={detail.modules ?? []} variant="build" />
+          </Card>
+        </>
       )}
     </div>
   )

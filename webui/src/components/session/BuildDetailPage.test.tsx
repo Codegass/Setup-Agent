@@ -64,6 +64,31 @@ it("uses a single-module note that does not mention an Overview tab", () => {
   expect(screen.getByText(/single-module project/i)).toBeInTheDocument()
 })
 
+it("shows an Outputs card with classes/JARs and warnings", () => {
+  render(<BuildDetailPage detail={{
+    build: { state: "success", system: "Maven", tool: "Maven 3.9.6", time: "47.2s",
+             note: "clean package", artifact: "target/commons-cli-1.6.0.jar",
+             classCount: 115, jarCount: 1, warnings: ["2 deprecation warnings in HelpFormatter.java"] },
+    moduleSummary: { singleModule: true },
+    modules: [],
+  } as any} />)
+  expect(screen.getByText("Outputs")).toBeInTheDocument()
+  expect(screen.getByText("115")).toBeInTheDocument()
+  expect(screen.getByText(/clean package/)).toBeInTheDocument()
+  expect(screen.getByText(/HelpFormatter\.java/)).toBeInTheDocument()
+})
+
+it("shows the module success rate for a multi-module build", () => {
+  render(<BuildDetailPage detail={{
+    build: { state: "success", system: "maven", classCount: 1300, jarCount: 12 },
+    moduleSummary: { modulesTotal: 24, modulesBuilt: 21, modulesFailed: 1, modulesSkipped: 2,
+                     buildSystems: ["maven"], singleModule: false },
+    modules: [{ name: "core", path: "core", buildStatus: "success", buildSource: "reactor" }],
+  } as any} />)
+  expect(screen.getByText("24")).toBeInTheDocument()
+  expect(screen.getByText(/88%/)).toBeInTheDocument()
+})
+
 it("omits the back button when onBack is not provided (embedded mode)", () => {
   render(<BuildDetailPage detail={{
     build: { state: "success", system: "maven", classCount: 13104, jarCount: 279 },
