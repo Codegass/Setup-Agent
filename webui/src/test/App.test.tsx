@@ -94,8 +94,11 @@ describe("App", () => {
     render(<App />)
 
     expect(screen.getByRole("status", { name: /loading workspaces/i })).toBeInTheDocument()
-    expect(await screen.findAllByText("apache/commons-cli")).not.toHaveLength(0)
-    expect(screen.getByText("docker · connected")).toBeInTheDocument()
+    expect(
+      (await screen.findAllByRole("button", { name: /apache\/commons-cli/i })).length,
+    ).toBeGreaterThan(0)
+    // The docker label lives in the rail header as "docker {version}".
+    expect(screen.getByText(/docker 27\.1\.1/i)).toBeInTheDocument()
   })
 
   it("shows an unavailable state when dashboard fetch fails", async () => {
@@ -116,19 +119,25 @@ describe("App", () => {
         if (dashboardCalls === 1) return Promise.resolve(jsonResponse(dashboard))
         return Promise.reject(new Error("refresh down"))
       }
+      // Auxiliary launch-queue polls are swallowed by the app.
       return Promise.reject(new Error(`unexpected fetch: ${url}`))
     })
 
     render(<App />)
 
-    expect(await screen.findAllByText("apache/commons-cli")).not.toHaveLength(0)
+    expect(
+      (await screen.findAllByRole("button", { name: /apache\/commons-cli/i })).length,
+    ).toBeGreaterThan(0)
 
-    fireEvent.click(screen.getByRole("button", { name: "Refresh dashboard" }))
-
-    expect(await screen.findByText(/couldn't refresh/i)).toBeInTheDocument()
-    expect(screen.getAllByText("apache/commons-cli")).not.toHaveLength(0)
+    // The next (silent) poll fails; the rail keeps its stale rows and the footer
+    // surfaces a quiet "couldn't refresh" stamp instead of a loud banner. The
+    // dashboard poll runs on a 5s interval, so allow more than one cycle.
+    expect(await screen.findByText(/couldn't refresh/i, undefined, { timeout: 7000 })).toBeInTheDocument()
+    expect(
+      screen.getAllByRole("button", { name: /apache\/commons-cli/i }).length,
+    ).toBeGreaterThan(0)
     expect(screen.queryByText("Dashboard unavailable")).not.toBeInTheDocument()
-  })
+  }, 10000)
 
   it("opens the detail pane, submits a workspace task, and renders facet sections", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
@@ -160,11 +169,11 @@ describe("App", () => {
 
     fireEvent.click(
       (await screen.findAllByRole("button", {
-        name: /open workspace apache\/commons-cli/i,
+        name: /apache\/commons-cli/i,
       }))[0],
     )
 
-    // Merged detail pane: header heading + summary band + section nav.
+    // Master-detail: header heading + summary band + top pill nav.
     expect(await screen.findByRole("heading", { name: "apache/commons-cli" })).toBeInTheDocument()
     expect(screen.getByRole("navigation", { name: /detail sections/i })).toBeInTheDocument()
     expect(screen.getByText("Build succeeds and tests are partial.")).toBeInTheDocument()
@@ -456,13 +465,17 @@ describe("App", () => {
     expect(screen.queryByLabelText("Workspace terminal")).not.toBeInTheDocument()
   })
 
-  it("deletes a workspace from the dashboard and refetches", async () => {
+  it("deletes a workspace from the detail pane and refetches", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
       const url = String(input)
       const method = (init?.method ?? "GET").toUpperCase()
 
       if (url === "/api/workspaces" && method === "GET") {
         return Promise.resolve(jsonResponse(dashboard))
+      }
+
+      if (url === "/api/sessions/CC-3") {
+        return Promise.resolve(jsonResponse(sessionDetail))
       }
 
       if (url === "/api/workspaces/sag-commons-cli" && method === "DELETE") {
@@ -485,11 +498,8 @@ describe("App", () => {
 
     render(<App />)
 
-    fireEvent.click(
-      (await screen.findAllByRole("button", {
-        name: /delete workspace apache\/commons-cli/i,
-      }))[0],
-    )
+    // The rail auto-selects the only workspace; delete from the detail header.
+    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
 
     fireEvent.click(screen.getByRole("button", { name: "Delete workspace" }))
 
