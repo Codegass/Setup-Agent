@@ -2,13 +2,13 @@ import { Activity, Box, FileText, Layers, Sparkles, Terminal } from "lucide-reac
 import type { LucideIcon } from "lucide-react"
 
 import type { ExecutionSessionDetail, Tone } from "@/api/types"
-import { BuildDetailPage } from "@/components/session/BuildDetailPage"
+import { BuildFacet } from "@/components/session/BuildFacet"
 import { ContextTrace } from "@/components/session/ContextTrace"
 import { EvidenceTimeline } from "@/components/session/EvidenceTimeline"
 import { FilesDigest } from "@/components/session/FilesDigest"
 import { LogsView } from "@/components/session/LogsView"
 import { ReportDoc } from "@/components/session/ReportDoc"
-import { TestDetailPage } from "@/components/session/TestDetailPage"
+import { TestFacet } from "@/components/session/TestFacet"
 
 export type FacetId = "build" | "test" | "flow" | "evidence" | "files" | "report" | "logs"
 
@@ -49,9 +49,9 @@ export function Empty({ label }: { label: string }) {
 export function FacetBody({ id, detail }: { id: FacetId; detail: ExecutionSessionDetail }) {
   switch (id) {
     case "build":
-      return <BuildDetailPage detail={detail} />
+      return <BuildFacet detail={detail} />
     case "test":
-      return <TestDetailPage detail={detail} />
+      return <TestFacet detail={detail} />
     case "flow":
       return detail.context ? (
         <ContextTrace ctx={detail.context} />
