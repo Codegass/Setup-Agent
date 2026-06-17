@@ -5,10 +5,10 @@ import type { ModuleSummary } from "@/api/types"
 import { cn } from "@/lib/utils"
 
 function statusClass(s: string): string {
-  if (s === "success") return "bg-emerald-50 text-emerald-700"
-  if (s === "failure") return "bg-red-50 text-red-600"
+  if (s === "success") return "bg-status-success-soft text-status-success"
+  if (s === "failure") return "bg-status-failed-soft text-status-failed"
   if (s === "skipped") return "bg-slate-100 text-slate-500"
-  return "bg-amber-50 text-amber-700"
+  return "bg-status-attention-soft text-status-attention"
 }
 
 function num(n?: number | null): string {
@@ -21,11 +21,15 @@ function passRate(p?: number | null, f?: number | null): string {
 }
 
 function covColor(rate: number): string {
-  return rate >= 80 ? "#22c55e" : rate >= 50 ? "#f59e0b" : "#ef4444"
+  return rate >= 80
+    ? "var(--status-success)"
+    : rate >= 50
+      ? "var(--status-attention)"
+      : "var(--status-failed)"
 }
 
 function covTextClass(rate: number): string {
-  return rate >= 80 ? "text-emerald-700" : rate >= 50 ? "text-amber-600" : "text-red-600"
+  return rate >= 80 ? "text-status-success" : rate >= 50 ? "text-status-attention" : "text-status-failed"
 }
 
 function CoverageBar({ label, rate }: { label: string; rate: number }) {
@@ -101,7 +105,7 @@ export function ModuleTable({
                       {(m.buildStatus ?? "unknown").toUpperCase()}
                     </span>
                     {m.buildSource === "partial" ? (
-                      <span className="ml-1.5 rounded bg-amber-50 px-1 py-0.5 text-[9px] text-amber-700">
+                      <span className="ml-1.5 rounded bg-status-attention-soft px-1 py-0.5 text-[9px] text-status-attention">
                         partial
                       </span>
                     ) : null}
@@ -113,7 +117,7 @@ export function ModuleTable({
                     <td className="px-2 py-2 text-right">{num(m.jarCount)}</td>
                     <td className="px-2 py-2">
                       {canExpandBuild ? (
-                        <button className="text-red-600 underline decoration-dotted" type="button"
+                        <button className="text-status-failed underline decoration-dotted" type="button"
                           onClick={() => setOpen(isOpen ? null : m.path)}>
                           {errs.length} error{errs.length > 1 ? "s" : ""}
                           <ChevronDown className={cn("ml-1 inline", isOpen && "rotate-180")} size={12} />
@@ -125,8 +129,8 @@ export function ModuleTable({
                   </>
                 ) : (
                   <>
-                    <td className="px-2 py-2 text-right text-emerald-700">{num(m.testsPassed)}</td>
-                    <td className={cn("px-2 py-2 text-right", (m.testsFailed ?? 0) > 0 && "text-red-600")}>{num(m.testsFailed)}</td>
+                    <td className="px-2 py-2 text-right text-status-success">{num(m.testsPassed)}</td>
+                    <td className={cn("px-2 py-2 text-right", (m.testsFailed ?? 0) > 0 && "text-status-failed")}>{num(m.testsFailed)}</td>
                     <td className="px-2 py-2 text-right">{num(m.testsSkipped)}</td>
                     <td className="px-2 py-2">{passRate(m.testsPassed, m.testsFailed)}</td>
                     <td className="px-2 py-2" style={{ minWidth: 150 }}>
@@ -141,7 +145,7 @@ export function ModuleTable({
                     </td>
                     <td className="px-2 py-2">
                       {canExpandTest ? (
-                        <button className="text-red-600 underline decoration-dotted" type="button"
+                        <button className="text-status-failed underline decoration-dotted" type="button"
                           onClick={() => setOpen(isOpen ? null : m.path)}>
                           View {fc} failure{fc > 1 ? "s" : ""}
                           <ChevronDown className={cn("ml-1 inline", isOpen && "rotate-180")} size={12} />
@@ -152,7 +156,7 @@ export function ModuleTable({
                 )}
               </tr>
               {isOpen ? (
-                <tr className="bg-red-50/60">
+                <tr className="bg-status-failed-soft/60">
                   <td colSpan={variant === "build" ? 5 : 7} className="px-3 py-2">
                     <div className="mb-1.5 flex flex-wrap items-center gap-3 font-mono text-[10px] text-slate-500">
                       {variant === "test" && failing.length ? (
@@ -168,7 +172,7 @@ export function ModuleTable({
                         <span>report: <span className="text-slate-600">{(m.evidenceRefs ?? [])[0]}</span></span>
                       ) : null}
                     </div>
-                    <div className="max-h-48 overflow-auto font-mono text-[11px] text-red-700">
+                    <div className="max-h-48 overflow-auto font-mono text-[11px] text-status-failed">
                       {(variant === "test" ? failing : errs).map((line) => (
                         <div key={line} className="py-0.5">{line}</div>
                       ))}
