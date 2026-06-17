@@ -15,6 +15,13 @@ from .models import LogLevel
 # (replaces the previously hardcoded "80%" magic number scattered across modules).
 DEFAULT_TEST_PASS_THRESHOLD = 0.8
 
+# Build verdict policy: the required fraction of EXPECTED compiled classes (source-
+# weighted across modules) that must actually be produced for a multi-module build
+# to count as green. Real Apache reactors rarely build 100% of modules, so build-green
+# is "most of the code compiled" rather than all-or-nothing. Configurable; a value of
+# 1.0 restores the strict "every module must build" behaviour.
+DEFAULT_BUILD_COVERAGE_THRESHOLD = 0.75
+
 
 class Config(BaseModel):
     """Main configuration class."""
@@ -85,6 +92,9 @@ class Config(BaseModel):
     # Validation / verdict policy
     # Minimum test pass rate (fraction, 0-1) for a build-green run to be a SUCCESS.
     test_pass_threshold: float = Field(default=DEFAULT_TEST_PASS_THRESHOLD)
+    # Minimum source-weighted compiled-class coverage (fraction, 0-1) for a
+    # multi-module build to count as green.
+    build_coverage_threshold: float = Field(default=DEFAULT_BUILD_COVERAGE_THRESHOLD)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -140,6 +150,9 @@ class Config(BaseModel):
             ),
             test_pass_threshold=float(
                 os.getenv("SAG_TEST_PASS_THRESHOLD", str(DEFAULT_TEST_PASS_THRESHOLD))
+            ),
+            build_coverage_threshold=float(
+                os.getenv("SAG_BUILD_COVERAGE_THRESHOLD", str(DEFAULT_BUILD_COVERAGE_THRESHOLD))
             ),
         )
 

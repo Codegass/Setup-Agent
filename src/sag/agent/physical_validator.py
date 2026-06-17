@@ -34,7 +34,7 @@ from urllib.parse import quote
 
 from loguru import logger
 
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
+from sag.config.settings import DEFAULT_BUILD_COVERAGE_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
     TestCaseCatalog,
@@ -105,6 +105,7 @@ class PhysicalValidator:
         project_path: str = "/workspace",
         compilation_recency_hours: int = 1,
         test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
+        build_coverage_threshold: float = DEFAULT_BUILD_COVERAGE_THRESHOLD,
         command_tracker=None,
     ):
         """
@@ -116,6 +117,8 @@ class PhysicalValidator:
             compilation_recency_hours: Hours to consider compilation as recent (default 1)
             test_pass_threshold: Minimum test pass rate (fraction 0-1) for a
                 build-green run to be a SUCCESS. Feeds :func:`evaluate_run_verdict`.
+            build_coverage_threshold: Minimum source-weighted compiled-class coverage
+                (fraction 0-1) for a multi-module build to count as green.
             command_tracker: Shared CommandTracker recording build/test commands
                 and the build's wall-clock duration. validate_build_status reads
                 the last recorded build off it to surface build_time/build_command
@@ -125,6 +128,7 @@ class PhysicalValidator:
         self.project_path = project_path
         self.compilation_recency_hours = compilation_recency_hours
         self.test_pass_threshold = test_pass_threshold
+        self.build_coverage_threshold = build_coverage_threshold
         self.command_tracker = command_tracker
 
         # Cache for validation results with TTL
@@ -1943,12 +1947,33 @@ PY"""
                 actual_vs_expected = self._verify_expected_artifacts(
                     project_dir, expected_artifacts
                 )
+                coverage = actual_vs_expected.get("class_coverage", 1.0)
+                threshold = self.build_coverage_threshold
                 if actual_vs_expected["all_present"]:
                     success = True
                     reason = f"All expected build artifacts found: {', '.join(actual_vs_expected['found'])}"
+                elif coverage >= threshold:
+                    # Loosened policy: a multi-module reactor rarely builds 100%; a
+                    # build that produced at least `build_coverage_threshold` of its
+                    # expected (source-weighted) classes counts as green. Still list
+                    # the missing modules for transparency.
+                    success = True
+                    missing = actual_vs_expected["missing"]
+                    reason = (
+                        f"Built {coverage * 100:.0f}% of expected classes "
+                        f"(>= {threshold * 100:.0f}% threshold); "
+                        f"{len(missing)} module(s) incomplete"
+                        + (f": {', '.join(missing[:5])}" if missing else "")
+                        + (" ..." if len(missing) > 5 else "")
+                    )
                 else:
                     success = False
-                    reason = f"Missing expected build artifacts: {', '.join(actual_vs_expected['missing'])}"
+                    reason = (
+                        f"Only {coverage * 100:.0f}% of expected classes built "
+                        f"(< {threshold * 100:.0f}% threshold) — missing: "
+                        f"{', '.join(actual_vs_expected['missing'][:8])}"
+                        + (" ..." if len(actual_vs_expected["missing"]) > 8 else "")
+                    )
             else:
                 # Cannot determine expected artifacts (e.g. an aggregator/empty
                 # root pom with no parseable modules or sources).
@@ -3142,12 +3167,24 @@ PY"""
         """
         Verify that expected artifacts actually exist.
         """
-        result = {"all_present": True, "found": [], "missing": []}
+        # classes_expected / classes_found accumulate a SOURCE-WEIGHTED coverage:
+        # each module contributes its source-file count, so building the large
+        # modules counts more than the tiny ones. class_coverage (computed at the
+        # end) lets validate_build_status accept a "most of the code compiled" build.
+        result = {
+            "all_present": True,
+            "found": [],
+            "missing": [],
+            "classes_expected": 0,
+            "classes_found": 0,
+        }
 
         for expected in expected_artifacts:
             artifact_found = False
 
             if expected["type"] == "classes":
+                min_expected = expected.get("min_count", 1)
+                result["classes_expected"] += min_expected
                 # For .class files, check if directory has sufficient class files
                 class_count_cmd = (
                     f"find {expected['path']} -name '*.class' -type f 2>/dev/null | wc -l"
@@ -3158,7 +3195,8 @@ PY"""
 
                 if class_count_result["success"]:
                     class_count = int(class_count_result["output"].strip() or 0)
-                    min_expected = expected.get("min_count", 1)
+                    # Partial credit toward coverage (capped at the module's expectation).
+                    result["classes_found"] += min(class_count, min_expected)
 
                     # We expect at least as many .class files as .java files
                     # (could be more due to inner classes, anonymous classes, etc.)
@@ -3206,6 +3244,14 @@ PY"""
                     result["missing"].append(expected["artifact"])
                     result["all_present"] = False
 
+        # Source-weighted fraction of expected classes actually produced. 1.0 when
+        # nothing class-based was expected (jar/file-only projects), so it never
+        # downgrades a build that has no per-module class expectations.
+        result["class_coverage"] = (
+            result["classes_found"] / result["classes_expected"]
+            if result["classes_expected"] > 0
+            else 1.0
+        )
         return result
 
     def _validate_gradle_cache(self, project_dir: str) -> Dict[str, any]:

@@ -76,7 +76,9 @@ def _agent_for_registration(phase_machine=None):
     from sag.agent.agent import SetupAgent
 
     agent = object.__new__(SetupAgent)
-    agent.config = SimpleNamespace(workspace_path="/workspace", test_pass_threshold=0.95)
+    agent.config = SimpleNamespace(
+        workspace_path="/workspace", test_pass_threshold=0.95, build_coverage_threshold=0.75
+    )
     # OutputStorageManager probes the orchestrator at construction time.
     agent.orchestrator = SimpleNamespace(
         project_name="demo",

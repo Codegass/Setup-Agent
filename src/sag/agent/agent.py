@@ -189,6 +189,7 @@ class SetupAgent:
             docker_orchestrator=self.orchestrator,
             project_path=self.config.workspace_path,
             test_pass_threshold=self.config.test_pass_threshold,
+            build_coverage_threshold=self.config.build_coverage_threshold,
         )
         # Attach the shared tracker so validate_build_status can surface the
         # timed build duration + command in its evidence dict.
