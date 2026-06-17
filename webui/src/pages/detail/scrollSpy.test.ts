@@ -69,4 +69,48 @@ describe("useScrollSpy", () => {
     expect(result.current.active).toBe("report")
     expect(el.scrollIntoView).toHaveBeenCalled()
   })
+
+  it("marks a jumped section active under the real default offset", () => {
+    // Regression guard: the default offset must cover a section's scroll-mt so a
+    // section that lands ~150px below the container top after a jump is still
+    // considered active by the next recompute (not the previous section).
+    const SCROLL_MT = 150
+
+    // Build three sections inside a scroll container so recompute can measure them.
+    const container = document.createElement("div")
+    const sections: HTMLElement[] = ids.map((id) => {
+      const section = document.createElement("section")
+      section.id = `facet-${id}`
+      container.appendChild(section)
+      return section
+    })
+    document.body.appendChild(container)
+
+    // Container top sits at viewport 0; the scroll position is 0 (we jumped to a
+    // section that scrolled to the very top, leaving its top at scroll-mt below).
+    container.getBoundingClientRect = () => ({ top: 0 }) as DOMRect
+    Object.defineProperty(container, "scrollTop", { value: 0, configurable: true })
+    // Section absolute tops: build=0 is "above" by scroll-mt after a jump-to-top.
+    // We simulate scrolling so the "test" section is the one jumped to: its
+    // rect.top sits at exactly scroll-mt (150) from the container top.
+    const rectTops = [-300, SCROLL_MT, 700] // build above, test jumped-to, flow below
+    sections.forEach((section, i) => {
+      section.getBoundingClientRect = () => ({ top: rectTops[i] }) as DOMRect
+    })
+
+    // Default offset (no offset option passed).
+    const { result } = renderHook(() => useScrollSpy(ids, "CC-1"))
+
+    // Attach the hook's container ref to our measurable container so recompute
+    // can read scrollTop and measure section rects.
+    result.current.containerRef.current = container
+
+    act(() => result.current.onScroll())
+
+    // With offset >= 150, "test" (top 150) satisfies 150 - offset <= 0 and is
+    // marked active. A too-small offset (e.g. 24) would leave "build" active.
+    expect(result.current.active).toBe("test")
+
+    document.body.removeChild(container)
+  })
 })

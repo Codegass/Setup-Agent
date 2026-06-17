@@ -37,7 +37,10 @@ export function useScrollSpy(
   sessionId: string,
   options?: { offset?: number; initialFacet?: string },
 ) {
-  const offset = options?.offset ?? 24
+  // Default offset must cover a jumped section's scroll-mt so the section you
+  // jumped to is the one the next recompute marks active (see DetailPane's
+  // section scroll-mt). A too-small offset lags the active pill by a section.
+  const offset = options?.offset ?? 150
   const initialFacet = options?.initialFacet
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [active, setActive] = useState<string | null>(ids[0] ?? null)

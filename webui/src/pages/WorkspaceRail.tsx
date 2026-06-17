@@ -1,9 +1,19 @@
-import { Activity, AlertTriangle, Check, Clock, GitBranch, Rocket, Search, X } from "lucide-react"
+import { Activity, AlertTriangle, Check, Clock, GitBranch, Rocket, Search, Trash2, X } from "lucide-react"
 import { useState } from "react"
 
-import type { DashboardResponse, LaunchQueueState, WorkspaceSummary } from "@/api/types"
+import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
+import { StatusBadge } from "@/components/common/Badge"
 import { TestBar } from "@/components/common/TestBar"
 import { statusMeta } from "@/components/common/status"
+import {
+  launchProjectName,
+  launchStatusLine,
+  pendingLaunchItems,
+} from "@/components/launch/launchRows"
+import {
+  DeleteWorkspaceDialog,
+  type DeleteWorkspaceTarget,
+} from "@/components/workspace/DeleteWorkspaceDialog"
 import { formatAgo } from "@/lib/relativeTime"
 import { cn } from "@/lib/utils"
 
@@ -79,6 +89,56 @@ function RailRow({
   )
 }
 
+function PendingRailRow({
+  item,
+  onRemove,
+}: {
+  item: LaunchQueueItem
+  onRemove: (target: DeleteWorkspaceTarget) => void
+}) {
+  const project = launchProjectName(item)
+  const failed = normalize(item.status) === "failed"
+  const dot = DOT_TONE[statusMeta(item.status).tone] ?? DOT_TONE.neutral
+  return (
+    <div
+      aria-label={`Pending launch ${project}`}
+      className={cn(
+        "flex w-full items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 text-left last:border-b-0",
+        failed ? "bg-status-failed-soft/40" : "bg-slate-50/40",
+      )}
+    >
+      <span className={cn("inline-flex h-1.5 w-1.5 shrink-0 rounded-full", dot)} />
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-1.5">
+          <span className="truncate text-[13px] font-medium text-slate-600">{project}</span>
+          {item.ref ? <span className="shrink-0 font-mono text-[9.5px] text-slate-500">{item.ref}</span> : null}
+        </span>
+        <span
+          className={cn("mt-0.5 block truncate text-[10px]", failed ? "text-status-failed" : "text-slate-500")}
+          title={failed ? item.error ?? undefined : undefined}
+        >
+          {launchStatusLine(item)}
+        </span>
+      </span>
+      <span className="flex shrink-0 items-center gap-1.5">
+        <StatusBadge status={item.status} />
+        {failed ? (
+          <button
+            aria-label={`Remove failed launch ${project}`}
+            className="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+            onClick={() =>
+              onRemove({ workspaceId: item.workspace_id, label: project, kind: "launch" })
+            }
+            type="button"
+          >
+            <Trash2 size={14} />
+          </button>
+        ) : null}
+      </span>
+    </div>
+  )
+}
+
 function Chip({ label, value, tone }: { label: string; value: number; tone?: "blue" | "red" }) {
   return (
     <div className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2">
@@ -95,6 +155,8 @@ export function WorkspaceRail({
   selectedId,
   onSelect,
   onLaunchSetups,
+  launchQueue = null,
+  onRemoveLaunch,
   highlightedWorkspaces = [],
   lastUpdatedAt = null,
   pollFailed = false,
@@ -103,18 +165,28 @@ export function WorkspaceRail({
   selectedId: string | null
   onSelect: (id: string) => void
   onLaunchSetups: () => void
+  launchQueue?: LaunchQueueState | null
+  onRemoveLaunch?: (workspaceId: string) => Promise<void>
   highlightedWorkspaces?: string[]
   lastUpdatedAt?: number | null
   pollFailed?: boolean
 }) {
   const [query, setQuery] = useState("")
+  const [removeTarget, setRemoveTarget] = useState<DeleteWorkspaceTarget | null>(null)
   const ordered = sortByAttentionFirst(data.workspaces)
   const q = query.trim().toLowerCase()
   const rows = q
     ? ordered.filter((w) => w.project.toLowerCase().includes(q) || (w.stack ?? "").toLowerCase().includes(q))
     : ordered
   const running = data.workspaces.filter((w) => normalize(w.docker.status) === "running").length
-  const attention = data.workspaces.filter(needsAttention).length
+  const pending = pendingLaunchItems(launchQueue, data.workspaces)
+  // Pending rows respect the workspace filter so the search box also narrows them.
+  const pendingRows = q
+    ? pending.filter((item) => launchProjectName(item).toLowerCase().includes(q))
+    : pending
+  const failedLaunches = pending.filter((item) => normalize(item.status) === "failed").length
+  const attention = data.workspaces.filter(needsAttention).length + failedLaunches
+  const dockerDot = DOT_TONE[statusMeta(data.docker.status).tone] ?? DOT_TONE.neutral
 
   return (
     <aside className="flex h-full min-h-0 w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white">
@@ -124,7 +196,7 @@ export function WorkspaceRail({
           <div className="min-w-0">
             <div className="text-[13px] font-semibold tracking-tight text-slate-900">SAG Workbench</div>
             <div className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-slate-500">
-              <span className="inline-flex h-1 w-1 rounded-full bg-status-success" /> docker {data.docker.version ?? data.docker.status}
+              <span className={cn("inline-flex h-1 w-1 rounded-full", dockerDot)} /> docker {data.docker.version ?? data.docker.status}
             </div>
           </div>
         </div>
@@ -141,8 +213,9 @@ export function WorkspaceRail({
           <Chip label="Attention" value={attention} tone={attention ? "red" : undefined} />
         </div>
         <div className="relative mt-3">
-          <Search className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
+          <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
           <input
+            aria-label="Filter workspaces"
             className="w-full rounded-md border border-slate-200 bg-slate-50/60 py-1.5 pl-8 pr-2 text-[12.5px] text-slate-700 placeholder:text-slate-400 focus:border-blue-300 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Filter workspaces…"
@@ -152,17 +225,26 @@ export function WorkspaceRail({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {rows.length ? (
-          rows.map((w) => (
-            <RailRow
-              key={w.id}
-              highlighted={highlightedWorkspaces.includes(w.id)}
-              onSelect={onSelect}
-              selected={w.id === selectedId}
-              workspace={w}
-            />
-          ))
-        ) : data.workspaces.length === 0 ? (
+        {pendingRows.length || rows.length ? (
+          <>
+            {pendingRows.map((item) => (
+              <PendingRailRow
+                key={`pending-${item.id}`}
+                item={item}
+                onRemove={onRemoveLaunch ? setRemoveTarget : () => {}}
+              />
+            ))}
+            {rows.map((w) => (
+              <RailRow
+                key={w.id}
+                highlighted={highlightedWorkspaces.includes(w.id)}
+                onSelect={onSelect}
+                selected={w.id === selectedId}
+                workspace={w}
+              />
+            ))}
+          </>
+        ) : data.workspaces.length === 0 && pending.length === 0 ? (
           <div className="flex flex-col items-center px-4 py-12 text-center">
             <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500">
               <GitBranch size={18} />
@@ -187,6 +269,17 @@ export function WorkspaceRail({
           <span>· refreshes automatically</span>
         )}
       </div>
+
+      {removeTarget && onRemoveLaunch ? (
+        <DeleteWorkspaceDialog
+          onCancel={() => setRemoveTarget(null)}
+          onConfirm={async (id) => {
+            await onRemoveLaunch(id)
+            setRemoveTarget(null)
+          }}
+          target={removeTarget}
+        />
+      ) : null}
     </aside>
   )
 }

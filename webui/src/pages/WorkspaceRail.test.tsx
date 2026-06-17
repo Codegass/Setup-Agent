@@ -1,8 +1,23 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import type { DashboardResponse, WorkspaceSummary } from "@/api/types"
+import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
 import { WorkspaceRail } from "./WorkspaceRail"
+
+function queueItem(overrides: Partial<LaunchQueueItem>): LaunchQueueItem {
+  return {
+    id: "li-1", row_index: 0, repo_url: "https://github.com/a/b.git", workspace_id: "sag-b",
+    ref: null, status: "queued", pid: null, exit_code: null, error: null, process_log: "", ...overrides,
+  }
+}
+
+function queue(items: LaunchQueueItem[]): LaunchQueueState {
+  return {
+    default_concurrency: 2,
+    summary: { queued: 0, launching: 0, running: 0, completed: 0, failed: 0 },
+    batches: [{ id: "batch-1", status: "running", concurrency: 2, created: "now", items }],
+  }
+}
 
 function ws(overrides: Partial<WorkspaceSummary>): WorkspaceSummary {
   return {
@@ -68,5 +83,47 @@ describe("WorkspaceRail", () => {
   it("shows the updated stamp in the footer", () => {
     render(<WorkspaceRail {...props} />)
     expect(screen.getByText(/updated just now/i)).toBeInTheDocument()
+  })
+
+  it("renders pending launches as muted setting-up rows above workspaces", () => {
+    render(
+      <WorkspaceRail
+        {...props}
+        launchQueue={queue([
+          queueItem({ id: "q1", workspace_id: "sag-queued", status: "queued" }),
+          queueItem({ id: "r1", workspace_id: "sag-launching", status: "launching" }),
+        ])}
+      />,
+    )
+    expect(screen.getByText(/waiting for a free setup slot/i)).toBeInTheDocument()
+    expect(screen.getByText(/setting up/i)).toBeInTheDocument()
+  })
+
+  it("renders a failed launch with its error and a remove button", () => {
+    const onRemoveLaunch = vi.fn().mockResolvedValue(undefined)
+    render(
+      <WorkspaceRail
+        {...props}
+        launchQueue={queue([
+          queueItem({ id: "f1", workspace_id: "sag-fail", status: "failed", error: "clone failed" }),
+        ])}
+        onRemoveLaunch={onRemoveLaunch}
+      />,
+    )
+    expect(screen.getByText("clone failed")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /remove failed launch fail/i })).toBeInTheDocument()
+  })
+
+  it("does not show the empty state while launches are queued", () => {
+    render(
+      <WorkspaceRail
+        {...props}
+        data={{ ...data, workspaces: [] }}
+        launchQueue={queue([queueItem({ id: "q1", workspace_id: "sag-queued", status: "queued" })])}
+        selectedId={null}
+      />,
+    )
+    expect(screen.queryByText(/no workspaces yet/i)).not.toBeInTheDocument()
+    expect(screen.getByLabelText(/pending launch queued/i)).toBeInTheDocument()
   })
 })

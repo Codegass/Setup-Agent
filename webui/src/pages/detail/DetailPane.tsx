@@ -36,7 +36,12 @@ export function DetailPane({
 }) {
   const facets = useMemo(() => buildDetailFacets(detail), [detail])
   const ids = useMemo(() => facets.map((f) => f.id), [facets])
-  const { containerRef, active, onScroll, jump } = useScrollSpy(ids, sessionId, { initialFacet })
+  // offset matches the section scroll-mt below so a jumped section is the one
+  // the scroll-spy marks active (instead of lagging a section behind).
+  const { containerRef, active, onScroll, jump } = useScrollSpy(ids, sessionId, {
+    initialFacet,
+    offset: 150,
+  })
 
   const [panel, setPanel] = useState<WorkspacePanelKind | null>(null)
   const [taskOpen, setTaskOpen] = useState(false)
@@ -69,7 +74,7 @@ export function DetailPane({
         <SummaryBand detail={detail} />
         <div className="mt-7 space-y-7">
           {facets.map((f) => (
-            <section key={f.id} className="scroll-mt-[120px]" id={`facet-${f.id}`}>
+            <section key={f.id} className="scroll-mt-[150px]" id={`facet-${f.id}`}>
               <div className="mb-2.5 flex items-center gap-2">
                 <f.icon className="text-slate-400" size={14} />
                 <h3 className="text-[13px] font-semibold tracking-tight text-slate-700">{f.label}</h3>

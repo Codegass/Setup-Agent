@@ -121,15 +121,16 @@ export function App() {
   const sessionId = selectedSessionId ?? selectedWorkspace?.latestSession ?? undefined
 
   // Auto-select the first attention-first workspace once the dashboard loads.
+  // Guard on the resolved workspace (not the raw id) so that if the current
+  // selection vanishes out-of-band (deleted via CLI, container pruned, dropped
+  // by a background poll), auto-select re-fires instead of leaving a dead id.
   useEffect(() => {
-    if (!dashboard || selectedWorkspaceId) {
+    if (!dashboard || selectedWorkspace) {
       return
     }
     const first = sortByAttentionFirst(dashboard.workspaces)[0]
-    if (first) {
-      setSelectedWorkspaceId(first.id)
-    }
-  }, [dashboard, selectedWorkspaceId])
+    setSelectedWorkspaceId(first ? first.id : null)
+  }, [dashboard, selectedWorkspace])
 
   useEffect(() => {
     if (!dashboard || !sessionId) {
@@ -221,7 +222,9 @@ export function App() {
           data={dashboard}
           highlightedWorkspaces={highlightedWorkspaces}
           lastUpdatedAt={lastUpdatedAt}
+          launchQueue={launchQueue}
           onLaunchSetups={() => setLaunchDialogOpen(true)}
+          onRemoveLaunch={deleteWorkspace}
           onSelect={selectWorkspace}
           pollFailed={Boolean(dashboardError)}
           selectedId={selectedWorkspaceId}
