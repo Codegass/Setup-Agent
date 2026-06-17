@@ -30,7 +30,7 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
         title={doc.title}
       />
       <div className="px-6 py-5">
-        <div className="mx-auto max-w-[640px] space-y-3">
+        <div className="mx-auto max-w-[68ch] space-y-3">
           {doc.blocks.map((block, index) => (
             <ReportBlock block={block} key={index} />
           ))}
@@ -83,7 +83,7 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
     return (
       <div
         className={`flex items-center gap-2 rounded-md border px-3 py-2 text-[13px] ${
-          ok ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-red-200 bg-red-50 text-red-700"
+          ok ? "border-status-success-border bg-status-success-soft text-status-success" : "border-status-failed-border bg-status-failed-soft text-status-failed"
         }`}
       >
         {text}
