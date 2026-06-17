@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 class WebModel(BaseModel):
@@ -54,6 +54,14 @@ class BuildSummary(WebModel):
         validation_alias=AliasChoices("evidence_refs", "evidenceRefs"),
         serialization_alias="evidenceRefs",
     )
+
+    @field_validator("note", mode="before")
+    @classmethod
+    def _coerce_note(cls, value: Any) -> str:
+        # The metrics path emits note=None when no build command is known
+        # (older runs, Gradle). Coerce to "" so model_validate succeeds and the
+        # structured build fields survive instead of falling back to defaults.
+        return "" if value is None else value
 
 
 class TestSummary(WebModel):

@@ -147,6 +147,7 @@ class SetupAgent:
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.build import BuildTool
+        from sag.tools.internal.command_tracker import CommandTracker
         from sag.tools.context_tool import ContextTool
         from sag.tools.internal.env_tool import EnvTool
         from sag.tools.file_io import FileIOTool
@@ -170,6 +171,17 @@ class SetupAgent:
             add_sag_cli_marker=True,
         )
 
+        # A single CommandTracker records the build/test commands (and the
+        # build's wall-clock duration) so the producer (MavenTool) and the
+        # consumer (PhysicalValidator build-status evidence) share one source
+        # of truth. Without this shared instance the build time/command never
+        # reach the report read model.
+        self.command_tracker = CommandTracker(
+            docker_orchestrator=self.orchestrator,
+            project_name=getattr(self, "project_name", None)
+            or getattr(self.orchestrator, "project_name", None),
+        )
+
         # PhysicalValidator is the canonical source of truth for build/test
         # status — store it on the instance so other methods can reuse it
         # without paying the cost of re-initialising it lazily.
@@ -178,10 +190,13 @@ class SetupAgent:
             project_path=self.config.workspace_path,
             test_pass_threshold=self.config.test_pass_threshold,
         )
+        # Attach the shared tracker so validate_build_status can surface the
+        # timed build duration + command in its evidence dict.
+        self.physical_validator.command_tracker = self.command_tracker
 
         # Stage-1 surface: the legacy tools below are no longer model-facing;
         # they live on as backends/delegates of the build/project/search facades.
-        maven_tool = MavenTool(self.orchestrator)
+        maven_tool = MavenTool(self.orchestrator, command_tracker=self.command_tracker)
         gradle_tool = GradleTool(self.orchestrator)
         setup_tool = ProjectSetupTool(self.orchestrator)
         system_tool = SystemTool(self.orchestrator)

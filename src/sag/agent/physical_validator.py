@@ -105,6 +105,7 @@ class PhysicalValidator:
         project_path: str = "/workspace",
         compilation_recency_hours: int = 1,
         test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
+        command_tracker=None,
     ):
         """
         Initialize physical validator.
@@ -115,11 +116,16 @@ class PhysicalValidator:
             compilation_recency_hours: Hours to consider compilation as recent (default 1)
             test_pass_threshold: Minimum test pass rate (fraction 0-1) for a
                 build-green run to be a SUCCESS. Feeds :func:`evaluate_run_verdict`.
+            command_tracker: Shared CommandTracker recording build/test commands
+                and the build's wall-clock duration. validate_build_status reads
+                the last recorded build off it to surface build_time/build_command
+                in its evidence. May be attached after construction.
         """
         self.docker_orchestrator = docker_orchestrator
         self.project_path = project_path
         self.compilation_recency_hours = compilation_recency_hours
         self.test_pass_threshold = test_pass_threshold
+        self.command_tracker = command_tracker
 
         # Cache for validation results with TTL
         self.validation_cache = {}

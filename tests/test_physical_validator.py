@@ -403,6 +403,58 @@ def test_validate_build_status_command_without_duration():
     assert "build_time" not in evidence
 
 
+def test_command_tracker_param_defaults_to_none():
+    """PhysicalValidator accepts a command_tracker param; absent -> attribute is None
+    (so the getattr hook in validate_build_status resolves to a real attribute)."""
+    validator = PhysicalValidator(docker_orchestrator=None, project_path="/workspace")
+    assert validator.command_tracker is None
+
+
+def test_shared_command_tracker_threads_real_maven_build_into_validator_evidence():
+    """End-to-end wiring guard (regression for the dead-chain P0).
+
+    Uses the REAL CommandTracker shared by the producer (MavenTool records a
+    timed build via track_build_command) and the consumer (PhysicalValidator),
+    exactly as the agent wires them. A stub tracker would mask a missing share;
+    here a real tracker proves the recorded duration/command actually reach the
+    build-status evidence — i.e. the producer and consumer point at one object.
+    """
+    from sag.tools.internal.command_tracker import CommandTracker
+    from sag.tools.internal.maven_tool import MavenTool
+
+    tracker = CommandTracker(project_name="mvn")
+
+    # Producer side: MavenTool constructed with the shared tracker records the
+    # build command + wall-clock duration (the same call maven_tool makes after
+    # a real `mvn package`).
+    maven_tool = MavenTool(orchestrator=None, command_tracker=tracker)
+    assert maven_tool.command_tracker is tracker
+    maven_tool.command_tracker.track_build_command(
+        command="mvn -q clean package",
+        tool="maven",
+        working_dir="/workspace/mvn",
+        exit_code=0,
+        output="BUILD SUCCESS",
+        duration=47.2,
+    )
+
+    # Consumer side: the validator gets the SAME tracker instance.
+    orch = FakeBuildOrchestrator(
+        files={"/workspace/mvn/pom.xml", "/workspace/mvn/target/foo-1.0.jar"},
+        dirs={"/workspace/mvn/target/classes"},
+    )
+    validator = PhysicalValidator(
+        docker_orchestrator=orch, project_path="/workspace", command_tracker=tracker
+    )
+    assert validator.command_tracker is tracker
+
+    evidence = validator.validate_build_status("mvn")["evidence"]
+
+    assert evidence["build_command"] == "mvn -q clean package"
+    assert evidence["build_time"] == "47.2s"
+    assert evidence["artifact"] == evidence["artifact_samples"][0]
+
+
 # ===========================================================================
 # TASK 2.2 - Single test-verdict policy (evaluate_run_verdict)
 # ===========================================================================
