@@ -8,21 +8,21 @@ import { cn } from "@/lib/utils"
 
 const dotClasses = {
   neutral: "bg-slate-400",
-  blue: "bg-blue-500",
-  green: "bg-emerald-500",
-  red: "bg-red-500",
-  amber: "bg-amber-500",
+  blue: "bg-status-running",
+  green: "bg-status-success",
+  red: "bg-status-failed",
+  amber: "bg-status-attention",
 }
 
 const recordDotClasses: Record<string, string> = {
-  success: "bg-emerald-500",
-  pass: "bg-emerald-500",
-  passed: "bg-emerald-500",
-  fail: "bg-red-500",
-  failed: "bg-red-500",
-  failure: "bg-red-500",
+  success: "bg-status-success",
+  pass: "bg-status-success",
+  passed: "bg-status-success",
+  fail: "bg-status-failed",
+  failed: "bg-status-failed",
+  failure: "bg-status-failed",
   info: "bg-slate-400",
-  partial: "bg-amber-500",
+  partial: "bg-status-attention",
 }
 
 export function EvidenceTimeline({
@@ -102,7 +102,7 @@ export function EvidenceTimeline({
                       <div className="mt-1.5 text-[12px] leading-relaxed text-slate-500">
                         {record.detail}
                       </div>
-                      <div className="mt-2 flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-blue-500">
+                      <div className="mt-2 flex min-w-0 items-center gap-1.5 font-mono text-[10.5px] text-status-running">
                         <ExternalLink size={11} />
                         <span className="truncate">{record.ref}</span>
                       </div>

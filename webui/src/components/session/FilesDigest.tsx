@@ -34,10 +34,10 @@ export function FilesDigest({
     <div>
       {!preview ? (
         <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 px-4 py-2.5">
-          <CountDot color="bg-emerald-500" label={`${digest.counts.added} added`} />
-          <CountDot color="bg-blue-500" label={`${digest.counts.modified} modified`} />
-          <CountDot color="bg-red-500" label={`${digest.counts.deleted} deleted`} />
-          <CountDot color="bg-amber-500" label={`${digest.counts.renamed} renamed`} />
+          <CountDot color="bg-status-success" label={`${digest.counts.added} added`} />
+          <CountDot color="bg-status-running" label={`${digest.counts.modified} modified`} />
+          <CountDot color="bg-status-failed" label={`${digest.counts.deleted} deleted`} />
+          <CountDot color="bg-status-attention" label={`${digest.counts.renamed} renamed`} />
           <div className="ml-auto font-mono text-[10.5px] text-slate-500">
             snapshot {digest.snapshot.base} - {digest.snapshot.head} / {digest.snapshot.mode}
           </div>
