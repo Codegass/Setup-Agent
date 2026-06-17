@@ -119,6 +119,27 @@ describe("App", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "false")
   })
 
+  it("does not block the UI while a delete is in flight", async () => {
+    let deleteCalls = 0
+    vi.spyOn(globalThis, "fetch").mockImplementation((input, init) => {
+      const url = String(input)
+      if (url === "/api/project-launches") return Promise.resolve(jsonResponse(emptyLaunchQueue))
+      if (url.startsWith("/api/sessions/")) return Promise.resolve(jsonResponse(sessionDetail))
+      if (init?.method === "DELETE") {
+        deleteCalls++
+        return new Promise(() => {}) // never resolves — proves the UI doesn't await it
+      }
+      return Promise.resolve(jsonResponse(dashboard))
+    })
+
+    render(<App />)
+    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/i }))
+    fireEvent.click(await screen.findByRole("button", { name: /^Delete workspace$/i }))
+    await waitFor(() => expect(deleteCalls).toBe(1))
+    // Dialog closed immediately despite the DELETE never resolving (non-blocking).
+    expect(screen.queryByRole("dialog", { name: /delete workspace/i })).not.toBeInTheDocument()
+  })
+
   it("shows an unavailable state when dashboard fetch fails", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network down"))
 

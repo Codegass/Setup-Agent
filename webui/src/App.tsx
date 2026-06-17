@@ -45,6 +45,7 @@ export function App() {
   const [selectedSessionId, setSelectedSessionIdState] = useState<string | undefined>(undefined)
   const [selectedFacet, setSelectedFacet] = useState<string | undefined>(undefined)
   const [railOpen, setRailOpen] = useState(false)
+  const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
   const highlightTimers = useRef<number[]>([])
 
   const loadLaunchQueue = useCallback(async () => {
@@ -190,18 +191,49 @@ export function App() {
   }
 
   const deleteWorkspace = async (workspaceId: string): Promise<void> => {
-    // Let errors propagate so the confirm dialog can surface a 409.
+    // Awaited path, used for the small/fast failed-launch removal. Let errors
+    // propagate so the confirm dialog can surface a 409.
     await deleteWorkspaceRequest(workspaceId)
     await loadDashboard()
     await loadLaunchQueue()
   }
 
-  // Delete initiated from the Detail Pane: after success the workspace is gone,
-  // so clear the selection and let the auto-select pick another.
-  const deleteWorkspaceFromDetail = async (workspaceId: string): Promise<void> => {
-    await deleteWorkspace(workspaceId)
+  // Non-freezing workspace delete: mark the id "deleting", fire the request in
+  // the background, and reconcile via a silent reload. Errors surface as a toast
+  // (the dialog has already closed). The row shows an inline "deleting…" state.
+  const startDelete = (workspaceId: string) => {
+    setDeletingIds((prev) => new Set(prev).add(workspaceId))
+    void deleteWorkspaceRequest(workspaceId)
+      .then(() => {
+        void loadDashboard({ silent: true })
+        void loadLaunchQueue()
+      })
+      .catch((err) => {
+        setLaunchNotice(
+          `Couldn't delete ${workspaceId}: ${err instanceof Error ? err.message : String(err)}`,
+        )
+      })
+      .finally(() => {
+        setDeletingIds((prev) => {
+          const next = new Set(prev)
+          next.delete(workspaceId)
+          return next
+        })
+      })
+  }
+
+  // Delete from the Detail Pane: start the background delete and clear the
+  // selection immediately so the pane doesn't dead-end (auto-select picks next).
+  const deleteWorkspaceFromDetail = (workspaceId: string): Promise<void> => {
+    startDelete(workspaceId)
     setSelectedWorkspaceId(null)
     setSelectedSessionIdState(undefined)
+    return Promise.resolve()
+  }
+
+  const deleteWorkspaces = (ids: string[]): Promise<void> => {
+    ids.forEach(startDelete)
+    return Promise.resolve()
   }
 
   const handleBatchSubmitted = (result: LaunchBatchResult) => {
@@ -252,10 +284,12 @@ export function App() {
             railOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0",
           )}
           data={dashboard}
+          deletingIds={deletingIds}
           highlightedWorkspaces={highlightedWorkspaces}
           lastUpdatedAt={lastUpdatedAt}
           launchQueue={launchQueue}
           onAfterSelect={() => setRailOpen(false)}
+          onDeleteMany={deleteWorkspaces}
           onLaunchSetups={() => setLaunchDialogOpen(true)}
           onRemoveLaunch={deleteWorkspace}
           onSelect={selectWorkspace}
