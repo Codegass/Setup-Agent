@@ -42,6 +42,28 @@ it("renders '—' for absent counts instead of a fake zero", () => {
   expect(screen.getAllByText("0").length).toBeGreaterThanOrEqual(1)
 })
 
+it("shows a conclusion card with the build system and command", () => {
+  render(<BuildDetailPage detail={{
+    build: { state: "success", tool: "Maven", time: "47.2s", note: "mvn -q install",
+             system: "Maven", classCount: 120, jarCount: 3 },
+    moduleSummary: { singleModule: true },
+    modules: [],
+  } as any} />)
+  expect(screen.getByText("Success")).toBeInTheDocument()
+  expect(screen.getByText("mvn -q install")).toBeInTheDocument()
+  expect(screen.getByText("120")).toBeInTheDocument()
+})
+
+it("uses a single-module note that does not mention an Overview tab", () => {
+  render(<BuildDetailPage detail={{
+    build: { state: "success", system: "maven", classCount: 1, jarCount: 1 },
+    moduleSummary: { singleModule: true },
+    modules: [],
+  } as any} />)
+  expect(screen.queryByText(/Overview/i)).not.toBeInTheDocument()
+  expect(screen.getByText(/single-module project/i)).toBeInTheDocument()
+})
+
 it("omits the back button when onBack is not provided (embedded mode)", () => {
   render(<BuildDetailPage detail={{
     build: { state: "success", system: "maven", classCount: 13104, jarCount: 279 },
