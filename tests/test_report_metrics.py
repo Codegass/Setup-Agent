@@ -63,3 +63,24 @@ def test_assemble_truncates_failing_and_samples():
     )
     assert len(m["build"]["artifact_samples"]) == 10
     assert len(m["test"]["failing_names"]) == 50
+
+
+def test_build_dict_surfaces_time_command_artifact():
+    metrics = assemble_report_metrics(
+        snapshot={"phases": {"build": True}, "status": {"overall": "success"}},
+        build_evidence={
+            "build_system": "maven", "tool": "Maven 3.9.6",
+            "class_files": 115, "jar_files": 1,
+            "build_time": "47.2s", "build_command": "clean package",
+            "artifact": "target/commons-cli-1.6.0.jar",
+            "artifact_samples": ["target/commons-cli-1.6.0.jar"],
+        },
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-06-17T00:00:00",
+    )
+    build = metrics["build"]
+    assert build["time"] == "47.2s"
+    assert build["note"] == "clean package"
+    assert build["artifact"] == "target/commons-cli-1.6.0.jar"

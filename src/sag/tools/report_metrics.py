@@ -50,6 +50,10 @@ def assemble_report_metrics(
         "artifact_samples": _str_list(build_evidence.get("artifact_samples"), _MAX_SAMPLES),
         "warnings": _str_list(build_evidence.get("warnings"), 25),
         "evidence_refs": _str_list(evidence_refs, 25),
+        "time": build_evidence.get("build_time"),
+        "note": build_evidence.get("build_command"),
+        "artifact": build_evidence.get("artifact")
+            or (_str_list(build_evidence.get("artifact_samples"), 1) or [None])[0],
     }
 
     test = {
