@@ -520,7 +520,11 @@ export function ContextTrace({
   const [expandedPhases, setExpandedPhases] = useState<Record<string, boolean>>({})
   const [debugOpen, setDebugOpen] = useState(false)
   const [selectedRef, setSelectedRef] = useState<ContextRef | null>(null)
-  const progress = trunkProgress(ctx.trunk.progress)
+  // Defensive: a malformed/partial context (e.g. an older shape missing `phases`)
+  // must not crash the whole detail pane — the Flow facet renders all at once now.
+  const trunk = ctx.trunk ?? { goal: "", state: "unknown", progress: {}, summary: "" }
+  const phases = ctx.phases ?? []
+  const progress = trunkProgress(trunk.progress ?? {})
 
   return (
     <div className="space-y-4">
@@ -531,9 +535,9 @@ export function ContextTrace({
               <Target aria-hidden className="text-blue-600" size={15} />
               <span className="truncate text-[13px] font-semibold text-slate-800">Trunk goal</span>
             </div>
-            <StatusBadge status={ctx.trunk.state} />
+            <StatusBadge status={trunk.state} />
           </div>
-          <p className="mt-2 text-[13px] leading-relaxed text-slate-700">{ctx.trunk.goal}</p>
+          <p className="mt-2 text-[13px] leading-relaxed text-slate-700">{trunk.goal}</p>
           {progress ? (
             <div className="mt-3 flex items-center gap-3">
               <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">
@@ -554,16 +558,16 @@ export function ContextTrace({
               </span>
             </div>
           ) : null}
-          {!preview && ctx.trunk.summary.trim() ? (
-            <p className="mt-3 text-[12px] leading-relaxed text-slate-500">{ctx.trunk.summary}</p>
+          {!preview && (trunk.summary ?? "").trim() ? (
+            <p className="mt-3 text-[12px] leading-relaxed text-slate-500">{trunk.summary}</p>
           ) : null}
         </div>
 
         <ol className="px-4 py-3">
-          {ctx.phases.map((phase, index) => (
+          {phases.map((phase, index) => (
             <PhaseRow
               key={phase.id}
-              last={index === ctx.phases.length - 1}
+              last={index === phases.length - 1}
               onOpenRef={setSelectedRef}
               onToggle={() =>
                 setExpandedPhases((current) => ({

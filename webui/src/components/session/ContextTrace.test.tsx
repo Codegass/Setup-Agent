@@ -194,4 +194,15 @@ describe("ContextTrace", () => {
     expect(screen.getByText("iter 95")).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: /Show .* more/i })).not.toBeInTheDocument()
   })
+
+  it("renders without crashing when the context is missing phases (older/partial shape)", () => {
+    // The --demo fixture emits a stale context shape with no `phases` array; the
+    // detail pane renders Flow on mount, so this must degrade, not throw.
+    const partial = {
+      trunk: { goal: "Set up kafka", state: "running", progress: {}, summary: "" },
+      debug: {},
+    } as unknown as ContextTraceModel
+    render(<ContextTrace ctx={partial} />)
+    expect(screen.getByText("Set up kafka")).toBeInTheDocument()
+  })
 })
