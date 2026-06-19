@@ -471,7 +471,10 @@ class MavenTool(BaseTool):
             # Use analysis result to determine success, not just exit code
             evidence_fields = self._maven_evidence_fields(analysis, ref_id)
             if analysis["build_success"]:
-                if any(goal in command.lower() for goal in ["test", "verify"]):
+                if any(
+                    goal in command.lower()
+                    for goal in ["test", "verify", "compile", "package", "install"]
+                ):
                     self._record_test_summary(
                         working_directory, analysis, result["exit_code"], maven_cmd
                     )
@@ -535,7 +538,10 @@ class MavenTool(BaseTool):
                     },
                 )
             else:
-                if any(goal in command.lower() for goal in ["test", "verify"]):
+                if any(
+                    goal in command.lower()
+                    for goal in ["test", "verify", "compile", "package", "install"]
+                ):
                     self._record_test_summary(
                         working_directory, analysis, result["exit_code"], maven_cmd
                     )
@@ -1087,6 +1093,14 @@ class MavenTool(BaseTool):
 
     def _analyze_maven_output(self, output: str, exit_code: int) -> Dict[str, Any]:
         """Analyze Maven output for key information."""
+        # Strip ANSI colour codes FIRST. Maven emits coloured output — "[INFO]"
+        # is actually "[\x1b[1;34mINFO\x1b[m]" — which breaks line-oriented regexes
+        # that expect a literal "[INFO] <module> ... SUCCESS". This silently made
+        # the Reactor Summary parser record ZERO modules on a coloured reactor
+        # build (Brooklyn: reactor printed but reactor_summary came back empty),
+        # so the module report fell back to the depth-limited filesystem scan.
+        output = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output or "")
+
         # CRITICAL: Check for BUILD SUCCESS/FAILURE in output, not just exit code
         # Maven can return 0 even when build fails in some scenarios
         has_build_success = "BUILD SUCCESS" in output or "[INFO] BUILD SUCCESS" in output
@@ -1146,8 +1160,6 @@ class MavenTool(BaseTool):
 
         # Check for POM parsing errors
         if "Non-parseable POM" in output and "Unrecognised tag" in output:
-            import re
-
             pom_error_match = re.search(
                 r"Non-parseable POM ([^:]+): Unrecognised tag: \'([^\']+)\'.+@(\d+):(\d+)", output
             )
@@ -1162,8 +1174,6 @@ class MavenTool(BaseTool):
                 analysis["build_success"] = False  # Override build success for POM errors
 
         # Check for Maven Enforcer Java version errors
-        import re
-
         enforcer_pattern = (
             r"Detected JDK Version: ([\d\.]+).*is not in the allowed range \[([\d\.]+),\)"
         )
@@ -1893,10 +1903,19 @@ class MavenTool(BaseTool):
     def _record_test_summary(
         self, working_directory: str, analysis: Dict[str, Any], exit_code: int, command: str
     ) -> None:
-        """Write a concise test execution summary for downstream reporting."""
+        """Write a concise build/test summary for downstream reporting.
+
+        Records the Maven Reactor Summary (per-module SUCCESS/FAILURE/SKIPPED) for
+        BOTH build and test commands so the report's module metrics can be
+        reactor-authoritative (which modules Maven actually built). The ``event``
+        field classifies the entry: a non-test build entry is tagged
+        ``build_summary`` so _load_test_history collects its reactor_summary but
+        does NOT mistake its (empty) test counts for the test aggregate.
+        """
         if not self.orchestrator:
             return
 
+        is_test = any(g in (command or "").lower() for g in ("test", "verify"))
         tests = analysis.get("tests_run") or {}
         failed_modules = []
         for module_info in analysis.get("failed_modules", []):
@@ -1909,6 +1928,7 @@ class MavenTool(BaseTool):
                     failed_modules.append(Path(pom_path).parent.name)
 
         entry = {
+            "event": "test_session_end" if is_test else "build_summary",
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "working_directory": working_directory,
             "command": command,
