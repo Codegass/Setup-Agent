@@ -66,6 +66,22 @@ def _build_reactor_index(reactor_status: Dict[str, str]) -> Dict[str, str]:
     return index
 
 
+def _match_reactor_key(index: Dict[str, str], name: str, path: str) -> Optional[str]:
+    """Return the reactor index KEY a scanned module matches, or None.
+
+    Same resolution order as :func:`_lookup_reactor` (full normalized name/path,
+    then trailing path segment) but returns the key so the caller can dedupe and
+    detect which reactor entries a disk scan covered.
+    """
+    for candidate in (_norm_key(name), _norm_key(path)):
+        if candidate and candidate in index:
+            return candidate
+    tail = _norm_key(path).rsplit(" ", 1)[-1]
+    if tail and tail in index:
+        return tail
+    return None
+
+
 def _lookup_reactor(
     index: Dict[str, str], name: str, path: str
 ) -> Optional[str]:
@@ -75,13 +91,8 @@ def _lookup_reactor(
     segment (e.g. "connect/api" -> "api") so descriptive Maven <name> labels
     that were indexed by tail still resolve.
     """
-    for candidate in (_norm_key(name), _norm_key(path)):
-        if candidate and candidate in index:
-            return index[candidate]
-    tail = _norm_key(path).rsplit(" ", 1)[-1]
-    if tail and tail in index:
-        return index[tail]
-    return None
+    key = _match_reactor_key(index, name, path)
+    return index.get(key) if key else None
 
 
 def assemble_module_metrics(
@@ -100,6 +111,14 @@ def assemble_module_metrics(
 
     any_failure = any(_norm_status(v) == "failure" for v in reactor_status.values())
     reactor_index = _build_reactor_index(reactor_status)
+    # When a live Maven Reactor Summary was captured it is AUTHORITATIVE for the
+    # "detected" module set: the detected modules are exactly the modules Maven
+    # built. A scanned dir that is not in the reactor is not part of the build
+    # (e.g. a standalone example pom) and is dropped; reactor entries that no disk
+    # scan matched still get a row. Without a reactor summary the caller has
+    # already narrowed `modules` to the active reactor-declared set.
+    reactor_present = bool(reactor_index)
+    matched_reactor_keys: set[str] = set()
 
     for scan in modules or []:
         path = str(scan.get("path") or "")
@@ -109,7 +128,16 @@ def assemble_module_metrics(
 
         # Build status: reactor wins; match descriptive Maven <name> labels by
         # normalizing both sides (name, path, trailing path segment).
-        reactor = _norm_status(_lookup_reactor(reactor_index, name, path))
+        reactor_key = _match_reactor_key(reactor_index, name, path)
+        reactor = _norm_status(reactor_index.get(reactor_key)) if reactor_key else None
+
+        if reactor_present:
+            # Authoritative reactor: skip scanned dirs not in the reactor, and
+            # dedupe if two scanned dirs map to the same reactor entry.
+            if reactor_key is None or reactor_key in matched_reactor_keys:
+                continue
+            matched_reactor_keys.add(reactor_key)
+
         if reactor is not None:
             build_status, build_source = reactor, "reactor"
             # Conflict guard: reactor says success but nothing was produced.
@@ -148,6 +176,40 @@ def assemble_module_metrics(
             "failing_count": failing_count,
             "evidence_refs": _str_list(t.get("evidence_refs") or scan.get("report_dirs"), 25),
         })
+
+    # Reactor entries that no disk scan matched were still built by Maven — count
+    # them (one row each) so "detected" equals the reactor module count exactly.
+    # A scanned module may have matched via the full normalized key OR the trailing
+    # segment (see _match_reactor_key), so skip a label if EITHER resolves to an
+    # already-counted module — otherwise a tail-matched module is double-counted.
+    if reactor_present:
+        for label, status in reactor_status.items():
+            full_key = _norm_key(label)
+            tail_key = full_key.rsplit(" ", 1)[-1] if full_key else ""
+            if not full_key:
+                continue
+            if full_key in matched_reactor_keys or (tail_key and tail_key in matched_reactor_keys):
+                continue
+            matched_reactor_keys.add(full_key)
+            out_modules.append({
+                "name": label,
+                "path": "",
+                "build_status": _norm_status(status) or "unknown",
+                "build_source": "reactor",
+                "class_count": None,
+                "jar_count": None,
+                "build_warnings": None,
+                "build_error_samples": [],
+                "tests_total": None,
+                "tests_passed": None,
+                "tests_failed": None,
+                "tests_errors": None,
+                "tests_skipped": None,
+                "test_source": "none",
+                "failing_names": [],
+                "failing_count": None,
+                "evidence_refs": [],
+            })
 
     total = len(out_modules)
     summary = {
