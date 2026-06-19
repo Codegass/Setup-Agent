@@ -83,13 +83,12 @@ describe("App", () => {
   })
 
   it("fetches and renders dashboard data after loading", async () => {
-    vi.spyOn(globalThis, "fetch").mockImplementation((input) =>
-      Promise.resolve(
-        String(input) === "/api/project-launches"
-          ? jsonResponse(emptyLaunchQueue)
-          : jsonResponse(dashboard),
-      ),
-    )
+    vi.spyOn(globalThis, "fetch").mockImplementation((input) => {
+      const url = String(input)
+      if (url === "/api/project-launches") return Promise.resolve(jsonResponse(emptyLaunchQueue))
+      if (url.startsWith("/api/sessions/")) return Promise.resolve(jsonResponse(sessionDetail))
+      return Promise.resolve(jsonResponse(dashboard))
+    })
 
     render(<App />)
 
@@ -133,7 +132,8 @@ describe("App", () => {
     })
 
     render(<App />)
-    fireEvent.click(await screen.findByRole("button", { name: /^Delete$/i }))
+    fireEvent.click(await screen.findByRole("button", { name: /more/i }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: /delete/i }))
     fireEvent.click(await screen.findByRole("button", { name: /^Delete workspace$/i }))
     await waitFor(() => expect(deleteCalls).toBe(1))
     // Dialog closed immediately despite the DELETE never resolving (non-blocking).
@@ -411,11 +411,12 @@ describe("App", () => {
       }))[0],
     )
 
-    // The detail header's session switcher lists every session as a chip.
-    expect(await screen.findByRole("button", { name: /SETUP-20260606-213241/ })).toBeInTheDocument()
-    expect(screen.getByText("Setup and configure the commons-cli project to be runnable")).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: /UI-12345678/ })).toBeInTheDocument()
-    expect(screen.getByText("Run formatter tests")).toBeInTheDocument()
+    // The detail header's overflow menu lists every session.
+    fireEvent.click(await screen.findByRole("button", { name: /more/i }))
+    expect(await screen.findByRole("menuitemradio", { name: /SETUP-20260606-213241/ })).toBeInTheDocument()
+    expect(screen.getByRole("menuitemradio", { name: /Setup and configure the commons-cli project to be runnable/ })).toBeInTheDocument()
+    expect(screen.getByRole("menuitemradio", { name: /UI-12345678/ })).toBeInTheDocument()
+    expect(screen.getByRole("menuitemradio", { name: /Run formatter tests/ })).toBeInTheDocument()
   })
 
   it("polls open running session details and renders fresh status", async () => {
@@ -537,8 +538,10 @@ describe("App", () => {
 
     render(<App />)
 
-    // The rail auto-selects the only workspace; delete from the detail header.
-    fireEvent.click(await screen.findByRole("button", { name: "Delete" }))
+    // The rail auto-selects the only workspace; delete from the detail header
+    // overflow menu.
+    fireEvent.click(await screen.findByRole("button", { name: /more/i }))
+    fireEvent.click(await screen.findByRole("menuitem", { name: /delete/i }))
 
     fireEvent.click(screen.getByRole("button", { name: "Delete workspace" }))
 

@@ -6,35 +6,35 @@ import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
 import { DetailHeader } from "./DetailHeader"
 
 const workspace: WorkspaceSummary = {
-  id: "sag-x",
-  project: "owner/x",
-  container: "sag-x",
-  stack: "Java · Maven",
+  id: "sag-acme",
+  project: "acme-platform",
+  container: "sag-acme",
+  stack: "maven",
+  commit: "9f8e7d6",
   docker: { status: "running", image: "sag/base" },
   task: "Build and test",
   build: { state: "success", tool: "Maven", time: "1s", note: "" },
   test: { state: "pass", pass: 10, fail: 0, skip: 0, total: 10 },
   report: "ready",
   changed: 0,
-  updated: "just now",
-  release: "1.4.0",
+  updated: "2m ago",
   sessions: [
-    { id: "CC-1", workspace: "sag-x", title: "first", status: "completed", entry: "SAG", start: "", duration: "", build: "success", test: { state: "pass", pass: 1, fail: 0, skip: 0, total: 1 }, report: "ready", files: 0, evidence: 0 },
-    { id: "CC-2", workspace: "sag-x", title: "second", status: "running", entry: "SAG", start: "", duration: "", build: "pending", test: { state: "none", pass: 0, fail: 0, skip: 0, total: 0 }, report: "none", files: 0, evidence: 0 },
+    { id: "CC-1", workspace: "sag-acme", title: "first", status: "completed", entry: "SAG", start: "", duration: "", build: "success", test: { state: "pass", pass: 1, fail: 0, skip: 0, total: 1 }, report: "ready", files: 0, evidence: 0 },
+    { id: "CC-2", workspace: "sag-acme", title: "second", status: "running", entry: "SAG", start: "", duration: "", build: "pending", test: { state: "none", pass: 0, fail: 0, skip: 0, total: 0 }, report: "none", files: 0, evidence: 0 },
   ],
 }
 
-const actions = { onNewTask: () => {}, onTerminal: () => {}, onSettings: () => {}, onDelete: () => {} }
+const noopHandlers = { onSession: () => {}, onNewTask: () => {}, onTerminal: () => {}, onSettings: () => {}, onDelete: () => {} }
 
 function makeDetail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionSessionDetail {
   return {
     id: "CC-1",
-    workspace: "sag-x",
+    workspace: "sag-acme",
     title: "first",
     status: "running",
-    entry: "SAG",
+    entry: "setup",
     start: "now",
-    duration: "1m",
+    duration: "8m 01s",
     outcome: "Working.",
     build: { state: "success", tool: "Maven", time: "1s", note: "" },
     test: { state: "pass", pass: 1, fail: 0, skip: 0, total: 1 },
@@ -50,65 +50,74 @@ describe("DetailHeader", () => {
     cleanup()
   })
 
-  it("renders project, container, status, and the session chips", () => {
-    render(<DetailHeader workspace={workspace} sessionId="CC-1" onSession={() => {}} {...actions} />)
-    expect(screen.getByRole("heading", { name: "owner/x" })).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: /CC-1/ })).toHaveAttribute("aria-current", "true")
-    expect(screen.getByRole("button", { name: /CC-2/ })).toBeInTheDocument()
+  it("renders the project heading and the entry tag", () => {
+    render(<DetailHeader workspace={workspace} detail={makeDetail()} sessionId="CC-1" {...noopHandlers} />)
+    expect(screen.getByRole("heading", { name: "acme-platform" })).toBeInTheDocument()
+    expect(screen.getByText("setup")).toBeInTheDocument()
   })
 
-  it("switches session when a chip is clicked", () => {
+  it("shows model and steps in the metadata line", () => {
+    render(
+      <DetailHeader
+        workspace={{ id: "sag-acme", project: "acme-platform", stack: "maven", commit: "9f8e7d6" } as WorkspaceSummary}
+        detail={{ model: "claude-sonnet-4.5", steps: 6, stepBudget: 40, duration: "8m 01s" } as ExecutionSessionDetail}
+        sessionId="S1"
+        {...noopHandlers}
+      />,
+    )
+    expect(screen.getByText(/claude-sonnet-4\.5/)).toBeInTheDocument()
+    expect(screen.getByText(/6\s*\/\s*40 steps/)).toBeInTheDocument()
+  })
+
+  it("falls back to a bare step count when no budget is present", () => {
+    render(
+      <DetailHeader
+        workspace={{ id: "sag-acme", project: "acme-platform" } as WorkspaceSummary}
+        detail={{ steps: 6 } as ExecutionSessionDetail}
+        sessionId="S1"
+        {...noopHandlers}
+      />,
+    )
+    expect(screen.getByText(/\b6 steps\b/)).toBeInTheDocument()
+    expect(screen.queryByText(/\/\s*\d+\s*steps/)).not.toBeInTheDocument()
+  })
+
+  it("renders the primary New task action and labeled secondary actions", () => {
+    const onNewTask = vi.fn()
+    render(<DetailHeader workspace={workspace} detail={makeDetail()} sessionId="CC-1" {...noopHandlers} onNewTask={onNewTask} />)
+    fireEvent.click(screen.getByRole("button", { name: /new task/i }))
+    expect(onNewTask).toHaveBeenCalledTimes(1)
+    expect(screen.getByRole("button", { name: /terminal/i })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /settings/i })).toBeInTheDocument()
+  })
+
+  it("opens the overflow menu and exposes Delete + the session switcher", () => {
+    const onDelete = vi.fn()
     const onSession = vi.fn()
-    render(<DetailHeader workspace={workspace} sessionId="CC-1" onSession={onSession} {...actions} />)
-    fireEvent.click(screen.getByRole("button", { name: /CC-2/ }))
+    render(<DetailHeader workspace={workspace} detail={makeDetail()} sessionId="CC-1" {...noopHandlers} onDelete={onDelete} onSession={onSession} />)
+
+    // Menu is closed initially.
+    expect(screen.queryByRole("menuitem", { name: /delete/i })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /more/i }))
+    fireEvent.click(screen.getByRole("menuitem", { name: /delete/i }))
+    expect(onDelete).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole("button", { name: /more/i }))
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /CC-2/ }))
     expect(onSession).toHaveBeenCalledWith("CC-2")
   })
 
-  it("shows the session Flow status when detail is provided", () => {
-    render(
-      <DetailHeader
-        workspace={workspace}
-        detail={makeDetail({ status: "running" })}
-        sessionId="CC-1"
-        onSession={() => {}}
-        {...actions}
-      />,
-    )
-    expect(screen.getByText("Flow")).toBeInTheDocument()
-  })
-
-  it("shows a partial-discovery badge when the session is partial", () => {
-    const { rerender } = render(
-      <DetailHeader
-        workspace={workspace}
-        detail={makeDetail({ partial: false })}
-        sessionId="CC-1"
-        onSession={() => {}}
-        {...actions}
-      />,
-    )
-    expect(screen.queryByText("partial discovery")).not.toBeInTheDocument()
-    rerender(
-      <DetailHeader
-        workspace={workspace}
-        detail={makeDetail({ partial: true })}
-        sessionId="CC-1"
-        onSession={() => {}}
-        {...actions}
-      />,
-    )
-    expect(screen.getByText("partial discovery")).toBeInTheDocument()
-  })
-
-  it("hides the session switcher when there is a single session", () => {
+  it("hides the session switcher in the menu when there is a single session", () => {
     render(
       <DetailHeader
         workspace={{ ...workspace, sessions: [workspace.sessions![0]] }}
+        detail={makeDetail()}
         sessionId="CC-1"
-        onSession={() => {}}
-        {...actions}
+        {...noopHandlers}
       />,
     )
-    expect(screen.queryByText("Sessions")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: /more/i }))
+    expect(screen.queryByRole("menuitemradio", { name: /CC-2/ })).not.toBeInTheDocument()
   })
 })
