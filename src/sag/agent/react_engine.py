@@ -1730,6 +1730,17 @@ class ReActEngine(UIEventEmitter):
 
         archived = getattr(self, "_archived_counts", None) or {}
 
+        # Runtime metadata for the web read model (graceful when config absent).
+        config = getattr(self, "config", None)
+        model_name = None
+        if config is not None:
+            getter = getattr(config, "get_litellm_model_name", None)
+            if callable(getter):
+                model_name = getter("action")
+        max_iterations = getattr(self, "max_iterations", None) or getattr(
+            config, "max_iterations", None
+        )
+
         # Cumulative per-tool usage: archived windows + the live window. Without
         # this the report's Tool Usage reflects only the post-compaction window.
         tools_used = dict(archived.get("tools_used", {}))
@@ -1746,6 +1757,8 @@ class ReActEngine(UIEventEmitter):
                 tool_failures[tool_name] = tool_failures.get(tool_name, 0) + 1
 
         return {
+            "model": model_name,
+            "max_iterations": max_iterations,
             "tools_used": tools_used,
             "tool_failures": tool_failures,
             "total_steps": len(self.steps) + archived.get("total_steps", 0),
