@@ -149,6 +149,12 @@ export interface ModuleRollup {
   coverageSource?: string | null
 }
 
+export interface VerdictSummary {
+  tone: "success" | "attention" | "failed"
+  headline: string
+  detail?: string | null
+}
+
 export interface ExecutionSessionDetail {
   id: string
   workspace: string
@@ -158,6 +164,10 @@ export interface ExecutionSessionDetail {
   start: string
   duration: string
   outcome: string
+  verdict?: VerdictSummary | null
+  model?: string | null
+  steps?: number | null
+  stepBudget?: number | null
   evidenceStatus?: string | null
   build: BuildSummary
   test: TestSummary
