@@ -32,6 +32,102 @@ function covTextClass(rate: number): string {
   return rate >= 80 ? "text-status-success" : rate >= 50 ? "text-status-attention" : "text-status-failed"
 }
 
+function buildLabel(s: string): string {
+  if (s === "success") return "Built"
+  if (s === "failure") return "Failed"
+  if (s === "skipped") return "Skipped"
+  return "Unknown"
+}
+
+function buildDotClass(s: string): string {
+  if (s === "success") return "bg-status-success"
+  if (s === "failure") return "bg-status-failed"
+  if (s === "skipped") return "bg-slate-400"
+  return "bg-status-attention"
+}
+
+function buildTextClass(s: string): string {
+  if (s === "success") return "text-status-success"
+  if (s === "failure") return "text-status-failed"
+  if (s === "skipped") return "text-slate-500"
+  return "text-status-attention"
+}
+
+function pct1(n: number): string {
+  return `${n.toFixed(1).replace(/\.0$/, "")}%`
+}
+
+function ProgressBar({ rate, color }: { rate: number; color: string }) {
+  return (
+    <span className="block h-[5px] overflow-hidden rounded-full bg-slate-100">
+      <span
+        className="block h-full rounded-full"
+        style={{ width: `${Math.max(0, Math.min(100, rate))}%`, background: color }}
+      />
+    </span>
+  )
+}
+
+function OverviewRow({ m }: { m: ModuleSummary }) {
+  const status = m.buildStatus ?? "unknown"
+  const pass = m.testsPassed ?? 0
+  const total = m.testsTotal ?? pass + (m.testsFailed ?? 0)
+  const fc = m.failingCount ?? 0
+  const failing = fc > 0
+  const testRate = total > 0 ? (pass / total) * 100 : 0
+  const testColor = failing ? "var(--status-failed)" : "var(--status-success)"
+  return (
+    <div
+      className="grid items-center gap-3 border-t border-slate-100 px-4 py-3"
+      style={{ gridTemplateColumns: "1.5fr 0.8fr 1.3fr 1fr 1fr" }}
+    >
+      <div className="min-w-0">
+        <div className="text-[13px] font-semibold text-slate-800">{m.name}</div>
+        <div className="truncate font-mono text-[11px] text-slate-400">{m.path}</div>
+      </div>
+      <div>
+        <span className={cn("inline-flex items-center gap-1.5 text-[12px] font-semibold", buildTextClass(status))}>
+          <span className={cn("h-1.5 w-1.5 rounded-full", buildDotClass(status))} />
+          {buildLabel(status)}
+        </span>
+      </div>
+      <div>
+        {total > 0 ? (
+          <>
+            <div className="mb-1.5 flex items-center justify-between font-mono text-[12px] text-slate-600">
+              <span>{`${pass.toLocaleString()} / ${total.toLocaleString()}`}</span>
+              {failing ? <span className="font-mono text-[11px] text-status-failed">{fc} failing</span> : null}
+            </div>
+            <ProgressBar rate={testRate} color={testColor} />
+          </>
+        ) : (
+          <span className="font-mono text-[12px] text-slate-400">—</span>
+        )}
+      </div>
+      <div>
+        {m.lineRate != null ? (
+          <>
+            <div className="mb-1.5 font-mono text-[12px] text-slate-700">{pct1(m.lineRate)}</div>
+            <ProgressBar rate={m.lineRate} color={covColor(m.lineRate)} />
+          </>
+        ) : (
+          <span className="font-mono text-[12px] text-slate-400">—</span>
+        )}
+      </div>
+      <div>
+        {m.branchRate != null ? (
+          <>
+            <div className="mb-1.5 font-mono text-[12px] text-slate-700">{pct1(m.branchRate)}</div>
+            <ProgressBar rate={m.branchRate} color={covColor(m.branchRate)} />
+          </>
+        ) : (
+          <span className="font-mono text-[12px] text-slate-400">—</span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function CoverageBar({ label, rate }: { label: string; rate: number }) {
   return (
     <div className="flex items-center gap-2 font-mono text-[11px]">
@@ -56,10 +152,30 @@ export function ModuleTable({
   variant,
 }: {
   modules: ModuleSummary[]
-  variant: "build" | "test"
+  variant: "build" | "test" | "overview"
 }) {
   const [open, setOpen] = useState<string | null>(null)
   const ordered = [...modules].sort((a, b) => failureRank(a) - failureRank(b))
+
+  if (variant === "overview") {
+    return (
+      <div>
+        <div
+          className="grid gap-3 bg-slate-50 px-4 py-2 font-mono text-[10px] uppercase tracking-[0.06em] text-slate-400"
+          style={{ gridTemplateColumns: "1.5fr 0.8fr 1.3fr 1fr 1fr" }}
+        >
+          <div>Module</div>
+          <div>Build</div>
+          <div>Tests</div>
+          <div>Line cov</div>
+          <div>Branch cov</div>
+        </div>
+        {ordered.map((m) => (
+          <OverviewRow key={m.path} m={m} />
+        ))}
+      </div>
+    )
+  }
 
   return (
     <table className="w-full border-collapse">

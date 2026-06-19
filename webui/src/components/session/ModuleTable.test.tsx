@@ -68,6 +68,23 @@ describe("ModuleTable (test variant)", () => {
     expect(screen.getByText(/not measured/i)).toBeInTheDocument()  // examples
   })
 
+  it("renders build, tests, and coverage cells in the overview variant", () => {
+    render(<ModuleTable variant="overview" modules={[
+      { name: "acme-core", path: "modules/acme-core", buildStatus: "success", buildSource: "reactor",
+        testSource: "runner_xml", testsTotal: 542, testsPassed: 540, testsFailed: 2,
+        failingNames: [], failingCount: 2, lineRate: 86.4, branchRate: 74.1 },
+      { name: "acme-cli", path: "modules/acme-cli", buildStatus: "failure", buildSource: "reactor",
+        testSource: "none", failingNames: [], failingCount: 0 },
+    ]} />)
+    expect(screen.getByText("acme-core")).toBeInTheDocument()
+    expect(screen.getByText("Built")).toBeInTheDocument()
+    expect(screen.getByText("Failed")).toBeInTheDocument()
+    expect(screen.getByText("540 / 542")).toBeInTheDocument()
+    expect(screen.getByText("2 failing")).toBeInTheDocument()
+    expect(screen.getByText("86.4%")).toBeInTheDocument()
+    expect(screen.getByText("74.1%")).toBeInTheDocument()
+  })
+
   it("offers copy-all and the report path in the expanded failing list", () => {
     const writeText = vi.fn()
     Object.assign(navigator, { clipboard: { writeText } })
