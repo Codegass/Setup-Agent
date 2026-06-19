@@ -16,11 +16,22 @@ from .models import LogLevel
 DEFAULT_TEST_PASS_THRESHOLD = 0.8
 
 # Build verdict policy: the required fraction of EXPECTED compiled classes (source-
-# weighted across modules) that must actually be produced for a multi-module build
-# to count as green. Real Apache reactors rarely build 100% of modules, so build-green
-# is "most of the code compiled" rather than all-or-nothing. Configurable; a value of
-# 1.0 restores the strict "every module must build" behaviour.
-DEFAULT_BUILD_COVERAGE_THRESHOLD = 0.75
+# weighted across the ACTIVE reactor modules) that must actually be produced for a
+# build to count as a full SUCCESS. A setup is only a success when every active
+# module compiles, so the default is 1.0 ("every active module must build"). Modules
+# disabled in the build config (profile-gated, commented out, not in the effective
+# reactor) are never counted as expected. Still configurable via
+# SAG_BUILD_COVERAGE_THRESHOLD to loosen per-run when needed; a partial build (real
+# output but below this threshold) is reported as PARTIAL, never SUCCESS.
+DEFAULT_BUILD_COVERAGE_THRESHOLD = 1.0
+
+# Test verdict policy: the required fraction of DETECTED tests that must actually be
+# EXECUTED for a build-green run to count as a full SUCCESS. Mirrors the build
+# coverage gate but for test execution: a run that detected a static suite (e.g.
+# 1122 tests) yet only ran a fraction of it (e.g. 1) is reported as PARTIAL, never
+# SUCCESS — the test suite was not really exercised. Configurable via
+# SAG_TEST_EXECUTION_THRESHOLD; 0.8 = "most detected tests must run".
+DEFAULT_TEST_EXECUTION_THRESHOLD = 0.8
 
 
 class Config(BaseModel):
@@ -95,6 +106,9 @@ class Config(BaseModel):
     # Minimum source-weighted compiled-class coverage (fraction, 0-1) for a
     # multi-module build to count as green.
     build_coverage_threshold: float = Field(default=DEFAULT_BUILD_COVERAGE_THRESHOLD)
+    # Minimum fraction (0-1) of DETECTED tests that must be executed for a
+    # build-green run to be a SUCCESS (else the run is capped at PARTIAL).
+    test_execution_threshold: float = Field(default=DEFAULT_TEST_EXECUTION_THRESHOLD)
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -153,6 +167,9 @@ class Config(BaseModel):
             ),
             build_coverage_threshold=float(
                 os.getenv("SAG_BUILD_COVERAGE_THRESHOLD", str(DEFAULT_BUILD_COVERAGE_THRESHOLD))
+            ),
+            test_execution_threshold=float(
+                os.getenv("SAG_TEST_EXECUTION_THRESHOLD", str(DEFAULT_TEST_EXECUTION_THRESHOLD))
             ),
         )
 

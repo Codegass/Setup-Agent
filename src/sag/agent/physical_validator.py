@@ -34,7 +34,11 @@ from urllib.parse import quote
 
 from loguru import logger
 
-from sag.config.settings import DEFAULT_BUILD_COVERAGE_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
+from sag.config.settings import (
+    DEFAULT_BUILD_COVERAGE_THRESHOLD,
+    DEFAULT_TEST_EXECUTION_THRESHOLD,
+    DEFAULT_TEST_PASS_THRESHOLD,
+)
 from sag.testcases.catalog import (
     RuntimeTestCaseRecord,
     TestCaseCatalog,
@@ -106,6 +110,7 @@ class PhysicalValidator:
         compilation_recency_hours: int = 1,
         test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
         build_coverage_threshold: float = DEFAULT_BUILD_COVERAGE_THRESHOLD,
+        test_execution_threshold: float = DEFAULT_TEST_EXECUTION_THRESHOLD,
         command_tracker=None,
     ):
         """
@@ -119,6 +124,9 @@ class PhysicalValidator:
                 build-green run to be a SUCCESS. Feeds :func:`evaluate_run_verdict`.
             build_coverage_threshold: Minimum source-weighted compiled-class coverage
                 (fraction 0-1) for a multi-module build to count as green.
+            test_execution_threshold: Minimum fraction (0-1) of DETECTED tests that
+                must actually execute for a build-green run to be a SUCCESS; below
+                this the run is capped at PARTIAL (tests not really exercised).
             command_tracker: Shared CommandTracker recording build/test commands
                 and the build's wall-clock duration. validate_build_status reads
                 the last recorded build off it to surface build_time/build_command
@@ -129,6 +137,7 @@ class PhysicalValidator:
         self.compilation_recency_hours = compilation_recency_hours
         self.test_pass_threshold = test_pass_threshold
         self.build_coverage_threshold = build_coverage_threshold
+        self.test_execution_threshold = test_execution_threshold
         self.command_tracker = command_tracker
 
         # Cache for validation results with TTL
@@ -1930,80 +1939,127 @@ PY"""
                 if cache["subprojects"]:
                     logger.info(f"   Multi-project build with subprojects: {cache['subprojects']}")
 
-        # Decision logic for BUILD ONLY (no test considerations)
+        # Decision logic for BUILD ONLY (no test considerations).
+        #
+        # Tri-state policy (user mandate): a setup is a full SUCCESS only when
+        # EVERY active module compiled. Real build output but incomplete module
+        # coverage is PARTIAL (the build happened, but not all modules) — never a
+        # clean success. No compiled evidence at all is BLOCKED.
+        #
+        # `success` means "the build is real / the build phase happened" (it stays
+        # True for a partial build so the phase is not hard-failed); `complete`
+        # means every expected/active module produced its output. The
+        # build_modules_incomplete conflict (emitted when success but not complete)
+        # is what caps the overall run verdict at partial downstream.
         success = False
+        complete = False
         reason = ""
 
-        # Priority 1: Build fingerprints (strongest evidence of successful build)
-        if evidence["has_build_fingerprints"]:
-            success = True
+        # Per-module expectations are authoritative and must be checked even when
+        # build fingerprints exist — fingerprints for SOME modules used to
+        # short-circuit the whole build to success. Modules disabled in the build
+        # config (profile-gated/commented out) are excluded from the expectations
+        # (see _parse_maven_expected_artifacts), so they never count against us.
+        expected_artifacts = (
+            self._get_expected_artifacts(project_dir, build_system)
+            if build_system in ("maven", "gradle")
+            else []
+        )
+        coverage_info = (
+            self._verify_expected_artifacts(project_dir, expected_artifacts)
+            if expected_artifacts
+            else None
+        )
+        threshold = self.build_coverage_threshold
+        class_count = artifacts_result.get("class_count", 0)
+        has_real_output = (
+            evidence["has_build_fingerprints"] or class_count > 0
+        )
+
+        # Hard JVM gate (Part 1 principle, applied to EVERY branch): a maven/gradle
+        # build is green only with compiled .class evidence. With zero compiled
+        # classes AND no real build artifacts, it is BLOCKED — even if a coverage
+        # default (no class-based expectation could be derived, so class_coverage
+        # falls back to 1.0) or an empty target/classes fingerprint would otherwise
+        # pass. Without this, commons-chain (0 classes, non-standard src layout) was
+        # reported "Built 100% of expected classes" while the module scan showed
+        # 0/1 built — the build verdict and the module report contradicting.
+        jvm_no_compiled_evidence = (
+            build_system in ("maven", "gradle")
+            and class_count == 0
+            and not evidence["has_artifacts"]
+        )
+
+        if jvm_no_compiled_evidence:
+            success, complete = False, False
+            reason = (
+                f"No compiled .class files found for {build_system} build — nothing "
+                f"compiled (an empty target/classes dir or a coverage default is not "
+                f"proof of compilation)"
+            )
+        elif coverage_info is not None:
+            coverage = coverage_info.get("class_coverage", 1.0)
+            missing = coverage_info.get("missing", [])
+            if coverage_info["all_present"] or coverage >= threshold:
+                success, complete = True, True
+                reason = (
+                    f"All expected build artifacts found: "
+                    f"{', '.join(coverage_info['found'][:5])}"
+                    if coverage_info["all_present"]
+                    else (
+                        f"Built {coverage * 100:.0f}% of expected classes "
+                        f"(>= {threshold * 100:.0f}% threshold)"
+                    )
+                )
+            elif coverage > 0 or has_real_output:
+                # Real build output, but some ACTIVE modules did not compile —
+                # honest PARTIAL, not a clean success.
+                success, complete = True, False
+                reason = (
+                    f"Built {coverage * 100:.0f}% of expected classes "
+                    f"(< {threshold * 100:.0f}% threshold); "
+                    f"{len(missing)} module(s) incomplete"
+                    + (f": {', '.join(missing[:5])}" if missing else "")
+                    + (" ..." if len(missing) > 5 else "")
+                )
+            else:
+                success, complete = False, False
+                reason = (
+                    f"Only {coverage * 100:.0f}% of expected classes built "
+                    f"(< {threshold * 100:.0f}% threshold) — missing: "
+                    f"{', '.join(missing[:8])}"
+                    + (" ..." if len(missing) > 8 else "")
+                )
+
+        elif evidence["has_build_fingerprints"]:
+            # Fingerprints but no determinable per-module expectations (e.g. an
+            # aggregator/empty root pom with no parseable modules or sources):
+            # treat as a real, complete build (nothing to be incomplete against).
+            success, complete = True, True
             reason = f"Build fingerprints found for {build_system} project"
 
-        # Priority 2: Build artifacts exist
         elif evidence["has_artifacts"]:
-            # Check if expected artifacts are present
-            expected_artifacts = self._get_expected_artifacts(project_dir, build_system)
-            if expected_artifacts:
-                actual_vs_expected = self._verify_expected_artifacts(
-                    project_dir, expected_artifacts
-                )
-                coverage = actual_vs_expected.get("class_coverage", 1.0)
-                threshold = self.build_coverage_threshold
-                if actual_vs_expected["all_present"]:
-                    success = True
-                    reason = f"All expected build artifacts found: {', '.join(actual_vs_expected['found'])}"
-                elif coverage >= threshold:
-                    # Loosened policy: a multi-module reactor rarely builds 100%; a
-                    # build that produced at least `build_coverage_threshold` of its
-                    # expected (source-weighted) classes counts as green. Still list
-                    # the missing modules for transparency.
-                    success = True
-                    missing = actual_vs_expected["missing"]
-                    reason = (
-                        f"Built {coverage * 100:.0f}% of expected classes "
-                        f"(>= {threshold * 100:.0f}% threshold); "
-                        f"{len(missing)} module(s) incomplete"
-                        + (f": {', '.join(missing[:5])}" if missing else "")
-                        + (" ..." if len(missing) > 5 else "")
-                    )
+            if build_system in ("maven", "gradle"):
+                # A JVM build is green only with compiled .class evidence. A
+                # stray/checked-in/vendored JAR is NOT proof the project compiled.
+                if class_count > 0:
+                    success, complete = True, True
+                    reason = f"Found {class_count} compiled classes (build appears successful)"
                 else:
-                    success = False
+                    success, complete = False, False
                     reason = (
-                        f"Only {coverage * 100:.0f}% of expected classes built "
-                        f"(< {threshold * 100:.0f}% threshold) — missing: "
-                        f"{', '.join(actual_vs_expected['missing'][:8])}"
-                        + (" ..." if len(actual_vs_expected["missing"]) > 8 else "")
+                        f"No compiled .class files found for {build_system} build "
+                        f"({evidence['artifact_count']} non-class artifact(s) such as vendored "
+                        f"JARs are not evidence the project compiled)"
                     )
             else:
-                # Cannot determine expected artifacts (e.g. an aggregator/empty
-                # root pom with no parseable modules or sources).
-                class_count = artifacts_result.get("class_count", 0)
-                if build_system in ["maven", "gradle"]:
-                    # SINGLE build-green policy: a JVM build is green only with
-                    # compiled .class evidence (or the build fingerprints handled
-                    # in Priority 1). A stray/checked-in/vendored JAR is NOT proof
-                    # the project compiled — Bigtop reported "build success" off one
-                    # such JAR with zero .class files while the real modules never
-                    # built. Require the compiled-class delta the user mandated.
-                    if class_count > 0:
-                        success = True
-                        reason = f"Found {class_count} compiled classes (build appears successful)"
-                    else:
-                        success = False
-                        reason = (
-                            f"No compiled .class files found for {build_system} build "
-                            f"({evidence['artifact_count']} non-class artifact(s) such as vendored "
-                            f"JARs are not evidence the project compiled)"
-                        )
-                else:
-                    # Non-JVM builds have no .class/JAR contract; existence of the
-                    # detected artifacts is the best available signal.
-                    success = True
-                    reason = f"Found {evidence['artifact_count']} build artifacts"
+                # Non-JVM builds have no .class/JAR contract; existence of the
+                # detected artifacts is the best available signal.
+                success, complete = True, True
+                reason = f"Found {evidence['artifact_count']} build artifacts"
 
-        # Priority 3: No build evidence found
         else:
-            success = False
+            success, complete = False, False
             reason = "No build evidence found (no artifacts or build fingerprints)"
 
         # Surface the build command + timed duration (if a command tracker with a
@@ -2024,18 +2080,28 @@ PY"""
         if samples:
             evidence.setdefault("artifact", samples[0])
 
-        conflicts = [] if success else ["build_validation_failed"]
+        if not success:
+            evidence_status = "blocked"
+            conflicts = ["build_validation_failed"]
+        elif not complete:
+            evidence_status = "partial"
+            conflicts = ["build_modules_incomplete"]
+        else:
+            evidence_status = "success"
+            conflicts = []
+
         result = {
             "success": success,
+            "build_complete": complete,
             "evidence": evidence,
             "reason": reason,
-            "evidence_status": "success" if success else "blocked",
+            "evidence_status": evidence_status,
             "test_stats": None,
             "conflicts": conflicts,
             "evidence_refs": self._build_status_evidence_refs(project_dir, artifacts_result),
         }
 
-        logger.info(f"Build validation complete: {'SUCCESS' if success else 'FAILURE'} - {reason}")
+        logger.info(f"Build validation complete: {evidence_status.upper()} - {reason}")
         return result
 
     def _build_status_evidence_refs(
@@ -2667,9 +2733,13 @@ PY"""
         lines = [l for l in (found.get("output") or "").splitlines() if l.strip()]
         module_dirs = sorted({l.rsplit("/", 1)[0] for l in lines})
 
-        # Single-module project: scan the root itself.
-        if not module_dirs:
-            module_dirs = [project_dir]
+        # Always scan the root module too. The submodule find runs at mindepth 2,
+        # so the depth-1 root pom is excluded — a root that compiled its own
+        # sources (e.g. commons-chain's 33 classes) would otherwise be invisible
+        # in the breakdown while unrelated example submodules showed as "0 built".
+        # Single-module projects (no submodules found) collapse to just the root.
+        if project_dir not in module_dirs:
+            module_dirs = [project_dir] + module_dirs
 
         modules: List[Dict[str, any]] = []
         for module_dir in module_dirs:
@@ -2856,6 +2926,46 @@ PY"""
 
         return expected
 
+    def _active_maven_module_dirs(self, project_dir: str) -> List[str]:
+        """Active Maven reactor module dirs: root + the root pom's active
+        ``<modules>`` (recursively), with ``<profiles>`` stripped so profile-gated
+        / pom-disabled modules are excluded.
+
+        This is the "detected" module set the build report falls back to when no
+        live Maven Reactor Summary was captured. It counts only modules that are
+        actually part of the build — never standalone non-reactor poms (e.g.
+        commons-chain's ``apps/*`` examples). Mirrors the module walk in
+        :meth:`_parse_maven_expected_artifacts`.
+        """
+        if not self.docker_orchestrator:
+            return [project_dir]
+
+        seen: List[str] = []
+
+        def walk(module_dir: str) -> None:
+            module_dir = module_dir.rstrip("/")
+            if module_dir in seen:
+                return
+            seen.append(module_dir)
+            pom = self._execute_command_with_logging(
+                f"cat {module_dir}/pom.xml 2>/dev/null", "reading pom.xml for modules"
+            )
+            if not pom.get("success"):
+                return
+            without_profiles = re.sub(
+                r"<profiles>.*?</profiles>", "", pom.get("output") or "", flags=re.DOTALL
+            )
+            for block in re.findall(
+                r"<modules>(.*?)</modules>", without_profiles, re.DOTALL
+            ):
+                for mod in re.findall(r"<module>([^<]+)</module>", block):
+                    mod = mod.strip()
+                    if mod:
+                        walk(f"{module_dir}/{mod}")
+
+        walk(project_dir)
+        return seen
+
     def _parse_maven_expected_artifacts(self, project_dir: str) -> List[Dict[str, str]]:
         """
         Parse pom.xml to determine expected Maven artifacts including .class files.
@@ -2996,16 +3106,29 @@ PY"""
                     version = version_match.group(1)
                     logger.debug(f"Inferred version {version} from existing JAR: {jar_name}")
 
-        # Check for modules (multi-module project)
-        modules_match = re.search(r"<modules>(.*?)</modules>", pom_content, re.DOTALL)
-        if modules_match:
-            # Multi-module project
-            module_content = modules_match.group(1)
-            modules = re.findall(r"<module>([^<]+)</module>", module_content)
+        # Check for modules (multi-module project). Only count modules that are
+        # active by default: strip <profiles> blocks first so profile-gated
+        # modules (disabled in the build config) are NOT treated as expected.
+        # The user mandate is "all ACTIVE modules" — a module turned off in the
+        # pom must not count against the build. (XML-commented modules are already
+        # excluded since comments are not <module> elements.)
+        pom_without_profiles = re.sub(
+            r"<profiles>.*?</profiles>", "", pom_content, flags=re.DOTALL
+        )
+        modules = []
+        for modules_block in re.findall(
+            r"<modules>(.*?)</modules>", pom_without_profiles, re.DOTALL
+        ):
+            modules.extend(re.findall(r"<module>([^<]+)</module>", modules_block))
 
+        if modules:
+            # Multi-module project (active modules only)
             for module in modules:
+                module = module.strip()
+                if not module:
+                    continue
                 module_dir = f"{project_dir}/{module}"
-                # Recursively get expected artifacts for each module
+                # Recursively get expected artifacts for each active module
                 module_expected = self._parse_maven_expected_artifacts(module_dir)
                 expected.extend(module_expected)
         else:

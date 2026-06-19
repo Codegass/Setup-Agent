@@ -190,6 +190,7 @@ class SetupAgent:
             project_path=self.config.workspace_path,
             test_pass_threshold=self.config.test_pass_threshold,
             build_coverage_threshold=self.config.build_coverage_threshold,
+            test_execution_threshold=self.config.test_execution_threshold,
         )
         # Attach the shared tracker so validate_build_status can surface the
         # timed build duration + command in its evidence dict.
@@ -1057,7 +1058,10 @@ START by working toward the current phase objective shown in my context.
         path can never diverge from the report.
         """
         from sag.agent.physical_validator import evaluate_run_verdict
-        from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
+        from sag.config.settings import (
+            DEFAULT_TEST_EXECUTION_THRESHOLD,
+            DEFAULT_TEST_PASS_THRESHOLD,
+        )
 
         self.final_verdict = "failed"
         # Surfaced to the verdict-kernel combiner (_get_verified_final_status)
@@ -1103,7 +1107,15 @@ START by working toward the current phase objective shown in my context.
 
         # Log comprehensive status
         if build_status["success"]:
-            logger.info(f"✅ Build validation: SUCCESS - {build_status['reason']}")
+            # A build is only a full SUCCESS when every active module compiled.
+            # success=True with build_complete=False means real build output but
+            # incomplete module coverage -> the run is capped at PARTIAL (same
+            # rule the report verdict enforces via build_modules_incomplete).
+            build_complete = build_status.get("build_complete", True)
+            if build_complete:
+                logger.info(f"✅ Build validation: SUCCESS - {build_status['reason']}")
+            else:
+                logger.warning(f"⚠️ Build validation: PARTIAL - {build_status['reason']}")
 
             # Report test status and fail when a known test suite was not successfully verified.
             if test_status["has_test_reports"]:
@@ -1138,7 +1150,38 @@ START by working toward the current phase objective shown in my context.
                     )
                     self.final_verdict = "failed"
                     return False
-                self.final_verdict = "success"
+                # Tests pass the threshold, but an incomplete-module build caps
+                # the whole run at PARTIAL — never announce SUCCESS unless every
+                # active module compiled.
+                self.final_verdict = "success" if build_complete else "partial"
+                if not build_complete:
+                    logger.warning(
+                        "⚠️ Run capped at PARTIAL: tests passed but not all active "
+                        "modules compiled"
+                    )
+
+                # Execution-coverage cap: a detected suite that barely ran (e.g.
+                # 1/1122) is not a full success even if the few tests that ran
+                # passed — mirror the report's tests_not_fully_executed gate so the
+                # CLI verdict matches.
+                exec_threshold = getattr(
+                    self.physical_validator,
+                    "test_execution_threshold",
+                    DEFAULT_TEST_EXECUTION_THRESHOLD,
+                )
+                executed = test_status.get("total_tests") or 0
+                if (
+                    self.final_verdict == "success"
+                    and isinstance(static_test_count, int)
+                    and static_test_count > 0
+                    and executed < static_test_count * exec_threshold
+                ):
+                    self.final_verdict = "partial"
+                    logger.warning(
+                        "⚠️ Run capped at PARTIAL: only "
+                        f"{executed}/{static_test_count} detected tests executed "
+                        f"(< {exec_threshold * 100:.0f}% threshold)"
+                    )
 
                 if pass_rate == 100.0:
                     logger.info(

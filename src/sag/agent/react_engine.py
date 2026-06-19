@@ -217,6 +217,7 @@ class ReActEngine(UIEventEmitter):
             project_path="/workspace",
             test_pass_threshold=self.config.test_pass_threshold,
             build_coverage_threshold=self.config.build_coverage_threshold,
+            test_execution_threshold=self.config.test_execution_threshold,
         )
         # Share the validator with the context manager so ContextTool's
         # completion-evidence gate reuses it (probe cache + threshold) instead

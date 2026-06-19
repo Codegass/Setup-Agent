@@ -109,20 +109,48 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
                 details.append(f"{jar_files} .jar")
             if details:
                 lines.append(f"🧾 Build artifacts: {', '.join(details)}")
-        if evidence.get("tests_total") is not None:
-            pass_pct = evidence.get("tests_pass_pct")
-            execution_rate = status.get("execution_rate")
-            test_line = f"🧪 Tests: {evidence['tests_total']} executed"
 
-            # Add pass rate
-            test_line += f" (pass rate {format_percentage(pass_pct)}"
+    # Tests line: surface the DETECTED (static) total alongside the executed
+    # count. The static total is vital and must never silently drop from the
+    # logs — even when nothing executed (e.g. "57 detected, 0 executed"), which
+    # the old executed-only line hid entirely.
+    tests_total = evidence.get("tests_total") if evidence else None
+    static_count = status.get("static_test_count")
+    if static_count or tests_total is not None:
+        pass_pct = (evidence or {}).get("tests_pass_pct")
+        execution_rate = status.get("execution_rate")
+        executed = tests_total if tests_total is not None else 0
 
-            # Add execution rate if available
-            if execution_rate is not None:
-                test_line += f", execution rate {format_percentage(execution_rate)}"
+        parts = []
+        if static_count:
+            parts.append(f"{static_count} detected")
+        parts.append(f"{executed} executed")
+        test_line = f"🧪 Tests: {', '.join(parts)}"
 
-            test_line += ")"
-            lines.append(test_line)
+        quals = []
+        if tests_total:
+            quals.append(f"pass rate {format_percentage(pass_pct)}")
+        if execution_rate is not None:
+            quals.append(f"execution rate {format_percentage(execution_rate)}")
+        if quals:
+            test_line += f" ({', '.join(quals)})"
+        lines.append(test_line)
+
+    # Module build completeness: how many ACTIVE modules built vs were detected
+    # (mirrors the tests line). The core "build all modules" signal — kept in the
+    # log, not just the markdown report.
+    modules_detected = status.get("modules_detected")
+    if modules_detected:
+        modules_built = status.get("modules_built") or 0
+        module_line = f"🧩 Modules: {modules_built} built / {modules_detected} detected"
+        extra = []
+        if status.get("modules_failed_count"):
+            extra.append(f"{status['modules_failed_count']} failed")
+        if status.get("modules_skipped_count"):
+            extra.append(f"{status['modules_skipped_count']} skipped")
+        if extra:
+            module_line += f" ({', '.join(extra)})"
+        lines.append(module_line)
 
     if attention.get("ignored_lines"):
         lines.append(f"ℹ️ Ignored telemetry lines: {attention['ignored_lines']}")

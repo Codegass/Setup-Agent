@@ -10,7 +10,7 @@ from sag import __version__
 from sag.agent.context_manager import TaskStatus
 from sag.agent.phase_machine import CRITICAL_PHASE
 from sag.agent.physical_validator import evaluate_run_verdict
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
+from sag.config.settings import DEFAULT_TEST_EXECUTION_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
@@ -90,6 +90,10 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
         "failing_test_names": list(test_analysis.get("failing_test_names") or []),
         "test_exclusions": test_analysis.get("test_exclusions", []),
         "modules_without_tests": test_analysis.get("modules_without_tests", []),
+        # Statically discovered test total from the catalog scan. Carried so the
+        # report can backfill the "detected" count when analyze never persisted
+        # static_test_count to the trunk (see _build_report_snapshot).
+        "catalog_test_count": test_analysis.get("catalog_test_count"),
     }
 
 
@@ -938,6 +942,27 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_evidence_result,
         )
 
+        # Compute module metrics once, up front (memoized), and stash the
+        # built/detected counts onto the snapshot status so the dashboard, the
+        # submodule breakdown, and the condensed log all show the SAME
+        # build-completeness numbers (detected = active reactor modules).
+        try:
+            module_metrics = self._build_module_metrics(
+                (execution_metrics or {}).get("test_history")
+                or self._load_test_history()
+                or {},
+                generated_at=timestamp,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"module metrics precompute skipped: {exc}")
+            module_metrics = None
+        if module_metrics:
+            msum = module_metrics.get("module_summary") or {}
+            report_snapshot["status"]["modules_detected"] = msum.get("modules_total")
+            report_snapshot["status"]["modules_built"] = msum.get("modules_built")
+            report_snapshot["status"]["modules_failed_count"] = msum.get("modules_failed")
+            report_snapshot["status"]["modules_skipped_count"] = msum.get("modules_skipped")
+
         # Generate both console and markdown versions with verified information and metrics
         console_report = self._generate_console_report(
             summary,
@@ -1219,7 +1244,11 @@ class ReportTool(BaseTool, UIEventEmitter):
                         "--fail-at-end" in command_str or " -fae" in command_str
                     )
 
-        if not modules_seen and not aggregate_entry:
+        # Keep the history when a build recorded reactor evidence even if no tests
+        # ran (build_summary entries) — otherwise the reactor module list would be
+        # discarded and the module metrics would fall back to the depth-limited
+        # filesystem scan.
+        if not modules_seen and not aggregate_entry and not reactor_records and not failed_modules:
             return {}
 
         aggregate_counts = aggregate_entry.get("_normalized_tests", {}) if aggregate_entry else {}
@@ -1287,6 +1316,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         static_test_count = None
         method_count = None
         parameterized_info = {}
+        trunk_context = None
         if self.context_manager:
             try:
                 trunk_context = self.context_manager.load_trunk_context()
@@ -1329,6 +1359,26 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
         test_analysis = physical_validation.get("test_analysis", {}) or {}
+
+        # Backfill: when analyze never persisted the static test total to the
+        # trunk, fall back to the catalog count from the test scan so the
+        # "detected" total never silently disappears from the report/logs (the
+        # catalog already counted them — e.g. 100 methods). Persist it back to the
+        # trunk (best-effort) so other consumers + validate_project_analysis_status
+        # stop reporting it as missing.
+        if not static_test_count:
+            catalog_count = to_int(test_analysis.get("catalog_test_count"))
+            if catalog_count:
+                static_test_count = catalog_count
+                logger.info(
+                    f"📊 Backfilled static test count from catalog scan: {catalog_count}"
+                )
+                if trunk_context is not None and self.context_manager:
+                    try:
+                        trunk_context.environment_summary["static_test_count"] = catalog_count
+                        self.context_manager._save_trunk_context(trunk_context)
+                    except Exception as exc:
+                        logger.debug(f"Could not persist backfilled static_test_count: {exc}")
 
         tests_total = test_analysis.get("total_tests")
         tests_failed = test_analysis.get("failed_tests")
@@ -1535,6 +1585,42 @@ class ReportTool(BaseTool, UIEventEmitter):
             "failed_tests": test_history.get("failed_tests", []),
             "evidence_result": evidence_result or {},
         }
+
+        # Module-coverage shortfall caps the run at PARTIAL too: a reactor that
+        # built fewer modules than it attempted is not a full success even when
+        # the physical class-coverage check passed. Surface it as the SAME
+        # conflict the build validator emits (build_modules_incomplete) so the
+        # verdict kernel caps it (the conflict is not in ADJUDICATED_CONFLICTS).
+        if (
+            status.get("modules_expected")
+            and status.get("modules_seen") is not None
+            and status["modules_seen"] < status["modules_expected"]
+        ):
+            ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
+            if "build_modules_incomplete" not in ev_conflicts:
+                ev_conflicts.append("build_modules_incomplete")
+
+        # Test-execution shortfall caps the run at PARTIAL: a static suite was
+        # detected but only a fraction actually ran (e.g. carbondata 1/1122 = 0.1%).
+        # Mirror the build-coverage gate — emit tests_not_fully_executed (a genuine,
+        # non-adjudicated conflict) when execution coverage is below the configured
+        # threshold, so the verdict kernel caps an otherwise-clean run at partial.
+        exec_threshold_pct = (
+            getattr(
+                self.physical_validator,
+                "test_execution_threshold",
+                DEFAULT_TEST_EXECUTION_THRESHOLD,
+            )
+            * 100.0
+        )
+        if (
+            status.get("static_test_count")
+            and status.get("execution_rate") is not None
+            and status["execution_rate"] < exec_threshold_pct
+        ):
+            ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
+            if "tests_not_fully_executed" not in ev_conflicts:
+                ev_conflicts.append("tests_not_fully_executed")
 
         # Stored verdict comes from the SAME kernel inputs as the header's
         # Result line (spec §6): header-vs-stored divergence is impossible.
@@ -2094,8 +2180,11 @@ class ReportTool(BaseTool, UIEventEmitter):
                     project_name=project_name_for_validator
                 )
 
-                # Use enhanced test parsing with metrics for better accuracy
-                test_analysis = self.physical_validator.parse_test_reports_with_metrics(project_dir)
+                # Use catalog-aware parsing: besides the runner XML metrics it
+                # carries catalog_test_count (the statically discovered test
+                # total), which backfills the report's "detected" count when the
+                # analyze step failed to persist static_test_count to the trunk.
+                test_analysis = self.physical_validator.parse_test_reports_with_catalog(project_dir)
 
                 # Also get test validation status for additional insights
                 test_status = self.physical_validator.validate_test_status(
@@ -2131,11 +2220,18 @@ class ReportTool(BaseTool, UIEventEmitter):
                 except Exception as _e:
                     logger.debug(f"Directory existence check failed: {_e}")
 
+                # Always store the projected test_analysis — even when no test
+                # reports exist (valid=False) it still carries catalog_test_count,
+                # the statically discovered test total. Without this, a failed/
+                # no-report build discards the "N detected tests" count entirely
+                # (the count the user relies on), and the report falls back to a
+                # bare "no tests executed".
+                actual_accomplishments["physical_validation"]["test_analysis"] = (
+                    build_stored_test_analysis(test_analysis)
+                )
+
                 if test_analysis.get("valid"):
                     actual_accomplishments["test_success"] = test_analysis["test_success"]
-                    actual_accomplishments["physical_validation"]["test_analysis"] = (
-                        build_stored_test_analysis(test_analysis)
-                    )
 
                     # Log if tests were excluded
                     if test_analysis.get("test_exclusions"):
@@ -3175,6 +3271,38 @@ class ReportTool(BaseTool, UIEventEmitter):
                 tests[m["path"]] = parsed
 
         reactor_status = self._reactor_status_from_history(test_history)
+
+        # No live reactor summary: narrow the detected set to the ACTIVE
+        # reactor-declared modules (root + root-pom active, profile-stripped
+        # <modules>) so standalone non-reactor poms (e.g. commons-chain's apps/*)
+        # and pom-disabled modules are not counted as detected. The reactor-summary
+        # path is already authoritative inside assemble_module_metrics.
+        if not reactor_status and build_system == "maven":
+            active_dirs = None
+            try:
+                active_dirs = validator._active_maven_module_dirs(project_dir)
+            except Exception as exc:
+                logger.debug(f"_active_maven_module_dirs failed: {exc}")
+            if active_dirs:
+                root = project_dir.rstrip("/")
+                active_rel = {
+                    (d.rstrip("/")[len(root):].strip("/") or ".") for d in active_dirs
+                }
+                # Keep the active-declared modules AND any scanned module that
+                # actually produced compiled artifacts. The latter matters when the
+                # build happened in submodules with no captured reactor summary
+                # (e.g. carbondata's profile-gated modules): those built modules
+                # must still be counted, not collapsed to "0/1". A module that is
+                # neither declared nor produced artifacts (e.g. commons-chain's
+                # standalone apps/*) stays excluded.
+                modules = [
+                    m
+                    for m in modules
+                    if str(m.get("path") or ".") in active_rel
+                    or (m.get("class_count") or 0) > 0
+                    or (m.get("jar_count") or 0) > 0
+                ] or modules
+
         build_error_samples: dict = {}  # populated by Maven error parsing when available
         return assemble_module_metrics(
             modules=modules,
@@ -3222,8 +3350,8 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         lines = ["", "## 🧩 Submodule Breakdown", ""]
         lines.append(
-            f"{summary.get('modules_total', 0)} modules · "
-            f"{summary.get('modules_built', 0)} built · "
+            f"{summary.get('modules_built', 0)} built / "
+            f"{summary.get('modules_total', 0)} detected · "
             f"{summary.get('modules_failed', 0)} failed · "
             f"{summary.get('modules_skipped', 0)} skipped · "
             f"test failures in {summary.get('modules_with_test_failures', 0)}"
@@ -3443,9 +3571,9 @@ class ReportTool(BaseTool, UIEventEmitter):
         expansion_factor = status.get("expansion_factor")
         pass_rate = status.get("pass_pct")
 
-        # Module coverage
-        modules_expected = status.get("modules_expected")
-        modules_seen = status.get("modules_seen", 0)
+        # Module build completeness (active modules built vs detected)
+        modules_detected = status.get("modules_detected")
+        modules_built = status.get("modules_built") or 0
 
         lines.append("### Build & Test Overview")
         lines.append("```")
@@ -3477,10 +3605,12 @@ class ReportTool(BaseTool, UIEventEmitter):
             pass_msg = f"{pass_icon} {format_percentage(pass_rate)} ({passed}/{executed} passed)"
             lines.append(f"│ Pass Rate       │ {pass_msg:<32} │")
 
-        if modules_expected:
-            mod_pct = (modules_seen / modules_expected * 100) if modules_expected else 0
-            mod_icon = "✅" if mod_pct >= 90 else "⚠️" if mod_pct >= 50 else "❌"
-            mod_msg = f"{mod_icon} {mod_pct:.1f}% ({modules_seen}/{modules_expected} modules)"
+        if modules_detected:
+            mod_icon = (
+                "✅" if modules_built >= modules_detected
+                else "⚠️" if modules_built > 0 else "❌"
+            )
+            mod_msg = f"{mod_icon} {modules_built}/{modules_detected} built"
             lines.append(f"│ Module Coverage │ {mod_msg:<32} │")
 
         lines.append("└─────────────────┴──────────────────────────────────┘")
