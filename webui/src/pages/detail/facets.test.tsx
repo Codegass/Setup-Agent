@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest"
 
-import type { ExecutionSessionDetail } from "@/api/types"
+import type { ContextTrace, ExecutionSessionDetail } from "@/api/types"
 
-import { buildDetailFacets } from "./facets"
+import { buildDetailFacets, buildDetailTabs } from "./facets"
 
 function detail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionSessionDetail {
   return {
@@ -21,6 +21,12 @@ function detail(overrides: Partial<ExecutionSessionDetail> = {}): ExecutionSessi
     logs: [],
     ...overrides,
   }
+}
+
+const ctx: ContextTrace = {
+  trunk: { goal: "Set up acme", state: "completed", progress: {}, summary: "" },
+  phases: [],
+  debug: {},
 }
 
 describe("buildDetailFacets", () => {
@@ -47,5 +53,53 @@ describe("buildDetailFacets", () => {
     expect(byId.evidence.count).toBe(1)
     expect(byId.files.count).toBe(1)
     expect(byId.build.count).toBeNull()
+  })
+})
+
+describe("buildDetailTabs", () => {
+  it("puts overview first and includes flow when context is present", () => {
+    const tabs = buildDetailTabs(detail({ context: ctx }))
+    expect(tabs[0].id).toBe("overview")
+    expect(tabs.map((t) => t.id)).toContain("flow")
+  })
+
+  it("always includes core tabs and surfaces tests count + red tone when failing", () => {
+    const tabs = buildDetailTabs(
+      detail({ test: { state: "partial", pass: 8, fail: 2, skip: 0, total: 10 } }),
+    )
+    const byId = Object.fromEntries(tabs.map((t) => [t.id, t]))
+    expect(byId.overview).toBeDefined()
+    expect(byId.tests).toBeDefined()
+    expect(byId.build).toBeDefined()
+    expect(byId.tests.count).toBe(2)
+    expect(byId.tests.tone).toBe("red")
+  })
+
+  it("omits tabs whose data is absent", () => {
+    const tabs = buildDetailTabs(detail()).map((t) => t.id)
+    expect(tabs).not.toContain("flow")
+    expect(tabs).not.toContain("files")
+    expect(tabs).not.toContain("evidence")
+    expect(tabs).not.toContain("logs")
+    expect(tabs).not.toContain("report")
+  })
+
+  it("includes files / evidence / logs / report tabs when their data is present", () => {
+    const tabs = buildDetailTabs(
+      detail({
+        evidence: [{ source: "maven", summary: "", counts: "", time: "", status: "pass", records: [] }],
+        files: {
+          snapshot: { base: "", head: "", mode: "" },
+          counts: { modified: 1, added: 0, deleted: 0, renamed: 0 },
+          items: [{ path: "a.java", change: "modified", type: "file", size: "", mtime: "", note: "" }],
+        },
+        logs: ["line"],
+        reportDoc: { title: "r", generated: "now", blocks: [] },
+      }),
+    ).map((t) => t.id)
+    expect(tabs).toContain("files")
+    expect(tabs).toContain("evidence")
+    expect(tabs).toContain("logs")
+    expect(tabs).toContain("report")
   })
 })
