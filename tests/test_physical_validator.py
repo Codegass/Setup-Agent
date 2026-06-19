@@ -531,34 +531,6 @@ def _coverage_validator(coverage, found, missing, threshold):
     return validator
 
 
-def test_validate_build_status_green_at_or_above_coverage_threshold():
-    validator = _coverage_validator(0.75, found=["a", "b", "c"], missing=["d"], threshold=0.75)
-
-    result = validator.validate_build_status("m")
-
-    assert result["success"] is True
-    assert result["conflicts"] == []  # above-threshold can reach full SUCCESS
-    assert "75%" in result["reason"]
-    assert "incomplete" in result["reason"].lower()
-
-
-def test_validate_build_status_fails_below_coverage_threshold():
-    validator = _coverage_validator(0.5, found=["a"], missing=["b", "c", "d"], threshold=0.75)
-
-    result = validator.validate_build_status("m")
-
-    assert result["success"] is False
-    assert "build_validation_failed" in result["conflicts"]
-    assert "50%" in result["reason"]
-
-
-def test_validate_build_status_strict_threshold_requires_all_modules():
-    """Threshold 1.0 restores the original all-or-nothing behaviour."""
-    validator = _coverage_validator(0.99, found=["a", "b", "c"], missing=["d"], threshold=1.0)
-
-    assert validator.validate_build_status("m")["success"] is False
-
-
 # ===========================================================================
 # TASK 2.2 - Single test-verdict policy (evaluate_run_verdict)
 # ===========================================================================
@@ -574,8 +546,9 @@ def test_settings_test_pass_threshold_from_env(monkeypatch):
 
 
 def test_settings_build_coverage_threshold_default():
-    assert DEFAULT_BUILD_COVERAGE_THRESHOLD == 0.75
-    assert Config().build_coverage_threshold == 0.75
+    # All active modules must compile for SUCCESS -> default is 100%.
+    assert DEFAULT_BUILD_COVERAGE_THRESHOLD == 1.0
+    assert Config().build_coverage_threshold == 1.0
 
 
 def test_settings_build_coverage_threshold_from_env(monkeypatch):

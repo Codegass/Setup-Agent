@@ -401,7 +401,10 @@ def test_failed_build_validation_uses_stable_conflict_and_project_fallback(monke
     result = validator.validate_build_status("demo")
 
     assert result["success"] is False
-    assert result["reason"] == "No build evidence found (no artifacts or build fingerprints)"
+    # Maven with zero compiled classes and no artifacts is caught by the hard JVM
+    # compiled-evidence gate (no phantom green); the conflict + project-fallback
+    # evidence_refs remain stable.
+    assert "No compiled .class files" in result["reason"]
     assert result["conflicts"] == ["build_validation_failed"]
     assert result["evidence_refs"] == ["/workspace/demo"]
 
