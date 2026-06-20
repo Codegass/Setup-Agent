@@ -65,6 +65,36 @@ def test_assemble_truncates_failing_and_samples():
     assert len(m["test"]["failing_names"]) == 50
 
 
+def test_assemble_surfaces_runtime_model_and_iteration_counts():
+    m = assemble_report_metrics(
+        snapshot=_snapshot(),
+        build_evidence={},
+        test_analysis={},
+        conflicts=[],
+        evidence_refs=[],
+        generated_at="2026-06-18T00:00:00",
+        execution_metrics={
+            "model": "claude-sonnet-4.5",
+            "total_iterations": 6,
+            "max_iterations": 40,
+        },
+    )
+    assert m["model"] == "claude-sonnet-4.5"
+    assert m["total_iterations"] == 6
+    assert m["max_iterations"] == 40
+
+
+def test_assemble_runtime_keys_default_none_without_execution_metrics():
+    m = assemble_report_metrics(
+        snapshot={"status": {}, "physical_evidence": {}},
+        build_evidence={}, test_analysis={}, conflicts=[], evidence_refs=[],
+        generated_at="x",
+    )
+    assert m["model"] is None
+    assert m["total_iterations"] is None
+    assert m["max_iterations"] is None
+
+
 def test_build_dict_surfaces_time_command_artifact():
     metrics = assemble_report_metrics(
         snapshot={"phases": {"build": True}, "status": {"overall": "success"}},

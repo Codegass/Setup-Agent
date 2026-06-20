@@ -34,11 +34,13 @@ def assemble_report_metrics(
     conflicts: List[str],
     evidence_refs: List[str],
     generated_at: str,
+    execution_metrics: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     status = (snapshot or {}).get("status") or {}
     evidence = (snapshot or {}).get("physical_evidence") or {}
     build_evidence = build_evidence or {}
     test_analysis = test_analysis or {}
+    execution_metrics = execution_metrics or {}
 
     build = {
         "state": status.get("overall") if isinstance(status.get("overall"), str) else None,
@@ -77,5 +79,15 @@ def assemble_report_metrics(
         "evidence_refs": _str_list(evidence_refs, 25),
     }
 
-    return {"version": METRICS_VERSION, "generated_at": generated_at,
-            "build": build, "test": test}
+    model = execution_metrics.get("model")
+    return {
+        "version": METRICS_VERSION,
+        "generated_at": generated_at,
+        # Runtime metadata for the web read model's DetailHeader chips. The web
+        # read model (_setup_artifact_item) reads these top-level keys directly.
+        "model": str(model) if isinstance(model, str) and model else None,
+        "total_iterations": _int_or_none(execution_metrics.get("total_iterations")),
+        "max_iterations": _int_or_none(execution_metrics.get("max_iterations")),
+        "build": build,
+        "test": test,
+    }

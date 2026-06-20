@@ -247,6 +247,9 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
   const phases = context.phases ?? []
   const percent = progressPercent(trunk.progress ?? {})
   const steps = stepsText(trunk.progress ?? {})
+  // Drive the trunk header from the real run outcome (was hardcoded amber): a
+  // successful run reads green, a failed run red, anything in-between neutral.
+  const trunkTone = phaseTone(trunk.state)
 
   return (
     <div>
@@ -255,8 +258,22 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
           <span className="font-sans text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-400">
             Agent goal
           </span>
-          <span className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-status-attention">
-            <span className="h-1.5 w-1.5 rounded-full bg-status-attention" />
+          <span
+            className={cn(
+              "inline-flex items-center gap-1.5 text-[11px] font-semibold",
+              trunkTone === "success" && "text-status-success",
+              trunkTone === "failed" && "text-status-failed",
+              trunkTone === "neutral" && "text-status-attention",
+            )}
+          >
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full",
+                trunkTone === "success" && "bg-status-success",
+                trunkTone === "failed" && "bg-status-failed",
+                trunkTone === "neutral" && "bg-status-attention",
+              )}
+            />
             {trunk.state}
           </span>
         </div>
@@ -270,7 +287,12 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
           <div className="mt-3 flex items-center gap-2.5">
             <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100">
               <div
-                className="h-full rounded-full bg-status-attention"
+                className={cn(
+                  "h-full rounded-full",
+                  trunkTone === "success" && "bg-status-success",
+                  trunkTone === "failed" && "bg-status-failed",
+                  trunkTone === "neutral" && "bg-status-attention",
+                )}
                 style={{ width: `${percent}%` }}
               />
             </div>

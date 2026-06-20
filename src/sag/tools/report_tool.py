@@ -966,6 +966,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     conflicts=list(report_evidence_result.get("conflicts") or []),
                     evidence_refs=list(report_evidence_result.get("evidence_refs") or []),
                     generated_at=timestamp,
+                    execution_metrics=execution_metrics,
                 )
             )
         except Exception as exc:  # pragma: no cover - defensive
@@ -1838,6 +1839,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             "total_runtime": 0,
             "start_time": None,
             "end_time": None,
+            "model": None,
+            "max_iterations": None,
             "total_steps": 0,
             "total_iterations": 0,
             "total_thoughts": 0,
@@ -1871,6 +1874,12 @@ class ReportTool(BaseTool, UIEventEmitter):
                         metrics["total_iterations"] = summary_snapshot["iterations"]
                     elif history_payload.get("current_iteration") is not None:
                         metrics["total_iterations"] = history_payload["current_iteration"]
+
+                    # Runtime metadata the web read model surfaces (model/step budget).
+                    if summary_snapshot.get("model") is not None:
+                        metrics["model"] = summary_snapshot["model"]
+                    if summary_snapshot.get("max_iterations") is not None:
+                        metrics["max_iterations"] = summary_snapshot["max_iterations"]
                 else:
                     history_steps = list(history_payload or [])
                     summary_snapshot = {}

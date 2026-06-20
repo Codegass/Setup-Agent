@@ -115,8 +115,11 @@ export function buildDetailTabs(d: ExecutionSessionDetail): TabMeta[] {
   if (nonZero(d.files?.items.length)) {
     tabs.push({ id: "files", label: "Files" })
   }
-  if (nonZero(d.evidence.length)) {
-    tabs.push({ id: "evidence", label: "Evidence" })
+  const evidenceCount = nonZero(d.evidence.length)
+  if (evidenceCount) {
+    // Mirror the prior buildDetailFacets behavior + the spec's "Evidence 2"
+    // inline count (neutral toned, unlike the red Tests fail count).
+    tabs.push({ id: "evidence", label: "Evidence", count: evidenceCount, tone: "neutral" })
   }
   if (nonZero(d.logs.length)) {
     tabs.push({ id: "logs", label: "Logs" })

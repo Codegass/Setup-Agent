@@ -91,6 +91,25 @@ describe("ActionDetailModal", () => {
     expect(screen.getByText("FULL OUTPUT BODY")).toBeInTheDocument()
   })
 
+  it("reports an honest failed status when the action did not succeed", () => {
+    render(
+      <ActionDetailModal
+        onClose={() => {}}
+        action={
+          {
+            toolName: "build",
+            success: false,
+            output: "BUILD FAILURE",
+            observation: "",
+            refs: [],
+            dispatchStatus: null,
+          } as never
+        }
+      />,
+    )
+    expect(screen.getByText("failed")).toBeInTheDocument()
+  })
+
   it("calls onClose when the dialog requests it", () => {
     const onClose = vi.fn()
     render(

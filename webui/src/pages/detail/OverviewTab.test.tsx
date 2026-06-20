@@ -88,6 +88,33 @@ describe("OverviewTab", () => {
     expect(screen.getByText("3 / 4")).toBeInTheDocument()
   })
 
+  it("colors the modules-built tile amber on a partial build and green on a clean build", () => {
+    const { rerender } = render(<OverviewTab detail={makeDetail()} onOpenFlow={() => {}} />)
+    // 3 / 4 with one failure → amber (attention)
+    expect(screen.getByText("3 / 4")).toHaveClass("text-status-attention")
+
+    rerender(
+      <OverviewTab
+        detail={makeDetail({
+          moduleSummary: {
+            modulesTotal: 4,
+            modulesBuilt: 4,
+            modulesFailed: 0,
+            modulesSkipped: 0,
+            modulesWithTestFailures: 0,
+            buildSystems: ["maven"],
+            singleModule: false,
+            lineRate: 79.2,
+            branchRate: 67.8,
+          },
+        })}
+        onOpenFlow={() => {}}
+      />,
+    )
+    // 4 / 4 with no failures → green (success)
+    expect(screen.getByText("4 / 4")).toHaveClass("text-status-success")
+  })
+
   it("renders coverage tiles when the module summary carries rates", () => {
     render(<OverviewTab detail={makeDetail()} onOpenFlow={() => {}} />)
     expect(screen.getByText(/line coverage/i)).toBeInTheDocument()

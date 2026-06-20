@@ -108,7 +108,11 @@ export function OverviewTab({
             label="Modules built"
             value={`${ms.modulesBuilt} / ${ms.modulesTotal}`}
             sub={ms.modulesFailed > 0 ? `${ms.modulesFailed} failed` : null}
-            valueClass="text-status-attention"
+            valueClass={
+              ms.modulesFailed === 0 && ms.modulesBuilt >= ms.modulesTotal
+                ? "text-status-success"
+                : "text-status-attention"
+            }
           />
         ) : (
           <Tile

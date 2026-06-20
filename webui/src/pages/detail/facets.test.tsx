@@ -102,4 +102,18 @@ describe("buildDetailTabs", () => {
     expect(tabs).toContain("logs")
     expect(tabs).toContain("report")
   })
+
+  it("attaches a neutral inline count to the evidence tab", () => {
+    const tabs = buildDetailTabs(
+      detail({
+        evidence: [
+          { source: "maven", summary: "", counts: "", time: "", status: "pass", records: [] },
+          { source: "junit", summary: "", counts: "", time: "", status: "pass", records: [] },
+        ],
+      }),
+    )
+    const evidence = tabs.find((t) => t.id === "evidence")
+    expect(evidence?.count).toBe(2)
+    expect(evidence?.tone).toBe("neutral")
+  })
 })

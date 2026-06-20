@@ -2,7 +2,14 @@
 server-composed verdict plus run metadata (model, steps, stepBudget). All
 fields are nullable so older sessions degrade gracefully."""
 
-from sag.web.models import ExecutionSessionDetail, VerdictSummary
+from sag.web.models import (
+    BuildSummary,
+    ExecutionSessionDetail,
+    ModuleRollup,
+    TestSummary,
+    VerdictSummary,
+)
+from sag.web.verdict import compose_verdict
 
 
 def test_detail_serializes_new_fields_camelcase():
@@ -31,6 +38,31 @@ def test_new_fields_default_none():
     })
     out = d.model_dump(mode="json", by_alias=True)
     assert out["verdict"] is None and out["model"] is None and out["stepBudget"] is None
+
+
+def test_compose_verdict_reads_serialized_model_aliases():
+    """_session_detail feeds compose_verdict the serialized (by_alias) Pydantic
+    dicts, so compose_verdict's reads (pass/fail/total, singleModule/modulesTotal/
+    modulesBuilt) must line up with the models' serialization_alias values. A rename
+    of any alias would silently drop a clause / mis-tone the verdict — lock it here."""
+    verdict = compose_verdict(
+        build=BuildSummary(state="partial", tool="Maven").model_dump(
+            mode="json", by_alias=True
+        ),
+        test=TestSummary(pass_count=1186, fail_count=7, total=1205).model_dump(
+            mode="json", by_alias=True
+        ),
+        module_summary=ModuleRollup(
+            modules_total=4, modules_built=3, modules_failed=1, single_module=False
+        ).model_dump(mode="json", by_alias=True),
+        outcome="PARTIAL",
+        blocker=None,
+    )
+    assert verdict is not None
+    assert verdict["tone"] == "attention"
+    assert verdict["headline"] == (
+        "Build passed on 3 of 4 modules. 7 of 1,205 tests failing — review before promoting"
+    )
 
 
 def test_verdict_summary_model_roundtrips():

@@ -99,6 +99,54 @@ describe("FlowTab", () => {
     expect(screen.getByText("Repository cloned successfully.")).toBeInTheDocument()
   })
 
+  it("shows a failed status on an action row when the action did not succeed", () => {
+    const base = makeDetail()
+    const ctx = base.context!
+    const action = ctx.phases[0].tasks[0].iterations[0].actions[0]
+    render(
+      <FlowTab
+        detail={makeDetail({
+          context: {
+            ...ctx,
+            phases: [
+              {
+                ...ctx.phases[0],
+                tasks: [
+                  {
+                    ...ctx.phases[0].tasks[0],
+                    iterations: [
+                      {
+                        ...ctx.phases[0].tasks[0].iterations[0],
+                        actions: [{ ...action, success: false }],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText("failed")).toBeInTheDocument()
+  })
+
+  it("renders the trunk header in a success tone when the run succeeded", () => {
+    render(
+      <FlowTab
+        detail={makeDetail({
+          context: {
+            trunk: { goal: "g", state: "completed", progress: { done: 5, total: 5 }, summary: "" },
+            phases: [],
+            debug: {},
+          },
+        })}
+      />,
+    )
+    const stateLabel = screen.getByText("completed")
+    expect(stateLabel).toHaveClass("text-status-success")
+  })
+
   it("falls back to an empty state when no phases are recorded", () => {
     render(
       <FlowTab
