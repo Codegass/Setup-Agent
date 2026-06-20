@@ -10,6 +10,9 @@ import { LogsView } from "@/components/session/LogsView"
 import { ReportDoc } from "@/components/session/ReportDoc"
 import { TestFacet } from "@/components/session/TestFacet"
 
+import { FlowTab } from "./FlowTab"
+import { OverviewTab } from "./OverviewTab"
+
 export type FacetId = "build" | "test" | "flow" | "evidence" | "files" | "report" | "logs"
 
 export interface FacetMeta {
@@ -138,19 +141,16 @@ export interface TabBodyProps {
 }
 
 /**
- * Renders the panel body for a tab. `overview`/`flow` reuse the existing trace renderer
- * until the dedicated OverviewTab/FlowTab land (Tasks 9/11); the rest delegate to the
- * existing session renderers. `onOpenFlow` is part of the API for those future panels.
+ * Renders the panel body for a tab. `overview`/`flow` use the dedicated OverviewTab/FlowTab
+ * panels; the rest delegate to the existing session renderers. `onOpenFlow` lets the Overview
+ * goal button jump into the Flow tab.
  */
-export function TabBody({ tabId, detail }: TabBodyProps) {
+export function TabBody({ tabId, detail, onOpenFlow }: TabBodyProps) {
   switch (tabId) {
     case "overview":
+      return <OverviewTab detail={detail} onOpenFlow={onOpenFlow ?? (() => {})} />
     case "flow":
-      return detail.context ? (
-        <ContextTrace ctx={detail.context} />
-      ) : (
-        <Empty label="Context trace unavailable for this session." />
-      )
+      return <FlowTab detail={detail} />
     case "tests":
       return <TestFacet detail={detail} />
     case "build":

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import type { ExecutionSessionDetail, SubmitTaskResponse, WorkspaceSummary } from "@/api/types"
 import { NewTaskModal } from "@/components/workspace/NewTaskModal"
@@ -10,12 +10,63 @@ import {
   DeleteWorkspaceDialog,
   type DeleteWorkspaceTarget,
 } from "@/components/workspace/DeleteWorkspaceDialog"
+import { cn } from "@/lib/utils"
 
 import { DetailHeader } from "./DetailHeader"
-import { FacetTabs } from "./FacetTabs"
-import { SummaryBand } from "./SummaryBand"
-import { buildDetailFacets, FacetBody, type FacetId } from "./facets"
-import { useScrollSpy } from "./scrollSpy"
+import { VerdictBand } from "./VerdictBand"
+import { buildDetailTabs, TabBody, type TabId } from "./facets"
+
+/** The tab bar: one nav model where a tab swaps the panel below it. A badge = items
+ *  needing attention. Markup/styling mirrors WorkbenchDetail.dc.html lines 76–92 (the
+ *  bottom-border tab nav at the top of the AFTER block). */
+function TabBar({
+  tabs,
+  active,
+  onSelect,
+}: {
+  tabs: ReturnType<typeof buildDetailTabs>
+  active: TabId
+  onSelect: (id: TabId) => void
+}) {
+  return (
+    <nav
+      aria-label="Detail tabs"
+      className="flex shrink-0 items-center gap-0.5 overflow-x-auto border-b border-slate-200 bg-white px-5 sm:px-7"
+    >
+      {tabs.map((tab) => {
+        const on = active === tab.id
+        return (
+          <button
+            key={tab.id}
+            aria-current={on}
+            className={cn(
+              "inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-[13px] font-semibold transition-colors",
+              on
+                ? "border-primary text-slate-700"
+                : "border-transparent text-slate-500 hover:text-slate-700",
+            )}
+            onClick={() => onSelect(tab.id)}
+            type="button"
+          >
+            <span>{tab.label}</span>
+            {tab.count != null ? (
+              <span
+                className={cn(
+                  "inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[11px] font-bold tabular-nums",
+                  tab.tone === "red"
+                    ? "bg-status-failed-soft text-status-failed"
+                    : "bg-slate-200 text-slate-600",
+                )}
+              >
+                {tab.count}
+              </span>
+            ) : null}
+          </button>
+        )
+      })}
+    </nav>
+  )
+}
 
 export function DetailPane({
   workspace,
@@ -34,14 +85,19 @@ export function DetailPane({
   onSubmitTask: (workspaceId: string, task: string, sourceSession?: string) => Promise<SubmitTaskResponse>
   onDelete: (workspaceId: string) => Promise<void>
 }) {
-  const facets = useMemo(() => buildDetailFacets(detail), [detail])
-  const ids = useMemo(() => facets.map((f) => f.id), [facets])
-  // offset matches the section scroll-mt below so a jumped section is the one
-  // the scroll-spy marks active (instead of lagging a section behind).
-  const { containerRef, active, onScroll, jump } = useScrollSpy(ids, sessionId, {
-    initialFacet,
-    offset: 150,
-  })
+  const tabs = useMemo(() => buildDetailTabs(detail), [detail])
+  const initial: TabId =
+    initialFacet && tabs.some((t) => t.id === initialFacet)
+      ? (initialFacet as TabId)
+      : "overview"
+  const [active, setActive] = useState<TabId>(initial)
+
+  // A new session (or one whose tab set no longer contains the active tab) resets
+  // the panel back to the requested/default tab.
+  useEffect(() => {
+    setActive(initial)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId])
 
   const [panel, setPanel] = useState<WorkspacePanelKind | null>(null)
   const [taskOpen, setTaskOpen] = useState(false)
@@ -62,30 +118,22 @@ export function DetailPane({
         workspace={workspace}
       />
 
-      <FacetTabs active={active} facets={facets} onJump={(id: FacetId) => jump(id)} />
-
-      {/* Single continuous scroll. `relative` makes this the offsetParent so
-          section positions are measured within the scroll container. */}
-      <div
-        ref={containerRef}
-        className="relative min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7"
-        onScroll={onScroll}
-      >
-        <SummaryBand detail={detail} />
-        <div className="mt-7 space-y-7">
-          {facets.map((f) => (
-            <section key={f.id} className="scroll-mt-[150px]" id={`facet-${f.id}`}>
-              <div className="mb-2.5 flex items-center gap-2">
-                <f.icon className="text-slate-400" size={14} />
-                <h3 className="text-[13px] font-semibold tracking-tight text-slate-700">{f.label}</h3>
-                <div className="ml-1 h-px flex-1 bg-slate-100" />
-              </div>
-              <FacetBody detail={detail} id={f.id} />
-            </section>
-          ))}
-        </div>
-        <div className="h-16" />
+      <div className="shrink-0 bg-white px-5 pb-3 pt-1 sm:px-7">
+        <VerdictBand detail={detail} />
       </div>
+
+      <TabBar active={active} onSelect={setActive} tabs={tabs} />
+
+      <main className="min-h-0 flex-1 overflow-y-auto px-5 py-6 sm:px-7">
+        <div className="mx-auto max-w-[1000px]">
+          <TabBody
+            detail={detail}
+            onOpenFlow={() => setActive("flow")}
+            onSubmitTask={onSubmitTask}
+            tabId={active}
+          />
+        </div>
+      </main>
 
       {panel ? (
         <WorkspacePanel kind={panel} latest={detail} onClose={() => setPanel(null)} workspace={workspace} />

@@ -212,10 +212,13 @@ describe("App", () => {
       }))[0],
     )
 
-    // Master-detail: header heading + summary band + top pill nav.
+    // Master-detail: header heading + verdict band + tab nav.
     expect(await screen.findByRole("heading", { name: "apache/commons-cli" })).toBeInTheDocument()
-    expect(screen.getByRole("navigation", { name: /detail sections/i })).toBeInTheDocument()
+    expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
+    // VerdictBand falls back to the raw outcome when no verdict is composed.
     expect(screen.getByText("Build succeeds and tests are partial.")).toBeInTheDocument()
+    // The Report tab swaps in the report document body.
+    fireEvent.click(screen.getByRole("button", { name: /^Report/ }))
     expect(screen.getByText("Project builds.")).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole("button", { name: "New task" }))
@@ -462,7 +465,8 @@ describe("App", () => {
     await new Promise((resolve) => setTimeout(resolve, 3200))
 
     expect(await screen.findByText("Setup completed after polling.")).toBeInTheDocument()
-    // The Test facet's tiles reflect the freshly polled 430/430 totals.
+    // The Tests tab's tiles reflect the freshly polled 430/430 totals.
+    fireEvent.click(screen.getByRole("button", { name: /^Tests/ }))
     expect(screen.getAllByText("430").length).toBeGreaterThanOrEqual(2)
   }, 8000)
 

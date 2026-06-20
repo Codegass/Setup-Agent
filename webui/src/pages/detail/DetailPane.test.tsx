@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, beforeAll, describe, expect, it, vi } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
 
@@ -13,11 +13,6 @@ vi.mock("@/components/terminal/TerminalPanel", () => ({
     <div aria-label="Workspace terminal">Terminal for {workspaceId}</div>
   ),
 }))
-
-beforeAll(() => {
-  // jsdom has no layout/scroll; stub so jump() doesn't throw.
-  Element.prototype.scrollIntoView = vi.fn()
-})
 
 const workspace: WorkspaceSummary = {
   id: "sag-x",
@@ -42,7 +37,8 @@ const detail: ExecutionSessionDetail = {
   start: "now",
   duration: "1m",
   outcome: "All good.",
-  build: { state: "success", tool: "Maven", time: "1s", note: "" },
+  verdict: { tone: "success", headline: "Build passed. 10 tests passing", detail: null },
+  build: { state: "success", tool: "Maven", time: "1s", note: "Compiled all modules" },
   test: { state: "pass", pass: 10, fail: 0, skip: 0, total: 10 },
   report: "ready",
   evidence: [],
@@ -61,17 +57,46 @@ describe("DetailPane", () => {
     cleanup()
   })
 
-  it("renders the header, summary band, section nav, and all facet sections", () => {
+  it("renders the header, the verdict band, and the tab bar (Overview active by default)", () => {
     render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
     expect(screen.getByRole("heading", { name: "owner/x" })).toBeInTheDocument()
-    expect(screen.getByText("All good.")).toBeInTheDocument()
-    expect(screen.getByRole("navigation", { name: /detail sections/i })).toBeInTheDocument()
-    // Top pills (one per facet) are buttons in the nav.
+    // VerdictBand renders the server-composed headline.
+    expect(screen.getByText(/Build passed\. 10 tests passing/)).toBeInTheDocument()
+    // Tab bar.
+    expect(screen.getByRole("navigation", { name: /detail tabs/i })).toBeInTheDocument()
+    const overview = screen.getByRole("button", { name: /^Overview/ })
+    expect(overview).toHaveAttribute("aria-current", "true")
+    expect(screen.getByRole("button", { name: /^Tests/ })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: /^Build/ })).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: /^Logs/ })).toBeInTheDocument()
-    for (const id of ["build", "test", "flow", "evidence", "files", "report", "logs"]) {
-      expect(document.getElementById(`facet-${id}`)).toBeTruthy()
+  })
+
+  it("switches panels when a tab is clicked (real switch, not scroll)", () => {
+    render(<DetailPane workspace={workspace} detail={detail} {...handlers} />)
+    // Overview content (the build-time KPI tile) is visible up front.
+    expect(screen.getByText("Build time")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: /^Build/ }))
+    const build = screen.getByRole("button", { name: /^Build/ })
+    expect(build).toHaveAttribute("aria-current", "true")
+    // The Build facet now owns the panel; the overview KPI tile is gone.
+    expect(screen.queryByText("Build time")).not.toBeInTheDocument()
+    expect(screen.getByText("Compiled all modules")).toBeInTheDocument()
+  })
+
+  it("honors initialFacet by opening that tab first", () => {
+    const withContext: ExecutionSessionDetail = {
+      ...detail,
+      context: {
+        trunk: { state: "completed", goal: "Set up the project", summary: "", progress: { done: 1, total: 1 } },
+        phases: [],
+        debug: {},
+      },
     }
+    render(
+      <DetailPane workspace={workspace} detail={withContext} initialFacet="flow" {...handlers} />,
+    )
+    expect(screen.getByRole("button", { name: /^Flow/ })).toHaveAttribute("aria-current", "true")
+    expect(screen.getByRole("button", { name: /^Overview/ })).toHaveAttribute("aria-current", "false")
   })
 
   it("opens the new-task modal from the header", () => {
