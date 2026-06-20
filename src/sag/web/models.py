@@ -511,6 +511,12 @@ class ModuleRollup(WebModel):
     )
 
 
+class VerdictSummary(WebModel):
+    tone: str  # "success" | "attention" | "failed"
+    headline: str
+    detail: str | None = None
+
+
 class ExecutionSessionDetail(WebModel):
     id: str
     workspace: str
@@ -541,6 +547,14 @@ class ExecutionSessionDetail(WebModel):
     context: ContextTrace | None = None
     logs: list[str] = Field(default_factory=list)
     partial: bool = False
+    verdict: VerdictSummary | None = None
+    model: str | None = None
+    steps: int | None = None
+    step_budget: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("step_budget", "stepBudget"),
+        serialization_alias="stepBudget",
+    )
 
 
 class TerminalConnectionState(WebModel):

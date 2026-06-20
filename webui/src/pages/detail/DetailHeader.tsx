@@ -1,52 +1,36 @@
-import { GitBranch, Plus, Settings as SettingsIcon, Terminal, Trash2 } from "lucide-react"
+import { MoreHorizontal, Plus, Settings as SettingsIcon, Terminal } from "lucide-react"
 import type { LucideIcon } from "lucide-react"
+import { useEffect, useRef, useState } from "react"
 
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
-import { Badge, LabeledStatus, StatusBadge } from "@/components/common/Badge"
 import { statusMeta } from "@/components/common/status"
 import { cn } from "@/lib/utils"
 
-function HeaderButton({
+function SecondaryButton({
   icon: Icon,
   label,
   onClick,
-  primary,
-  danger,
-  title,
 }: {
   icon: LucideIcon
-  label?: string
+  label: string
   onClick?: () => void
-  primary?: boolean
-  danger?: boolean
-  title?: string
 }) {
-  if (primary) {
-    return (
-      <button
-        className="inline-flex items-center gap-1.5 rounded-md bg-slate-900 px-2.5 py-1.5 text-[12px] font-medium text-white hover:bg-slate-800"
-        onClick={onClick}
-        type="button"
-      >
-        <Icon size={14} />
-        {label}
-      </button>
-    )
-  }
   return (
     <button
-      aria-label={title}
-      className={cn(
-        "rounded-md p-1.5 text-slate-400",
-        danger ? "hover:bg-red-50 hover:text-red-600" : "hover:bg-slate-100 hover:text-slate-700",
-      )}
+      className="inline-flex h-[34px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-700 hover:bg-slate-50"
       onClick={onClick}
-      title={title}
       type="button"
     >
-      <Icon size={16} />
+      <Icon size={14} />
+      <span className="hidden sm:inline">{label}</span>
     </button>
   )
+}
+
+function stepsClause(steps: number | null | undefined, budget: number | null | undefined): string | null {
+  if (steps == null) return null
+  if (budget != null) return `${steps} / ${budget} steps`
+  return `${steps} steps`
 }
 
 export function DetailHeader({
@@ -68,85 +52,139 @@ export function DetailHeader({
   onSettings: () => void
   onDelete: () => void
 }) {
+  const [menuOpen, setMenuOpen] = useState(false)
+  const menuRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!menuOpen) return
+    function handle(event: MouseEvent) {
+      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+        setMenuOpen(false)
+      }
+    }
+    document.addEventListener("mousedown", handle)
+    return () => document.removeEventListener("mousedown", handle)
+  }, [menuOpen])
+
   const sessions = workspace.sessions ?? []
-  const meta = [workspace.stack, workspace.commit, workspace.updated ? `updated ${workspace.updated}` : null]
-    .filter(Boolean)
+  const entry = detail?.entry?.trim()
+
+  // Single mono metadata line: omit any null/empty piece, join with " · ".
+  const meta = [
+    workspace.container,
+    workspace.stack,
+    workspace.commit,
+    detail?.model,
+    stepsClause(detail?.steps, detail?.stepBudget),
+    detail?.duration,
+    workspace.updated ? `finished ${workspace.updated}` : null,
+  ]
+    .filter((piece): piece is string => Boolean(piece && String(piece).trim()))
     .join(" · ")
 
   return (
-    <div className="sticky top-0 z-[var(--z-sticky)] border-b border-slate-200 bg-white/85 px-5 py-3.5 backdrop-blur-md sm:px-7">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-slate-200 bg-slate-50 text-slate-500">
-              <GitBranch size={16} />
+    <div className="sticky top-0 z-[var(--z-sticky)] flex-none border-b border-slate-200 bg-white/90 px-5 pb-4 pt-4 backdrop-blur-md sm:px-6">
+      <div className="flex items-start gap-4">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2.5">
+            <h2 className="truncate text-[19px] font-bold leading-tight tracking-[-0.02em] text-slate-900">
+              {workspace.project}
+            </h2>
+            {entry ? (
+              <span className="shrink-0 font-mono text-[11px] text-slate-400">{entry}</span>
+            ) : null}
+          </div>
+          {meta ? (
+            <div className="mt-[3px] truncate font-mono text-[12px] leading-snug text-slate-500">
+              {meta}
             </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h2 className="truncate text-[18px] font-semibold tracking-tight text-slate-900">
-                  {workspace.project}
-                </h2>
-                {workspace.release ? (
-                  <Badge className="border-slate-200 bg-slate-50 text-slate-500" mono>
-                    {workspace.release}
-                  </Badge>
+          ) : null}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            className="inline-flex h-[34px] items-center gap-1.5 rounded-lg bg-primary px-3.5 text-[13px] font-semibold text-white hover:opacity-90"
+            onClick={onNewTask}
+            type="button"
+          >
+            <Plus size={14} />
+            <span className="hidden sm:inline">New task</span>
+          </button>
+          <SecondaryButton icon={Terminal} label="Terminal" onClick={onTerminal} />
+          <SecondaryButton icon={SettingsIcon} label="Settings" onClick={onSettings} />
+
+          <div className="relative" ref={menuRef}>
+            <button
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              aria-label="More"
+              className="inline-flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+              onClick={() => setMenuOpen((open) => !open)}
+              type="button"
+            >
+              <MoreHorizontal size={16} />
+            </button>
+
+            {menuOpen ? (
+              <div
+                className="absolute right-0 top-[40px] z-[var(--z-popover,40)] w-[240px] rounded-xl border border-slate-200 bg-white p-1.5 shadow-[0_12px_30px_-8px_rgba(15,23,42,0.22)]"
+                role="menu"
+              >
+                {sessions.length > 1 ? (
+                  <div className="border-b border-slate-100 pb-1.5">
+                    <div className="px-2 py-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                      Sessions
+                    </div>
+                    {sessions.map((s) => {
+                      const active = s.id === sessionId
+                      return (
+                        <button
+                          key={s.id}
+                          aria-current={active}
+                          className={cn(
+                            "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12.5px] transition-colors",
+                            active
+                              ? "bg-status-running-soft text-status-running"
+                              : "text-slate-600 hover:bg-slate-50",
+                          )}
+                          onClick={() => {
+                            onSession(s.id)
+                            setMenuOpen(false)
+                          }}
+                          role="menuitemradio"
+                          aria-checked={active}
+                          title={s.title}
+                          type="button"
+                        >
+                          <span
+                            className={cn(
+                              "inline-flex h-1.5 w-1.5 shrink-0 rounded-full",
+                              `bg-status-${toneToken(statusMeta(s.status).tone)}`,
+                            )}
+                          />
+                          <span className="font-mono">{s.id}</span>
+                          <span className="truncate text-slate-400">{s.title}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
                 ) : null}
-                {detail?.partial ? (
-                  <Badge tone="amber">partial discovery</Badge>
-                ) : null}
+                <button
+                  className="mt-1 w-full rounded-lg px-2 py-2 text-left text-[13px] font-semibold text-status-failed hover:bg-status-failed-soft"
+                  onClick={() => {
+                    setMenuOpen(false)
+                    onDelete()
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  Delete workspace…
+                </button>
               </div>
-              <div className="mt-0.5 truncate font-mono text-[10.5px] text-slate-500">
-                <span className="text-slate-600">{workspace.container}</span>
-                {meta ? ` · ${meta}` : ""}
-              </div>
-            </div>
+            ) : null}
           </div>
         </div>
-        <div className="flex items-center gap-1.5">
-          {detail ? <LabeledStatus label="Flow" status={detail.status} /> : null}
-          <StatusBadge status={workspace.docker.status} />
-          <div className="mx-1 h-5 w-px bg-slate-200" />
-          <HeaderButton icon={Plus} label="New task" onClick={onNewTask} primary />
-          <HeaderButton icon={Terminal} onClick={onTerminal} title="Terminal" />
-          <HeaderButton icon={SettingsIcon} onClick={onSettings} title="Settings" />
-          <HeaderButton danger icon={Trash2} onClick={onDelete} title="Delete" />
-        </div>
       </div>
-
-      {sessions.length > 1 ? (
-        <div className="mt-3 flex items-center gap-1.5 overflow-x-auto pb-0.5">
-          <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
-            Sessions
-          </span>
-          {sessions.map((s) => {
-            const active = s.id === sessionId
-            return (
-              <button
-                key={s.id}
-                aria-current={active}
-                className={cn(
-                  "group flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11.5px] transition-colors",
-                  active
-                    ? "border-status-running-border bg-status-running-soft text-status-running"
-                    : "border-slate-200 bg-white text-slate-500 hover:bg-slate-50",
-                )}
-                onClick={() => onSession(s.id)}
-                title={s.title}
-                type="button"
-              >
-                <span
-                  className={cn(
-                    "inline-flex h-1.5 w-1.5 rounded-full",
-                    `bg-status-${toneToken(statusMeta(s.status).tone)}`,
-                  )}
-                />
-                <span className="font-mono">{s.id}</span>
-                <span className="hidden max-w-[150px] truncate sm:inline">{s.title}</span>
-              </button>
-            )
-          })}
-        </div>
-      ) : null}
     </div>
   )
 }

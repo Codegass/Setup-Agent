@@ -24,6 +24,7 @@ from sag.web.models import (
     ReportDocument,
     TerminalConnectionState,
     TestSummary,
+    VerdictSummary,
     WorkspaceSummary,
 )
 
@@ -417,6 +418,17 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
             "02:16:41 mvn test completed: 312 passed, 8 HelpFormatter width failures",
         ],
         partial=True,
+        verdict=VerdictSummary(
+            tone="attention",
+            headline=(
+                "Build passed on 2 of 3 modules. 8 of 320 tests failing — "
+                "review before promoting"
+            ),
+            detail=None,
+        ),
+        model="claude-sonnet-4.5",
+        steps=6,
+        step_budget=40,
     )
 
 

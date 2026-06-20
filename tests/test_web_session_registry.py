@@ -598,6 +598,76 @@ def test_container_session_registry_returns_setup_artifact_detail():
     assert detail.context.phases[0].id == "phase_provision"
 
 
+def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
+    """report_metrics.json carries model/iteration counts (the only writer of that
+    file), and _setup_artifact_item -> _session_detail must surface them as
+    model/steps/stepBudget AND compose the verdict from the serialized model keys.
+    Locks the dead-wiring + serialization-alias contracts for real (non-demo) runs."""
+    files = {
+        "/workspace/.setup_agent/contexts/trunk_20260618_100000.json": json.dumps(
+            {
+                "context_id": "trunk_20260618_100000",
+                "created_at": "2026-06-18 10:00:00.000000",
+                "last_updated": "2026-06-18 10:08:01.000000",
+                "goal": "Setup and configure the acme-platform project to be runnable",
+                "todo_list": [
+                    {"id": "phase_build", "description": "Build", "status": "completed"},
+                ],
+            }
+        ),
+        "/workspace/.setup_agent/report_metrics.json": json.dumps(
+            {
+                "version": 1,
+                "generated_at": "2026-06-18 10:08:01",
+                "model": "claude-sonnet-4.5",
+                "total_iterations": 6,
+                "max_iterations": 40,
+                "build": {"state": "partial", "system": "maven", "tool": "Maven"},
+                "test": {
+                    "state": "partial",
+                    "total": 1205, "passed": 1186, "failed": 7, "skipped": 12,
+                },
+            }
+        ),
+        "/workspace/.setup_agent/module_metrics.json": json.dumps(
+            {
+                "modules": [],
+                "module_summary": {
+                    "modulesTotal": 4, "modulesBuilt": 3, "modulesFailed": 1,
+                    "singleModule": False,
+                },
+            }
+        ),
+        "/workspace/setup-report-20260618-100801.md": (
+            "# Project Setup Report\n\n"
+            "**Generated:** 2026-06-18 10:08:01\n"
+            "**Result:** PARTIAL\n"
+        ),
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(
+        workspace_summary(),
+        "SETUP-commons-cli-20260618-100000",
+    )
+
+    assert detail is not None
+    # findings 1/5: runtime metadata is read from report_metrics.json (the file
+    # the read model actually consumes) -> surfaced as model/steps/stepBudget.
+    assert detail.model == "claude-sonnet-4.5"
+    assert detail.steps == 6
+    assert detail.step_budget == 40
+    # finding 6: the verdict is composed from the serialized (by_alias) model
+    # dicts; assert the real keys feed compose_verdict end-to-end.
+    assert detail.verdict is not None
+    assert detail.verdict.tone == "attention"
+    assert detail.verdict.headline == (
+        "Build passed on 3 of 4 modules. 7 of 1,205 tests failing — review before promoting"
+    )
+
+
 def test_setup_artifact_detail_uses_trunk_report_phase_without_backfill():
     files = {
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(

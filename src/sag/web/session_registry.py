@@ -27,8 +27,10 @@ from sag.web.models import (
     ModuleSummary,
     ReportDocument,
     TestSummary,
+    VerdictSummary,
     WorkspaceSummary,
 )
+from sag.web.verdict import compose_verdict
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
@@ -370,7 +372,18 @@ def _session_detail(
     summary = _session_summary(item, workspace_id)
     outcome = _text(item.get("outcome"), default=summary.title)
     build = _build_summary(item.get("build"))
+    module_summary = _module_rollup(item.get("module_summary"))
     report_doc = _report_document(item)
+
+    verdict = compose_verdict(
+        build=build.model_dump(mode="json", by_alias=True),
+        test=summary.test.model_dump(mode="json", by_alias=True),
+        module_summary=module_summary.model_dump(mode="json", by_alias=True)
+        if module_summary is not None
+        else None,
+        outcome=outcome,
+        blocker=item.get("blocker"),
+    )
 
     return ExecutionSessionDetail(
         id=summary.id,
@@ -385,7 +398,7 @@ def _session_detail(
         build=build,
         test=summary.test,
         modules=_module_summaries(item.get("modules")),
-        module_summary=_module_rollup(item.get("module_summary")),
+        module_summary=module_summary,
         report=summary.report,
         report_doc=report_doc,
         blocker=None,
@@ -394,6 +407,10 @@ def _session_detail(
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
+        verdict=VerdictSummary.model_validate(verdict) if verdict else None,
+        model=_optional_text(item.get("model")),
+        steps=_optional_int(item.get("steps")),
+        step_budget=_optional_int(item.get("step_budget")),
     )
 
 
@@ -552,6 +569,9 @@ def _setup_artifact_item(
         "report_path": report_path,
         "report_raw": report_raw,
         "logs": _setup_logs(logs_root or Path("logs"), project_name),
+        "model": _optional_text(metrics.get("model")) if isinstance(metrics, dict) else None,
+        "steps": metrics.get("total_iterations") if isinstance(metrics, dict) else None,
+        "step_budget": metrics.get("max_iterations") if isinstance(metrics, dict) else None,
     }
 
 
@@ -1513,6 +1533,15 @@ def _to_int(value: Any) -> int:
         return int(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _to_float_or_none(value: Any) -> float | None:
