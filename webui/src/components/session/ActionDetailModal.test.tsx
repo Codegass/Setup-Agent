@@ -110,6 +110,26 @@ describe("ActionDetailModal", () => {
     expect(screen.getByText("failed")).toBeInTheDocument()
   })
 
+  it("shows a placeholder when the action has no raw output", () => {
+    render(
+      <ActionDetailModal
+        onClose={() => {}}
+        action={
+          {
+            toolName: "project",
+            success: true,
+            output: "",
+            observation: "Project analysis completed.",
+            refs: [],
+            dispatchStatus: null,
+          } as never
+        }
+      />,
+    )
+    expect(screen.getByText(/no raw output captured/i)).toBeInTheDocument()
+    expect(screen.getByText(/Project analysis completed/)).toBeInTheDocument()
+  })
+
   it("calls onClose when the dialog requests it", () => {
     const onClose = vi.fn()
     render(

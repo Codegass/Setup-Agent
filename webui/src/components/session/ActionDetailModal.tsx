@@ -77,9 +77,15 @@ export function ActionDetailModal({
         <div className="max-h-[72vh] space-y-3.5 overflow-auto px-[18px] py-4">
           <div className="space-y-1.5">
             <SectionLabel hint="raw tool result" title="Tool output" />
-            <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg border border-slate-100 bg-slate-50 px-3 py-3 font-mono text-[12.5px] leading-relaxed text-slate-700">
-              {action.output}
-            </pre>
+            {action.output?.trim() ? (
+              <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg border border-slate-100 bg-slate-50 px-3 py-3 font-mono text-[12.5px] leading-relaxed text-slate-700">
+                {action.output}
+              </pre>
+            ) : (
+              <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 font-mono text-[12px] text-slate-400">
+                no raw output captured
+              </div>
+            )}
             {ref ? (
               <div>
                 <button
