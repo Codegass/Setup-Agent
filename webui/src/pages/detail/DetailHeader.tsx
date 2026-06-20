@@ -83,7 +83,7 @@ export function DetailHeader({
     .join(" · ")
 
   return (
-    <div className="sticky top-0 z-[var(--z-sticky)] flex-none border-b border-slate-200 bg-white/90 px-5 pt-4 backdrop-blur-md sm:px-6">
+    <div className="sticky top-0 z-[var(--z-sticky)] flex-none border-b border-slate-200 bg-white/90 px-5 pb-4 pt-4 backdrop-blur-md sm:px-6">
       <div className="flex items-start gap-4">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2.5">

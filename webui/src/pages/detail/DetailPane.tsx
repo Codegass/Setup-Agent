@@ -118,7 +118,7 @@ export function DetailPane({
         workspace={workspace}
       />
 
-      <div className="shrink-0 bg-white px-5 pb-3 pt-1 sm:px-7">
+      <div className="shrink-0 bg-white px-5 pb-4 pt-4 sm:px-7">
         <VerdictBand detail={detail} />
       </div>
 
