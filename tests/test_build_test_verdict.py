@@ -420,6 +420,26 @@ def test_agent_caps_at_partial_on_low_test_execution():
     assert agent.final_verdict == "partial"
 
 
+def test_agent_zero_executed_tests_is_partial_not_failed():
+    """CLI parity (carbondata regression): build green but the detected suite did
+    NOT run (0 of 1122 executed) -> PARTIAL, not a 0% pass-rate FAILURE. The CLI
+    verdict must match the report's tests_not_fully_executed -> PARTIAL."""
+    agent = _agent_with_validator(
+        FakePhysicalValidator(
+            build_status={"success": True, "build_complete": True, "reason": "Built 100%"},
+            test_status={
+                "has_test_reports": True, "status": "WARNING", "reason": "no tests ran",
+                "pass_rate": 0.0, "total_tests": 0, "passed_tests": 0,
+                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
+                "test_exclusions": [], "modules_without_tests": [],
+            },
+            analysis_status={"analyzed": True, "has_static_test_count": True, "static_test_count": 1122},
+        )
+    )
+    agent._get_verified_final_status(react_engine_success=True)
+    assert agent.final_verdict == "partial"  # not "failed"
+
+
 # ===========================================================================
 # 7. Module count keeps submodules that actually built (no 0/N despite artifacts)
 # ===========================================================================

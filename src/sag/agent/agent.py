@@ -1124,6 +1124,20 @@ START by working toward the current phase objective shown in my context.
                     "error_tests", 0
                 )
 
+                # Build verified but the detected suite did not actually run ->
+                # PARTIAL, not a 0% pass-rate FAILURE (0 tests executed is "not
+                # run", not "0% passed"). Mirrors the report's
+                # tests_not_fully_executed cap so the CLI verdict cannot diverge
+                # from the report (carbondata: 0 of 1122 executed -> report PARTIAL
+                # but the CLI said FAILED before this guard).
+                if (test_status.get("total_tests") or 0) == 0:
+                    self.final_verdict = "partial"
+                    logger.warning(
+                        "⚠️ Test validation: PARTIAL - build verified but 0 of "
+                        f"{static_test_count or 'the detected'} tests executed"
+                    )
+                    return False
+
                 # Route the test gate through the SINGLE verdict policy
                 # (evaluate_run_verdict) so the run/test success path can never
                 # diverge from the report verdict: a build-green run at or above
