@@ -143,7 +143,12 @@ def assemble_module_metrics(
             # Conflict guard: reactor says success but nothing was produced.
             if reactor == "success" and not (class_count or jar_count) and path != ".":
                 build_source = "partial"
-        elif class_count or jar_count:
+        elif (class_count or 0) > 0:
+            # No reactor summary: infer "built" from FRESH compiled classes only.
+            # ponytail: a jar with no .class files is NOT counted as built — it's
+            # usually a stale jar left from a prior run while this build's modules
+            # failed dependency resolution (commons-vfs read 7/7 with 4 dep
+            # failures). Such a module stays detected but not built.
             build_status, build_source = "success", "artifacts"
         elif any_failure:
             build_status, build_source = "skipped", "partial"

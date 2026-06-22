@@ -11,6 +11,11 @@ from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
 from ..base import BaseTool, ToolResult
 
 
+def _path_exists(orch, path: str) -> bool:
+    result = orch.execute_command(f"test -e {path} && echo yes || echo no")
+    return "yes" in (result.get("output") or "")
+
+
 class ProjectAnalyzerTool(BaseTool):
     """Tool for analyzing project structure and generating intelligent execution plans."""
 
@@ -802,7 +807,7 @@ ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
 
 
 def strip_comments(source: str) -> str:
-    source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+    source = re.sub(r'/\\*.*?\\*/', '', source, flags=re.S)
     source = re.sub(r'//.*', '', source)
     return source
 
@@ -1119,19 +1124,15 @@ PY"""
         if not orch:
             return rec
 
-        def exists(path: str) -> bool:
-            result = orch.execute_command(f"test -e {path} && echo yes || echo no")
-            return "yes" in (result.get("output") or "")
-
-        has_pom = exists(f"{project_path}/pom.xml")
-        has_gradlew = exists(f"{project_path}/gradlew")
-        has_build_gradle = exists(f"{project_path}/build.gradle") or exists(
-            f"{project_path}/build.gradle.kts"
+        has_pom = _path_exists(orch, f"{project_path}/pom.xml")
+        has_gradlew = _path_exists(orch, f"{project_path}/gradlew")
+        has_build_gradle = _path_exists(orch, f"{project_path}/build.gradle") or _path_exists(
+            orch, f"{project_path}/build.gradle.kts"
         )
         rec["has_gradle"] = has_gradlew or has_build_gradle
 
-        root_main_java = exists(f"{project_path}/src/main/java")
-        root_main_groovy = exists(f"{project_path}/src/main/groovy")
+        root_main_java = _path_exists(orch, f"{project_path}/src/main/java")
+        root_main_groovy = _path_exists(orch, f"{project_path}/src/main/groovy")
 
         packaging = None
         if has_pom:
@@ -1239,10 +1240,6 @@ PY"""
         if not orch:
             return
 
-        def exists(path: str) -> bool:
-            result = orch.execute_command(f"test -e {path} && echo yes || echo no")
-            return "yes" in (result.get("output") or "")
-
         find_cmd = (
             f"find {project_path} -maxdepth 6 -type d "
             f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' \\) "
@@ -1274,9 +1271,9 @@ PY"""
         test_root = f"{project_path}/{top_seg}" if top_seg else project_path
 
         # The test cluster's own build system can differ from the main build's.
-        if exists(f"{test_root}/settings.gradle") or exists(f"{test_root}/build.gradle"):
+        if _path_exists(orch, f"{test_root}/settings.gradle") or _path_exists(orch, f"{test_root}/build.gradle"):
             test_system = "gradle"
-        elif exists(f"{test_root}/pom.xml"):
+        elif _path_exists(orch, f"{test_root}/pom.xml"):
             test_system = "maven"
         else:
             test_system = build_rec.get("build_system")

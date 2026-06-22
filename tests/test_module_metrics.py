@@ -53,6 +53,30 @@ def test_falls_back_to_artifacts_when_no_reactor():
     assert metrics["module_summary"]["single_module"] is True
 
 
+def test_no_reactor_jar_without_classes_is_not_built():
+    # commons-vfs shape: no reactor summary, a module left a stale jar but
+    # compiled no fresh .class files (its build failed dependency resolution).
+    # It must read detected-but-not-built, not an optimistic "success".
+    metrics = assemble_module_metrics(
+        modules=[
+            {"path": "core", "name": "core", "class_count": 12, "jar_count": 1,
+             "report_dirs": []},
+            {"path": "examples", "name": "examples", "class_count": 0, "jar_count": 1,
+             "report_dirs": []},
+        ],
+        reactor_status={},
+        tests={},
+        build_systems=["maven"],
+        build_error_samples={},
+        generated_at="t",
+    )
+    by_path = {m["path"]: m for m in metrics["modules"]}
+    assert by_path["core"]["build_status"] == "success"        # has classes
+    assert by_path["examples"]["build_status"] != "success"    # jar only -> not built
+    assert metrics["module_summary"]["modules_total"] == 2
+    assert metrics["module_summary"]["modules_built"] == 1
+
+
 def test_reactor_matches_descriptive_maven_name_label():
     # Real Maven reactor labels use the module <name> display string, e.g.
     # "Apache Kafka :: Connect :: API", while scan_modules derives the key from

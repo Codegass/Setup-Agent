@@ -286,7 +286,7 @@ def extract_test_methods(content):
     methods = []
 
     # Primary pattern for common test annotations
-    pattern = r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|DataProvider)(?:\([^)]*\))?\\s*(?:.*?\\s+)?(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\('
+    pattern = r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|DataProvider)(?:\\([^)]*\\))?\\s*(?:.*?\\s+)?(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\('
     matches = re.findall(pattern, content, re.DOTALL)
     methods.extend([method_name for _, method_name in matches])
 
