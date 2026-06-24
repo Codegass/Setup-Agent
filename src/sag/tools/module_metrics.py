@@ -217,11 +217,14 @@ def assemble_module_metrics(
             })
 
     total = len(out_modules)
+    tested = sum(1 for m in out_modules if (m["tests_total"] or 0) > 0)
     summary = {
         "modules_total": total,
         "modules_built": sum(1 for m in out_modules if m["build_status"] == "success"),
         "modules_failed": sum(1 for m in out_modules if m["build_status"] == "failure"),
         "modules_skipped": sum(1 for m in out_modules if m["build_status"] == "skipped"),
+        "modules_tested": tested,
+        "modules_not_tested": total - tested,
         "modules_with_test_failures": sum(
             1 for m in out_modules if (m["failing_count"] or 0) > 0
         ),

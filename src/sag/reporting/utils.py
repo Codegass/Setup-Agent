@@ -142,7 +142,14 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
     modules_detected = status.get("modules_detected")
     if modules_detected:
         modules_built = status.get("modules_built") or 0
-        module_line = f"🧩 Modules: {modules_built} built / {modules_detected} detected"
+        modules_tested = status.get("modules_tested") or 0
+        modules_not_tested = status.get("modules_not_tested")
+        if modules_not_tested is None:
+            modules_not_tested = modules_detected - modules_tested
+        module_line = (
+            f"🧩 Modules: {modules_built} built / {modules_detected} detected"
+            f" · {modules_tested} tested / {modules_not_tested} not tested"
+        )
         extra = []
         if status.get("modules_failed_count"):
             extra.append(f"{status['modules_failed_count']} failed")

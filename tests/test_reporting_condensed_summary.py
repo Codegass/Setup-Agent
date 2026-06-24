@@ -66,6 +66,28 @@ def test_modules_built_detected_line_surfaced():
     assert "2 failed" in out
 
 
+def test_modules_tested_not_tested_surfaced():
+    out = render_condensed_summary(
+        _snapshot(
+            {"verdict": "partial", "modules_detected": 5, "modules_built": 3,
+             "modules_tested": 2, "modules_not_tested": 3},
+            {"class_files": 100, "jar_files": 4, "tests_total": None, "tests_pass_pct": None},
+        )
+    )
+    assert "🧩 Modules: 3 built / 5 detected · 2 tested / 3 not tested" in out
+
+
+def test_modules_not_tested_defaults_to_detected_minus_tested():
+    out = render_condensed_summary(
+        _snapshot(
+            {"verdict": "partial", "modules_detected": 5, "modules_built": 3,
+             "modules_tested": 2},  # modules_not_tested omitted
+            {"class_files": 100, "jar_files": 4, "tests_total": None, "tests_pass_pct": None},
+        )
+    )
+    assert "2 tested / 3 not tested" in out
+
+
 def test_single_module_built_detected_line():
     out = render_condensed_summary(
         _snapshot(

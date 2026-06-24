@@ -269,6 +269,73 @@ def test_reactor_only_module_counted_when_no_scan_match():
     assert "ghost" in {m["name"] for m in metrics["modules"]}
 
 
+def test_no_reactor_jar_without_classes_is_not_built():
+    # commons-vfs shape: no reactor summary, a module left a stale jar but
+    # compiled no fresh .class files (its build failed dependency resolution).
+    # It must read detected-but-not-built, not an optimistic "success".
+    metrics = assemble_module_metrics(
+        modules=[
+            {"path": "core", "name": "core", "class_count": 12, "jar_count": 1,
+             "report_dirs": []},
+            {"path": "examples", "name": "examples", "class_count": 0, "jar_count": 1,
+             "report_dirs": []},
+        ],
+        reactor_status={},
+        tests={},
+        build_systems=["maven"],
+        build_error_samples={},
+        generated_at="t",
+    )
+    by_path = {m["path"]: m for m in metrics["modules"]}
+    assert by_path["core"]["build_status"] == "success"        # has classes
+    assert by_path["examples"]["build_status"] != "success"    # jar only -> not built
+    assert metrics["module_summary"]["modules_total"] == 2
+    assert metrics["module_summary"]["modules_built"] == 1
+
+
+def test_module_summary_counts_tested_and_not_tested():
+    """tested = modules that ran >=1 test (tests_total>0); not_tested = detected - tested."""
+    metrics = assemble_module_metrics(
+        modules=[
+            {"path": "api", "name": "api", "class_count": 10, "jar_count": 1, "report_dirs": []},
+            {"path": "core", "name": "core", "class_count": 8, "jar_count": 1, "report_dirs": []},
+            {"path": "util", "name": "util", "class_count": 4, "jar_count": 0, "report_dirs": []},
+        ],
+        reactor_status={"api": "success", "core": "success", "util": "success"},
+        tests={
+            "api": {"tests_total": 12, "tests_passed": 12, "failing_count": 0},
+            "core": {"tests_total": 0, "tests_passed": 0, "failing_count": 0},  # built, no tests run
+        },
+        build_systems=["maven"], build_error_samples={}, generated_at="t",
+    )
+    s = metrics["module_summary"]
+    assert s["modules_total"] == 3
+    assert s["modules_tested"] == 1            # only api ran tests
+    assert s["modules_not_tested"] == 2        # core (0 tests) + util (no entry)
+    assert s["modules_tested"] + s["modules_not_tested"] == s["modules_total"]
+
+
+def test_submodule_breakdown_header_shows_tested_not_tested():
+    """The markdown breakdown header surfaces tested / not-tested alongside built/detected."""
+    metrics = {
+        "module_summary": {"modules_total": 3, "modules_built": 2, "modules_failed": 0,
+                           "modules_skipped": 0, "modules_tested": 1, "modules_not_tested": 2,
+                           "modules_with_test_failures": 0,
+                           "build_systems": ["maven"], "single_module": False},
+        "modules": [
+            {"name": "api", "path": "api", "build_status": "success",
+             "tests_total": 12, "tests_passed": 12, "tests_failed": 0, "failing_count": 0},
+            {"name": "core", "path": "core", "build_status": "success",
+             "tests_total": 0, "failing_count": 0},
+            {"name": "util", "path": "util", "build_status": "unknown",
+             "tests_total": None, "failing_count": None},
+        ],
+    }
+    body = "\n".join(ReportTool()._render_submodule_breakdown(metrics))
+    assert "2 built / 3 detected" in body
+    assert "1 tested · 2 not tested" in body
+
+
 def test_scan_modules_includes_root_in_multi_module():
     """The submodule find runs at mindepth 2, so the depth-1 root pom is excluded;
     the root module that actually compiled must still be scanned (path ".")."""

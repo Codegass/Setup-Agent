@@ -962,6 +962,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_snapshot["status"]["modules_built"] = msum.get("modules_built")
             report_snapshot["status"]["modules_failed_count"] = msum.get("modules_failed")
             report_snapshot["status"]["modules_skipped_count"] = msum.get("modules_skipped")
+            report_snapshot["status"]["modules_tested"] = msum.get("modules_tested")
+            report_snapshot["status"]["modules_not_tested"] = msum.get("modules_not_tested")
 
         # Generate both console and markdown versions with verified information and metrics
         console_report = self._generate_console_report(
@@ -3352,6 +3354,8 @@ class ReportTool(BaseTool, UIEventEmitter):
         lines.append(
             f"{summary.get('modules_built', 0)} built / "
             f"{summary.get('modules_total', 0)} detected · "
+            f"{summary.get('modules_tested', 0)} tested · "
+            f"{summary.get('modules_not_tested', 0)} not tested · "
             f"{summary.get('modules_failed', 0)} failed · "
             f"{summary.get('modules_skipped', 0)} skipped · "
             f"test failures in {summary.get('modules_with_test_failures', 0)}"
@@ -3612,6 +3616,13 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
             mod_msg = f"{mod_icon} {modules_built}/{modules_detected} built"
             lines.append(f"│ Module Coverage │ {mod_msg:<32} │")
+
+            tested = status.get("modules_tested") or 0
+            not_tested = status.get("modules_not_tested")
+            if not_tested is None:
+                not_tested = modules_detected - tested
+            test_msg = f"🧪 {tested} tested / {not_tested} not tested"
+            lines.append(f"│ Module Tests    │ {test_msg:<32} │")
 
         lines.append("└─────────────────┴──────────────────────────────────┘")
         lines.append("```")
