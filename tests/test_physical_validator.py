@@ -21,7 +21,11 @@ from sag.agent.physical_validator import (
     _format_build_duration,
     evaluate_run_verdict,
 )
-from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD, Config
+from sag.config.settings import (
+    DEFAULT_BUILD_COVERAGE_THRESHOLD,
+    DEFAULT_TEST_PASS_THRESHOLD,
+    Config,
+)
 from sag.tools.report_tool import ReportTool
 
 
@@ -263,6 +267,34 @@ def test_validate_build_status_maven_unaffected():
     assert result["success"] is True
 
 
+def test_validate_build_status_maven_vendored_jar_only_is_not_green():
+    """Bigtop-B regression: an empty/aggregator root pom whose ``mvn compile``
+    produced ZERO .class files (no target/classes, no maven-status fingerprints,
+    no parseable expected artifacts) must NOT be reported green just because a
+    single vendored/checked-in JAR exists somewhere in the tree.
+
+    This is the exact false positive from the Bigtop run: build validation said
+    'SUCCESS - Found 1 build artifacts' off one stray JAR with class_count == 0.
+    """
+    orch = FakeBuildOrchestrator(
+        files={
+            "/workspace/bigtop/pom.xml",
+            "/workspace/bigtop/build-tools/vendored.jar",
+        },
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    result = validator.validate_build_status("bigtop")
+
+    assert result["evidence"]["build_system"] == "maven"
+    # The stray JAR is still counted as an artifact...
+    assert result["evidence"]["has_artifacts"] is True
+    assert result["evidence"]["artifact_count"] >= 1
+    # ...but a JVM build with zero compiled classes is NOT green.
+    assert result["success"] is False
+    assert "class" in result["reason"].lower()
+
+
 # ===========================================================================
 # Build evidence surfaced for the metrics read model (report_metrics contract)
 # ===========================================================================
@@ -456,6 +488,50 @@ def test_shared_command_tracker_threads_real_maven_build_into_validator_evidence
 
 
 # ===========================================================================
+# Loosened build-green: source-weighted module-coverage threshold
+# ===========================================================================
+def test_verify_expected_artifacts_reports_source_weighted_coverage():
+    """coverage = sum(min(found, expected)) / sum(expected), weighted by source size."""
+    big = {f"/workspace/p/big/target/classes/C{i}.class" for i in range(95)}
+    small = {f"/workspace/p/small/target/classes/C{i}.class" for i in range(5)}
+    # the 'missing' module (100 sources) produced no classes
+    orch = FakeBuildOrchestrator(files=big | small)
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    expected = [
+        {"type": "classes", "path": "/workspace/p/big/target/classes", "min_count": 95, "artifact": "big"},
+        {"type": "classes", "path": "/workspace/p/small/target/classes", "min_count": 5, "artifact": "small"},
+        {"type": "classes", "path": "/workspace/p/missing/target/classes", "min_count": 100, "artifact": "missing"},
+    ]
+    result = validator._verify_expected_artifacts("/workspace/p", expected)
+
+    assert result["all_present"] is False
+    assert result["classes_expected"] == 200
+    assert result["classes_found"] == 100  # 95 + 5 + 0
+    assert result["class_coverage"] == 0.5
+
+
+def _coverage_validator(coverage, found, missing, threshold):
+    """A validator wired to reach Priority 2 with a controlled coverage result."""
+    orch = FakeBuildOrchestrator(files={"/workspace/m/pom.xml", "/workspace/m/target/app.jar"})
+    validator = PhysicalValidator(
+        docker_orchestrator=orch, project_path="/workspace", build_coverage_threshold=threshold
+    )
+    validator._get_expected_artifacts = lambda *a, **k: [
+        {"type": "classes", "min_count": 1, "path": "x", "artifact": "x"}
+    ]
+    validator._verify_expected_artifacts = lambda *a, **k: {
+        "all_present": False,
+        "found": found,
+        "missing": missing,
+        "classes_expected": 4,
+        "classes_found": int(round(coverage * 4)),
+        "class_coverage": coverage,
+    }
+    return validator
+
+
+# ===========================================================================
 # TASK 2.2 - Single test-verdict policy (evaluate_run_verdict)
 # ===========================================================================
 def test_settings_test_pass_threshold_default():
@@ -467,6 +543,18 @@ def test_settings_test_pass_threshold_from_env(monkeypatch):
     """SAG_TEST_PASS_THRESHOLD must override the default in Config.from_env."""
     monkeypatch.setenv("SAG_TEST_PASS_THRESHOLD", "0.95")
     assert Config.from_env().test_pass_threshold == 0.95
+
+
+def test_settings_build_coverage_threshold_default():
+    # All active modules must compile for SUCCESS -> default is 100%.
+    assert DEFAULT_BUILD_COVERAGE_THRESHOLD == 1.0
+    assert Config().build_coverage_threshold == 1.0
+
+
+def test_settings_build_coverage_threshold_from_env(monkeypatch):
+    """SAG_BUILD_COVERAGE_THRESHOLD must override the default in Config.from_env."""
+    monkeypatch.setenv("SAG_BUILD_COVERAGE_THRESHOLD", "0.5")
+    assert Config.from_env().build_coverage_threshold == 0.5
 
 
 @pytest.mark.parametrize(

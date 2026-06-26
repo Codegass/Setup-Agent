@@ -11,6 +11,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from sag.evidence import EvidenceFinding, EvidenceStatus, coerce_evidence_status
+from sag.utils.container_io import write_container_text
 
 
 class TaskStatus(str, Enum):
@@ -736,16 +737,15 @@ CONTEXT_EOF"""
                         f"Failed to create directory {dir_path}: {mkdir_result.get('output', '')}"
                     )
 
-                # Use cat with heredoc to write file - much simpler and more transparent
-                save_command = f"""cat > {branch_file} << 'CONTEXT_EOF'
-{context_data}
-CONTEXT_EOF"""
+                # Branch history accumulates large tool outputs, so a single
+                # heredoc command overflows the kernel per-arg limit
+                # ("argument list too long") and silently loses the agent's
+                # per-phase memory. The shared writer streams large content as
+                # base64 chunks; small content still takes the fast heredoc path.
+                if not write_container_text(self.orchestrator, branch_file, context_data):
+                    raise Exception(f"Failed to save branch history to {branch_file}")
 
-                result = self.orchestrator.execute_command(save_command)
-                if not (result.get("success") or result.get("exit_code") == 0):
-                    raise Exception(f"Failed to save branch history: {result.get('output', '')}")
-
-                logger.debug(f"Saved branch history using heredoc to: {branch_file}")
+                logger.debug(f"Saved branch history to: {branch_file}")
             else:
                 # Save to local file system
                 Path(branch_file).parent.mkdir(parents=True, exist_ok=True)

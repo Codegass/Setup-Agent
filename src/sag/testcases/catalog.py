@@ -286,7 +286,7 @@ def extract_test_methods(content):
     methods = []
 
     # Primary pattern for common test annotations
-    pattern = r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|DataProvider)(?:\([^)]*\))?\\s*(?:.*?\\s+)?(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\('
+    pattern = r'@(Test|ParameterizedTest|RepeatedTest|TestFactory|TestTemplate|DataProvider)(?:\\([^)]*\\))?\\s*(?:.*?\\s+)?(?:public\\s+)?(?:void\\s+)?([a-zA-Z0-9_]+)\\s*\\('
     matches = re.findall(pattern, content, re.DOTALL)
     methods.extend([method_name for _, method_name in matches])
 
@@ -303,6 +303,13 @@ def extract_test_methods(content):
                     if method_name not in methods and not method_name.startswith('set') and not method_name.startswith('get'):
                         methods.append(method_name)
                     break
+
+    # Tertiary pattern for JUnit 3 style tests (methods starting with "test" and returning void)
+    junit3_pattern = r'public\\s+void\\s+(test[a-zA-Z0-9_]*)\\s*\\('
+    for match in re.finditer(junit3_pattern, content):
+        method_name = match.group(1)
+        if method_name not in methods:
+            methods.append(method_name)
 
     # Remove duplicates while preserving order
     seen = set()

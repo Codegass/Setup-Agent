@@ -11,6 +11,11 @@ from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
 from ..base import BaseTool, ToolResult
 
 
+def _path_exists(orch, path: str) -> bool:
+    result = orch.execute_command(f"test -e {path} && echo yes || echo no")
+    return "yes" in (result.get("output") or "")
+
+
 class ProjectAnalyzerTool(BaseTool):
     """Tool for analyzing project structure and generating intelligent execution plans."""
 
@@ -205,6 +210,18 @@ class ProjectAnalyzerTool(BaseTool):
                     analysis["parameterized_info"] = test_count_result.get("parameterized_info", {})
             else:
                 logger.debug("No test methods discovered in Java project")
+
+        # Step 4.6: Recommend where/how to build so the build phase targets the
+        # real reactor/module instead of an empty aggregator root.
+        try:
+            analysis["build_recommendation"] = self._recommend_build_approach(
+                project_path, analysis
+            )
+            # Tests can live in different modules / a different build system than
+            # the main build (Bigtop: Maven build module, Gradle test modules).
+            self._recommend_test_approach(project_path, analysis["build_recommendation"])
+        except Exception as exc:
+            logger.warning(f"Build-approach recommendation failed: {exc}")
 
         # Step 5: 生成智能执行计划
         execution_plan = self._generate_execution_plan(analysis)
@@ -790,7 +807,7 @@ ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
 
 
 def strip_comments(source: str) -> str:
-    source = re.sub(r'/\*.*?\*/', '', source, flags=re.S)
+    source = re.sub(r'/\\*.*?\\*/', '', source, flags=re.S)
     source = re.sub(r'//.*', '', source)
     return source
 
@@ -1078,6 +1095,191 @@ PY"""
             frameworks.append("Kotlin Test")
 
         return frameworks
+
+    def _recommend_build_approach(
+        self, project_path: str, analysis: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Recommend WHERE and HOW to build so the build phase does not compile an
+        empty aggregator root.
+
+        Bigtop's root pom is ``packaging=pom`` aggregating Groovy/Gradle modules,
+        so ``mvn compile`` at the root returns BUILD SUCCESS with zero
+        ``target/classes/*.class``. This inspects the real layout — root packaging,
+        root/module main-source dirs (Java AND Groovy), and any Gradle build — and
+        returns a concrete recommendation the build phase can target:
+
+            {build_system, build_root, goal, is_aggregator_only, has_gradle,
+             source_modules, rationale}
+        """
+        rec: Dict[str, Any] = {
+            "build_system": analysis.get("build_system"),
+            "build_root": project_path,
+            "goal": "compile",
+            "is_aggregator_only": False,
+            "has_gradle": False,
+            "source_modules": [],
+            "rationale": "",
+        }
+        orch = self.docker_orchestrator
+        if not orch:
+            return rec
+
+        has_pom = _path_exists(orch, f"{project_path}/pom.xml")
+        has_gradlew = _path_exists(orch, f"{project_path}/gradlew")
+        has_build_gradle = _path_exists(orch, f"{project_path}/build.gradle") or _path_exists(
+            orch, f"{project_path}/build.gradle.kts"
+        )
+        rec["has_gradle"] = has_gradlew or has_build_gradle
+
+        root_main_java = _path_exists(orch, f"{project_path}/src/main/java")
+        root_main_groovy = _path_exists(orch, f"{project_path}/src/main/groovy")
+
+        packaging = None
+        if has_pom:
+            pkg = orch.execute_command(f"grep -m1 '<packaging>' {project_path}/pom.xml 2>/dev/null")
+            match = re.search(r"<packaging>\s*([^<\s]+)\s*</packaging>", pkg.get("output") or "")
+            packaging = match.group(1).strip().lower() if match else "jar"
+
+        # Find source-bearing modules DIRECTLY rather than trusting the root
+        # pom's <modules> — Bigtop declares its modules inside a profile, so the
+        # parsed list is empty and the Groovy iTest framework was missed. Scan for
+        # both Java and Groovy main-source dirs, excluding build output.
+        source_modules = []
+        find_cmd = (
+            f"find {project_path} -maxdepth 5 -type d "
+            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' \\) "
+            f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
+        )
+        found = orch.execute_command(find_cmd)
+        seen_dirs = set()
+        for line in (found.get("output") or "").splitlines():
+            line = line.strip()
+            if not line or "/src/main/" not in line:
+                continue
+            lang = "groovy" if line.endswith("/src/main/groovy") else "java"
+            module_dir = line.rsplit("/src/main/", 1)[0]
+            if module_dir == project_path or module_dir in seen_dirs:
+                continue
+            seen_dirs.add(module_dir)
+            source_modules.append(
+                {
+                    "module": module_dir[len(project_path):].lstrip("/"),
+                    "dir": module_dir,
+                    "lang": lang,
+                }
+            )
+        rec["source_modules"] = source_modules
+
+        # 1) Plain Maven module with its own sources: compile at the root.
+        if has_pom and (root_main_java or root_main_groovy):
+            rec.update(build_system="maven", build_root=project_path, goal="compile")
+            rec["rationale"] = "Root Maven module has main sources; compile at the root."
+            return rec
+
+        # 2) Aggregator root (packaging=pom): compiling the root produces nothing.
+        if has_pom and packaging == "pom":
+            groovy_modules = [m for m in source_modules if m["lang"] == "groovy"]
+            if source_modules:
+                # Groovy is compiled by a plugin bound to a later phase, so a bare
+                # `compile` frequently yields no target/classes; `install` runs it.
+                goal = "install" if groovy_modules else "compile"
+                # If the root pom declares modules, the reactor builds them — build
+                # at root. If it does NOT (Bigtop: profile-gated modules), building
+                # the root compiles nothing, so target the source module directly.
+                if analysis.get("maven_modules"):
+                    build_root = project_path
+                    scope = "the reactor at the root"
+                else:
+                    preferred = (groovy_modules or source_modules)[0]
+                    build_root = preferred["dir"]
+                    scope = f"module {preferred['module']} directly"
+                rec.update(build_system="maven", build_root=build_root, goal=goal)
+                rec["rationale"] = (
+                    f"Aggregator root over {len(source_modules)} source module(s) "
+                    f"({len(groovy_modules)} Groovy); build {scope} with '{goal}'."
+                )
+                return rec
+            if rec["has_gradle"]:
+                rec.update(build_system="gradle", build_root=project_path, goal="build")
+                rec["rationale"] = (
+                    "Maven root is an aggregator with no compilable modules, but a "
+                    "Gradle build is present and is likely the primary build."
+                )
+                return rec
+            # Nothing to compile anywhere and no Gradle: packaging/meta-project.
+            rec["is_aggregator_only"] = True
+            rec["rationale"] = (
+                "Root is a Maven aggregator with no module main sources and no Gradle "
+                "build — there is no standard Java compile target (packaging/meta-project)."
+            )
+            return rec
+
+        # 3) Gradle-only project.
+        if not has_pom and rec["has_gradle"]:
+            rec.update(build_system="gradle", build_root=project_path, goal="build")
+            rec["rationale"] = "Gradle build detected (no root pom)."
+            return rec
+
+        return rec
+
+    def _recommend_test_approach(self, project_path: str, build_rec: Dict[str, Any]) -> None:
+        """Recommend WHERE to run tests — they often live in different modules (and
+        a different build system) than the main build.
+
+        Bigtop: the 6 compiled classes are the Maven/Groovy bigtop-test-framework,
+        but ~49 of 57 tests are in the Gradle bigtop-data-generators modules — so
+        `mvn test` in the build module ran zero tests. This finds the test-bearing
+        modules, picks the dominant cluster, and records test_root/test_system on
+        the recommendation (falling back to the build target when tests are
+        co-located).
+        """
+        orch = self.docker_orchestrator
+        build_rec.setdefault("test_root", build_rec.get("build_root", project_path))
+        build_rec.setdefault("test_system", build_rec.get("build_system"))
+        build_rec.setdefault("test_modules", [])
+        if not orch:
+            return
+
+        find_cmd = (
+            f"find {project_path} -maxdepth 6 -type d "
+            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' \\) "
+            f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
+        )
+        found = orch.execute_command(find_cmd)
+        test_module_dirs = []
+        for line in (found.get("output") or "").splitlines():
+            line = line.strip()
+            if "/src/test/" not in line:
+                continue
+            module_dir = line.rsplit("/src/test/", 1)[0]
+            if module_dir not in test_module_dirs:
+                test_module_dirs.append(module_dir)
+        if not test_module_dirs:
+            return
+        build_rec["test_modules"] = [
+            d[len(project_path):].lstrip("/") or "." for d in test_module_dirs
+        ]
+
+        # Group test modules by their first path segment under the project root and
+        # pick the segment that owns the most test modules (where the tests cluster).
+        seg_counts: Dict[str, int] = {}
+        for module_dir in test_module_dirs:
+            rel = module_dir[len(project_path):].lstrip("/")
+            top = rel.split("/")[0] if rel else ""
+            seg_counts[top] = seg_counts.get(top, 0) + 1
+        top_seg = max(seg_counts.items(), key=lambda kv: kv[1])[0]
+        test_root = f"{project_path}/{top_seg}" if top_seg else project_path
+
+        # The test cluster's own build system can differ from the main build's.
+        if _path_exists(orch, f"{test_root}/settings.gradle") or _path_exists(orch, f"{test_root}/build.gradle"):
+            test_system = "gradle"
+        elif _path_exists(orch, f"{test_root}/pom.xml"):
+            test_system = "maven"
+        else:
+            test_system = build_rec.get("build_system")
+
+        build_rec["test_root"] = test_root
+        build_rec["test_system"] = test_system
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
@@ -1426,6 +1628,13 @@ PY"""
                 logger.error("No trunk context found to update")
                 return False
 
+            # ALWAYS record environment metrics (like static test count) unconditionally
+            # This ensures we don't lose test counts if the execution plan is rejected
+            self._record_environment_metrics(trunk_context, analysis)
+            
+            # Save the metrics immediately in case we return early
+            self.context_manager._save_trunk_context(trunk_context)
+
             # Stage-2 phase machine (spec §3.1): a phase trunk (phase_<name>
             # task ids) is owned by the engine — the analyzer's execution plan
             # is phase-internal advice surfaced in the tool output, never trunk
@@ -1433,8 +1642,6 @@ PY"""
             # phase_report entries, turning every later _persist_phase_record
             # into a silent no-op and orphaning task_N entries in the webui.
             if any(str(task.id).startswith("phase_") for task in trunk_context.todo_list):
-                self._record_environment_metrics(trunk_context, analysis)
-                self.context_manager._save_trunk_context(trunk_context)
                 logger.info(
                     "Phase trunk detected: preserved phase_* tasks (analyzer plan "
                     "stays phase-internal advice; recorded analysis metrics only)"
@@ -1509,7 +1716,7 @@ PY"""
 
                 # Remember the identified build system + test metrics so weaker
                 # future analyses cannot regress the plan (see guard above).
-                self._record_environment_metrics(trunk_context, analysis)
+                # (Metrics already recorded unconditionally at the top of method)
 
                 # 保存更新后的context
                 self.context_manager._save_trunk_context(trunk_context)
@@ -1539,6 +1746,15 @@ PY"""
         )
         if not incoming_unknown:
             trunk_context.environment_summary["build_system"] = analysis.get("build_system")
+
+        build_recommendation = analysis.get("build_recommendation")
+        if build_recommendation:
+            trunk_context.environment_summary["build_recommendation"] = build_recommendation
+            logger.info(
+                "📊 Stored build recommendation: "
+                f"{build_recommendation.get('build_system')} '{build_recommendation.get('goal')}' "
+                f"at {build_recommendation.get('build_root')}"
+            )
 
         static_test_count = analysis.get("static_test_count")
         if static_test_count is not None:
@@ -1614,6 +1830,36 @@ PY"""
         build_system = analysis.get("build_system", "Unknown")
         output += f"📂 Project Type: {project_type}\n"
         output += f"🔧 Build System: {build_system}\n"
+
+        # Recommended build target — steer the build phase away from compiling an
+        # empty aggregator root (e.g. Bigtop's packaging=pom over Groovy/Gradle).
+        rec = analysis.get("build_recommendation") or {}
+        if rec.get("rationale"):
+            if rec.get("is_aggregator_only"):
+                output += (
+                    f"🧭 Recommended Build: NONE — {rec['rationale']} "
+                    f"Consider phase(action='blocked') with this evidence rather than forcing a compile.\n"
+                )
+            else:
+                output += (
+                    f"🧭 Recommended Build: {rec.get('build_system')} "
+                    f"'{rec.get('goal')}' in {rec.get('build_root')} — {rec['rationale']}\n"
+                )
+                if rec.get("source_modules"):
+                    mods = ", ".join(
+                        f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6]
+                    )
+                    output += f"   • Source modules: {mods}\n"
+            # Tests may live in a different module / build system than the build.
+            test_root = rec.get("test_root")
+            if test_root and (
+                test_root != rec.get("build_root")
+                or rec.get("test_system") != rec.get("build_system")
+            ):
+                output += (
+                    f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "
+                    f"— the test suite lives here, not in the build module.\n"
+                )
 
         # 显示发现的文件
         existing_files = analysis.get("existing_files", [])

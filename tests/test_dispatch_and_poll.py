@@ -161,6 +161,47 @@ def test_soft_timeout_returns_full_result_when_finished_in_window():
     assert result["termination_reason"] is None
 
 
+def test_collect_detached_result_preserves_full_log_untruncated_for_storage():
+    """A finished detached build log must be read WITHOUT the orchestrator's
+    emergency truncation and handed back complete under `full_output`, so the
+    build tools can persist the real error to the output store. The inline
+    `output` stays bounded so it never floods the model context (Brooklyn: the
+    truncated cat hid the compile error and the agent looped blind)."""
+    orchestrator = build_orchestrator()
+    middle_marker = "[ERROR] COMPILATION ERROR in BrooklynModule.java"
+    big_log = (
+        "\n".join(f"[INFO] downloading dep {i}" for i in range(1500))
+        + f"\n{middle_marker}\n"
+        + "\n".join(f"[INFO] trailing line {i}" for i in range(1500))
+        + "\nBUILD FAILURE\n"
+    )
+    assert len(big_log) > 10000  # large enough to trigger inline bounding
+
+    seen = {}
+
+    def fake_execute(command, **kwargs):
+        seen["truncate_output"] = kwargs.get("truncate_output", True)
+        seen["command"] = command
+        return {"exit_code": 0, "output": big_log}
+
+    orchestrator.execute_command = fake_execute
+
+    result = orchestrator._collect_detached_result(
+        _handle(), {"finished": True, "exit_code": 1, "tail": "BUILD FAILURE"}
+    )
+
+    # The log was read with truncation explicitly disabled...
+    assert seen["truncate_output"] is False
+    assert seen["command"].startswith("cat ")
+    # ...so the complete log (including the mid-stream error) is preserved.
+    assert result["full_output"] == big_log
+    assert middle_marker in result["full_output"]
+    # The inline output is bounded for context safety.
+    assert len(result["output"]) < len(result["full_output"])
+    assert result["exit_code"] == 1
+    assert result["dispatch_status"] == "completed_detached"
+
+
 def test_soft_timeout_hands_off_still_running_command():
     orchestrator = _soft_timeout_orchestrator([RUNNING_POLL])
 

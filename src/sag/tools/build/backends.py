@@ -34,7 +34,12 @@ class MavenBackend:
             "command": self.VERBS[verb],
             "working_directory": working_directory,
         }
-        if verb == "test":
+        # --fail-at-end for every reactor-building verb (not just test): one pass
+        # builds ALL modules and reports every module's failure at once, instead
+        # of aborting at the first error and making the agent rediscover failures
+        # one module per iteration. Pairs with the coverage-based build verdict
+        # (a partial compile -> PARTIAL listing the modules that failed).
+        if verb in ("compile", "package", "test"):
             kwargs["fail_at_end"] = True
         if args:
             kwargs["extra_args"] = args
@@ -60,7 +65,10 @@ class GradleBackend:
             "tasks": self.VERBS[verb],
             "working_directory": working_directory,
         }
-        if verb == "test":
+        # Gradle's equivalent of Maven --fail-at-end is --continue (set via
+        # fail_at_end=True): build every subproject in one pass and report all
+        # failures, rather than stopping at the first.
+        if verb in ("compile", "package", "test"):
             kwargs["fail_at_end"] = True
         if args:
             kwargs["gradle_args"] = args

@@ -58,6 +58,16 @@ class TestStats(BaseModel):
         return round((self.executed / self.discovered) * 100, 1)
 
     def as_summary(self) -> str:
+        # Be explicit when nothing ran: "0 / 0 passed, 0.0% pass rate" reads like a
+        # clean result and hides that a discovered suite was never executed. Report
+        # the detected-but-not-executed case honestly so it cannot be mistaken for a
+        # pass (Bigtop: 57 tests detected, 0 executed because the build produced no
+        # classes). When tests DID run, the discovered/executed ratio is surfaced
+        # separately via execution_rate, so the summary stays unchanged there.
+        if self.executed <= 0:
+            if self.discovered and self.discovered > 0:
+                return f"0 of {self.discovered} detected tests executed (no tests ran)"
+            return "no tests executed"
         return (
             f"{self.passed} / {self.executed} passed, "
             f"{self.pass_rate:.1f}% pass rate, "

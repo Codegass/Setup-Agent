@@ -218,7 +218,7 @@ def test_submodule_breakdown_section_renders_failures_first():
     lines = tool._render_submodule_breakdown(metrics)
     body = "\n".join(lines)
     assert "Submodule Breakdown" in body
-    assert "3 modules" in body and "1 failed" in body
+    assert "1 built / 3 detected" in body and "1 failed" in body
     # failed/test-failing modules listed before all-green ones
     assert body.index("runtime") < body.index("api")
 

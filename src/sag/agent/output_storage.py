@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.utils.container_io import write_container_text
+
 
 class OutputStorageManager:
     """Manages storage of full outputs with indexing for efficient retrieval."""
@@ -128,23 +130,11 @@ class OutputStorageManager:
         except Exception as e:
             logger.error(f"Failed to save output index: {e}")
 
-    def _heredoc_delimiter(self, content: str) -> str:
-        digest = hashlib.md5(content.encode()).hexdigest()[:12]
-        delimiter = f"SAG_OUTPUT_EOF_{digest}"
-        while f"\n{delimiter}\n" in f"\n{content}\n":
-            digest = hashlib.md5(f"{content}{delimiter}".encode()).hexdigest()[:12]
-            delimiter = f"SAG_OUTPUT_EOF_{digest}"
-        return delimiter
-
     def _write_container_text(self, path: str, content: str, *, append: bool = False) -> bool:
-        delimiter = self._heredoc_delimiter(content)
-        operator = ">>" if append else ">"
-        command = f"cat {operator} {path} <<'{delimiter}'\n{content}\n{delimiter}"
-        result = self.orchestrator.execute_command(command)
-        if result.get("exit_code") == 0 or result.get("success"):
-            return True
-        logger.error(f"Failed to write container file {path}: {result.get('output')}")
-        return False
+        # Delegate to the shared writer: it keeps the fast single-command heredoc
+        # for small content and streams large content as base64 chunks, so a big
+        # payload never trips the kernel per-arg limit ("argument list too long").
+        return write_container_text(self.orchestrator, path, content, append=append)
 
     def store_output(
         self,
@@ -212,6 +202,16 @@ class OutputStorageManager:
             logger.error(f"Failed to store output to {self.storage_file}: {e}")
             return ""
 
+        # Reload-and-merge before saving: _save_index() overwrites the shared
+        # container index file from this instance's in-memory copy. Other
+        # OutputStorageManager instances (each tool builds its own) append to the
+        # SAME jsonl/index, so saving a stale cache would clobber their refs — e.g.
+        # the build tool's manager wiping the maven compile-log ref, after which the
+        # agent's output_search returns "No output found" and it cannot diagnose the
+        # build. Refresh from disk so we add to the union, never overwrite it. The
+        # jsonl is global/append-only, so the line_number below stays valid.
+        self.current_index = self._load_index()
+
         # Update index with searchable metadata
         self.current_index[ref_id] = {
             "task_id": task_id,
@@ -262,6 +262,16 @@ class OutputStorageManager:
             The full output text, or None if not found
         """
         if ref_id not in self.current_index:
+            # current_index is an in-memory cache populated at construction time.
+            # Another OutputStorageManager instance (e.g. the build tool's own
+            # manager) may have stored this output AFTER we loaded our copy, so a
+            # miss here is often just a stale cache rather than a real absence.
+            # Reload the durable container index before giving up — this is what
+            # keeps detached build logs retrievable across separate tool instances
+            # (the OutputSearchTool builds its own manager once per session).
+            self.current_index = self._load_index()
+
+        if ref_id not in self.current_index:
             logger.warning(f"Reference ID not found in index: {ref_id}")
             return None
 
@@ -309,6 +319,12 @@ class OutputStorageManager:
             List of matching output references with snippets
         """
         results = []
+
+        # Refresh from the durable index first: another manager instance may have
+        # stored outputs since we loaded our in-memory copy at construction (see
+        # retrieve_output). Without this, search/list miss build outputs written by
+        # the build tool's separate manager.
+        self.current_index = self._load_index()
 
         # First, filter by index criteria
         candidates = []
