@@ -290,8 +290,31 @@ class ToolOrchestrator:
             logger=self.logger,
         )
 
+    def _recommended_workdir(self, action: str) -> Optional[str]:
+        """Analyzer's recommended reactor root for a build/test call, or None.
+
+        Turns the build_recommendation (env summary) from advisory prose into the
+        enforced working_directory default when the model omits one — test_root for
+        the test phase, else build_root. Best-effort: any failure yields None so the
+        caller keeps the existing /workspace default.
+        """
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            rec = (getattr(trunk, "environment_summary", None) or {}).get(
+                "build_recommendation"
+            )
+        except Exception:
+            return None
+        if not rec:
+            return None
+        root = rec.get("test_root") if action == "test" else rec.get("build_root")
+        return root or None
+
     def execute(self, call: ToolCall) -> ToolExecution:
         started_at = time.perf_counter()
+        model_omitted_workdir = not str(
+            (call.raw_params or {}).get("working_directory") or ""
+        ).strip()
         if call.name not in self.tools:
             # Legacy tool names (model drift) map onto their stage-1 successors
             # before any lookup, so old names execute instead of failing.
@@ -358,6 +381,26 @@ class ToolOrchestrator:
                 },
             )
             return execution
+
+        if call.name == "build" and model_omitted_workdir:
+            action = str((call.raw_params or {}).get("action") or "").strip().lower()
+            recommended_workdir = self._recommended_workdir(action)
+            if recommended_workdir:
+                before = (call.raw_params or {}).get("working_directory")
+                call.raw_params = {
+                    **(call.raw_params or {}),
+                    "working_directory": recommended_workdir,
+                }
+                call.parameter_fixes = [
+                    *call.parameter_fixes,
+                    ParameterFix(
+                        field="working_directory",
+                        before=before,
+                        after=recommended_workdir,
+                        reason="analyzer-recommended reactor root (model omitted working_directory)",
+                        source="state_injection",
+                    ),
+                ]
 
         parameter_fixes = call.parameter_fixes
         if call.validated_params is None:
