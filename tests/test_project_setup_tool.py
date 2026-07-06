@@ -29,7 +29,7 @@ class FakeProjectSetupOrchestrator:
         self.commands = []
         self.files = {}
 
-    def execute_command(self, command, workdir=None, timeout=None):
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append((command, workdir, timeout))
 
         if command == "apt-get update":
@@ -113,7 +113,7 @@ class FakeCloneOrchestrator:
         self.checkout_success = checkout_success
         self.commands = []
 
-    def execute_command(self, command, workdir=None, timeout=None):
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append((command, workdir, timeout))
 
         if command == "which git":

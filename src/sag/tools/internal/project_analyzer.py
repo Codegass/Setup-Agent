@@ -536,12 +536,19 @@ class ProjectAnalyzerTool(BaseTool):
                 )
                 break
 
-            # 2. Check standard properties
+            # 2. Check standard properties, then the maven-compiler-plugin
+            # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
+            # Java level only as <source>/<target>/<release> inside the compiler
+            # plugin config rather than as maven.compiler.* properties; without this
+            # the analyzer detects nothing and the wrong JDK gets provisioned.
             java_version_patterns = [
                 r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
                 r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
                 r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
                 r"<java\.version>([^<]+)</java\.version>",
+                r"<release>\s*(1\.\d+|\d+)\s*</release>",  # compiler-plugin config
+                r"<target>\s*(1\.\d+|\d+)\s*</target>",
+                r"<source>\s*(1\.\d+|\d+)\s*</source>",
             ]
 
             for pattern in java_version_patterns:

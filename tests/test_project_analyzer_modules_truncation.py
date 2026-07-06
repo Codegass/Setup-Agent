@@ -69,3 +69,20 @@ def test_analyzer_reads_pom_untruncated_and_parses_modules_and_jdk():
 def test_truncated_read_would_lose_the_modules_block():
     # Guard: proves the cap drops <modules>, i.e. the untruncated read is load-bearing.
     assert "<modules>" not in _truncate(_big_pom())
+
+
+def test_java_version_from_compiler_plugin_config():
+    # Many poms (cassandra-java-driver) declare the Java level only via the compiler
+    # plugin <configuration>, not maven.compiler.* properties. Detect that form so the
+    # right JDK is chosen instead of falling back to the container default.
+    pom = (
+        "<project><build><plugins><plugin>"
+        "<artifactId>maven-compiler-plugin</artifactId>"
+        "<configuration><source>1.8</source><target>1.8</target></configuration>"
+        "</plugin></plugins></build></project>"
+    )
+    orch = RecordingOrch(pom)
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    config = {}
+    analyzer._analyze_maven_configuration("/workspace/p", config)
+    assert config.get("java_version") == "8"
