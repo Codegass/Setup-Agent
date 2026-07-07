@@ -1202,6 +1202,12 @@ PY"""
                 if analysis.get("maven_modules"):
                     build_root = project_path
                     scope = "the reactor at the root"
+                    # Reactor modules can depend on siblings' produced artifacts
+                    # (shaded jars, code-gen), not just their .class files — those
+                    # exist only after a module is built and installed, which
+                    # `compile` never does. Install so the test phase resolves them
+                    # (cassandra-java-driver: core needs the shaded-guava jar).
+                    goal = "install"
                 else:
                     preferred = (groovy_modules or source_modules)[0]
                     build_root = preferred["dir"]
