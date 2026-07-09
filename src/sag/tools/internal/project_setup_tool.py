@@ -10,7 +10,9 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
+from .build_preflight import PythonPreflight, read_build_requirements
 from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
+from .python_env import detect_installer
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
@@ -455,8 +457,8 @@ class ProjectSetupTool(BaseTool):
             output += f"• Use npm tool: npm(command='install')\n"
             output += f"• Run build: npm(command='run build')\n"
         elif project_type["type"] == "python":
-            output += f"• Use uv tool: uv(command='sync')\n"
-            output += f"• Run tests: uv(command='run pytest')\n"
+            output += f"• Install dependencies into ./.venv: build(action='deps')\n"
+            output += f"• Run tests: build(action='test')\n"
         else:
             output += f"• Analyze project structure: project(action='analyze')\n"
             output += f"• Use bash tool for custom setup commands\n"
@@ -993,11 +995,118 @@ class ProjectSetupTool(BaseTool):
                     "java_version_requested": java_version,
                 }
 
+        elif project_type["type"] == "python":
+            return self._install_python_dependencies(directory)
+
         # Add more project types as needed
         return {
             "success": False,
             "error": f"Auto-installation not implemented for project type: {project_type['type']}",
         }
+
+    def _install_python_dependencies(self, directory: str) -> Dict[str, Any]:
+        """Real python setup via the shared helpers (spec 2026-07-07):
+        PythonPreflight (manifest-driven, check-and-fix, never a hard block)
+        -> project venv -> the detect_installer ladder commands -> env
+        overlay. The ladder strings live ONLY in python_env.detect_installer;
+        this method never invents install commands."""
+        directory = directory.rstrip("/")
+        requirements = read_build_requirements(self.orchestrator)
+
+        # Pre-flight FIRST (same pattern as python_tool.setup_env): satisfied
+        # or absent requirement is a no-op; a mismatch provisions and narrates.
+        outcome = PythonPreflight(self.orchestrator).run(
+            requirements.get("python_version"),
+            constraint=requirements.get("python_constraint"),
+            source=requirements.get("python_version_source") or "requires-python",
+        )
+        if outcome.narration:
+            logger.info(outcome.narration)
+
+        venv = requirements.get("python_venv") or f"{directory}/.venv"
+
+        # Venv next. A provisioning pre-flight already created it (uv/apt).
+        if not outcome.provisioned and not self._python_venv_exists(venv):
+            made = self.orchestrator.execute_command(
+                f"python3 -m venv {venv}", workdir=directory
+            )
+            if not made.get("success"):
+                return {
+                    "success": False,
+                    "error": f"could not create venv at {venv}: {made.get('output', '')}",
+                    "exit_code": made.get("exit_code"),
+                    "venv": venv,
+                }
+
+        # The project's OWN declared installer (shared faithfulness ladder).
+        listing = self.orchestrator.execute_command(f"ls -A1 {directory}", workdir=directory)
+        files_present = {
+            line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
+        }
+        ladder = detect_installer(files_present)
+        commands = [
+            c.replace("{venv}", venv).replace("{dir}", directory)
+            for c in ladder["commands"]
+        ]
+
+        output_lines = [outcome.narration] if outcome.narration else []
+        for cmd in commands:
+            result = self.orchestrator.execute_command(cmd, workdir=directory)
+            output_lines.append(f"$ {cmd}")
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "error": result.get("output", ""),
+                    "exit_code": result.get("exit_code"),
+                    "installer": ladder["installer"],
+                    "command": cmd,
+                    "venv": venv,
+                }
+
+        python_version = requirements.get("python_version") or outcome.active_version
+        self._register_python_runtime_overlay(venv, python_version)
+
+        if commands:
+            installed = (
+                f"Python dependencies via {ladder['installer']} "
+                f"(source: {ladder['source']}), venv at {venv}"
+            )
+        else:
+            # Honest empty ladder: nothing declared means nothing installed.
+            installed = (
+                f"Python venv at {venv}; no declared install commands found — "
+                "nothing installed"
+            )
+        return {
+            "success": True,
+            "installed": installed,
+            "installer": ladder["installer"],
+            "install_commands": commands,
+            "venv": venv,
+            "python_version": python_version,
+            "output": "\n".join(output_lines),
+        }
+
+    def _python_venv_exists(self, venv: str) -> bool:
+        probe = self.orchestrator.execute_command(
+            f"test -x {venv}/bin/python && echo EXISTS || echo MISSING"
+        )
+        return "EXISTS" in (probe.get("output") or "")
+
+    def _register_python_runtime_overlay(self, venv: str, version: Optional[str]) -> None:
+        """Register the project venv interpreter (mirrors the Java overlay)."""
+        try:
+            EnvOverlayStore(self.orchestrator).register(
+                "python",
+                f"{venv}/bin/python",
+                version=version,
+                source="project_setup_install",
+                env={"VIRTUAL_ENV": venv},
+                path_prepend=[f"{venv}/bin"],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register Python env overlay: {exc}")
 
     def _register_java_runtime_overlay(self, java_home: str, java_version: Optional[str]) -> None:
         """Register the Java runtime selected by setup without changing install semantics."""
@@ -1604,9 +1713,9 @@ class ProjectSetupTool(BaseTool):
             output += f"2. Install packages: npm(command='install')\n"
             output += f"3. Run build: npm(command='run build')\n"
         elif project_type["type"] == "python":
-            output += f"1. Install Python and uv: project_setup(action='install_dependencies')\n"
-            output += f"2. Install packages: uv(command='sync')\n"
-            output += f"3. Run tests: uv(command='run pytest')\n"
+            output += f"1. Set up the Python environment: project_setup(action='install_dependencies')\n"
+            output += f"2. Install packages into ./.venv: build(action='deps')\n"
+            output += f"3. Run tests: build(action='test')\n"
         else:
             output += f"1. Examine build files manually\n"
             output += f"2. Use bash tool for custom setup commands\n"

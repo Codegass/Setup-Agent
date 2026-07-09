@@ -327,3 +327,59 @@ def test_unknown_operation_is_rejected_with_the_valid_vocabulary():
     assert result.success is False
     assert result.error_code == "UNKNOWN_PYTHON_OPERATION"
     assert any("setup_env" in s for s in result.suggestions)
+
+
+# ---------------------------------------------------------------------------
+# setup tool python branch (Task 7): the SAME shared installer ladder —
+# PythonPreflight (manifest) -> venv -> detect_installer commands -> overlay.
+# The ladder strings live ONLY in python_env.detect_installer.
+# ---------------------------------------------------------------------------
+
+
+def test_setup_tool_python_branch_issues_the_shared_ladder_commands():
+    from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
+    from sag.tools.internal.project_setup_tool import ProjectSetupTool
+    from sag.tools.internal.python_env import detect_installer
+
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("ls -A1 /workspace/proj", ok("poetry.lock\npyproject.toml\nsrc"))],
+    )
+    result = ProjectSetupTool(orch)._install_dependencies_for_project_type(
+        {
+            "type": "python",
+            "build_files": ["pyproject.toml"],
+            "language": "python",
+            "dependencies": [],
+            "suggested_tools": ["bash"],
+        },
+        "/workspace/proj",
+    )
+    assert result["success"] is True
+
+    # The commands are the SAME ladder detect_installer declares for a
+    # poetry-locked project (placeholders filled) — no duplicated strings.
+    expected = [
+        c.replace("{venv}", "/workspace/proj/.venv").replace("{dir}", "/workspace/proj")
+        for c in detect_installer({"poetry.lock", "pyproject.toml"})["commands"]
+    ]
+    assert "poetry install" in expected  # the project's OWN tool is attempted
+    positions = [next(i for i, c in enumerate(orch.commands) if c == e) for e in expected]
+
+    # Order per the spec: manifest pre-flight, then venv, then the installer.
+    preflight = next(i for i, c in enumerate(orch.commands) if "python3 --version" in c)
+    venv_create = next(
+        i for i, c in enumerate(orch.commands) if "-m venv /workspace/proj/.venv" in c
+    )
+    assert preflight < venv_create < positions[0]
+
+    # The venv interpreter lands in the shared env overlay.
+    assert any(DEFAULT_OVERLAY_JSON in c for c in orch.commands)
+
+    # A python project never touches the maven/JDK machinery. (Overlay writes
+    # are base64 payloads — excluded so alphabet coincidences can't match.)
+    assert not any(
+        ("mvn" in c or "maven" in c or "jdk" in c or "apt-get" in c)
+        for c in orch.commands
+        if DEFAULT_OVERLAY_JSON not in c
+    )
