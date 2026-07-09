@@ -798,6 +798,18 @@ class PhysicalValidator:
                     d.strip() for d in dirs_result.get("output", "").split("\n") if d.strip()
                 ]
 
+            # Python: python_tool writes pytest --junitxml reports OUTSIDE the
+            # project dir (PYTEST_REPORT_DIR). The XML inside is standard JUnit
+            # XML, so this parser consumes it UNCHANGED (spec 2026-07-07
+            # Component 4) — only the discovery gains the extra directory.
+            from sag.tools.internal.python_tool import PYTEST_REPORT_DIR
+
+            pytest_probe = self.docker_orchestrator.execute_command(
+                f"test -d {PYTEST_REPORT_DIR} && echo EXISTS"
+            )
+            if "EXISTS" in (pytest_probe.get("output") or ""):
+                report_dirs.append(PYTEST_REPORT_DIR)
+
             # Step 2: For each directory, list XML files in small batches to avoid truncation
             report_files: List[str] = []
             for report_dir in report_dirs:
@@ -1099,6 +1111,7 @@ def is_report_file(path):
         "/target/surefire-reports/" in s
         or "/target/failsafe-reports/" in s
         or "/build/test-results/" in s
+        or "/.setup_agent/pytest-reports/" in s
     )
 
 def normalize_method_name(method_name):
@@ -1145,7 +1158,12 @@ def int_attr(node, name):
         return 0
 
 root = Path(project_dir)
-report_files = sorted(str(path) for path in root.rglob("*.xml") if is_report_file(path))
+# pytest --junitxml reports live OUTSIDE the project dir; scan that root too.
+pytest_reports = Path("/workspace/.setup_agent/pytest-reports")
+scan_roots = [root] + ([pytest_reports] if pytest_reports.is_dir() else [])
+report_files = sorted(
+    {{str(path) for scan_root in scan_roots for path in scan_root.rglob("*.xml") if is_report_file(path)}}
+)
 report_dirs = sorted({{str(Path(path).parent) for path in report_files}})
 
 groovy_classes = set()
@@ -1918,6 +1936,7 @@ PY"""
             logger.info("❌ No build artifacts found")
 
         # Check 2: Build system fingerprints
+        python_build = None
         if build_system == "maven":
             fingerprints = self._validate_maven_fingerprints(project_dir)
             evidence["has_build_fingerprints"] = fingerprints["valid"]
@@ -1938,6 +1957,27 @@ PY"""
                 logger.info(f"✅ Gradle build cache found: {cache['details']}")
                 if cache["subprojects"]:
                     logger.info(f"   Multi-project build with subprojects: {cache['subprojects']}")
+        elif build_system == "python":
+            # Python evidence ladder (spec 2026-07-07 Component 4): venv ->
+            # pip check -> package imports -> compileall coverage -> declared
+            # C-extension .so artifacts. The ladder result IS the fingerprint
+            # evidence for a python build (there are no .class/JAR analogs).
+            python_build = self._verify_python_build(project_dir)
+            evidence["has_build_fingerprints"] = python_build["venv_exists"]
+            evidence["fingerprint_details"] = {
+                key: python_build[key]
+                for key in (
+                    "venv_exists",
+                    "pip_check_clean",
+                    "imports_ok",
+                    "import_failures",
+                    "compileall_coverage",
+                    "ext_modules_ok",
+                )
+            }
+            logger.info(
+                f"Python evidence ladder: {evidence['fingerprint_details']}"
+            )
 
         # Decision logic for BUILD ONLY (no test considerations).
         #
@@ -1990,7 +2030,16 @@ PY"""
             and not evidence["has_artifacts"]
         )
 
-        if jvm_no_compiled_evidence:
+        if build_system == "python" and python_build is not None:
+            # Tri-state mapping (spec 2026-07-07 Component 4): no venv or a
+            # failed import -> BLOCKED; imports ok but pip-check breakage /
+            # sub-threshold compileall coverage / missing declared C-extension
+            # -> PARTIAL with the failed rung named; every rung green -> SUCCESS.
+            success = python_build["success"]
+            complete = python_build["complete"]
+            reason = python_build["reason"]
+
+        elif jvm_no_compiled_evidence:
             success, complete = False, False
             reason = (
                 f"No compiled .class files found for {build_system} build — nothing "
@@ -2090,7 +2139,7 @@ PY"""
             evidence_status = "success"
             conflicts = []
 
-        conflicts.extend(self._collect_jdk_conflicts())
+        conflicts.extend(self._collect_env_conflicts())
 
         result = {
             "success": success,
@@ -2106,29 +2155,200 @@ PY"""
         logger.info(f"Build validation complete: {evidence_status.upper()} - {reason}")
         return result
 
-    def _collect_jdk_conflicts(self) -> List[str]:
-        """jdk_mismatch when the manifest's required JDK != the active one.
+    def _collect_env_conflicts(self) -> List[str]:
+        """jdk_mismatch / python_version_mismatch when the manifest's required
+        toolchain differs from the active one at validation time.
 
-        Report-only honesty signal (spec §4): provisioning failures degrade
-        here instead of blocking the run. Empty when no requirement is known.
+        Report-only honesty signals (spec §4 + spec 2026-07-07 Component 4):
+        provisioning failures degrade here instead of blocking the run. Empty
+        when no requirement is known. python_version_mismatch is the exact
+        mirror of jdk_mismatch, with one PythonPreflight-aligned tolerance: an
+        active interpreter that satisfies the raw declared constraint is NOT a
+        mismatch even when it differs from the resolved-newest version.
         """
+        conflicts: List[str] = []
         try:
             from sag.tools.internal.build_preflight import (
                 active_java_major,
+                active_python_version,
                 read_build_requirements,
             )
+            from sag.tools.internal.python_env import resolve_python_version
 
-            required = (read_build_requirements(self.docker_orchestrator) or {}).get(
-                "java_version"
-            )
-            if not required:
-                return []
-            active = active_java_major(self.docker_orchestrator)
-            if active and active != str(required):
-                return ["jdk_mismatch"]
+            manifest = read_build_requirements(self.docker_orchestrator) or {}
+
+            required_jdk = manifest.get("java_version")
+            if required_jdk:
+                active = active_java_major(self.docker_orchestrator)
+                if active and active != str(required_jdk):
+                    conflicts.append("jdk_mismatch")
+
+            required_python = manifest.get("python_version")
+            if required_python:
+                active_py = active_python_version(self.docker_orchestrator)
+                constraint = manifest.get("python_constraint")
+                constraint_satisfied = bool(
+                    active_py
+                    and constraint
+                    and resolve_python_version(constraint, [active_py]) == active_py
+                )
+                if (
+                    active_py
+                    and active_py != str(required_python)
+                    and not constraint_satisfied
+                ):
+                    conflicts.append("python_version_mismatch")
         except Exception as exc:
-            logger.debug(f"jdk conflict check skipped: {exc}")
-        return []
+            logger.debug(f"env conflict check skipped: {exc}")
+        return conflicts
+
+    def _verify_python_build(self, project_dir: str) -> Dict[str, any]:
+        """Python evidence ladder (spec 2026-07-07 Component 4).
+
+        Rungs, in order: venv exists -> `pip check` clean -> every manifest
+        package imports -> `compileall` source-weighted coverage (tests/docs/
+        examples excluded, the analog of the Java class-coverage ratio) ->
+        declared C-extensions have built `.so` artifacts. A missing venv or a
+        failed import is BLOCKED (success=False); pip-check breakage, coverage
+        below build_coverage_threshold, or a missing declared extension is
+        PARTIAL (success=True, complete=False) with the failed rung named;
+        every rung green is SUCCESS. Unknown rungs (no declared packages, no
+        countable sources) stay None — never invented evidence.
+        """
+        from sag.tools.internal.build_preflight import read_build_requirements
+
+        manifest = read_build_requirements(self.docker_orchestrator) or {}
+        venv = manifest.get("python_venv") or f"{project_dir.rstrip('/')}/.venv"
+        packages = manifest.get("python_packages") or []
+        result: Dict[str, any] = {
+            "venv_exists": False,
+            "pip_check_clean": False,
+            "imports_ok": None,
+            "import_failures": [],
+            "compileall_coverage": None,
+            "ext_modules_ok": None,
+            "success": False,
+            "complete": False,
+            "reason": "",
+        }
+
+        venv_probe = self._execute_command_with_logging(
+            f"test -d {venv}", "checking python venv"
+        )
+        result["venv_exists"] = venv_probe["success"]
+        if not result["venv_exists"]:
+            result["reason"] = (
+                f"No venv at {venv} — the Python environment was never set up"
+            )
+            return result
+
+        pip_check = self._execute_command_with_logging(
+            f"{venv}/bin/pip check", "pip dependency check"
+        )
+        result["pip_check_clean"] = pip_check["success"]
+
+        if packages:
+            failures = []
+            for package in packages:
+                import_probe = self._execute_command_with_logging(
+                    f'{venv}/bin/python -c "import {package}"', f"import {package}"
+                )
+                if not import_probe["success"]:
+                    failures.append(package)
+            result["imports_ok"] = not failures
+            result["import_failures"] = failures
+            if failures:
+                result["reason"] = (
+                    f"Top-level package import failed: {', '.join(failures)} — "
+                    f"the installed environment is not usable"
+                )
+                return result
+
+        package_dirs = self._python_package_dirs(project_dir, packages)
+        target = " ".join(package_dirs)
+        self._execute_command_with_logging(
+            f"{venv}/bin/python -m compileall -q {target}", "compileall"
+        )
+        # Source-weighted coverage: .pyc under __pycache__ / .py sources, with
+        # tests/docs/examples and dot-dirs (.venv) excluded on BOTH counts.
+        py_count = self._int_from_count(
+            f"find {target} -name '*.py' -type f -not -path '*/.*' "
+            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
+            f"2>/dev/null | wc -l"
+        )
+        pyc_count = self._int_from_count(
+            f"find {target} -path '*/__pycache__/*.pyc' -type f -not -path '*/.*' "
+            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
+            f"2>/dev/null | wc -l"
+        )
+        if py_count and pyc_count is not None:
+            result["compileall_coverage"] = min(pyc_count / py_count, 1.0)
+
+        if manifest.get("has_c_extensions"):
+            so_probe = self._execute_command_with_logging(
+                f"find {project_dir} {venv} -name '*.so' -type f 2>/dev/null | head -1",
+                "C-extension artifacts",
+            )
+            result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
+
+        partial_reasons = []
+        if not result["pip_check_clean"]:
+            partial_reasons.append("pip check reported dependency breakage")
+        coverage = result["compileall_coverage"]
+        threshold = self.build_coverage_threshold
+        if coverage is not None and coverage < threshold:
+            partial_reasons.append(
+                f"compileall coverage {coverage * 100:.0f}% below the "
+                f"{threshold * 100:.0f}% threshold"
+            )
+        if result["ext_modules_ok"] is False:
+            partial_reasons.append(
+                "declared C-extensions have no built .so artifact"
+            )
+
+        result["success"] = True
+        if partial_reasons:
+            result["reason"] = "; ".join(partial_reasons)
+        else:
+            result["complete"] = True
+            coverage_note = (
+                f"compileall coverage {coverage * 100:.0f}%"
+                if coverage is not None
+                else "compileall coverage not measurable"
+            )
+            imported = (
+                f"{len(packages)} package(s) import"
+                if packages
+                else "no declared packages to import"
+            )
+            result["reason"] = (
+                f"Python build verified: venv present, pip check clean, "
+                f"{imported}, {coverage_note}"
+            )
+        return result
+
+    def _python_package_dirs(self, project_dir: str, packages: List[str]) -> List[str]:
+        """Package source dirs, src-layout probed before flat layout; the
+        project dir is the honest last resort when nothing is declared."""
+        root = project_dir.rstrip("/")
+        dirs: List[str] = []
+        for package in packages:
+            for candidate in (f"{root}/src/{package}", f"{root}/{package}"):
+                probe = self._execute_command_with_logging(
+                    f"test -d {candidate}", f"locating package {package}"
+                )
+                if probe["success"]:
+                    dirs.append(candidate)
+                    break
+        return dirs or [root]
+
+    def _int_from_count(self, command: str) -> Optional[int]:
+        """Last line of a `... | wc -l` pipeline as an int, or None."""
+        result = self._execute_command_with_logging(command, "counting files")
+        try:
+            return int((result.get("output") or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
 
     def _build_status_evidence_refs(
         self, project_dir: str, artifacts_result: Dict[str, any]
@@ -2367,7 +2587,7 @@ PY"""
                     "You MUST run project_analyzer(action='analyze') immediately to count static tests "
                     "and generate an intelligent execution plan. This is REQUIRED for accurate reporting."
                 )
-                return result
+                return self._apply_python_collected_fallback(result, project_name)
 
             trunk_file = trunk_file_result["output"].strip()
             result["trunk_context_found"] = True
@@ -2417,6 +2637,45 @@ PY"""
                 "for better reporting. This helps track test coverage and execution rates."
             )
 
+        return self._apply_python_collected_fallback(result, project_name)
+
+    def _apply_python_collected_fallback(
+        self, result: Dict[str, any], project_name: Optional[str]
+    ) -> Dict[str, any]:
+        """Fallback static_test_count from python_tool's collect-only denominator.
+
+        When the env summary carries no static_test_count and the build system
+        is python, read COLLECTED_JSON (written by python_tool's `pytest
+        --collect-only` pass). This feeds the existing tests_not_fully_executed
+        gate UNCHANGED (spec 2026-07-07 Component 4) — never overrides a count
+        the analyzer already recorded.
+        """
+        if result.get("has_static_test_count"):
+            return result
+        try:
+            from sag.tools.internal.python_tool import COLLECTED_JSON
+
+            project_dir = (
+                f"{self.project_path}/{project_name}" if project_name else self.project_path
+            )
+            if self._detect_build_system(project_dir) != "python":
+                return result
+            read = self._execute_command_with_logging(
+                f"cat {COLLECTED_JSON}", "reading pytest collect-only denominator"
+            )
+            if not read["success"] or not (read.get("output") or "").strip():
+                return result
+            collected = json.loads(read["output"]).get("collected")
+            if isinstance(collected, int):
+                result["has_static_test_count"] = True
+                result["static_test_count"] = collected
+                result["static_test_count_source"] = "pytest_collect_only"
+                logger.info(
+                    f"✅ static_test_count fallback: {collected} tests from "
+                    f"pytest --collect-only (COLLECTED_JSON)"
+                )
+        except Exception as exc:
+            logger.debug(f"pytest collected fallback skipped: {exc}")
         return result
 
     def parse_test_reports_with_catalog(

@@ -30,17 +30,19 @@ class ConflictOrch:
 
 
 def test_collect_jdk_conflict_on_mismatch():
+    # _collect_env_conflicts is the renamed _collect_jdk_conflicts (it now
+    # also covers python); the jdk_mismatch contract is unchanged.
     validator = PhysicalValidator.__new__(PhysicalValidator)
     validator.docker_orchestrator = ConflictOrch(java="11", manifest={"java_version": "17"})
-    assert validator._collect_jdk_conflicts() == ["jdk_mismatch"]
+    assert validator._collect_env_conflicts() == ["jdk_mismatch"]
 
 
 def test_no_conflict_when_matching_or_unknown():
     validator = PhysicalValidator.__new__(PhysicalValidator)
     validator.docker_orchestrator = ConflictOrch(java="17", manifest={"java_version": "17"})
-    assert validator._collect_jdk_conflicts() == []
+    assert validator._collect_env_conflicts() == []
     validator.docker_orchestrator = ConflictOrch(java="11", manifest={})  # no requirement
-    assert validator._collect_jdk_conflicts() == []
+    assert validator._collect_env_conflicts() == []
 
 
 def _metrics(tested_pairs):
