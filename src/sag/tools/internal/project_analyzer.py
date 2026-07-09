@@ -10,6 +10,30 @@ from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
 
 from ..base import BaseTool, ToolResult
 
+# Enforcer version accepts range syntax ([1.8,), [11,17)); capture the lower
+# bound including a legacy "1.x" form (the old \d+ captured "1" from "1.8").
+ENFORCER_JAVA_PATTERN = (
+    r"<requireJavaVersion>.*?<version>\s*\[?\s*(\d+(?:\.\d+)?)"
+)
+
+
+def _normalize_java_version(raw) -> Optional[str]:
+    """Normalize a detected Java version to a plain major string, or None.
+
+    Rejects unresolved property indirection (``${...}``) and non-numeric
+    junk; maps legacy ``1.x`` to ``x`` (1.8 -> 8).
+    """
+    if not raw:
+        return None
+    value = str(raw).strip()
+    if not value or "${" in value:
+        return None
+    if value.startswith("1.") and value[2:].isdigit():
+        return value[2:]
+    if value.isdigit():
+        return value
+    return None
+
 
 def _path_exists(orch, path: str) -> bool:
     result = orch.execute_command(f"test -e {path} && echo yes || echo no")
@@ -523,18 +547,19 @@ class ProjectAnalyzerTool(BaseTool):
                 break  # Already found
 
             # 1. First check Maven Enforcer plugin for RequireJavaVersion
-            enforcer_pattern = (
-                r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            enforcer_match = re.search(
+                ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE
             )
-            enforcer_match = re.search(enforcer_pattern, pom_content, re.DOTALL | re.IGNORECASE)
             if enforcer_match:
-                java_version = enforcer_match.group(1).strip()
-                java_version_source = "maven-enforcer"
-                java_version_enforced = True
-                logger.info(
-                    f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                )
-                break
+                normalized = _normalize_java_version(enforcer_match.group(1))
+                if normalized:
+                    java_version = normalized
+                    java_version_source = "maven-enforcer"
+                    java_version_enforced = True
+                    logger.info(
+                        f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
+                    )
+                    break
 
             # 2. Check standard properties, then the maven-compiler-plugin
             # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
@@ -554,7 +579,12 @@ class ProjectAnalyzerTool(BaseTool):
             for pattern in java_version_patterns:
                 match = re.search(pattern, pom_content)
                 if match:
-                    java_version = match.group(1).strip()
+                    normalized = _normalize_java_version(match.group(1))
+                    if not normalized:
+                        # Rejected capture (e.g. ${...} indirection): fall
+                        # through to the next pattern instead of accepting it.
+                        continue
+                    java_version = normalized
                     java_version_source = "maven-compiler"
                     logger.info(
                         f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
@@ -562,9 +592,6 @@ class ProjectAnalyzerTool(BaseTool):
                     break
 
         if java_version:
-            # Normalize version (e.g., "1.8" -> "8")
-            if java_version.startswith("1."):
-                java_version = java_version[2:]
             config["java_version"] = java_version
             config["java_version_source"] = java_version_source
             config["java_version_enforced"] = java_version_enforced
@@ -644,10 +671,10 @@ class ProjectAnalyzerTool(BaseTool):
         for pattern in java_version_patterns:
             match = re.search(pattern, gradle_content, re.IGNORECASE | re.MULTILINE)
             if match:
-                version = match.group(1).strip()
-                # 处理版本号格式（比如 1.8 -> 8）
-                if version.startswith("1."):
-                    version = version[2:]
+                version = _normalize_java_version(match.group(1))
+                if not version:
+                    # Rejected capture: fall through to the next pattern.
+                    continue
                 config["java_version"] = version
                 logger.info(f"Found Java version: {version}")
                 break

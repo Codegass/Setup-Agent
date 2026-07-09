@@ -10,6 +10,7 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
+from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
@@ -723,18 +724,19 @@ class ProjectSetupTool(BaseTool):
                 break  # Already found
 
             # 1. First check Maven Enforcer plugin for RequireJavaVersion (highest priority)
-            enforcer_pattern = (
-                r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            enforcer_match = re.search(
+                ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE
             )
-            enforcer_match = re.search(enforcer_pattern, pom_content, re.DOTALL | re.IGNORECASE)
             if enforcer_match:
-                java_version = enforcer_match.group(1).strip()
-                java_version_source = "maven-enforcer"
-                java_version_enforced = True
-                logger.info(
-                    f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                )
-                break
+                normalized = _normalize_java_version(enforcer_match.group(1))
+                if normalized:
+                    java_version = normalized
+                    java_version_source = "maven-enforcer"
+                    java_version_enforced = True
+                    logger.info(
+                        f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
+                    )
+                    break
 
             # 2. Check standard properties, then the maven-compiler-plugin
             # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
@@ -754,7 +756,12 @@ class ProjectSetupTool(BaseTool):
             for pattern in java_version_patterns:
                 match = re.search(pattern, pom_content)
                 if match:
-                    java_version = match.group(1).strip()
+                    normalized = _normalize_java_version(match.group(1))
+                    if not normalized:
+                        # Rejected capture (e.g. ${...} indirection): fall
+                        # through to the next pattern instead of accepting it.
+                        continue
+                    java_version = normalized
                     java_version_source = "maven-compiler"
                     logger.info(
                         f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
@@ -762,9 +769,6 @@ class ProjectSetupTool(BaseTool):
                     break
 
         if java_version:
-            # Normalize version (e.g., "1.8" -> "8")
-            if java_version.startswith("1."):
-                java_version = java_version[2:]
             logger.info(
                 f"Detected Java version: {java_version} (source: {java_version_source}, enforced: {java_version_enforced})"
             )
@@ -809,10 +813,10 @@ class ProjectSetupTool(BaseTool):
         for pattern in java_version_patterns:
             match = re.search(pattern, gradle_content, re.IGNORECASE | re.MULTILINE)
             if match:
-                version = match.group(1).strip()
-                # Normalize version format (1.8 -> 8)
-                if version.startswith("1."):
-                    version = version[2:]
+                version = _normalize_java_version(match.group(1))
+                if not version:
+                    # Rejected capture: fall through to the next pattern.
+                    continue
                 logger.info(f"Found Java version from Gradle: {version}")
                 return version
 
