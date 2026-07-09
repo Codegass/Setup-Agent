@@ -674,8 +674,14 @@ class ProjectSetupTool(BaseTool):
 
     def _detect_maven_java_version(self, project_path: str) -> Optional[str]:
         """Detect Java version from Maven pom.xml files."""
-        # Read main pom.xml
-        main_pom_result = self.orchestrator.execute_command(f"cat {project_path}/pom.xml")
+        # Read main pom.xml UNTRUNCATED — parsed internally (enforcer requireJavaVersion,
+        # maven.compiler.*, compiler-plugin <source>/<target>) and never shown to the
+        # model. XML-aware truncation drops enforcer/plugin-config blocks on large poms,
+        # so the required JDK could be missed (cassandra-java-driver: <source>1.8 at
+        # line 620 -> defaulted to 11 -> core won't compile).
+        main_pom_result = self.orchestrator.execute_command(
+            f"cat {project_path}/pom.xml", truncate_output=False
+        )
         if main_pom_result["exit_code"] != 0 or not main_pom_result.get("output"):
             logger.warning(f"Could not read main pom.xml at {project_path}")
             return None
@@ -730,12 +736,19 @@ class ProjectSetupTool(BaseTool):
                 )
                 break
 
-            # 2. Check standard properties
+            # 2. Check standard properties, then the maven-compiler-plugin
+            # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
+            # Java level only as <source>/<target>/<release> inside the compiler
+            # plugin config rather than as maven.compiler.* properties; without this
+            # the wrong JDK gets provisioned (cassandra core won't compile on 11).
             java_version_patterns = [
                 r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
                 r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
                 r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
                 r"<java\.version>([^<]+)</java\.version>",
+                r"<release>\s*(1\.\d+|\d+)\s*</release>",  # compiler-plugin config
+                r"<target>\s*(1\.\d+|\d+)\s*</target>",
+                r"<source>\s*(1\.\d+|\d+)\s*</source>",
             ]
 
             for pattern in java_version_patterns:

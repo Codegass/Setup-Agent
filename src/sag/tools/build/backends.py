@@ -23,6 +23,11 @@ class MavenBackend:
         "compile": "compile",
         "test": "test",
         "package": "package",
+        # A reactor whose modules depend on siblings' produced artifacts (shaded
+        # jars, code-gen, packaged deps) needs those installed to the local repo so
+        # later phases resolve them; `compile`/`package` alone don't (e.g.
+        # cassandra-java-driver core needs the shaded-guava jar).
+        "install": "install",
     }
 
     def __init__(self, maven_tool):
@@ -39,7 +44,7 @@ class MavenBackend:
         # of aborting at the first error and making the agent rediscover failures
         # one module per iteration. Pairs with the coverage-based build verdict
         # (a partial compile -> PARTIAL listing the modules that failed).
-        if verb in ("compile", "package", "test"):
+        if verb in ("compile", "package", "test", "install"):
             kwargs["fail_at_end"] = True
         if args:
             kwargs["extra_args"] = args
@@ -54,6 +59,10 @@ class GradleBackend:
         "compile": "compileJava",
         "test": "test",
         "package": "assemble",
+        # Gradle resolves sibling modules via project() deps in-build, so there is
+        # no local-repo install step to mirror Maven's; `assemble` builds every
+        # subproject's artifacts, which is the closest equivalent.
+        "install": "assemble",
     }
 
     def __init__(self, gradle_tool):
@@ -68,7 +77,7 @@ class GradleBackend:
         # Gradle's equivalent of Maven --fail-at-end is --continue (set via
         # fail_at_end=True): build every subproject in one pass and report all
         # failures, rather than stopping at the first.
-        if verb in ("compile", "package", "test"):
+        if verb in ("compile", "package", "test", "install"):
             kwargs["fail_at_end"] = True
         if args:
             kwargs["gradle_args"] = args

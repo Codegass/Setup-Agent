@@ -45,13 +45,13 @@ class BuildTool(BaseTool):
         timeout: Optional[int] = None,
     ) -> ToolResult:
         verb = (action or "").strip().lower()
-        if verb not in ("deps", "compile", "test", "package"):
+        if verb not in ("deps", "compile", "test", "package", "install"):
             return ToolResult(
                 success=False,
                 output=f"Unknown build action: {action!r}",
                 verdict="failed",
                 error="invalid action",
-                suggestions=["Use action= deps | compile | test | package"],
+                suggestions=["Use action= deps | compile | test | package | install"],
             )
 
         system, checked = self._detect_system(working_directory)
@@ -151,8 +151,10 @@ class BuildTool(BaseTool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["deps", "compile", "test", "package"],
-                    "description": "What to do; the build system is auto-selected",
+                    "enum": ["deps", "compile", "test", "package", "install"],
+                    "description": "What to do; the build system is auto-selected. "
+                    "Use install for a multi-module reactor whose modules depend on "
+                    "siblings' built artifacts (shaded jars, code-gen).",
                 },
                 "args": {
                     "type": "string",

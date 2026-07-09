@@ -465,8 +465,14 @@ class ProjectAnalyzerTool(BaseTool):
 
     def _analyze_maven_configuration(self, project_path: str, config: Dict[str, Any]):
         """分析Maven配置（pom.xml）- 包括多模块项目和父POM"""
-        # First, read the main pom.xml
-        result = self.docker_orchestrator.execute_command(f"cat {project_path}/pom.xml")
+        # First, read the main pom.xml. Read it UNTRUNCATED: the default XML-aware
+        # truncation protects the model's context window, but this content is parsed
+        # internally by regex (java version, <modules>, <packaging>, dependencies) and
+        # never reaches the model. Truncation drops <modules>/enforcer blocks on large
+        # poms (httpcomponents-client: <modules> at line 260), which mis-scoped builds.
+        result = self.docker_orchestrator.execute_command(
+            f"cat {project_path}/pom.xml", truncate_output=False
+        )
         if not result.get("success"):
             return
 
@@ -530,12 +536,19 @@ class ProjectAnalyzerTool(BaseTool):
                 )
                 break
 
-            # 2. Check standard properties
+            # 2. Check standard properties, then the maven-compiler-plugin
+            # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
+            # Java level only as <source>/<target>/<release> inside the compiler
+            # plugin config rather than as maven.compiler.* properties; without this
+            # the analyzer detects nothing and the wrong JDK gets provisioned.
             java_version_patterns = [
                 r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
                 r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
                 r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
                 r"<java\.version>([^<]+)</java\.version>",
+                r"<release>\s*(1\.\d+|\d+)\s*</release>",  # compiler-plugin config
+                r"<target>\s*(1\.\d+|\d+)\s*</target>",
+                r"<source>\s*(1\.\d+|\d+)\s*</source>",
             ]
 
             for pattern in java_version_patterns:
@@ -558,11 +571,11 @@ class ProjectAnalyzerTool(BaseTool):
         else:
             logger.warning(f"No Java version found in Maven configuration for {project_path}")
 
-        # Check for multi-module project
+        # Check for multi-module project. The pom is read untruncated above, so the
+        # <modules> block is intact even on large poms.
         modules_match = re.search(r"<modules>(.*?)</modules>", main_pom_content, re.DOTALL)
         if modules_match:
-            module_content = modules_match.group(1)
-            modules = re.findall(r"<module>([^<]+)</module>", module_content)
+            modules = re.findall(r"<module>([^<]+)</module>", modules_match.group(1))
             config["maven_modules"] = modules
             config["is_multi_module"] = True
             logger.info(f"Found multi-module Maven project with {len(modules)} modules: {modules}")
@@ -1189,6 +1202,12 @@ PY"""
                 if analysis.get("maven_modules"):
                     build_root = project_path
                     scope = "the reactor at the root"
+                    # Reactor modules can depend on siblings' produced artifacts
+                    # (shaded jars, code-gen), not just their .class files — those
+                    # exist only after a module is built and installed, which
+                    # `compile` never does. Install so the test phase resolves them
+                    # (cassandra-java-driver: core needs the shaded-guava jar).
+                    goal = "install"
                 else:
                     preferred = (groovy_modules or source_modules)[0]
                     build_root = preferred["dir"]
@@ -1280,6 +1299,19 @@ PY"""
 
         build_rec["test_root"] = test_root
         build_rec["test_system"] = test_system
+
+        # A Maven reactor built at its root must also be TESTED at its root so
+        # `mvn test` runs across every module. The dominant-cluster heuristic above
+        # exists for tests that live in a foreign subtree / build system (Bigtop's
+        # Gradle tests beside a Maven build); when the build is already the reactor
+        # root and the tests are the same system, a single leaf segment is the wrong
+        # target (httpcomponents-client: 5 sibling modules tie at 1 test dir each,
+        # so the heuristic picked an arbitrary leaf and ran 16 of 1856 tests).
+        if (
+            build_rec.get("build_root") == project_path
+            and test_system == build_rec.get("build_system")
+        ):
+            build_rec["test_root"] = project_path
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
