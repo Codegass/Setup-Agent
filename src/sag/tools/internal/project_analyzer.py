@@ -488,8 +488,102 @@ class ProjectAnalyzerTool(BaseTool):
             ):
                 config["build_system"] = "Gradle"
                 self._analyze_gradle_configuration(project_path, config)
+        elif project_type == "Python":
+            # Keep the structure-detection label (this dict overwrites the
+            # analysis via update(), so a None here would erase it) and add
+            # the Python analysis depth (spec Component 1).
+            config["build_system"] = "pip/poetry"
+            self._analyze_python_project(project_path, config)
 
         return config
+
+    def _analyze_python_project(self, project_path: str, analysis: Dict[str, Any]) -> None:
+        """Python analysis depth (spec Component 1): interpreter constraint ->
+        concrete version (newest satisfying), installer faithfulness ladder,
+        top-level package discovery, and READ-ONLY test hints (tox/nox are
+        metadata only, never executed). Fills ``analysis["python_config"]``,
+        which _persist_build_requirements merges into the handoff manifest.
+        """
+        from .python_env import (
+            detect_installer,
+            discover_packages,
+            requires_python_from_pyproject,
+            requires_python_from_setup_cfg,
+            requires_python_from_setup_py,
+            resolve_python_version,
+            setup_cfg_test_deps,
+            tox_test_hints,
+        )
+
+        orch = self.docker_orchestrator
+        if not orch:
+            return
+
+        listing = orch.execute_command(f"ls -1 {project_path} 2>/dev/null")
+        files_present = {
+            line.strip()
+            for line in (listing.get("output") or "").splitlines()
+            if line.strip()
+        }
+
+        def read(name: str) -> str:
+            if name not in files_present:
+                return ""
+            # Untruncated like the pom reads: this content is parsed
+            # internally by regex and never reaches the model's context.
+            result = orch.execute_command(
+                f"cat {project_path}/{name}", truncate_output=False
+            )
+            return result.get("output", "") if result.get("success") else ""
+
+        pyproject = read("pyproject.toml")
+        setup_py = read("setup.py")
+        setup_cfg = read("setup.cfg")
+        tox_ini = read("tox.ini")
+
+        # Constraint precedence mirrors packaging reality: pyproject is
+        # authoritative when present, setup.py/setup.cfg are the legacy forms.
+        constraint = None
+        constraint_source = None
+        for source, value in (
+            ("pyproject.toml", requires_python_from_pyproject(pyproject)),
+            ("setup.py", requires_python_from_setup_py(setup_py)),
+            ("setup.cfg", requires_python_from_setup_cfg(setup_cfg)),
+        ):
+            if value:
+                constraint, constraint_source = value, source
+                break
+
+        installer = detect_installer(files_present)
+
+        hints = tox_test_hints(tox_ini)
+        for dep in setup_cfg_test_deps(setup_cfg):
+            if dep not in hints["test_deps"]:
+                hints["test_deps"].append(dep)
+
+        # C-extension markers: ext_modules in setup.py, the [tool.setuptools]
+        # ext-modules table in pyproject, or cython anywhere in either. The
+        # bare [tool.setuptools] table is NOT a marker — every modern
+        # setuptools project has one, and flagging it would demand .so
+        # evidence from pure-Python builds.
+        has_c_extensions = bool(
+            re.search(r"\bext_modules\b", setup_py)
+            or re.search(r"\bext[-_]modules\b", pyproject)
+            or re.search(r"(?i)\bcython\b", pyproject + setup_py)
+        )
+
+        analysis["python_config"] = {
+            "python_constraint": constraint,
+            "python_constraint_source": constraint_source,
+            "python_version": resolve_python_version(constraint),
+            "python_installer": installer["installer"],
+            "python_install_commands": installer["commands"],
+            "python_install_source": installer["source"],
+            "python_packages": discover_packages(orch, project_path),
+            "python_venv": f"{project_path.rstrip('/')}/.venv",
+            "has_c_extensions": has_c_extensions,
+            "test_hints": hints,
+        }
 
     def _analyze_maven_configuration(self, project_path: str, config: Dict[str, Any]):
         """分析Maven配置（pom.xml）- 包括多模块项目和父POM"""
@@ -1379,21 +1473,40 @@ PY"""
             fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
         )
 
-        write_build_requirements(
-            self.docker_orchestrator,
-            {
-                "java_version": analysis.get("java_version"),
-                "java_version_source": analysis.get("java_version_source"),
-                "java_version_enforced": bool(analysis.get("java_version_enforced")),
-                "root_shape": root_shape,
-                "build_root": build_root,
-                "build_goal": rec.get("goal"),
-                "fail_at_end": fail_at_end,
-                "test_root": rec.get("test_root"),
-                "test_system": rec.get("test_system"),
-                "test_fail_at_end": test_fail_at_end,
-            },
-        )
+        data = {
+            "java_version": analysis.get("java_version"),
+            "java_version_source": analysis.get("java_version_source"),
+            "java_version_enforced": bool(analysis.get("java_version_enforced")),
+            "root_shape": root_shape,
+            "build_root": build_root,
+            "build_goal": rec.get("goal"),
+            "fail_at_end": fail_at_end,
+            "test_root": rec.get("test_root"),
+            "test_system": rec.get("test_system"),
+            "test_fail_at_end": test_fail_at_end,
+        }
+
+        # Python requirements ride along on the SAME handoff manifest (spec
+        # Component 1): java keys stay, python keys are added when the
+        # analyzer's Python branch ran.
+        python_config = analysis.get("python_config") or {}
+        if python_config:
+            data.update(
+                {
+                    "python_version": python_config.get("python_version"),
+                    "python_constraint": python_config.get("python_constraint"),
+                    "python_constraint_source": python_config.get("python_constraint_source"),
+                    "python_installer": python_config.get("python_installer"),
+                    "python_install_commands": python_config.get("python_install_commands") or [],
+                    "python_install_source": python_config.get("python_install_source"),
+                    "python_packages": python_config.get("python_packages") or [],
+                    "python_venv": python_config.get("python_venv"),
+                    "has_c_extensions": bool(python_config.get("has_c_extensions")),
+                    "test_hints": python_config.get("test_hints") or {},
+                }
+            )
+
+        write_build_requirements(self.docker_orchestrator, data)
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """

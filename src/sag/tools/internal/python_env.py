@@ -3,7 +3,7 @@ installer-ladder detection. Used by the analyzer, python_tool, and the setup
 tool so the ladder exists exactly once (spec Components 1-3)."""
 
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 SUPPORTED_PYTHONS = ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
 
@@ -71,3 +71,134 @@ def resolve_python_version(
         if all(_satisfies(candidate, s) for s in specs):
             return candidate
     return None
+
+
+# ---------------------------------------------------------------------------
+# Installer ladder + package discovery (spec Components 1 & 3)
+# ---------------------------------------------------------------------------
+
+# Directories that carry an __init__.py without being the import package.
+_NON_PACKAGE_DIRS = {"tests", "docs", "examples"}
+
+# pip rung for a pyproject without a lock: try the test extra first so test
+# dependencies land, then fall back to a plain editable install.
+_PYPROJECT_PIP_COMMAND = (
+    "{venv}/bin/pip install -e '.[test]' || {venv}/bin/pip install -e ."
+)
+
+
+def detect_installer(files_present) -> Dict[str, Any]:
+    """Pick the project's OWN declared installer (faithfulness ladder):
+    poetry.lock -> poetry, Pipfile.lock -> pipenv, then the pip rungs
+    (pyproject editable, requirements*.txt, bare setup.py). Command strings
+    carry ``{venv}`` / ``{dir}`` placeholders the executing caller fills in;
+    detection never runs anything."""
+    files = set(files_present or ())
+    if "poetry.lock" in files:
+        return {"installer": "poetry", "commands": ["poetry install"],
+                "source": "poetry.lock"}
+    if "Pipfile.lock" in files:
+        return {"installer": "pipenv", "commands": ["pipenv install --dev"],
+                "source": "Pipfile.lock"}
+    if "pyproject.toml" in files:
+        return {"installer": "pip", "commands": [_PYPROJECT_PIP_COMMAND],
+                "source": "pyproject.toml"}
+    requirements = sorted(
+        name for name in files
+        if name.startswith("requirements") and name.endswith(".txt")
+    )
+    if "requirements.txt" in requirements:  # the plain file installs first
+        requirements.remove("requirements.txt")
+        requirements.insert(0, "requirements.txt")
+    if requirements:
+        return {
+            "installer": "pip",
+            "commands": [f"{{venv}}/bin/pip install -r {name}" for name in requirements],
+            "source": requirements[0],
+        }
+    if "setup.py" in files:
+        return {"installer": "pip", "commands": ["{venv}/bin/pip install -e ."],
+                "source": "setup.py"}
+    # Nothing declared: honest empty ladder (callers narrate, never invent).
+    return {"installer": "pip", "commands": [], "source": None}
+
+
+def discover_packages(orchestrator, project_dir: str) -> List[str]:
+    """Top-level import packages: src-layout (``src/<pkg>/__init__.py``)
+    first, then flat layout (``<pkg>/__init__.py``), excluding
+    tests/docs/examples. Empty when nothing is found — never invented."""
+    root = project_dir.rstrip("/")
+    for base in (f"{root}/src", root):
+        result = orchestrator.execute_command(
+            f"find {base} -maxdepth 2 -name __init__.py -not -path '*/.*' 2>/dev/null"
+        )
+        packages = []
+        for line in (result.get("output") or "").splitlines():
+            line = line.strip()
+            if not line.endswith("/__init__.py"):
+                continue
+            parent, _, name = line[: -len("/__init__.py")].rpartition("/")
+            if parent != base or not name or name in _NON_PACKAGE_DIRS:
+                continue
+            if name not in packages:
+                packages.append(name)
+        if packages:
+            return sorted(packages)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Test hints — tox.ini / setup.cfg are READ-ONLY metadata, never executed
+# (settled spec decision)
+# ---------------------------------------------------------------------------
+
+
+def _ini_section(content: str, section: str) -> Dict[str, List[str]]:
+    """Tiny INI scrape for one section: {key: [value lines]}. Handles the
+    indented continuation-line style tox.ini and setup.cfg both use."""
+    values: Dict[str, List[str]] = {}
+    in_section = False
+    current: Optional[str] = None
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            in_section = stripped[1:-1].strip() == section
+            current = None
+            continue
+        if not in_section or not stripped or stripped.startswith(("#", ";")):
+            continue
+        if line[:1] in (" ", "\t") and current is not None:  # continuation
+            values[current].append(stripped)
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        current = key.strip()
+        values[current] = [value.strip()] if value.strip() else []
+    return values
+
+
+def tox_test_hints(content: str) -> Dict[str, Any]:
+    """Scrape tox.ini ``[testenv]`` for deps and the pytest args of its
+    commands. tox substitutions (``{posargs}``) are dropped: the args feed a
+    direct pytest run, never a tox one."""
+    section = _ini_section(content, "testenv")
+    deps = [dep for dep in section.get("deps", []) if dep]
+    pytest_args: Optional[str] = None
+    for command in section.get("commands", []):
+        if command == "pytest" or command.startswith("pytest "):
+            raw = re.sub(r"\{[^}]*\}", "", command[len("pytest"):])
+            pytest_args = " ".join(raw.split()) or None
+            break
+    return {"pytest_args": pytest_args, "test_deps": deps}
+
+
+def setup_cfg_test_deps(content: str) -> List[str]:
+    """Test/dev extras from setup.cfg ``[options.extras_require]``."""
+    section = _ini_section(content, "options.extras_require")
+    deps: List[str] = []
+    for extra in ("test", "tests", "dev"):
+        for dep in section.get(extra, []):
+            if dep and dep not in deps:
+                deps.append(dep)
+    return deps
