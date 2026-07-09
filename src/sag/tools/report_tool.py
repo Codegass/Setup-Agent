@@ -964,6 +964,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_snapshot["status"]["modules_skipped_count"] = msum.get("modules_skipped")
             report_snapshot["status"]["modules_tested"] = msum.get("modules_tested")
             report_snapshot["status"]["modules_not_tested"] = msum.get("modules_not_tested")
+            report_snapshot["status"]["modules_test_bearing"] = msum.get("modules_test_bearing")
 
         # Generate both console and markdown versions with verified information and metrics
         console_report = self._generate_console_report(
@@ -1624,6 +1625,35 @@ class ReportTool(BaseTool, UIEventEmitter):
             ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
             if "tests_not_fully_executed" not in ev_conflicts:
                 ev_conflicts.append("tests_not_fully_executed")
+
+        # Scope shortfall caps the run at PARTIAL: tests ran in a strict subset
+        # of the test-bearing modules (leaf-scoped run in a reactor). Same
+        # non-adjudicated conflict mechanism as the two gates above (spec §4).
+        # The module counts are folded into status HERE — not only in the
+        # caller's dashboard passthrough, which runs after this snapshot is
+        # built — because the stored verdict below must already see the cap.
+        # _build_module_metrics is memoized on self, so the caller's later
+        # passthrough reads the identical cached result (no extra scans).
+        try:
+            module_metrics = self._build_module_metrics(
+                test_history or self._load_test_history() or {},
+                generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"module metrics for scope-narrowing check skipped: {exc}")
+            module_metrics = None
+        if module_metrics:
+            msum = module_metrics.get("module_summary") or {}
+            status["modules_tested"] = msum.get("modules_tested")
+            status["modules_test_bearing"] = msum.get("modules_test_bearing")
+        if (
+            status.get("modules_test_bearing")
+            and status.get("modules_tested") is not None
+            and 0 < status["modules_tested"] < status["modules_test_bearing"]
+        ):
+            ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
+            if "reactor_scope_narrowed" not in ev_conflicts:
+                ev_conflicts.append("reactor_scope_narrowed")
 
         # Stored verdict comes from the SAME kernel inputs as the header's
         # Result line (spec §6): header-vs-stored divergence is impossible.

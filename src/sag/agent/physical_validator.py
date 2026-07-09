@@ -2090,6 +2090,8 @@ PY"""
             evidence_status = "success"
             conflicts = []
 
+        conflicts.extend(self._collect_jdk_conflicts())
+
         result = {
             "success": success,
             "build_complete": complete,
@@ -2103,6 +2105,30 @@ PY"""
 
         logger.info(f"Build validation complete: {evidence_status.upper()} - {reason}")
         return result
+
+    def _collect_jdk_conflicts(self) -> List[str]:
+        """jdk_mismatch when the manifest's required JDK != the active one.
+
+        Report-only honesty signal (spec §4): provisioning failures degrade
+        here instead of blocking the run. Empty when no requirement is known.
+        """
+        try:
+            from sag.tools.internal.build_preflight import (
+                active_java_major,
+                read_build_requirements,
+            )
+
+            required = (read_build_requirements(self.docker_orchestrator) or {}).get(
+                "java_version"
+            )
+            if not required:
+                return []
+            active = active_java_major(self.docker_orchestrator)
+            if active and active != str(required):
+                return ["jdk_mismatch"]
+        except Exception as exc:
+            logger.debug(f"jdk conflict check skipped: {exc}")
+        return []
 
     def _build_status_evidence_refs(
         self, project_dir: str, artifacts_result: Dict[str, any]
@@ -2771,12 +2797,23 @@ PY"""
                 if "EXISTS" in (chk.get("output") or ""):
                     report_dirs.append(rd)
 
+            # Test-bearing probe: does this module declare test sources? Feeds
+            # modules_test_bearing so the report can tell "tests ran in a strict
+            # subset of the test-bearing modules" (reactor_scope_narrowed) apart
+            # from "these modules simply have no tests" (spec §4).
+            tst = self._execute_command_with_logging(
+                f"test -d {module_dir}/src/test && echo EXISTS",
+                f"checking test sources {rel}",
+            )
+            has_test_sources = "EXISTS" in (tst.get("output") or "")
+
             modules.append({
                 "path": rel,
                 "name": name,
                 "class_count": class_count,
                 "jar_count": jar_count,
                 "report_dirs": report_dirs,
+                "has_test_sources": has_test_sources,
             })
         return modules
 

@@ -177,6 +177,7 @@ def assemble_module_metrics(
             "tests_errors": _int_or_none(t.get("tests_errors")),
             "tests_skipped": _int_or_none(t.get("tests_skipped")),
             "test_source": "runner_xml" if has_tests else "none",
+            "has_test_sources": bool(scan.get("has_test_sources")),
             "failing_names": failing_names,
             "failing_count": failing_count,
             "evidence_refs": _str_list(t.get("evidence_refs") or scan.get("report_dirs"), 25),
@@ -211,6 +212,10 @@ def assemble_module_metrics(
                 "tests_errors": None,
                 "tests_skipped": None,
                 "test_source": "none",
+                # No disk scan matched this reactor entry, so test sources are
+                # unknowable — default False so it can never inflate the
+                # test-bearing count (and thus never fire the scope conflict).
+                "has_test_sources": False,
                 "failing_names": [],
                 "failing_count": None,
                 "evidence_refs": [],
@@ -225,6 +230,9 @@ def assemble_module_metrics(
         "modules_skipped": sum(1 for m in out_modules if m["build_status"] == "skipped"),
         "modules_tested": tested,
         "modules_not_tested": total - tested,
+        "modules_test_bearing": sum(
+            1 for m in out_modules if m.get("has_test_sources")
+        ),
         "modules_with_test_failures": sum(
             1 for m in out_modules if (m["failing_count"] or 0) > 0
         ),
