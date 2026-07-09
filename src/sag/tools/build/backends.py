@@ -10,10 +10,14 @@ from typing import Any, Dict, Optional
 from sag.tools.base import ToolResult
 
 # Marker files probed (in priority order) to select a backend.
+# python comes AFTER maven/gradle on purpose: a JVM repo with a stray
+# requirements.txt (docs tooling, scripts) must stay JVM — dict order IS the
+# probe order in BuildTool._detect_system.
 BUILD_MARKERS = {
     "maven": ("pom.xml",),
     "gradle": ("build.gradle", "build.gradle.kts", "settings.gradle",
                "settings.gradle.kts", "gradlew"),
+    "python": ("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
 }
 
 
@@ -51,6 +55,34 @@ class MavenBackend:
         if timeout:
             kwargs["timeout"] = timeout
         return self.maven_tool.execute(**kwargs)
+
+
+class PythonBackend:
+    VERBS = {
+        "deps": "setup_env",
+        "compile": "compile",
+        "test": "test",
+        # Both packaging verbs map to the wheel build: Python has no local-repo
+        # install step to mirror Maven's, and the wheel is extra evidence only
+        # (spec settled decision: never required for a green verdict).
+        "package": "build",
+        "install": "build",
+    }
+
+    def __init__(self, python_tool):
+        self.python_tool = python_tool
+
+    def run(self, verb: str, args: Optional[str], working_directory: str,
+            timeout: Optional[int]) -> ToolResult:
+        kwargs: Dict[str, Any] = {
+            "operation": self.VERBS[verb],
+            "working_directory": working_directory,
+        }
+        if args:
+            kwargs["args"] = args
+        if timeout:
+            kwargs["timeout"] = timeout
+        return self.python_tool.execute(**kwargs)
 
 
 class GradleBackend:

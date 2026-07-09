@@ -13,7 +13,7 @@ from sag.tools.internal.build_preflight import (
     read_build_requirements,
 )
 
-from .backends import BUILD_MARKERS, GradleBackend, MavenBackend
+from .backends import BUILD_MARKERS, GradleBackend, MavenBackend, PythonBackend
 
 # Verbs that actually invoke the JDK; `deps` resolution is not gated on a
 # matching toolchain, so it skips the pre-flight (spec §1b: no-op when moot).
@@ -26,16 +26,19 @@ class BuildTool(BaseTool):
         docker_orchestrator,
         maven_tool=None,
         gradle_tool=None,
+        python_tool=None,
         test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
     ):
         super().__init__(
             name="build",
             description=(
                 "Build the project: action = deps | compile | test | package. "
-                "The build system (maven/gradle) is auto-selected from project files, and the "
-                "CORRECT toolchain (registered Maven/JDK versions) is resolved automatically — "
-                "bash mvn/gradle uses the stale system PATH and often picks the wrong version, "
-                "even when project docs show a raw command. "
+                "The build system (maven/gradle/python) is auto-selected from project files, "
+                "and the CORRECT toolchain (registered Maven/JDK versions) is resolved "
+                "automatically — bash mvn/gradle uses the stale system PATH and often picks "
+                "the wrong version, even when project docs show a raw command. "
+                "python: deps installs into ./.venv via the project's own tool "
+                "(poetry/pipenv/pip ladder); test runs pytest once with JUnit XML. "
                 "Long builds run detached and hand back a log ref — never killed."
             ),
         )
@@ -46,6 +49,8 @@ class BuildTool(BaseTool):
             self._backends["maven"] = MavenBackend(maven_tool)
         if gradle_tool is not None:
             self._backends["gradle"] = GradleBackend(gradle_tool)
+        if python_tool is not None:
+            self._backends["python"] = PythonBackend(python_tool)
 
     def execute(
         self,
@@ -108,10 +113,16 @@ class BuildTool(BaseTool):
             )
 
         # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
+        # Routing by system: python skips the JDK pre-flight entirely.
+        # PythonPreflight already runs inside python_tool.setup_env (the deps
+        # verb), and the venv interpreter it provisions is what test/compile/
+        # build invoke — running a facade-level pre-flight here would
+        # double-provision. The python bounded retry likewise lives inside
+        # python_tool (classify_python_version_error), not here.
         preamble_lines: List[str] = []
         jdk_retry_meta: Optional[Dict[str, Optional[str]]] = None
         outcome = None
-        if verb in _PREFLIGHT_VERBS:
+        if verb in _PREFLIGHT_VERBS and system != "python":
             requirements = read_build_requirements(self.docker_orchestrator)
             outcome = JdkPreflight(self.docker_orchestrator).run(
                 requirements.get("java_version"),

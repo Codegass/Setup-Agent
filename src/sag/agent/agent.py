@@ -156,6 +156,7 @@ class SetupAgent:
         from sag.tools.internal.output_search_tool import OutputSearchTool
         from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
         from sag.tools.internal.project_setup_tool import ProjectSetupTool
+        from sag.tools.internal.python_tool import PythonTool
         from sag.tools.phase_tool import PhaseTool
         from sag.tools.project_tool import ProjectTool
         from sag.tools.report_tool import ReportTool
@@ -200,6 +201,7 @@ class SetupAgent:
         # they live on as backends/delegates of the build/project/search facades.
         maven_tool = MavenTool(self.orchestrator, command_tracker=self.command_tracker)
         gradle_tool = GradleTool(self.orchestrator)
+        python_tool = PythonTool(self.orchestrator, command_tracker=self.command_tracker)
         setup_tool = ProjectSetupTool(self.orchestrator)
         system_tool = SystemTool(self.orchestrator)
         env_tool = EnvTool(self.orchestrator)
@@ -233,6 +235,7 @@ class SetupAgent:
                 self.orchestrator,
                 maven_tool=maven_tool,
                 gradle_tool=gradle_tool,
+                python_tool=python_tool,
                 test_pass_threshold=self.config.test_pass_threshold,
             ),
             ProjectTool(
