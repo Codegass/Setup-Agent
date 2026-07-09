@@ -17,6 +17,8 @@ import shlex
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+from sag.tools.internal.gradle_tool import GradleTool
+from sag.tools.internal.maven_tool import MavenTool
 
 
 class ScriptedOrch:
@@ -234,3 +236,229 @@ def test_gradle_version_error_single_retry(monkeypatch):
     assert len(gradle.calls) == 2
     assert "retry 1/1" in (result.output or "")
     assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+
+
+# --- Internal MavenTool/GradleTool wiring (donor port) ----------------------
+#
+# The same pre-flight + bounded retry guards the internal tools for agents
+# that reach maven/gradle directly instead of through the consolidated
+# facade. The donor's workdir re-targeting ("defaulting to the recommended
+# reactor root") and its auto fail_at_end/--continue mutations are NOT
+# ported: PR #12's orchestration-layer injection and the BuildTool backends
+# own those. Kept: narration prepend, bounded retry, and the [scope] warning
+# for EXPLICITLY narrowed working directories.
+
+
+class MavenScriptedOrch:
+    """Canned results for the internal MavenTool; records every command."""
+
+    def __init__(self, java="17", manifest=None, build_output="BUILD SUCCESS",
+                 build_ok=True, project_name="proj"):
+        self.java = java
+        self.manifest = manifest or {}
+        self.build_output = build_output
+        self.build_ok = build_ok
+        self.commands = []
+        self.project_name = project_name
+
+    def execute_command(self, cmd, workdir=None, timeout=None):
+        self.commands.append(cmd)
+        if "java -version" in cmd:
+            return {"success": True, "exit_code": 0,
+                    "output": f'openjdk version "{self.java}.0.1"'}
+        if cmd == f"cat {REQUIREMENTS_PATH}":
+            if self.manifest:
+                return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
+            return {"success": False, "exit_code": 1, "output": ""}
+        if cmd.startswith("mvn") and ("test" in cmd or "install" in cmd or "compile" in cmd):
+            return {"success": self.build_ok, "exit_code": 0 if self.build_ok else 1,
+                    "output": self.build_output}
+        if cmd.startswith("find") and "target/classes" in cmd:
+            # post-build artifact validation for compile/package/install
+            return {"success": True, "exit_code": 0,
+                    "output": "/workspace/proj/target/classes/Foo.class"}
+        if "test -f" in cmd or "test -e" in cmd:  # pom probes
+            return {"success": True, "exit_code": 0, "output": "EXISTS"}
+        if "command -v mvn" in cmd or "which mvn" in cmd:
+            return {"success": True, "exit_code": 0, "output": "/usr/bin/mvn"}
+        return {"success": True, "exit_code": 0, "output": ""}
+
+
+def _internal_maven_tool(orch):
+    tool = MavenTool.__new__(MavenTool)  # skip full __init__; wire minimum
+    tool.orchestrator = orch
+    tool.toolchain_manager = None
+    tool.command_tracker = None
+    tool.output_storage = None
+    return tool
+
+
+def _mvn_runs(orch, phase):
+    # Actual mvn invocations only: the test-summary heredoc embeds the mvn
+    # command string, so a bare '"mvn" in c' substring filter would overcount.
+    return [c for c in orch.commands if c.startswith("mvn") and phase in c]
+
+
+def test_maven_tool_matching_jdk_no_narration():
+    orch = MavenScriptedOrch(java="17", manifest={"java_version": "17"})
+    result = _internal_maven_tool(orch).execute(
+        command="compile", working_directory="/workspace/proj"
+    )
+    assert "[pre-flight]" not in (result.output or "")
+
+
+def test_maven_tool_mismatch_narrated_in_observation(monkeypatch):
+    _patch_provision(monkeypatch)
+    orch = MavenScriptedOrch(
+        java="11", manifest={"java_version": "17", "java_version_source": "maven-enforcer"}
+    )
+    result = _internal_maven_tool(orch).execute(
+        command="compile", working_directory="/workspace/proj"
+    )
+    assert "[pre-flight] Required: Java 17" in (result.output or "")
+
+
+def test_maven_tool_version_error_triggers_single_retry(monkeypatch):
+    _patch_provision(monkeypatch)
+    orch = MavenScriptedOrch(java="11", manifest={},
+                             build_output=ENFORCER_FAIL, build_ok=False)
+    result = _internal_maven_tool(orch).execute(
+        command="compile", working_directory="/workspace/proj"
+    )
+    mvn_runs = _mvn_runs(orch, "compile")
+    assert len(mvn_runs) == 2          # original + exactly one retry
+    assert "retry 1/1" in (result.output or "")
+    assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+
+
+def test_maven_tool_non_version_failure_does_not_retry():
+    orch = MavenScriptedOrch(java="17", manifest={"java_version": "17"},
+                             build_output="BUILD FAILURE: test failures", build_ok=False)
+    _internal_maven_tool(orch).execute(command="test", working_directory="/workspace/proj")
+    assert len(_mvn_runs(orch, "test")) == 1
+
+
+def test_maven_tool_scope_warning_when_leaf_targeted():
+    orch = MavenScriptedOrch(java="17", manifest={
+        "java_version": "17", "root_shape": "healthy_reactor",
+        "build_root": "/workspace/proj",
+    })
+    result = _internal_maven_tool(orch).execute(
+        command="test", working_directory="/workspace/proj/core"
+    )
+    assert "[scope]" in (result.output or "")
+
+
+def test_maven_tool_no_scope_warning_at_recommended_root():
+    orch = MavenScriptedOrch(java="17", manifest={
+        "java_version": "17", "root_shape": "healthy_reactor",
+        "build_root": "/workspace/proj",
+    })
+    result = _internal_maven_tool(orch).execute(
+        command="test", working_directory="/workspace/proj"
+    )
+    assert "[scope]" not in (result.output or "")
+
+
+def test_maven_tool_unscoped_invocation_never_retargets_or_warns():
+    # The tool's own project-name fallback (not the model) lands below the
+    # manifest build_root: not an explicit narrowing, so stay quiet. The
+    # donor's re-targeting default is superseded by PR #12's orchestration
+    # injection and is deliberately not ported.
+    orch = MavenScriptedOrch(java="17", manifest={
+        "java_version": "17", "root_shape": "healthy_reactor",
+        "build_root": "/workspace",
+    })
+    result = _internal_maven_tool(orch).execute(command="test")  # default "/workspace"
+    assert "defaulting to the recommended reactor root" not in (result.output or "")
+    assert "[scope]" not in (result.output or "")
+
+
+def test_maven_tool_pl_flag_warns_about_narrowed_scope():
+    orch = MavenScriptedOrch(java="17", manifest={"java_version": "17"})
+    result = _internal_maven_tool(orch).execute(
+        command="test", working_directory="/workspace/proj", extra_args="-pl core"
+    )
+    assert "[scope]" in (result.output or "")
+
+
+class GradleScriptedOrch(MavenScriptedOrch):
+    def execute_command(self, cmd, workdir=None, timeout=None):
+        self.commands.append(cmd)
+        if "java -version" in cmd:
+            return {"success": True, "exit_code": 0,
+                    "output": f'openjdk version "{self.java}.0.1"'}
+        if cmd == f"cat {REQUIREMENTS_PATH}":
+            if self.manifest:
+                return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
+            return {"success": False, "exit_code": 1, "output": ""}
+        # Actual gradle invocations only: build-file probes ('test -f
+        # .../build.gradle || ...') contain both 'gradle' and 'build', so a
+        # bare substring match would swallow them and feed probes the canned
+        # build output. Anchor on the executable at the start of the command.
+        if cmd.startswith("gradle") and ("build" in cmd or "test" in cmd or "check" in cmd):
+            return {"success": self.build_ok, "exit_code": 0 if self.build_ok else 1,
+                    "output": self.build_output}
+        if "test -f" in cmd:  # wrapper detection, build-file/settings probes
+            return {"success": True, "exit_code": 0, "output": "yes"}
+        if "which gradle" in cmd:
+            return {"success": True, "exit_code": 0, "output": "/usr/bin/gradle"}
+        return {"success": True, "exit_code": 0, "output": "yes"}
+
+
+def _internal_gradle_tool(orch):
+    tool = GradleTool.__new__(GradleTool)  # skip full __init__; wire minimum
+    tool.orchestrator = orch
+    tool.toolchain_manager = None
+    tool.output_storage = None
+    return tool
+
+
+def _gradle_runs(orch, task):
+    # Same overcount hazard as _mvn_runs: only count real gradle invocations.
+    return [c for c in orch.commands if c.startswith("gradle") and task in c]
+
+
+def test_gradle_tool_mismatch_narrated(monkeypatch):
+    _patch_provision(monkeypatch)
+    orch = GradleScriptedOrch(java="11", manifest={"java_version": "17"})
+    result = _internal_gradle_tool(orch).execute(
+        command="build", working_directory="/workspace/proj"
+    )
+    assert "[pre-flight] Required: Java 17" in (result.output or "")
+
+
+def test_gradle_tool_version_error_single_retry(monkeypatch):
+    _patch_provision(monkeypatch)
+    fail = "Unsupported class file major version 61 ... class file version 61.0"
+    orch = GradleScriptedOrch(java="11", manifest={}, build_output=fail, build_ok=False)
+    result = _internal_gradle_tool(orch).execute(
+        command="build", working_directory="/workspace/proj"
+    )
+    runs = _gradle_runs(orch, "build")
+    assert len(runs) == 2          # original + exactly one retry
+    assert "retry 1/1" in (result.output or "")
+
+
+def test_gradle_tool_scope_warning_when_leaf_targeted():
+    orch = GradleScriptedOrch(java="17", manifest={
+        "java_version": "17", "root_shape": "healthy_reactor",
+        "build_root": "/workspace/proj",
+    })
+    result = _internal_gradle_tool(orch).execute(
+        command="build", working_directory="/workspace/proj/core"
+    )
+    assert "[scope]" in (result.output or "")
+
+
+def test_gradle_tool_no_auto_continue_mutation_on_healthy_reactor():
+    # No auto --continue mutation on the internal tool: the BuildTool
+    # backends (PR #12) own fail-at-end/--continue wiring; the internal
+    # tool only honors an explicit fail_at_end=True.
+    orch = GradleScriptedOrch(java="17", manifest={
+        "java_version": "17", "root_shape": "healthy_reactor",
+        "build_root": "/workspace/proj",
+    })
+    _internal_gradle_tool(orch).execute(command="build", working_directory="/workspace/proj")
+    runs = _gradle_runs(orch, "build")
+    assert runs and "--continue" not in runs[0]

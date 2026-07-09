@@ -14,6 +14,12 @@ from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceStatus, TestStats
 
 from ..base import BaseTool, ToolError, ToolResult
+from .build_preflight import (
+    JdkPreflight,
+    active_java_major,
+    classify_version_error,
+    read_build_requirements,
+)
 from .build_utils import detached_handoff_tool_result
 from .command_tracker import CommandTracker
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
@@ -126,6 +132,11 @@ class MavenTool(BaseTool):
             timeout: Maximum seconds to wait for command completion (default: 300)
         """
 
+        # Whether the agent explicitly scoped this invocation. The
+        # orchestration layer (PR #12) owns working-directory injection, so
+        # this never re-targets; explicitness only gates the [scope] warning.
+        explicitly_scoped = working_directory not in (None, "/workspace")
+
         # Deterministic working directory fallback (do not override user intent unless certain)
         try:
             if working_directory in (None, "/workspace") and self.orchestrator:
@@ -175,6 +186,33 @@ class MavenTool(BaseTool):
                                 working_directory = cand_dir
         except Exception as _e:
             logger.debug(f"Working directory fallback skipped: {_e}")
+
+        # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
+        preamble_lines: List[str] = []
+        requirements = read_build_requirements(self.orchestrator)
+        outcome = JdkPreflight(self.orchestrator).run(
+            requirements.get("java_version"),
+            source=requirements.get("java_version_source") or "unknown",
+        )
+        if outcome.narration:
+            preamble_lines.append(outcome.narration)
+
+        # [scope] warning ONLY for explicit narrowing (spec §3). Working-
+        # directory defaulting lives in the orchestration layer (PR #12); the
+        # tool never re-targets and never mutates fail_at_end on its own.
+        recommended_root = (requirements.get("build_root") or "").rstrip("/")
+        if (
+            explicitly_scoped
+            and requirements.get("root_shape") == "healthy_reactor"
+            and recommended_root
+            and (working_directory or "").rstrip("/") != recommended_root
+        ) or ("-pl" in (extra_args or "")):
+            preamble_lines.append(
+                "[scope] narrower than the recommended reactor root "
+                f"({recommended_root or 'root'}) — sibling deps may be unresolved; "
+                "tests outside this module will not run"
+            )
+        preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         required_version = ToolVersionRequirement.from_raw(
             maven_version_requirement, source="tool_parameter"
@@ -335,29 +373,58 @@ class MavenTool(BaseTool):
                 ]
             )
 
-            _build_t0 = time.monotonic()
-            if is_long_running and hasattr(self.orchestrator, "execute_command_with_soft_timeout"):
-                # Dispatch-and-poll: run detached with a soft window; if still
-                # running when it closes, hand the log tail back to the agent
-                # instead of killing a legitimately long build.
-                logger.info(f"Executing Maven command via dispatch-and-poll: {maven_cmd}")
-                result = self.orchestrator.execute_command_with_soft_timeout(
-                    maven_cmd,
-                    workdir=working_directory,
-                )
-            elif is_long_running and hasattr(self.orchestrator, "execute_command_with_monitoring"):
-                # Use monitoring version with extended timeouts for build commands
-                logger.info(f"Executing Maven command with extended timeout: {maven_cmd}")
-                result = self.orchestrator.execute_command_with_monitoring(
-                    maven_cmd,
-                    workdir=working_directory,
-                    silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
-                    absolute_timeout=3600,  # 60 minutes total
-                    optimize_for_maven=True,
-                )
-            else:
+            def _run_build():
+                if is_long_running and hasattr(
+                    self.orchestrator, "execute_command_with_soft_timeout"
+                ):
+                    # Dispatch-and-poll: run detached with a soft window; if still
+                    # running when it closes, hand the log tail back to the agent
+                    # instead of killing a legitimately long build.
+                    logger.info(f"Executing Maven command via dispatch-and-poll: {maven_cmd}")
+                    return self.orchestrator.execute_command_with_soft_timeout(
+                        maven_cmd,
+                        workdir=working_directory,
+                    )
+                if is_long_running and hasattr(
+                    self.orchestrator, "execute_command_with_monitoring"
+                ):
+                    # Use monitoring version with extended timeouts for build commands
+                    logger.info(f"Executing Maven command with extended timeout: {maven_cmd}")
+                    return self.orchestrator.execute_command_with_monitoring(
+                        maven_cmd,
+                        workdir=working_directory,
+                        silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
+                        absolute_timeout=3600,  # 60 minutes total
+                        optimize_for_maven=True,
+                    )
                 # Use regular version for quick commands like help, version, etc.
-                result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+                return self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
+
+            _build_t0 = time.monotonic()
+            result = _run_build()
+
+            # Bounded retry: a version-shaped failure means the requirement in
+            # the error text is authoritative; re-provision from it and rerun
+            # ONCE (spec §1c: exactly one retry, never more).
+            jdk_retry_meta = None
+            if (
+                result.get("exit_code") != 0
+                and not result.get("dispatch_status")
+                and not result.get("termination_reason")
+            ):
+                needed = classify_version_error(result.get("output") or "")
+                active = outcome.active_version or active_java_major(self.orchestrator)
+                if needed and needed != active:
+                    retry_outcome = JdkPreflight(self.orchestrator).run(
+                        needed, source="build-error"
+                    )
+                    if retry_outcome.provisioned:
+                        preamble += (
+                            f"[pre-flight] build error requires Java {needed}, "
+                            f"re-provisioned, retry 1/1\n"
+                        )
+                        jdk_retry_meta = {"from": active, "to": needed}
+                        result = _run_build()
             _build_elapsed = time.monotonic() - _build_t0
 
             if result.get("dispatch_status") == "running_detached":
@@ -435,23 +502,27 @@ class MavenTool(BaseTool):
             if raw_output:
                 evidence_fields = self._maven_evidence_fields(analysis, ref_id)
                 if analysis["build_success"]:
-                    return ToolResult(
-                        success=True,
-                        output=result["output"],
-                        raw_output=result["output"],
-                        **evidence_fields,
-                        metadata={
-                            "command": maven_cmd,
-                            "exit_code": result["exit_code"],
-                            "analysis": analysis,
-                            "maven_runtime": maven_runtime,
-                            "output_ref_id": ref_id,
-                            **(
-                                {"maven_version_requirement": requested_requirement_metadata}
-                                if requested_requirement_metadata
-                                else {}
-                            ),
-                        },
+                    return self._finalize_main_result(
+                        ToolResult(
+                            success=True,
+                            output=result["output"],
+                            raw_output=result["output"],
+                            **evidence_fields,
+                            metadata={
+                                "command": maven_cmd,
+                                "exit_code": result["exit_code"],
+                                "analysis": analysis,
+                                "maven_runtime": maven_runtime,
+                                "output_ref_id": ref_id,
+                                **(
+                                    {"maven_version_requirement": requested_requirement_metadata}
+                                    if requested_requirement_metadata
+                                    else {}
+                                ),
+                            },
+                        ),
+                        preamble,
+                        jdk_retry_meta,
                     )
 
                 error_result = self._handle_maven_error(
@@ -466,7 +537,7 @@ class MavenTool(BaseTool):
                 error_result.raw_output = result["output"]
                 if ref_id:
                     error_result.metadata["output_ref_id"] = ref_id
-                return error_result
+                return self._finalize_main_result(error_result, preamble, jdk_retry_meta)
 
             # Use analysis result to determine success, not just exit code
             evidence_fields = self._maven_evidence_fields(analysis, ref_id)
@@ -507,35 +578,43 @@ class MavenTool(BaseTool):
                             analysis["missing_artifacts"] = validation_result.get(
                                 "missing_artifacts", []
                             )
-                            return self._handle_maven_error(
-                                result["output"],
-                                result["exit_code"],
-                                maven_cmd,
-                                analysis,
-                                maven_runtime,
-                                output_ref_id=ref_id,
+                            return self._finalize_main_result(
+                                self._handle_maven_error(
+                                    result["output"],
+                                    result["exit_code"],
+                                    maven_cmd,
+                                    analysis,
+                                    maven_runtime,
+                                    output_ref_id=ref_id,
+                                ),
+                                preamble,
+                                jdk_retry_meta,
                             )
                     except Exception as e:
                         logger.warning(f"Could not validate build artifacts: {e}")
 
-                return ToolResult(
-                    success=True,
-                    output=self._format_success_output_enhanced(analysis, ref_id),
-                    raw_output=result["output"],
-                    **evidence_fields,
-                    metadata={
-                        "command": maven_cmd,
-                        "exit_code": result["exit_code"],
-                        "analysis": analysis,
-                        "validation": validation_result,
-                        "output_ref_id": ref_id,
-                        "maven_runtime": maven_runtime,
-                        **(
-                            {"maven_version_requirement": requested_requirement_metadata}
-                            if requested_requirement_metadata
-                            else {}
-                        ),
-                    },
+                return self._finalize_main_result(
+                    ToolResult(
+                        success=True,
+                        output=self._format_success_output_enhanced(analysis, ref_id),
+                        raw_output=result["output"],
+                        **evidence_fields,
+                        metadata={
+                            "command": maven_cmd,
+                            "exit_code": result["exit_code"],
+                            "analysis": analysis,
+                            "validation": validation_result,
+                            "output_ref_id": ref_id,
+                            "maven_runtime": maven_runtime,
+                            **(
+                                {"maven_version_requirement": requested_requirement_metadata}
+                                if requested_requirement_metadata
+                                else {}
+                            ),
+                        },
+                    ),
+                    preamble,
+                    jdk_retry_meta,
                 )
             else:
                 if any(
@@ -546,13 +625,17 @@ class MavenTool(BaseTool):
                         working_directory, analysis, result["exit_code"], maven_cmd
                     )
                 # Build failed - use error handler even if exit code was 0
-                return self._handle_maven_error(
-                    result["output"],
-                    result["exit_code"],
-                    maven_cmd,
-                    analysis,
-                    maven_runtime,
-                    output_ref_id=ref_id,
+                return self._finalize_main_result(
+                    self._handle_maven_error(
+                        result["output"],
+                        result["exit_code"],
+                        maven_cmd,
+                        analysis,
+                        maven_runtime,
+                        output_ref_id=ref_id,
+                    ),
+                    preamble,
+                    jdk_retry_meta,
                 )
 
         except Exception as e:
@@ -568,6 +651,25 @@ class MavenTool(BaseTool):
                 ],
                 error_code="MAVEN_EXECUTION_ERROR",
             )
+
+    def _finalize_main_result(
+        self,
+        tool_result: ToolResult,
+        preamble: str,
+        jdk_retry: Optional[Dict[str, str]] = None,
+    ) -> ToolResult:
+        """Prepend pre-flight/scope narration and record retry metadata.
+
+        The narration is the feature (transparency-by-construction, spec
+        §§1b-1c, 3): whatever the pre-flight did — or could not do — must be
+        visible in the agent's observation, not just in host logs.
+        """
+        if preamble:
+            tool_result.output = preamble + (tool_result.output or "")
+            tool_result.raw_output = preamble + (tool_result.raw_output or "")
+        if jdk_retry:
+            tool_result.metadata["jdk_retry"] = jdk_retry
+        return tool_result
 
     def _build_maven_command(
         self,

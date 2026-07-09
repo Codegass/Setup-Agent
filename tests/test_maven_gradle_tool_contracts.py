@@ -584,7 +584,13 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
     assert result.success is False
     assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
     assert orchestrator.monitored_commands == []
-    assert orchestrator.commands == []
+    # The JDK pre-flight's probes (manifest read, java -version) are the only
+    # container commands allowed before the version-resolution early-return.
+    assert [
+        (command, workdir, timeout)
+        for (command, workdir, timeout) in orchestrator.commands
+        if "build_requirements.json" not in command and "java -version" not in command
+    ] == []
     assert toolchain_manager.seen_spec.version_requirement.raw == "3.9.6"
     assert result.metadata["maven_version_requirement"] == {
         "raw": "3.9.6",
