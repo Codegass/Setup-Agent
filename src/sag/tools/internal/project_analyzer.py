@@ -244,6 +244,10 @@ class ProjectAnalyzerTool(BaseTool):
             # Tests can live in different modules / a different build system than
             # the main build (Bigtop: Maven build module, Gradle test modules).
             self._recommend_test_approach(project_path, analysis["build_recommendation"])
+            # Persist the phase-1 -> build-tool handoff into the container so
+            # MavenTool/GradleTool (which only hold an orchestrator) can run
+            # the JDK pre-flight against the analyzed requirements.
+            self._persist_build_requirements(project_path, analysis)
         except Exception as exc:
             logger.warning(f"Build-approach recommendation failed: {exc}")
 
@@ -1339,6 +1343,57 @@ PY"""
             and test_system == build_rec.get("build_system")
         ):
             build_rec["test_root"] = project_path
+
+    def _persist_build_requirements(self, project_path: str, analysis: Dict[str, Any]) -> None:
+        """Persist the analyzer's build/test requirements manifest (spec §2).
+
+        The root shape is DERIVED from the recommendation the analyzer already
+        computed — it is a classification of the chosen targeting, not a second
+        classifier that could disagree with it:
+
+        - build target IS the project root and the root pom declares reactor
+          modules -> ``healthy_reactor``: install/test with fail-at-end so one
+          broken module cannot hide the rest (the tri-state verdict absorbs
+          partial reactor failures).
+        - build target is a subdirectory -> ``pathological_aggregator``: the
+          PR #9 leaf targeting was chosen because building the root compiles
+          nothing (Bigtop: profile-gated modules).
+        - anything else -> ``single_module``.
+        """
+        from .build_preflight import write_build_requirements
+
+        rec = analysis.get("build_recommendation") or {}
+        build_root = rec.get("build_root") or project_path
+        root = project_path.rstrip("/")
+        if build_root.rstrip("/") == root and analysis.get("maven_modules"):
+            root_shape = "healthy_reactor"
+        elif build_root.startswith(f"{root}/"):
+            root_shape = "pathological_aggregator"
+        else:
+            root_shape = "single_module"
+
+        fail_at_end = root_shape == "healthy_reactor"
+        # Fail-at-end testing only makes sense at reactor scope; when the test
+        # cluster lives elsewhere (Bigtop's Gradle subtree) leave it alone.
+        test_fail_at_end = (
+            fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
+        )
+
+        write_build_requirements(
+            self.docker_orchestrator,
+            {
+                "java_version": analysis.get("java_version"),
+                "java_version_source": analysis.get("java_version_source"),
+                "java_version_enforced": bool(analysis.get("java_version_enforced")),
+                "root_shape": root_shape,
+                "build_root": build_root,
+                "build_goal": rec.get("goal"),
+                "fail_at_end": fail_at_end,
+                "test_root": rec.get("test_root"),
+                "test_system": rec.get("test_system"),
+                "test_fail_at_end": test_fail_at_end,
+            },
+        )
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
