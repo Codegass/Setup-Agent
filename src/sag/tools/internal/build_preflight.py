@@ -1,4 +1,4 @@
-"""JDK pre-flight + build-requirements manifest.
+"""JDK/Python pre-flight + build-requirements manifest.
 
 The pre-flight CONSUMES the phase-1 analysis (it is a guarantee layer, not a
 second analyzer): the analyzer persists requirements into the container at
@@ -6,6 +6,10 @@ REQUIREMENTS_PATH; MavenTool/GradleTool call JdkPreflight at the top of every
 build/test execution. When the environment already matches, the pre-flight is
 a single `java -version` no-op. See
 docs/superpowers/specs/2026-07-06-java-execution-strategy-fixes-design.md.
+
+PythonPreflight is the same contract for Python interpreters (uv -> apt
+provision ladder), per
+docs/superpowers/specs/2026-07-07-python-project-support-design.md Component 2.
 """
 
 import json
@@ -14,6 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from loguru import logger
+
+from sag.tools.internal.python_env import resolve_python_version
 
 REQUIREMENTS_PATH = "/workspace/.setup_agent/build_requirements.json"
 
@@ -197,4 +203,183 @@ def classify_version_error(output: str) -> Optional[str]:
     if match:
         # Class-file major 52 = JDK 8, 61 = JDK 17: major - 44.
         return str(int(match.group(1)) - 44)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Python pre-flight (spec 2026-07-07 Component 2): same PreflightOutcome
+# contract as JdkPreflight — check-and-fix, never raises, never blocks.
+# ---------------------------------------------------------------------------
+
+_PYTHON_VERSION_RE = re.compile(r"Python\s+(\d+\.\d+)")
+
+_UV_INSTALL = "curl -LsSf https://astral.sh/uv/install.sh | sh"
+# uv lands in ~/.local/bin; every uv invocation prepends it so the install
+# rung and the provisioning calls agree on PATH.
+_UV_PATH = 'export PATH="$HOME/.local/bin:$PATH"'
+
+
+def active_python_version(orchestrator) -> Optional[str]:
+    """major.minor of the currently active `python3`, or None."""
+    result = orchestrator.execute_command("python3 --version 2>&1")
+    match = _PYTHON_VERSION_RE.search(result.get("output") or "")
+    return match.group(1) if match else None
+
+
+def _register_python_overlay(orchestrator, venv: str, version: str) -> bool:
+    """Register the provisioned interpreter/venv in the shared env overlay."""
+    try:
+        from sag.runtime.env_overlay import EnvOverlayStore
+
+        EnvOverlayStore(orchestrator).register(
+            "python",
+            f"{venv}/bin/python",
+            version=version,
+            source="python_preflight",
+            env={"VIRTUAL_ENV": venv},
+            path_prepend=[f"{venv}/bin"],
+            activate=True,
+        )
+        return True
+    except Exception as exc:
+        logger.warning(f"Python pre-flight overlay registration failed: {exc}")
+        return False
+
+
+class PythonPreflight:
+    """Check-and-fix Python interpreter guarantee (uv -> apt ladder).
+
+    Mirrors JdkPreflight: satisfied (or no) requirement -> no-op; mismatch ->
+    provision + narrate; ladder exhausted -> mismatch=True, which the verifier
+    maps to the python_version_mismatch conflict. Never raises, never blocks.
+    """
+
+    def __init__(self, orchestrator):
+        self.orchestrator = orchestrator
+
+    def run(
+        self,
+        required_version: Optional[str],
+        constraint: Optional[str] = None,
+        source: str = "unknown",
+    ) -> PreflightOutcome:
+        try:
+            return self._run(required_version, constraint, source)
+        except Exception as exc:  # never let the pre-flight kill a build
+            logger.warning(f"Python pre-flight error (continuing): {exc}")
+            return PreflightOutcome(True, None, required_version)
+
+    def _run(self, required: Optional[str], constraint: Optional[str], source: str) -> PreflightOutcome:
+        if not required:
+            return PreflightOutcome(True, None, None)
+        active = active_python_version(self.orchestrator)
+        if active == required or self._constraint_satisfied(active, constraint):
+            logger.debug(f"Python pre-flight: active {active} satisfies requirement")
+            return PreflightOutcome(True, active, required)
+
+        header = (
+            f"[pre-flight] Required: Python {required} (source: {source}). "
+            f"Active: {active or 'unknown'}."
+        )
+        venv = self._venv_path()
+        rung = self._provision(required, venv)
+        if rung:
+            _register_python_overlay(self.orchestrator, venv, required)
+            return PreflightOutcome(
+                matched=False, active_version=active, required_version=required,
+                provisioned=True,
+                narration=(
+                    f"{header}\n→ {rung}-provisioned {required}, "
+                    f"venv at {venv} (overlay registered)"
+                ),
+            )
+        return PreflightOutcome(
+            matched=False, active_version=active, required_version=required,
+            provisioned=False, mismatch=True,
+            narration=(
+                f"{header}\n→ could not provision Python {required} "
+                f"(uv + apt exhausted); continuing on Python {active or 'unknown'} — "
+                "the verdict will record python_version_mismatch"
+            ),
+        )
+
+    @staticmethod
+    def _constraint_satisfied(active: Optional[str], constraint: Optional[str]) -> bool:
+        """The active interpreter may satisfy the raw constraint without being
+        the resolved newest (e.g. 3.12 for '>=3.9'): the pre-flight guarantees
+        requirements, it does not chase the newest interpreter."""
+        if not active or not constraint:
+            return False
+        return resolve_python_version(constraint, [active]) == active
+
+    def _venv_path(self) -> str:
+        """Project venv from the analyzer manifest; /workspace/.venv fallback."""
+        return read_build_requirements(self.orchestrator).get("python_venv") or "/workspace/.venv"
+
+    def _provision(self, version: str, venv: str) -> Optional[str]:
+        """uv -> apt ladder; returns the rung name on success, None on failure."""
+        if self._uv_available() and self._uv_provision(version, venv):
+            return "uv"
+        if self._apt_provision(version, venv):
+            return "apt"
+        return None
+
+    def _uv_available(self) -> bool:
+        probe = self.orchestrator.execute_command(f"{_UV_PATH}; command -v uv")
+        if probe.get("success"):
+            return True
+        install = self.orchestrator.execute_command(_UV_INSTALL)
+        if not install.get("success"):
+            return False
+        probe = self.orchestrator.execute_command(f"{_UV_PATH}; command -v uv")
+        return bool(probe.get("success"))
+
+    def _uv_provision(self, version: str, venv: str) -> bool:
+        install = self.orchestrator.execute_command(
+            f"{_UV_PATH}; uv python install {version}"
+        )
+        if not install.get("success"):
+            return False
+        made = self.orchestrator.execute_command(
+            f"{_UV_PATH}; uv venv --python {version} {venv}"
+        )
+        return bool(made.get("success"))
+
+    def _apt_provision(self, version: str, venv: str) -> bool:
+        apt = self.orchestrator.execute_command(
+            f"DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1; "
+            f"DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            f"python{version}-venv python{version}"
+        )
+        if not apt.get("success"):
+            return False
+        made = self.orchestrator.execute_command(f"python{version} -m venv {venv}")
+        return bool(made.get("success"))
+
+
+# pip's version-shaped rejections, in match priority. Each captures the
+# Requires-Python constraint; the interpreter to provision is the newest
+# supported CPython satisfying it (spec Component 1 policy, via
+# resolve_python_version). A bare SyntaxError is deliberately NOT classified:
+# it cannot distinguish "needs a newer interpreter" from "broken source".
+_PIP_REQUIRES_PYTHON_PATTERNS = [
+    # "requires a different Python: 3.8.10 not in '>=3.10'"
+    re.compile(r"requires a different Python:\s*[\d.]+\s+not in\s+['\"]([^'\"]+)['\"]"),
+    # "... 24.2 Requires-Python >=3.10; ..." / metadata "Requires-Python: >=3.10"
+    re.compile(r"Requires-Python[:\s]\s*([^;\n]+)"),
+]
+
+
+def classify_python_version_error(output: str) -> Optional[str]:
+    """Extract the Python major.minor a failed pip install says it needs.
+
+    Only pip's explicit Requires-Python rejections are actionable; anything
+    non-version-shaped (including bare SyntaxErrors) returns None so the
+    bounded retry never fires on ambiguity."""
+    if not output:
+        return None
+    for pattern in _PIP_REQUIRES_PYTHON_PATTERNS:
+        match = pattern.search(output)
+        if match:
+            return resolve_python_version(match.group(1).strip())
     return None
