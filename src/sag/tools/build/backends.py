@@ -42,6 +42,11 @@ class MavenBackend:
         kwargs: Dict[str, Any] = {
             "command": self.VERBS[verb],
             "working_directory": working_directory,
+            # Single pre-flight ownership: the facade (BuildTool.execute) runs
+            # the JDK pre-flight, bounded retry and [scope] narration BEFORE
+            # delegating here; the internal tool must not run them again
+            # (duplicate probes, duplicate narration, a second rerun).
+            "_env_preflight": False,
         }
         # --fail-at-end for every reactor-building verb (not just test): one pass
         # builds ALL modules and reports every module's failure at once, instead
@@ -105,6 +110,9 @@ class GradleBackend:
         kwargs: Dict[str, Any] = {
             "tasks": self.VERBS[verb],
             "working_directory": working_directory,
+            # Single pre-flight ownership: the facade owns pre-flight/retry/
+            # [scope] on this path (see MavenBackend.run).
+            "_env_preflight": False,
         }
         # Gradle's equivalent of Maven --fail-at-end is --continue (set via
         # fail_at_end=True): build every subproject in one pass and report all

@@ -56,6 +56,8 @@ class GradleTool(BaseTool):
         configure_on_demand: bool = False,  # Gradle-specific optimization
         build_cache: bool = True,  # Gradle-specific: use build cache
         fail_at_end: bool = False,  # Continue execution after failures
+        *,
+        _env_preflight: bool = True,
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.
@@ -108,30 +110,40 @@ class GradleTool(BaseTool):
             logger.debug(f"Gradle working directory fallback skipped: {_e}")
 
         # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
+        # Single-ownership rule: the consolidated build facade (BuildTool)
+        # runs the pre-flight, the bounded retry and the [scope] narration on
+        # its path and passes _env_preflight=False; only direct callers (e.g.
+        # tool_recovery's delegate path) keep the guarantee here. Exactly one
+        # layer probes the container — and reruns — per build.
         preamble_lines: List[str] = []
-        requirements = read_build_requirements(self.orchestrator)
-        outcome = JdkPreflight(self.orchestrator).run(
-            requirements.get("java_version"),
-            source=requirements.get("java_version_source") or "unknown",
-        )
-        if outcome.narration:
-            preamble_lines.append(outcome.narration)
-
-        # [scope] warning ONLY for explicit narrowing (spec §3). Working-
-        # directory defaulting lives in the orchestration layer (PR #12); the
-        # tool never re-targets and never mutates fail_at_end on its own.
-        recommended_root = (requirements.get("build_root") or "").rstrip("/")
-        if (
-            explicitly_scoped
-            and requirements.get("root_shape") == "healthy_reactor"
-            and recommended_root
-            and (working_directory or "").rstrip("/") != recommended_root
-        ):
-            preamble_lines.append(
-                "[scope] narrower than the recommended reactor root "
-                f"({recommended_root}) — sibling deps may be unresolved; "
-                "tests outside this module will not run"
+        outcome = None
+        if _env_preflight:
+            requirements = read_build_requirements(self.orchestrator)
+            outcome = JdkPreflight(self.orchestrator).run(
+                requirements.get("java_version"),
+                source=requirements.get("java_version_source") or "unknown",
             )
+            if outcome.narration:
+                preamble_lines.append(outcome.narration)
+
+            # [scope] warning ONLY for explicit narrowing (spec §3), with the
+            # facade's semantics: an explicit working_directory strictly
+            # DEEPER than a healthy reactor's recommended build root.
+            # Working-directory defaulting lives in the orchestration layer
+            # (PR #12); the tool never re-targets and never mutates
+            # fail_at_end on its own.
+            recommended_root = (requirements.get("build_root") or "").rstrip("/")
+            if (
+                explicitly_scoped
+                and requirements.get("root_shape") == "healthy_reactor"
+                and recommended_root
+                and (working_directory or "").rstrip("/").startswith(recommended_root + "/")
+            ):
+                preamble_lines.append(
+                    "[scope] narrower than the recommended reactor root "
+                    f"({recommended_root}) — sibling deps may be unresolved; "
+                    "tests outside this module will not run"
+                )
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         resolved_gradle = self._resolve_gradle_executable(
@@ -260,10 +272,13 @@ class GradleTool(BaseTool):
 
             # Bounded retry: a version-shaped failure means the requirement in
             # the error text is authoritative; re-provision from it and rerun
-            # ONCE (spec §1c: exactly one retry, never more).
+            # ONCE (spec §1c: exactly one retry, never more). Owned by the
+            # facade on the facade path (outcome is None there): a retry on
+            # BOTH layers would mean two version-driven reruns per build.
             jdk_retry_meta = None
             if (
-                result.get("exit_code") != 0
+                outcome is not None
+                and result.get("exit_code") != 0
                 and not result.get("dispatch_status")
                 and not result.get("termination_reason")
             ):

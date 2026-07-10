@@ -6,9 +6,15 @@ OBSERVATION text because the narration IS the feature
 (transparency-by-construction). The donor branch wired this into the internal
 MavenTool/GradleTool; here the consolidated build facade is the hot path.
 
+Single pre-flight ownership: the facade runs pre-flight/bounded-retry/[scope]
+and passes _env_preflight=False to the internal tools, so exactly ONE layer
+probes the container — and reruns — per build. The internal tools keep the
+guarantee only for direct callers (tool_recovery's delegate path).
+
 PR #12's orchestration layer owns working-directory injection, so the facade
 adds NO workdir defaulting — only the [scope] warning when the model
-EXPLICITLY narrows below a healthy reactor's recommended build root.
+EXPLICITLY narrows below a healthy reactor's recommended build root (or, for
+maven, passes a -pl module selection).
 """
 
 import json
@@ -213,6 +219,59 @@ def test_no_scope_warning_when_workdir_resolved_by_detection_fallback():
     assert "[scope]" not in (result.output or "")
 
 
+def test_scope_warning_for_pl_token_in_args():
+    # -pl is a maven module selection: a [scope] narrowing even at the root.
+    orch = ScriptedOrch(java="17", manifest={"java_version": "17"})
+    result = _tool(orch).execute(
+        action="test", args="-pl core", working_directory="/workspace/proj"
+    )
+    assert "[scope]" in (result.output or "")
+
+
+def test_scope_warning_for_pl_equals_form():
+    orch = ScriptedOrch(java="17", manifest={"java_version": "17"})
+    result = _tool(orch).execute(
+        action="test", args="-pl=core -am", working_directory="/workspace/proj"
+    )
+    assert "[scope]" in (result.output or "")
+
+
+def test_no_scope_warning_for_pl_substring_lookalike():
+    # '-pl' must be a token match, not a substring: '--no-plugin-updates'
+    # contains '-pl' but selects no modules.
+    orch = ScriptedOrch(java="17", manifest={"java_version": "17"})
+    result = _tool(orch).execute(
+        action="test", args="--no-plugin-updates", working_directory="/workspace/proj"
+    )
+    assert "[scope]" not in (result.output or "")
+
+
+def test_backends_delegate_with_env_preflight_disabled():
+    # Single ownership: the facade already ran the pre-flight, so the
+    # backends must tell the internal tools to skip theirs.
+    maven = ScriptedBackendTool()
+    gradle = ScriptedBackendTool()
+    orch = ScriptedOrch(
+        java="17",
+        manifest={"java_version": "17"},
+        markers=("/workspace/proj/pom.xml",),
+    )
+    _tool(orch, maven=maven, gradle=gradle).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    assert maven.calls[0]["_env_preflight"] is False
+
+    orch = ScriptedOrch(
+        java="17",
+        manifest={"java_version": "17"},
+        markers=("/workspace/proj/build.gradle",),
+    )
+    _tool(orch, maven=maven, gradle=gradle).execute(
+        action="test", working_directory="/workspace/proj"
+    )
+    assert gradle.calls[0]["_env_preflight"] is False
+
+
 def test_deps_action_skips_preflight():
     orch = ScriptedOrch(java="11", manifest={"java_version": "17"})
     result = _tool(orch).execute(action="deps", working_directory="/workspace/proj")
@@ -240,13 +299,14 @@ def test_gradle_version_error_single_retry(monkeypatch):
 
 # --- Internal MavenTool/GradleTool wiring (donor port) ----------------------
 #
-# The same pre-flight + bounded retry guards the internal tools for agents
-# that reach maven/gradle directly instead of through the consolidated
-# facade. The donor's workdir re-targeting ("defaulting to the recommended
-# reactor root") and its auto fail_at_end/--continue mutations are NOT
-# ported: PR #12's orchestration-layer injection and the BuildTool backends
-# own those. Kept: narration prepend, bounded retry, and the [scope] warning
-# for EXPLICITLY narrowed working directories.
+# The same pre-flight + bounded retry guards the internal tools ONLY for
+# direct callers (tool_recovery resolves the backend delegates and calls
+# safe_execute directly). On the facade path the backends pass
+# _env_preflight=False and the internal tools run NO probes, NO narration and
+# NO retry — the facade owns all of it (single pre-flight ownership). The
+# donor's workdir re-targeting ("defaulting to the recommended reactor
+# root") and its auto fail_at_end/--continue mutations are NOT ported: PR
+# #12's orchestration-layer injection and the BuildTool backends own those.
 
 
 class MavenScriptedOrch:
@@ -382,6 +442,52 @@ def test_maven_tool_pl_flag_warns_about_narrowed_scope():
     assert "[scope]" in (result.output or "")
 
 
+def test_maven_tool_pl_detection_is_a_token_match():
+    # '--no-plugin-updates' contains '-pl' but selects no modules: no [scope].
+    orch = MavenScriptedOrch(java="17", manifest={"java_version": "17"})
+    result = _internal_maven_tool(orch).execute(
+        command="test",
+        working_directory="/workspace/proj",
+        extra_args="--no-plugin-updates",
+    )
+    assert "[scope]" not in (result.output or "")
+
+
+def test_maven_tool_env_preflight_false_runs_no_probes():
+    # Facade path: the backend passes _env_preflight=False, so the internal
+    # tool must not re-probe the container (no manifest cat, no java
+    # -version) and must not narrate.
+    orch = MavenScriptedOrch(java="11", manifest={"java_version": "17"})
+    result = _internal_maven_tool(orch).execute(
+        command="compile", working_directory="/workspace/proj", _env_preflight=False
+    )
+    assert not any("java -version" in c for c in orch.commands)
+    assert not any(REQUIREMENTS_PATH in c for c in orch.commands)
+    assert "[pre-flight]" not in (result.output or "")
+    assert "[scope]" not in (result.output or "")
+
+
+def test_maven_tool_env_preflight_false_never_retries(monkeypatch):
+    # A version-shaped failure on the facade path is the FACADE's retry to
+    # make; the internal tool reruns nothing.
+    _patch_provision(monkeypatch)
+    orch = MavenScriptedOrch(java="11", manifest={},
+                             build_output=ENFORCER_FAIL, build_ok=False)
+    result = _internal_maven_tool(orch).execute(
+        command="compile", working_directory="/workspace/proj", _env_preflight=False
+    )
+    assert len(_mvn_runs(orch, "compile")) == 1
+    assert "retry 1/1" not in (result.output or "")
+    assert "jdk_retry" not in (result.metadata or {})
+
+
+def test_maven_tool_schema_does_not_expose_env_preflight():
+    # _env_preflight is plumbing between the facade and its backends, never a
+    # model-facing parameter.
+    schema = MavenTool(MavenScriptedOrch()).get_parameter_schema()
+    assert "_env_preflight" not in schema.get("properties", {})
+
+
 class GradleScriptedOrch(MavenScriptedOrch):
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
@@ -462,3 +568,115 @@ def test_gradle_tool_no_auto_continue_mutation_on_healthy_reactor():
     _internal_gradle_tool(orch).execute(command="build", working_directory="/workspace/proj")
     runs = _gradle_runs(orch, "build")
     assert runs and "--continue" not in runs[0]
+
+
+def test_gradle_tool_env_preflight_false_runs_no_probes():
+    orch = GradleScriptedOrch(java="11", manifest={"java_version": "17"})
+    result = _internal_gradle_tool(orch).execute(
+        command="build", working_directory="/workspace/proj", _env_preflight=False
+    )
+    assert not any("java -version" in c for c in orch.commands)
+    assert not any(REQUIREMENTS_PATH in c for c in orch.commands)
+    assert "[pre-flight]" not in (result.output or "")
+    assert "[scope]" not in (result.output or "")
+
+
+def test_gradle_tool_env_preflight_false_never_retries(monkeypatch):
+    _patch_provision(monkeypatch)
+    fail = "Unsupported class file major version 61 ... class file version 61.0"
+    orch = GradleScriptedOrch(java="11", manifest={}, build_output=fail, build_ok=False)
+    result = _internal_gradle_tool(orch).execute(
+        command="build", working_directory="/workspace/proj", _env_preflight=False
+    )
+    assert len(_gradle_runs(orch, "build")) == 1
+    assert "retry 1/1" not in (result.output or "")
+
+
+# --- End-to-end: facade + REAL internal MavenTool (single-rerun bound) ------
+#
+# The regression this pins down: pre-flight/bounded-retry used to run on BOTH
+# layers, so a version-shaped failure could trigger one rerun per layer (two
+# total) plus duplicate container probes. Through the facade there must be
+# exactly ONE manifest read, and a version-driven failure must produce
+# exactly ONE rerun — counted on the actual mvn invocations.
+
+
+class EndToEndOrch(MavenScriptedOrch):
+    """MavenScriptedOrch that also answers the facade's marker probes and
+    scripts per-invocation mvn results (fail first, then whatever the script
+    says)."""
+
+    def __init__(self, mvn_results, **kwargs):
+        super().__init__(**kwargs)
+        # mvn_results: list of (ok, output); the last entry replays forever so
+        # a runaway retry loop shows up as extra counted runs, not IndexError.
+        self.mvn_results = list(mvn_results)
+
+    def execute_command(self, cmd, workdir=None, timeout=None):
+        if "&& echo exists || echo missing" in cmd:  # facade marker probe
+            self.commands.append(cmd)
+            exists = "pom.xml" in cmd
+            return {"success": True, "exit_code": 0,
+                    "output": "exists" if exists else "missing"}
+        if cmd.startswith("mvn"):
+            self.commands.append(cmd)
+            ok, output = (
+                self.mvn_results.pop(0)
+                if len(self.mvn_results) > 1
+                else self.mvn_results[0]
+            )
+            return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
+        return super().execute_command(cmd, workdir, timeout)
+
+
+def _e2e_build_tool(orch):
+    return BuildTool(orch, maven_tool=_internal_maven_tool(orch),
+                     gradle_tool=ScriptedBackendTool())
+
+
+def test_exactly_one_version_driven_rerun_end_to_end(monkeypatch):
+    _patch_provision(monkeypatch)
+    orch = EndToEndOrch(
+        [(False, ENFORCER_FAIL), (True, "BUILD SUCCESS")],
+        java="11", manifest={},
+    )
+    result = _e2e_build_tool(orch).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    mvn_runs = [c for c in orch.commands if c.startswith("mvn")]
+    assert len(mvn_runs) == 2                       # original + exactly one rerun
+    assert result.success
+    assert (result.output or "").count("retry 1/1") == 1
+    assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+
+
+def test_persistent_version_failure_stays_within_single_rerun_bound(monkeypatch):
+    # Two successive version-shaped failures must NOT yield a second rerun
+    # (the old two-layer wiring could rerun once per layer).
+    _patch_provision(monkeypatch)
+    orch = EndToEndOrch([(False, ENFORCER_FAIL)], java="11", manifest={})
+    result = _e2e_build_tool(orch).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    mvn_runs = [c for c in orch.commands if c.startswith("mvn")]
+    assert len(mvn_runs) == 2                       # bound: 1 original + 1 rerun
+    assert not result.success
+    assert (result.output or "").count("retry 1/1") == 1
+
+
+def test_end_to_end_single_manifest_probe(monkeypatch):
+    # Duplicate-probe regression: only the facade reads the requirements
+    # manifest; the internal MavenTool (facade path) must not re-read it.
+    _patch_provision(monkeypatch)
+    orch = EndToEndOrch(
+        [(True, "BUILD SUCCESS")], java="17", manifest={"java_version": "17"},
+    )
+    result = _e2e_build_tool(orch).execute(
+        action="compile", working_directory="/workspace/proj"
+    )
+    assert result.success
+    manifest_reads = [c for c in orch.commands if REQUIREMENTS_PATH in c]
+    assert len(manifest_reads) == 1
+    java_probes = [c for c in orch.commands if "java -version" in c]
+    assert len(java_probes) == 1                    # facade pre-flight only
+    assert (result.output or "").count("[pre-flight]") == 0  # matched: silent

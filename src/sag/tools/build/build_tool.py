@@ -1,6 +1,7 @@
 """build(action: deps|compile|test|package) — one tool over all ecosystems."""
 
 import posixpath
+import re
 import shlex
 from typing import Any, Dict, List, Optional
 
@@ -131,17 +132,29 @@ class BuildTool(BaseTool):
             if outcome.narration:
                 preamble_lines.append(outcome.narration)
 
+            # [scope] semantics live HERE (single ownership): warn only when
+            # the model explicitly narrows — a working_directory strictly
+            # DEEPER than a healthy reactor's recommended build root, or a
+            # Maven -pl module selection. -pl is a token match so
+            # '-plugin'-shaped args never trip it.
             build_root = (requirements.get("build_root") or "").rstrip("/")
-            if (
+            scoped_deeper = (
                 explicitly_scoped
                 and requirements.get("root_shape") == "healthy_reactor"
                 and build_root
                 and (working_directory or "").rstrip("/").startswith(build_root + "/")
-            ):
+            )
+            pl_scoped = system == "maven" and bool(
+                re.search(r"(^|\s)-pl(\s|=)", args or "")
+            )
+            if scoped_deeper or pl_scoped:
+                narrowed = (
+                    working_directory if scoped_deeper else f"-pl selection ({args})"
+                )
                 preamble_lines.append(
-                    f"[scope] {working_directory} is narrower than the recommended "
-                    f"reactor root ({build_root}) — sibling deps may be unresolved; "
-                    "tests outside this module will not run"
+                    f"[scope] {narrowed} is narrower than the recommended "
+                    f"reactor root ({build_root or 'root'}) — sibling deps may be "
+                    "unresolved; tests outside this module will not run"
                 )
 
         inner = backend.run(verb, args, working_directory, timeout)

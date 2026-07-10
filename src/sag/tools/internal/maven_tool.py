@@ -86,6 +86,8 @@ class MavenTool(BaseTool):
         use_wrapper: bool = False,
         extra_args: str = None,
         maven_version_requirement: str = None,
+        *,
+        _env_preflight: bool = True,
     ) -> ToolResult:
         """
         Execute Maven commands with comprehensive error handling.
@@ -188,30 +190,41 @@ class MavenTool(BaseTool):
             logger.debug(f"Working directory fallback skipped: {_e}")
 
         # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
+        # Single-ownership rule: the consolidated build facade (BuildTool)
+        # runs the pre-flight, the bounded retry and the [scope] narration on
+        # its path and passes _env_preflight=False; only direct callers (e.g.
+        # tool_recovery's delegate path) keep the guarantee here. Exactly one
+        # layer probes the container — and reruns — per build.
         preamble_lines: List[str] = []
-        requirements = read_build_requirements(self.orchestrator)
-        outcome = JdkPreflight(self.orchestrator).run(
-            requirements.get("java_version"),
-            source=requirements.get("java_version_source") or "unknown",
-        )
-        if outcome.narration:
-            preamble_lines.append(outcome.narration)
-
-        # [scope] warning ONLY for explicit narrowing (spec §3). Working-
-        # directory defaulting lives in the orchestration layer (PR #12); the
-        # tool never re-targets and never mutates fail_at_end on its own.
-        recommended_root = (requirements.get("build_root") or "").rstrip("/")
-        if (
-            explicitly_scoped
-            and requirements.get("root_shape") == "healthy_reactor"
-            and recommended_root
-            and (working_directory or "").rstrip("/") != recommended_root
-        ) or ("-pl" in (extra_args or "")):
-            preamble_lines.append(
-                "[scope] narrower than the recommended reactor root "
-                f"({recommended_root or 'root'}) — sibling deps may be unresolved; "
-                "tests outside this module will not run"
+        outcome = None
+        if _env_preflight:
+            requirements = read_build_requirements(self.orchestrator)
+            outcome = JdkPreflight(self.orchestrator).run(
+                requirements.get("java_version"),
+                source=requirements.get("java_version_source") or "unknown",
             )
+            if outcome.narration:
+                preamble_lines.append(outcome.narration)
+
+            # [scope] warning ONLY for explicit narrowing (spec §3), with the
+            # facade's semantics: an explicit working_directory strictly
+            # DEEPER than a healthy reactor's recommended build root, or a
+            # -pl module selection (token match so '-plugin'-shaped args
+            # never trip it). Working-directory defaulting lives in the
+            # orchestration layer (PR #12); the tool never re-targets and
+            # never mutates fail_at_end on its own.
+            recommended_root = (requirements.get("build_root") or "").rstrip("/")
+            if (
+                explicitly_scoped
+                and requirements.get("root_shape") == "healthy_reactor"
+                and recommended_root
+                and (working_directory or "").rstrip("/").startswith(recommended_root + "/")
+            ) or re.search(r"(^|\s)-pl(\s|=)", extra_args or ""):
+                preamble_lines.append(
+                    "[scope] narrower than the recommended reactor root "
+                    f"({recommended_root or 'root'}) — sibling deps may be unresolved; "
+                    "tests outside this module will not run"
+                )
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         required_version = ToolVersionRequirement.from_raw(
@@ -405,10 +418,13 @@ class MavenTool(BaseTool):
 
             # Bounded retry: a version-shaped failure means the requirement in
             # the error text is authoritative; re-provision from it and rerun
-            # ONCE (spec §1c: exactly one retry, never more).
+            # ONCE (spec §1c: exactly one retry, never more). Owned by the
+            # facade on the facade path (outcome is None there): a retry on
+            # BOTH layers would mean two version-driven reruns per build.
             jdk_retry_meta = None
             if (
-                result.get("exit_code") != 0
+                outcome is not None
+                and result.get("exit_code") != 0
                 and not result.get("dispatch_status")
                 and not result.get("termination_reason")
             ):
