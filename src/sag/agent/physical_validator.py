@@ -48,6 +48,16 @@ from sag.testcases.catalog import (
     normalize_testcase_identifier,
 )
 
+# top_level.txt names that are install tooling, never the project under test —
+# filtered out of the imports-rung fallback (_installed_top_level_packages).
+_NON_PROJECT_TOP_LEVEL = {
+    "pip",
+    "setuptools",
+    "wheel",
+    "pkg_resources",
+    "_distutils_hack",
+}
+
 
 # In-container test-report parser (executed via `python3 - <<'PY'`). The two
 # header assignments (project_dir, pytest_reports_dir) are prepended by
@@ -2253,6 +2263,9 @@ class PhysicalValidator:
                     "ext_modules_ok",
                 )
             }
+            # Skipped-rung warnings (e.g. "imports rung skipped: ...") must be
+            # VISIBLE in the report, not a silent None in the details.
+            evidence["warnings"].extend(python_build.get("warnings") or [])
             logger.info(
                 f"Python evidence ladder: {evidence['fingerprint_details']}"
             )
@@ -2492,6 +2505,15 @@ class PhysicalValidator:
         PARTIAL (success=True, complete=False) with the failed rung named;
         every rung green is SUCCESS. Unknown rungs (no declared packages, no
         countable sources) stay None — never invented evidence.
+
+        Imports rung fallback (pyyaml re-probe bug #6): package_dir layouts
+        (``package_dir={'': 'lib'}``) can defeat static discovery, leaving the
+        manifest's python_packages empty. The imports check is the STRONGEST
+        evidence rung, so before skipping it the import targets are derived
+        from the venv itself — the installed distributions' top_level.txt
+        records (tooling names filtered). Only when that too yields nothing
+        does the rung stay None, and then the skip is a VISIBLE warning in
+        the evidence, never a silent hole in the report.
         """
         from sag.tools.internal.build_preflight import read_build_requirements
 
@@ -2508,6 +2530,7 @@ class PhysicalValidator:
             "success": False,
             "complete": False,
             "reason": "",
+            "warnings": [],
         }
 
         venv_probe = self._execute_command_with_logging(
@@ -2524,6 +2547,16 @@ class PhysicalValidator:
             f"{venv}/bin/pip check", "pip dependency check"
         )
         result["pip_check_clean"] = pip_check["success"]
+
+        if not packages:
+            # Fallback import targets from the venv's own installed
+            # top_level.txt records (see docstring); still honest — read
+            # from disk, never invented.
+            packages = self._installed_top_level_packages(venv)
+        if not packages:
+            result["warnings"].append(
+                "imports rung skipped: no importable package detected"
+            )
 
         if packages:
             failures = []
@@ -2604,6 +2637,24 @@ class PhysicalValidator:
                 f"{imported}, {coverage_note}"
             )
         return result
+
+    def _installed_top_level_packages(self, venv: str) -> List[str]:
+        """Import targets from the installed distributions' top_level.txt
+        records (the editable/local install's dist-info) when the manifest
+        declares no packages. Tooling names are filtered so pip/setuptools
+        are never probed as project evidence; empty when nothing real."""
+        probe = self._execute_command_with_logging(
+            f"find {venv}/lib/python*/site-packages -maxdepth 2 "
+            f"-name 'top_level.txt' -exec cat {{}} + 2>/dev/null",
+            "reading installed top_level.txt",
+        )
+        packages: List[str] = []
+        for line in (probe.get("output") or "").splitlines():
+            name = line.strip()
+            if not name or name in _NON_PROJECT_TOP_LEVEL or name in packages:
+                continue
+            packages.append(name)
+        return sorted(packages)
 
     def _python_package_dirs(self, project_dir: str, packages: List[str]) -> List[str]:
         """Package source dirs, src-layout probed before flat layout; the

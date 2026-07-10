@@ -123,12 +123,88 @@ def detect_installer(files_present) -> Dict[str, Any]:
     return {"installer": "pip", "commands": [], "source": None}
 
 
+# package_dir root mapping ({'': '<dir>'}): the project's own declaration of
+# where its import packages live (pyyaml's lib/ layout). Only the '' root key
+# relocates the probe base; named per-package mappings are ignored.
+_SETUP_PY_PKG_DIR = re.compile(
+    r"package_dir\s*=\s*\{[^}]*?(['\"])\1\s*:\s*['\"]([^'\"]+)['\"]"
+)
+_PYPROJECT_PKG_DIR_INLINE = re.compile(
+    r"package-dir\s*=\s*\{[^}]*?(['\"])\1\s*=\s*['\"]([^'\"]+)['\"]"
+)
+_PYPROJECT_PKG_DIR_TABLE = re.compile(
+    r"\[tool\.setuptools\.package-dir\]([^\[]*)"
+)
+_PYPROJECT_PKG_DIR_ROOT_KEY = re.compile(
+    r"^\s*(['\"])\1\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE
+)
+
+
+def package_dir_from_setup_py(content: str) -> Optional[str]:
+    """The ``package_dir={'': '<dir>'}`` root mapping, or None."""
+    m = _SETUP_PY_PKG_DIR.search(content or "")
+    return m.group(2).strip() or None if m else None
+
+
+def package_dir_from_setup_cfg(content: str) -> Optional[str]:
+    """The ``[options] package_dir`` root mapping (``= <dir>`` line), or None."""
+    for line in _ini_section(content or "", "options").get("package_dir", []):
+        stripped = line.strip()
+        if stripped.startswith("="):
+            value = stripped[1:].strip()
+            if value:
+                return value
+    return None
+
+
+def package_dir_from_pyproject(content: str) -> Optional[str]:
+    """The ``[tool.setuptools] package-dir`` root mapping, inline dict or
+    ``[tool.setuptools.package-dir]`` table form, or None."""
+    content = content or ""
+    m = _PYPROJECT_PKG_DIR_INLINE.search(content)
+    if m:
+        return m.group(2).strip() or None
+    table = _PYPROJECT_PKG_DIR_TABLE.search(content)
+    if table:
+        m = _PYPROJECT_PKG_DIR_ROOT_KEY.search(table.group(1))
+        if m:
+            return m.group(2).strip() or None
+    return None
+
+
+def _declared_package_dir(orchestrator, root: str) -> Optional[str]:
+    """The declared package_dir root ('' key) from setup.py / setup.cfg /
+    pyproject.toml, normalized ('.'/'' -> None: that IS the flat layout)."""
+    readers = (
+        ("setup.py", package_dir_from_setup_py),
+        ("setup.cfg", package_dir_from_setup_cfg),
+        ("pyproject.toml", package_dir_from_pyproject),
+    )
+    for name, parse in readers:
+        result = orchestrator.execute_command(f"cat {root}/{name} 2>/dev/null")
+        mapped = parse(result.get("output") or "")
+        if mapped:
+            mapped = mapped.strip().strip("/")
+            if mapped and mapped != ".":
+                return mapped
+    return None
+
+
 def discover_packages(orchestrator, project_dir: str) -> List[str]:
-    """Top-level import packages: src-layout (``src/<pkg>/__init__.py``)
-    first, then flat layout (``<pkg>/__init__.py``), excluding
-    tests/docs/examples. Empty when nothing is found — never invented."""
+    """Top-level import packages: the project's declared package_dir mapping
+    (``package_dir={'': 'lib'}`` — pyyaml-style layouts) first, then
+    src-layout (``src/<pkg>/__init__.py``), then flat layout
+    (``<pkg>/__init__.py``), excluding tests/docs/examples. Empty when
+    nothing is found — never invented."""
     root = project_dir.rstrip("/")
-    for base in (f"{root}/src", root):
+    bases = [f"{root}/src", root]
+    mapped = _declared_package_dir(orchestrator, root)
+    if mapped:
+        mapped_base = f"{root}/{mapped}"
+        if mapped_base in bases:
+            bases.remove(mapped_base)
+        bases.insert(0, mapped_base)
+    for base in bases:
         result = orchestrator.execute_command(
             f"find {base} -maxdepth 2 -name __init__.py -not -path '*/.*' 2>/dev/null"
         )
