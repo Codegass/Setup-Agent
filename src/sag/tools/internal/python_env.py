@@ -180,6 +180,63 @@ def package_dir_from_pyproject(content: str) -> Optional[str]:
     return None
 
 
+# The project's own declared distribution name ([project].name /
+# [tool.poetry].name / setup(name=...)), used ONLY to rank flat-layout
+# candidates (apache/libcloud bug #8): a top-level dir whose import-normalized
+# name matches the project name IS the project package, and sibling
+# repo-support dirs (contrib/, demos/, integration/) that happen to carry an
+# __init__.py are dropped. A heuristic, never a deny-list — the validator's
+# installed-record gate is the guarantee.
+_PYPROJECT_NAME_SECTION = re.compile(
+    r"^\[(?:project|tool\.poetry)\]\s*$(.*?)(?=^\[|\Z)", re.MULTILINE | re.DOTALL
+)
+_NAME_KEY = re.compile(r"^\s*name\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
+_SETUP_PY_NAME = re.compile(r"\bname\s*=\s*['\"]([^'\"]+)['\"]")
+
+
+def project_name_from_pyproject(content: str) -> Optional[str]:
+    """The ``name`` key of ``[project]`` (PEP 621) or ``[tool.poetry]``, or
+    None. A ``name`` key in any other table is never the project name."""
+    for section in _PYPROJECT_NAME_SECTION.finditer(content or ""):
+        m = _NAME_KEY.search(section.group(1))
+        if m:
+            return m.group(1).strip() or None
+    return None
+
+
+def project_name_from_setup_py(content: str) -> Optional[str]:
+    """The ``setup(name=...)`` distribution name, or None. Full-line ``#``
+    comments are dropped first (same limitation notes as
+    package_dir_from_setup_py)."""
+    live = "\n".join(
+        line
+        for line in (content or "").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    m = _SETUP_PY_NAME.search(live)
+    return m.group(1).strip() or None if m else None
+
+
+def _import_normalized(name: str) -> str:
+    """Distribution/dir name in import-name form: lowercase, ``-``/``.``
+    runs collapsed to ``_`` (apache-libcloud -> apache_libcloud)."""
+    return re.sub(r"[-.]+", "_", (name or "").strip().lower())
+
+
+def _declared_project_name(orchestrator, root: str) -> Optional[str]:
+    """The declared project name from pyproject.toml, else setup.py."""
+    readers = (
+        ("pyproject.toml", project_name_from_pyproject),
+        ("setup.py", project_name_from_setup_py),
+    )
+    for filename, parse in readers:
+        result = orchestrator.execute_command(f"cat {root}/{filename} 2>/dev/null")
+        name = parse(result.get("output") or "")
+        if name:
+            return name
+    return None
+
+
 def _declared_package_dir(orchestrator, root: str) -> Optional[str]:
     """The declared package_dir root ('' key) from setup.py / setup.cfg /
     pyproject.toml, normalized ('.'/'' -> None: that IS the flat layout)."""
@@ -203,7 +260,15 @@ def discover_packages(orchestrator, project_dir: str) -> List[str]:
     (``package_dir={'': 'lib'}`` — pyyaml-style layouts) first, then
     src-layout (``src/<pkg>/__init__.py``), then flat layout
     (``<pkg>/__init__.py``), excluding tests/docs/examples. Empty when
-    nothing is found — never invented."""
+    nothing is found — never invented.
+
+    Flat-layout ranking (apache/libcloud bug #8): a repo root can carry
+    __init__.py in dirs that are NOT the project (contrib/, demos/,
+    integration/, pylint_plugins/). When a flat candidate's import-normalized
+    name matches the declared project name, that match IS the project and the
+    non-matching candidates are dropped; without a name-match every candidate
+    is kept (heuristic only — the validator's installed-record gate is the
+    guarantee). src-layout and package_dir bases are never ranked."""
     root = project_dir.rstrip("/")
     bases = [f"{root}/src", root]
     mapped = _declared_package_dir(orchestrator, root)
@@ -227,6 +292,16 @@ def discover_packages(orchestrator, project_dir: str) -> List[str]:
             if name not in packages:
                 packages.append(name)
         if packages:
+            if base == root and len(packages) > 1:
+                declared = _declared_project_name(orchestrator, root)
+                if declared:
+                    wanted = _import_normalized(declared)
+                    matches = [
+                        name for name in packages
+                        if _import_normalized(name) == wanted
+                    ]
+                    if matches:
+                        packages = matches
             return sorted(packages)
     return []
 

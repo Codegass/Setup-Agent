@@ -2548,6 +2548,19 @@ class PhysicalValidator:
         project's own record yields nothing does the rung stay None, and then
         the skip is a VISIBLE warning in the evidence, never a silent hole in
         the report.
+
+        Installed-record gate (apache/libcloud false-BLOCKED bug #8): the
+        project's own installed top-level names gate the import targets
+        ALWAYS, not only when the manifest is empty. Discovery's flat-layout
+        probe happily lists repo-support dirs (contrib/, demos/,
+        integration/, pylint_plugins/ — each carries an __init__.py) that
+        were never installed, and one such junk name used to fail the whole
+        rung. Targets are manifest ∩ installed when that intersection is
+        non-empty, else the installed names alone; junk manifest names
+        surface as a "discovered but not installed" warning instead of a
+        false BLOCKED. Only when NOTHING of the project is installed do the
+        manifest packages keep today's semantics — their import failure is
+        then real evidence.
         """
         from sag.tools.internal.build_preflight import read_build_requirements
 
@@ -2582,11 +2595,26 @@ class PhysicalValidator:
         )
         result["pip_check_clean"] = pip_check["success"]
 
-        if not packages:
-            # Fallback import targets from the PROJECT's own installed
-            # top_level.txt record (see docstring); still honest — read
-            # from disk, never invented, never a dependency's record.
-            packages = self._installed_top_level_packages(venv, project_dir)
+        # The PROJECT's own installed top_level.txt record gates the import
+        # targets ALWAYS (bug #8, see docstring); still honest — read from
+        # disk, never invented, never a dependency's record.
+        installed = self._installed_top_level_packages(venv, project_dir)
+        if packages and installed:
+            matched = [name for name in packages if name in installed]
+            junk = sorted(name for name in packages if name not in installed)
+            if junk:
+                result["warnings"].append(
+                    "discovered but not installed: " + ", ".join(junk)
+                    + " — skipped by the imports rung (not in the project's "
+                    "installed record)"
+                )
+            packages = matched or installed
+        elif not packages:
+            # Empty manifest (package_dir layouts, bug #6): the installed
+            # record is the fallback source of import targets.
+            packages = installed
+        # else: nothing of the project installed — keep the manifest packages
+        # and today's semantics (their import failure is real evidence).
         if not packages:
             result["warnings"].append(
                 "imports rung skipped: no importable package detected"

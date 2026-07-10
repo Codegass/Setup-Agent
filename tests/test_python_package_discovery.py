@@ -21,6 +21,15 @@ validator's imports rung — the STRONGEST evidence rung — silently vanished
 (c) nothing importable at all -> imports_ok stays None BUT the skip surfaces
     as a visible warning in the build evidence, never silently.
 
+Bug #8 (apache/libcloud live probe) extends (a) into an ALWAYS-on gate: the
+flat-layout probe listed repo-support dirs (contrib/, demos/, integration/,
+pylint_plugins/ — each carries an __init__.py) as manifest packages, none of
+them was ever installed, and the imports rung required ALL manifest names ->
+false BLOCKED on a good build. Covered at the end of this file: import
+targets are manifest ∩ installed (else installed alone; else manifest as
+before), junk names warn instead of blocking, and discover_packages ranks
+flat-layout candidates by the declared project name.
+
 Scripted-orchestrator house style: tests/test_python_verifier.py.
 """
 
@@ -37,6 +46,8 @@ from sag.tools.internal.python_env import (
     package_dir_from_pyproject,
     package_dir_from_setup_cfg,
     package_dir_from_setup_py,
+    project_name_from_pyproject,
+    project_name_from_setup_py,
 )
 
 _TOOLING_NAMES = ("pip", "setuptools", "wheel", "pkg_resources", "_distutils_hack")
@@ -316,14 +327,22 @@ def test_top_level_fallback_failed_import_still_blocks():
     assert sorted(details["import_failures"]) == ["_yaml", "yaml"]
 
 
-def test_manifest_packages_still_win_over_fallback():
+def test_installed_record_outranks_a_disjoint_manifest():
+    # Bug #8 flips the old "manifest wins" rule: the installed record is now
+    # ALWAYS consulted. A manifest name with no installed counterpart is a
+    # junk discovery; with no intersection at all, the installed names ARE
+    # the import targets and the junk surfaces as a visible warning.
     orch = TopLevelOrch(manifest=_manifest(python_packages=["declared"]))
-    _validate(orch)
+    result = _validate(orch)
     imports = _import_commands(orch)
-    assert any('"import declared"' in c for c in imports)
-    assert not any('"import yaml"' in c for c in imports)
-    # No fallback probe needed when the manifest already declares packages.
-    assert not any("top_level.txt" in c for c in orch.commands)
+    assert any('"import yaml"' in c for c in imports)
+    assert any('"import _yaml"' in c for c in imports)
+    assert not any('"import declared"' in c for c in imports)
+    assert any("top_level.txt" in c for c in orch.commands)
+    assert any(
+        "discovered but not installed" in w and "declared" in w
+        for w in result["evidence"]["warnings"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -532,3 +551,214 @@ def test_package_dir_parsers_ignore_named_package_mappings():
     assert package_dir_from_pyproject(
         '[tool.setuptools]\npackage-dir = {"yaml" = "lib/yaml"}\n'
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Bug #8 (apache/libcloud live probe): junk flat-layout discoveries must
+# never turn the imports rung into a false BLOCKED
+# ---------------------------------------------------------------------------
+
+# The live repro shape: repo-support dirs each carry an __init__.py, so
+# discovery listed them as manifest packages; only the real package was ever
+# installed (its record's top_level.txt says so).
+_LIBCLOUD_JUNK = ["contrib", "demos", "integration", "pylint_plugins"]
+_LIBCLOUD_DIST = _dist(
+    "apache_libcloud-3.8.0.dist-info",
+    "libcloud\n",
+    direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
+)
+
+
+def test_libcloud_junk_discoveries_warn_but_never_block():
+    # (a) manifest ∩ installed drives the rung: only libcloud is probed, it
+    # imports fine, and the junk names surface as a warning — verdict NOT
+    # blocked (the live run said BLOCKED on contrib/demos/integration/
+    # pylint_plugins, none of which was ever installed).
+    orch = TopLevelOrch(
+        dists=[_LIBCLOUD_DIST] + _DEP_DISTS + _TOOLING_DISTS,
+        manifest=_manifest(python_packages=_LIBCLOUD_JUNK + ["libcloud"]),
+    )
+    result = _validate(orch)
+    imports = _import_commands(orch)
+    assert any('"import libcloud"' in c for c in imports)
+    assert len(imports) == 1  # junk names are never import-probed
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is True
+    assert details["import_failures"] == []
+    assert result["success"] is True
+    assert result["evidence_status"] != "blocked"
+    warning = next(
+        w for w in result["evidence"]["warnings"]
+        if "discovered but not installed" in w
+    )
+    for name in _LIBCLOUD_JUNK:
+        assert name in warning
+    assert "libcloud," not in warning  # the real package is not junk
+
+
+def test_all_junk_manifest_falls_back_to_installed_names():
+    # (b) empty intersection: the installed project names alone are the
+    # import targets.
+    orch = TopLevelOrch(
+        dists=[_LIBCLOUD_DIST] + _DEP_DISTS + _TOOLING_DISTS,
+        manifest=_manifest(python_packages=list(_LIBCLOUD_JUNK)),
+    )
+    result = _validate(orch)
+    imports = _import_commands(orch)
+    assert any('"import libcloud"' in c for c in imports)
+    assert len(imports) == 1
+    assert result["evidence"]["fingerprint_details"]["imports_ok"] is True
+    assert result["evidence_status"] != "blocked"
+
+
+def test_nothing_installed_keeps_manifest_import_semantics():
+    # (c) no project record in site-packages at all: manifest packages remain
+    # the import targets exactly as before — their failure is real evidence
+    # (the environment truly is unusable), never masked by the gate.
+    orch = TopLevelOrch(
+        dists=[],
+        manifest=_manifest(python_packages=["libcloud"]),
+        import_ok=False,
+    )
+    result = _validate(orch)
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is False
+    assert details["import_failures"] == ["libcloud"]
+
+
+def test_fully_installed_manifest_needs_no_junk_warning():
+    # Clean intersection (every manifest name installed): no junk warning,
+    # both names probed.
+    orch = TopLevelOrch(manifest=_manifest(python_packages=["yaml", "_yaml"]))
+    result = _validate(orch)
+    imports = _import_commands(orch)
+    assert len(imports) == 2
+    assert not any(
+        "discovered but not installed" in w
+        for w in result["evidence"]["warnings"]
+    )
+    assert result["evidence"]["fingerprint_details"]["imports_ok"] is True
+
+
+def test_failed_import_of_an_installed_package_still_blocks():
+    # The gate weakens nothing: an INSTALLED project package that fails to
+    # import is still a real BLOCKED.
+    orch = TopLevelOrch(
+        dists=[_LIBCLOUD_DIST] + _DEP_DISTS + _TOOLING_DISTS,
+        manifest=_manifest(python_packages=_LIBCLOUD_JUNK + ["libcloud"]),
+        failing_imports={"libcloud"},
+    )
+    result = _validate(orch)
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    assert result["evidence"]["fingerprint_details"]["import_failures"] == [
+        "libcloud"
+    ]
+
+
+# ---------------------------------------------------------------------------
+# (d) discover_packages ranks flat-layout candidates by the declared name
+# ---------------------------------------------------------------------------
+
+_LIBCLOUD_FLAT_FIND = "".join(
+    f"/workspace/libcloud/{name}/__init__.py\n"
+    for name in ("contrib", "demos", "integration", "pylint_plugins", "libcloud")
+)
+
+
+def test_discover_packages_flat_name_match_drops_junk_dirs():
+    orch = PackageDirOrch(
+        files={
+            "/workspace/libcloud/setup.py": (
+                "setup(\n    name='libcloud',\n    packages=['libcloud'],\n)\n"
+            )
+        },
+        find_outputs={"/workspace/libcloud": _LIBCLOUD_FLAT_FIND},
+    )
+    assert discover_packages(orch, "/workspace/libcloud") == ["libcloud"]
+
+
+def test_discover_packages_flat_name_match_is_import_normalized():
+    # Distribution names use '-', import dirs use '_': My-Lib ~ my_lib.
+    orch = PackageDirOrch(
+        files={"/workspace/mylib/pyproject.toml": '[project]\nname = "My-Lib"\n'},
+        find_outputs={
+            "/workspace/mylib": (
+                "/workspace/mylib/my_lib/__init__.py\n"
+                "/workspace/mylib/contrib/__init__.py\n"
+            )
+        },
+    )
+    assert discover_packages(orch, "/workspace/mylib") == ["my_lib"]
+
+
+def test_discover_packages_without_name_match_keeps_all_candidates():
+    # apache-libcloud normalizes to apache_libcloud — no flat dir matches, so
+    # every candidate is kept (a heuristic, never a deny-list; the
+    # validator's installed-record gate is the guarantee, see above).
+    orch = PackageDirOrch(
+        files={
+            "/workspace/libcloud/setup.py": "setup(name='apache-libcloud')\n"
+        },
+        find_outputs={"/workspace/libcloud": _LIBCLOUD_FLAT_FIND},
+    )
+    assert discover_packages(orch, "/workspace/libcloud") == [
+        "contrib", "demos", "integration", "libcloud", "pylint_plugins",
+    ]
+
+
+def test_discover_packages_src_layout_is_never_ranked():
+    # src-layout behavior unchanged: no ranking, both packages kept even
+    # though only one matches the declared name.
+    orch = PackageDirOrch(
+        files={"/workspace/proj/pyproject.toml": '[project]\nname = "foo"\n'},
+        find_outputs={
+            "/workspace/proj/src": (
+                "/workspace/proj/src/foo/__init__.py\n"
+                "/workspace/proj/src/foo_helpers/__init__.py\n"
+            )
+        },
+    )
+    assert discover_packages(orch, "/workspace/proj") == ["foo", "foo_helpers"]
+
+
+def test_discover_packages_single_flat_candidate_survives_name_mismatch():
+    # A lone flat candidate is kept even when it does not match the declared
+    # name — ranking only ever DROPS junk next to a name-match, it never
+    # empties the discovery.
+    orch = PackageDirOrch(
+        files={
+            "/workspace/proj/pyproject.toml": '[project]\nname = "something-else"\n'
+        },
+        find_outputs={"/workspace/proj": "/workspace/proj/bar/__init__.py\n"},
+    )
+    assert discover_packages(orch, "/workspace/proj") == ["bar"]
+
+
+# ---------------------------------------------------------------------------
+# project-name parsers (pure functions)
+# ---------------------------------------------------------------------------
+
+
+def test_project_name_parsers_extract_the_declared_name():
+    assert project_name_from_pyproject(
+        '[project]\nname = "apache-libcloud"\nversion = "3.8.0"\n'
+    ) == "apache-libcloud"
+    assert project_name_from_pyproject(
+        '[tool.poetry]\nname = "mylib"\n'
+    ) == "mylib"
+    assert project_name_from_setup_py("setup(\n    name='PyYAML',\n)") == "PyYAML"
+    assert project_name_from_setup_py(
+        "# name='old'\nsetup(name='new')"
+    ) == "new"
+
+
+def test_project_name_parsers_never_read_unrelated_keys():
+    # A name key outside [project]/[tool.poetry] is not the project name.
+    assert project_name_from_pyproject('[tool.other]\nname = "nope"\n') is None
+    assert project_name_from_pyproject("[project]\nversion = '1.0'\n") is None
+    # author_name= is not name= (word boundary), and no name at all is None.
+    assert project_name_from_setup_py("setup(author_name='x')") is None
+    assert project_name_from_setup_py("setup(packages=['x'])") is None
