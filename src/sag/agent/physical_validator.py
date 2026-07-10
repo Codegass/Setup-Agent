@@ -2530,7 +2530,14 @@ class PhysicalValidator:
         manifest package imports -> `compileall` source-weighted coverage
         (tests/docs/examples excluded, the analog of the Java class-coverage
         ratio) -> declared C-extensions have built `.so` artifacts. A missing
-        venv or a failed import is BLOCKED (success=False); pip-check
+        venv or a failed import is BLOCKED (success=False) — EXCEPT when the
+        only failing names are underscore-prefixed accessory modules (_yaml,
+        _cffi_backend, ...) next to at least one green non-underscore
+        import: wheels list optional C-extension modules statically in
+        top_level.txt whether or not the extension was built (pyyaml bug
+        #14), so those failures are C-extension-rung evidence — PARTIAL
+        ("optional extension module(s) not importable: ..."), never a false
+        red on a usable environment; pip-check
         breakage, coverage below build_coverage_threshold, or a missing
         declared extension is PARTIAL (success=True, complete=False) with the
         failed rung named; a pip-check that cannot run because pip itself is
@@ -2651,14 +2658,36 @@ class PhysicalValidator:
                 "imports rung skipped: no importable package detected"
             )
 
+        optional_ext_failures: List[str] = []
         if packages:
             failures = []
+            imported = []
             for package in packages:
                 import_probe = self._execute_command_with_logging(
                     f'{venv}/bin/python -c "import {package}"', f"import {package}"
                 )
-                if not import_probe["success"]:
+                if import_probe["success"]:
+                    imported.append(package)
+                else:
                     failures.append(package)
+            # Severity partition (pyyaml optional-libyaml bug #14):
+            # underscore-prefixed top-level names (_yaml, _cffi_backend, ...)
+            # are accessory C-extension modules — the wheel's top_level.txt
+            # lists them statically whether or not the OPTIONAL extension was
+            # built, so their import failure is C-extension-rung evidence
+            # (PARTIAL, see below), never a blocker — PROVIDED at least one
+            # real (non-underscore) package imported: a 1287/1287-green
+            # pyyaml suite proved the env usable while `import _yaml` alone
+            # said BLOCKED. Any non-underscore failure keeps blocking (the
+            # libcloud broken-sibling case), and underscore failures with NO
+            # green non-underscore import verified nothing usable — those
+            # also keep blocking.
+            blocking = [name for name in failures if not name.startswith("_")]
+            if failures and not blocking and any(
+                not name.startswith("_") for name in imported
+            ):
+                optional_ext_failures = failures
+                failures = []
             result["imports_ok"] = not failures
             result["import_failures"] = failures
             if failures:
@@ -2688,12 +2717,19 @@ class PhysicalValidator:
         if py_count and pyc_count is not None:
             result["compileall_coverage"] = min(pyc_count / py_count, 1.0)
 
+        so_missing = False
         if manifest.get("has_c_extensions"):
             so_probe = self._execute_command_with_logging(
                 f"find {project_dir} {venv} -name '*.so' -type f 2>/dev/null | head -1",
                 "C-extension artifacts",
             )
             result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
+            so_missing = not result["ext_modules_ok"]
+        if optional_ext_failures:
+            # Bug #14: an unimportable optional extension module is
+            # C-extension-rung evidence — the rung goes red even when a .so
+            # artifact exists on disk (the module still did not import).
+            result["ext_modules_ok"] = False
 
         partial_reasons = []
         if result["pip_check_clean"] is False:
@@ -2717,9 +2753,14 @@ class PhysicalValidator:
                 f"compileall coverage {coverage * 100:.0f}% below the "
                 f"{threshold * 100:.0f}% threshold"
             )
-        if result["ext_modules_ok"] is False:
+        if so_missing:
             partial_reasons.append(
                 "declared C-extensions have no built .so artifact"
+            )
+        if optional_ext_failures:
+            partial_reasons.append(
+                "optional extension module(s) not importable: "
+                + ", ".join(optional_ext_failures)
             )
 
         result["success"] = True

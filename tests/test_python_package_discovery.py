@@ -715,6 +715,92 @@ def test_failed_import_of_an_installed_package_still_blocks():
 
 
 # ---------------------------------------------------------------------------
+# Bug #14 (pyyaml live probe): OPTIONAL extension modules (_yaml) fail the
+# imports rung on a perfectly usable environment — false BLOCKED
+# ---------------------------------------------------------------------------
+
+# The live repro shape: pyyaml's wheel statically lists top_level.txt as
+# "yaml\n_yaml\n" whether or not the OPTIONAL libyaml C-extension was built.
+# The suite ran 1287/1287 green and `import yaml` worked, but `import _yaml`
+# failed -> "BLOCKED - Top-level package import failed: _yaml". A 1287-green
+# suite proves the environment WAS usable: underscore-prefixed top-level
+# names are accessory/extension modules and must route to the C-extension
+# rung (PARTIAL), never BLOCK — as long as a real (non-underscore) project
+# package imported.
+
+
+def test_optional_extension_import_failure_is_partial_not_blocked():
+    # yaml imports, _yaml fails: PARTIAL via the ext rung, never BLOCKED.
+    orch = TopLevelOrch(failing_imports={"_yaml"})
+    result = _validate(orch)
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is True  # the real package imported
+    assert details["import_failures"] == []  # no BLOCKING failure
+    assert details["ext_modules_ok"] is False  # the optional extension rung
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence_status"] != "blocked"
+    assert (
+        "optional extension module(s) not importable: _yaml" in result["reason"]
+    )
+    # The environment was never called unusable.
+    assert "not usable" not in result["reason"]
+
+
+def test_non_underscore_import_failure_still_blocks_next_to_optional_one():
+    # Rule (b) regression: ANY non-underscore failure keeps today's BLOCKED
+    # semantics, and the evidence lists every failing name honestly.
+    orch = TopLevelOrch(failing_imports={"yaml", "_yaml"})
+    result = _validate(orch)
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is False
+    assert sorted(details["import_failures"]) == ["_yaml", "yaml"]
+
+
+def test_all_underscore_names_failing_with_nothing_else_is_blocked():
+    # Rule (c): when EVERY installed top-level name is underscore-prefixed
+    # and they all fail, nothing usable was verified — BLOCKED, never a
+    # soft PARTIAL on zero evidence.
+    project = _dist(
+        "cffi_backend_only-1.0.dist-info",
+        "_cffi_backend\n",
+        direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
+    )
+    orch = TopLevelOrch(
+        dists=[project] + _DEP_DISTS + _TOOLING_DISTS,
+        failing_imports={"_cffi_backend"},
+    )
+    result = _validate(orch)
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is False
+    assert details["import_failures"] == ["_cffi_backend"]
+
+
+def test_underscore_failure_without_a_green_regular_import_is_blocked():
+    # Rule (a)'s guard: the optional-extension demotion requires at least one
+    # NON-underscore package to have imported. An underscore failure next to
+    # only underscore successes verified nothing usable — BLOCKED.
+    project = _dist(
+        "underscores_only-1.0.dist-info",
+        "_alpha\n_beta\n",
+        direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
+    )
+    orch = TopLevelOrch(
+        dists=[project] + _DEP_DISTS + _TOOLING_DISTS,
+        failing_imports={"_beta"},
+    )
+    result = _validate(orch)
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    assert result["evidence"]["fingerprint_details"]["import_failures"] == ["_beta"]
+
+
+# ---------------------------------------------------------------------------
 # (d) discover_packages ranks flat-layout candidates by the declared name
 # ---------------------------------------------------------------------------
 
