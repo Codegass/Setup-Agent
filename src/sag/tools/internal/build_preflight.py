@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from sag.tools.internal.python_env import resolve_python_version
+from sag.tools.internal.python_env import ensure_venv_pip, resolve_python_version
 
 REQUIREMENTS_PATH = "/workspace/.setup_agent/build_requirements.json"
 
@@ -284,7 +284,7 @@ class PythonPreflight:
         venv = self._venv_path()
         rung = self._provision(required, venv)
         if rung:
-            pip_note = self._ensure_venv_pip(venv)
+            pip_note = self._ensure_venv_pip(venv, required)
             _register_python_overlay(self.orchestrator, venv, required)
             narration = (
                 f"{header}\n→ {rung}-provisioned {required}, "
@@ -350,31 +350,24 @@ class PythonPreflight:
         )
         return bool(made.get("success"))
 
-    def _ensure_venv_pip(self, venv: str) -> Optional[str]:
-        """Verify pip exists inside the fresh venv; repair with ensurepip.
-
-        Bug #12: pip-less venvs silently broke the installer ladder AND made
-        the verifier's pip-check rung report phantom dependency breakage.
-        Probe -> ensurepip repair -> re-probe. Never blocks: a still-missing
-        pip returns a narration line and the run continues."""
-        probe = self.orchestrator.execute_command(
-            f"{venv}/bin/python -m pip --version"
-        )
-        if probe.get("success"):
-            return None
-        self.orchestrator.execute_command(
-            f"{venv}/bin/python -m ensurepip --upgrade"
-        )
-        probe = self.orchestrator.execute_command(
-            f"{venv}/bin/python -m pip --version"
-        )
-        if probe.get("success"):
-            return (
-                f"→ venv had no pip; repaired with "
-                f"'{venv}/bin/python -m ensurepip --upgrade'"
-            )
+    def _ensure_venv_pip(self, venv: str, version: Optional[str] = None) -> Optional[str]:
+        """Verify pip exists inside the fresh venv; repair via the shared
+        python_env.ensure_venv_pip ladder (bug #12 / bug #13 defect 1):
+        probe -> ensurepip -> recreate -> re-probe. Never blocks: a
+        still-missing pip returns a narration line and the run continues."""
+        repair = ensure_venv_pip(self.orchestrator, venv, python_version=version)
+        action = repair.get("action")
+        if repair.get("ok"):
+            if action is None:
+                return None
+            if action == "ensurepip":
+                return (
+                    f"→ venv had no pip; repaired with "
+                    f"'{venv}/bin/python -m ensurepip --upgrade'"
+                )
+            return f"→ venv had no pip; recreated {venv} with a seeded venv"
         return (
-            f"→ pip still missing in {venv} after ensurepip — "
+            f"→ pip still missing in {venv} after ensurepip and recreation — "
             f"pip-based install commands will fail; continuing (never blocks)"
         )
 

@@ -12,7 +12,7 @@ from sag.runtime import EnvOverlayStore
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import PythonPreflight, read_build_requirements
 from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
-from .python_env import detect_installer
+from .python_env import detect_installer, ensure_venv_pip
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
@@ -1038,18 +1038,49 @@ class ProjectSetupTool(BaseTool):
                     "venv": venv,
                 }
 
+        output_lines = [outcome.narration] if outcome.narration else []
+
+        # Bug #13 defect 1: a reused venv can be pip-less/broken (this very
+        # phase left one behind in the live run) — probe/repair/recreate
+        # BEFORE anything installs, narrated.
+        repair = ensure_venv_pip(
+            self.orchestrator, venv, python_version=requirements.get("python_version")
+        )
+        if repair.get("action"):
+            if not repair.get("ok"):
+                repair_note = (
+                    f"[env] venv at {venv} still has no working pip after ensurepip "
+                    "and recreation — pip installs will fail honestly"
+                )
+            elif repair.get("action") == "ensurepip":
+                repair_note = "[env] existing venv was missing pip — repaired with ensurepip"
+            else:
+                repair_note = f"[env] existing venv was missing pip — recreated at {venv}"
+            logger.info(repair_note)
+            output_lines.append(repair_note)
+
         # The project's OWN declared installer (shared faithfulness ladder).
         listing = self.orchestrator.execute_command(f"ls -A1 {directory}", workdir=directory)
         files_present = {
             line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
         }
-        ladder = detect_installer(files_present)
+        # Bug #13 defect 3: real extras only — read the metadata the editable
+        # rungs verify their extras against.
+        contents = {}
+        for name in ("pyproject.toml", "setup.cfg"):
+            if name in files_present:
+                read = self.orchestrator.execute_command(
+                    f"cat {directory}/{name}", workdir=directory
+                )
+                contents[name] = (read.get("output") or "") if read.get("success") else ""
+        ladder = detect_installer(files_present, contents)
+        if ladder.get("note"):
+            logger.info(f"[setup] {ladder['note']}")
+            output_lines.append(f"[setup] {ladder['note']}")
         commands = [
             c.replace("{venv}", venv).replace("{dir}", directory)
             for c in ladder["commands"]
         ]
-
-        output_lines = [outcome.narration] if outcome.narration else []
         for cmd in commands:
             result = self.orchestrator.execute_command(cmd, workdir=directory)
             output_lines.append(f"$ {cmd}")

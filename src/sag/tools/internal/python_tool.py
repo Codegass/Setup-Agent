@@ -13,8 +13,9 @@ required for a green verdict.
 
 import json
 import re
+import shlex
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -25,7 +26,7 @@ from .build_preflight import (
     classify_python_version_error,
     read_build_requirements,
 )
-from .python_env import discover_packages
+from .python_env import detect_installer, discover_packages, ensure_venv_pip
 
 # The verifier (Task 6) reads both: the JUnit XML under PYTEST_REPORT_DIR for
 # executed counts, COLLECTED_JSON as the detected-tests denominator feeding
@@ -40,7 +41,81 @@ _PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 _NO_TESTS_RE = re.compile(r"no tests collected|no tests ran")
 
+# Bug #13 defect 2: install-failure signatures that must redden the result
+# even when the wrapper reports exit 0 (live evidence: "No module named pip"
+# on a run that claimed success while nothing installed).
+_INSTALL_ERROR_RE = re.compile(
+    r"No module named pip"
+    r"|error: subprocess-exited-with-error"
+    r"|ERROR: No matching distribution found"
+    r"|ERROR: Could not find a version"
+    r"|ERROR: Could not install"
+)
+
+# Bug #13 defect 6: honest pytest outcome classification.
+_FAILED_STATS_RE = re.compile(r"\b\d+ failed\b")
+_COLLECTION_ERROR_RE = re.compile(r"ERROR collecting|errors? during collection")
+_USAGE_ERROR_RE = re.compile(r"(?i)usage error|unrecognized arguments|error: usage:")
+
+# Bug #13 defect 7: pytest-plausible flags (simple allowlist heuristic).
+# -k/-m/--maxfail take a value token; everything else must fullmatch here or
+# be an EXISTING test path — 'make test' never reaches a pytest command line.
+_PYTEST_VALUE_FLAGS = ("-k", "-m", "--maxfail")
+_PYTEST_FLAG_RE = re.compile(
+    r"-x|-q|-s|-v{1,3}|-r[a-zA-Z]+|--lf|--ff|--nf|--maxfail=\d+"
+    r"|--tb=(?:auto|long|short|line|native|no)|--durations=\d+|--collect-only|--co"
+)
+
+_PYTEST_USAGE_HINT = (
+    "Pass pytest-style args only: existing test paths and flags like "
+    "-k EXPR, -m MARK, -x, -q, -v, -s, --maxfail=N, --lf, --ff, --tb=STYLE"
+)
+
 _OPERATIONS = ("setup_env", "test", "build", "compile")
+
+
+def _classify_pytest_result(
+    exit_code: Optional[int], output: str
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Honest pytest outcome mapping (bug #13 defect 6): usage errors,
+    collection errors, a missing pytest and zero collected are NEVER green;
+    tests that RAN with failures are an honest green result (stats in the
+    output) — a result to report, not an error state."""
+    text = output or ""
+
+    def _snippet(pattern: re.Pattern) -> str:
+        for line in text.splitlines():
+            if pattern.search(line):
+                return line.strip()
+        return ""
+
+    if "No module named pytest" in text:
+        return (
+            False,
+            "pytest is not importable in the venv (No module named pytest)",
+            "PYTEST_MISSING",
+        )
+    if exit_code == 4 or _USAGE_ERROR_RE.search(text):
+        detail = _snippet(_USAGE_ERROR_RE) or f"pytest exited {exit_code}"
+        return False, f"pytest usage error — {detail}", "PYTEST_USAGE_ERROR"
+    if exit_code == 2 or _COLLECTION_ERROR_RE.search(text):
+        detail = _snippet(_COLLECTION_ERROR_RE) or f"pytest exited {exit_code}"
+        return False, f"pytest collection error — {detail}", "PYTEST_COLLECTION_ERROR"
+    if exit_code == 5 or _NO_TESTS_RE.search(text):
+        return (
+            False,
+            "pytest collected zero tests — nothing was executed",
+            "PYTEST_NO_TESTS",
+        )
+    if exit_code == 0:
+        return True, None, None
+    if exit_code == 1 and _FAILED_STATS_RE.search(text):
+        return True, None, None  # honest result: the suite RAN, some tests failed
+    return (
+        False,
+        f"pytest exited {exit_code} — honest result recorded, no rerun",
+        "PYTEST_ERROR",
+    )
 
 
 class PythonTool(BaseTool):
@@ -123,21 +198,73 @@ class PythonTool(BaseTool):
                     preamble,
                 )
 
+        # Bug #13 defect 1: an earlier phase (clone auto-install) can leave a
+        # pip-less/broken venv the pre-flight never repairs because the venv
+        # already exists. Probe/repair/recreate BEFORE anything installs.
+        repair = ensure_venv_pip(
+            self.orchestrator, venv, python_version=requirements.get("python_version")
+        )
+        if repair.get("action") == "ensurepip":
+            preamble.append("[env] existing venv was missing pip — repaired with ensurepip")
+        elif repair.get("action") == "recreated":
+            if repair.get("ok"):
+                preamble.append(f"[env] existing venv was missing pip — recreated at {venv}")
+            else:
+                preamble.append(
+                    f"[env] venv at {venv} still has no working pip after ensurepip "
+                    "and recreation — pip installs will fail honestly"
+                )
+
         installer = requirements.get("python_installer") or "pip"
+        note = requirements.get("python_install_note")
         commands = [
             c.replace("{venv}", venv).replace("{dir}", working_directory)
             for c in (requirements.get("python_install_commands") or [])
         ]
         if not commands:
-            preamble.append(
-                "[setup] no declared install commands in the manifest — nothing installed"
-            )
+            # Bug #13 defect 4: self-healing deps — an empty manifest (the
+            # agent skipped project analyze) must not no-op green; the marker
+            # files are right there, so detect the ladder inline.
+            ladder = self._detect_ladder_inline(working_directory)
+            commands = [
+                c.replace("{venv}", venv).replace("{dir}", working_directory)
+                for c in ladder["commands"]
+            ]
+            if commands:
+                installer = ladder["installer"] or installer
+                note = ladder.get("note")
+                preamble.append("[setup] manifest empty — detected installer ladder inline")
+            else:
+                return self._finish(
+                    ToolResult(
+                        success=False,
+                        output="",
+                        error=(
+                            "no python install commands: the manifest is empty and no "
+                            "installer markers (poetry.lock/Pipfile.lock/pyproject.toml/"
+                            "requirements*.txt/setup.py) were found in "
+                            f"{working_directory}"
+                        ),
+                        error_code="PYTHON_NO_INSTALLER_DETECTED",
+                        suggestions=[
+                            "Run project(action='analyze') to (re)generate the "
+                            "build-requirements manifest",
+                            "Check that working_directory points at the project root",
+                        ],
+                        metadata={"operation": "setup_env", "venv": venv},
+                    ),
+                    preamble,
+                )
+        if note:
+            # Bug #13 defect 3: the missing-test-extras hole is narrated, never silent.
+            preamble.append(f"[setup] {note}")
 
         transcript: List[str] = []
         deviation: Optional[str] = None
         retry_meta: Optional[Dict[str, str]] = None
         retried = False
         overall_ok = True
+        failure_detail: Optional[str] = None
         for cmd in commands:
             result = self._run(cmd, working_directory, timeout)
 
@@ -173,15 +300,26 @@ class PythonTool(BaseTool):
                 result = self._run(cmd, working_directory, timeout)
 
             transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
-            if not result.get("success"):
+            # Bug #13 defect 2: honest failure — a non-zero exit OR an
+            # install-error signature in the output (a wrapper reporting
+            # exit 0 while stderr said "No module named pip") is a FAILURE,
+            # and the observation leads with it instead of burying it.
+            masked = self._install_error_line(result.get("output") or "")
+            if not result.get("success") or masked:
                 overall_ok = False
+                failure_detail = masked or self._failure_tail_line(result)
+                preamble.insert(0, f"[setup] dependency install FAILED — {failure_detail}")
                 break
 
         return self._finish(
             ToolResult(
                 success=overall_ok,
                 output="\n".join(transcript),
-                error=None if overall_ok else "dependency installation failed",
+                error=(
+                    None
+                    if overall_ok
+                    else f"dependency installation failed — {failure_detail}"
+                ),
                 error_code=None if overall_ok else "PYTHON_SETUP_FAILED",
                 metadata={
                     "operation": "setup_env",
@@ -195,6 +333,44 @@ class PythonTool(BaseTool):
             preamble,
         )
 
+    def _detect_ladder_inline(self, working_directory: str) -> Dict[str, Any]:
+        """Bug #13 defect 4: run the shared installer detection against the
+        working directory when the manifest declares nothing — same ladder,
+        same extras rules (the strings live ONLY in python_env)."""
+        listing = self.orchestrator.execute_command(f"ls -A1 {working_directory}")
+        files_present = {
+            line.strip()
+            for line in (listing.get("output") or "").splitlines()
+            if line.strip()
+        }
+        contents: Dict[str, str] = {}
+        for name in ("pyproject.toml", "setup.cfg"):
+            if name in files_present:
+                read = self.orchestrator.execute_command(
+                    f"cat {working_directory}/{name}"
+                )
+                contents[name] = (read.get("output") or "") if read.get("success") else ""
+        return detect_installer(files_present, contents)
+
+    @staticmethod
+    def _install_error_line(output: str) -> Optional[str]:
+        """The line carrying an install-error signature, or None."""
+        match = _INSTALL_ERROR_RE.search(output or "")
+        if not match:
+            return None
+        for line in (output or "").splitlines():
+            if match.group(0) in line:
+                return line.strip()
+        return match.group(0)
+
+    @staticmethod
+    def _failure_tail_line(result: Dict[str, Any]) -> str:
+        """Surface the stderr: the last non-empty output line, with the exit."""
+        output = result.get("output") or ""
+        tail = next((l.strip() for l in reversed(output.splitlines()) if l.strip()), "")
+        exit_code = result.get("exit_code")
+        return f"exit {exit_code}: {tail}" if tail else f"install command exited {exit_code}"
+
     # ------------------------------------------------------------------
     # test
     # ------------------------------------------------------------------
@@ -204,6 +380,38 @@ class PythonTool(BaseTool):
         requirements: Dict[str, Any], venv: str,
     ) -> ToolResult:
         python = f"{venv}/bin/python"
+        preamble: List[str] = []
+
+        # Bug #13 defect 7: allowlist-sanitize the args BEFORE anything runs —
+        # 'make test' was pasted verbatim into 'pytest make test' in the live run.
+        hints = requirements.get("test_hints") or {}
+        raw_args = (args or "").strip()
+        if raw_args:
+            pytest_args, rejection = self._sanitize_pytest_args(
+                raw_args, working_directory
+            )
+            if rejection:
+                return ToolResult(
+                    success=False,
+                    output=f"[test] rejected args {raw_args!r} — {rejection}",
+                    error=rejection,
+                    error_code="PYTEST_ARGS_REJECTED",
+                    suggestions=[
+                        _PYTEST_USAGE_HINT,
+                        "For make targets or shell commands use the bash tool instead",
+                    ],
+                    metadata={"operation": "test", "rejected_args": raw_args},
+                )
+        else:
+            pytest_args = (hints.get("pytest_args") or "").strip()
+
+        # Bug #13 defect 5: pytest bootstrap — ensure pytest is importable in
+        # the venv first; live evidence: 5 test calls failed with 'No module
+        # named pytest' and still looked successful.
+        probe = self.orchestrator.execute_command(f"{python} -m pytest --version")
+        if not probe.get("success"):
+            self._run(f"{python} -m pip install pytest", working_directory, timeout)
+            preamble.append("[test] pytest not in venv — installed for the run")
 
         # Detected-tests denominator FIRST (spec Component 3): the verifier
         # compares executed counts against it (tests_not_fully_executed).
@@ -213,8 +421,6 @@ class PythonTool(BaseTool):
         collected = self._parse_collected(collect.get("output") or "")
         self._write_collected(collected)
 
-        hints = requirements.get("test_hints") or {}
-        pytest_args = (args or hints.get("pytest_args") or "").strip()
         report = f"{PYTEST_REPORT_DIR}/pytest-{int(time.time())}.xml"
         self.orchestrator.execute_command(f"mkdir -p {PYTEST_REPORT_DIR}")
         command = f"{python} -m pytest"
@@ -226,12 +432,15 @@ class PythonTool(BaseTool):
         # report, never an error to retry — no rerun, ever.
         result = self._run(command, working_directory, timeout)
         exit_code = result.get("exit_code")
-        success = exit_code == 0
+        output = result.get("output") or ""
+        # Bug #13 defect 6: honest mapping — collection/usage errors and zero
+        # collected are never green, even when the wrapper showed exit 0.
+        success, error, error_code = _classify_pytest_result(exit_code, output)
         if self.command_tracker:
             try:
                 self.command_tracker.track_test_command(
                     command=command, tool="python", working_dir=working_directory,
-                    exit_code=exit_code, output=result.get("output") or "",
+                    exit_code=exit_code, output=output,
                 )
             except Exception as exc:  # tracking must never mask the honest result
                 logger.debug(f"python test tracking skipped: {exc}")
@@ -244,19 +453,75 @@ class PythonTool(BaseTool):
             "collected": collected,
             "collected_json": COLLECTED_JSON,
         }
-        tail = self._tail(result.get("output") or "")
+        tail = self._tail(output)
         if success:
-            return ToolResult(
-                success=True, output=tail,
-                raw_output=result.get("output"), metadata=metadata,
+            return self._finish(
+                ToolResult(
+                    success=True, output=tail,
+                    raw_output=output, metadata=metadata,
+                ),
+                preamble,
             )
-        return ToolResult(
-            success=False, output=tail,
-            raw_output=result.get("output"),
-            error=f"pytest exited {exit_code} — honest result recorded, no rerun",
-            error_code="PYTEST_FAILURES" if exit_code == 1 else "PYTEST_ERROR",
-            metadata=metadata,
+        return self._finish(
+            ToolResult(
+                success=False, output=tail,
+                raw_output=output,
+                error=error,
+                error_code=error_code,
+                metadata=metadata,
+            ),
+            preamble,
         )
+
+    def _sanitize_pytest_args(
+        self, raw: str, working_directory: str
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Bug #13 defect 7: simple allowlist heuristic — pytest-plausible
+        flags and EXISTING test paths pass; everything else is rejected with
+        the correct usage named. Returns (cleaned_args, None) on acceptance,
+        (None, reason) on rejection."""
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            return None, f"args are not shell-parseable: {exc}"
+        cleaned: List[str] = []
+        pending_flag: Optional[str] = None
+        for token in tokens:
+            if pending_flag is not None:
+                if pending_flag == "--maxfail" and not token.isdigit():
+                    return None, f"--maxfail needs a number, got {token!r}"
+                cleaned.append(shlex.quote(token))
+                pending_flag = None
+                continue
+            if token in _PYTEST_VALUE_FLAGS:
+                cleaned.append(token)
+                pending_flag = token
+                continue
+            if _PYTEST_FLAG_RE.fullmatch(token):
+                cleaned.append(token)
+                continue
+            if token.startswith("-"):
+                return None, (
+                    f"{token!r} is not an accepted pytest flag. {_PYTEST_USAGE_HINT}"
+                )
+            path = token.split("::", 1)[0]
+            full = (
+                path if path.startswith("/")
+                else f"{working_directory.rstrip('/')}/{path}"
+            )
+            probe = self.orchestrator.execute_command(
+                f"test -e {shlex.quote(full)} && echo EXISTS || echo MISSING"
+            )
+            if "EXISTS" not in (probe.get("output") or ""):
+                return None, (
+                    f"{token!r} is not an existing test path under "
+                    f"{working_directory} — this is not a make/shell command line. "
+                    f"{_PYTEST_USAGE_HINT}"
+                )
+            cleaned.append(shlex.quote(token))
+        if pending_flag is not None:
+            return None, f"{pending_flag} requires a value"
+        return " ".join(cleaned), None
 
     # ------------------------------------------------------------------
     # build (wheel — extra evidence, never required for green)
@@ -317,6 +582,24 @@ class PythonTool(BaseTool):
             else None
         )
         coverage = (pyc_count / py_count) if py_count else None
+        if py_count == 0:
+            # Bug #13 defect 8: 0/0 compiled is VACUOUS evidence — say so
+            # instead of a misleading green ('0/0 sources compiled').
+            return ToolResult(
+                success=True,
+                output=f"no sources found under {target} — nothing verified",
+                raw_output=result.get("output"),
+                metadata={
+                    "operation": "compile",
+                    "dirs": dirs,
+                    "py_count": 0,
+                    "pyc_count": pyc_count,
+                    "failed": None,
+                    "coverage": None,
+                    "exit_code": result.get("exit_code"),
+                    "vacuous": True,
+                },
+            )
         summary = f"compileall over {target}: "
         if py_count is not None and pyc_count is not None:
             summary += f"{pyc_count}/{py_count} sources compiled, {failed} failed"

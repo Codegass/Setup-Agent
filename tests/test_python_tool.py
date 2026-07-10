@@ -225,7 +225,10 @@ def test_test_writes_collected_denominator_and_junitxml_report():
     assert result.success is True
     writes = [c for c in orch.commands if COLLECTED_JSON in c and "<<" in c]
     assert writes and '"collected": 42' in writes[0]
-    runs = [c for c in orch.commands if "-m pytest" in c and "--collect-only" not in c]
+    runs = [
+        c for c in orch.commands
+        if "-m pytest" in c and "--collect-only" not in c and "--version" not in c
+    ]
     assert len(runs) == 1
     assert runs[0].startswith("/workspace/proj/.venv/bin/python -m pytest")
     assert f"--junitxml={PYTEST_REPORT_DIR}/pytest-" in runs[0]
@@ -244,10 +247,16 @@ def test_pytest_failures_are_honest_and_never_rerun():
         ],
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
-    runs = [c for c in orch.commands if "-m pytest" in c and "--collect-only" not in c]
+    runs = [
+        c for c in orch.commands
+        if "-m pytest" in c and "--collect-only" not in c and "--version" not in c
+    ]
     assert len(runs) == 1  # exit 1 with failures is an HONEST result, not an error to retry
-    assert result.success is False
+    # Bug #13 defect 6: tests that RAN with failures are an honest green —
+    # the result (stats in output) is the deliverable, not an error state.
+    assert result.success is True
     assert "2 failed, 3 passed" in result.output
+    assert result.metadata.get("exit_code") == 1
 
 
 def test_no_tests_collected_records_zero_denominator():
@@ -327,6 +336,316 @@ def test_unknown_operation_is_rejected_with_the_valid_vocabulary():
     assert result.success is False
     assert result.error_code == "UNKNOWN_PYTHON_OPERATION"
     assert any("setup_env" in s for s in result.suggestions)
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 1: venv repair everywhere — an earlier phase can leave a
+# pip-less/broken .venv that the pre-flight never repairs because the venv
+# already exists (live evidence: /workspace/paramiko/.venv without pip,
+# deps failed 3x). Probe -> ensurepip once -> recreate, narrated.
+# ---------------------------------------------------------------------------
+
+
+def test_setup_env_repairs_pip_less_venv_with_ensurepip():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("-m pip --version", FailThenOk("No module named pip", times=1)),
+        ],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    ensurepip = next(i for i, c in enumerate(orch.commands) if "-m ensurepip" in c)
+    first_install = next(
+        i for i, c in enumerate(orch.commands)
+        if "pip install -r requirements.txt" in c
+    )
+    assert ensurepip < first_install  # repaired BEFORE anything installs
+    assert "[env] existing venv was missing pip — repaired" in result.output
+    assert result.success is True
+
+
+def test_setup_env_recreates_venv_when_ensurepip_cannot_restore_pip():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            # probe fails before ensurepip AND after: only recreation restores pip
+            ("-m pip --version", FailThenOk("No module named pip", times=2)),
+        ],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    recreate = next(
+        i for i, c in enumerate(orch.commands)
+        if "python3 -m venv --clear /workspace/proj/.venv" in c
+    )
+    first_install = next(
+        i for i, c in enumerate(orch.commands)
+        if "pip install -r requirements.txt" in c
+    )
+    assert recreate < first_install
+    assert "[env] existing venv was missing pip — recreated" in result.output
+    assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 2: honest failure on install errors — live evidence: deps
+# claimed "✅ build executed successfully" while stderr said "No module named
+# pip" and nothing installed.
+# ---------------------------------------------------------------------------
+
+
+def test_deps_install_error_with_zero_exit_is_an_honest_failure():
+    manifest = {
+        **MANIFEST,
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            # The live failure shape: the wrapper reported exit 0 while the
+            # output carried the fatal install error.
+            ("pip install -e .", ok("/workspace/proj/.venv/bin/python: No module named pip")),
+        ],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    assert result.success is False
+    assert "No module named pip" in (result.error or "")
+
+
+def test_failed_install_observation_leads_with_the_failure():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            (
+                "pip install -r requirements.txt",
+                fail("/workspace/proj/.venv/bin/python: No module named pip"),
+            ),
+        ],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    assert result.success is False
+    # The observation LEADS with the failure — never buried under transcript.
+    assert result.output.splitlines()[0].startswith("[setup] dependency install FAILED")
+    assert "No module named pip" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 3 (narration side): a manifest whose pip rung has no test
+# extras must say so, so missing pytest/icecream is never silent (paramiko).
+# ---------------------------------------------------------------------------
+
+
+def test_setup_env_narrates_missing_test_extras_note():
+    manifest = {
+        **MANIFEST,
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
+        "python_install_note": "no test extras declared — test deps may be missing",
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[("test -x /workspace/proj/.venv/bin/python", ok("EXISTS"))],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    assert result.success is True
+    assert "no test extras declared — test deps may be missing" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 4: self-healing deps — an empty manifest (agent skipped
+# project analyze) must not no-op with success; detect the ladder inline
+# from the marker files sitting right there, or fail honestly.
+# ---------------------------------------------------------------------------
+
+
+def test_setup_env_empty_manifest_detects_installer_ladder_inline():
+    orch = Orch(
+        manifest=None,  # no build-requirements manifest at all
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("ls -A1 /workspace/proj", ok("pyproject.toml\nsrc\nREADME.md")),
+            (
+                "cat /workspace/proj/pyproject.toml",
+                ok('[project]\nname = "proj"\n\n[project.optional-dependencies]\ntest = ["pytest"]\n'),
+            ),
+        ],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    assert result.success is True
+    assert "[setup] manifest empty — detected installer ladder inline" in result.output
+    assert any(
+        "/workspace/proj/.venv/bin/python -m pip install -e '.[test]'" in c
+        for c in orch.commands
+    )
+
+
+def test_setup_env_empty_manifest_and_no_markers_fails_with_analyze_guidance():
+    orch = Orch(
+        manifest=None,
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("ls -A1 /workspace/proj", ok("README.md\nLICENSE")),
+        ],
+    )
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+    assert result.success is False  # NEVER a vacuous green no-op
+    assert result.error_code == "PYTHON_NO_INSTALLER_DETECTED"
+    assert any("project(action='analyze')" in s for s in result.suggestions)
+    assert not any("pip install" in c for c in orch.commands)
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 5: pytest bootstrap — live evidence: 5 test calls failed
+# with 'No module named pytest' and still looked successful.
+# ---------------------------------------------------------------------------
+
+
+def test_test_bootstraps_pytest_into_the_venv_when_missing():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("-m pytest --version", fail("No module named pytest")),
+            ("--collect-only", ok("3 tests collected in 0.01s")),
+        ],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    probe = next(i for i, c in enumerate(orch.commands) if "-m pytest --version" in c)
+    install = next(
+        i for i, c in enumerate(orch.commands)
+        if "/workspace/proj/.venv/bin/python -m pip install pytest" in c
+    )
+    collect = next(i for i, c in enumerate(orch.commands) if "--collect-only" in c)
+    assert probe < install < collect  # probe -> install once -> only then run
+    assert "[test] pytest not in venv — installed for the run" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 6: honest test results — collection/usage errors and zero
+# collected must never be green ("Exit code: 0" was shown for collection
+# errors in the live run).
+# ---------------------------------------------------------------------------
+
+
+def test_collection_errors_are_never_green_even_with_exit_zero():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", ok("2 tests collected in 0.05s")),
+            (
+                "--junitxml",
+                ok(
+                    "==== ERRORS ====\n"
+                    "ERROR collecting tests/test_x.py\n"
+                    "ModuleNotFoundError: No module named 'icecream'\n"
+                    "!!!!! Interrupted: 1 error during collection !!!!!"
+                ),
+            ),
+        ],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    assert result.success is False
+    assert result.error_code == "PYTEST_COLLECTION_ERROR"
+    assert "ERROR collecting tests/test_x.py" in (result.error or "")
+
+
+def test_usage_errors_are_never_green():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", ok("2 tests collected in 0.05s")),
+            (
+                "--junitxml",
+                fail(
+                    "ERROR: usage: __main__.py [options] [file_or_dir]\n"
+                    "__main__.py: error: unrecognized arguments: --frobnicate",
+                    exit_code=4,
+                ),
+            ),
+        ],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    assert result.success is False
+    assert result.error_code == "PYTEST_USAGE_ERROR"
+
+
+def test_zero_collected_is_never_green():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", fail("no tests collected in 0.01s", exit_code=5)),
+            ("--junitxml", fail("no tests ran in 0.01s", exit_code=5)),
+        ],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    assert result.success is False
+    assert result.error_code == "PYTEST_NO_TESTS"
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 7: arg sanitizing — 'make test' was pasted verbatim into
+# the pytest command line ('pytest make test') in the live run.
+# ---------------------------------------------------------------------------
+
+
+def test_non_pytest_args_are_rejected_before_anything_runs():
+    for bad in ("make test", "test-python", "-C /workspace/proj test"):
+        orch = Orch(manifest=dict(MANIFEST))
+        result = PythonTool(orch).execute(
+            "test", working_directory="/workspace/proj", args=bad
+        )
+        assert result.success is False, bad
+        assert result.error_code == "PYTEST_ARGS_REJECTED", bad
+        # Nothing pytest ran — the bogus args never reach a command line.
+        assert not any("-m pytest" in c for c in orch.commands), bad
+        # The message names the correct usage.
+        assert any("-k" in s for s in result.suggestions), bad
+
+
+def test_pytest_plausible_args_pass_through_sanitizing():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -e /workspace/proj/tests/test_a.py", ok("EXISTS")),
+            ("--collect-only", ok("1 test collected in 0.01s")),
+        ],
+    )
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/proj",
+        args="-k smoke -x --maxfail=2 tests/test_a.py",
+    )
+    run = next(c for c in orch.commands if "--junitxml" in c)
+    assert "-k smoke" in run
+    assert "-x" in run
+    assert "--maxfail=2" in run
+    assert "tests/test_a.py" in run
+    assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 8: vacuous compile — compileall over 0 sources must say so
+# instead of a misleading '0/0 sources compiled' green.
+# ---------------------------------------------------------------------------
+
+
+def test_compile_zero_sources_is_vacuous_and_says_so():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -d /workspace/proj/src/proj", ok("EXISTS")),
+            ("__pycache__", ok("0")),
+            ("-name '*.py'", ok("0")),
+        ],
+    )
+    result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
+    assert result.success is True  # vacuous, not a failure — but never misleading
+    assert (
+        "no sources found under /workspace/proj/src/proj — nothing verified"
+        in result.output
+    )
+    assert result.metadata.get("vacuous") is True
 
 
 # ---------------------------------------------------------------------------

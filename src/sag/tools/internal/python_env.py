@@ -80,23 +80,85 @@ def resolve_python_version(
 # Directories that carry an __init__.py without being the import package.
 _NON_PACKAGE_DIRS = {"tests", "docs", "examples"}
 
-# pip rung for a pyproject without a lock: try the test extra first so test
-# dependencies land, then fall back to a plain editable install.
-# Module form ('{venv}/bin/python -m pip') everywhere (bug #12): a plain
-# `uv venv` ships no {venv}/bin/pip binary, and the module invocation
-# survives seeding differences.
-_PYPROJECT_PIP_COMMAND = (
-    "{venv}/bin/python -m pip install -e '.[test]' || "
-    "{venv}/bin/python -m pip install -e ."
+# Bug #13 defect 3: the pip rung must install the extras the project ACTUALLY
+# declares — a hardcoded '.[test]' made pip warn "does not provide the extra
+# 'test'" while the tool claimed success (paramiko: pytest never installed).
+NO_TEST_EXTRAS_NOTE = "no test extras declared — test deps may be missing"
+
+# Test-shaped extras, in preference order; only names that EXIST are used.
+_TEST_EXTRA_PREFERENCE = ("test", "tests", "dev", "develop")
+
+_PYPROJECT_OPTDEPS_TABLE = re.compile(
+    r"^\[project\.optional-dependencies\]\s*$(.*?)(?=^\[|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+# Extras keys are `name = [` assignments; requiring the `[` keeps dependency
+# pins inside multi-line arrays ("pytest==7.4") from reading as keys.
+_EXTRA_KEY_RE = re.compile(
+    r"""^\s*["']?([A-Za-z0-9][A-Za-z0-9._-]*)["']?\s*=\s*\[""", re.MULTILINE
 )
 
 
-def detect_installer(files_present) -> Dict[str, Any]:
+def declared_extras(pyproject_content: str = "", setup_cfg_content: str = "") -> List[str]:
+    """Extras names the project ACTUALLY declares: pyproject
+    ``[project.optional-dependencies]`` keys plus setup.cfg
+    ``[options.extras_require]`` keys, declaration order, de-duplicated."""
+    extras: List[str] = []
+    table = _PYPROJECT_OPTDEPS_TABLE.search(pyproject_content or "")
+    if table:
+        for match in _EXTRA_KEY_RE.finditer(table.group(1)):
+            name = match.group(1)
+            if name not in extras:
+                extras.append(name)
+    for name in _ini_section(setup_cfg_content or "", "options.extras_require"):
+        if name not in extras:
+            extras.append(name)
+    return extras
+
+
+def preferred_test_extras(extras) -> List[str]:
+    """The test-shaped extras that EXIST, in preference order (bug #13
+    defect 3): test/tests/dev/develop — never an invented name."""
+    present = set(extras or ())
+    return [name for name in _TEST_EXTRA_PREFERENCE if name in present]
+
+
+def _editable_pip_rung(contents: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    """Editable-install rung with REAL extras only. Multiple test-shaped
+    extras combine; none -> plain ``-e .`` plus NO_TEST_EXTRAS_NOTE so the
+    caller narrates the hole instead of silently skipping test deps.
+    Module form ('{venv}/bin/python -m pip') everywhere (bug #12): a plain
+    `uv venv` ships no {venv}/bin/pip binary."""
+    contents = contents or {}
+    extras = preferred_test_extras(
+        declared_extras(
+            contents.get("pyproject.toml", ""), contents.get("setup.cfg", "")
+        )
+    )
+    if extras:
+        joined = ",".join(extras)
+        return {
+            "commands": [f"{{venv}}/bin/python -m pip install -e '.[{joined}]'"],
+            "test_extras": extras,
+            "note": None,
+        }
+    return {
+        "commands": ["{venv}/bin/python -m pip install -e ."],
+        "test_extras": [],
+        "note": NO_TEST_EXTRAS_NOTE,
+    }
+
+
+def detect_installer(files_present, contents: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """Pick the project's OWN declared installer (faithfulness ladder):
     poetry.lock -> poetry, Pipfile.lock -> pipenv, then the pip rungs
     (pyproject editable, requirements*.txt, bare setup.py). Command strings
     carry ``{venv}`` / ``{dir}`` placeholders the executing caller fills in;
-    detection never runs anything."""
+    detection never runs anything.
+
+    ``contents`` optionally maps pyproject.toml/setup.cfg names to their text
+    so the editable rungs install the extras that ACTUALLY exist (bug #13
+    defect 3); without it no extra is ever invented."""
     files = set(files_present or ())
     if "poetry.lock" in files:
         return {"installer": "poetry", "commands": ["poetry install"],
@@ -105,8 +167,8 @@ def detect_installer(files_present) -> Dict[str, Any]:
         return {"installer": "pipenv", "commands": ["pipenv install --dev"],
                 "source": "Pipfile.lock"}
     if "pyproject.toml" in files:
-        return {"installer": "pip", "commands": [_PYPROJECT_PIP_COMMAND],
-                "source": "pyproject.toml"}
+        return {"installer": "pip", "source": "pyproject.toml",
+                **_editable_pip_rung(contents)}
     requirements = sorted(
         name for name in files
         if name.startswith("requirements") and name.endswith(".txt")
@@ -124,11 +186,48 @@ def detect_installer(files_present) -> Dict[str, Any]:
             "source": requirements[0],
         }
     if "setup.py" in files:
-        return {"installer": "pip",
-                "commands": ["{venv}/bin/python -m pip install -e ."],
-                "source": "setup.py"}
+        return {"installer": "pip", "source": "setup.py",
+                **_editable_pip_rung(contents)}
     # Nothing declared: honest empty ladder (callers narrate, never invent).
     return {"installer": "pip", "commands": [], "source": None}
+
+
+# ---------------------------------------------------------------------------
+# Venv pip guarantee (bug #13 defect 1): an earlier phase can leave a
+# pip-less/broken venv that the pre-flight never repairs because the venv
+# already exists. Shared by python_tool, the setup tool and the pre-flight.
+# ---------------------------------------------------------------------------
+
+# uv lands in ~/.local/bin (same PATH note as build_preflight).
+_LOCAL_BIN_PATH = 'export PATH="$HOME/.local/bin:$PATH"'
+
+
+def ensure_venv_pip(orchestrator, venv: str, python_version: Optional[str] = None) -> Dict[str, Any]:
+    """Guarantee ``{venv}/bin/python -m pip`` works before anything installs.
+
+    Probe -> ensurepip once -> RECREATE the venv (python3 -m venv --clear,
+    then a seeded uv venv) -> re-probe. Returns ``{"ok": bool, "action":
+    None | "ensurepip" | "recreated"}``. Check-and-fix only: callers narrate
+    the repair; a still-broken pip never blocks here — the install commands
+    fail honestly downstream."""
+
+    def pip_ok() -> bool:
+        probe = orchestrator.execute_command(f"{venv}/bin/python -m pip --version")
+        return bool(probe.get("success"))
+
+    if pip_ok():
+        return {"ok": True, "action": None}
+    orchestrator.execute_command(f"{venv}/bin/python -m ensurepip --upgrade")
+    if pip_ok():
+        return {"ok": True, "action": "ensurepip"}
+    recreated = orchestrator.execute_command(f"python3 -m venv --clear {venv}")
+    if recreated.get("success") and pip_ok():
+        return {"ok": True, "action": "recreated"}
+    python_arg = f" --python {python_version}" if python_version else ""
+    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}")
+    if pip_ok():
+        return {"ok": True, "action": "recreated"}
+    return {"ok": False, "action": "recreated"}
 
 
 # package_dir root mapping ({'': '<dir>'}): the project's own declaration of

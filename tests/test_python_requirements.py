@@ -62,14 +62,14 @@ def test_installer_ladder_pipenv_rung():
     assert result["source"] == "Pipfile.lock"
 
 
-def test_installer_ladder_pyproject_rung_tries_test_extra_then_plain():
+def test_installer_ladder_pyproject_rung_without_metadata_is_plain_editable():
+    # Bug #13 defect 3: never invent a '.[test]' extra — without metadata to
+    # verify extras against, the rung is a plain editable install, noted.
     result = detect_installer({"pyproject.toml", "setup.py"})
     assert result["installer"] == "pip"
-    assert result["commands"] == [
-        "{venv}/bin/python -m pip install -e '.[test]' || "
-        "{venv}/bin/python -m pip install -e ."
-    ]
+    assert result["commands"] == ["{venv}/bin/python -m pip install -e ."]
     assert result["source"] == "pyproject.toml"
+    assert result["note"] == "no test extras declared — test deps may be missing"
 
 
 def test_installer_ladder_requirements_rung_orders_requirements_txt_first():
@@ -119,6 +119,75 @@ def test_installer_nothing_declared_is_an_honest_empty_ladder():
     assert result["installer"] == "pip"
     assert result["commands"] == []
     assert result["source"] is None
+
+
+# ---------------------------------------------------------------------------
+# Bug #13 defect 3: REAL extras detection — the pip rung must install the
+# extras the project ACTUALLY declares ([project.optional-dependencies] /
+# setup.cfg [options.extras_require]), never a hardcoded '.[test]'.
+# paramiko evidence: no 'test' extra exists, pip printed "does not provide
+# the extra 'test'", and pytest/icecream silently never installed.
+# ---------------------------------------------------------------------------
+
+from sag.tools.internal.python_env import declared_extras
+
+PARAMIKO_SHAPED_PYPROJECT = """\
+[project]
+name = "paramiko"
+
+[project.optional-dependencies]
+gssapi = ["pyasn1>=0.1.7"]
+invoke = ["invoke>=2.0"]
+all = ["pyasn1>=0.1.7", "invoke>=2.0"]
+"""
+
+
+def test_declared_extras_reads_pyproject_and_setup_cfg():
+    assert declared_extras(PARAMIKO_SHAPED_PYPROJECT, "") == ["gssapi", "invoke", "all"]
+    cfg = "[options.extras_require]\ntests =\n    mock\n    pytest\n"
+    assert declared_extras("", cfg) == ["tests"]
+
+
+def test_declared_extras_ignores_dependency_pins_inside_arrays():
+    content = (
+        "[project.optional-dependencies]\n"
+        'test = [\n    "pytest==7.4",\n    "coverage>=6",\n]\n'
+        'lint = ["ruff"]\n'
+    )
+    assert declared_extras(content, "") == ["test", "lint"]
+
+
+def test_pyproject_rung_without_test_extras_is_plain_editable_with_note():
+    # paramiko shape: extras exist, but none of them are test extras.
+    result = detect_installer(
+        {"pyproject.toml"}, contents={"pyproject.toml": PARAMIKO_SHAPED_PYPROJECT}
+    )
+    assert result["commands"] == ["{venv}/bin/python -m pip install -e ."]
+    assert result["test_extras"] == []
+    assert result["note"] == "no test extras declared — test deps may be missing"
+
+
+def test_pyproject_rung_combines_the_test_extras_that_exist():
+    content = (
+        '[project]\nname = "x"\n\n'
+        "[project.optional-dependencies]\n"
+        'tests = ["pytest"]\ndev = ["tox"]\ndocs = ["sphinx"]\n'
+    )
+    result = detect_installer({"pyproject.toml"}, contents={"pyproject.toml": content})
+    # preference order test/tests/dev/develop, restricted to what EXISTS
+    assert result["commands"] == ["{venv}/bin/python -m pip install -e '.[tests,dev]'"]
+    assert result["test_extras"] == ["tests", "dev"]
+    assert result.get("note") is None
+
+
+def test_setup_cfg_extras_feed_the_editable_rung():
+    cfg = "[options.extras_require]\ntest =\n    mock\n    pytest\n"
+    result = detect_installer(
+        {"pyproject.toml", "setup.cfg"},
+        contents={"pyproject.toml": '[project]\nname = "x"\n', "setup.cfg": cfg},
+    )
+    assert result["commands"] == ["{venv}/bin/python -m pip install -e '.[test]'"]
+    assert result["test_extras"] == ["test"]
 
 
 class LayoutOrch:
@@ -220,10 +289,14 @@ def test_analyzer_persists_python_manifest_keys(monkeypatch):
     assert captured["python_version"] == "3.13"      # newest satisfying >=3.9
     assert captured["python_constraint"] == ">=3.9"
     assert captured["python_installer"] == "pip"
+    # Bug #13 defect 3: no extras declared -> plain editable install, and the
+    # missing-test-extras note rides the manifest so setup_env narrates it.
     assert captured["python_install_commands"] == [
-        "{venv}/bin/python -m pip install -e '.[test]' || "
         "{venv}/bin/python -m pip install -e ."
     ]
+    assert captured["python_install_note"] == (
+        "no test extras declared — test deps may be missing"
+    )
     assert captured["python_packages"] == ["foo"]
     assert captured["python_venv"].endswith("/.venv")
     assert captured["has_c_extensions"] is False
@@ -253,7 +326,10 @@ def test_analyzer_test_hints_are_metadata_only():
     assert config["test_hints"]["test_deps"] == ["pytest", "pytest-cov", "mock"]
     assert config["test_hints"]["pytest_args"] == "-q tests/"  # {posargs} stripped
     assert config["python_installer"] == "pip"                  # bare setup.py rung
-    assert config["python_install_commands"] == ["{venv}/bin/python -m pip install -e ."]
+    # Bug #13 defect 3: the setup.cfg-declared 'test' extra IS real — install it.
+    assert config["python_install_commands"] == [
+        "{venv}/bin/python -m pip install -e '.[test]'"
+    ]
     assert config["python_packages"] == ["legacy"]
     # tox is READ-ONLY metadata (settled decision): never executed
     assert not any(c.strip().startswith(("tox", "nox")) for c in orch.commands)

@@ -558,7 +558,12 @@ class ProjectAnalyzerTool(BaseTool):
                 constraint, constraint_source = value, source
                 break
 
-        installer = detect_installer(files_present)
+        # Bug #13 defect 3: the editable pip rungs install the extras the
+        # project ACTUALLY declares — pass the metadata contents through.
+        installer = detect_installer(
+            files_present,
+            {"pyproject.toml": pyproject, "setup.cfg": setup_cfg},
+        )
 
         hints = tox_test_hints(tox_ini)
         for dep in setup_cfg_test_deps(setup_cfg):
@@ -583,6 +588,9 @@ class ProjectAnalyzerTool(BaseTool):
             "python_installer": installer["installer"],
             "python_install_commands": installer["commands"],
             "python_install_source": installer["source"],
+            # Bug #13 defect 3: no-test-extras rides the manifest so
+            # setup_env narrates the hole instead of failing silently.
+            "python_install_note": installer.get("note"),
             "python_packages": discover_packages(orch, project_path),
             "python_venv": f"{project_path.rstrip('/')}/.venv",
             "has_c_extensions": has_c_extensions,
@@ -1523,6 +1531,7 @@ PY"""
                     "python_constraint_source": python_config.get("python_constraint_source"),
                     "python_installer": python_config.get("python_installer"),
                     "python_install_commands": python_config.get("python_install_commands") or [],
+                    "python_install_note": python_config.get("python_install_note"),
                     "python_install_source": python_config.get("python_install_source"),
                     "python_packages": python_config.get("python_packages") or [],
                     "python_venv": python_config.get("python_venv"),
