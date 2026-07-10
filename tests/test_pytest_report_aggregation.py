@@ -269,6 +269,132 @@ def test_maven_surefire_raw_accumulation_unchanged(workspace):
 
 
 # ---------------------------------------------------------------------------
+# FIX A, shell fallback path: when the compact in-container parser is
+# unavailable, the find/cat fallback must apply the SAME pytest per-test
+# aggregation (latest invocation wins) instead of raw-summing XMLs and
+# severity-merging statuses (which double-counted re-run tests and made a
+# re-run pass unable to clear an earlier failure).
+# ---------------------------------------------------------------------------
+
+
+class CompactParserDownOrch(LocalExecOrch):
+    """Compact in-container parser fails (exit 1) -> the shell find/cat
+    fallback executes for real against the tmp-dir fixtures."""
+
+    def execute_command(self, cmd, workdir=None, **kwargs):
+        if "SAG_COMPACT_TEST_REPORT_PARSER" in cmd:
+            self.commands.append(cmd)
+            return {"exit_code": 1, "success": False, "output": ""}
+        return super().execute_command(cmd, workdir=workdir, **kwargs)
+
+
+def _parse_fallback(project):
+    validator = PhysicalValidator(
+        docker_orchestrator=CompactParserDownOrch(), project_path=str(project.parent)
+    )
+    return validator.parse_test_reports(str(project))
+
+
+def test_fallback_shell_path_subset_rerun_aggregates_per_test(workspace):
+    """Full run 9/10 + subset re-run of the 1 failure now passing -> 10/10
+    through the shell fallback too: no double-counted total (11), no
+    never-overridable failure from the severity merge."""
+    project, reports = workspace
+    (reports / "pytest-1000.xml").write_text(_full_suite("failed"))
+    (reports / "pytest-2000.xml").write_text(
+        _junit_xml([("tests.test_api", "test_broken", "passed")])
+    )
+
+    result = _parse_fallback(project)
+
+    assert result["valid"] is True
+    assert result["total_tests"] == 10
+    assert result["passed_tests"] == 10
+    assert result["failed_tests"] == 0
+    assert result["test_success"] is True
+    assert result["failing_test_names"] == []
+    # Raw executions stay honest: 11 runs happened, 1 of them failed.
+    assert result["raw_total_tests"] == 11
+    assert result["raw_failed_tests"] == 1
+
+
+def test_fallback_shell_path_latest_invocation_wins_by_epoch(workspace):
+    """pytest-100.xml (epoch 100) is LATER than pytest-99.xml even though it
+    sorts first as a string; its passing result must win in the fallback."""
+    project, reports = workspace
+    (reports / "pytest-99.xml").write_text(_junit_xml([("tests.test_api", "test_flaky", "failed")]))
+    (reports / "pytest-100.xml").write_text(
+        _junit_xml([("tests.test_api", "test_flaky", "passed")])
+    )
+
+    result = _parse_fallback(project)
+
+    assert result["total_tests"] == 1
+    assert result["passed_tests"] == 1
+    assert result["failed_tests"] == 0
+    assert result["test_success"] is True
+    assert result["failing_test_names"] == []
+
+
+def test_fallback_shell_path_parameterized_union(workspace):
+    """8 parameterized executions of one method stay 8 primary entries and 1
+    unique method through the fallback (same basis as the compact parser)."""
+    project, reports = workspace
+    params = ["http", "https", "all", "mixed", "socks", "env", "noproxy", "cidr"]
+    (reports / "pytest-1000.xml").write_text(
+        _junit_xml(
+            [
+                ("tests.test_lowlevel", f"test_use_proxy_from_environment[{p}]", "failed")
+                for p in params
+            ]
+        )
+    )
+
+    result = _parse_fallback(project)
+
+    assert result["total_tests"] == 8
+    assert result["failed_tests"] == 8
+    assert result["unique_tests"] == 1
+
+
+def test_fallback_shell_path_maven_raw_accumulation_unchanged(workspace):
+    """Maven surefire semantics through the shell fallback stay byte-identical:
+    RAW sums across files, severity-merged unique statuses (failed wins over a
+    later pass)."""
+    project, _reports = workspace
+    surefire = project / "target" / "surefire-reports"
+    surefire.mkdir(parents=True)
+    first = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuite name="com.example.FooTest" tests="3" failures="1" errors="0" skipped="0">'
+        '<testcase classname="com.example.FooTest" name="testA" time="0.01" />'
+        '<testcase classname="com.example.FooTest" name="testB" time="0.01" />'
+        '<testcase classname="com.example.FooTest" name="testC" time="0.01">'
+        '<failure message="nope">AssertionError</failure></testcase>'
+        "</testsuite>"
+    )
+    rerun = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuite name="com.example.FooTest" tests="1" failures="0" errors="0" skipped="0">'
+        '<testcase classname="com.example.FooTest" name="testC" time="0.01" />'
+        "</testsuite>"
+    )
+    (surefire / "TEST-com.example.FooTest.xml").write_text(first)
+    (surefire / "TEST-com.example.FooTest.RERUN.xml").write_text(rerun)
+
+    result = _parse_fallback(project)
+
+    assert result["valid"] is True
+    assert result["total_tests"] == 4
+    assert result["passed_tests"] == 3
+    assert result["failed_tests"] == 1
+    assert result["test_success"] is False
+    assert result["unique_tests"] == 3
+    assert result["unique_failed_tests"] == 1
+    assert "com.example.FooTest::testC" in result["failing_test_names"]
+
+
+# ---------------------------------------------------------------------------
 # FIX B: pytest --collect-only denominator feeds discovered + the coverage gate
 # ---------------------------------------------------------------------------
 

@@ -320,6 +320,32 @@ print(json.dumps(result, separators=(",", ":")))
 '''
 
 
+def _is_pytest_report_path(path: str, pytest_reports_dir: str) -> bool:
+    """True for python_tool's per-invocation pytest XMLs.
+
+    Mirrors the compact in-container parser's is_pytest_report so the shell
+    find/cat fallback partitions report files on the same basis.
+    """
+    s = str(path)
+    return (
+        s.startswith(pytest_reports_dir.rstrip("/") + "/")
+        or "/.setup_agent/pytest-reports/" in s
+    )
+
+
+def _pytest_run_order(path: str) -> Tuple[int, int, str]:
+    """Invocation order for pytest report files (latest wins downstream).
+
+    Prefers the epoch python_tool embeds in the filename (pytest-<epoch>.xml),
+    mirroring the compact in-container parser; unrecognized names sort last by
+    path (no cheap mtime is available through the shell fallback).
+    """
+    match = re.search(r"pytest-(\d+)\.xml$", path)
+    if match:
+        return (0, int(match.group(1)), path)
+    return (1, 0, path)
+
+
 def evaluate_run_verdict(
     build_green: bool,
     pass_rate: float,
@@ -1138,7 +1164,20 @@ class PhysicalValidator:
                     f"📊 Identified {len(groovy_test_classes)} Groovy test classes to exclude"
                 )
 
-            for report_file in report_files:
+            # Partition: pytest invocation XMLs need per-test aggregation with
+            # the LATEST invocation winning (python_tool writes ONE cumulative
+            # XML per pytest run, so raw sums double-count every test present
+            # in two invocations and a severity merge lets a stale failure
+            # override a later re-run pass). JVM surefire/failsafe/gradle XMLs
+            # keep the legacy raw accumulation + severity merge, unchanged.
+            pytest_report_files = sorted(
+                (f for f in report_files if _is_pytest_report_path(f, PYTEST_REPORT_DIR)),
+                key=_pytest_run_order,
+            )
+            pytest_file_set = set(pytest_report_files)
+            jvm_report_files = [f for f in report_files if f not in pytest_file_set]
+
+            for report_file in jvm_report_files:
                 try:
                     xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
                     if xml_result.get("exit_code") != 0:
@@ -1223,6 +1262,127 @@ class PhysicalValidator:
                     test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
                     logger.warning(f"Failed to parse test report {report_file}: {e}")
 
+            # pytest reports: per-test aggregation across invocations, latest
+            # invocation winning — mirrors the compact in-container parser. The
+            # execution id keeps the [param] suffix so parameterized runs stay
+            # distinct and the primary executed total remains comparable to the
+            # pytest --collect-only denominator.
+            pytest_raw = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+            pytest_suites_only = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+            pytest_union: Dict[str, str] = {}
+            for report_file in pytest_report_files:
+                try:
+                    xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
+                    if xml_result.get("exit_code") != 0:
+                        test_result["parsing_errors"].append(f"Failed to read {report_file}")
+                        continue
+
+                    xml_content = xml_result.get("output", "")
+                    if not xml_content.strip():
+                        continue
+
+                    stats = self._parse_single_test_xml(
+                        xml_content, report_file, groovy_test_classes
+                    )
+                    if not stats:
+                        test_result["parsing_errors"].append(
+                            f"Failed to parse XML structure in {report_file}"
+                        )
+                        continue
+
+                    for key in pytest_raw:
+                        pytest_raw[key] += stats.get(key, 0)
+
+                    testcases_in_file = stats.get("testcases", [])
+                    if not testcases_in_file:
+                        # Suite-attribute-only XML: nothing to deduplicate, the
+                        # counts flow into the primary totals as-is.
+                        for key in pytest_suites_only:
+                            pytest_suites_only[key] += stats.get(key, 0)
+                        continue
+
+                    files_with_testcases += 1
+                    total_testcases_found += len(testcases_in_file)
+
+                    file_units: Dict[str, str] = {}
+                    file_methods: Dict[str, str] = {}
+                    for testcase in testcases_in_file:
+                        normalized_key = normalize_testcase_identifier(
+                            testcase.get("classname", ""),
+                            testcase.get("name"),
+                            testcase.get("file"),
+                        )
+                        if not normalized_key:
+                            continue
+
+                        status = testcase.get("status", "passed")
+                        raw_name = testcase.get("name") or ""
+                        suffix = raw_name[raw_name.index("[") :] if "[" in raw_name else ""
+                        unit = normalized_key + suffix
+                        file_units[unit] = (
+                            merge_testcase_status(file_units[unit], status)
+                            if unit in file_units
+                            else status
+                        )
+                        file_methods[normalized_key] = (
+                            merge_testcase_status(file_methods[normalized_key], status)
+                            if normalized_key in file_methods
+                            else status
+                        )
+
+                        execution_time = testcase.get("time", 0.0)
+                        if normalized_key not in test_case_records:
+                            test_case_records[normalized_key] = RuntimeTestCaseRecord(
+                                descriptor=(
+                                    test_catalog.get(normalized_key) if test_catalog else None
+                                ),
+                                key=normalized_key,
+                                statuses=[status],
+                                final_status=status,
+                                execution_time_ms=(
+                                    float(execution_time) * 1000 if execution_time else 0.0
+                                ),
+                                sources={report_file},
+                                raw_names=[raw_name],
+                            )
+                        else:
+                            record = test_case_records[normalized_key]
+                            record.statuses.append(status)
+                            record.execution_time_ms += (
+                                float(execution_time) * 1000 if execution_time else 0.0
+                            )
+                            record.sources.add(report_file)
+                            if raw_name not in record.raw_names:
+                                record.raw_names.append(raw_name)
+
+                    # LATEST invocation wins for the tests it re-ran; everything
+                    # else persists (never severity-merged across invocations).
+                    pytest_union.update(file_units)
+                    for key, merged_status in file_methods.items():
+                        test_case_records[key].final_status = merged_status
+                except Exception as e:
+                    test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
+                    logger.warning(f"Failed to parse test report {report_file}: {e}")
+
+            # Fold the pytest per-test union into the primary counters (the JVM
+            # counters above stay raw accumulation, unchanged). raw_* keeps the
+            # honest execution totals across BOTH kinds of reports.
+            raw_totals = {
+                "total": test_result["total_tests"] + pytest_raw["total"],
+                "passed": test_result["passed_tests"] + pytest_raw["passed"],
+                "failed": test_result["failed_tests"] + pytest_raw["failed"],
+                "errors": test_result["error_tests"] + pytest_raw["errors"],
+                "skipped": test_result["skipped_tests"] + pytest_raw["skipped"],
+            }
+            union_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+            for unit_status in pytest_union.values():
+                union_counts[unit_status] = union_counts.get(unit_status, 0) + 1
+            test_result["total_tests"] += len(pytest_union) + pytest_suites_only["total"]
+            test_result["passed_tests"] += union_counts["passed"] + pytest_suites_only["passed"]
+            test_result["failed_tests"] += union_counts["failed"] + pytest_suites_only["failed"]
+            test_result["error_tests"] += union_counts["error"] + pytest_suites_only["errors"]
+            test_result["skipped_tests"] += union_counts["skipped"] + pytest_suites_only["skipped"]
+
             logger.info(
                 f"📊 Debug: Found {total_testcases_found} total testcases in {files_with_testcases} files"
             )
@@ -1232,11 +1392,11 @@ class PhysicalValidator:
 
             if test_case_records:
                 # Preserve raw metrics before overwriting with deduplicated counts
-                test_result["raw_total_tests"] = test_result["total_tests"]
-                test_result["raw_passed_tests"] = test_result["passed_tests"]
-                test_result["raw_failed_tests"] = test_result["failed_tests"]
-                test_result["raw_error_tests"] = test_result["error_tests"]
-                test_result["raw_skipped_tests"] = test_result["skipped_tests"]
+                test_result["raw_total_tests"] = raw_totals["total"]
+                test_result["raw_passed_tests"] = raw_totals["passed"]
+                test_result["raw_failed_tests"] = raw_totals["failed"]
+                test_result["raw_error_tests"] = raw_totals["errors"]
+                test_result["raw_skipped_tests"] = raw_totals["skipped"]
 
                 # Store runtime records in result
                 test_result["test_case_records"] = {
