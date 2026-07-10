@@ -1485,16 +1485,29 @@ class ReportTool(BaseTool, UIEventEmitter):
             "test": actual_accomplishments.get("test_success", False),
         }
 
-        # Calculate test metrics with consistent counting
-        # static_test_count reflects the number of declared test methods
-        # execution_rate therefore measures method-level coverage
+        # Calculate test metrics with consistent counting. The numerator must
+        # share the denominator's basis:
+        # - Maven/Gradle: static_test_count counts declared test METHODS
+        #   (catalog scan), so execution_rate measures method-level coverage
+        #   with the param-stripped unique method count as numerator.
+        # - Python: static_test_count comes from pytest --collect-only, which
+        #   counts parameterized invocations ([param] EXPANDED). The parser's
+        #   executed union preserves [param] precisely so it stays comparable
+        #   to the collect-only count — using the stripped unique method count
+        #   here read a full 100%-green run (50 collected, 50 executed, 21
+        #   methods) as 42% coverage and falsely fired tests_not_fully_executed.
         execution_rate = None
         expansion_factor = None
 
         executed_tests = to_int(tests_total)
         raw_executed_tests = to_int(raw_total_tests)
         unique_executed_tests = to_int(unique_total_tests)
-        coverage_executed_tests = unique_executed_tests or executed_tests
+        if static_test_count and self._is_python_project(project_info):
+            coverage_executed_tests = (
+                executed_tests if executed_tests is not None else unique_executed_tests
+            )
+        else:
+            coverage_executed_tests = unique_executed_tests or executed_tests
 
         if static_test_count and coverage_executed_tests is not None:
             try:
@@ -3293,6 +3306,25 @@ class ReportTool(BaseTool, UIEventEmitter):
         result = self._compute_module_metrics(test_history, generated_at=generated_at)
         self._module_metrics_cache = result
         return result
+
+    def _is_python_project(self, project_info: Optional[dict] = None) -> bool:
+        """True when the project under report is python (pytest-based).
+
+        Physical detection first (same rationale as _compute_module_metrics:
+        project_info.build_system is often "Unknown" at report time), falling
+        back to the reported build system when no validator is wired.
+        """
+        detect = getattr(self.physical_validator, "_detect_build_system", None)
+        if callable(detect):
+            try:
+                project_dir = (project_info or {}).get("directory") or "/workspace"
+                detected = str(detect(project_dir) or "").strip().lower()
+                if detected and detected != "unknown":
+                    return detected == "python"
+            except Exception as exc:
+                logger.debug(f"_detect_build_system failed: {exc}")
+        reported = str((project_info or {}).get("build_system") or "").strip().lower()
+        return reported in ("python", "pip/poetry")
 
     def _compute_module_metrics(self, test_history: dict, *, generated_at: str):
         validator = getattr(self, "physical_validator", None)

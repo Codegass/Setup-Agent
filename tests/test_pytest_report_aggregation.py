@@ -330,11 +330,23 @@ def test_collected_json_fallback_populates_test_stats_discovered():
     assert any(COLLECTED_JSON in c for c in orch.commands)
 
 
-def test_execution_coverage_gate_consumes_collected_fallback():
+def test_execution_coverage_gate_consumes_collected_fallback(workspace):
     """The report snapshot's static_test_count (the number the
     tests_not_fully_executed gate reads) must come from the collect-only
     denominator when trunk/catalog have nothing: 8 of 635 executed -> the
-    conflict fires and caps the run, instead of a silent 0/8 false red."""
+    conflict fires and caps the run, instead of a silent 0/8 false red.
+
+    The test_analysis fed to the snapshot is the REAL parser's output for the
+    subset XML (total 8, unique 1 — FIX A contract), so the gate is exercised
+    with numbers the live pipeline can actually produce. The collect-only
+    denominator is param-EXPANDED, so the coverage numerator must be the
+    param-expanded executed union (8), never the stripped method count (1)."""
+    project, reports = workspace
+    (reports / "pytest-1783661384.xml").write_text(_SUBSET_XML)
+    parsed = _parse(project)
+    assert parsed["total_tests"] == 8
+    assert parsed["unique_tests"] == 1  # parser-faithful: 8 params of ONE method
+
     tool = ReportTool()
     accomplishments = {
         "physical_validation": {
@@ -348,21 +360,14 @@ def test_execution_coverage_gate_consumes_collected_fallback():
                     "pass_rate": 0.0,
                 },
             },
-            "test_analysis": {
-                "total_tests": 8,
-                "passed_tests": 0,
-                "failed_tests": 8,
-                "error_tests": 0,
-                "skipped_tests": 0,
-                "unique_tests": 8,
-            },
+            "test_analysis": parsed,
         },
     }
 
     snapshot = tool._build_report_snapshot(
         verified_status="partial",
         report_filename="setup-report-test.md",
-        project_info={},
+        project_info={"build_system": "pip/poetry"},
         actual_accomplishments=accomplishments,
         execution_metrics={},
     )
@@ -371,6 +376,81 @@ def test_execution_coverage_gate_consumes_collected_fallback():
     assert status["static_test_count"] == 635
     assert status["execution_rate"] == pytest.approx(8 / 635 * 100, abs=0.01)
     assert "tests_not_fully_executed" in snapshot["evidence_result"]["conflicts"]
+
+
+def test_full_green_parameterized_run_keeps_coverage_gate_quiet(workspace):
+    """One full 100%-green pytest run: 50 collected, 50 executed union entries,
+    21 unique methods. The pytest --collect-only denominator counts
+    parameterized invocations ([param] expanded), so the coverage numerator
+    must share that basis — comparing the param-STRIPPED unique method count
+    (21) against the expanded denominator (50) read a genuinely full green run
+    as 42% coverage, falsely fired tests_not_fully_executed and capped it at
+    PARTIAL."""
+    project, reports = workspace
+    cases = [("tests.test_api", f"test_ok_{i}", "passed") for i in range(20)]
+    cases += [("tests.test_params", f"test_matrix[case{i}]", "passed") for i in range(30)]
+    (reports / "pytest-1000.xml").write_text(_junit_xml(cases))
+
+    parsed = _parse(project)  # REAL compact parser
+    assert parsed["total_tests"] == 50
+    assert parsed["passed_tests"] == 50
+    assert parsed["unique_tests"] == 21
+
+    tool = ReportTool()
+    accomplishments = {
+        "physical_validation": {
+            "test_status": {"static_test_count": 50},
+            "test_analysis": parsed,
+        },
+    }
+
+    snapshot = tool._build_report_snapshot(
+        verified_status="success",
+        report_filename="setup-report-test.md",
+        project_info={"build_system": "pip/poetry"},
+        actual_accomplishments=accomplishments,
+        execution_metrics={},
+    )
+
+    status = snapshot["status"]
+    assert status["static_test_count"] == 50
+    assert status["execution_rate"] == pytest.approx(100.0, abs=0.01)
+    assert "tests_not_fully_executed" not in snapshot["evidence_result"].get("conflicts", [])
+
+
+def test_java_method_denominator_keeps_unique_numerator():
+    """Maven/Gradle guard: static_test_count counts declared test METHODS
+    (catalog scan), so the unique method count stays the numerator there — a
+    surefire run with parameterized expansions (50 raw executions of 21
+    methods) is 21/21 = 100% coverage, not 238% and not 42%."""
+    tool = ReportTool()
+    accomplishments = {
+        "physical_validation": {
+            "test_analysis": {
+                "total_tests": 50,
+                "passed_tests": 50,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "raw_total_tests": 50,
+                "unique_tests": 21,
+                "catalog_test_count": 21,
+            },
+        },
+    }
+
+    snapshot = tool._build_report_snapshot(
+        verified_status="success",
+        report_filename="setup-report-test.md",
+        project_info={"build_system": "Maven"},
+        actual_accomplishments=accomplishments,
+        execution_metrics={},
+    )
+
+    status = snapshot["status"]
+    assert status["static_test_count"] == 21
+    assert status["execution_rate"] == pytest.approx(100.0, abs=0.01)
+    assert "tests_not_fully_executed" not in snapshot["evidence_result"].get("conflicts", [])
 
 
 def test_env_summary_static_count_still_wins_when_present():
