@@ -267,8 +267,12 @@ def discover_packages(orchestrator, project_dir: str) -> List[str]:
     integration/, pylint_plugins/). When a flat candidate's import-normalized
     name matches the declared project name, that match IS the project and the
     non-matching candidates are dropped; without a name-match every candidate
-    is kept (heuristic only — the validator's installed-record gate is the
-    guarantee). src-layout and package_dir bases are never ranked."""
+    is kept. Either way the ranking is a heuristic only: the validator's
+    imports rung probes the project's FULL installed record whenever one
+    exists, so a genuine sibling dropped here (mercurial shape: hgext/ and
+    hgdemandimport/ next to the name-matched mercurial/) is still
+    import-probed, and a junk dir kept here still cannot block. src-layout
+    and package_dir bases are never ranked."""
     root = project_dir.rstrip("/")
     bases = [f"{root}/src", root]
     mapped = _declared_package_dir(orchestrator, root)

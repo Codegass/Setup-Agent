@@ -25,10 +25,12 @@ Bug #8 (apache/libcloud live probe) extends (a) into an ALWAYS-on gate: the
 flat-layout probe listed repo-support dirs (contrib/, demos/, integration/,
 pylint_plugins/ — each carries an __init__.py) as manifest packages, none of
 them was ever installed, and the imports rung required ALL manifest names ->
-false BLOCKED on a good build. Covered at the end of this file: import
-targets are manifest ∩ installed (else installed alone; else manifest as
-before), junk names warn instead of blocking, and discover_packages ranks
-flat-layout candidates by the declared project name.
+false BLOCKED on a good build. Covered at the end of this file: whenever the
+project's own installed record is non-empty its FULL name set is the import
+target list (never a manifest-narrowed subset — flat-layout ranking can drop
+genuine installed siblings, mercurial shape; else manifest as before), junk
+names warn instead of blocking, and discover_packages ranks flat-layout
+candidates by the declared project name.
 
 Scripted-orchestrator house style: tests/test_python_verifier.py.
 """
@@ -560,7 +562,10 @@ def test_package_dir_parsers_ignore_named_package_mappings():
 
 # The live repro shape: repo-support dirs each carry an __init__.py, so
 # discovery listed them as manifest packages; only the real package was ever
-# installed (its record's top_level.txt says so).
+# installed (its record's top_level.txt says so). The direct_url deliberately
+# points at /workspace/pyyaml: TopLevelOrch's harness project dir is
+# /workspace/pyyaml regardless of the distribution under test, and the PEP
+# 610 ladder selects the record whose direct_url targets THAT dir.
 _LIBCLOUD_JUNK = ["contrib", "demos", "integration", "pylint_plugins"]
 _LIBCLOUD_DIST = _dist(
     "apache_libcloud-3.8.0.dist-info",
@@ -626,6 +631,57 @@ def test_nothing_installed_keeps_manifest_import_semantics():
     details = result["evidence"]["fingerprint_details"]
     assert details["imports_ok"] is False
     assert details["import_failures"] == ["libcloud"]
+
+
+def test_installed_sibling_dropped_by_flat_ranking_is_still_probed():
+    # Mercurial shape: flat mercurial/ + hgext/ + hgdemandimport/, ALL in the
+    # project's own top_level.txt, setup(name='mercurial'). Discovery's
+    # flat-layout ranking narrows the manifest to ['mercurial'] (the declared
+    # name matches one candidate) — but the siblings ARE the project: the
+    # validator must probe the FULL installed record, so a broken sibling
+    # import is a real BLOCKED, never a silent success.
+    project = _dist(
+        "mercurial-6.5.dist-info",
+        "mercurial\nhgext\nhgdemandimport\n",
+        direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
+    )
+    orch = TopLevelOrch(
+        dists=[project] + _DEP_DISTS + _TOOLING_DISTS,
+        manifest=_manifest(python_packages=["mercurial"]),
+        failing_imports={"hgext"},
+    )
+    result = _validate(orch)
+    imports = _import_commands(orch)
+    assert any('"import mercurial"' in c for c in imports)
+    assert any('"import hgext"' in c for c in imports)
+    assert any('"import hgdemandimport"' in c for c in imports)
+    assert result["success"] is False
+    assert result["evidence_status"] == "blocked"
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is False
+    assert details["import_failures"] == ["hgext"]
+
+
+def test_installed_siblings_are_all_probed_on_partial_intersection():
+    # Same shape, healthy imports: every installed name is probed (the gate
+    # re-expands matched -> installed), and a manifest narrowed by ranking
+    # produces no junk warning — nothing was discovered-but-not-installed.
+    project = _dist(
+        "mercurial-6.5.dist-info",
+        "mercurial\nhgext\nhgdemandimport\n",
+        direct_url='{"url": "file:///workspace/pyyaml", "dir_info": {"editable": true}}',
+    )
+    orch = TopLevelOrch(
+        dists=[project] + _DEP_DISTS + _TOOLING_DISTS,
+        manifest=_manifest(python_packages=["mercurial"]),
+    )
+    result = _validate(orch)
+    assert len(_import_commands(orch)) == 3
+    assert result["evidence"]["fingerprint_details"]["imports_ok"] is True
+    assert not any(
+        "discovered but not installed" in w
+        for w in result["evidence"]["warnings"]
+    )
 
 
 def test_fully_installed_manifest_needs_no_junk_warning():

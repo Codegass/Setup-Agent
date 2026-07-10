@@ -2555,12 +2555,16 @@ class PhysicalValidator:
         probe happily lists repo-support dirs (contrib/, demos/,
         integration/, pylint_plugins/ — each carries an __init__.py) that
         were never installed, and one such junk name used to fail the whole
-        rung. Targets are manifest ∩ installed when that intersection is
-        non-empty, else the installed names alone; junk manifest names
-        surface as a "discovered but not installed" warning instead of a
-        false BLOCKED. Only when NOTHING of the project is installed do the
-        manifest packages keep today's semantics — their import failure is
-        then real evidence.
+        rung. Whenever the project's record is non-empty, the FULL installed
+        set is the import target list — never a manifest-narrowed subset:
+        discovery's flat-layout ranking can drop genuine installed siblings
+        (mercurial shape: mercurial/ + hgext/ + hgdemandimport/ all
+        installed, only the name-match kept in the manifest), and probing
+        manifest ∩ installed would let a broken sibling import pass
+        silently. Junk manifest names surface as a "discovered but not
+        installed" warning instead of a false BLOCKED. Only when NOTHING of
+        the project is installed do the manifest packages keep today's
+        semantics — their import failure is then real evidence.
         """
         from sag.tools.internal.build_preflight import read_build_requirements
 
@@ -2600,7 +2604,6 @@ class PhysicalValidator:
         # disk, never invented, never a dependency's record.
         installed = self._installed_top_level_packages(venv, project_dir)
         if packages and installed:
-            matched = [name for name in packages if name in installed]
             junk = sorted(name for name in packages if name not in installed)
             if junk:
                 result["warnings"].append(
@@ -2608,7 +2611,10 @@ class PhysicalValidator:
                     + " — skipped by the imports rung (not in the project's "
                     "installed record)"
                 )
-            packages = matched or installed
+            # The FULL installed set, never manifest ∩ installed: discovery's
+            # flat-layout ranking can narrow the manifest below the installed
+            # record, and a broken installed sibling must still BLOCK.
+            packages = installed
         elif not packages:
             # Empty manifest (package_dir layouts, bug #6): the installed
             # record is the fallback source of import targets.
