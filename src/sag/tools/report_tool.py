@@ -3286,9 +3286,25 @@ class ReportTool(BaseTool, UIEventEmitter):
                 build_system = str(detect(project_dir) or "").strip().lower()
             except Exception as exc:
                 logger.debug(f"_detect_build_system failed: {exc}")
+        if build_system == "python":
+            # Python project (pyproject.toml/setup.py/requirements.txt markers):
+            # the module scan speaks Java (.class/jar globs, surefire/gradle
+            # report dirs), so its counts are meaningless here. Live pyyaml run:
+            # python fell through the maven fallback below and the scan produced
+            # "🧩 Modules: 0 built / 1 detected" plus a bogus module-derived
+            # build_modules_incomplete while 1287/1287 pytest tests had run.
+            # None suppresses the modules line, the breakdown section, and the
+            # module-derived conflicts — v1 python scope is single-package
+            # (packages-as-modules is future work).
+            return None
         if build_system not in ("maven", "gradle"):
             # Fall back to the reported build system, then maven as last resort.
             reported = str(project_info.get("build_system") or "").strip().lower()
+            if reported in ("python", "pip/poetry"):
+                # Reported-python with no physical maven/gradle markers: same
+                # suppression as detected-python (the 'else maven' fallback was
+                # the live-run bug).
+                return None
             build_system = reported if reported in ("maven", "gradle") else "maven"
         try:
             modules = validator.scan_modules(project_dir, build_system)
