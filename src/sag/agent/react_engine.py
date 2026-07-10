@@ -554,8 +554,12 @@ class ReActEngine(UIEventEmitter):
             if not test_root:
                 return None
             # Only worth calling out when the tests are NOT where we built.
-            if test_root == rec.get("build_root") and rec.get("test_system") == rec.get(
-                "build_system"
+            # A python rec is pytest-at-the-build-root by construction, so its
+            # differing labels (pytest vs python) must not render the
+            # misleading "lives here, not in the build module" call-out.
+            if test_root == rec.get("build_root") and (
+                rec.get("test_system") == rec.get("build_system")
+                or is_python_build_system(rec.get("build_system"))
             ):
                 return None
             return (

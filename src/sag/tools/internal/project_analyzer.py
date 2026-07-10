@@ -1251,17 +1251,30 @@ PY"""
             "rationale": "",
         }
         # Python project: a missing Java compile target is EXPECTED, never a
-        # block signal. Store the CANONICAL ecosystem label on the payload —
-        # the runtime phase intros key their python guidance off
-        # rec["build_system"] (react_engine._detected_build_system), and the
-        # structure label ("pip/poetry") or an "unknown" fallthrough left the
-        # signal non-canonical on live runs.
-        if str(analysis.get("project_type", "")).strip().lower() == "python":
-            rec["build_system"] = "python"
+        # block signal. Make the recommendation REAL — live probes (paramiko,
+        # pyyaml) showed an empty/None-build_system rec left the trunk's
+        # environment_summary without any python signal, so the phase intros
+        # carried neither the rec line nor the python guidance and agents
+        # improvised (bash pip against the system python, blocked build
+        # phases, unrun tests). Key off the same signal _analyze_python_project
+        # produces (python_config), with the structure label as fallback, and
+        # store the CANONICAL ecosystem label — the runtime phase intros key
+        # their python guidance off rec["build_system"]
+        # (react_engine._detected_build_system).
+        python_config = analysis.get("python_config") or {}
+        if python_config or str(analysis.get("project_type", "")).strip().lower() == "python":
+            installer = python_config.get("python_installer") or "pip"
+            rec.update(
+                build_system="python",
+                build_root=project_path,
+                goal="deps",
+                test_root=project_path,
+                test_system="pytest",
+            )
             rec["rationale"] = (
-                "Python project — no Java compile target exists; install "
-                "dependencies (build deps) then verify byte-compilation "
-                "(build compile)."
+                f"Python project ({installer}): create the venv and install "
+                "with build(action='deps'), verify with build(action='compile'), "
+                "test with build(action='test')."
             )
             return rec
 
@@ -1388,6 +1401,11 @@ PY"""
         build_rec.setdefault("test_root", build_rec.get("build_root", project_path))
         build_rec.setdefault("test_system", build_rec.get("build_system"))
         build_rec.setdefault("test_modules", [])
+        # A python recommendation already carries its real test target (pytest
+        # at the project root); the Java/Groovy test-dir scan below must not
+        # override it (a stray src/test/java dir would relabel it maven).
+        if str(build_rec.get("build_system", "")).strip().lower() == "python":
+            return
         if not orch:
             return
 
@@ -2085,10 +2103,16 @@ PY"""
                     )
                     output += f"   • Source modules: {mods}\n"
             # Tests may live in a different module / build system than the build.
+            # (Python recs are pytest-at-the-build-root by construction — their
+            # differing labels must not render the "not in the build module"
+            # call-out; mirrors react_engine._recommended_build_line.)
             test_root = rec.get("test_root")
             if test_root and (
                 test_root != rec.get("build_root")
-                or rec.get("test_system") != rec.get("build_system")
+                or (
+                    rec.get("test_system") != rec.get("build_system")
+                    and str(rec.get("build_system", "")).strip().lower() != "python"
+                )
             ):
                 output += (
                     f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "
