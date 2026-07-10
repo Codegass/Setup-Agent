@@ -6,9 +6,37 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
+from sag.testcases.catalog import (
+    STATIC_SCAN_EXCLUSION_HELPER,
+    TestCaseCatalog,
+    build_java_test_catalog,
+)
 
 from ..base import BaseTool, ToolResult
+
+# Enforcer version accepts range syntax ([1.8,), [11,17)); capture the lower
+# bound including a legacy "1.x" form (the old \d+ captured "1" from "1.8").
+ENFORCER_JAVA_PATTERN = (
+    r"<requireJavaVersion>.*?<version>\s*\[?\s*(\d+(?:\.\d+)?)"
+)
+
+
+def _normalize_java_version(raw) -> Optional[str]:
+    """Normalize a detected Java version to a plain major string, or None.
+
+    Rejects unresolved property indirection (``${...}``) and non-numeric
+    junk; maps legacy ``1.x`` to ``x`` (1.8 -> 8).
+    """
+    if not raw:
+        return None
+    value = str(raw).strip()
+    if not value or "${" in value:
+        return None
+    if value.startswith("1.") and value[2:].isdigit():
+        return value[2:]
+    if value.isdigit():
+        return value
+    return None
 
 
 def _path_exists(orch, path: str) -> bool:
@@ -220,6 +248,10 @@ class ProjectAnalyzerTool(BaseTool):
             # Tests can live in different modules / a different build system than
             # the main build (Bigtop: Maven build module, Gradle test modules).
             self._recommend_test_approach(project_path, analysis["build_recommendation"])
+            # Persist the phase-1 -> build-tool handoff into the container so
+            # MavenTool/GradleTool (which only hold an orchestrator) can run
+            # the JDK pre-flight against the analyzed requirements.
+            self._persist_build_requirements(project_path, analysis)
         except Exception as exc:
             logger.warning(f"Build-approach recommendation failed: {exc}")
 
@@ -460,8 +492,110 @@ class ProjectAnalyzerTool(BaseTool):
             ):
                 config["build_system"] = "Gradle"
                 self._analyze_gradle_configuration(project_path, config)
+        elif project_type == "Python":
+            # Keep the structure-detection label (this dict overwrites the
+            # analysis via update(), so a None here would erase it) and add
+            # the Python analysis depth (spec Component 1).
+            config["build_system"] = "pip/poetry"
+            self._analyze_python_project(project_path, config)
 
         return config
+
+    def _analyze_python_project(self, project_path: str, analysis: Dict[str, Any]) -> None:
+        """Python analysis depth (spec Component 1): interpreter constraint ->
+        concrete version (newest satisfying), installer faithfulness ladder,
+        top-level package discovery, and READ-ONLY test hints (tox/nox are
+        metadata only, never executed). Fills ``analysis["python_config"]``,
+        which _persist_build_requirements merges into the handoff manifest.
+        """
+        from .python_env import (
+            detect_installer,
+            discover_packages,
+            requires_python_from_pyproject,
+            requires_python_from_setup_cfg,
+            requires_python_from_setup_py,
+            resolve_python_version,
+            setup_cfg_test_deps,
+            tox_test_hints,
+        )
+
+        orch = self.docker_orchestrator
+        if not orch:
+            return
+
+        listing = orch.execute_command(f"ls -1 {project_path} 2>/dev/null")
+        files_present = {
+            line.strip()
+            for line in (listing.get("output") or "").splitlines()
+            if line.strip()
+        }
+
+        def read(name: str) -> str:
+            if name not in files_present:
+                return ""
+            # Untruncated like the pom reads: this content is parsed
+            # internally by regex and never reaches the model's context.
+            result = orch.execute_command(
+                f"cat {project_path}/{name}", truncate_output=False
+            )
+            return result.get("output", "") if result.get("success") else ""
+
+        pyproject = read("pyproject.toml")
+        setup_py = read("setup.py")
+        setup_cfg = read("setup.cfg")
+        tox_ini = read("tox.ini")
+
+        # Constraint precedence mirrors packaging reality: pyproject is
+        # authoritative when present, setup.py/setup.cfg are the legacy forms.
+        constraint = None
+        constraint_source = None
+        for source, value in (
+            ("pyproject.toml", requires_python_from_pyproject(pyproject)),
+            ("setup.py", requires_python_from_setup_py(setup_py)),
+            ("setup.cfg", requires_python_from_setup_cfg(setup_cfg)),
+        ):
+            if value:
+                constraint, constraint_source = value, source
+                break
+
+        # Bug #13 defect 3: the editable pip rungs install the extras the
+        # project ACTUALLY declares — pass the metadata contents through.
+        installer = detect_installer(
+            files_present,
+            {"pyproject.toml": pyproject, "setup.cfg": setup_cfg},
+        )
+
+        hints = tox_test_hints(tox_ini)
+        for dep in setup_cfg_test_deps(setup_cfg):
+            if dep not in hints["test_deps"]:
+                hints["test_deps"].append(dep)
+
+        # C-extension markers: ext_modules in setup.py, the [tool.setuptools]
+        # ext-modules table in pyproject, or cython anywhere in either. The
+        # bare [tool.setuptools] table is NOT a marker — every modern
+        # setuptools project has one, and flagging it would demand .so
+        # evidence from pure-Python builds.
+        has_c_extensions = bool(
+            re.search(r"\bext_modules\b", setup_py)
+            or re.search(r"\bext[-_]modules\b", pyproject)
+            or re.search(r"(?i)\bcython\b", pyproject + setup_py)
+        )
+
+        analysis["python_config"] = {
+            "python_constraint": constraint,
+            "python_constraint_source": constraint_source,
+            "python_version": resolve_python_version(constraint),
+            "python_installer": installer["installer"],
+            "python_install_commands": installer["commands"],
+            "python_install_source": installer["source"],
+            # Bug #13 defect 3: no-test-extras rides the manifest so
+            # setup_env narrates the hole instead of failing silently.
+            "python_install_note": installer.get("note"),
+            "python_packages": discover_packages(orch, project_path),
+            "python_venv": f"{project_path.rstrip('/')}/.venv",
+            "has_c_extensions": has_c_extensions,
+            "test_hints": hints,
+        }
 
     def _analyze_maven_configuration(self, project_path: str, config: Dict[str, Any]):
         """分析Maven配置（pom.xml）- 包括多模块项目和父POM"""
@@ -523,18 +657,19 @@ class ProjectAnalyzerTool(BaseTool):
                 break  # Already found
 
             # 1. First check Maven Enforcer plugin for RequireJavaVersion
-            enforcer_pattern = (
-                r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            enforcer_match = re.search(
+                ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE
             )
-            enforcer_match = re.search(enforcer_pattern, pom_content, re.DOTALL | re.IGNORECASE)
             if enforcer_match:
-                java_version = enforcer_match.group(1).strip()
-                java_version_source = "maven-enforcer"
-                java_version_enforced = True
-                logger.info(
-                    f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                )
-                break
+                normalized = _normalize_java_version(enforcer_match.group(1))
+                if normalized:
+                    java_version = normalized
+                    java_version_source = "maven-enforcer"
+                    java_version_enforced = True
+                    logger.info(
+                        f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
+                    )
+                    break
 
             # 2. Check standard properties, then the maven-compiler-plugin
             # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
@@ -554,7 +689,12 @@ class ProjectAnalyzerTool(BaseTool):
             for pattern in java_version_patterns:
                 match = re.search(pattern, pom_content)
                 if match:
-                    java_version = match.group(1).strip()
+                    normalized = _normalize_java_version(match.group(1))
+                    if not normalized:
+                        # Rejected capture (e.g. ${...} indirection): fall
+                        # through to the next pattern instead of accepting it.
+                        continue
+                    java_version = normalized
                     java_version_source = "maven-compiler"
                     logger.info(
                         f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
@@ -562,9 +702,6 @@ class ProjectAnalyzerTool(BaseTool):
                     break
 
         if java_version:
-            # Normalize version (e.g., "1.8" -> "8")
-            if java_version.startswith("1."):
-                java_version = java_version[2:]
             config["java_version"] = java_version
             config["java_version_source"] = java_version_source
             config["java_version_enforced"] = java_version_enforced
@@ -644,10 +781,10 @@ class ProjectAnalyzerTool(BaseTool):
         for pattern in java_version_patterns:
             match = re.search(pattern, gradle_content, re.IGNORECASE | re.MULTILINE)
             if match:
-                version = match.group(1).strip()
-                # 处理版本号格式（比如 1.8 -> 8）
-                if version.startswith("1."):
-                    version = version[2:]
+                version = _normalize_java_version(match.group(1))
+                if not version:
+                    # Rejected capture: fall through to the next pattern.
+                    continue
                 config["java_version"] = version
                 logger.info(f"Found Java version: {version}")
                 break
@@ -805,16 +942,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-EXCLUDED_DIR_NAMES = {
-    '.git',
-    '.svn',
-    '.idea',
-    '.vscode',
-    'target',
-    'build',
-    'out',
-    'tmp',
-}
+{STATIC_SCAN_EXCLUSION_HELPER}
 
 ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
 
@@ -827,9 +955,6 @@ def strip_comments(source: str) -> str:
 
 counts = Counter()
 project_root = Path('.')
-
-def is_excluded(path: Path) -> bool:
-    return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
 
 test_dirs = []
 for candidate in project_root.rglob('src'):
@@ -1133,6 +1258,34 @@ PY"""
             "source_modules": [],
             "rationale": "",
         }
+        # Python project: a missing Java compile target is EXPECTED, never a
+        # block signal. Make the recommendation REAL — live probes (paramiko,
+        # pyyaml) showed an empty/None-build_system rec left the trunk's
+        # environment_summary without any python signal, so the phase intros
+        # carried neither the rec line nor the python guidance and agents
+        # improvised (bash pip against the system python, blocked build
+        # phases, unrun tests). Key off the same signal _analyze_python_project
+        # produces (python_config), with the structure label as fallback, and
+        # store the CANONICAL ecosystem label — the runtime phase intros key
+        # their python guidance off rec["build_system"]
+        # (react_engine._detected_build_system).
+        python_config = analysis.get("python_config") or {}
+        if python_config or str(analysis.get("project_type", "")).strip().lower() == "python":
+            installer = python_config.get("python_installer") or "pip"
+            rec.update(
+                build_system="python",
+                build_root=project_path,
+                goal="deps",
+                test_root=project_path,
+                test_system="pytest",
+            )
+            rec["rationale"] = (
+                f"Python project ({installer}): create the venv and install "
+                "with build(action='deps'), verify with build(action='compile'), "
+                "test with build(action='test')."
+            )
+            return rec
+
         orch = self.docker_orchestrator
         if not orch:
             return rec
@@ -1256,6 +1409,11 @@ PY"""
         build_rec.setdefault("test_root", build_rec.get("build_root", project_path))
         build_rec.setdefault("test_system", build_rec.get("build_system"))
         build_rec.setdefault("test_modules", [])
+        # A python recommendation already carries its real test target (pytest
+        # at the project root); the Java/Groovy test-dir scan below must not
+        # override it (a stray src/test/java dir would relabel it maven).
+        if str(build_rec.get("build_system", "")).strip().lower() == "python":
+            return
         if not orch:
             return
 
@@ -1312,6 +1470,77 @@ PY"""
             and test_system == build_rec.get("build_system")
         ):
             build_rec["test_root"] = project_path
+
+    def _persist_build_requirements(self, project_path: str, analysis: Dict[str, Any]) -> None:
+        """Persist the analyzer's build/test requirements manifest (spec §2).
+
+        The root shape is DERIVED from the recommendation the analyzer already
+        computed — it is a classification of the chosen targeting, not a second
+        classifier that could disagree with it:
+
+        - build target IS the project root and the root pom declares reactor
+          modules -> ``healthy_reactor``: install/test with fail-at-end so one
+          broken module cannot hide the rest (the tri-state verdict absorbs
+          partial reactor failures).
+        - build target is a subdirectory -> ``pathological_aggregator``: the
+          PR #9 leaf targeting was chosen because building the root compiles
+          nothing (Bigtop: profile-gated modules).
+        - anything else -> ``single_module``.
+        """
+        from .build_preflight import write_build_requirements
+
+        rec = analysis.get("build_recommendation") or {}
+        build_root = rec.get("build_root") or project_path
+        root = project_path.rstrip("/")
+        if build_root.rstrip("/") == root and analysis.get("maven_modules"):
+            root_shape = "healthy_reactor"
+        elif build_root.startswith(f"{root}/"):
+            root_shape = "pathological_aggregator"
+        else:
+            root_shape = "single_module"
+
+        fail_at_end = root_shape == "healthy_reactor"
+        # Fail-at-end testing only makes sense at reactor scope; when the test
+        # cluster lives elsewhere (Bigtop's Gradle subtree) leave it alone.
+        test_fail_at_end = (
+            fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
+        )
+
+        data = {
+            "java_version": analysis.get("java_version"),
+            "java_version_source": analysis.get("java_version_source"),
+            "java_version_enforced": bool(analysis.get("java_version_enforced")),
+            "root_shape": root_shape,
+            "build_root": build_root,
+            "build_goal": rec.get("goal"),
+            "fail_at_end": fail_at_end,
+            "test_root": rec.get("test_root"),
+            "test_system": rec.get("test_system"),
+            "test_fail_at_end": test_fail_at_end,
+        }
+
+        # Python requirements ride along on the SAME handoff manifest (spec
+        # Component 1): java keys stay, python keys are added when the
+        # analyzer's Python branch ran.
+        python_config = analysis.get("python_config") or {}
+        if python_config:
+            data.update(
+                {
+                    "python_version": python_config.get("python_version"),
+                    "python_constraint": python_config.get("python_constraint"),
+                    "python_constraint_source": python_config.get("python_constraint_source"),
+                    "python_installer": python_config.get("python_installer"),
+                    "python_install_commands": python_config.get("python_install_commands") or [],
+                    "python_install_note": python_config.get("python_install_note"),
+                    "python_install_source": python_config.get("python_install_source"),
+                    "python_packages": python_config.get("python_packages") or [],
+                    "python_venv": python_config.get("python_venv"),
+                    "has_c_extensions": bool(python_config.get("has_c_extensions")),
+                    "test_hints": python_config.get("test_hints") or {},
+                }
+            )
+
+        write_build_requirements(self.docker_orchestrator, data)
 
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
@@ -1883,10 +2112,16 @@ PY"""
                     )
                     output += f"   • Source modules: {mods}\n"
             # Tests may live in a different module / build system than the build.
+            # (Python recs are pytest-at-the-build-root by construction — their
+            # differing labels must not render the "not in the build module"
+            # call-out; mirrors react_engine._recommended_build_line.)
             test_root = rec.get("test_root")
             if test_root and (
                 test_root != rec.get("build_root")
-                or rec.get("test_system") != rec.get("build_system")
+                or (
+                    rec.get("test_system") != rec.get("build_system")
+                    and str(rec.get("build_system", "")).strip().lower() != "python"
+                )
             ):
                 output += (
                     f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "

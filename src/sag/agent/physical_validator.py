@@ -48,6 +48,343 @@ from sag.testcases.catalog import (
     normalize_testcase_identifier,
 )
 
+# top_level.txt names that are install tooling, never the project under test —
+# a second deny-list layer under the record selection in
+# _installed_top_level_packages (the project's own record could still list a
+# tooling name it vendors).
+_NON_PROJECT_TOP_LEVEL = {
+    "pip",
+    "setuptools",
+    "wheel",
+    "pkg_resources",
+    "_distutils_hack",
+}
+
+
+def _normalize_dist_name(name: str) -> str:
+    """PEP 503 name normalization: case-folded, runs of ``-_.`` collapse to
+    ``-`` — 'PyYAML' and 'pyyaml' are the same distribution."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _dist_record_matches(record_dir: str, project_name: str) -> bool:
+    """True when a site-packages ``*.dist-info`` / ``*.egg-info`` dir is the
+    PROJECT's own record: the distribution-name segment must equal the
+    PEP 503-normalized project name, and anything after it must look like a
+    version (leading digit) — so ``requests_toolbelt-1.0.dist-info`` never
+    matches project ``requests``. A dependency's record never matches."""
+    base = record_dir.rstrip("/").rsplit("/", 1)[-1]
+    for suffix in (".dist-info", ".egg-info"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    else:
+        return False
+    wanted = _normalize_dist_name(project_name)
+    normalized = _normalize_dist_name(base)
+    if normalized == wanted:
+        return True
+    if not normalized.startswith(f"{wanted}-"):
+        return False
+    return normalized[len(wanted) + 1 : len(wanted) + 2].isdigit()
+
+
+# In-container test-report parser (executed via `python3 - <<'PY'`). The two
+# header assignments (project_dir, pytest_reports_dir) are prepended by
+# _parse_test_reports_compact_in_container. Kept as a plain module string so
+# the embedded script needs no f-string brace escaping.
+#
+# Aggregation model (live 2026-07-10 requests run):
+# - Maven/Gradle report dirs: RAW accumulation across files with severity-merged
+#   unique statuses — byte-identical to the original parser (surefire re-run
+#   files legitimately add executions).
+# - pytest reports dir: python_tool writes ONE cumulative JUnit XML PER pytest
+#   INVOCATION (pytest-<epoch>.xml). Files are aggregated per test id with the
+#   LATEST invocation winning, so a diagnostic subset re-run updates the tests
+#   it ran but never erases (or double-counts) the rest of the suite. The
+#   primary executed/passed/failed counts are the deduped union.
+_COMPACT_REPORT_PARSER_BODY = '''
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def is_pytest_report(s):
+    return s.startswith(pytest_reports_dir.rstrip("/") + "/") or "/.setup_agent/pytest-reports/" in s
+
+
+def is_report_file(path):
+    s = str(path)
+    if not path.name.endswith(".xml"):
+        return False
+    return (
+        "/target/surefire-reports/" in s
+        or "/target/failsafe-reports/" in s
+        or "/build/test-results/" in s
+        or is_pytest_report(s)
+    )
+
+
+def normalize_method_name(method_name):
+    if not method_name:
+        return ""
+    name = method_name.strip()
+    if "[" in name:
+        name = name.split("[")[0]
+    if "(" in name:
+        name = name.split("(")[0]
+    if " #" in name:
+        name = name.split(" #")[0]
+    return name.strip()
+
+
+def normalize_key(classname, name, file_path=None):
+    method_name = normalize_method_name(name)
+    if not method_name:
+        return None
+    if classname:
+        classname = classname.replace("$", ".").strip()
+    elif file_path:
+        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "").strip(".")
+    else:
+        return method_name
+    return f"{classname}::{method_name}"
+
+
+def testcase_status(testcase):
+    if testcase.find("error") is not None:
+        return "error"
+    if testcase.find("failure") is not None:
+        return "failed"
+    if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
+        return "skipped"
+    return "passed"
+
+
+def merge_status(current, new):
+    severity = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
+    return new if severity.get(new, 0) > severity.get(current, 0) else current
+
+
+def int_attr(node, name):
+    try:
+        return int(float(node.get(name, 0) or 0))
+    except Exception:
+        return 0
+
+
+root = Path(project_dir)
+# pytest --junitxml reports live OUTSIDE the project dir; scan that root too.
+pytest_reports = Path(pytest_reports_dir)
+scan_roots = [root] + ([pytest_reports] if pytest_reports.is_dir() else [])
+report_files = sorted(
+    {str(path) for scan_root in scan_roots for path in scan_root.rglob("*.xml") if is_report_file(path)}
+)
+report_dirs = sorted({str(Path(path).parent) for path in report_files})
+
+groovy_classes = set()
+for groovy in root.rglob("src/test/groovy/**/*.groovy"):
+    try:
+        text = groovy.read_text(errors="ignore")
+    except Exception:
+        continue
+    if "@Test" in text:
+        groovy_classes.add(groovy.stem)
+
+unique = {}
+parsing_errors = []
+
+
+def parse_report(report_file):
+    """Return (testcase tuples, None), (None, suite-attr counts) or None."""
+    try:
+        tree = ET.parse(report_file)
+        xml_root = tree.getroot()
+    except Exception as exc:
+        parsing_errors.append(f"Error parsing {report_file}: {exc}")
+        return None
+    testcases = list(xml_root.iter("testcase"))
+    if testcases:
+        cases = []
+        for testcase in testcases:
+            classname = (testcase.get("classname") or "").strip()
+            simple_classname = classname.split(".")[-1] if classname else ""
+            if simple_classname in groovy_classes:
+                continue
+            cases.append(
+                (
+                    classname,
+                    testcase.get("name"),
+                    testcase.get("file") or report_file,
+                    testcase_status(testcase),
+                )
+            )
+        return (cases, None)
+    counts = {"total": 0, "failed": 0, "error": 0, "skipped": 0}
+    suites = [xml_root] if xml_root.tag == "testsuite" else list(xml_root.iter("testsuite"))
+    for suite in suites:
+        counts["total"] += int_attr(suite, "tests")
+        counts["failed"] += int_attr(suite, "failures")
+        counts["error"] += int_attr(suite, "errors")
+        counts["skipped"] += int_attr(suite, "skipped")
+    return (None, counts)
+
+
+def bump(counts, status):
+    counts["total"] += 1
+    if status == "error":
+        counts["error"] += 1
+    elif status == "failed":
+        counts["failed"] += 1
+    elif status == "skipped":
+        counts["skipped"] += 1
+    else:
+        counts["passed"] += 1
+
+
+def add_suite_counts(counts, suite_counts):
+    counts["total"] += suite_counts["total"]
+    counts["failed"] += suite_counts["failed"]
+    counts["error"] += suite_counts["error"]
+    counts["skipped"] += suite_counts["skipped"]
+    counts["passed"] += max(
+        0,
+        suite_counts["total"]
+        - suite_counts["failed"]
+        - suite_counts["error"]
+        - suite_counts["skipped"],
+    )
+
+
+# Maven/Gradle: raw accumulation, severity-merged unique statuses (unchanged).
+jvm = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for report_file in (p for p in report_files if not is_pytest_report(p)):
+    parsed = parse_report(report_file)
+    if parsed is None:
+        continue
+    cases, suite_counts = parsed
+    if cases is None:
+        add_suite_counts(jvm, suite_counts)
+        continue
+    for classname, name, file_attr, status in cases:
+        bump(jvm, status)
+        key = normalize_key(classname, name, file_attr)
+        if key:
+            unique[key] = merge_status(unique[key], status) if key in unique else status
+
+
+def pytest_run_order(path):
+    # Prefer the epoch python_tool embeds in the filename; mtime is the fallback.
+    match = re.search(r"pytest-(\\d+)\\.xml$", path)
+    if match:
+        return (0, int(match.group(1)), path)
+    try:
+        return (0, int(os.path.getmtime(path)), path)
+    except OSError:
+        return (1, 0, path)
+
+
+# pytest: per-test aggregation across invocations, LATEST invocation wins.
+pytest_raw = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+pytest_suites_only = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+pytest_union = {}
+for report_file in sorted((p for p in report_files if is_pytest_report(p)), key=pytest_run_order):
+    parsed = parse_report(report_file)
+    if parsed is None:
+        continue
+    cases, suite_counts = parsed
+    if cases is None:
+        add_suite_counts(pytest_raw, suite_counts)
+        add_suite_counts(pytest_suites_only, suite_counts)
+        continue
+    file_units = {}
+    file_methods = {}
+    for classname, name, file_attr, status in cases:
+        bump(pytest_raw, status)
+        key = normalize_key(classname, name, file_attr)
+        if not key:
+            continue
+        # Execution id keeps the [param] suffix: parameterized invocations stay
+        # distinct so executed totals stay comparable to the collect-only count.
+        unit = key + (name[name.index("["):] if name and "[" in name else "")
+        file_units[unit] = merge_status(file_units[unit], status) if unit in file_units else status
+        file_methods[key] = merge_status(file_methods[key], status) if key in file_methods else status
+    # LATEST invocation wins for the tests it re-ran; everything else persists.
+    pytest_union.update(file_units)
+    unique.update(file_methods)
+
+union_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for status in pytest_union.values():
+    union_counts[status] = union_counts.get(status, 0) + 1
+
+raw = {key: jvm[key] + pytest_raw[key] for key in jvm}
+total_tests = jvm["total"] + len(pytest_union) + pytest_suites_only["total"]
+passed_tests = jvm["passed"] + union_counts["passed"] + pytest_suites_only["passed"]
+failed_tests = jvm["failed"] + union_counts["failed"] + pytest_suites_only["failed"]
+error_tests = jvm["error"] + union_counts["error"] + pytest_suites_only["error"]
+skipped_tests = jvm["skipped"] + union_counts["skipped"] + pytest_suites_only["skipped"]
+
+unique_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for status in unique.values():
+    unique_counts[status] = unique_counts.get(status, 0) + 1
+
+result = {
+    "valid": bool(report_files),
+    "total_tests": total_tests,
+    "passed_tests": passed_tests,
+    "failed_tests": failed_tests,
+    "error_tests": error_tests,
+    "skipped_tests": skipped_tests,
+    "raw_total_tests": raw["total"],
+    "raw_passed_tests": raw["passed"],
+    "raw_failed_tests": raw["failed"],
+    "raw_error_tests": raw["error"],
+    "raw_skipped_tests": raw["skipped"],
+    "unique_tests": len(unique),
+    "unique_passed_tests": unique_counts.get("passed", 0),
+    "unique_failed_tests": unique_counts.get("failed", 0),
+    "unique_error_tests": unique_counts.get("error", 0),
+    "unique_skipped_tests": unique_counts.get("skipped", 0),
+    "test_success": total_tests > 0 and failed_tests == 0 and error_tests == 0,
+    "failing_test_names": sorted(
+        key for key, status in unique.items() if status in ("failed", "error")
+    )[:50],
+    "report_files": report_files[:200],
+    "report_file_count": len(report_files),
+    "report_dirs": report_dirs,
+    "parsing_errors": parsing_errors[:50],
+}
+print(json.dumps(result, separators=(",", ":")))
+'''
+
+
+def _is_pytest_report_path(path: str, pytest_reports_dir: str) -> bool:
+    """True for python_tool's per-invocation pytest XMLs.
+
+    Mirrors the compact in-container parser's is_pytest_report so the shell
+    find/cat fallback partitions report files on the same basis.
+    """
+    s = str(path)
+    return (
+        s.startswith(pytest_reports_dir.rstrip("/") + "/")
+        or "/.setup_agent/pytest-reports/" in s
+    )
+
+
+def _pytest_run_order(path: str) -> Tuple[int, int, str]:
+    """Invocation order for pytest report files (latest wins downstream).
+
+    Prefers the epoch python_tool embeds in the filename (pytest-<epoch>.xml),
+    mirroring the compact in-container parser; unrecognized names sort last by
+    path (no cheap mtime is available through the shell fallback).
+    """
+    match = re.search(r"pytest-(\d+)\.xml$", path)
+    if match:
+        return (0, int(match.group(1)), path)
+    return (1, 0, path)
+
 
 def evaluate_run_verdict(
     build_green: bool,
@@ -798,6 +1135,18 @@ class PhysicalValidator:
                     d.strip() for d in dirs_result.get("output", "").split("\n") if d.strip()
                 ]
 
+            # Python: python_tool writes pytest --junitxml reports OUTSIDE the
+            # project dir (PYTEST_REPORT_DIR). The XML inside is standard JUnit
+            # XML, so this parser consumes it UNCHANGED (spec 2026-07-07
+            # Component 4) — only the discovery gains the extra directory.
+            from sag.tools.internal.python_tool import PYTEST_REPORT_DIR
+
+            pytest_probe = self.docker_orchestrator.execute_command(
+                f"test -d {PYTEST_REPORT_DIR} && echo EXISTS"
+            )
+            if "EXISTS" in (pytest_probe.get("output") or ""):
+                report_dirs.append(PYTEST_REPORT_DIR)
+
             # Step 2: For each directory, list XML files in small batches to avoid truncation
             report_files: List[str] = []
             for report_dir in report_dirs:
@@ -855,7 +1204,20 @@ class PhysicalValidator:
                     f"📊 Identified {len(groovy_test_classes)} Groovy test classes to exclude"
                 )
 
-            for report_file in report_files:
+            # Partition: pytest invocation XMLs need per-test aggregation with
+            # the LATEST invocation winning (python_tool writes ONE cumulative
+            # XML per pytest run, so raw sums double-count every test present
+            # in two invocations and a severity merge lets a stale failure
+            # override a later re-run pass). JVM surefire/failsafe/gradle XMLs
+            # keep the legacy raw accumulation + severity merge, unchanged.
+            pytest_report_files = sorted(
+                (f for f in report_files if _is_pytest_report_path(f, PYTEST_REPORT_DIR)),
+                key=_pytest_run_order,
+            )
+            pytest_file_set = set(pytest_report_files)
+            jvm_report_files = [f for f in report_files if f not in pytest_file_set]
+
+            for report_file in jvm_report_files:
                 try:
                     xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
                     if xml_result.get("exit_code") != 0:
@@ -940,6 +1302,127 @@ class PhysicalValidator:
                     test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
                     logger.warning(f"Failed to parse test report {report_file}: {e}")
 
+            # pytest reports: per-test aggregation across invocations, latest
+            # invocation winning — mirrors the compact in-container parser. The
+            # execution id keeps the [param] suffix so parameterized runs stay
+            # distinct and the primary executed total remains comparable to the
+            # pytest --collect-only denominator.
+            pytest_raw = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+            pytest_suites_only = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+            pytest_union: Dict[str, str] = {}
+            for report_file in pytest_report_files:
+                try:
+                    xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
+                    if xml_result.get("exit_code") != 0:
+                        test_result["parsing_errors"].append(f"Failed to read {report_file}")
+                        continue
+
+                    xml_content = xml_result.get("output", "")
+                    if not xml_content.strip():
+                        continue
+
+                    stats = self._parse_single_test_xml(
+                        xml_content, report_file, groovy_test_classes
+                    )
+                    if not stats:
+                        test_result["parsing_errors"].append(
+                            f"Failed to parse XML structure in {report_file}"
+                        )
+                        continue
+
+                    for key in pytest_raw:
+                        pytest_raw[key] += stats.get(key, 0)
+
+                    testcases_in_file = stats.get("testcases", [])
+                    if not testcases_in_file:
+                        # Suite-attribute-only XML: nothing to deduplicate, the
+                        # counts flow into the primary totals as-is.
+                        for key in pytest_suites_only:
+                            pytest_suites_only[key] += stats.get(key, 0)
+                        continue
+
+                    files_with_testcases += 1
+                    total_testcases_found += len(testcases_in_file)
+
+                    file_units: Dict[str, str] = {}
+                    file_methods: Dict[str, str] = {}
+                    for testcase in testcases_in_file:
+                        normalized_key = normalize_testcase_identifier(
+                            testcase.get("classname", ""),
+                            testcase.get("name"),
+                            testcase.get("file"),
+                        )
+                        if not normalized_key:
+                            continue
+
+                        status = testcase.get("status", "passed")
+                        raw_name = testcase.get("name") or ""
+                        suffix = raw_name[raw_name.index("[") :] if "[" in raw_name else ""
+                        unit = normalized_key + suffix
+                        file_units[unit] = (
+                            merge_testcase_status(file_units[unit], status)
+                            if unit in file_units
+                            else status
+                        )
+                        file_methods[normalized_key] = (
+                            merge_testcase_status(file_methods[normalized_key], status)
+                            if normalized_key in file_methods
+                            else status
+                        )
+
+                        execution_time = testcase.get("time", 0.0)
+                        if normalized_key not in test_case_records:
+                            test_case_records[normalized_key] = RuntimeTestCaseRecord(
+                                descriptor=(
+                                    test_catalog.get(normalized_key) if test_catalog else None
+                                ),
+                                key=normalized_key,
+                                statuses=[status],
+                                final_status=status,
+                                execution_time_ms=(
+                                    float(execution_time) * 1000 if execution_time else 0.0
+                                ),
+                                sources={report_file},
+                                raw_names=[raw_name],
+                            )
+                        else:
+                            record = test_case_records[normalized_key]
+                            record.statuses.append(status)
+                            record.execution_time_ms += (
+                                float(execution_time) * 1000 if execution_time else 0.0
+                            )
+                            record.sources.add(report_file)
+                            if raw_name not in record.raw_names:
+                                record.raw_names.append(raw_name)
+
+                    # LATEST invocation wins for the tests it re-ran; everything
+                    # else persists (never severity-merged across invocations).
+                    pytest_union.update(file_units)
+                    for key, merged_status in file_methods.items():
+                        test_case_records[key].final_status = merged_status
+                except Exception as e:
+                    test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
+                    logger.warning(f"Failed to parse test report {report_file}: {e}")
+
+            # Fold the pytest per-test union into the primary counters (the JVM
+            # counters above stay raw accumulation, unchanged). raw_* keeps the
+            # honest execution totals across BOTH kinds of reports.
+            raw_totals = {
+                "total": test_result["total_tests"] + pytest_raw["total"],
+                "passed": test_result["passed_tests"] + pytest_raw["passed"],
+                "failed": test_result["failed_tests"] + pytest_raw["failed"],
+                "errors": test_result["error_tests"] + pytest_raw["errors"],
+                "skipped": test_result["skipped_tests"] + pytest_raw["skipped"],
+            }
+            union_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+            for unit_status in pytest_union.values():
+                union_counts[unit_status] = union_counts.get(unit_status, 0) + 1
+            test_result["total_tests"] += len(pytest_union) + pytest_suites_only["total"]
+            test_result["passed_tests"] += union_counts["passed"] + pytest_suites_only["passed"]
+            test_result["failed_tests"] += union_counts["failed"] + pytest_suites_only["failed"]
+            test_result["error_tests"] += union_counts["error"] + pytest_suites_only["errors"]
+            test_result["skipped_tests"] += union_counts["skipped"] + pytest_suites_only["skipped"]
+
             logger.info(
                 f"📊 Debug: Found {total_testcases_found} total testcases in {files_with_testcases} files"
             )
@@ -949,11 +1432,11 @@ class PhysicalValidator:
 
             if test_case_records:
                 # Preserve raw metrics before overwriting with deduplicated counts
-                test_result["raw_total_tests"] = test_result["total_tests"]
-                test_result["raw_passed_tests"] = test_result["passed_tests"]
-                test_result["raw_failed_tests"] = test_result["failed_tests"]
-                test_result["raw_error_tests"] = test_result["error_tests"]
-                test_result["raw_skipped_tests"] = test_result["skipped_tests"]
+                test_result["raw_total_tests"] = raw_totals["total"]
+                test_result["raw_passed_tests"] = raw_totals["passed"]
+                test_result["raw_failed_tests"] = raw_totals["failed"]
+                test_result["raw_error_tests"] = raw_totals["errors"]
+                test_result["raw_skipped_tests"] = raw_totals["skipped"]
 
                 # Store runtime records in result
                 test_result["test_case_records"] = {
@@ -1080,163 +1563,16 @@ class PhysicalValidator:
         validator does ``find`` followed by ``cat``. This parser keeps all XML
         reading local to the container and only returns aggregate metrics.
         """
-        project_dir_json = json.dumps(project_dir)
-        command = f"""python3 - <<'PY'
-# SAG_COMPACT_TEST_REPORT_PARSER
-import json
-import os
-import re
-import xml.etree.ElementTree as ET
-from pathlib import Path
+        from sag.tools.internal.python_tool import PYTEST_REPORT_DIR
 
-project_dir = {project_dir_json}
-
-def is_report_file(path):
-    s = str(path)
-    if not path.name.endswith(".xml"):
-        return False
-    return (
-        "/target/surefire-reports/" in s
-        or "/target/failsafe-reports/" in s
-        or "/build/test-results/" in s
-    )
-
-def normalize_method_name(method_name):
-    if not method_name:
-        return ""
-    name = method_name.strip()
-    if "[" in name:
-        name = name.split("[")[0]
-    if "(" in name:
-        name = name.split("(")[0]
-    if " #" in name:
-        name = name.split(" #")[0]
-    return name.strip()
-
-def normalize_key(classname, name, file_path=None):
-    method_name = normalize_method_name(name)
-    if not method_name:
-        return None
-    if classname:
-        classname = classname.replace("$", ".").strip()
-    elif file_path:
-        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "").strip(".")
-    else:
-        return method_name
-    return f"{{classname}}::{{method_name}}"
-
-def testcase_status(testcase):
-    if testcase.find("error") is not None:
-        return "error"
-    if testcase.find("failure") is not None:
-        return "failed"
-    if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
-        return "skipped"
-    return "passed"
-
-def merge_status(current, new):
-    severity = {{"passed": 0, "skipped": 1, "failed": 2, "error": 3}}
-    return new if severity.get(new, 0) > severity.get(current, 0) else current
-
-def int_attr(node, name):
-    try:
-        return int(float(node.get(name, 0) or 0))
-    except Exception:
-        return 0
-
-root = Path(project_dir)
-report_files = sorted(str(path) for path in root.rglob("*.xml") if is_report_file(path))
-report_dirs = sorted({{str(Path(path).parent) for path in report_files}})
-
-groovy_classes = set()
-for groovy in root.rglob("src/test/groovy/**/*.groovy"):
-    try:
-        text = groovy.read_text(errors="ignore")
-    except Exception:
-        continue
-    if "@Test" in text:
-        groovy_classes.add(groovy.stem)
-
-raw = {{"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}}
-unique = {{}}
-parsing_errors = []
-
-for report_file in report_files:
-    try:
-        tree = ET.parse(report_file)
-        xml_root = tree.getroot()
-    except Exception as exc:
-        parsing_errors.append(f"Error parsing {{report_file}}: {{exc}}")
-        continue
-
-    testcases = list(xml_root.iter("testcase"))
-    if testcases:
-        for testcase in testcases:
-            classname = (testcase.get("classname") or "").strip()
-            simple_classname = classname.split(".")[-1] if classname else ""
-            if simple_classname in groovy_classes:
-                continue
-            status = testcase_status(testcase)
-            raw["total"] += 1
-            if status == "error":
-                raw["error"] += 1
-            elif status == "failed":
-                raw["failed"] += 1
-            elif status == "skipped":
-                raw["skipped"] += 1
-            else:
-                raw["passed"] += 1
-
-            file_attr = testcase.get("file") or report_file
-            key = normalize_key(classname, testcase.get("name"), file_attr)
-            if key:
-                unique[key] = merge_status(unique[key], status) if key in unique else status
-        continue
-
-    suites = [xml_root] if xml_root.tag == "testsuite" else list(xml_root.iter("testsuite"))
-    for suite in suites:
-        total = int_attr(suite, "tests")
-        failed = int_attr(suite, "failures")
-        error = int_attr(suite, "errors")
-        skipped = int_attr(suite, "skipped")
-        raw["total"] += total
-        raw["failed"] += failed
-        raw["error"] += error
-        raw["skipped"] += skipped
-        raw["passed"] += max(0, total - failed - error - skipped)
-
-unique_counts = {{"passed": 0, "failed": 0, "error": 0, "skipped": 0}}
-for status in unique.values():
-    unique_counts[status] = unique_counts.get(status, 0) + 1
-
-result = {{
-    "valid": bool(report_files),
-    "total_tests": raw["total"],
-    "passed_tests": raw["passed"],
-    "failed_tests": raw["failed"],
-    "error_tests": raw["error"],
-    "skipped_tests": raw["skipped"],
-    "raw_total_tests": raw["total"],
-    "raw_passed_tests": raw["passed"],
-    "raw_failed_tests": raw["failed"],
-    "raw_error_tests": raw["error"],
-    "raw_skipped_tests": raw["skipped"],
-    "unique_tests": len(unique),
-    "unique_passed_tests": unique_counts.get("passed", 0),
-    "unique_failed_tests": unique_counts.get("failed", 0),
-    "unique_error_tests": unique_counts.get("error", 0),
-    "unique_skipped_tests": unique_counts.get("skipped", 0),
-    "test_success": raw["total"] > 0 and raw["failed"] == 0 and raw["error"] == 0,
-    "failing_test_names": sorted(
-        key for key, status in unique.items() if status in ("failed", "error")
-    )[:50],
-    "report_files": report_files[:200],
-    "report_file_count": len(report_files),
-    "report_dirs": report_dirs,
-    "parsing_errors": parsing_errors[:50],
-}}
-print(json.dumps(result, separators=(",", ":")))
-PY"""
+        command = (
+            "python3 - <<'PY'\n"
+            "# SAG_COMPACT_TEST_REPORT_PARSER\n"
+            f"project_dir = {json.dumps(project_dir)}\n"
+            f"pytest_reports_dir = {json.dumps(PYTEST_REPORT_DIR)}\n"
+            f"{_COMPACT_REPORT_PARSER_BODY}\n"
+            "PY"
+        )
         result = self.docker_orchestrator.execute_command(command)
         if result.get("exit_code") != 0 or not result.get("output"):
             return None
@@ -1918,6 +2254,7 @@ PY"""
             logger.info("❌ No build artifacts found")
 
         # Check 2: Build system fingerprints
+        python_build = None
         if build_system == "maven":
             fingerprints = self._validate_maven_fingerprints(project_dir)
             evidence["has_build_fingerprints"] = fingerprints["valid"]
@@ -1938,6 +2275,30 @@ PY"""
                 logger.info(f"✅ Gradle build cache found: {cache['details']}")
                 if cache["subprojects"]:
                     logger.info(f"   Multi-project build with subprojects: {cache['subprojects']}")
+        elif build_system == "python":
+            # Python evidence ladder (spec 2026-07-07 Component 4): venv ->
+            # pip check -> package imports -> compileall coverage -> declared
+            # C-extension .so artifacts. The ladder result IS the fingerprint
+            # evidence for a python build (there are no .class/JAR analogs).
+            python_build = self._verify_python_build(project_dir)
+            evidence["has_build_fingerprints"] = python_build["venv_exists"]
+            evidence["fingerprint_details"] = {
+                key: python_build[key]
+                for key in (
+                    "venv_exists",
+                    "pip_check_clean",
+                    "imports_ok",
+                    "import_failures",
+                    "compileall_coverage",
+                    "ext_modules_ok",
+                )
+            }
+            # Skipped-rung warnings (e.g. "imports rung skipped: ...") must be
+            # VISIBLE in the report, not a silent None in the details.
+            evidence["warnings"].extend(python_build.get("warnings") or [])
+            logger.info(
+                f"Python evidence ladder: {evidence['fingerprint_details']}"
+            )
 
         # Decision logic for BUILD ONLY (no test considerations).
         #
@@ -1990,7 +2351,16 @@ PY"""
             and not evidence["has_artifacts"]
         )
 
-        if jvm_no_compiled_evidence:
+        if build_system == "python" and python_build is not None:
+            # Tri-state mapping (spec 2026-07-07 Component 4): no venv or a
+            # failed import -> BLOCKED; imports ok but pip-check breakage /
+            # sub-threshold compileall coverage / missing declared C-extension
+            # -> PARTIAL with the failed rung named; every rung green -> SUCCESS.
+            success = python_build["success"]
+            complete = python_build["complete"]
+            reason = python_build["reason"]
+
+        elif jvm_no_compiled_evidence:
             success, complete = False, False
             reason = (
                 f"No compiled .class files found for {build_system} build — nothing "
@@ -2090,6 +2460,8 @@ PY"""
             evidence_status = "success"
             conflicts = []
 
+        conflicts.extend(self._collect_env_conflicts())
+
         result = {
             "success": success,
             "build_complete": complete,
@@ -2103,6 +2475,407 @@ PY"""
 
         logger.info(f"Build validation complete: {evidence_status.upper()} - {reason}")
         return result
+
+    def _collect_env_conflicts(self) -> List[str]:
+        """jdk_mismatch / python_version_mismatch when the manifest's required
+        toolchain differs from the active one at validation time.
+
+        Report-only honesty signals (spec §4 + spec 2026-07-07 Component 4):
+        provisioning failures degrade here instead of blocking the run. Empty
+        when no requirement is known. python_version_mismatch is the exact
+        mirror of jdk_mismatch, with one PythonPreflight-aligned tolerance: an
+        active interpreter that satisfies the raw declared constraint is NOT a
+        mismatch even when it differs from the resolved-newest version.
+        """
+        conflicts: List[str] = []
+        try:
+            from sag.tools.internal.build_preflight import (
+                active_java_major,
+                active_python_version,
+                read_build_requirements,
+            )
+            from sag.tools.internal.python_env import resolve_python_version
+
+            manifest = read_build_requirements(self.docker_orchestrator) or {}
+
+            required_jdk = manifest.get("java_version")
+            if required_jdk:
+                active = active_java_major(self.docker_orchestrator)
+                if active and active != str(required_jdk):
+                    conflicts.append("jdk_mismatch")
+
+            required_python = manifest.get("python_version")
+            if required_python:
+                active_py = active_python_version(self.docker_orchestrator)
+                constraint = manifest.get("python_constraint")
+                constraint_satisfied = bool(
+                    active_py
+                    and constraint
+                    and resolve_python_version(constraint, [active_py]) == active_py
+                )
+                if (
+                    active_py
+                    and active_py != str(required_python)
+                    and not constraint_satisfied
+                ):
+                    conflicts.append("python_version_mismatch")
+        except Exception as exc:
+            logger.debug(f"env conflict check skipped: {exc}")
+        return conflicts
+
+    def _verify_python_build(self, project_dir: str) -> Dict[str, any]:
+        """Python evidence ladder (spec 2026-07-07 Component 4).
+
+        Rungs, in order: venv exists -> `python -m pip check` clean -> every
+        manifest package imports -> `compileall` source-weighted coverage
+        (tests/docs/examples excluded, the analog of the Java class-coverage
+        ratio) -> declared C-extensions have built `.so` artifacts. A missing
+        venv or a failed import is BLOCKED (success=False) — EXCEPT when the
+        only failing names are underscore-prefixed accessory modules (_yaml,
+        _cffi_backend, ...) next to at least one green non-underscore
+        import: wheels list optional C-extension modules statically in
+        top_level.txt whether or not the extension was built (pyyaml bug
+        #14), so those failures are C-extension-rung evidence — PARTIAL
+        ("optional extension module(s) not importable: ..."), never a false
+        red on a usable environment; pip-check
+        breakage, coverage below build_coverage_threshold, or a missing
+        declared extension is PARTIAL (success=True, complete=False) with the
+        failed rung named; a pip-check that cannot run because pip itself is
+        missing from the venv (bug #12: plain uv venvs ship no pip) is
+        UNVERIFIABLE (pip_check_clean=None) — a visible skip warning plus the
+        bug-#9 cap at PARTIAL, never phantom breakage and never silent green;
+        every rung green is SUCCESS. Unknown rungs (no declared packages, no
+        countable sources) stay None — never invented evidence — and an
+        unknown IMPORTS rung caps the build at PARTIAL (pyyaml live probe
+        bug #9): imports are the strongest evidence, so "never probed" must
+        not read as green on a testless project.
+
+        Imports rung fallback (pyyaml re-probe bug #6): package_dir layouts
+        (``package_dir={'': 'lib'}``) can defeat static discovery, leaving the
+        manifest's python_packages empty. The imports check is the STRONGEST
+        evidence rung, so before skipping it the import targets are derived
+        from the venv itself — but ONLY from the PROJECT's own installed
+        record: the dist-info whose direct_url.json points back at the
+        project dir, else a name-matched dist-info/egg-info (see
+        _installed_top_level_packages). Third-party dependency records in the
+        same site-packages are never project evidence. Only when the
+        project's own record yields nothing does the rung stay None, and then
+        the skip is a VISIBLE warning in the evidence, never a silent hole in
+        the report.
+
+        Installed-record gate (apache/libcloud false-BLOCKED bug #8): the
+        project's own installed top-level names gate the import targets
+        ALWAYS, not only when the manifest is empty. Discovery's flat-layout
+        probe happily lists repo-support dirs (contrib/, demos/,
+        integration/, pylint_plugins/ — each carries an __init__.py) that
+        were never installed, and one such junk name used to fail the whole
+        rung. Whenever the project's record is non-empty, the FULL installed
+        set is the import target list — never a manifest-narrowed subset:
+        discovery's flat-layout ranking can drop genuine installed siblings
+        (mercurial shape: mercurial/ + hgext/ + hgdemandimport/ all
+        installed, only the name-match kept in the manifest), and probing
+        manifest ∩ installed would let a broken sibling import pass
+        silently. Junk manifest names surface as a "discovered but not
+        installed" warning instead of a false BLOCKED. Only when NOTHING of
+        the project is installed do the manifest packages keep today's
+        semantics — their import failure is then real evidence.
+        """
+        from sag.tools.internal.build_preflight import read_build_requirements
+
+        manifest = read_build_requirements(self.docker_orchestrator) or {}
+        venv = manifest.get("python_venv") or f"{project_dir.rstrip('/')}/.venv"
+        packages = manifest.get("python_packages") or []
+        result: Dict[str, any] = {
+            "venv_exists": False,
+            "pip_check_clean": None,
+            "imports_ok": None,
+            "import_failures": [],
+            "compileall_coverage": None,
+            "ext_modules_ok": None,
+            "success": False,
+            "complete": False,
+            "reason": "",
+            "warnings": [],
+        }
+
+        venv_probe = self._execute_command_with_logging(
+            f"test -d {venv}", "checking python venv"
+        )
+        result["venv_exists"] = venv_probe["success"]
+        if not result["venv_exists"]:
+            result["reason"] = (
+                f"No venv at {venv} — the Python environment was never set up"
+            )
+            return result
+
+        # Module form ('{venv}/bin/python -m pip check'), never the
+        # '{venv}/bin/pip' binary a plain `uv venv` does not ship (bug #12).
+        pip_check = self._execute_command_with_logging(
+            f"{venv}/bin/python -m pip check", "pip dependency check"
+        )
+        pip_check_output = pip_check.get("output") or ""
+        if pip_check["success"]:
+            result["pip_check_clean"] = True
+        elif (
+            "No module named pip" in pip_check_output
+            or "no such file or directory" in pip_check_output.lower()
+        ):
+            # A MISSING pip (or venv python) is UNVERIFIABLE evidence, never
+            # dependency breakage (bug #12): the rung stays None with a
+            # visible skip warning, and — bug-#9 semantics — an unknown rung
+            # caps the build at PARTIAL below, never silent green.
+            result["pip_check_clean"] = None
+            result["warnings"].append(
+                "pip check rung skipped: pip not present in venv"
+            )
+        else:
+            result["pip_check_clean"] = False
+
+        # The PROJECT's own installed top_level.txt record gates the import
+        # targets ALWAYS (bug #8, see docstring); still honest — read from
+        # disk, never invented, never a dependency's record.
+        installed = self._installed_top_level_packages(venv, project_dir)
+        if packages and installed:
+            junk = sorted(name for name in packages if name not in installed)
+            if junk:
+                result["warnings"].append(
+                    "discovered but not installed: " + ", ".join(junk)
+                    + " — skipped by the imports rung (not in the project's "
+                    "installed record)"
+                )
+            # The FULL installed set, never manifest ∩ installed: discovery's
+            # flat-layout ranking can narrow the manifest below the installed
+            # record, and a broken installed sibling must still BLOCK.
+            packages = installed
+        elif not packages:
+            # Empty manifest (package_dir layouts, bug #6): the installed
+            # record is the fallback source of import targets.
+            packages = installed
+        # else: nothing of the project installed — keep the manifest packages
+        # and today's semantics (their import failure is real evidence).
+        if not packages:
+            result["warnings"].append(
+                "imports rung skipped: no importable package detected"
+            )
+
+        optional_ext_failures: List[str] = []
+        if packages:
+            failures = []
+            imported = []
+            for package in packages:
+                import_probe = self._execute_command_with_logging(
+                    f'{venv}/bin/python -c "import {package}"', f"import {package}"
+                )
+                if import_probe["success"]:
+                    imported.append(package)
+                else:
+                    failures.append(package)
+            # Severity partition (pyyaml optional-libyaml bug #14):
+            # underscore-prefixed top-level names (_yaml, _cffi_backend, ...)
+            # are accessory C-extension modules — the wheel's top_level.txt
+            # lists them statically whether or not the OPTIONAL extension was
+            # built, so their import failure is C-extension-rung evidence
+            # (PARTIAL, see below), never a blocker — PROVIDED at least one
+            # real (non-underscore) package imported: a 1287/1287-green
+            # pyyaml suite proved the env usable while `import _yaml` alone
+            # said BLOCKED. Any non-underscore failure keeps blocking (the
+            # libcloud broken-sibling case), and underscore failures with NO
+            # green non-underscore import verified nothing usable — those
+            # also keep blocking.
+            blocking = [name for name in failures if not name.startswith("_")]
+            if failures and not blocking and any(
+                not name.startswith("_") for name in imported
+            ):
+                optional_ext_failures = failures
+                failures = []
+            result["imports_ok"] = not failures
+            result["import_failures"] = failures
+            if failures:
+                result["reason"] = (
+                    f"Top-level package import failed: {', '.join(failures)} — "
+                    f"the installed environment is not usable"
+                )
+                return result
+
+        package_dirs = self._python_package_dirs(project_dir, packages)
+        target = " ".join(package_dirs)
+        self._execute_command_with_logging(
+            f"{venv}/bin/python -m compileall -q {target}", "compileall"
+        )
+        # Source-weighted coverage: .pyc under __pycache__ / .py sources, with
+        # tests/docs/examples and dot-dirs (.venv) excluded on BOTH counts.
+        py_count = self._int_from_count(
+            f"find {target} -name '*.py' -type f -not -path '*/.*' "
+            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
+            f"2>/dev/null | wc -l"
+        )
+        pyc_count = self._int_from_count(
+            f"find {target} -path '*/__pycache__/*.pyc' -type f -not -path '*/.*' "
+            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
+            f"2>/dev/null | wc -l"
+        )
+        if py_count and pyc_count is not None:
+            result["compileall_coverage"] = min(pyc_count / py_count, 1.0)
+
+        so_missing = False
+        if manifest.get("has_c_extensions"):
+            so_probe = self._execute_command_with_logging(
+                f"find {project_dir} {venv} -name '*.so' -type f 2>/dev/null | head -1",
+                "C-extension artifacts",
+            )
+            result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
+            so_missing = not result["ext_modules_ok"]
+        if optional_ext_failures:
+            # Bug #14: an unimportable optional extension module is
+            # C-extension-rung evidence — the rung goes red even when a .so
+            # artifact exists on disk (the module still did not import).
+            result["ext_modules_ok"] = False
+
+        partial_reasons = []
+        if result["pip_check_clean"] is False:
+            partial_reasons.append("pip check reported dependency breakage")
+        elif result["pip_check_clean"] is None:
+            # UNVERIFIABLE rung (bug #12) — honest PARTIAL, never a phantom
+            # breakage and never a silent green.
+            partial_reasons.append("pip check unverified")
+        if result["imports_ok"] is None:
+            # pyyaml live probe bug #9: an UNKNOWN imports rung is not green.
+            # venv + compileall are real evidence (success stays True), but
+            # the strongest rung was never probed — cap at PARTIAL, never a
+            # silent SUCCESS on a project whose install was never verified.
+            partial_reasons.append(
+                "imports unverified: no importable package detected"
+            )
+        coverage = result["compileall_coverage"]
+        threshold = self.build_coverage_threshold
+        if coverage is not None and coverage < threshold:
+            partial_reasons.append(
+                f"compileall coverage {coverage * 100:.0f}% below the "
+                f"{threshold * 100:.0f}% threshold"
+            )
+        if so_missing:
+            partial_reasons.append(
+                "declared C-extensions have no built .so artifact"
+            )
+        if optional_ext_failures:
+            partial_reasons.append(
+                "optional extension module(s) not importable: "
+                + ", ".join(optional_ext_failures)
+            )
+
+        result["success"] = True
+        if partial_reasons:
+            result["reason"] = "; ".join(partial_reasons)
+        else:
+            result["complete"] = True
+            coverage_note = (
+                f"compileall coverage {coverage * 100:.0f}%"
+                if coverage is not None
+                else "compileall coverage not measurable"
+            )
+            imported = (
+                f"{len(packages)} package(s) import"
+                if packages
+                else "no declared packages to import"
+            )
+            result["reason"] = (
+                f"Python build verified: venv present, pip check clean, "
+                f"{imported}, {coverage_note}"
+            )
+        return result
+
+    def _installed_top_level_packages(
+        self, venv: str, project_dir: str
+    ) -> List[str]:
+        """Import targets from the PROJECT's OWN installed record when the
+        manifest declares no packages — never from third-party dependencies
+        sharing the same site-packages.
+
+        Selection ladder: (1) the dist-info whose PEP 610 ``direct_url.json``
+        points back into the project dir — the record pip writes for
+        ``pip install -e .`` / ``pip install .``; (2) else any dist-info
+        with a PEP 610 ``dir_info`` marker — a local-directory install (pip
+        records the symlink-resolved realpath, so the exact-tree grep can
+        miss; index-installed dependencies carry no direct_url.json at all);
+        (3) else the record (``*.dist-info`` / ``*.egg-info``) whose
+        distribution name matches the project dir name, PEP 503-normalized,
+        version-boundary enforced (_dist_record_matches). A dependency's
+        record is never read as project evidence: its broken import must not
+        BLOCK, and its working import must not fake imports_ok=True when the
+        project's own install failed. Tooling names stay deny-listed as a
+        second layer. Empty — an honest, visible imports-rung skip — when no
+        record is the project's own."""
+        root = project_dir.rstrip("/")
+        site = f"{venv}/lib/python*/site-packages"
+
+        def dist_dirs(probe: Dict[str, any]) -> List[str]:
+            return [
+                line.strip()[: -len("/direct_url.json")]
+                for line in (probe.get("output") or "").splitlines()
+                if line.strip().endswith("/direct_url.json")
+            ]
+
+        direct = self._execute_command_with_logging(
+            f"grep -Fls 'file://{root}' {site}/*.dist-info/direct_url.json "
+            f"2>/dev/null",
+            "locating the project's own dist-info (direct_url.json)",
+        )
+        record_dirs = dist_dirs(direct)
+        if not record_dirs:
+            local = self._execute_command_with_logging(
+                f"grep -Fls '\"dir_info\"' {site}/*.dist-info/direct_url.json "
+                f"2>/dev/null",
+                "locating local-directory installs (PEP 610 dir_info)",
+            )
+            record_dirs = dist_dirs(local)
+        if not record_dirs:
+            listing = self._execute_command_with_logging(
+                f"find {site} -maxdepth 1 "
+                f"\\( -name '*.dist-info' -o -name '*.egg-info' \\) "
+                f"2>/dev/null",
+                "listing installed distribution records",
+            )
+            project_name = root.rsplit("/", 1)[-1]
+            record_dirs = [
+                line.strip()
+                for line in (listing.get("output") or "").splitlines()
+                if line.strip() and _dist_record_matches(line.strip(), project_name)
+            ]
+        packages: List[str] = []
+        for record_dir in record_dirs:
+            probe = self._execute_command_with_logging(
+                f"cat {record_dir}/top_level.txt 2>/dev/null",
+                "reading the project's top_level.txt",
+            )
+            for line in (probe.get("output") or "").splitlines():
+                name = line.strip()
+                if not name or name in _NON_PROJECT_TOP_LEVEL or name in packages:
+                    continue
+                packages.append(name)
+        return sorted(packages)
+
+    def _python_package_dirs(self, project_dir: str, packages: List[str]) -> List[str]:
+        """Package source dirs, src-layout probed before flat layout; the
+        project dir is the honest last resort when nothing is declared."""
+        root = project_dir.rstrip("/")
+        dirs: List[str] = []
+        for package in packages:
+            for candidate in (f"{root}/src/{package}", f"{root}/{package}"):
+                probe = self._execute_command_with_logging(
+                    f"test -d {candidate}", f"locating package {package}"
+                )
+                if probe["success"]:
+                    dirs.append(candidate)
+                    break
+        return dirs or [root]
+
+    def _int_from_count(self, command: str) -> Optional[int]:
+        """Last line of a `... | wc -l` pipeline as an int, or None."""
+        result = self._execute_command_with_logging(command, "counting files")
+        try:
+            return int((result.get("output") or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
 
     def _build_status_evidence_refs(
         self, project_dir: str, artifacts_result: Dict[str, any]
@@ -2198,7 +2971,14 @@ PY"""
             )
 
         failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
-        discovered = (
+        # Python projects: python_tool's pytest --collect-only denominator is
+        # ground truth from the actual runner and takes PRIORITY over any
+        # static heuristic the runner metrics may carry (live 2026-07-10 click
+        # run: a static scan that swept the .venv reported 32927 while pytest
+        # collected 1927). The metrics chain stays the fallback when no
+        # collected count exists; _python_collected_count is None outside
+        # python, so maven/gradle priority order is unchanged.
+        discovered = self._python_collected_count(project_name) or (
             test_metrics.get("discovered")
             or test_metrics.get("discovered_tests")
             or test_metrics.get("static_test_count")
@@ -2274,6 +3054,10 @@ PY"""
             "parsing_errors": test_metrics.get("parsing_errors", []),
             "evidence_status": evidence_status,
             "test_stats": test_stats,
+            # The discovered-suite denominator (analyzer count or the pytest
+            # collect-only fallback) — consumers like the report snapshot's
+            # execution-coverage gate read this even when test_stats is None.
+            "static_test_count": discovered,
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(report_files) or [project_dir],
         }
@@ -2341,7 +3125,7 @@ PY"""
                     "You MUST run project_analyzer(action='analyze') immediately to count static tests "
                     "and generate an intelligent execution plan. This is REQUIRED for accurate reporting."
                 )
-                return result
+                return self._apply_python_collected_denominator(result, project_name)
 
             trunk_file = trunk_file_result["output"].strip()
             result["trunk_context_found"] = True
@@ -2391,7 +3175,75 @@ PY"""
                 "for better reporting. This helps track test coverage and execution rates."
             )
 
+        return self._apply_python_collected_denominator(result, project_name)
+
+    def _apply_python_collected_denominator(
+        self, result: Dict[str, any], project_name: Optional[str]
+    ) -> Dict[str, any]:
+        """static_test_count from python_tool's collect-only denominator.
+
+        build_system == python: the COLLECTED_JSON count (written by
+        python_tool's `pytest --collect-only` pass at test time — ground truth
+        from the actual runner) takes PRIORITY over any static heuristic the
+        env summary carries. Static scans sweep the project dir, and the setup
+        plants the venv INSIDE it (live 2026-07-10 click run: site-packages
+        pushed the static count to 32927 while pytest collected 1927, capping
+        a 98.7% run at PARTIAL). The static count remains the fallback when no
+        collected count exists. Maven/Gradle: _python_collected_count is None,
+        so the env-summary priority order is unchanged.
+        """
+        collected = self._python_collected_count(project_name)
+        if collected is None:
+            return result
+        if (
+            result.get("has_static_test_count")
+            and result.get("static_test_count") != collected
+        ):
+            # Preserve the static-scan number as evidence; it no longer feeds
+            # the execution-coverage gate.
+            result["static_test_count_static_scan"] = result["static_test_count"]
+            logger.info(
+                f"✅ python denominator priority: {collected} tests from pytest "
+                f"--collect-only override the static scan count "
+                f"{result['static_test_count']}"
+            )
+        else:
+            logger.info(
+                f"✅ static_test_count: {collected} tests from "
+                f"pytest --collect-only (COLLECTED_JSON)"
+            )
+        result["has_static_test_count"] = True
+        result["static_test_count"] = collected
+        result["static_test_count_source"] = "pytest_collect_only"
         return result
+
+    def _python_collected_count(self, project_name: Optional[str]) -> Optional[int]:
+        """python_tool's `pytest --collect-only` denominator, python-only.
+
+        Returns the collected-test count from COLLECTED_JSON when the build
+        system is python; None otherwise (maven/gradle semantics untouched).
+        Shared by validate_project_analysis_status AND validate_test_status so
+        the two denominators can never diverge again (live 2026-07-10:
+        test_stats.discovered was None while the analysis fallback had 635).
+        """
+        try:
+            from sag.tools.internal.python_tool import COLLECTED_JSON
+
+            project_dir = (
+                f"{self.project_path}/{project_name}" if project_name else self.project_path
+            )
+            if self._detect_build_system(project_dir) != "python":
+                return None
+            read = self._execute_command_with_logging(
+                f"cat {COLLECTED_JSON}", "reading pytest collect-only denominator"
+            )
+            if not read["success"] or not (read.get("output") or "").strip():
+                return None
+            collected = json.loads(read["output"]).get("collected")
+            return collected if isinstance(collected, int) else None
+        except Exception as exc:
+            logger.debug(f"pytest collected fallback skipped: {exc}")
+            return None
 
     def parse_test_reports_with_catalog(
         self, project_dir: str, test_catalog: Optional[TestCaseCatalog] = None
@@ -2771,12 +3623,23 @@ PY"""
                 if "EXISTS" in (chk.get("output") or ""):
                     report_dirs.append(rd)
 
+            # Test-bearing probe: does this module declare test sources? Feeds
+            # modules_test_bearing so the report can tell "tests ran in a strict
+            # subset of the test-bearing modules" (reactor_scope_narrowed) apart
+            # from "these modules simply have no tests" (spec §4).
+            tst = self._execute_command_with_logging(
+                f"test -d {module_dir}/src/test && echo EXISTS",
+                f"checking test sources {rel}",
+            )
+            has_test_sources = "EXISTS" in (tst.get("output") or "")
+
             modules.append({
                 "path": rel,
                 "name": name,
                 "class_count": class_count,
                 "jar_count": jar_count,
                 "report_dirs": report_dirs,
+                "has_test_sources": has_test_sources,
             })
         return modules
 

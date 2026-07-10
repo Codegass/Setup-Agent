@@ -156,6 +156,7 @@ class SetupAgent:
         from sag.tools.internal.output_search_tool import OutputSearchTool
         from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
         from sag.tools.internal.project_setup_tool import ProjectSetupTool
+        from sag.tools.internal.python_tool import PythonTool
         from sag.tools.phase_tool import PhaseTool
         from sag.tools.project_tool import ProjectTool
         from sag.tools.report_tool import ReportTool
@@ -200,6 +201,7 @@ class SetupAgent:
         # they live on as backends/delegates of the build/project/search facades.
         maven_tool = MavenTool(self.orchestrator, command_tracker=self.command_tracker)
         gradle_tool = GradleTool(self.orchestrator)
+        python_tool = PythonTool(self.orchestrator, command_tracker=self.command_tracker)
         setup_tool = ProjectSetupTool(self.orchestrator)
         system_tool = SystemTool(self.orchestrator)
         env_tool = EnvTool(self.orchestrator)
@@ -233,6 +235,7 @@ class SetupAgent:
                 self.orchestrator,
                 maven_tool=maven_tool,
                 gradle_tool=gradle_tool,
+                python_tool=python_tool,
                 test_pass_threshold=self.config.test_pass_threshold,
             ),
             ProjectTool(
@@ -435,9 +438,12 @@ class SetupAgent:
             # rendering); descriptions are the one-line phase objectives
             # (TOOLS, never raw commands).
             from sag.agent.phase_machine import PHASE_NAMES
-            from sag.agent.react_engine import PHASE_OBJECTIVES
+            from sag.agent.react_engine import KICKOFF_PHASE_OBJECTIVES
 
-            initial_tasks = [PHASE_OBJECTIVES[name] for name in PHASE_NAMES]
+            # KICKOFF variant: authored at t=0 BEFORE the repo is analyzed, so
+            # the build objective's blocking instruction is conditional on
+            # ecosystem (live python runs obeyed the unconditional Java text).
+            initial_tasks = [KICKOFF_PHASE_OBJECTIVES[name] for name in PHASE_NAMES]
             phase_task_ids = [f"phase_{name}" for name in PHASE_NAMES]
 
             logger.info("Creating trunk context from the engine-owned phase plan...")
@@ -1013,14 +1019,80 @@ START by working toward the current phase objective shown in my context.
         machine = getattr(getattr(self, "react_engine", None), "phase_machine", None)
         machine_outcome = machine.overall_outcome() if machine is not None else None
 
+        # Scoped blocked-build cap (live-run 2026-06-24 pyyaml false-red):
+        # machine_outcome == "failed" means the agent blocked the build phase.
+        # When the PHYSICAL build evidence disagrees — validate_build_status
+        # found a real build (success=True: Java artifacts/fingerprints, or the
+        # Python ladder's success/partial-with-imports) — evidence outranks
+        # agent belief and the cap is PARTIAL, not FAILED. The block is still
+        # surfaced (never promoted to success), so agent dishonesty stays
+        # catchable; only the evidence-contradicted false-red is gone. With no
+        # physical build evidence the cap stays FAILED exactly as before.
+        build_status = getattr(self, "_last_build_status", None)
+        blocked_build_evidence_backed = (
+            machine_outcome == "failed"
+            and isinstance(build_status, dict)
+            and bool(build_status.get("success"))
+        )
+        if blocked_build_evidence_backed:
+            machine_outcome = "partial"
+            logger.warning(
+                "Phase machine recorded a blocked build phase, but physical "
+                "build evidence shows a real build; capping verdict to partial "
+                "instead of failed"
+            )
+
         conflicts = test_status.get("conflicts", []) if isinstance(test_status, dict) else []
         self.final_verdict = run_verdict(machine_outcome, physical_verdict, conflicts)
+
+        # Report-mirror cap (cayenne 2026-06-24 probe): conflicts emitted at
+        # the report-snapshot stage (_build_report_snapshot appends
+        # reactor_scope_narrowed / tests_not_fully_executed /
+        # build_modules_incomplete right next to the stored kernel verdict)
+        # never reach validate_test_status, so run_verdict() above got an empty
+        # conflict list and the CLI announced "verdict=success" while the
+        # generated report read "⚠️ PARTIAL". The snapshot's stored verdict is
+        # already the kernel output WITH every conflict cap applied — consume
+        # it here instead of duplicating the conflict logic (same mirroring
+        # pattern as PR #9's "0 executed tests is PARTIAL on the CLI"). The
+        # mirror caps at partial only: conflict caps are partial-level by
+        # kernel design, and failed-level judges (phase machine, physical
+        # evidence) are already consumed first-hand above — including the
+        # evidence-backed blocked-build cap, which must not be re-demoted. It
+        # never promotes (failed stays failed), and no-report runs (snapshot
+        # absent) keep today's behavior exactly.
+        snapshot_verdict, snapshot_conflicts = self._report_snapshot_verdict()
+        snapshot_capped = (
+            snapshot_verdict in ("partial", "failed")
+            and self.final_verdict == "success"
+        )
+        if snapshot_capped:
+            self.final_verdict = "partial"
+            logger.warning(
+                "⚠️ Run capped at PARTIAL: the report snapshot's verdict is "
+                f"{snapshot_verdict} (conflicts: {', '.join(snapshot_conflicts) or 'none recorded'})"
+            )
 
         # The banner must explain WHY the verdict is what it is — round 6:
         # a conflict-capped vfs run printed "no test reports found" while its
         # 96.2% test results sat right there in the report.
         if self.final_verdict == "partial":
-            if physical_verdict == "partial":
+            if blocked_build_evidence_backed:
+                # Record BOTH sides: the agent's block stays visible, and so
+                # does the physical evidence that contradicts it.
+                self.final_verdict_reason = (
+                    "build phase blocked by agent, but physical evidence shows a real build"
+                )
+            elif snapshot_capped:
+                self.final_verdict_reason = (
+                    "report verdict is partial"
+                    + (
+                        f" (conflicts at report time: {', '.join(snapshot_conflicts[:3])})"
+                        if snapshot_conflicts
+                        else " (see report)"
+                    )
+                )
+            elif physical_verdict == "partial":
                 self.final_verdict_reason = "build verified, tests not verified (no test reports found)"
             elif machine_outcome == "partial":
                 self.final_verdict_reason = "one or more phases were blocked (see report)"
@@ -1044,6 +1116,27 @@ START by working toward the current phase objective shown in my context.
             )
         return physical_ok
 
+    def _report_snapshot_verdict(self) -> tuple:
+        """The kernel verdict the LAST generated report stored, plus its
+        evidence conflicts: ``(verdict | None, conflicts)``.
+
+        report_tool stamps ``status["verdict"]`` on every snapshot from
+        _snapshot_kernel_verdict (which already folds in the report-stage
+        conflict caps: reactor_scope_narrowed, tests_not_fully_executed,
+        build_modules_incomplete), and the ReAct engine keeps that snapshot in
+        successful_states["report_snapshot"]. Runs that never generated a
+        report — or that never had an engine at all (``sag run --task``,
+        legacy, direct unit-test invocations) — return (None, []) so the
+        finalization keeps its no-report behavior untouched.
+        """
+        states = getattr(getattr(self, "react_engine", None), "successful_states", None)
+        snapshot = states.get("report_snapshot") if isinstance(states, dict) else None
+        if not isinstance(snapshot, dict):
+            return None, []
+        verdict = (snapshot.get("status") or {}).get("verdict")
+        conflicts = (snapshot.get("evidence_result") or {}).get("conflicts") or []
+        return verdict, list(conflicts)
+
     def _get_physical_final_status(self, react_engine_success: bool) -> bool:
         """Verify the final run status against physical evidence.
 
@@ -1065,8 +1158,10 @@ START by working toward the current phase objective shown in my context.
 
         self.final_verdict = "failed"
         # Surfaced to the verdict-kernel combiner (_get_verified_final_status)
-        # so evidence conflicts from validate_test_status can cap the verdict.
+        # so evidence conflicts from validate_test_status can cap the verdict
+        # and the blocked-build cap can be scoped by real build evidence.
         self._last_test_status = None
+        self._last_build_status = None
         project_name = self._get_project_name_for_validation()
 
         if not project_name:
@@ -1081,6 +1176,7 @@ START by working toward the current phase objective shown in my context.
 
         # Get BUILD status (primary concern)
         build_status = self.physical_validator.validate_build_status(project_name)
+        self._last_build_status = build_status
 
         # Get TEST status separately so known test suites cannot disappear behind build artifacts.
         test_status = self.physical_validator.validate_test_status(project_name)

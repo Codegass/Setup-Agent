@@ -11,6 +11,12 @@ from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceStatus, TestStats
 
 from ..base import BaseTool, ToolError, ToolResult
+from .build_preflight import (
+    JdkPreflight,
+    active_java_major,
+    classify_version_error,
+    read_build_requirements,
+)
 from .build_utils import detached_handoff_tool_result
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
@@ -50,6 +56,8 @@ class GradleTool(BaseTool):
         configure_on_demand: bool = False,  # Gradle-specific optimization
         build_cache: bool = True,  # Gradle-specific: use build cache
         fail_at_end: bool = False,  # Continue execution after failures
+        *,
+        _env_preflight: bool = True,
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.
@@ -76,6 +84,11 @@ class GradleTool(BaseTool):
         if command and not tasks:
             tasks = command
 
+        # Whether the agent explicitly scoped this invocation. The
+        # orchestration layer (PR #12) owns working-directory injection, so
+        # this never re-targets; explicitness only gates the [scope] warning.
+        explicitly_scoped = working_directory not in (None, "/workspace")
+
         # Deterministic working directory fallback (only when safe)
         try:
             if working_directory in (None, "/workspace") and self.orchestrator:
@@ -95,6 +108,43 @@ class GradleTool(BaseTool):
                             working_directory = probe_dir
         except Exception as _e:
             logger.debug(f"Gradle working directory fallback skipped: {_e}")
+
+        # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
+        # Single-ownership rule: the consolidated build facade (BuildTool)
+        # runs the pre-flight, the bounded retry and the [scope] narration on
+        # its path and passes _env_preflight=False; only direct callers (e.g.
+        # tool_recovery's delegate path) keep the guarantee here. Exactly one
+        # layer probes the container — and reruns — per build.
+        preamble_lines: List[str] = []
+        outcome = None
+        if _env_preflight:
+            requirements = read_build_requirements(self.orchestrator)
+            outcome = JdkPreflight(self.orchestrator).run(
+                requirements.get("java_version"),
+                source=requirements.get("java_version_source") or "unknown",
+            )
+            if outcome.narration:
+                preamble_lines.append(outcome.narration)
+
+            # [scope] warning ONLY for explicit narrowing (spec §3), with the
+            # facade's semantics: an explicit working_directory strictly
+            # DEEPER than a healthy reactor's recommended build root.
+            # Working-directory defaulting lives in the orchestration layer
+            # (PR #12); the tool never re-targets and never mutates
+            # fail_at_end on its own.
+            recommended_root = (requirements.get("build_root") or "").rstrip("/")
+            if (
+                explicitly_scoped
+                and requirements.get("root_shape") == "healthy_reactor"
+                and recommended_root
+                and (working_directory or "").rstrip("/").startswith(recommended_root + "/")
+            ):
+                preamble_lines.append(
+                    "[scope] narrower than the recommended reactor root "
+                    f"({recommended_root}) — sibling deps may be unresolved; "
+                    "tests outside this module will not run"
+                )
+        preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
         resolved_gradle = self._resolve_gradle_executable(
             working_directory=working_directory,
@@ -189,30 +239,62 @@ class GradleTool(BaseTool):
             quick_markers = ("help", "tasks", "projects", "properties", "--version")
             is_long_running = not any(marker in gradle_cmd for marker in quick_markers)
 
-            if is_long_running and hasattr(self.orchestrator, "execute_command_with_soft_timeout"):
-                # Dispatch-and-poll: run detached with a soft window; if still
-                # running when it closes, hand the log tail back to the agent
-                # instead of killing a legitimately long build.
-                logger.info(f"Executing Gradle command via dispatch-and-poll: {gradle_cmd}")
-                result = self.orchestrator.execute_command_with_soft_timeout(
-                    gradle_cmd,
-                    workdir=working_directory,
-                )
-            elif is_long_running and hasattr(self.orchestrator, "execute_command_with_monitoring"):
-                # Use monitoring version with extended timeouts for build commands
-                logger.info(f"Executing Gradle command with extended timeout: {gradle_cmd}")
-                result = self.orchestrator.execute_command_with_monitoring(
-                    gradle_cmd,
-                    workdir=working_directory,
-                    silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
-                    absolute_timeout=3600,  # 60 minutes total
-                    optimize_for_maven=True,  # Use Maven optimization (works for both Maven and Gradle)
-                )
-            else:
+            def _run_build():
+                if is_long_running and hasattr(
+                    self.orchestrator, "execute_command_with_soft_timeout"
+                ):
+                    # Dispatch-and-poll: run detached with a soft window; if still
+                    # running when it closes, hand the log tail back to the agent
+                    # instead of killing a legitimately long build.
+                    logger.info(f"Executing Gradle command via dispatch-and-poll: {gradle_cmd}")
+                    return self.orchestrator.execute_command_with_soft_timeout(
+                        gradle_cmd,
+                        workdir=working_directory,
+                    )
+                if is_long_running and hasattr(
+                    self.orchestrator, "execute_command_with_monitoring"
+                ):
+                    # Use monitoring version with extended timeouts for build commands
+                    logger.info(f"Executing Gradle command with extended timeout: {gradle_cmd}")
+                    return self.orchestrator.execute_command_with_monitoring(
+                        gradle_cmd,
+                        workdir=working_directory,
+                        silent_timeout=1200,  # 20 minutes for no output (dependency downloads)
+                        absolute_timeout=3600,  # 60 minutes total
+                        optimize_for_maven=True,  # Use Maven optimization (works for both Maven and Gradle)
+                    )
                 # Use regular version for quick commands like help, tasks, etc.
-                result = self.orchestrator.execute_command(
+                return self.orchestrator.execute_command(
                     gradle_cmd, workdir=working_directory, timeout=timeout
                 )
+
+            result = _run_build()
+
+            # Bounded retry: a version-shaped failure means the requirement in
+            # the error text is authoritative; re-provision from it and rerun
+            # ONCE (spec §1c: exactly one retry, never more). Owned by the
+            # facade on the facade path (outcome is None there): a retry on
+            # BOTH layers would mean two version-driven reruns per build.
+            jdk_retry_meta = None
+            if (
+                outcome is not None
+                and result.get("exit_code") != 0
+                and not result.get("dispatch_status")
+                and not result.get("termination_reason")
+            ):
+                needed = classify_version_error(result.get("output") or "")
+                active = outcome.active_version or active_java_major(self.orchestrator)
+                if needed and needed != active:
+                    retry_outcome = JdkPreflight(self.orchestrator).run(
+                        needed, source="build-error"
+                    )
+                    if retry_outcome.provisioned:
+                        preamble += (
+                            f"[pre-flight] build error requires Java {needed}, "
+                            f"re-provisioned, retry 1/1\n"
+                        )
+                        jdk_retry_meta = {"from": active, "to": needed}
+                        result = _run_build()
 
             if result.get("dispatch_status") == "running_detached":
                 return detached_handoff_tool_result("gradle", gradle_cmd, result)
@@ -243,40 +325,52 @@ class GradleTool(BaseTool):
 
             if raw_output:
                 evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
-                return ToolResult(
-                    success=result["exit_code"] == 0,
-                    output=result["output"],
-                    raw_output=result["output"],
-                    **evidence_fields,
-                    metadata={
-                        "command": gradle_cmd,
-                        "exit_code": result["exit_code"],
-                        "analysis": analysis,
-                        "output_ref_id": ref_id,
-                    },
+                return self._finalize_main_result(
+                    ToolResult(
+                        success=result["exit_code"] == 0,
+                        output=result["output"],
+                        raw_output=result["output"],
+                        **evidence_fields,
+                        metadata={
+                            "command": gradle_cmd,
+                            "exit_code": result["exit_code"],
+                            "analysis": analysis,
+                            "output_ref_id": ref_id,
+                        },
+                    ),
+                    preamble,
+                    jdk_retry_meta,
                 )
 
             evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
             if result["exit_code"] == 0:
-                return ToolResult(
-                    success=True,
-                    output=self._format_success_output_enhanced(analysis, ref_id),
-                    raw_output=result["output"],
-                    **evidence_fields,
-                    metadata={
-                        "command": gradle_cmd,
-                        "exit_code": result["exit_code"],
-                        "analysis": analysis,
-                        "output_ref_id": ref_id,
-                    },
+                return self._finalize_main_result(
+                    ToolResult(
+                        success=True,
+                        output=self._format_success_output_enhanced(analysis, ref_id),
+                        raw_output=result["output"],
+                        **evidence_fields,
+                        metadata={
+                            "command": gradle_cmd,
+                            "exit_code": result["exit_code"],
+                            "analysis": analysis,
+                            "output_ref_id": ref_id,
+                        },
+                    ),
+                    preamble,
+                    jdk_retry_meta,
                 )
             else:
-                return self._handle_gradle_error(
-                    result["output"],
-                    result["exit_code"],
-                    gradle_cmd,
-                    analysis,
-                    output_ref_id=ref_id,
+                return self._finalize_main_result(
+                    self._handle_gradle_error(
+                        result["output"],
+                        result["exit_code"],
+                        gradle_cmd,
+                        analysis,
+                        output_ref_id=ref_id,
+                    ),
+                    preamble,
+                    jdk_retry_meta,
                 )
 
         except Exception as e:
@@ -294,6 +388,25 @@ class GradleTool(BaseTool):
                 ],
                 error_code="GRADLE_EXECUTION_ERROR",
             )
+
+    def _finalize_main_result(
+        self,
+        tool_result: ToolResult,
+        preamble: str,
+        jdk_retry: Optional[Dict[str, str]] = None,
+    ) -> ToolResult:
+        """Prepend pre-flight/scope narration and record retry metadata.
+
+        The narration is the feature (transparency-by-construction, spec
+        §§1b-1c, 3): whatever the pre-flight did — or could not do — must be
+        visible in the agent's observation, not just in host logs.
+        """
+        if preamble:
+            tool_result.output = preamble + (tool_result.output or "")
+            tool_result.raw_output = preamble + (tool_result.raw_output or "")
+        if jdk_retry:
+            tool_result.metadata["jdk_retry"] = jdk_retry
+        return tool_result
 
     def _resolve_gradle_executable(self, working_directory: str, prefer_wrapper: bool = True):
         if not self.toolchain_manager:

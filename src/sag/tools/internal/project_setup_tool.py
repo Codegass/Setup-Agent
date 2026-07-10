@@ -10,6 +10,9 @@ from loguru import logger
 from sag.runtime import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
+from .build_preflight import PythonPreflight, read_build_requirements
+from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
+from .python_env import detect_installer, ensure_venv_pip
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
@@ -454,8 +457,8 @@ class ProjectSetupTool(BaseTool):
             output += f"• Use npm tool: npm(command='install')\n"
             output += f"• Run build: npm(command='run build')\n"
         elif project_type["type"] == "python":
-            output += f"• Use uv tool: uv(command='sync')\n"
-            output += f"• Run tests: uv(command='run pytest')\n"
+            output += f"• Install dependencies into ./.venv: build(action='deps')\n"
+            output += f"• Run tests: build(action='test')\n"
         else:
             output += f"• Analyze project structure: project(action='analyze')\n"
             output += f"• Use bash tool for custom setup commands\n"
@@ -723,18 +726,19 @@ class ProjectSetupTool(BaseTool):
                 break  # Already found
 
             # 1. First check Maven Enforcer plugin for RequireJavaVersion (highest priority)
-            enforcer_pattern = (
-                r"<requireJavaVersion>.*?<version>\[?(\d+),?\)?</version>.*?</requireJavaVersion>"
+            enforcer_match = re.search(
+                ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE
             )
-            enforcer_match = re.search(enforcer_pattern, pom_content, re.DOTALL | re.IGNORECASE)
             if enforcer_match:
-                java_version = enforcer_match.group(1).strip()
-                java_version_source = "maven-enforcer"
-                java_version_enforced = True
-                logger.info(
-                    f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                )
-                break
+                normalized = _normalize_java_version(enforcer_match.group(1))
+                if normalized:
+                    java_version = normalized
+                    java_version_source = "maven-enforcer"
+                    java_version_enforced = True
+                    logger.info(
+                        f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
+                    )
+                    break
 
             # 2. Check standard properties, then the maven-compiler-plugin
             # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
@@ -754,7 +758,12 @@ class ProjectSetupTool(BaseTool):
             for pattern in java_version_patterns:
                 match = re.search(pattern, pom_content)
                 if match:
-                    java_version = match.group(1).strip()
+                    normalized = _normalize_java_version(match.group(1))
+                    if not normalized:
+                        # Rejected capture (e.g. ${...} indirection): fall
+                        # through to the next pattern instead of accepting it.
+                        continue
+                    java_version = normalized
                     java_version_source = "maven-compiler"
                     logger.info(
                         f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
@@ -762,9 +771,6 @@ class ProjectSetupTool(BaseTool):
                     break
 
         if java_version:
-            # Normalize version (e.g., "1.8" -> "8")
-            if java_version.startswith("1."):
-                java_version = java_version[2:]
             logger.info(
                 f"Detected Java version: {java_version} (source: {java_version_source}, enforced: {java_version_enforced})"
             )
@@ -809,10 +815,10 @@ class ProjectSetupTool(BaseTool):
         for pattern in java_version_patterns:
             match = re.search(pattern, gradle_content, re.IGNORECASE | re.MULTILINE)
             if match:
-                version = match.group(1).strip()
-                # Normalize version format (1.8 -> 8)
-                if version.startswith("1."):
-                    version = version[2:]
+                version = _normalize_java_version(match.group(1))
+                if not version:
+                    # Rejected capture: fall through to the next pattern.
+                    continue
                 logger.info(f"Found Java version from Gradle: {version}")
                 return version
 
@@ -989,11 +995,149 @@ class ProjectSetupTool(BaseTool):
                     "java_version_requested": java_version,
                 }
 
+        elif project_type["type"] == "python":
+            return self._install_python_dependencies(directory)
+
         # Add more project types as needed
         return {
             "success": False,
             "error": f"Auto-installation not implemented for project type: {project_type['type']}",
         }
+
+    def _install_python_dependencies(self, directory: str) -> Dict[str, Any]:
+        """Real python setup via the shared helpers (spec 2026-07-07):
+        PythonPreflight (manifest-driven, check-and-fix, never a hard block)
+        -> project venv -> the detect_installer ladder commands -> env
+        overlay. The ladder strings live ONLY in python_env.detect_installer;
+        this method never invents install commands."""
+        directory = directory.rstrip("/")
+        requirements = read_build_requirements(self.orchestrator)
+
+        # Pre-flight FIRST (same pattern as python_tool.setup_env): satisfied
+        # or absent requirement is a no-op; a mismatch provisions and narrates.
+        outcome = PythonPreflight(self.orchestrator).run(
+            requirements.get("python_version"),
+            constraint=requirements.get("python_constraint"),
+            source=requirements.get("python_version_source") or "requires-python",
+        )
+        if outcome.narration:
+            logger.info(outcome.narration)
+
+        venv = requirements.get("python_venv") or f"{directory}/.venv"
+
+        # Venv next. A provisioning pre-flight already created it (uv/apt).
+        if not outcome.provisioned and not self._python_venv_exists(venv):
+            made = self.orchestrator.execute_command(
+                f"python3 -m venv {venv}", workdir=directory
+            )
+            if not made.get("success"):
+                return {
+                    "success": False,
+                    "error": f"could not create venv at {venv}: {made.get('output', '')}",
+                    "exit_code": made.get("exit_code"),
+                    "venv": venv,
+                }
+
+        output_lines = [outcome.narration] if outcome.narration else []
+
+        # Bug #13 defect 1: a reused venv can be pip-less/broken (this very
+        # phase left one behind in the live run) — probe/repair/recreate
+        # BEFORE anything installs, narrated.
+        repair = ensure_venv_pip(
+            self.orchestrator, venv, python_version=requirements.get("python_version")
+        )
+        if repair.get("action"):
+            if not repair.get("ok"):
+                repair_note = (
+                    f"[env] venv at {venv} still has no working pip after ensurepip "
+                    "and recreation — pip installs will fail honestly"
+                )
+            elif repair.get("action") == "ensurepip":
+                repair_note = "[env] existing venv was missing pip — repaired with ensurepip"
+            else:
+                repair_note = f"[env] existing venv was missing pip — recreated at {venv}"
+            logger.info(repair_note)
+            output_lines.append(repair_note)
+
+        # The project's OWN declared installer (shared faithfulness ladder).
+        listing = self.orchestrator.execute_command(f"ls -A1 {directory}", workdir=directory)
+        files_present = {
+            line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
+        }
+        # Bug #13 defect 3: real extras only — read the metadata the editable
+        # rungs verify their extras against.
+        contents = {}
+        for name in ("pyproject.toml", "setup.cfg"):
+            if name in files_present:
+                read = self.orchestrator.execute_command(
+                    f"cat {directory}/{name}", workdir=directory
+                )
+                contents[name] = (read.get("output") or "") if read.get("success") else ""
+        ladder = detect_installer(files_present, contents)
+        if ladder.get("note"):
+            logger.info(f"[setup] {ladder['note']}")
+            output_lines.append(f"[setup] {ladder['note']}")
+        commands = [
+            c.replace("{venv}", venv).replace("{dir}", directory)
+            for c in ladder["commands"]
+        ]
+        for cmd in commands:
+            result = self.orchestrator.execute_command(cmd, workdir=directory)
+            output_lines.append(f"$ {cmd}")
+            if not result.get("success"):
+                return {
+                    "success": False,
+                    "error": result.get("output", ""),
+                    "exit_code": result.get("exit_code"),
+                    "installer": ladder["installer"],
+                    "command": cmd,
+                    "venv": venv,
+                }
+
+        python_version = requirements.get("python_version") or outcome.active_version
+        self._register_python_runtime_overlay(venv, python_version)
+
+        if commands:
+            installed = (
+                f"Python dependencies via {ladder['installer']} "
+                f"(source: {ladder['source']}), venv at {venv}"
+            )
+        else:
+            # Honest empty ladder: nothing declared means nothing installed.
+            installed = (
+                f"Python venv at {venv}; no declared install commands found — "
+                "nothing installed"
+            )
+        return {
+            "success": True,
+            "installed": installed,
+            "installer": ladder["installer"],
+            "install_commands": commands,
+            "venv": venv,
+            "python_version": python_version,
+            "output": "\n".join(output_lines),
+        }
+
+    def _python_venv_exists(self, venv: str) -> bool:
+        probe = self.orchestrator.execute_command(
+            f"test -x {venv}/bin/python && echo EXISTS || echo MISSING"
+        )
+        return "EXISTS" in (probe.get("output") or "")
+
+    def _register_python_runtime_overlay(self, venv: str, version: Optional[str]) -> None:
+        """Register the project venv interpreter (mirrors the Java overlay)."""
+        try:
+            EnvOverlayStore(self.orchestrator).register(
+                "python",
+                f"{venv}/bin/python",
+                version=version,
+                source="project_setup_install",
+                env={"VIRTUAL_ENV": venv},
+                path_prepend=[f"{venv}/bin"],
+                activate=True,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to register Python env overlay: {exc}")
 
     def _register_java_runtime_overlay(self, java_home: str, java_version: Optional[str]) -> None:
         """Register the Java runtime selected by setup without changing install semantics."""
@@ -1600,9 +1744,9 @@ class ProjectSetupTool(BaseTool):
             output += f"2. Install packages: npm(command='install')\n"
             output += f"3. Run build: npm(command='run build')\n"
         elif project_type["type"] == "python":
-            output += f"1. Install Python and uv: project_setup(action='install_dependencies')\n"
-            output += f"2. Install packages: uv(command='sync')\n"
-            output += f"3. Run tests: uv(command='run pytest')\n"
+            output += f"1. Set up the Python environment: project_setup(action='install_dependencies')\n"
+            output += f"2. Install packages into ./.venv: build(action='deps')\n"
+            output += f"3. Run tests: build(action='test')\n"
         else:
             output += f"1. Examine build files manually\n"
             output += f"2. Use bash tool for custom setup commands\n"

@@ -609,12 +609,21 @@ def _attach_phase_machine(agent, block_phase=None):
     return machine
 
 
-def test_machine_failed_outcome_caps_physical_success():
+def test_machine_failed_outcome_scoped_by_real_build_evidence():
+    """Scoped blocked-build cap (2026-06-24 pyyaml false-red): the agent
+    blocked the build phase, but physical validation found a real build
+    (success=True) — evidence outranks agent belief, so the cap is PARTIAL
+    (the block stays surfaced; never promoted to success), not FAILED.
+    A blocked build WITHOUT physical evidence still fails (see
+    test_machine_success_still_subject_to_physical_validation and
+    tests/test_python_phase_verdict.py)."""
     agent = _agent_with_validator(_all_green_validator())
     _attach_phase_machine(agent, block_phase="build")
 
-    assert agent._get_verified_final_status(react_engine_success=True) is False
-    assert agent.final_verdict == "failed"
+    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent.final_verdict == "partial"
+    assert "blocked" in agent.final_verdict_reason
+    assert "real build" in agent.final_verdict_reason
 
 
 def test_machine_partial_outcome_caps_success_verdict_to_partial():

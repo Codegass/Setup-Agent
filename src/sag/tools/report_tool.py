@@ -964,6 +964,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_snapshot["status"]["modules_skipped_count"] = msum.get("modules_skipped")
             report_snapshot["status"]["modules_tested"] = msum.get("modules_tested")
             report_snapshot["status"]["modules_not_tested"] = msum.get("modules_not_tested")
+            report_snapshot["status"]["modules_test_bearing"] = msum.get("modules_test_bearing")
 
         # Generate both console and markdown versions with verified information and metrics
         console_report = self._generate_console_report(
@@ -1362,6 +1363,29 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
         test_analysis = physical_validation.get("test_analysis", {}) or {}
+        test_status_pv = physical_validation.get("test_status", {}) or {}
+        collected_discovered = to_int(
+            (test_status_pv.get("test_stats") or {}).get("discovered")
+        ) or to_int(test_status_pv.get("static_test_count"))
+
+        # Python denominator priority: validate_test_status carries the pytest
+        # --collect-only count (COLLECTED_JSON, written by python_tool at test
+        # time — ground truth from the actual runner). It OUTRANKS any static
+        # heuristic the trunk carries: static scans sweep the project dir, and
+        # the setup plants the venv INSIDE it (live 2026-07-10 click run:
+        # site-packages pushed the static count to 32927 while pytest collected
+        # 1927, so 1902 green executions read as 5.8% coverage and
+        # tests_not_fully_executed capped the run at PARTIAL). The trunk static
+        # count remains the fallback below when no collected count exists.
+        # Java priority order unchanged (trunk/catalog win).
+        if collected_discovered and self._is_python_project(project_info):
+            if static_test_count and static_test_count != collected_discovered:
+                logger.info(
+                    "📊 python denominator priority: pytest collect-only "
+                    f"{collected_discovered} overrides the trunk static count "
+                    f"{static_test_count}"
+                )
+            static_test_count = collected_discovered
 
         # Backfill: when analyze never persisted the static test total to the
         # trunk, fall back to the catalog count from the test scan so the
@@ -1379,6 +1403,29 @@ class ReportTool(BaseTool, UIEventEmitter):
                 if trunk_context is not None and self.context_manager:
                     try:
                         trunk_context.environment_summary["static_test_count"] = catalog_count
+                        self.context_manager._save_trunk_context(trunk_context)
+                    except Exception as exc:
+                        logger.debug(f"Could not persist backfilled static_test_count: {exc}")
+
+        # Python fallback: there is no Java catalog to backfill from, but
+        # validate_test_status already carries the pytest --collect-only
+        # denominator (test_stats.discovered / static_test_count). Feed it to
+        # the SAME static_test_count the execution-coverage gate below reads so
+        # a diagnostic subset re-run can never masquerade as the whole suite
+        # (live 2026-07-10 requests run: 8 executed of 635 collected).
+        if not static_test_count:
+            fallback_discovered = collected_discovered
+            if fallback_discovered:
+                static_test_count = fallback_discovered
+                logger.info(
+                    "📊 Backfilled static test count from pytest collect-only "
+                    f"denominator: {fallback_discovered}"
+                )
+                if trunk_context is not None and self.context_manager:
+                    try:
+                        trunk_context.environment_summary["static_test_count"] = (
+                            fallback_discovered
+                        )
                         self.context_manager._save_trunk_context(trunk_context)
                     except Exception as exc:
                         logger.debug(f"Could not persist backfilled static_test_count: {exc}")
@@ -1458,16 +1505,29 @@ class ReportTool(BaseTool, UIEventEmitter):
             "test": actual_accomplishments.get("test_success", False),
         }
 
-        # Calculate test metrics with consistent counting
-        # static_test_count reflects the number of declared test methods
-        # execution_rate therefore measures method-level coverage
+        # Calculate test metrics with consistent counting. The numerator must
+        # share the denominator's basis:
+        # - Maven/Gradle: static_test_count counts declared test METHODS
+        #   (catalog scan), so execution_rate measures method-level coverage
+        #   with the param-stripped unique method count as numerator.
+        # - Python: static_test_count comes from pytest --collect-only, which
+        #   counts parameterized invocations ([param] EXPANDED). The parser's
+        #   executed union preserves [param] precisely so it stays comparable
+        #   to the collect-only count — using the stripped unique method count
+        #   here read a full 100%-green run (50 collected, 50 executed, 21
+        #   methods) as 42% coverage and falsely fired tests_not_fully_executed.
         execution_rate = None
         expansion_factor = None
 
         executed_tests = to_int(tests_total)
         raw_executed_tests = to_int(raw_total_tests)
         unique_executed_tests = to_int(unique_total_tests)
-        coverage_executed_tests = unique_executed_tests or executed_tests
+        if static_test_count and self._is_python_project(project_info):
+            coverage_executed_tests = (
+                executed_tests if executed_tests is not None else unique_executed_tests
+            )
+        else:
+            coverage_executed_tests = unique_executed_tests or executed_tests
 
         if static_test_count and coverage_executed_tests is not None:
             try:
@@ -1559,11 +1619,21 @@ class ReportTool(BaseTool, UIEventEmitter):
             tests_ok = actual_accomplishments.get("test_success", False)
         status["tests_ok"] = tests_ok
 
+        # Carry the build validator's detected system + fingerprint evidence
+        # into the snapshot so the condensed summary can render build evidence
+        # appropriate to the ecosystem: on python the fingerprint_details ARE
+        # the build evidence (venv/pip check/imports/compileall ladder) and the
+        # Java "0 .class, 0 .jar" line is suppressed.
+        build_evidence = (physical_validation.get("build_status") or {}).get(
+            "evidence"
+        ) or {}
         physical_evidence = {
             "class_files": physical_validation.get("class_files"),
             "jar_files": physical_validation.get("jar_files"),
             "tests_total": status["tests_total"],
             "tests_pass_pct": pass_pct,
+            "build_system": build_evidence.get("build_system"),
+            "fingerprint_details": build_evidence.get("fingerprint_details") or {},
         }
 
         flags = {
@@ -1624,6 +1694,35 @@ class ReportTool(BaseTool, UIEventEmitter):
             ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
             if "tests_not_fully_executed" not in ev_conflicts:
                 ev_conflicts.append("tests_not_fully_executed")
+
+        # Scope shortfall caps the run at PARTIAL: tests ran in a strict subset
+        # of the test-bearing modules (leaf-scoped run in a reactor). Same
+        # non-adjudicated conflict mechanism as the two gates above (spec §4).
+        # The module counts are folded into status HERE — not only in the
+        # caller's dashboard passthrough, which runs after this snapshot is
+        # built — because the stored verdict below must already see the cap.
+        # _build_module_metrics is memoized on self, so the caller's later
+        # passthrough reads the identical cached result (no extra scans).
+        try:
+            module_metrics = self._build_module_metrics(
+                test_history or self._load_test_history() or {},
+                generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"module metrics for scope-narrowing check skipped: {exc}")
+            module_metrics = None
+        if module_metrics:
+            msum = module_metrics.get("module_summary") or {}
+            status["modules_tested"] = msum.get("modules_tested")
+            status["modules_test_bearing"] = msum.get("modules_test_bearing")
+        if (
+            status.get("modules_test_bearing")
+            and status.get("modules_tested") is not None
+            and 0 < status["modules_tested"] < status["modules_test_bearing"]
+        ):
+            ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
+            if "reactor_scope_narrowed" not in ev_conflicts:
+                ev_conflicts.append("reactor_scope_narrowed")
 
         # Stored verdict comes from the SAME kernel inputs as the header's
         # Result line (spec §6): header-vs-stored divergence is impossible.
@@ -3238,6 +3337,25 @@ class ReportTool(BaseTool, UIEventEmitter):
         self._module_metrics_cache = result
         return result
 
+    def _is_python_project(self, project_info: Optional[dict] = None) -> bool:
+        """True when the project under report is python (pytest-based).
+
+        Physical detection first (same rationale as _compute_module_metrics:
+        project_info.build_system is often "Unknown" at report time), falling
+        back to the reported build system when no validator is wired.
+        """
+        detect = getattr(self.physical_validator, "_detect_build_system", None)
+        if callable(detect):
+            try:
+                project_dir = (project_info or {}).get("directory") or "/workspace"
+                detected = str(detect(project_dir) or "").strip().lower()
+                if detected and detected != "unknown":
+                    return detected == "python"
+            except Exception as exc:
+                logger.debug(f"_detect_build_system failed: {exc}")
+        reported = str((project_info or {}).get("build_system") or "").strip().lower()
+        return reported in ("python", "pip/poetry")
+
     def _compute_module_metrics(self, test_history: dict, *, generated_at: str):
         validator = getattr(self, "physical_validator", None)
         if validator is None:
@@ -3256,9 +3374,25 @@ class ReportTool(BaseTool, UIEventEmitter):
                 build_system = str(detect(project_dir) or "").strip().lower()
             except Exception as exc:
                 logger.debug(f"_detect_build_system failed: {exc}")
+        if build_system == "python":
+            # Python project (pyproject.toml/setup.py/requirements.txt markers):
+            # the module scan speaks Java (.class/jar globs, surefire/gradle
+            # report dirs), so its counts are meaningless here. Live pyyaml run:
+            # python fell through the maven fallback below and the scan produced
+            # "🧩 Modules: 0 built / 1 detected" plus a bogus module-derived
+            # build_modules_incomplete while 1287/1287 pytest tests had run.
+            # None suppresses the modules line, the breakdown section, and the
+            # module-derived conflicts — v1 python scope is single-package
+            # (packages-as-modules is future work).
+            return None
         if build_system not in ("maven", "gradle"):
             # Fall back to the reported build system, then maven as last resort.
             reported = str(project_info.get("build_system") or "").strip().lower()
+            if reported in ("python", "pip/poetry"):
+                # Reported-python with no physical maven/gradle markers: same
+                # suppression as detected-python (the 'else maven' fallback was
+                # the live-run bug).
+                return None
             build_system = reported if reported in ("maven", "gradle") else "maven"
         try:
             modules = validator.scan_modules(project_dir, build_system)
