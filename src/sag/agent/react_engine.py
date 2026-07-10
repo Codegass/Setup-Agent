@@ -96,6 +96,51 @@ PYTHON_PHASE_OBJECTIVES = {
     ),
 }
 
+# Kickoff-plan variant of the build objective. The plan is authored at t=0,
+# BEFORE the repo is cloned/analyzed, so it cannot know the ecosystem — and
+# live python runs (4/5, 2026-06/07 probes) obeyed the unconditional
+# "NO Java compile target -> phase(action='blocked')" instruction from the
+# static task text and blocked the build phase. The sentence is made
+# conditional here; the project-aware correction happens AT RUNTIME in the
+# phase intros (phase_objective + _python_phase_guidance), once the analyzer
+# has run. PHASE_OBJECTIVES itself stays byte-identical so the runtime Java
+# intros do not change.
+_KICKOFF_BLOCK_SENTENCE_BEFORE = (
+    "If the analyzer reports NO Java compile target (a packaging/meta-project), "
+)
+_KICKOFF_BLOCK_SENTENCE_AFTER = (
+    "If the analyzer reports NO Java compile target (a packaging/meta-project) "
+    "AND the project is not a Python/other-ecosystem project, "
+)
+assert _KICKOFF_BLOCK_SENTENCE_BEFORE in PHASE_OBJECTIVES["build"], (
+    "kickoff softening lost its anchor — update _KICKOFF_BLOCK_SENTENCE_BEFORE "
+    "alongside PHASE_OBJECTIVES['build']"
+)
+KICKOFF_PHASE_OBJECTIVES = {
+    **PHASE_OBJECTIVES,
+    "build": PHASE_OBJECTIVES["build"].replace(
+        _KICKOFF_BLOCK_SENTENCE_BEFORE, _KICKOFF_BLOCK_SENTENCE_AFTER
+    ),
+}
+
+# Runtime python guidance for the BUILD/TEST phase intros, injected AFTER the
+# analyzer has run (the same environment_summary["build_recommendation"]
+# plumbing as _recommended_build_line). This is the live-effective seam: the
+# kickoff plan text cannot know the project type, and live runs proved the
+# template-time python objectives alone did not stop agents from blocking the
+# build phase and under-executing tests (0-2 executions vs 1287 passing).
+PYTHON_BUILD_PHASE_GUIDANCE = (
+    "This is a Python project — there is no Java compile target and that is "
+    "NOT grounds for phase(action='blocked'). Do: build(action='deps') to "
+    "create the venv and install dependencies with the project's own tool, "
+    "then build(action='compile') to verify byte-compilation. Never run "
+    "pip/pytest via bash — the build tool resolves the project venv."
+)
+PYTHON_TEST_PHASE_GUIDANCE = (
+    "Run tests with build(action='test') — it runs pytest with a JUnit XML "
+    "report; a partial pass above threshold is a valid, honest outcome."
+)
+
 # Build-system labels the analyzer emits for Python projects: structure
 # detection records "pip/poetry"; the physical validator and manifest say
 # "python"; installer variants may surface too.
@@ -457,6 +502,13 @@ class ReActEngine(UIEventEmitter):
             rec_line = self._recommended_build_line(phase)
             if rec_line:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
+            # Python guidance is injected HERE, at runtime, because this is
+            # the first text the model sees after the analyzer has recorded
+            # the project type — the kickoff plan (authored at t=0) still
+            # carries the generic text and cannot be trusted to correct it.
+            guidance = self._python_phase_guidance(phase)
+            if guidance:
+                lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
         return ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
             content="\n".join(lines),
@@ -474,6 +526,18 @@ class ReActEngine(UIEventEmitter):
             return None
         rec = env.get("build_recommendation") or {}
         return rec.get("build_system") or env.get("build_system")
+
+    def _python_phase_guidance(self, phase: str) -> Optional[str]:
+        """Explicit python guidance block for the build/test intros, keyed off
+        the analyzer's recorded build system (build_recommendation or the env
+        summary — the same best-effort plumbing as _recommended_build_line).
+        Returns None for every non-python project, keeping Java intros
+        byte-identical."""
+        if phase not in ("build", "test"):
+            return None
+        if not is_python_build_system(self._detected_build_system()):
+            return None
+        return PYTHON_BUILD_PHASE_GUIDANCE if phase == "build" else PYTHON_TEST_PHASE_GUIDANCE
 
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
         """One-line build/test recommendation from the analyzer, read from the

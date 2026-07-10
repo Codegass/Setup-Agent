@@ -1258,6 +1258,21 @@ PY"""
             "source_modules": [],
             "rationale": "",
         }
+        # Python project: a missing Java compile target is EXPECTED, never a
+        # block signal. Store the CANONICAL ecosystem label on the payload —
+        # the runtime phase intros key their python guidance off
+        # rec["build_system"] (react_engine._detected_build_system), and the
+        # structure label ("pip/poetry") or an "unknown" fallthrough left the
+        # signal non-canonical on live runs.
+        if str(analysis.get("project_type", "")).strip().lower() == "python":
+            rec["build_system"] = "python"
+            rec["rationale"] = (
+                "Python project — no Java compile target exists; install "
+                "dependencies (build deps) then verify byte-compilation "
+                "(build compile)."
+            )
+            return rec
+
         orch = self.docker_orchestrator
         if not orch:
             return rec

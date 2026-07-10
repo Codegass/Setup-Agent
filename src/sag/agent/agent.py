@@ -438,9 +438,12 @@ class SetupAgent:
             # rendering); descriptions are the one-line phase objectives
             # (TOOLS, never raw commands).
             from sag.agent.phase_machine import PHASE_NAMES
-            from sag.agent.react_engine import PHASE_OBJECTIVES
+            from sag.agent.react_engine import KICKOFF_PHASE_OBJECTIVES
 
-            initial_tasks = [PHASE_OBJECTIVES[name] for name in PHASE_NAMES]
+            # KICKOFF variant: authored at t=0 BEFORE the repo is analyzed, so
+            # the build objective's blocking instruction is conditional on
+            # ecosystem (live python runs obeyed the unconditional Java text).
+            initial_tasks = [KICKOFF_PHASE_OBJECTIVES[name] for name in PHASE_NAMES]
             phase_task_ids = [f"phase_{name}" for name in PHASE_NAMES]
 
             logger.info("Creating trunk context from the engine-owned phase plan...")
