@@ -1042,6 +1042,34 @@ START by working toward the current phase objective shown in my context.
         conflicts = test_status.get("conflicts", []) if isinstance(test_status, dict) else []
         self.final_verdict = run_verdict(machine_outcome, physical_verdict, conflicts)
 
+        # Report-mirror cap (cayenne 2026-06-24 probe): conflicts emitted at
+        # the report-snapshot stage (_build_report_snapshot appends
+        # reactor_scope_narrowed / tests_not_fully_executed /
+        # build_modules_incomplete right next to the stored kernel verdict)
+        # never reach validate_test_status, so run_verdict() above got an empty
+        # conflict list and the CLI announced "verdict=success" while the
+        # generated report read "⚠️ PARTIAL". The snapshot's stored verdict is
+        # already the kernel output WITH every conflict cap applied — consume
+        # it here instead of duplicating the conflict logic (same mirroring
+        # pattern as PR #9's "0 executed tests is PARTIAL on the CLI"). The
+        # mirror caps at partial only: conflict caps are partial-level by
+        # kernel design, and failed-level judges (phase machine, physical
+        # evidence) are already consumed first-hand above — including the
+        # evidence-backed blocked-build cap, which must not be re-demoted. It
+        # never promotes (failed stays failed), and no-report runs (snapshot
+        # absent) keep today's behavior exactly.
+        snapshot_verdict, snapshot_conflicts = self._report_snapshot_verdict()
+        snapshot_capped = (
+            snapshot_verdict in ("partial", "failed")
+            and self.final_verdict == "success"
+        )
+        if snapshot_capped:
+            self.final_verdict = "partial"
+            logger.warning(
+                "⚠️ Run capped at PARTIAL: the report snapshot's verdict is "
+                f"{snapshot_verdict} (conflicts: {', '.join(snapshot_conflicts) or 'none recorded'})"
+            )
+
         # The banner must explain WHY the verdict is what it is — round 6:
         # a conflict-capped vfs run printed "no test reports found" while its
         # 96.2% test results sat right there in the report.
@@ -1051,6 +1079,15 @@ START by working toward the current phase objective shown in my context.
                 # does the physical evidence that contradicts it.
                 self.final_verdict_reason = (
                     "build phase blocked by agent, but physical evidence shows a real build"
+                )
+            elif snapshot_capped:
+                self.final_verdict_reason = (
+                    "report verdict is partial"
+                    + (
+                        f" (conflicts at report time: {', '.join(snapshot_conflicts[:3])})"
+                        if snapshot_conflicts
+                        else " (see report)"
+                    )
                 )
             elif physical_verdict == "partial":
                 self.final_verdict_reason = "build verified, tests not verified (no test reports found)"
@@ -1075,6 +1112,27 @@ START by working toward the current phase objective shown in my context.
                 "Phase machine recorded blocked phases; capping verdict to partial"
             )
         return physical_ok
+
+    def _report_snapshot_verdict(self) -> tuple:
+        """The kernel verdict the LAST generated report stored, plus its
+        evidence conflicts: ``(verdict | None, conflicts)``.
+
+        report_tool stamps ``status["verdict"]`` on every snapshot from
+        _snapshot_kernel_verdict (which already folds in the report-stage
+        conflict caps: reactor_scope_narrowed, tests_not_fully_executed,
+        build_modules_incomplete), and the ReAct engine keeps that snapshot in
+        successful_states["report_snapshot"]. Runs that never generated a
+        report — or that never had an engine at all (``sag run --task``,
+        legacy, direct unit-test invocations) — return (None, []) so the
+        finalization keeps its no-report behavior untouched.
+        """
+        states = getattr(getattr(self, "react_engine", None), "successful_states", None)
+        snapshot = states.get("report_snapshot") if isinstance(states, dict) else None
+        if not isinstance(snapshot, dict):
+            return None, []
+        verdict = (snapshot.get("status") or {}).get("verdict")
+        conflicts = (snapshot.get("evidence_result") or {}).get("conflicts") or []
+        return verdict, list(conflicts)
 
     def _get_physical_final_status(self, react_engine_success: bool) -> bool:
         """Verify the final run status against physical evidence.
