@@ -1599,11 +1599,21 @@ class ReportTool(BaseTool, UIEventEmitter):
             tests_ok = actual_accomplishments.get("test_success", False)
         status["tests_ok"] = tests_ok
 
+        # Carry the build validator's detected system + fingerprint evidence
+        # into the snapshot so the condensed summary can render build evidence
+        # appropriate to the ecosystem: on python the fingerprint_details ARE
+        # the build evidence (venv/pip check/imports/compileall ladder) and the
+        # Java "0 .class, 0 .jar" line is suppressed.
+        build_evidence = (physical_validation.get("build_status") or {}).get(
+            "evidence"
+        ) or {}
         physical_evidence = {
             "class_files": physical_validation.get("class_files"),
             "jar_files": physical_validation.get("jar_files"),
             "tests_total": status["tests_total"],
             "tests_pass_pct": pass_pct,
+            "build_system": build_evidence.get("build_system"),
+            "fingerprint_details": build_evidence.get("fingerprint_details") or {},
         }
 
         flags = {

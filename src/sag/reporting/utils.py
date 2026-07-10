@@ -66,6 +66,33 @@ def _phase_icon(flag: Optional[bool]) -> str:
     return "⚪"
 
 
+def _python_evidence_rungs(fingerprints: Dict[str, Any]) -> List[str]:
+    """Render the python evidence-ladder rungs (validate_build_status's
+    fingerprint_details) as compact summary parts.
+
+    Boolean rungs render ✓/✗; rungs the ladder could not measure (None —
+    e.g. no declared packages to import, no declared C-extensions) are
+    omitted rather than invented.
+    """
+    parts: List[str] = []
+    tick = lambda flag: "✓" if flag else "✗"  # noqa: E731 - tiny local helper
+    if fingerprints.get("venv_exists") is not None:
+        parts.append(f"venv {tick(fingerprints['venv_exists'])}")
+    if fingerprints.get("pip_check_clean") is not None:
+        parts.append(f"pip check {tick(fingerprints['pip_check_clean'])}")
+    if fingerprints.get("imports_ok") is not None:
+        parts.append(f"imports {tick(fingerprints['imports_ok'])}")
+    coverage = fingerprints.get("compileall_coverage")
+    if coverage is not None:
+        try:
+            parts.append(f"compileall {float(coverage) * 100:.0f}%")
+        except (TypeError, ValueError):
+            pass
+    if fingerprints.get("ext_modules_ok") is not None:
+        parts.append(f"C-extensions {tick(fingerprints['ext_modules_ok'])}")
+    return parts
+
+
 def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
     """Render a compact multi-line summary for console/log surfaces."""
     status = snapshot.get("status", {})
@@ -99,16 +126,30 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
         lines.append(f"⚠️ {item}")
 
     if evidence:
-        class_files = evidence.get("class_files")
-        jar_files = evidence.get("jar_files")
-        if class_files is not None or jar_files is not None:
-            details = []
-            if class_files is not None:
-                details.append(f"{class_files} .class")
-            if jar_files is not None:
-                details.append(f"{jar_files} .jar")
-            if details:
-                lines.append(f"🧾 Build artifacts: {', '.join(details)}")
+        # Python projects have no .class/JAR analog — "0 .class, 0 .jar" on a
+        # green python run is a Java-ism. The evidence ladder the validator
+        # already produced (venv -> pip check -> imports -> compileall ->
+        # C-extensions, see PhysicalValidator._verify_python_build) IS the
+        # build evidence there; unknown rungs (None) are skipped, never
+        # invented. Java/Maven/Gradle keep the artifacts line unchanged.
+        build_system = str(
+            evidence.get("build_system") or project.get("build_system") or ""
+        ).strip().lower()
+        if build_system in ("python", "pip/poetry"):
+            rungs = _python_evidence_rungs(evidence.get("fingerprint_details") or {})
+            if rungs:
+                lines.append(f"🧾 Build evidence: {', '.join(rungs)}")
+        else:
+            class_files = evidence.get("class_files")
+            jar_files = evidence.get("jar_files")
+            if class_files is not None or jar_files is not None:
+                details = []
+                if class_files is not None:
+                    details.append(f"{class_files} .class")
+                if jar_files is not None:
+                    details.append(f"{jar_files} .jar")
+                if details:
+                    lines.append(f"🧾 Build artifacts: {', '.join(details)}")
 
     # Tests line: surface the DETECTED (static) total alongside the executed
     # count. The static total is vital and must never silently drop from the
