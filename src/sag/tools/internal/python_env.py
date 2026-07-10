@@ -141,8 +141,16 @@ _PYPROJECT_PKG_DIR_ROOT_KEY = re.compile(
 
 
 def package_dir_from_setup_py(content: str) -> Optional[str]:
-    """The ``package_dir={'': '<dir>'}`` root mapping, or None."""
-    m = _SETUP_PY_PKG_DIR.search(content or "")
+    """The ``package_dir={'': '<dir>'}`` root mapping, or None. Full-line
+    ``#`` comments are dropped first so a commented-out mapping is never
+    read as the live declaration (docstring mentions remain a heuristic
+    limitation)."""
+    live = "\n".join(
+        line
+        for line in (content or "").splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    m = _SETUP_PY_PKG_DIR.search(live)
     return m.group(2).strip() or None if m else None
 
 

@@ -49,7 +49,9 @@ from sag.testcases.catalog import (
 )
 
 # top_level.txt names that are install tooling, never the project under test —
-# filtered out of the imports-rung fallback (_installed_top_level_packages).
+# a second deny-list layer under the record selection in
+# _installed_top_level_packages (the project's own record could still list a
+# tooling name it vendors).
 _NON_PROJECT_TOP_LEVEL = {
     "pip",
     "setuptools",
@@ -57,6 +59,34 @@ _NON_PROJECT_TOP_LEVEL = {
     "pkg_resources",
     "_distutils_hack",
 }
+
+
+def _normalize_dist_name(name: str) -> str:
+    """PEP 503 name normalization: case-folded, runs of ``-_.`` collapse to
+    ``-`` — 'PyYAML' and 'pyyaml' are the same distribution."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _dist_record_matches(record_dir: str, project_name: str) -> bool:
+    """True when a site-packages ``*.dist-info`` / ``*.egg-info`` dir is the
+    PROJECT's own record: the distribution-name segment must equal the
+    PEP 503-normalized project name, and anything after it must look like a
+    version (leading digit) — so ``requests_toolbelt-1.0.dist-info`` never
+    matches project ``requests``. A dependency's record never matches."""
+    base = record_dir.rstrip("/").rsplit("/", 1)[-1]
+    for suffix in (".dist-info", ".egg-info"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    else:
+        return False
+    wanted = _normalize_dist_name(project_name)
+    normalized = _normalize_dist_name(base)
+    if normalized == wanted:
+        return True
+    if not normalized.startswith(f"{wanted}-"):
+        return False
+    return normalized[len(wanted) + 1 : len(wanted) + 2].isdigit()
 
 
 # In-container test-report parser (executed via `python3 - <<'PY'`). The two
@@ -2510,10 +2540,14 @@ class PhysicalValidator:
         (``package_dir={'': 'lib'}``) can defeat static discovery, leaving the
         manifest's python_packages empty. The imports check is the STRONGEST
         evidence rung, so before skipping it the import targets are derived
-        from the venv itself — the installed distributions' top_level.txt
-        records (tooling names filtered). Only when that too yields nothing
-        does the rung stay None, and then the skip is a VISIBLE warning in
-        the evidence, never a silent hole in the report.
+        from the venv itself — but ONLY from the PROJECT's own installed
+        record: the dist-info whose direct_url.json points back at the
+        project dir, else a name-matched dist-info/egg-info (see
+        _installed_top_level_packages). Third-party dependency records in the
+        same site-packages are never project evidence. Only when the
+        project's own record yields nothing does the rung stay None, and then
+        the skip is a VISIBLE warning in the evidence, never a silent hole in
+        the report.
         """
         from sag.tools.internal.build_preflight import read_build_requirements
 
@@ -2549,10 +2583,10 @@ class PhysicalValidator:
         result["pip_check_clean"] = pip_check["success"]
 
         if not packages:
-            # Fallback import targets from the venv's own installed
-            # top_level.txt records (see docstring); still honest — read
-            # from disk, never invented.
-            packages = self._installed_top_level_packages(venv)
+            # Fallback import targets from the PROJECT's own installed
+            # top_level.txt record (see docstring); still honest — read
+            # from disk, never invented, never a dependency's record.
+            packages = self._installed_top_level_packages(venv, project_dir)
         if not packages:
             result["warnings"].append(
                 "imports rung skipped: no importable package detected"
@@ -2638,22 +2672,74 @@ class PhysicalValidator:
             )
         return result
 
-    def _installed_top_level_packages(self, venv: str) -> List[str]:
-        """Import targets from the installed distributions' top_level.txt
-        records (the editable/local install's dist-info) when the manifest
-        declares no packages. Tooling names are filtered so pip/setuptools
-        are never probed as project evidence; empty when nothing real."""
-        probe = self._execute_command_with_logging(
-            f"find {venv}/lib/python*/site-packages -maxdepth 2 "
-            f"-name 'top_level.txt' -exec cat {{}} + 2>/dev/null",
-            "reading installed top_level.txt",
+    def _installed_top_level_packages(
+        self, venv: str, project_dir: str
+    ) -> List[str]:
+        """Import targets from the PROJECT's OWN installed record when the
+        manifest declares no packages — never from third-party dependencies
+        sharing the same site-packages.
+
+        Selection ladder: (1) the dist-info whose PEP 610 ``direct_url.json``
+        points back into the project dir — the record pip writes for
+        ``pip install -e .`` / ``pip install .``; (2) else any dist-info
+        with a PEP 610 ``dir_info`` marker — a local-directory install (pip
+        records the symlink-resolved realpath, so the exact-tree grep can
+        miss; index-installed dependencies carry no direct_url.json at all);
+        (3) else the record (``*.dist-info`` / ``*.egg-info``) whose
+        distribution name matches the project dir name, PEP 503-normalized,
+        version-boundary enforced (_dist_record_matches). A dependency's
+        record is never read as project evidence: its broken import must not
+        BLOCK, and its working import must not fake imports_ok=True when the
+        project's own install failed. Tooling names stay deny-listed as a
+        second layer. Empty — an honest, visible imports-rung skip — when no
+        record is the project's own."""
+        root = project_dir.rstrip("/")
+        site = f"{venv}/lib/python*/site-packages"
+
+        def dist_dirs(probe: Dict[str, any]) -> List[str]:
+            return [
+                line.strip()[: -len("/direct_url.json")]
+                for line in (probe.get("output") or "").splitlines()
+                if line.strip().endswith("/direct_url.json")
+            ]
+
+        direct = self._execute_command_with_logging(
+            f"grep -Fls 'file://{root}' {site}/*.dist-info/direct_url.json "
+            f"2>/dev/null",
+            "locating the project's own dist-info (direct_url.json)",
         )
+        record_dirs = dist_dirs(direct)
+        if not record_dirs:
+            local = self._execute_command_with_logging(
+                f"grep -Fls '\"dir_info\"' {site}/*.dist-info/direct_url.json "
+                f"2>/dev/null",
+                "locating local-directory installs (PEP 610 dir_info)",
+            )
+            record_dirs = dist_dirs(local)
+        if not record_dirs:
+            listing = self._execute_command_with_logging(
+                f"find {site} -maxdepth 1 "
+                f"\\( -name '*.dist-info' -o -name '*.egg-info' \\) "
+                f"2>/dev/null",
+                "listing installed distribution records",
+            )
+            project_name = root.rsplit("/", 1)[-1]
+            record_dirs = [
+                line.strip()
+                for line in (listing.get("output") or "").splitlines()
+                if line.strip() and _dist_record_matches(line.strip(), project_name)
+            ]
         packages: List[str] = []
-        for line in (probe.get("output") or "").splitlines():
-            name = line.strip()
-            if not name or name in _NON_PROJECT_TOP_LEVEL or name in packages:
-                continue
-            packages.append(name)
+        for record_dir in record_dirs:
+            probe = self._execute_command_with_logging(
+                f"cat {record_dir}/top_level.txt 2>/dev/null",
+                "reading the project's top_level.txt",
+            )
+            for line in (probe.get("output") or "").splitlines():
+                name = line.strip()
+                if not name or name in _NON_PROJECT_TOP_LEVEL or name in packages:
+                    continue
+                packages.append(name)
         return sorted(packages)
 
     def _python_package_dirs(self, project_dir: str, packages: List[str]) -> List[str]:
