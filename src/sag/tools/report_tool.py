@@ -1363,6 +1363,29 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         physical_validation = actual_accomplishments.get("physical_validation", {}) or {}
         test_analysis = physical_validation.get("test_analysis", {}) or {}
+        test_status_pv = physical_validation.get("test_status", {}) or {}
+        collected_discovered = to_int(
+            (test_status_pv.get("test_stats") or {}).get("discovered")
+        ) or to_int(test_status_pv.get("static_test_count"))
+
+        # Python denominator priority: validate_test_status carries the pytest
+        # --collect-only count (COLLECTED_JSON, written by python_tool at test
+        # time — ground truth from the actual runner). It OUTRANKS any static
+        # heuristic the trunk carries: static scans sweep the project dir, and
+        # the setup plants the venv INSIDE it (live 2026-07-10 click run:
+        # site-packages pushed the static count to 32927 while pytest collected
+        # 1927, so 1902 green executions read as 5.8% coverage and
+        # tests_not_fully_executed capped the run at PARTIAL). The trunk static
+        # count remains the fallback below when no collected count exists.
+        # Java priority order unchanged (trunk/catalog win).
+        if collected_discovered and self._is_python_project(project_info):
+            if static_test_count and static_test_count != collected_discovered:
+                logger.info(
+                    "📊 python denominator priority: pytest collect-only "
+                    f"{collected_discovered} overrides the trunk static count "
+                    f"{static_test_count}"
+                )
+            static_test_count = collected_discovered
 
         # Backfill: when analyze never persisted the static test total to the
         # trunk, fall back to the catalog count from the test scan so the
@@ -1391,10 +1414,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # a diagnostic subset re-run can never masquerade as the whole suite
         # (live 2026-07-10 requests run: 8 executed of 635 collected).
         if not static_test_count:
-            test_status_pv = physical_validation.get("test_status", {}) or {}
-            fallback_discovered = to_int(
-                (test_status_pv.get("test_stats") or {}).get("discovered")
-            ) or to_int(test_status_pv.get("static_test_count"))
+            fallback_discovered = collected_discovered
             if fallback_discovered:
                 static_test_count = fallback_discovered
                 logger.info(

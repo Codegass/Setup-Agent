@@ -15,6 +15,36 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
+# Environment/vendor directories pruned from every STATIC test scan at the
+# walk level (never post-hoc). The setup itself plants environments INSIDE the
+# project dir (python venvs: site-packages ships thousands of vendored test
+# functions/methods — live 2026-07-10 click run: the static scan reported
+# 32927 "static tests detected" while pytest collected 1927, capping a 98.7%
+# run at PARTIAL). Java projects never carried an env dir inside the repo, so
+# the historical set only knew VCS/IDE/build-output dirs.
+STATIC_SCAN_EXCLUDED_DIR_NAMES = (
+    # environment / vendor dirs
+    ".venv",
+    "venv",
+    "env",
+    "site-packages",
+    "node_modules",
+    ".git",
+    ".tox",
+    ".nox",
+    "__pycache__",
+    "build",
+    "dist",
+    ".eggs",
+    # VCS/IDE/build-output dirs the java scans always pruned
+    ".svn",
+    ".idea",
+    ".vscode",
+    "target",
+    "out",
+    "tmp",
+)
+
 
 @dataclass
 class TestCaseDescriptor:
@@ -258,10 +288,7 @@ import json
 import re
 from pathlib import Path
 
-EXCLUDED_DIR_NAMES = {{
-    '.git', '.svn', '.idea', '.vscode',
-    'target', 'build', 'out', 'tmp'
-}}
+EXCLUDED_DIR_NAMES = set({sorted(STATIC_SCAN_EXCLUDED_DIR_NAMES)!r})
 
 def extract_package(content):
     match = re.search(r'^package\\s+([a-zA-Z0-9_.]+);', content, re.MULTILINE)
@@ -327,10 +354,12 @@ def is_excluded(path):
 project_root = Path('.')
 test_cases = []
 
-# Find all test directories
+# Find all test directories (env/vendor subtrees pruned at the walk level)
 test_dirs = []
 for candidate in project_root.rglob('src'):
     if candidate.name != 'src':
+        continue
+    if is_excluded(candidate):
         continue
     test_dir = candidate / 'test' / 'java'
     if not test_dir.is_dir():

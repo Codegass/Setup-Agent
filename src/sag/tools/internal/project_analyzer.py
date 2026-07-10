@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from sag.testcases.catalog import TestCaseCatalog, build_java_test_catalog
+from sag.testcases.catalog import (
+    STATIC_SCAN_EXCLUDED_DIR_NAMES,
+    TestCaseCatalog,
+    build_java_test_catalog,
+)
 
 from ..base import BaseTool, ToolResult
 
@@ -930,16 +934,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-EXCLUDED_DIR_NAMES = {
-    '.git',
-    '.svn',
-    '.idea',
-    '.vscode',
-    'target',
-    'build',
-    'out',
-    'tmp',
-}
+EXCLUDED_DIR_NAMES = set({sorted(STATIC_SCAN_EXCLUDED_DIR_NAMES)!r})
 
 ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
 

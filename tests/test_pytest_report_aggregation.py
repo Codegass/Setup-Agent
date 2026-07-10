@@ -579,9 +579,14 @@ def test_java_method_denominator_keeps_unique_numerator():
     assert "tests_not_fully_executed" not in snapshot["evidence_result"].get("conflicts", [])
 
 
-def test_env_summary_static_count_still_wins_when_present():
-    """The fallback NEVER overrides a count the analyzer already recorded
-    (validate_project_analysis_status contract stays intact)."""
+def test_collect_only_denominator_outranks_env_summary_on_python():
+    """python denominator priority (bug #7, click live probe): the pytest
+    --collect-only count is ground truth from the actual runner and OVERRIDES
+    an env-summary static count when both exist — static scans can be polluted
+    by the venv the setup plants inside the project dir (click: 32927 static
+    vs 1927 collected capped a 98.7% run at PARTIAL). The static count is kept
+    as evidence and stays the fallback when no collected count exists; java
+    priority order is unchanged (see tests/test_static_scan_exclusions.py)."""
 
     class TrunkOrch(CollectedDenominatorOrch):
         def execute_command(self, cmd, workdir=None, **kwargs):
@@ -605,4 +610,6 @@ def test_env_summary_static_count_still_wins_when_present():
 
     analysis = validator.validate_project_analysis_status("proj")
 
-    assert analysis["static_test_count"] == 700
+    assert analysis["static_test_count"] == 635
+    assert analysis["static_test_count_source"] == "pytest_collect_only"
+    assert analysis["static_test_count_static_scan"] == 700

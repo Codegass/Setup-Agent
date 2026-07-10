@@ -2859,19 +2859,18 @@ class PhysicalValidator:
             )
 
         failed_count = test_metrics.get("failed_tests", 0) + test_metrics.get("error_tests", 0)
-        discovered = (
+        # Python projects: python_tool's pytest --collect-only denominator is
+        # ground truth from the actual runner and takes PRIORITY over any
+        # static heuristic the runner metrics may carry (live 2026-07-10 click
+        # run: a static scan that swept the .venv reported 32927 while pytest
+        # collected 1927). The metrics chain stays the fallback when no
+        # collected count exists; _python_collected_count is None outside
+        # python, so maven/gradle priority order is unchanged.
+        discovered = self._python_collected_count(project_name) or (
             test_metrics.get("discovered")
             or test_metrics.get("discovered_tests")
             or test_metrics.get("static_test_count")
         )
-        if not discovered:
-            # Python projects: the analyzer often never persists a
-            # static_test_count, so the runner metrics alone cannot tell a
-            # subset re-run from the full suite (live 2026-07-10 requests run:
-            # 0/8 scored as the whole suite). Reuse python_tool's pytest
-            # --collect-only denominator so test_stats.discovered and the
-            # execution-coverage gate see the real suite size.
-            discovered = self._python_collected_count(project_name)
         has_test_count_evidence = test_metrics.get("valid", False) or any(
             key in test_metrics and test_metrics.get(key) is not None
             for key in (
@@ -3014,7 +3013,7 @@ class PhysicalValidator:
                     "You MUST run project_analyzer(action='analyze') immediately to count static tests "
                     "and generate an intelligent execution plan. This is REQUIRED for accurate reporting."
                 )
-                return self._apply_python_collected_fallback(result, project_name)
+                return self._apply_python_collected_denominator(result, project_name)
 
             trunk_file = trunk_file_result["output"].strip()
             result["trunk_context_found"] = True
@@ -3064,30 +3063,46 @@ class PhysicalValidator:
                 "for better reporting. This helps track test coverage and execution rates."
             )
 
-        return self._apply_python_collected_fallback(result, project_name)
+        return self._apply_python_collected_denominator(result, project_name)
 
-    def _apply_python_collected_fallback(
+    def _apply_python_collected_denominator(
         self, result: Dict[str, any], project_name: Optional[str]
     ) -> Dict[str, any]:
-        """Fallback static_test_count from python_tool's collect-only denominator.
+        """static_test_count from python_tool's collect-only denominator.
 
-        When the env summary carries no static_test_count and the build system
-        is python, read COLLECTED_JSON (written by python_tool's `pytest
-        --collect-only` pass). This feeds the existing tests_not_fully_executed
-        gate UNCHANGED (spec 2026-07-07 Component 4) — never overrides a count
-        the analyzer already recorded.
+        build_system == python: the COLLECTED_JSON count (written by
+        python_tool's `pytest --collect-only` pass at test time — ground truth
+        from the actual runner) takes PRIORITY over any static heuristic the
+        env summary carries. Static scans sweep the project dir, and the setup
+        plants the venv INSIDE it (live 2026-07-10 click run: site-packages
+        pushed the static count to 32927 while pytest collected 1927, capping
+        a 98.7% run at PARTIAL). The static count remains the fallback when no
+        collected count exists. Maven/Gradle: _python_collected_count is None,
+        so the env-summary priority order is unchanged.
         """
-        if result.get("has_static_test_count"):
-            return result
         collected = self._python_collected_count(project_name)
-        if collected is not None:
-            result["has_static_test_count"] = True
-            result["static_test_count"] = collected
-            result["static_test_count_source"] = "pytest_collect_only"
+        if collected is None:
+            return result
+        if (
+            result.get("has_static_test_count")
+            and result.get("static_test_count") != collected
+        ):
+            # Preserve the static-scan number as evidence; it no longer feeds
+            # the execution-coverage gate.
+            result["static_test_count_static_scan"] = result["static_test_count"]
             logger.info(
-                f"✅ static_test_count fallback: {collected} tests from "
+                f"✅ python denominator priority: {collected} tests from pytest "
+                f"--collect-only override the static scan count "
+                f"{result['static_test_count']}"
+            )
+        else:
+            logger.info(
+                f"✅ static_test_count: {collected} tests from "
                 f"pytest --collect-only (COLLECTED_JSON)"
             )
+        result["has_static_test_count"] = True
+        result["static_test_count"] = collected
+        result["static_test_count_source"] = "pytest_collect_only"
         return result
 
     def _python_collected_count(self, project_name: Optional[str]) -> Optional[int]:

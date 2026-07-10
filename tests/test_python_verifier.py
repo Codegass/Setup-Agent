@@ -335,11 +335,17 @@ def test_collected_json_fallback_feeds_static_test_count():
     assert result["static_test_count"] == 42
 
 
-def test_env_summary_static_count_wins_over_fallback():
+def test_collect_only_denominator_wins_over_env_summary_on_python():
+    """Bug #7 (click live probe): on python the pytest --collect-only count is
+    ground truth and outranks the env-summary static heuristic (which the venv
+    the setup plants inside the project dir can pollute); the static count is
+    kept as evidence and remains the fallback when no collected count exists."""
     orch = CollectedOrch(collected=42, trunk_env={"static_test_count": 100})
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
     result = validator.validate_project_analysis_status("proj")
-    assert result["static_test_count"] == 100
+    assert result["static_test_count"] == 42
+    assert result["static_test_count_source"] == "pytest_collect_only"
+    assert result["static_test_count_static_scan"] == 100
 
 
 def test_fallback_only_applies_to_python_projects():
