@@ -2534,7 +2534,10 @@ class PhysicalValidator:
         below build_coverage_threshold, or a missing declared extension is
         PARTIAL (success=True, complete=False) with the failed rung named;
         every rung green is SUCCESS. Unknown rungs (no declared packages, no
-        countable sources) stay None — never invented evidence.
+        countable sources) stay None — never invented evidence — and an
+        unknown IMPORTS rung caps the build at PARTIAL (pyyaml live probe
+        bug #9): imports are the strongest evidence, so "never probed" must
+        not read as green on a testless project.
 
         Imports rung fallback (pyyaml re-probe bug #6): package_dir layouts
         (``package_dir={'': 'lib'}``) can defeat static discovery, leaving the
@@ -2673,6 +2676,14 @@ class PhysicalValidator:
         partial_reasons = []
         if not result["pip_check_clean"]:
             partial_reasons.append("pip check reported dependency breakage")
+        if result["imports_ok"] is None:
+            # pyyaml live probe bug #9: an UNKNOWN imports rung is not green.
+            # venv + compileall are real evidence (success stays True), but
+            # the strongest rung was never probed — cap at PARTIAL, never a
+            # silent SUCCESS on a project whose install was never verified.
+            partial_reasons.append(
+                "imports unverified: no importable package detected"
+            )
         coverage = result["compileall_coverage"]
         threshold = self.build_coverage_threshold
         if coverage is not None and coverage < threshold:

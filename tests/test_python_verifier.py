@@ -174,6 +174,58 @@ def test_all_rungs_green_is_success():
 
 
 # ---------------------------------------------------------------------------
+# Unverified imports rung (pyyaml live probe bug #9): unknown evidence caps
+# the build at PARTIAL, never silent green
+# ---------------------------------------------------------------------------
+
+
+def test_unverified_imports_cap_build_at_partial():
+    """imports_ok None (no importable package detected anywhere: manifest
+    empty AND no project-owned installed record in the venv) must cap the
+    build at PARTIAL. venv + compileall are real evidence, so success stays
+    True — but unknown import evidence is never green (complete False)."""
+    orch = LadderOrch(manifest=_manifest(python_packages=[]))
+    result = _validate(orch)
+    details = result["evidence"]["fingerprint_details"]
+    assert details["imports_ok"] is None
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    # The PARTIAL reason names the skipped rung.
+    assert "imports unverified: no importable package detected" in result["reason"]
+    # The existing visible evidence warning stays.
+    assert any(
+        "imports rung skipped: no importable package detected" in w
+        for w in result["evidence"]["warnings"]
+    )
+    # No import was ever probed — the rung is genuinely unknown, not failed.
+    assert not any('-c "import' in c for c in orch.commands)
+
+
+def test_verified_imports_still_reach_full_success():
+    """Regression: the bug #9 cap must not touch imports_ok=True — every
+    rung green stays SUCCESS/complete, with no unverified-imports reason."""
+    orch = LadderOrch()
+    result = _validate(orch)
+    assert result["evidence"]["fingerprint_details"]["imports_ok"] is True
+    assert result["success"] is True
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert "imports unverified" not in result["reason"]
+
+
+def test_failed_imports_still_blocked_not_partial():
+    """Regression: the bug #9 cap must not touch imports_ok=False — a failed
+    import stays BLOCKED (success False), never softened to PARTIAL."""
+    orch = LadderOrch(import_ok=False)
+    result = _validate(orch)
+    assert result["evidence"]["fingerprint_details"]["imports_ok"] is False
+    assert result["success"] is False
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
 # pytest JUnit XML round-trips through the EXISTING parser unchanged
 # ---------------------------------------------------------------------------
 
