@@ -49,6 +49,277 @@ from sag.testcases.catalog import (
 )
 
 
+# In-container test-report parser (executed via `python3 - <<'PY'`). The two
+# header assignments (project_dir, pytest_reports_dir) are prepended by
+# _parse_test_reports_compact_in_container. Kept as a plain module string so
+# the embedded script needs no f-string brace escaping.
+#
+# Aggregation model (live 2026-07-10 requests run):
+# - Maven/Gradle report dirs: RAW accumulation across files with severity-merged
+#   unique statuses — byte-identical to the original parser (surefire re-run
+#   files legitimately add executions).
+# - pytest reports dir: python_tool writes ONE cumulative JUnit XML PER pytest
+#   INVOCATION (pytest-<epoch>.xml). Files are aggregated per test id with the
+#   LATEST invocation winning, so a diagnostic subset re-run updates the tests
+#   it ran but never erases (or double-counts) the rest of the suite. The
+#   primary executed/passed/failed counts are the deduped union.
+_COMPACT_REPORT_PARSER_BODY = '''
+import json
+import os
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def is_pytest_report(s):
+    return s.startswith(pytest_reports_dir.rstrip("/") + "/") or "/.setup_agent/pytest-reports/" in s
+
+
+def is_report_file(path):
+    s = str(path)
+    if not path.name.endswith(".xml"):
+        return False
+    return (
+        "/target/surefire-reports/" in s
+        or "/target/failsafe-reports/" in s
+        or "/build/test-results/" in s
+        or is_pytest_report(s)
+    )
+
+
+def normalize_method_name(method_name):
+    if not method_name:
+        return ""
+    name = method_name.strip()
+    if "[" in name:
+        name = name.split("[")[0]
+    if "(" in name:
+        name = name.split("(")[0]
+    if " #" in name:
+        name = name.split(" #")[0]
+    return name.strip()
+
+
+def normalize_key(classname, name, file_path=None):
+    method_name = normalize_method_name(name)
+    if not method_name:
+        return None
+    if classname:
+        classname = classname.replace("$", ".").strip()
+    elif file_path:
+        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "").strip(".")
+    else:
+        return method_name
+    return f"{classname}::{method_name}"
+
+
+def testcase_status(testcase):
+    if testcase.find("error") is not None:
+        return "error"
+    if testcase.find("failure") is not None:
+        return "failed"
+    if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
+        return "skipped"
+    return "passed"
+
+
+def merge_status(current, new):
+    severity = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
+    return new if severity.get(new, 0) > severity.get(current, 0) else current
+
+
+def int_attr(node, name):
+    try:
+        return int(float(node.get(name, 0) or 0))
+    except Exception:
+        return 0
+
+
+root = Path(project_dir)
+# pytest --junitxml reports live OUTSIDE the project dir; scan that root too.
+pytest_reports = Path(pytest_reports_dir)
+scan_roots = [root] + ([pytest_reports] if pytest_reports.is_dir() else [])
+report_files = sorted(
+    {str(path) for scan_root in scan_roots for path in scan_root.rglob("*.xml") if is_report_file(path)}
+)
+report_dirs = sorted({str(Path(path).parent) for path in report_files})
+
+groovy_classes = set()
+for groovy in root.rglob("src/test/groovy/**/*.groovy"):
+    try:
+        text = groovy.read_text(errors="ignore")
+    except Exception:
+        continue
+    if "@Test" in text:
+        groovy_classes.add(groovy.stem)
+
+unique = {}
+parsing_errors = []
+
+
+def parse_report(report_file):
+    """Return (testcase tuples, None), (None, suite-attr counts) or None."""
+    try:
+        tree = ET.parse(report_file)
+        xml_root = tree.getroot()
+    except Exception as exc:
+        parsing_errors.append(f"Error parsing {report_file}: {exc}")
+        return None
+    testcases = list(xml_root.iter("testcase"))
+    if testcases:
+        cases = []
+        for testcase in testcases:
+            classname = (testcase.get("classname") or "").strip()
+            simple_classname = classname.split(".")[-1] if classname else ""
+            if simple_classname in groovy_classes:
+                continue
+            cases.append(
+                (
+                    classname,
+                    testcase.get("name"),
+                    testcase.get("file") or report_file,
+                    testcase_status(testcase),
+                )
+            )
+        return (cases, None)
+    counts = {"total": 0, "failed": 0, "error": 0, "skipped": 0}
+    suites = [xml_root] if xml_root.tag == "testsuite" else list(xml_root.iter("testsuite"))
+    for suite in suites:
+        counts["total"] += int_attr(suite, "tests")
+        counts["failed"] += int_attr(suite, "failures")
+        counts["error"] += int_attr(suite, "errors")
+        counts["skipped"] += int_attr(suite, "skipped")
+    return (None, counts)
+
+
+def bump(counts, status):
+    counts["total"] += 1
+    if status == "error":
+        counts["error"] += 1
+    elif status == "failed":
+        counts["failed"] += 1
+    elif status == "skipped":
+        counts["skipped"] += 1
+    else:
+        counts["passed"] += 1
+
+
+def add_suite_counts(counts, suite_counts):
+    counts["total"] += suite_counts["total"]
+    counts["failed"] += suite_counts["failed"]
+    counts["error"] += suite_counts["error"]
+    counts["skipped"] += suite_counts["skipped"]
+    counts["passed"] += max(
+        0,
+        suite_counts["total"]
+        - suite_counts["failed"]
+        - suite_counts["error"]
+        - suite_counts["skipped"],
+    )
+
+
+# Maven/Gradle: raw accumulation, severity-merged unique statuses (unchanged).
+jvm = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for report_file in (p for p in report_files if not is_pytest_report(p)):
+    parsed = parse_report(report_file)
+    if parsed is None:
+        continue
+    cases, suite_counts = parsed
+    if cases is None:
+        add_suite_counts(jvm, suite_counts)
+        continue
+    for classname, name, file_attr, status in cases:
+        bump(jvm, status)
+        key = normalize_key(classname, name, file_attr)
+        if key:
+            unique[key] = merge_status(unique[key], status) if key in unique else status
+
+
+def pytest_run_order(path):
+    # Prefer the epoch python_tool embeds in the filename; mtime is the fallback.
+    match = re.search(r"pytest-(\\d+)\\.xml$", path)
+    if match:
+        return (0, int(match.group(1)), path)
+    try:
+        return (0, int(os.path.getmtime(path)), path)
+    except OSError:
+        return (1, 0, path)
+
+
+# pytest: per-test aggregation across invocations, LATEST invocation wins.
+pytest_raw = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+pytest_suites_only = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+pytest_union = {}
+for report_file in sorted((p for p in report_files if is_pytest_report(p)), key=pytest_run_order):
+    parsed = parse_report(report_file)
+    if parsed is None:
+        continue
+    cases, suite_counts = parsed
+    if cases is None:
+        add_suite_counts(pytest_raw, suite_counts)
+        add_suite_counts(pytest_suites_only, suite_counts)
+        continue
+    file_units = {}
+    file_methods = {}
+    for classname, name, file_attr, status in cases:
+        bump(pytest_raw, status)
+        key = normalize_key(classname, name, file_attr)
+        if not key:
+            continue
+        # Execution id keeps the [param] suffix: parameterized invocations stay
+        # distinct so executed totals stay comparable to the collect-only count.
+        unit = key + (name[name.index("["):] if name and "[" in name else "")
+        file_units[unit] = merge_status(file_units[unit], status) if unit in file_units else status
+        file_methods[key] = merge_status(file_methods[key], status) if key in file_methods else status
+    # LATEST invocation wins for the tests it re-ran; everything else persists.
+    pytest_union.update(file_units)
+    unique.update(file_methods)
+
+union_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for status in pytest_union.values():
+    union_counts[status] = union_counts.get(status, 0) + 1
+
+raw = {key: jvm[key] + pytest_raw[key] for key in jvm}
+total_tests = jvm["total"] + len(pytest_union) + pytest_suites_only["total"]
+passed_tests = jvm["passed"] + union_counts["passed"] + pytest_suites_only["passed"]
+failed_tests = jvm["failed"] + union_counts["failed"] + pytest_suites_only["failed"]
+error_tests = jvm["error"] + union_counts["error"] + pytest_suites_only["error"]
+skipped_tests = jvm["skipped"] + union_counts["skipped"] + pytest_suites_only["skipped"]
+
+unique_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
+for status in unique.values():
+    unique_counts[status] = unique_counts.get(status, 0) + 1
+
+result = {
+    "valid": bool(report_files),
+    "total_tests": total_tests,
+    "passed_tests": passed_tests,
+    "failed_tests": failed_tests,
+    "error_tests": error_tests,
+    "skipped_tests": skipped_tests,
+    "raw_total_tests": raw["total"],
+    "raw_passed_tests": raw["passed"],
+    "raw_failed_tests": raw["failed"],
+    "raw_error_tests": raw["error"],
+    "raw_skipped_tests": raw["skipped"],
+    "unique_tests": len(unique),
+    "unique_passed_tests": unique_counts.get("passed", 0),
+    "unique_failed_tests": unique_counts.get("failed", 0),
+    "unique_error_tests": unique_counts.get("error", 0),
+    "unique_skipped_tests": unique_counts.get("skipped", 0),
+    "test_success": total_tests > 0 and failed_tests == 0 and error_tests == 0,
+    "failing_test_names": sorted(
+        key for key, status in unique.items() if status in ("failed", "error")
+    )[:50],
+    "report_files": report_files[:200],
+    "report_file_count": len(report_files),
+    "report_dirs": report_dirs,
+    "parsing_errors": parsing_errors[:50],
+}
+print(json.dumps(result, separators=(",", ":")))
+'''
+
+
 def evaluate_run_verdict(
     build_green: bool,
     pass_rate: float,
@@ -1092,169 +1363,16 @@ class PhysicalValidator:
         validator does ``find`` followed by ``cat``. This parser keeps all XML
         reading local to the container and only returns aggregate metrics.
         """
-        project_dir_json = json.dumps(project_dir)
-        command = f"""python3 - <<'PY'
-# SAG_COMPACT_TEST_REPORT_PARSER
-import json
-import os
-import re
-import xml.etree.ElementTree as ET
-from pathlib import Path
+        from sag.tools.internal.python_tool import PYTEST_REPORT_DIR
 
-project_dir = {project_dir_json}
-
-def is_report_file(path):
-    s = str(path)
-    if not path.name.endswith(".xml"):
-        return False
-    return (
-        "/target/surefire-reports/" in s
-        or "/target/failsafe-reports/" in s
-        or "/build/test-results/" in s
-        or "/.setup_agent/pytest-reports/" in s
-    )
-
-def normalize_method_name(method_name):
-    if not method_name:
-        return ""
-    name = method_name.strip()
-    if "[" in name:
-        name = name.split("[")[0]
-    if "(" in name:
-        name = name.split("(")[0]
-    if " #" in name:
-        name = name.split(" #")[0]
-    return name.strip()
-
-def normalize_key(classname, name, file_path=None):
-    method_name = normalize_method_name(name)
-    if not method_name:
-        return None
-    if classname:
-        classname = classname.replace("$", ".").strip()
-    elif file_path:
-        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "").strip(".")
-    else:
-        return method_name
-    return f"{{classname}}::{{method_name}}"
-
-def testcase_status(testcase):
-    if testcase.find("error") is not None:
-        return "error"
-    if testcase.find("failure") is not None:
-        return "failed"
-    if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
-        return "skipped"
-    return "passed"
-
-def merge_status(current, new):
-    severity = {{"passed": 0, "skipped": 1, "failed": 2, "error": 3}}
-    return new if severity.get(new, 0) > severity.get(current, 0) else current
-
-def int_attr(node, name):
-    try:
-        return int(float(node.get(name, 0) or 0))
-    except Exception:
-        return 0
-
-root = Path(project_dir)
-# pytest --junitxml reports live OUTSIDE the project dir; scan that root too.
-pytest_reports = Path("/workspace/.setup_agent/pytest-reports")
-scan_roots = [root] + ([pytest_reports] if pytest_reports.is_dir() else [])
-report_files = sorted(
-    {{str(path) for scan_root in scan_roots for path in scan_root.rglob("*.xml") if is_report_file(path)}}
-)
-report_dirs = sorted({{str(Path(path).parent) for path in report_files}})
-
-groovy_classes = set()
-for groovy in root.rglob("src/test/groovy/**/*.groovy"):
-    try:
-        text = groovy.read_text(errors="ignore")
-    except Exception:
-        continue
-    if "@Test" in text:
-        groovy_classes.add(groovy.stem)
-
-raw = {{"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}}
-unique = {{}}
-parsing_errors = []
-
-for report_file in report_files:
-    try:
-        tree = ET.parse(report_file)
-        xml_root = tree.getroot()
-    except Exception as exc:
-        parsing_errors.append(f"Error parsing {{report_file}}: {{exc}}")
-        continue
-
-    testcases = list(xml_root.iter("testcase"))
-    if testcases:
-        for testcase in testcases:
-            classname = (testcase.get("classname") or "").strip()
-            simple_classname = classname.split(".")[-1] if classname else ""
-            if simple_classname in groovy_classes:
-                continue
-            status = testcase_status(testcase)
-            raw["total"] += 1
-            if status == "error":
-                raw["error"] += 1
-            elif status == "failed":
-                raw["failed"] += 1
-            elif status == "skipped":
-                raw["skipped"] += 1
-            else:
-                raw["passed"] += 1
-
-            file_attr = testcase.get("file") or report_file
-            key = normalize_key(classname, testcase.get("name"), file_attr)
-            if key:
-                unique[key] = merge_status(unique[key], status) if key in unique else status
-        continue
-
-    suites = [xml_root] if xml_root.tag == "testsuite" else list(xml_root.iter("testsuite"))
-    for suite in suites:
-        total = int_attr(suite, "tests")
-        failed = int_attr(suite, "failures")
-        error = int_attr(suite, "errors")
-        skipped = int_attr(suite, "skipped")
-        raw["total"] += total
-        raw["failed"] += failed
-        raw["error"] += error
-        raw["skipped"] += skipped
-        raw["passed"] += max(0, total - failed - error - skipped)
-
-unique_counts = {{"passed": 0, "failed": 0, "error": 0, "skipped": 0}}
-for status in unique.values():
-    unique_counts[status] = unique_counts.get(status, 0) + 1
-
-result = {{
-    "valid": bool(report_files),
-    "total_tests": raw["total"],
-    "passed_tests": raw["passed"],
-    "failed_tests": raw["failed"],
-    "error_tests": raw["error"],
-    "skipped_tests": raw["skipped"],
-    "raw_total_tests": raw["total"],
-    "raw_passed_tests": raw["passed"],
-    "raw_failed_tests": raw["failed"],
-    "raw_error_tests": raw["error"],
-    "raw_skipped_tests": raw["skipped"],
-    "unique_tests": len(unique),
-    "unique_passed_tests": unique_counts.get("passed", 0),
-    "unique_failed_tests": unique_counts.get("failed", 0),
-    "unique_error_tests": unique_counts.get("error", 0),
-    "unique_skipped_tests": unique_counts.get("skipped", 0),
-    "test_success": raw["total"] > 0 and raw["failed"] == 0 and raw["error"] == 0,
-    "failing_test_names": sorted(
-        key for key, status in unique.items() if status in ("failed", "error")
-    )[:50],
-    "report_files": report_files[:200],
-    "report_file_count": len(report_files),
-    "report_dirs": report_dirs,
-    "parsing_errors": parsing_errors[:50],
-}}
-print(json.dumps(result, separators=(",", ":")))
-PY"""
+        command = (
+            "python3 - <<'PY'\n"
+            "# SAG_COMPACT_TEST_REPORT_PARSER\n"
+            f"project_dir = {json.dumps(project_dir)}\n"
+            f"pytest_reports_dir = {json.dumps(PYTEST_REPORT_DIR)}\n"
+            f"{_COMPACT_REPORT_PARSER_BODY}\n"
+            "PY"
+        )
         result = self.docker_orchestrator.execute_command(command)
         if result.get("exit_code") != 0 or not result.get("output"):
             return None
@@ -2449,6 +2567,14 @@ PY"""
             or test_metrics.get("discovered_tests")
             or test_metrics.get("static_test_count")
         )
+        if not discovered:
+            # Python projects: the analyzer often never persists a
+            # static_test_count, so the runner metrics alone cannot tell a
+            # subset re-run from the full suite (live 2026-07-10 requests run:
+            # 0/8 scored as the whole suite). Reuse python_tool's pytest
+            # --collect-only denominator so test_stats.discovered and the
+            # execution-coverage gate see the real suite size.
+            discovered = self._python_collected_count(project_name)
         has_test_count_evidence = test_metrics.get("valid", False) or any(
             key in test_metrics and test_metrics.get(key) is not None
             for key in (
@@ -2520,6 +2646,10 @@ PY"""
             "parsing_errors": test_metrics.get("parsing_errors", []),
             "evidence_status": evidence_status,
             "test_stats": test_stats,
+            # The discovered-suite denominator (analyzer count or the pytest
+            # collect-only fallback) — consumers like the report snapshot's
+            # execution-coverage gate read this even when test_stats is None.
+            "static_test_count": discovered,
             "conflicts": list(dict.fromkeys(conflicts)),
             "evidence_refs": list(report_files) or [project_dir],
         }
@@ -2652,6 +2782,26 @@ PY"""
         """
         if result.get("has_static_test_count"):
             return result
+        collected = self._python_collected_count(project_name)
+        if collected is not None:
+            result["has_static_test_count"] = True
+            result["static_test_count"] = collected
+            result["static_test_count_source"] = "pytest_collect_only"
+            logger.info(
+                f"✅ static_test_count fallback: {collected} tests from "
+                f"pytest --collect-only (COLLECTED_JSON)"
+            )
+        return result
+
+    def _python_collected_count(self, project_name: Optional[str]) -> Optional[int]:
+        """python_tool's `pytest --collect-only` denominator, python-only.
+
+        Returns the collected-test count from COLLECTED_JSON when the build
+        system is python; None otherwise (maven/gradle semantics untouched).
+        Shared by validate_project_analysis_status AND validate_test_status so
+        the two denominators can never diverge again (live 2026-07-10:
+        test_stats.discovered was None while the analysis fallback had 635).
+        """
         try:
             from sag.tools.internal.python_tool import COLLECTED_JSON
 
@@ -2659,24 +2809,17 @@ PY"""
                 f"{self.project_path}/{project_name}" if project_name else self.project_path
             )
             if self._detect_build_system(project_dir) != "python":
-                return result
+                return None
             read = self._execute_command_with_logging(
                 f"cat {COLLECTED_JSON}", "reading pytest collect-only denominator"
             )
             if not read["success"] or not (read.get("output") or "").strip():
-                return result
+                return None
             collected = json.loads(read["output"]).get("collected")
-            if isinstance(collected, int):
-                result["has_static_test_count"] = True
-                result["static_test_count"] = collected
-                result["static_test_count_source"] = "pytest_collect_only"
-                logger.info(
-                    f"✅ static_test_count fallback: {collected} tests from "
-                    f"pytest --collect-only (COLLECTED_JSON)"
-                )
+            return collected if isinstance(collected, int) else None
         except Exception as exc:
             logger.debug(f"pytest collected fallback skipped: {exc}")
-        return result
+            return None
 
     def parse_test_reports_with_catalog(
         self, project_dir: str, test_catalog: Optional[TestCaseCatalog] = None

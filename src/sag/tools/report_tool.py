@@ -1384,6 +1384,32 @@ class ReportTool(BaseTool, UIEventEmitter):
                     except Exception as exc:
                         logger.debug(f"Could not persist backfilled static_test_count: {exc}")
 
+        # Python fallback: there is no Java catalog to backfill from, but
+        # validate_test_status already carries the pytest --collect-only
+        # denominator (test_stats.discovered / static_test_count). Feed it to
+        # the SAME static_test_count the execution-coverage gate below reads so
+        # a diagnostic subset re-run can never masquerade as the whole suite
+        # (live 2026-07-10 requests run: 8 executed of 635 collected).
+        if not static_test_count:
+            test_status_pv = physical_validation.get("test_status", {}) or {}
+            fallback_discovered = to_int(
+                (test_status_pv.get("test_stats") or {}).get("discovered")
+            ) or to_int(test_status_pv.get("static_test_count"))
+            if fallback_discovered:
+                static_test_count = fallback_discovered
+                logger.info(
+                    "📊 Backfilled static test count from pytest collect-only "
+                    f"denominator: {fallback_discovered}"
+                )
+                if trunk_context is not None and self.context_manager:
+                    try:
+                        trunk_context.environment_summary["static_test_count"] = (
+                            fallback_discovered
+                        )
+                        self.context_manager._save_trunk_context(trunk_context)
+                    except Exception as exc:
+                        logger.debug(f"Could not persist backfilled static_test_count: {exc}")
+
         tests_total = test_analysis.get("total_tests")
         tests_failed = test_analysis.get("failed_tests")
         tests_error = test_analysis.get("error_tests")
