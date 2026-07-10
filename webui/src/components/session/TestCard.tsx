@@ -1,6 +1,7 @@
 import type { TestSummary } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
+import { Tooltip } from "@/components/ui/tooltip"
 
 // Method coverage = executed / declared methods. Only a valid coverage figure
 // when the static catalog is a complete denominator (rate in (0, 100]); a rate
@@ -93,14 +94,16 @@ export function TestCard({
       ) : null}
 
       {onOpenDetail ? (
-        <button
-          aria-label="Open test details"
-          className="mt-3 inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
-          onClick={onOpenDetail}
-          type="button"
-        >
-          Details <span aria-hidden>→</span>
-        </button>
+        <Tooltip className="mt-3" label="Open the full test breakdown">
+          <button
+            aria-label="Open test details"
+            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+            onClick={onOpenDetail}
+            type="button"
+          >
+            Details <span aria-hidden>→</span>
+          </button>
+        </Tooltip>
       ) : null}
     </Card>
   )

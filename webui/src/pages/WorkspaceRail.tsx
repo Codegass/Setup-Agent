@@ -14,6 +14,7 @@ import {
   DeleteWorkspaceDialog,
   type DeleteWorkspaceTarget,
 } from "@/components/workspace/DeleteWorkspaceDialog"
+import { Tooltip } from "@/components/ui/tooltip"
 import { formatAgo } from "@/lib/relativeTime"
 import { cn } from "@/lib/utils"
 
@@ -173,16 +174,18 @@ function PendingRailRow({
       <span className="flex shrink-0 items-center gap-1.5">
         <StatusBadge status={item.status} />
         {failed ? (
-          <button
-            aria-label={`Remove failed launch ${project}`}
-            className="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
-            onClick={() =>
-              onRemove({ workspaceId: item.workspace_id, label: project, kind: "launch" })
-            }
-            type="button"
-          >
-            <Trash2 size={14} />
-          </button>
+          <Tooltip label="Remove this failed launch from the list">
+            <button
+              aria-label={`Remove failed launch ${project}`}
+              className="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+              onClick={() =>
+                onRemove({ workspaceId: item.workspace_id, label: project, kind: "launch" })
+              }
+              type="button"
+            >
+              <Trash2 size={14} />
+            </button>
+          </Tooltip>
         ) : null}
       </span>
     </div>
@@ -287,13 +290,15 @@ export function WorkspaceRail({
             </div>
           </div>
         </div>
-        <button
-          className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-slate-900 px-3 py-2 text-[12.5px] font-medium text-white hover:bg-slate-800"
-          onClick={onLaunchSetups}
-          type="button"
-        >
-          <Rocket size={14} /> Launch setups
-        </button>
+        <Tooltip className="mt-3 w-full" label="Queue project setups from a list of repo URLs" side="bottom">
+          <button
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-slate-900 px-3 py-2 text-[12.5px] font-medium text-white hover:bg-slate-800"
+            onClick={onLaunchSetups}
+            type="button"
+          >
+            <Rocket size={14} /> Launch setups
+          </button>
+        </Tooltip>
         <div className="mt-3 flex gap-2">
           <Chip label="Workspaces" value={data.workspaces.length} />
           <Chip label="Running" value={running} tone="blue" />
@@ -311,13 +316,15 @@ export function WorkspaceRail({
         </div>
         {onDeleteMany && data.workspaces.length ? (
           <div className="mt-2 flex justify-end">
-            <button
-              className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500 hover:text-slate-700"
-              onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
-              type="button"
-            >
-              {selectMode ? "Cancel" : "Select"}
-            </button>
+            <Tooltip label={selectMode ? "Exit multi-select mode" : "Select multiple workspaces to delete"}>
+              <button
+                className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500 hover:text-slate-700"
+                onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+                type="button"
+              >
+                {selectMode ? "Cancel" : "Select"}
+              </button>
+            </Tooltip>
           </div>
         ) : null}
       </div>
@@ -363,14 +370,16 @@ export function WorkspaceRail({
 
       {selectMode ? (
         <div className="flex items-center gap-2 border-t border-slate-200 bg-white px-4 py-2">
-          <button
-            className="flex-1 rounded-md bg-status-failed px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-40"
-            disabled={picked.size === 0}
-            onClick={() => setBatchConfirm(true)}
-            type="button"
-          >
-            Delete {picked.size} selected
-          </button>
+          <Tooltip className="flex-1" label="Delete the checked workspaces and their containers">
+            <button
+              className="w-full rounded-md bg-status-failed px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-40"
+              disabled={picked.size === 0}
+              onClick={() => setBatchConfirm(true)}
+              type="button"
+            >
+              Delete {picked.size} selected
+            </button>
+          </Tooltip>
           <button
             className="rounded-md border border-slate-200 px-3 py-1.5 text-[12px] text-slate-600 hover:bg-slate-50"
             onClick={exitSelectMode}

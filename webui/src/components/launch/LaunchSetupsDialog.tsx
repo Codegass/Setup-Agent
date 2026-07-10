@@ -388,8 +388,12 @@ function RowCells({
           type="checkbox"
         />
       </div>
+      {/* Native title (not <Tooltip>): this dialog's own version-help tooltip is
+          asserted with getByRole("tooltip") in its test; a second role=tooltip
+          in the tree would break that query. */}
       <button
         aria-label={`Remove row ${rowLabel}`}
+        title="Remove this row"
         className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:opacity-40"
         onClick={onRemove}
         type="button"

@@ -18,6 +18,8 @@ import type {
 } from "@/api/types"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
+import { SummaryStrip } from "@/components/SummaryStrip"
+import { Tooltip } from "@/components/ui/tooltip"
 import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
 import { RailSkeleton } from "@/pages/RailSkeleton"
 import { WorkspaceRail } from "@/pages/WorkspaceRail"
@@ -301,20 +303,24 @@ export function App() {
       <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
         {/* Mobile top bar: opens the workspace rail drawer (hidden at lg+). */}
         <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-2 lg:hidden">
-          <button
-            aria-controls="workspace-rail"
-            aria-expanded={railOpen}
-            aria-label="Workspaces menu"
-            className="rounded-md border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={() => setRailOpen((value) => !value)}
-            type="button"
-          >
-            <Menu size={16} />
-          </button>
+          <Tooltip label="Open the workspaces list" side="bottom">
+            <button
+              aria-controls="workspace-rail"
+              aria-expanded={railOpen}
+              aria-label="Workspaces menu"
+              className="rounded-md border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+              onClick={() => setRailOpen((value) => !value)}
+              type="button"
+            >
+              <Menu size={16} />
+            </button>
+          </Tooltip>
           <span className="truncate font-mono text-[12px] font-semibold text-slate-700">
             {selectedWorkspace ? selectedWorkspace.project : "SAG Workbench"}
           </span>
         </div>
+
+        {dashboard ? <SummaryStrip workspaces={dashboard.workspaces} /> : null}
 
         <div className="min-h-0 flex-1 overflow-hidden">
         {!dashboard && !loading && dashboardError ? (

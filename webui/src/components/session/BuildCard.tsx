@@ -3,6 +3,7 @@ import { Box, Check, X } from "lucide-react"
 import type { BuildSummary } from "@/api/types"
 import { StatusBadge } from "@/components/common/Badge"
 import { Card } from "@/components/common/Card"
+import { Tooltip } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
 function normalized(status: string): string {
@@ -59,14 +60,16 @@ export function BuildCard({
       ) : null}
 
       {onOpenDetail ? (
-        <button
-          aria-label="Open build details"
-          className="mt-3 inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
-          onClick={onOpenDetail}
-          type="button"
-        >
-          Details <span aria-hidden>→</span>
-        </button>
+        <Tooltip className="mt-3" label="Open the full build breakdown">
+          <button
+            aria-label="Open build details"
+            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+            onClick={onOpenDetail}
+            type="button"
+          >
+            Details <span aria-hidden>→</span>
+          </button>
+        </Tooltip>
       ) : null}
     </Card>
   )

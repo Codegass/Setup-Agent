@@ -4,26 +4,31 @@ import { useEffect, useRef, useState } from "react"
 
 import type { ExecutionSessionDetail, WorkspaceSummary } from "@/api/types"
 import { statusMeta } from "@/components/common/status"
+import { Tooltip } from "@/components/ui/tooltip"
 import { cn } from "@/lib/utils"
 
 function SecondaryButton({
   icon: Icon,
   label,
+  hint,
   onClick,
 }: {
   icon: LucideIcon
   label: string
+  hint: string
   onClick?: () => void
 }) {
   return (
-    <button
-      className="inline-flex h-[34px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-700 hover:bg-slate-50"
-      onClick={onClick}
-      type="button"
-    >
-      <Icon size={14} />
-      <span className="hidden sm:inline">{label}</span>
-    </button>
+    <Tooltip label={hint} side="bottom">
+      <button
+        className="inline-flex h-[34px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-700 hover:bg-slate-50"
+        onClick={onClick}
+        type="button"
+      >
+        <Icon size={14} />
+        <span className="hidden sm:inline">{label}</span>
+      </button>
+    </Tooltip>
   )
 }
 
@@ -102,28 +107,32 @@ export function DetailHeader({
         </div>
 
         <div className="flex shrink-0 items-center gap-2">
-          <button
-            className="inline-flex h-[34px] items-center gap-1.5 rounded-lg bg-primary px-3.5 text-[13px] font-semibold text-white hover:opacity-90"
-            onClick={onNewTask}
-            type="button"
-          >
-            <Plus size={14} />
-            <span className="hidden sm:inline">New task</span>
-          </button>
-          <SecondaryButton icon={Terminal} label="Terminal" onClick={onTerminal} />
-          <SecondaryButton icon={SettingsIcon} label="Settings" onClick={onSettings} />
-
-          <div className="relative" ref={menuRef}>
+          <Tooltip label="Run a new task in this workspace" side="bottom">
             <button
-              aria-haspopup="menu"
-              aria-expanded={menuOpen}
-              aria-label="More"
-              className="inline-flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
-              onClick={() => setMenuOpen((open) => !open)}
+              className="inline-flex h-[34px] items-center gap-1.5 rounded-lg bg-primary px-3.5 text-[13px] font-semibold text-white hover:opacity-90"
+              onClick={onNewTask}
               type="button"
             >
-              <MoreHorizontal size={16} />
+              <Plus size={14} />
+              <span className="hidden sm:inline">New task</span>
             </button>
+          </Tooltip>
+          <SecondaryButton icon={Terminal} label="Terminal" hint="Open a terminal in this container" onClick={onTerminal} />
+          <SecondaryButton icon={SettingsIcon} label="Settings" hint="View workspace settings" onClick={onSettings} />
+
+          <div className="relative" ref={menuRef}>
+            <Tooltip label="More actions (sessions, delete)" side="bottom">
+              <button
+                aria-haspopup="menu"
+                aria-expanded={menuOpen}
+                aria-label="More"
+                className="inline-flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                onClick={() => setMenuOpen((open) => !open)}
+                type="button"
+              >
+                <MoreHorizontal size={16} />
+              </button>
+            </Tooltip>
 
             {menuOpen ? (
               <div
