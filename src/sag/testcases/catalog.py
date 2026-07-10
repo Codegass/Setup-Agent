@@ -22,28 +22,78 @@ from loguru import logger
 # 32927 "static tests detected" while pytest collected 1927, capping a 98.7%
 # run at PARTIAL). Java projects never carried an env dir inside the repo, so
 # the historical set only knew VCS/IDE/build-output dirs.
+#
+# ONLY unambiguous names belong here: this set is matched against BARE
+# directory names at any depth. Bare 'env'/'venv' are real java names (Spring
+# ships an org.springframework.core.env test package; modules get named
+# env/), so they live in STATIC_SCAN_VENV_DIR_NAMES below and are pruned only
+# on a virtualenv signature. Bare 'dist' is likewise a plausible module
+# segment and python dist/ dirs hold archives, not loose test sources, so it
+# is not excluded at all.
 STATIC_SCAN_EXCLUDED_DIR_NAMES = (
-    # environment / vendor dirs
+    # unambiguous environment / vendor dirs
     ".venv",
-    "venv",
-    "env",
     "site-packages",
     "node_modules",
     ".git",
     ".tox",
     ".nox",
     "__pycache__",
-    "build",
-    "dist",
     ".eggs",
     # VCS/IDE/build-output dirs the java scans always pruned
     ".svn",
     ".idea",
     ".vscode",
     "target",
+    "build",
     "out",
     "tmp",
 )
+
+# Ambiguous names: pruned ONLY when the directory carries a virtualenv
+# signature (pyvenv.cfg, bin/activate, Scripts/activate[.bat], conda-meta).
+# A bare-name match here hid REAL project tests — e.g. a
+# src/test/java/com/example/env/ package or a module literally named env/.
+STATIC_SCAN_VENV_DIR_NAMES = (
+    "env",
+    "venv",
+)
+
+# Shared exclusion helper injected verbatim into every embedded scan script
+# (they run inside the container via `python3 - <<'PY'`, with the project
+# root as cwd and `from pathlib import Path` already imported). Keeping ONE
+# definition guarantees the catalog scan and the annotation counter prune
+# identically.
+STATIC_SCAN_EXCLUSION_HELPER = f"""
+EXCLUDED_DIR_NAMES = set({sorted(STATIC_SCAN_EXCLUDED_DIR_NAMES)!r})
+VENV_DIR_NAMES = set({sorted(STATIC_SCAN_VENV_DIR_NAMES)!r})
+_VENV_SIGNATURE_CACHE = {{}}
+
+
+def _has_venv_signature(prefix_parts):
+    cached = _VENV_SIGNATURE_CACHE.get(prefix_parts)
+    if cached is None:
+        d = Path(*prefix_parts)
+        cached = (
+            (d / 'pyvenv.cfg').is_file()
+            or (d / 'bin' / 'activate').is_file()
+            or (d / 'Scripts' / 'activate').is_file()
+            or (d / 'Scripts' / 'activate.bat').is_file()
+            or (d / 'conda-meta').is_dir()
+        )
+        _VENV_SIGNATURE_CACHE[prefix_parts] = cached
+    return cached
+
+
+def is_excluded(path):
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part in EXCLUDED_DIR_NAMES:
+            return True
+        if part in VENV_DIR_NAMES and _has_venv_signature(parts[:i + 1]):
+            return True
+    return False
+"""
 
 
 @dataclass
@@ -288,7 +338,7 @@ import json
 import re
 from pathlib import Path
 
-EXCLUDED_DIR_NAMES = set({sorted(STATIC_SCAN_EXCLUDED_DIR_NAMES)!r})
+{STATIC_SCAN_EXCLUSION_HELPER}
 
 def extract_package(content):
     match = re.search(r'^package\\s+([a-zA-Z0-9_.]+);', content, re.MULTILINE)
@@ -347,9 +397,6 @@ def extract_test_methods(content):
             unique_methods.append(method)
 
     return unique_methods
-
-def is_excluded(path):
-    return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
 
 project_root = Path('.')
 test_cases = []

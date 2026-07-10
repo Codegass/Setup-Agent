@@ -9,9 +9,14 @@ executed) at PARTIAL: "only 1927/32927 detected tests executed".
 
 Two fixes under test here:
 
-FIX A — the static test scans prune environment/vendor dirs (.venv, venv, env,
-        site-packages, node_modules, .git, .tox, .nox, __pycache__, build,
-        dist, .eggs) at the scan level, never post-hoc.
+FIX A — the static test scans prune environment/vendor dirs at the scan
+        level, never post-hoc. Unambiguous names (.venv, site-packages,
+        node_modules, .git, .tox, .nox, __pycache__, .eggs) are pruned
+        unconditionally; bare 'env'/'venv' are REAL java names (Spring ships
+        an org.springframework.core.env test package, modules get named
+        env/), so those are pruned ONLY when the directory carries a
+        virtualenv signature (pyvenv.cfg, bin/activate, Scripts/activate,
+        conda-meta).
 FIX B — on python projects the pytest --collect-only count (COLLECTED_JSON,
         ground truth from the actual runner) takes PRIORITY over any static
         heuristic; the static count remains the fallback when no collected
@@ -109,6 +114,9 @@ def _make_click_shaped_tree(tmp_path, project_files=12, vendored_files=60):
         (extra / "ExtraTest.java").write_text(
             _java_test_class("com.extra", "ExtraTest", ["testExtra"])
         )
+    # `venv` is only pruned on a virtualenv SIGNATURE (a bare name is a real
+    # java module/package candidate); a planted env always carries one.
+    (project / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
 
     return project
 
@@ -135,6 +143,132 @@ def test_annotation_counter_prunes_env_dirs(tmp_path):
 
     assert counts is not None
     assert counts["Test"] == 12  # 12 own tests; 300+ vendored ones pruned
+
+
+# ===========================================================================
+# REJECT (b): bare 'env'/'venv' are REAL java names — the scan must keep them
+# unless the directory carries a virtualenv signature.
+# ===========================================================================
+def _make_env_named_java_tree(tmp_path):
+    """Reviewer repro: 'env' as a java package segment (a real convention —
+    Spring's org.springframework.core.env test package) AND 'env' as a module
+    name with its own src/test/java. Neither is a virtualenv."""
+    project = tmp_path / "envproj"
+
+    plain = project / "src" / "test" / "java" / "com" / "example"
+    plain.mkdir(parents=True)
+    (plain / "PlainTest.java").write_text(
+        _java_test_class("com.example", "PlainTest", ["testPlain"])
+    )
+
+    # 1) java package segment named 'env'
+    env_pkg = plain / "env"
+    env_pkg.mkdir()
+    (env_pkg / "EnvConfigTest.java").write_text(
+        _java_test_class("com.example.env", "EnvConfigTest", ["testEnvConfig"])
+    )
+
+    # 2) module literally named 'env' containing src/test/java
+    env_mod = project / "env" / "src" / "test" / "java" / "com" / "example" / "mod"
+    env_mod.mkdir(parents=True)
+    (env_mod / "EnvModuleTest.java").write_text(
+        _java_test_class("com.example.mod", "EnvModuleTest", ["testEnvModule"])
+    )
+
+    return project
+
+
+def test_catalog_keeps_env_package_and_env_module_tests(tmp_path):
+    """All 3 real tests must land in the catalog (the catalog feeds
+    parse_test_reports_with_catalog's unexecuted-test matching, so a pruned
+    real test gets misreported as nonexistent)."""
+    project = _make_env_named_java_tree(tmp_path)
+
+    catalog = build_java_test_catalog(str(project), LocalShellOrch())
+
+    assert catalog.count() == 3
+    files = {d.file_path for d in catalog.get_all().values()}
+    assert "src/test/java/com/example/env/EnvConfigTest.java" in files
+    assert "env/src/test/java/com/example/mod/EnvModuleTest.java" in files
+
+
+def test_annotation_counter_keeps_env_package_and_env_module_tests(tmp_path):
+    project = _make_env_named_java_tree(tmp_path)
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=LocalShellOrch())
+
+    counts = analyzer._get_java_test_annotation_counts(str(project))
+
+    assert counts is not None
+    assert counts["Test"] == 3
+
+
+def test_env_dir_with_virtualenv_signature_is_pruned(tmp_path):
+    """A dir literally named env/ that IS a virtualenv (pyvenv.cfg) must stay
+    pruned — that is the click-run pollution the exclusion exists for."""
+    project = tmp_path / "sigproj"
+    own = project / "src" / "test" / "java" / "com" / "example"
+    own.mkdir(parents=True)
+    (own / "OwnTest.java").write_text(
+        _java_test_class("com.example", "OwnTest", ["testOwn"])
+    )
+
+    planted = project / "env"
+    vendored = planted / "src" / "test" / "java" / "com" / "vendor"
+    vendored.mkdir(parents=True)
+    (vendored / "VendorTest.java").write_text(
+        _java_test_class("com.vendor", "VendorTest", ["testVendor"])
+    )
+    (planted / "pyvenv.cfg").write_text("home = /usr/bin\n")
+
+    catalog = build_java_test_catalog(str(project), LocalShellOrch())
+    assert catalog.count() == 1
+    files = {d.file_path for d in catalog.get_all().values()}
+    assert not any(f.startswith("env/") for f in files)
+
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=LocalShellOrch())
+    counts = analyzer._get_java_test_annotation_counts(str(project))
+    assert counts is not None
+    assert counts["Test"] == 1
+
+
+def test_venv_dir_with_bin_activate_signature_is_pruned(tmp_path):
+    """Old-style virtualenvs may lack pyvenv.cfg; bin/activate is a
+    sufficient signature."""
+    project = tmp_path / "actproj"
+    own = project / "src" / "test" / "java" / "com" / "example"
+    own.mkdir(parents=True)
+    (own / "OwnTest.java").write_text(
+        _java_test_class("com.example", "OwnTest", ["testOwn"])
+    )
+
+    planted = project / "venv"
+    (planted / "bin").mkdir(parents=True)
+    (planted / "bin" / "activate").write_text("# activate\n")
+    vendored = planted / "src" / "test" / "java"
+    vendored.mkdir(parents=True)
+    (vendored / "VendorTest.java").write_text(
+        _java_test_class("com.vendor", "VendorTest", ["testVendor"])
+    )
+
+    catalog = build_java_test_catalog(str(project), LocalShellOrch())
+
+    assert catalog.count() == 1
+
+
+def test_dist_named_module_tests_are_kept(tmp_path):
+    """'dist' is NOT unconditionally excluded: it is a plausible java
+    package/module segment, and python dist/ dirs hold archives, not loose
+    test sources."""
+    project = tmp_path / "distproj"
+    mod = project / "dist" / "src" / "test" / "java" / "com" / "example"
+    mod.mkdir(parents=True)
+    (mod / "DistTest.java").write_text(
+        _java_test_class("com.example", "DistTest", ["testDist"])
+    )
+
+    catalog = build_java_test_catalog(str(project), LocalShellOrch())
+
+    assert catalog.count() == 1
 
 
 # ===========================================================================

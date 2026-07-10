@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.testcases.catalog import (
-    STATIC_SCAN_EXCLUDED_DIR_NAMES,
+    STATIC_SCAN_EXCLUSION_HELPER,
     TestCaseCatalog,
     build_java_test_catalog,
 )
@@ -934,7 +934,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-EXCLUDED_DIR_NAMES = set({sorted(STATIC_SCAN_EXCLUDED_DIR_NAMES)!r})
+{STATIC_SCAN_EXCLUSION_HELPER}
 
 ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
 
@@ -947,9 +947,6 @@ def strip_comments(source: str) -> str:
 
 counts = Counter()
 project_root = Path('.')
-
-def is_excluded(path: Path) -> bool:
-    return any(part in EXCLUDED_DIR_NAMES for part in path.parts)
 
 test_dirs = []
 for candidate in project_root.rglob('src'):
