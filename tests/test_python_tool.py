@@ -78,8 +78,8 @@ MANIFEST = {
     "python_venv": "/workspace/proj/.venv",
     "python_installer": "pip",
     "python_install_commands": [
-        "{venv}/bin/pip install -r requirements.txt",
-        "{venv}/bin/pip install -r requirements-dev.txt",
+        "{venv}/bin/python -m pip install -r requirements.txt",
+        "{venv}/bin/python -m pip install -r requirements-dev.txt",
     ],
     "python_packages": ["proj"],
     "test_hints": {"pytest_args": None, "test_deps": []},
@@ -98,11 +98,11 @@ def test_setup_env_runs_preflight_then_install_commands_in_ladder_order():
     preflight = next(i for i, c in enumerate(orch.commands) if "python3 --version" in c)
     first = next(
         i for i, c in enumerate(orch.commands)
-        if "/workspace/proj/.venv/bin/pip install -r requirements.txt" in c
+        if "/workspace/proj/.venv/bin/python -m pip install -r requirements.txt" in c
     )
     second = next(
         i for i, c in enumerate(orch.commands)
-        if "/workspace/proj/.venv/bin/pip install -r requirements-dev.txt" in c
+        if "/workspace/proj/.venv/bin/python -m pip install -r requirements-dev.txt" in c
     )
     # Pre-flight first, then the manifest commands in ladder order, with the
     # {venv} placeholder filled from the manifest venv.
@@ -142,7 +142,7 @@ def test_setup_env_poetry_failure_falls_back_to_pip_narrated_as_deviation():
     attempted = next(i for i, c in enumerate(orch.commands) if "poetry install" in c)
     fallback = next(
         i for i, c in enumerate(orch.commands)
-        if "/workspace/proj/.venv/bin/pip install -e ." in c
+        if "/workspace/proj/.venv/bin/python -m pip install -e ." in c
     )
     assert attempted < fallback  # the project's own tool was tried FIRST
     # The deviation is narrated in the observation — the generated setup docs
@@ -171,7 +171,7 @@ def test_version_shaped_install_failure_reprovisions_and_reruns_once(monkeypatch
         **MANIFEST,
         "python_version": None,
         "python_constraint": None,
-        "python_install_commands": ["{venv}/bin/pip install -e ."],
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
     }
     orch = Orch(
         manifest=manifest,
@@ -195,7 +195,7 @@ def test_version_retry_is_bounded_to_exactly_once(monkeypatch):
         **MANIFEST,
         "python_version": None,
         "python_constraint": None,
-        "python_install_commands": ["{venv}/bin/pip install -e ."],
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
     }
     orch = Orch(
         manifest=manifest,
@@ -283,7 +283,7 @@ def test_build_installs_build_into_the_venv_first():
     result = PythonTool(orch).execute("build", working_directory="/workspace/proj")
     installed = next(
         i for i, c in enumerate(orch.commands)
-        if "/workspace/proj/.venv/bin/pip install build" in c
+        if "/workspace/proj/.venv/bin/python -m pip install build" in c
     )
     built = next(i for i, c in enumerate(orch.commands) if "-m build --wheel" in c)
     assert installed < built

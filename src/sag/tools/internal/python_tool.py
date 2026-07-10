@@ -34,7 +34,8 @@ PYTEST_REPORT_DIR = "/workspace/.setup_agent/pytest-reports"
 COLLECTED_JSON = "/workspace/.setup_agent/pytest_collected.json"
 
 # The pip rung a failed poetry/pipenv install falls back to (narrated).
-_PIP_FALLBACK = "{venv}/bin/pip install -e ."
+# Module form (bug #12): plain uv venvs ship no {venv}/bin/pip binary.
+_PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
 
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
 _NO_TESTS_RE = re.compile(r"no tests collected|no tests ran")
@@ -265,7 +266,7 @@ class PythonTool(BaseTool):
         self, working_directory: str, args: Optional[str], timeout: int,
         requirements: Dict[str, Any], venv: str,
     ) -> ToolResult:
-        self._run(f"{venv}/bin/pip install build", working_directory, timeout)
+        self._run(f"{venv}/bin/python -m pip install build", working_directory, timeout)
         result = self._run(
             f"{venv}/bin/python -m build --wheel", working_directory, timeout
         )

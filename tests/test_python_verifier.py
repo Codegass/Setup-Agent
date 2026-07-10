@@ -23,7 +23,7 @@ def _manifest(**overrides):
         "python_version": "3.12",
         "python_constraint": ">=3.9",
         "python_installer": "pip",
-        "python_install_commands": ["{venv}/bin/pip install -e ."],
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
         "python_packages": ["foo"],
         "python_venv": "/workspace/proj/.venv",
         "has_c_extensions": False,
@@ -35,11 +35,12 @@ def _manifest(**overrides):
 class LadderOrch:
     """Scriptable python evidence-ladder container: flat-layout package foo."""
 
-    def __init__(self, *, venv=True, pip_clean=True, import_ok=True,
-                 py_count=10, pyc_count=10, so_present=False,
+    def __init__(self, *, venv=True, pip_clean=True, pip_output=None,
+                 import_ok=True, py_count=10, pyc_count=10, so_present=False,
                  manifest=None, active="3.12"):
         self.venv = venv
         self.pip_clean = pip_clean
+        self.pip_output = pip_output  # forces a FAILED pip check with this output
         self.import_ok = import_ok
         self.py_count = py_count
         self.pyc_count = pyc_count
@@ -74,6 +75,8 @@ class LadderOrch:
                 return res(True)
             return res(False)
         if "pip check" in c:
+            if self.pip_output is not None:
+                return res(False, self.pip_output)
             return res(
                 self.pip_clean,
                 "No broken requirements found." if self.pip_clean
@@ -137,6 +140,60 @@ def test_dirty_pip_check_is_partial():
     assert result["evidence_status"] == "partial"
     assert "pip check" in result["reason"]
     assert result["evidence"]["fingerprint_details"]["pip_check_clean"] is False
+
+
+def test_missing_pip_module_is_unverifiable_not_breakage():
+    """Bug #12 reproduction: plain `uv venv` seeds NO pip, so the pip-check
+    rung fails with 'No module named pip' — a MISSING TOOL, not dependency
+    breakage. The rung must go UNVERIFIABLE (pip_check_clean None) with a
+    visible skip warning and the honest PARTIAL reason 'pip check unverified'
+    — never the phantom 'pip check reported dependency breakage'."""
+    orch = LadderOrch(
+        pip_output="/workspace/proj/.venv/bin/python: No module named pip"
+    )
+    result = _validate(orch)
+    details = result["evidence"]["fingerprint_details"]
+    assert details["pip_check_clean"] is None  # UNVERIFIABLE, not False
+    assert result["success"] is True
+    assert result["build_complete"] is False  # bug-#9 semantics: never silent green
+    assert result["evidence_status"] == "partial"
+    assert "pip check unverified" in result["reason"]
+    assert "breakage" not in result["reason"]
+    assert any(
+        "pip check rung skipped: pip not present in venv" in w
+        for w in result["evidence"]["warnings"]
+    )
+
+
+def test_missing_python_binary_is_unverifiable_not_breakage():
+    """Same bug, other shell shape: the venv dir exists but its python binary
+    does not, so the shell reports 'No such file or directory' — also a
+    missing tool, never dependency breakage."""
+    orch = LadderOrch(
+        pip_output=(
+            "bash: /workspace/proj/.venv/bin/python: No such file or directory"
+        )
+    )
+    result = _validate(orch)
+    assert result["evidence"]["fingerprint_details"]["pip_check_clean"] is None
+    assert result["evidence_status"] == "partial"
+    assert "pip check unverified" in result["reason"]
+    assert any(
+        "pip check rung skipped: pip not present in venv" in w
+        for w in result["evidence"]["warnings"]
+    )
+
+
+def test_verifier_runs_pip_check_in_module_form():
+    """The rung must invoke '{venv}/bin/python -m pip check', never the
+    '{venv}/bin/pip' binary (which plain uv venvs do not ship)."""
+    orch = LadderOrch()
+    _validate(orch)
+    assert any(
+        c.strip() == "/workspace/proj/.venv/bin/python -m pip check"
+        for c in orch.commands
+    )
+    assert not any("/bin/pip " in c for c in orch.commands)
 
 
 def test_low_compileall_coverage_is_partial():

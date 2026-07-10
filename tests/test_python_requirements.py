@@ -66,7 +66,8 @@ def test_installer_ladder_pyproject_rung_tries_test_extra_then_plain():
     result = detect_installer({"pyproject.toml", "setup.py"})
     assert result["installer"] == "pip"
     assert result["commands"] == [
-        "{venv}/bin/pip install -e '.[test]' || {venv}/bin/pip install -e ."
+        "{venv}/bin/python -m pip install -e '.[test]' || "
+        "{venv}/bin/python -m pip install -e ."
     ]
     assert result["source"] == "pyproject.toml"
 
@@ -75,8 +76,8 @@ def test_installer_ladder_requirements_rung_orders_requirements_txt_first():
     result = detect_installer({"requirements-dev.txt", "requirements.txt", "setup.py"})
     assert result["installer"] == "pip"
     assert result["commands"] == [
-        "{venv}/bin/pip install -r requirements.txt",
-        "{venv}/bin/pip install -r requirements-dev.txt",
+        "{venv}/bin/python -m pip install -r requirements.txt",
+        "{venv}/bin/python -m pip install -r requirements-dev.txt",
     ]
     assert result["source"] == "requirements.txt"
 
@@ -84,8 +85,26 @@ def test_installer_ladder_requirements_rung_orders_requirements_txt_first():
 def test_installer_ladder_bare_setup_py_rung():
     result = detect_installer({"setup.py"})
     assert result["installer"] == "pip"
-    assert result["commands"] == ["{venv}/bin/pip install -e ."]
+    assert result["commands"] == ["{venv}/bin/python -m pip install -e ."]
     assert result["source"] == "setup.py"
+
+
+def test_installer_ladder_pip_rungs_are_module_form_only():
+    """Bug #12: a plain `uv venv` ships NO {venv}/bin/pip binary, so every
+    pip rung must be module-form ('{venv}/bin/python -m pip ...') — the module
+    invocation survives seeding differences. String-level guarantee over every
+    pip-rung shape; poetry/pipenv rungs stay the project's own tool."""
+    pip_rung_file_sets = [
+        {"pyproject.toml"},
+        {"requirements.txt", "requirements-dev.txt", "requirements-test.txt"},
+        {"setup.py"},
+    ]
+    for files in pip_rung_file_sets:
+        for command in detect_installer(files)["commands"]:
+            assert "{venv}/bin/pip" not in command, (files, command)
+            assert command.count("pip install") == command.count(
+                "{venv}/bin/python -m pip install"
+            ), (files, command)
 
 
 def test_installer_precedence_locks_beat_pyproject():
@@ -202,7 +221,8 @@ def test_analyzer_persists_python_manifest_keys(monkeypatch):
     assert captured["python_constraint"] == ">=3.9"
     assert captured["python_installer"] == "pip"
     assert captured["python_install_commands"] == [
-        "{venv}/bin/pip install -e '.[test]' || {venv}/bin/pip install -e ."
+        "{venv}/bin/python -m pip install -e '.[test]' || "
+        "{venv}/bin/python -m pip install -e ."
     ]
     assert captured["python_packages"] == ["foo"]
     assert captured["python_venv"].endswith("/.venv")
@@ -233,7 +253,7 @@ def test_analyzer_test_hints_are_metadata_only():
     assert config["test_hints"]["test_deps"] == ["pytest", "pytest-cov", "mock"]
     assert config["test_hints"]["pytest_args"] == "-q tests/"  # {posargs} stripped
     assert config["python_installer"] == "pip"                  # bare setup.py rung
-    assert config["python_install_commands"] == ["{venv}/bin/pip install -e ."]
+    assert config["python_install_commands"] == ["{venv}/bin/python -m pip install -e ."]
     assert config["python_packages"] == ["legacy"]
     # tox is READ-ONLY metadata (settled decision): never executed
     assert not any(c.strip().startswith(("tox", "nox")) for c in orch.commands)

@@ -26,7 +26,8 @@ class PyOrch:
 
     def __init__(self, python_output, uv_present=True, uv_install_ok=True,
                  uv_python_ok=True, uv_venv_ok=True, apt_ok=True,
-                 apt_venv_ok=True, manifest=None):
+                 apt_venv_ok=True, manifest=None, venv_pip_ok=True,
+                 ensurepip_ok=True):
         self.python_output = python_output
         self.uv_present = uv_present
         self.uv_install_ok = uv_install_ok
@@ -35,6 +36,8 @@ class PyOrch:
         self.apt_ok = apt_ok
         self.apt_venv_ok = apt_venv_ok
         self.manifest = manifest
+        self.venv_pip_ok = venv_pip_ok      # `python -m pip --version` probe
+        self.ensurepip_ok = ensurepip_ok    # `python -m ensurepip` repair
         self.commands = []
 
     def execute_command(self, cmd, workdir=None):
@@ -63,6 +66,13 @@ class PyOrch:
             return result(self.apt_ok)
         if "-m venv" in cmd:
             return result(self.apt_venv_ok)
+        if "-m pip --version" in cmd:
+            return result(self.venv_pip_ok, "pip 25.0" if self.venv_pip_ok else
+                          "No module named pip")
+        if "-m ensurepip" in cmd:
+            if self.ensurepip_ok:
+                self.venv_pip_ok = True  # the repair takes: re-probe succeeds
+            return result(self.ensurepip_ok)
         return result(True)
 
 
@@ -108,7 +118,12 @@ def test_mismatch_provisions_via_uv_and_narrates(monkeypatch):
     assert "uv-provisioned 3.11" in outcome.narration
     assert "/workspace/proj/.venv" in outcome.narration  # manifest venv, not a default
     assert any("uv python install 3.11" in c for c in orch.commands)
-    assert any("uv venv --python 3.11 /workspace/proj/.venv" in c for c in orch.commands)
+    # --seed: plain `uv venv` ships NO pip, which broke every later
+    # `python -m pip ...` rung (bug #12).
+    assert any(
+        "uv venv --seed --python 3.11 /workspace/proj/.venv" in c
+        for c in orch.commands
+    )
 
 
 def test_uv_unavailable_falls_back_to_apt(monkeypatch):
@@ -120,6 +135,8 @@ def test_uv_unavailable_falls_back_to_apt(monkeypatch):
     assert "apt-provisioned 3.11" in outcome.narration
     assert any("apt-get install" in c and "python3.11-venv" in c for c in orch.commands)
     assert any("python3.11 -m venv" in c for c in orch.commands)
+    # The apt path verifies pip inside the fresh venv too (bug #12).
+    assert any("-m pip --version" in c for c in orch.commands)
 
 
 def test_ladder_exhausted_degrades_to_mismatch_never_raises(monkeypatch):
@@ -129,6 +146,48 @@ def test_ladder_exhausted_degrades_to_mismatch_never_raises(monkeypatch):
     assert outcome.provisioned is False
     assert outcome.mismatch is True  # verifier maps this to python_version_mismatch
     assert "could not provision" in outcome.narration
+
+
+# ---------------------------------------------------------------------------
+# Venv pip guarantee (bug #12): seeded venvs are verified, pip-less venvs are
+# repaired with ensurepip, and a still-missing pip is narrated — never a block
+# ---------------------------------------------------------------------------
+
+
+def test_provisioned_venv_pip_is_verified_no_repair_when_present(monkeypatch):
+    orch = PyOrch("Python 3.8.10", venv_pip_ok=True)
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    outcome = PythonPreflight(orch).run("3.11", source="requires-python")
+    assert outcome.provisioned is True
+    # The venv pip probe ran; a healthy venv needs no ensurepip repair.
+    assert any("-m pip --version" in c for c in orch.commands)
+    assert not any("-m ensurepip" in c for c in orch.commands)
+    assert "ensurepip" not in outcome.narration
+
+
+def test_missing_pip_is_repaired_with_ensurepip(monkeypatch):
+    orch = PyOrch("Python 3.8.10", venv_pip_ok=False, ensurepip_ok=True)
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    outcome = PythonPreflight(orch).run("3.11", source="requires-python")
+    assert outcome.provisioned is True
+    assert outcome.mismatch is False
+    assert any("-m ensurepip --upgrade" in c for c in orch.commands)
+    # The repair is narrated so the setup docs reflect what actually ran.
+    assert "ensurepip" in outcome.narration
+    # Probe -> repair -> re-probe: two pip probes bracket the ensurepip.
+    probes = [i for i, c in enumerate(orch.commands) if "-m pip --version" in c]
+    repair = next(i for i, c in enumerate(orch.commands) if "-m ensurepip" in c)
+    assert len(probes) == 2 and probes[0] < repair < probes[1]
+
+
+def test_pip_still_missing_after_ensurepip_narrates_never_blocks(monkeypatch):
+    orch = PyOrch("Python 3.8.10", venv_pip_ok=False, ensurepip_ok=False)
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    outcome = PythonPreflight(orch).run("3.11", source="requires-python")
+    # Never a block: the interpreter IS provisioned, the hole is narrated.
+    assert outcome.provisioned is True
+    assert outcome.mismatch is False
+    assert "pip still missing" in outcome.narration
 
 
 # ---------------------------------------------------------------------------

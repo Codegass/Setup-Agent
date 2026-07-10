@@ -82,8 +82,12 @@ _NON_PACKAGE_DIRS = {"tests", "docs", "examples"}
 
 # pip rung for a pyproject without a lock: try the test extra first so test
 # dependencies land, then fall back to a plain editable install.
+# Module form ('{venv}/bin/python -m pip') everywhere (bug #12): a plain
+# `uv venv` ships no {venv}/bin/pip binary, and the module invocation
+# survives seeding differences.
 _PYPROJECT_PIP_COMMAND = (
-    "{venv}/bin/pip install -e '.[test]' || {venv}/bin/pip install -e ."
+    "{venv}/bin/python -m pip install -e '.[test]' || "
+    "{venv}/bin/python -m pip install -e ."
 )
 
 
@@ -113,11 +117,15 @@ def detect_installer(files_present) -> Dict[str, Any]:
     if requirements:
         return {
             "installer": "pip",
-            "commands": [f"{{venv}}/bin/pip install -r {name}" for name in requirements],
+            "commands": [
+                f"{{venv}}/bin/python -m pip install -r {name}"
+                for name in requirements
+            ],
             "source": requirements[0],
         }
     if "setup.py" in files:
-        return {"installer": "pip", "commands": ["{venv}/bin/pip install -e ."],
+        return {"installer": "pip",
+                "commands": ["{venv}/bin/python -m pip install -e ."],
                 "source": "setup.py"}
     # Nothing declared: honest empty ladder (callers narrate, never invent).
     return {"installer": "pip", "commands": [], "source": None}

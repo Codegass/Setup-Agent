@@ -61,7 +61,7 @@ def _manifest(**overrides):
         "python_version": "3.12",
         "python_constraint": ">=3.8",
         "python_installer": "pip",
-        "python_install_commands": ["{venv}/bin/pip install -e ."],
+        "python_install_commands": ["{venv}/bin/python -m pip install -e ."],
         "python_packages": [],
         "python_venv": "/workspace/pyyaml/.venv",
         "has_c_extensions": False,

@@ -2526,13 +2526,17 @@ class PhysicalValidator:
     def _verify_python_build(self, project_dir: str) -> Dict[str, any]:
         """Python evidence ladder (spec 2026-07-07 Component 4).
 
-        Rungs, in order: venv exists -> `pip check` clean -> every manifest
-        package imports -> `compileall` source-weighted coverage (tests/docs/
-        examples excluded, the analog of the Java class-coverage ratio) ->
-        declared C-extensions have built `.so` artifacts. A missing venv or a
-        failed import is BLOCKED (success=False); pip-check breakage, coverage
-        below build_coverage_threshold, or a missing declared extension is
-        PARTIAL (success=True, complete=False) with the failed rung named;
+        Rungs, in order: venv exists -> `python -m pip check` clean -> every
+        manifest package imports -> `compileall` source-weighted coverage
+        (tests/docs/examples excluded, the analog of the Java class-coverage
+        ratio) -> declared C-extensions have built `.so` artifacts. A missing
+        venv or a failed import is BLOCKED (success=False); pip-check
+        breakage, coverage below build_coverage_threshold, or a missing
+        declared extension is PARTIAL (success=True, complete=False) with the
+        failed rung named; a pip-check that cannot run because pip itself is
+        missing from the venv (bug #12: plain uv venvs ship no pip) is
+        UNVERIFIABLE (pip_check_clean=None) — a visible skip warning plus the
+        bug-#9 cap at PARTIAL, never phantom breakage and never silent green;
         every rung green is SUCCESS. Unknown rungs (no declared packages, no
         countable sources) stay None — never invented evidence — and an
         unknown IMPORTS rung caps the build at PARTIAL (pyyaml live probe
@@ -2576,7 +2580,7 @@ class PhysicalValidator:
         packages = manifest.get("python_packages") or []
         result: Dict[str, any] = {
             "venv_exists": False,
-            "pip_check_clean": False,
+            "pip_check_clean": None,
             "imports_ok": None,
             "import_failures": [],
             "compileall_coverage": None,
@@ -2597,10 +2601,28 @@ class PhysicalValidator:
             )
             return result
 
+        # Module form ('{venv}/bin/python -m pip check'), never the
+        # '{venv}/bin/pip' binary a plain `uv venv` does not ship (bug #12).
         pip_check = self._execute_command_with_logging(
-            f"{venv}/bin/pip check", "pip dependency check"
+            f"{venv}/bin/python -m pip check", "pip dependency check"
         )
-        result["pip_check_clean"] = pip_check["success"]
+        pip_check_output = pip_check.get("output") or ""
+        if pip_check["success"]:
+            result["pip_check_clean"] = True
+        elif (
+            "No module named pip" in pip_check_output
+            or "no such file or directory" in pip_check_output.lower()
+        ):
+            # A MISSING pip (or venv python) is UNVERIFIABLE evidence, never
+            # dependency breakage (bug #12): the rung stays None with a
+            # visible skip warning, and — bug-#9 semantics — an unknown rung
+            # caps the build at PARTIAL below, never silent green.
+            result["pip_check_clean"] = None
+            result["warnings"].append(
+                "pip check rung skipped: pip not present in venv"
+            )
+        else:
+            result["pip_check_clean"] = False
 
         # The PROJECT's own installed top_level.txt record gates the import
         # targets ALWAYS (bug #8, see docstring); still honest — read from
@@ -2674,8 +2696,12 @@ class PhysicalValidator:
             result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
 
         partial_reasons = []
-        if not result["pip_check_clean"]:
+        if result["pip_check_clean"] is False:
             partial_reasons.append("pip check reported dependency breakage")
+        elif result["pip_check_clean"] is None:
+            # UNVERIFIABLE rung (bug #12) — honest PARTIAL, never a phantom
+            # breakage and never a silent green.
+            partial_reasons.append("pip check unverified")
         if result["imports_ok"] is None:
             # pyyaml live probe bug #9: an UNKNOWN imports rung is not green.
             # venv + compileall are real evidence (success stays True), but

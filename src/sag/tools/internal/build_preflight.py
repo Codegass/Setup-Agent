@@ -284,14 +284,17 @@ class PythonPreflight:
         venv = self._venv_path()
         rung = self._provision(required, venv)
         if rung:
+            pip_note = self._ensure_venv_pip(venv)
             _register_python_overlay(self.orchestrator, venv, required)
+            narration = (
+                f"{header}\n→ {rung}-provisioned {required}, "
+                f"venv at {venv} (overlay registered)"
+            )
+            if pip_note:
+                narration += f"\n{pip_note}"
             return PreflightOutcome(
                 matched=False, active_version=active, required_version=required,
-                provisioned=True,
-                narration=(
-                    f"{header}\n→ {rung}-provisioned {required}, "
-                    f"venv at {venv} (overlay registered)"
-                ),
+                provisioned=True, narration=narration,
             )
         return PreflightOutcome(
             matched=False, active_version=active, required_version=required,
@@ -340,10 +343,40 @@ class PythonPreflight:
         )
         if not install.get("success"):
             return False
+        # --seed: a plain `uv venv` ships NO pip inside the venv (bug #12),
+        # which broke every `{venv}/bin/python -m pip ...` rung downstream.
         made = self.orchestrator.execute_command(
-            f"{_UV_PATH}; uv venv --python {version} {venv}"
+            f"{_UV_PATH}; uv venv --seed --python {version} {venv}"
         )
         return bool(made.get("success"))
+
+    def _ensure_venv_pip(self, venv: str) -> Optional[str]:
+        """Verify pip exists inside the fresh venv; repair with ensurepip.
+
+        Bug #12: pip-less venvs silently broke the installer ladder AND made
+        the verifier's pip-check rung report phantom dependency breakage.
+        Probe -> ensurepip repair -> re-probe. Never blocks: a still-missing
+        pip returns a narration line and the run continues."""
+        probe = self.orchestrator.execute_command(
+            f"{venv}/bin/python -m pip --version"
+        )
+        if probe.get("success"):
+            return None
+        self.orchestrator.execute_command(
+            f"{venv}/bin/python -m ensurepip --upgrade"
+        )
+        probe = self.orchestrator.execute_command(
+            f"{venv}/bin/python -m pip --version"
+        )
+        if probe.get("success"):
+            return (
+                f"→ venv had no pip; repaired with "
+                f"'{venv}/bin/python -m ensurepip --upgrade'"
+            )
+        return (
+            f"→ pip still missing in {venv} after ensurepip — "
+            f"pip-based install commands will fail; continuing (never blocks)"
+        )
 
     def _apt_provision(self, version: str, venv: str) -> bool:
         apt = self.orchestrator.execute_command(
