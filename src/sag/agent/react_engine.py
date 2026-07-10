@@ -70,6 +70,59 @@ PHASE_OBJECTIVES = {
     "report": "Generate the final report with the report tool, then phase(action='done').",
 }
 
+# Python overrides for the build/test objectives (live-run 2026-06-24 pyyaml
+# false-red, root cause 1): the Java build objective tells the agent to
+# phase(action='blocked') when the analyzer reports no Java compile target —
+# on a Python project the agent obeyed, and the blocked-build cap turned an
+# honest physical PARTIAL into FAILED. Python projects get their own build and
+# test objectives; the Java strings above stay byte-identical for Java
+# projects (see phase_objective).
+PYTHON_PHASE_OBJECTIVES = {
+    "build": (
+        "Set up the environment and install dependencies: build(action='deps'), "
+        "then verify byte-compilation with build(action='compile'). A Python "
+        "project has no Java compile target — that is NOT grounds for "
+        "phase(action='blocked'). Block only when the environment or dependency "
+        "install itself genuinely fails, with that evidence. Never run "
+        "pip/python via bash — build resolves the registered toolchain. Long "
+        "installs detach; poll the job ref with search."
+    ),
+    "test": (
+        "Run the test suite with pytest via build(action='test'). Run it in "
+        "the analyzer's Recommended Tests target when one is present; otherwise "
+        "the project root. Partial pass above threshold is a valid outcome — "
+        "report the numbers honestly in key_results. If tests genuinely cannot "
+        "run, phase(action='blocked') with evidence."
+    ),
+}
+
+# Build-system labels the analyzer emits for Python projects: structure
+# detection records "pip/poetry"; the physical validator and manifest say
+# "python"; installer variants may surface too.
+_PYTHON_BUILD_SYSTEM_LABELS = frozenset(
+    {"python", "pip", "poetry", "pip/poetry", "pipenv", "uv", "setuptools", "hatch", "pdm", "conda"}
+)
+
+
+def is_python_build_system(build_system: Optional[str]) -> bool:
+    if not build_system:
+        return False
+    label = str(build_system).strip().lower()
+    return label in _PYTHON_BUILD_SYSTEM_LABELS or "python" in label
+
+
+def phase_objective(phase: str, build_system: Optional[str] = None) -> str:
+    """Project-aware phase objective (spec §3.1).
+
+    When the analyzer detected a Python project, the build/test phases get the
+    PYTHON_PHASE_OBJECTIVES overrides; every other project (and an unknown
+    build system) gets the PHASE_OBJECTIVES defaults byte-identical."""
+    if is_python_build_system(build_system):
+        override = PYTHON_PHASE_OBJECTIVES.get(phase)
+        if override:
+            return override
+    return PHASE_OBJECTIVES.get(phase, "")
+
 
 def wall_clock_exceeded(
     start_time: float, cap_seconds: Optional[float], now: Optional[float] = None
@@ -381,12 +434,16 @@ class ReActEngine(UIEventEmitter):
         phase = machine.current_phase
         _, reserved, remaining = self._phase_budget_numbers(phase)
         budget = max(5, remaining - reserved)
+        # Project-aware objective: by build/test time the analyzer has recorded
+        # the detected build system on the trunk, so a Python project gets the
+        # Python objective (deps -> compile, pytest) instead of the Java one.
+        objective = phase_objective(phase, self._detected_build_system())
         lines = [
             f"=== PHASE: {phase.upper()} ===",
             "Run picture so far:",
             *machine.digest_lines(),
             "",
-            f"Objective: {PHASE_OBJECTIVES[phase]}",
+            f"Objective: {objective}",
             f"Budget: flexible — up to ~{budget} iterations available (a small reserve is "
             f"kept for later phases). When finished, call phase(action='done', "
             f"key_results=..., evidence=[refs]). If it cannot be finished, "
@@ -399,12 +456,24 @@ class ReActEngine(UIEventEmitter):
         if phase in ("build", "test"):
             rec_line = self._recommended_build_line(phase)
             if rec_line:
-                lines.insert(lines.index(f"Objective: {PHASE_OBJECTIVES[phase]}") + 1, rec_line)
+                lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
         return ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
             content="\n".join(lines),
             timestamp=self._get_timestamp(),
         )
+
+    def _detected_build_system(self) -> Optional[str]:
+        """The analyzer-detected build system, read best-effort from the trunk's
+        environment_summary (the same plumbing as _recommended_build_line).
+        Any failure abstains with None -> the Java-default objectives."""
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            env = getattr(trunk, "environment_summary", None) or {}
+        except Exception:
+            return None
+        rec = env.get("build_recommendation") or {}
+        return rec.get("build_system") or env.get("build_system")
 
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
         """One-line build/test recommendation from the analyzer, read from the
@@ -756,7 +825,7 @@ class ReActEngine(UIEventEmitter):
         try:
             from .context_manager import BranchContextHistory
 
-            description = PHASE_OBJECTIVES.get(machine.current_phase, "")
+            description = phase_objective(machine.current_phase, self._detected_build_system())
             trunk = cm.load_trunk_context()
             if trunk is not None:
                 for task in trunk.todo_list:

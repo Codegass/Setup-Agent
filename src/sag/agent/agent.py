@@ -1016,6 +1016,29 @@ START by working toward the current phase objective shown in my context.
         machine = getattr(getattr(self, "react_engine", None), "phase_machine", None)
         machine_outcome = machine.overall_outcome() if machine is not None else None
 
+        # Scoped blocked-build cap (live-run 2026-06-24 pyyaml false-red):
+        # machine_outcome == "failed" means the agent blocked the build phase.
+        # When the PHYSICAL build evidence disagrees — validate_build_status
+        # found a real build (success=True: Java artifacts/fingerprints, or the
+        # Python ladder's success/partial-with-imports) — evidence outranks
+        # agent belief and the cap is PARTIAL, not FAILED. The block is still
+        # surfaced (never promoted to success), so agent dishonesty stays
+        # catchable; only the evidence-contradicted false-red is gone. With no
+        # physical build evidence the cap stays FAILED exactly as before.
+        build_status = getattr(self, "_last_build_status", None)
+        blocked_build_evidence_backed = (
+            machine_outcome == "failed"
+            and isinstance(build_status, dict)
+            and bool(build_status.get("success"))
+        )
+        if blocked_build_evidence_backed:
+            machine_outcome = "partial"
+            logger.warning(
+                "Phase machine recorded a blocked build phase, but physical "
+                "build evidence shows a real build; capping verdict to partial "
+                "instead of failed"
+            )
+
         conflicts = test_status.get("conflicts", []) if isinstance(test_status, dict) else []
         self.final_verdict = run_verdict(machine_outcome, physical_verdict, conflicts)
 
@@ -1023,7 +1046,13 @@ START by working toward the current phase objective shown in my context.
         # a conflict-capped vfs run printed "no test reports found" while its
         # 96.2% test results sat right there in the report.
         if self.final_verdict == "partial":
-            if physical_verdict == "partial":
+            if blocked_build_evidence_backed:
+                # Record BOTH sides: the agent's block stays visible, and so
+                # does the physical evidence that contradicts it.
+                self.final_verdict_reason = (
+                    "build phase blocked by agent, but physical evidence shows a real build"
+                )
+            elif physical_verdict == "partial":
                 self.final_verdict_reason = "build verified, tests not verified (no test reports found)"
             elif machine_outcome == "partial":
                 self.final_verdict_reason = "one or more phases were blocked (see report)"
@@ -1068,8 +1097,10 @@ START by working toward the current phase objective shown in my context.
 
         self.final_verdict = "failed"
         # Surfaced to the verdict-kernel combiner (_get_verified_final_status)
-        # so evidence conflicts from validate_test_status can cap the verdict.
+        # so evidence conflicts from validate_test_status can cap the verdict
+        # and the blocked-build cap can be scoped by real build evidence.
         self._last_test_status = None
+        self._last_build_status = None
         project_name = self._get_project_name_for_validation()
 
         if not project_name:
@@ -1084,6 +1115,7 @@ START by working toward the current phase objective shown in my context.
 
         # Get BUILD status (primary concern)
         build_status = self.physical_validator.validate_build_status(project_name)
+        self._last_build_status = build_status
 
         # Get TEST status separately so known test suites cannot disappear behind build artifacts.
         test_status = self.physical_validator.validate_test_status(project_name)
