@@ -584,6 +584,96 @@ def test_zero_collected_is_never_green():
 
 
 # ---------------------------------------------------------------------------
+# Reviewer-confirmed defect (criterion f): the text-only usage/collection
+# signatures substring-matched ANYWHERE in the run output — including the
+# captured stdout/stderr of the tests under test — and were checked BEFORE
+# the exit-1 + failed-stats honest-results branch. Any CLI-heavy project
+# (argparse/click) with a failing argument-handling test tripped this.
+# ---------------------------------------------------------------------------
+
+# Forensic evidence: exit 1, honest '1 failed, 5 passed' summary, a failing
+# CLI test's captured stderr carrying argparse's standard error text.
+_ARGPARSE_FAILURE_OUTPUT = (
+    "==================================== FAILURES ====================================\n"
+    "________________________________ test_cli_rejects ________________________________\n"
+    "    def test_cli_rejects():\n"
+    ">       main(['--bogus'])\n"
+    "E       SystemExit: 2\n"
+    "----------------------------- Captured stderr call -----------------------------\n"
+    "usage: prog [-h] [--count COUNT]\n"
+    "prog: error: unrecognized arguments: --bogus\n"
+    "============================ short test summary info ============================\n"
+    "FAILED tests/test_cli.py::test_cli_rejects - SystemExit: 2\n"
+    "========================== 1 failed, 5 passed in 0.34s ==========================="
+)
+
+
+def test_failing_cli_test_with_captured_argparse_stderr_is_an_honest_result():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", ok("6 tests collected in 0.05s")),
+            ("--junitxml", fail(_ARGPARSE_FAILURE_OUTPUT, exit_code=1)),
+        ],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    # The suite RAN and reported honest stats — captured argparse text from
+    # the tests under test is NOT a pytest usage error.
+    assert result.success is True
+    assert result.error_code is None
+    assert "1 failed, 5 passed" in result.output
+
+
+def test_passing_suite_with_captured_argparse_stderr_stays_green():
+    from sag.tools.internal.python_tool import _classify_pytest_result
+
+    # Adjacent false-red: fully PASSING suite (exit 0) whose output shows the
+    # argparse text (e.g. run with -s, or log_cli on a CLI-heavy project).
+    output = (
+        "tests/test_cli.py::test_usage_error PASSED\n"
+        "usage: prog [-h] [--count COUNT]\n"
+        "prog: error: unrecognized arguments: --bogus\n"
+        "=============================== 6 passed in 0.21s ==============================="
+    )
+    success, error, error_code = _classify_pytest_result(0, output)
+    assert success is True
+    assert error is None
+    assert error_code is None
+
+
+def test_collection_error_text_in_assertion_repr_with_failed_stats_is_honest():
+    from sag.tools.internal.python_tool import _classify_pytest_result
+
+    # 'ERROR collecting' quoted inside a failing assertion repr at exit 1
+    # with honest failed stats present is a RESULT, not a collection error.
+    output = (
+        "==================================== FAILURES ====================================\n"
+        "_______________________________ test_log_scraper ________________________________\n"
+        "E       AssertionError: assert 'ERROR collecting tests/x.py' not in log\n"
+        "========================== 1 failed, 3 passed in 0.11s ==========================="
+    )
+    success, error, error_code = _classify_pytest_result(1, output)
+    assert success is True
+    assert error is None
+    assert error_code is None
+
+
+def test_pytest_own_usage_error_line_is_still_red_when_the_exit_code_lies():
+    from sag.tools.internal.python_tool import _classify_pytest_result
+
+    # A wrapper reporting exit 0 must not mask pytest's OWN usage error —
+    # the anchored line-start 'ERROR: usage:' shape, no stats line.
+    output = (
+        "ERROR: usage: __main__.py [options] [file_or_dir]\n"
+        "__main__.py: error: unrecognized arguments: --frobnicate"
+    )
+    success, error, error_code = _classify_pytest_result(0, output)
+    assert success is False
+    assert error_code == "PYTEST_USAGE_ERROR"
+    assert "ERROR: usage:" in (error or "")
+
+
+# ---------------------------------------------------------------------------
 # Bug #13 defect 7: arg sanitizing — 'make test' was pasted verbatim into
 # the pytest command line ('pytest make test') in the live run.
 # ---------------------------------------------------------------------------

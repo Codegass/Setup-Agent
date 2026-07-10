@@ -54,8 +54,23 @@ _INSTALL_ERROR_RE = re.compile(
 
 # Bug #13 defect 6: honest pytest outcome classification.
 _FAILED_STATS_RE = re.compile(r"\b\d+ failed\b")
-_COLLECTION_ERROR_RE = re.compile(r"ERROR collecting|errors? during collection")
-_USAGE_ERROR_RE = re.compile(r"(?i)usage error|unrecognized arguments|error: usage:")
+# Pytest's own summary stats line ("1 failed, 5 passed in 0.34s"): when it is
+# present the suite RAN — text-signature fallbacks must never override it.
+_SUMMARY_STATS_RE = re.compile(r"\b\d+ (?:passed|failed)\b")
+# Reviewer-confirmed defect (criterion f): these signatures previously
+# substring-matched ANYWHERE in the output — including captured stdout/stderr
+# of the tests under test (argparse's 'prog: error: unrecognized arguments'
+# on any CLI-heavy project). Anchored to pytest's OWN line shapes: the
+# 'ERROR: usage:' prefix only pytest prints at line start, the collection
+# ERROR header line, and the '!! Interrupted: N errors during collection !!'
+# band. Applied only when the exit code is unreliable (0/None) and no
+# summary stats line exists.
+_COLLECTION_ERROR_RE = re.compile(
+    r"^_*\s*ERROR collecting\b"
+    r"|!!+\s*Interrupted: \d+ errors? during collection",
+    re.MULTILINE,
+)
+_USAGE_ERROR_RE = re.compile(r"^ERROR: usage:", re.MULTILINE)
 
 # Bug #13 defect 7: pytest-plausible flags (simple allowlist heuristic).
 # -k/-m/--maxfail take a value token; everything else must fullmatch here or
@@ -95,22 +110,49 @@ def _classify_pytest_result(
             "pytest is not importable in the venv (No module named pytest)",
             "PYTEST_MISSING",
         )
-    if exit_code == 4 or _USAGE_ERROR_RE.search(text):
+    # Pytest's documented exit codes are authoritative when present.
+    if exit_code == 4:
         detail = _snippet(_USAGE_ERROR_RE) or f"pytest exited {exit_code}"
         return False, f"pytest usage error — {detail}", "PYTEST_USAGE_ERROR"
-    if exit_code == 2 or _COLLECTION_ERROR_RE.search(text):
+    if exit_code == 2:
         detail = _snippet(_COLLECTION_ERROR_RE) or f"pytest exited {exit_code}"
         return False, f"pytest collection error — {detail}", "PYTEST_COLLECTION_ERROR"
-    if exit_code == 5 or _NO_TESTS_RE.search(text):
+    if exit_code == 5:
         return (
             False,
             "pytest collected zero tests — nothing was executed",
             "PYTEST_NO_TESTS",
         )
+    # An explicit summary stats line at exit 1 WINS over text-signature
+    # fallbacks (reviewer-confirmed defect): the suite RAN, some tests failed
+    # — an honest result to report, never an error state. Captured argparse/
+    # click stderr from the tests under test must not redden it.
+    if exit_code == 1 and _FAILED_STATS_RE.search(text):
+        return True, None, None
+    # Text-only signatures apply ONLY when the exit code is unreliable
+    # (a wrapper reporting 0/None) AND pytest printed no summary stats line
+    # — the lying-wrapper hole they were built for, nothing wider.
+    if exit_code in (0, None) and not _SUMMARY_STATS_RE.search(text):
+        if _USAGE_ERROR_RE.search(text):
+            return (
+                False,
+                f"pytest usage error — {_snippet(_USAGE_ERROR_RE)}",
+                "PYTEST_USAGE_ERROR",
+            )
+        if _COLLECTION_ERROR_RE.search(text):
+            return (
+                False,
+                f"pytest collection error — {_snippet(_COLLECTION_ERROR_RE)}",
+                "PYTEST_COLLECTION_ERROR",
+            )
+        if _NO_TESTS_RE.search(text):
+            return (
+                False,
+                "pytest collected zero tests — nothing was executed",
+                "PYTEST_NO_TESTS",
+            )
     if exit_code == 0:
         return True, None, None
-    if exit_code == 1 and _FAILED_STATS_RE.search(text):
-        return True, None, None  # honest result: the suite RAN, some tests failed
     return (
         False,
         f"pytest exited {exit_code} — honest result recorded, no rerun",
