@@ -6,6 +6,7 @@ import {
   fetchDashboard,
   fetchLaunchQueue,
   fetchSession,
+  fetchSystem,
   submitProjectBatch,
   submitTask,
 } from "@/api/client"
@@ -15,10 +16,11 @@ import type {
   LaunchBatchResult,
   LaunchQueueState,
   SubmitTaskResponse,
+  SystemSummary,
 } from "@/api/types"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
-import { SummaryStrip } from "@/components/SummaryStrip"
+import { NavBar } from "@/components/NavBar"
 import { Tooltip } from "@/components/ui/tooltip"
 import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
 import { RailSkeleton } from "@/pages/RailSkeleton"
@@ -33,6 +35,7 @@ const LAUNCH_HIGHLIGHT_MS = 8000
 
 export function App() {
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
+  const [system, setSystem] = useState<SystemSummary | null>(null)
   const [dashboardError, setDashboardError] = useState<string | null>(null)
   const [routeError, setRouteError] = useState<string | null>(null)
   const [sessionDetails, setSessionDetails] = useState<Record<string, ExecutionSessionDetail>>({})
@@ -49,6 +52,21 @@ export function App() {
   const [railOpen, setRailOpen] = useState(false)
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
   const highlightTimers = useRef<number[]>([])
+
+  useEffect(() => {
+    let active = true
+    const load = () => {
+      void fetchSystem()
+        .then((s) => active && setSystem(s))
+        .catch(() => {})
+    }
+    load()
+    const id = window.setInterval(load, DASHBOARD_POLL_MS)
+    return () => {
+      active = false
+      window.clearInterval(id)
+    }
+  }, [])
 
   const loadLaunchQueue = useCallback(async () => {
     try {
@@ -320,7 +338,7 @@ export function App() {
           </span>
         </div>
 
-        {dashboard ? <SummaryStrip workspaces={dashboard.workspaces} /> : null}
+        <NavBar onLaunchSetups={() => setLaunchDialogOpen(true)} system={system} />
 
         <div className="min-h-0 flex-1 overflow-hidden">
         {!dashboard && !loading && dashboardError ? (

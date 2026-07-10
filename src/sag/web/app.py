@@ -73,6 +73,10 @@ def create_app(
     def get_workspaces() -> dict:
         return builder.dashboard().model_dump(mode="json", by_alias=True)
 
+    @app.get("/api/system")
+    def get_system() -> dict:
+        return builder.system().model_dump(mode="json", by_alias=True)
+
     @app.post("/api/workspaces/{workspace_id}/tasks", status_code=202)
     def submit_task(workspace_id: str, request: TaskRequest) -> dict:
         return runner.submit(workspace_id, request)

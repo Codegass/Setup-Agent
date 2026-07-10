@@ -471,9 +471,11 @@ class DockerOrchestrator:
                     )
                     return json.dumps(data, indent=2)
 
-            # 如果无法安全截断，返回原内容（但会有警告）
-            logger.warning(
-                "🚨 Large JSON file detected but cannot be safely truncated - preserving integrity"
+            # Not the {history:[...]} shape we can trim — return unchanged. Debug,
+            # not warning: no data is lost and it fires on every large trunk*.json
+            # dashboard read (log spam).
+            logger.debug(
+                "Large JSON file left untruncated (unrecognized shape) - preserving integrity"
             )
             return json_content
 

@@ -1,7 +1,8 @@
 import { Activity, AlertTriangle, Check, Clock, GitBranch, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
-import { useState } from "react"
+import { type MouseEvent as ReactMouseEvent, useState } from "react"
 
 import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
+import { rollup } from "@/components/SummaryStrip"
 import { StatusBadge } from "@/components/common/Badge"
 import { TestBar } from "@/components/common/TestBar"
 import { statusMeta } from "@/components/common/status"
@@ -203,6 +204,37 @@ function Chip({ label, value, tone }: { label: string; value: number; tone?: "bl
   )
 }
 
+function pct(num: number, den: number): string | null {
+  return den > 0 ? `${((100 * num) / den).toFixed(1)}%` : null
+}
+
+/** Compact fleet rollup shown in the sidebar under the workspace chips. */
+function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
+  if (!workspaces.length) return null
+  const r = rollup(workspaces)
+  const rows: Array<{ label: string; value: string; hint: string }> = []
+  const build = pct(r.buildSuccess, r.buildKnown)
+  if (build) rows.push({ label: "Build success", value: build, hint: `${r.buildSuccess} of ${r.buildKnown} workspaces built` })
+  const pass = pct(r.passed, r.executedNonSkip)
+  if (pass) rows.push({ label: "Pass rate", value: pass, hint: `${r.passed.toLocaleString()} passed of ${r.executedNonSkip.toLocaleString()} executed` })
+  const exec = pct(r.executed, r.declared)
+  if (exec) rows.push({ label: "Exec rate", value: exec, hint: `${r.executed.toLocaleString()} executed of ${r.declared.toLocaleString()} declared` })
+  if (!rows.length) return null
+
+  return (
+    <div className="mt-2 space-y-1 rounded-md border border-slate-200 bg-slate-50/50 px-2.5 py-2">
+      {rows.map((row) => (
+        <Tooltip key={row.label} className="flex w-full items-center justify-between" label={row.hint} side="bottom">
+          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-slate-400">{row.label}</span>
+          <span className={cn("font-mono text-[11px] font-semibold", parseFloat(row.value) >= 80 ? "text-status-success" : "text-status-attention")}>
+            {row.value}
+          </span>
+        </Tooltip>
+      ))}
+    </div>
+  )
+}
+
 export function WorkspaceRail({
   data,
   selectedId,
@@ -259,6 +291,25 @@ export function WorkspaceRail({
     setBatchConfirm(false)
   }
   const [removeTarget, setRemoveTarget] = useState<DeleteWorkspaceTarget | null>(null)
+  const [railWidth, setRailWidth] = useState(() => {
+    const saved = Number(localStorage.getItem("sag.railWidth"))
+    return saved >= 240 && saved <= 560 ? saved : 320
+  })
+  const startResize = (e: ReactMouseEvent) => {
+    e.preventDefault()
+    let latest = railWidth
+    const onMove = (ev: globalThis.MouseEvent) => {
+      latest = Math.min(560, Math.max(240, ev.clientX))
+      setRailWidth(latest)
+    }
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove)
+      window.removeEventListener("mouseup", onUp)
+      localStorage.setItem("sag.railWidth", String(latest))
+    }
+    window.addEventListener("mousemove", onMove)
+    window.addEventListener("mouseup", onUp)
+  }
   const ordered = sortByAttentionFirst(data.workspaces)
   const q = query.trim().toLowerCase()
   const rows = q
@@ -277,9 +328,17 @@ export function WorkspaceRail({
   return (
     <aside
       aria-label="Workspaces"
-      className={cn("flex h-full min-h-0 w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white", className)}
+      className={cn("relative flex h-full min-h-0 shrink-0 flex-col border-r border-slate-200 bg-white", className)}
       id="workspace-rail"
+      style={{ width: railWidth }}
     >
+      {/* Drag the right edge to resize (desktop only; the rail is a drawer on mobile). */}
+      <div
+        aria-orientation="vertical"
+        className="absolute right-0 top-0 z-10 hidden h-full w-1 cursor-col-resize hover:bg-slate-300 lg:block"
+        onMouseDown={startResize}
+        role="separator"
+      />
       <div className="border-b border-slate-200 px-4 pb-3 pt-4">
         <div className="flex items-center gap-2">
           <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-900 font-mono text-[11px] font-bold text-white">S</span>
@@ -304,6 +363,7 @@ export function WorkspaceRail({
           <Chip label="Running" value={running} tone="blue" />
           <Chip label="Attention" value={attention} tone={attention ? "red" : undefined} />
         </div>
+        <RailSummary workspaces={data.workspaces} />
         <div className="relative mt-3">
           <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
           <input

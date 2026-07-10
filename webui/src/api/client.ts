@@ -7,6 +7,7 @@ import type {
   LaunchBatchResult,
   LaunchQueueState,
   SubmitTaskResponse,
+  SystemSummary,
 } from "./types"
 
 async function readJson<T>(response: Response): Promise<T> {
@@ -23,6 +24,10 @@ async function getJson<T>(path: string): Promise<T> {
 
 export function fetchDashboard(): Promise<DashboardResponse> {
   return getJson<DashboardResponse>("/api/workspaces")
+}
+
+export function fetchSystem(): Promise<SystemSummary> {
+  return getJson<SystemSummary>("/api/system")
 }
 
 export function fetchSession(sessionId: string): Promise<ExecutionSessionDetail> {

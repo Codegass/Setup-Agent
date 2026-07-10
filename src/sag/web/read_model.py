@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from loguru import logger
 
 from sag.web.demo_data import build_demo_dashboard, get_demo_session
@@ -9,6 +12,7 @@ from sag.web.models import (
     DashboardResponse,
     DockerSummary,
     ExecutionSessionDetail,
+    SystemSummary,
     WorkspaceSummary,
 )
 from sag.web.session_registry import ContainerSessionRegistry
@@ -49,6 +53,46 @@ class ReadModelBuilder:
             docker=DockerSummary(status="connected"),
             workspaces=workspaces,
         )
+
+    def system(self) -> SystemSummary:
+        """Host + docker resource usage for the nav bar. Each source is best-effort:
+        a failure leaves that field None rather than erroring the whole endpoint."""
+        summary = SystemSummary()
+        try:
+            if self.workspace_registry is None:
+                self.workspace_registry = WorkspaceRegistry()
+            df = self.workspace_registry.client.df()
+            used = int(df.get("LayersSize", 0) or 0)  # total image layer bytes
+            for vol in df.get("Volumes") or []:
+                used += max(0, int((vol.get("UsageData") or {}).get("Size", 0) or 0))
+            for container in df.get("Containers") or []:
+                used += max(0, int(container.get("SizeRw", 0) or 0))
+            summary.docker_disk_used = used
+            summary.docker_reclaimable = (
+                sum(int(b.get("Size", 0) or 0) for b in (df.get("BuildCache") or [])) or None
+            )
+        except Exception:
+            logger.debug("docker df unavailable")
+
+        try:
+            meminfo = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                field, _, rest = line.partition(":")
+                meminfo[field] = int(rest.strip().split()[0]) * 1024  # kB -> bytes
+            total = meminfo.get("MemTotal")
+            available = meminfo.get("MemAvailable")
+            if total is not None:
+                summary.mem_total = total
+                if available is not None:
+                    summary.mem_used = total - available
+        except Exception:
+            logger.debug("/proc/meminfo unavailable")
+
+        try:
+            summary.cpu_load = round(os.getloadavg()[0], 2)
+        except (OSError, AttributeError):
+            pass
+        return summary
 
     def session_detail(self, session_id: str) -> ExecutionSessionDetail:
         if self.demo_mode:
