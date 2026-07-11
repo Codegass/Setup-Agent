@@ -98,9 +98,10 @@ class ContainerSessionRegistry:
         self.logs_root = logs_root if logs_root is not None else _resolve_logs_root()
         self._now = now_fn if now_fn is not None else time.monotonic
         self._missing_sessions: dict[str, float] = {}
+        self._client: Any = None
 
     def list_workspace_sessions(self, workspace: WorkspaceSummary) -> list[ExecutionSessionSummary]:
-        orchestrator = self._orchestrator(workspace.id)
+        orchestrator = self._reader(workspace)
         raw = _read_container_file(orchestrator, SESSION_INDEX_PATH)
         rows = parse_session_index(raw, workspace.id) if raw is not None else []
         return _merge_session_summaries(
@@ -137,7 +138,7 @@ class ContainerSessionRegistry:
         workspace: WorkspaceSummary,
         session_id: str,
     ) -> ExecutionSessionDetail | None:
-        orchestrator = self._orchestrator(workspace.id)
+        orchestrator = self._reader(workspace)
         raw = _read_container_file(orchestrator, SESSION_INDEX_PATH)
 
         item = _find_session_item(raw, session_id) if raw is not None else None
@@ -153,6 +154,32 @@ class ContainerSessionRegistry:
 
         context = _read_context_trace(orchestrator)
         return _session_detail(item, workspace.id, context)
+
+    def _reader(self, workspace: WorkspaceSummary) -> Any:
+        """A reader for a workspace's result files. Tests inject a fake via
+        orchestrator_factory; production reads from the host mirror (no docker
+        exec, so viewing results never revives a stopped container)."""
+        if self.orchestrator_factory is not None:
+            return self.orchestrator_factory(workspace.id)
+
+        from sag.web.session_mirror import MirrorReader, ensure_mirror
+
+        client = self._docker_client()
+        mirror = None
+        if client is not None:
+            running = getattr(getattr(workspace, "docker", None), "status", "") == "running"
+            mirror = ensure_mirror(client, workspace.id, running, self.logs_root)
+        return MirrorReader(mirror if mirror is not None else self.logs_root / "web_mirror" / "__missing__")
+
+    def _docker_client(self) -> Any:
+        if self._client is None:
+            try:
+                import docker
+
+                self._client = docker.from_env()
+            except Exception:
+                self._client = None
+        return self._client
 
     def _orchestrator(self, workspace_id: str) -> Any:
         if self.orchestrator_factory is not None:
