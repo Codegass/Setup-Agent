@@ -53,6 +53,16 @@ export function App() {
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
   const highlightTimers = useRef<number[]>([])
 
+  const [dark, setDark] = useState(() => {
+    const saved = localStorage.getItem("sag.theme")
+    if (saved) return saved === "dark"
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false
+  })
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", dark)
+    localStorage.setItem("sag.theme", dark ? "dark" : "light")
+  }, [dark])
+
   useEffect(() => {
     let active = true
     const load = () => {
@@ -283,7 +293,7 @@ export function App() {
   }
 
   return (
-    <div className="flex h-screen min-h-0 w-full overflow-hidden bg-[#fbfbfc] text-slate-900">
+    <div className="flex h-screen min-h-0 w-full overflow-hidden bg-background text-foreground">
       {/* Mobile-only backdrop behind the rail drawer. */}
       {railOpen ? (
         <button
@@ -338,7 +348,7 @@ export function App() {
           </span>
         </div>
 
-        <NavBar system={system} />
+        <NavBar dark={dark} onToggleTheme={() => setDark((v) => !v)} system={system} />
 
         <div className="min-h-0 flex-1 overflow-hidden">
         {!dashboard && !loading && dashboardError ? (

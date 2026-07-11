@@ -114,6 +114,29 @@
   --ring: oklch(0.72 0.16 252);
 }
 
+/* Dark-mode compatibility layer. The component tree hard-codes slate/white
+   utilities instead of theme tokens, so a bare `.dark` toggle would only flip the
+   body. Remap the utilities actually in use to the dark tokens defined above.
+   ponytail: covers base utilities (not every hover:/opacity variant); retone
+   components to tokens for pixel-perfect control. Plain rules (outside @layer) so
+   they win over Tailwind's utility layer. */
+.dark .bg-white { background-color: var(--card); }
+.dark .bg-slate-50,
+.dark .bg-slate-100 { background-color: var(--muted); }
+.dark .bg-slate-200,
+.dark .bg-slate-300 { background-color: var(--accent); }
+.dark .bg-slate-900 { background-color: var(--primary); }
+.dark .text-slate-900,
+.dark .text-slate-800,
+.dark .text-slate-700 { color: var(--foreground); }
+.dark .text-slate-600,
+.dark .text-slate-500,
+.dark .text-slate-400,
+.dark .text-slate-300 { color: var(--muted-foreground); }
+.dark .border-slate-100,
+.dark .border-slate-200,
+.dark .border-slate-300 { border-color: var(--border); }
+
 @layer base {
   * {
     @apply border-border outline-ring/50;

@@ -9,6 +9,8 @@ describe("NavBar", () => {
   it("renders formatted system stats", () => {
     render(
       <NavBar
+        dark={false}
+        onToggleTheme={() => {}}
         system={{
           dockerDiskUsed: 2 * (1 << 30),
           memUsed: 4 * (1 << 30),
@@ -23,7 +25,7 @@ describe("NavBar", () => {
   })
 
   it("omits stats that are unavailable", () => {
-    render(<NavBar system={null} />)
+    render(<NavBar dark={false} onToggleTheme={() => {}} system={null} />)
     expect(screen.queryByText(/GB/)).not.toBeInTheDocument()
   })
 })

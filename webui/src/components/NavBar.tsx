@@ -1,3 +1,5 @@
+import { Moon, Sun } from "lucide-react"
+
 import type { SystemSummary } from "@/api/types"
 import { Tooltip } from "@/components/ui/tooltip"
 
@@ -22,7 +24,15 @@ function Readout({ label, value, hint }: { label: string; value: string; hint: s
   )
 }
 
-export function NavBar({ system }: { system: SystemSummary | null }) {
+export function NavBar({
+  dark,
+  onToggleTheme,
+  system,
+}: {
+  dark: boolean
+  onToggleTheme: () => void
+  system: SystemSummary | null
+}) {
   const disk = bytes(system?.dockerDiskUsed)
   const mem =
     system?.memTotal != null && system?.memUsed != null
@@ -32,21 +42,33 @@ export function NavBar({ system }: { system: SystemSummary | null }) {
   const reclaimable = bytes(system?.dockerReclaimable)
 
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-[#fbfbfc] px-5 py-2 sm:px-6">
+    <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-background px-5 py-2 sm:px-6">
       <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">
         SAG Workbench
       </span>
 
-      <div className="hidden items-center gap-4 sm:flex">
-        {disk ? (
-          <Readout
-            label="Docker"
-            value={disk}
-            hint={`Docker disk in use${reclaimable ? `, ${reclaimable} reclaimable` : ""}`}
-          />
-        ) : null}
-        {mem ? <Readout label="RAM" value={mem} hint="Host memory used / total" /> : null}
-        {cpu ? <Readout label="Load" value={cpu} hint="Host 1-minute load average" /> : null}
+      <div className="flex items-center gap-4">
+        <div className="hidden items-center gap-4 sm:flex">
+          {disk ? (
+            <Readout
+              label="Docker"
+              value={disk}
+              hint={`Docker disk in use${reclaimable ? `, ${reclaimable} reclaimable` : ""}`}
+            />
+          ) : null}
+          {mem ? <Readout label="RAM" value={mem} hint="Host memory used / total" /> : null}
+          {cpu ? <Readout label="Load" value={cpu} hint="Host 1-minute load average" /> : null}
+        </div>
+        <Tooltip label={dark ? "Switch to light mode" : "Switch to dark mode"} side="bottom">
+          <button
+            aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
+            className="rounded-md border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+            onClick={onToggleTheme}
+            type="button"
+          >
+            {dark ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
+        </Tooltip>
       </div>
     </div>
   )
