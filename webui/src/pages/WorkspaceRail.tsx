@@ -1,4 +1,4 @@
-import { Activity, AlertTriangle, Check, Clock, GitBranch, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
+import { Activity, AlertTriangle, Check, CircleCheck, Clock, Gauge, GitBranch, Hammer, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
 import { type MouseEvent as ReactMouseEvent, useState } from "react"
 
 import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
@@ -218,33 +218,84 @@ function Chip({ label, value, tone }: { label: string; value: number; tone?: "bl
   )
 }
 
-function pct(num: number, den: number): string | null {
-  return den > 0 ? `${((100 * num) / den).toFixed(1)}%` : null
+function pct(num: number, den: number): number | null {
+  return den > 0 ? (100 * num) / den : null
 }
 
-/** Compact fleet rollup shown in the sidebar under the workspace chips. */
+function compact(n: number): string {
+  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : n.toLocaleString()
+}
+
+function StatCard({
+  icon: Icon,
+  label,
+  rate,
+  detail,
+  hint,
+}: {
+  icon: typeof Hammer
+  label: string
+  rate: number
+  detail: string
+  hint: string
+}) {
+  const tone = rate >= 80 ? "text-status-success" : "text-status-attention"
+  return (
+    <Tooltip className="flex-1" label={hint} side="bottom">
+      <div className="w-full rounded-lg border border-border bg-card px-2.5 py-2">
+        <div className="flex items-center gap-1.5">
+          <Icon className={cn("shrink-0", tone)} size={14} />
+          <span className={cn("text-[17px] font-bold leading-none tabular-nums", tone)}>
+            {rate.toFixed(0)}%
+          </span>
+        </div>
+        <div className="mt-1.5 font-mono text-[8.5px] uppercase tracking-[0.1em] text-muted-foreground">
+          {label}
+        </div>
+        <div className="font-mono text-[10px] font-medium tabular-nums text-foreground">{detail}</div>
+      </div>
+    </Tooltip>
+  )
+}
+
+/** Fleet rollup shown in the sidebar under the workspace chips. */
 function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
   if (!workspaces.length) return null
   const r = rollup(workspaces)
-  const rows: Array<{ label: string; value: string; hint: string }> = []
   const build = pct(r.buildSuccess, r.buildKnown)
-  if (build) rows.push({ label: "Build success", value: build, hint: `${r.buildSuccess} of ${r.buildKnown} workspaces built` })
   const pass = pct(r.passed, r.executedNonSkip)
-  if (pass) rows.push({ label: "Pass rate", value: pass, hint: `${r.passed.toLocaleString()} passed of ${r.executedNonSkip.toLocaleString()} executed` })
   const exec = pct(r.executed, r.declared)
-  if (exec) rows.push({ label: "Exec rate", value: exec, hint: `${r.executed.toLocaleString()} executed of ${r.declared.toLocaleString()} declared` })
-  if (!rows.length) return null
+  if (build === null && pass === null && exec === null) return null
 
   return (
-    <div className="mt-2 space-y-1 rounded-md border border-border bg-muted px-2.5 py-2">
-      {rows.map((row) => (
-        <Tooltip key={row.label} className="flex w-full items-center justify-between" label={row.hint} side="bottom">
-          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{row.label}</span>
-          <span className={cn("font-mono text-[11px] font-semibold", parseFloat(row.value) >= 80 ? "text-status-success" : "text-status-attention")}>
-            {row.value}
-          </span>
-        </Tooltip>
-      ))}
+    <div className="mt-2 flex gap-2">
+      {build !== null ? (
+        <StatCard
+          detail={`${r.buildSuccess}/${r.buildKnown}`}
+          hint={`${r.buildSuccess} of ${r.buildKnown} workspaces built successfully`}
+          icon={Hammer}
+          label="Build"
+          rate={build}
+        />
+      ) : null}
+      {pass !== null ? (
+        <StatCard
+          detail={`${compact(r.passed)}/${compact(r.executedNonSkip)}`}
+          hint={`${r.passed.toLocaleString()} passed of ${r.executedNonSkip.toLocaleString()} executed (skips excluded)`}
+          icon={CircleCheck}
+          label="Pass"
+          rate={pass}
+        />
+      ) : null}
+      {exec !== null ? (
+        <StatCard
+          detail={`${compact(r.executed)}/${compact(r.declared)}`}
+          hint={`${r.executed.toLocaleString()} executed of ${r.declared.toLocaleString()} declared test methods`}
+          icon={Gauge}
+          label="Exec"
+          rate={exec}
+        />
+      ) : null}
     </div>
   )
 }
