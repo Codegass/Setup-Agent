@@ -36,6 +36,11 @@ SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
 _EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
 _CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
+# Cap the context trace payload: a huge full_outputs.jsonl (big runs like camel)
+# shipped raw to the browser and rendered can crash the renderer. Skip files over
+# the per-file cap and stop once the total budget is spent.
+_MAX_CONTEXT_FILE_CHARS = 1_000_000
+_MAX_CONTEXT_TOTAL_CHARS = 8_000_000
 
 
 class SessionRegistry:
@@ -1499,6 +1504,7 @@ def _read_context_trace(orchestrator: Any) -> ContextTrace | None:
         contexts_dir = Path(temp_dir) / "contexts"
         contexts_dir.mkdir()
 
+        total = 0
         for filename in filenames[:100]:
             raw = _read_container_file(
                 orchestrator,
@@ -1506,6 +1512,11 @@ def _read_context_trace(orchestrator: Any) -> ContextTrace | None:
             )
             if raw is None:
                 continue
+            # ponytail: drop oversized context files rather than crash the browser
+            # render; raise the caps if the trace ever needs the full outputs.
+            if len(raw) > _MAX_CONTEXT_FILE_CHARS or total + len(raw) > _MAX_CONTEXT_TOTAL_CHARS:
+                continue
+            total += len(raw)
             target = contexts_dir / filename
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(raw, encoding="utf-8")
