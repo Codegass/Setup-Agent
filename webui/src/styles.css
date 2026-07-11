@@ -112,6 +112,24 @@
   --border: oklch(1 0 0 / 12%);
   --input: oklch(1 0 0 / 16%);
   --ring: oklch(0.72 0.16 252);
+
+  /* Dark status palette: the light soft tints are near-white (oklch ~0.97) and
+     unreadable as row/badge backgrounds under dark-mode light text. */
+  --status-idle: oklch(0.75 0.02 264);
+  --status-idle-soft: oklch(0.27 0.03 265);
+  --status-idle-border: oklch(0.4 0.03 265);
+  --status-running: oklch(0.75 0.13 252);
+  --status-running-soft: oklch(0.3 0.06 255);
+  --status-running-border: oklch(0.45 0.09 255);
+  --status-success: oklch(0.75 0.12 158);
+  --status-success-soft: oklch(0.28 0.05 158);
+  --status-success-border: oklch(0.42 0.08 158);
+  --status-failed: oklch(0.74 0.15 27);
+  --status-failed-soft: oklch(0.29 0.06 27);
+  --status-failed-border: oklch(0.44 0.09 27);
+  --status-attention: oklch(0.78 0.12 80);
+  --status-attention-soft: oklch(0.3 0.05 85);
+  --status-attention-border: oklch(0.45 0.08 85);
 }
 
 /* Dark-mode compatibility layer. The component tree hard-codes slate/white
@@ -136,6 +154,27 @@
 .dark .border-slate-100,
 .dark .border-slate-200,
 .dark .border-slate-300 { border-color: var(--border); }
+.dark .hover\:bg-slate-50:hover,
+.dark .hover\:bg-slate-50\/80:hover,
+.dark .hover\:bg-slate-100:hover,
+.dark .hover\:bg-slate-200:hover { background-color: var(--accent); }
+.dark .hover\:text-slate-500:hover,
+.dark .hover\:text-slate-600:hover,
+.dark .hover\:text-slate-700:hover,
+.dark .hover\:text-slate-800:hover,
+.dark .hover\:text-slate-900:hover { color: var(--foreground); }
+.dark .bg-slate-50\/50,
+.dark .bg-slate-50\/60,
+.dark .bg-slate-50\/80 { background-color: var(--muted); }
+.dark .bg-blue-50,
+.dark .bg-blue-50\/60,
+.dark .bg-blue-100 { background-color: var(--status-running-soft); }
+.dark .text-blue-600,
+.dark .text-blue-700 { color: var(--status-running); }
+.dark .border-blue-100,
+.dark .border-blue-200,
+.dark .border-blue-300,
+.dark .border-blue-500 { border-color: var(--status-running-border); }
 
 @layer base {
   * {
