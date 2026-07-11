@@ -1,5 +1,3 @@
-import { Rocket } from "lucide-react"
-
 import type { SystemSummary } from "@/api/types"
 import { Tooltip } from "@/components/ui/tooltip"
 
@@ -24,13 +22,7 @@ function Readout({ label, value, hint }: { label: string; value: string; hint: s
   )
 }
 
-export function NavBar({
-  onLaunchSetups,
-  system,
-}: {
-  onLaunchSetups: () => void
-  system: SystemSummary | null
-}) {
+export function NavBar({ system }: { system: SystemSummary | null }) {
   const disk = bytes(system?.dockerDiskUsed)
   const mem =
     system?.memTotal != null && system?.memUsed != null
@@ -41,15 +33,9 @@ export function NavBar({
 
   return (
     <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-[#fbfbfc] px-5 py-2 sm:px-6">
-      <Tooltip label="Launch one or more project setups" side="bottom">
-        <button
-          className="inline-flex items-center gap-1.5 rounded-md bg-slate-900 px-3 py-1.5 text-[13px] font-semibold text-white hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-          onClick={onLaunchSetups}
-          type="button"
-        >
-          <Rocket size={14} /> Launch setups
-        </button>
-      </Tooltip>
+      <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">
+        SAG Workbench
+      </span>
 
       <div className="hidden items-center gap-4 sm:flex">
         {disk ? (

@@ -338,7 +338,7 @@ export function App() {
           </span>
         </div>
 
-        <NavBar onLaunchSetups={() => setLaunchDialogOpen(true)} system={system} />
+        <NavBar system={system} />
 
         <div className="min-h-0 flex-1 overflow-hidden">
         {!dashboard && !loading && dashboardError ? (

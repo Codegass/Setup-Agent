@@ -1,16 +1,14 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { cleanup, render, screen } from "@testing-library/react"
+import { afterEach, describe, expect, it } from "vitest"
 
 import { NavBar } from "./NavBar"
 
 describe("NavBar", () => {
   afterEach(() => cleanup())
 
-  it("launches and renders formatted system stats", () => {
-    const onLaunch = vi.fn()
+  it("renders formatted system stats", () => {
     render(
       <NavBar
-        onLaunchSetups={onLaunch}
         system={{
           dockerDiskUsed: 2 * (1 << 30),
           memUsed: 4 * (1 << 30),
@@ -19,16 +17,13 @@ describe("NavBar", () => {
         }}
       />,
     )
-    fireEvent.click(screen.getByRole("button", { name: /Launch setups/ }))
-    expect(onLaunch).toHaveBeenCalled()
     expect(screen.getByText("2.0 GB")).toBeInTheDocument()
     expect(screen.getByText("4.0 GB / 16.0 GB")).toBeInTheDocument()
     expect(screen.getByText("1.23")).toBeInTheDocument()
   })
 
   it("omits stats that are unavailable", () => {
-    render(<NavBar onLaunchSetups={() => {}} system={null} />)
-    expect(screen.getByRole("button", { name: /Launch setups/ })).toBeInTheDocument()
+    render(<NavBar system={null} />)
     expect(screen.queryByText(/GB/)).not.toBeInTheDocument()
   })
 })
