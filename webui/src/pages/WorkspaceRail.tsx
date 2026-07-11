@@ -85,11 +85,25 @@ function RailRow({
           </span>
         ) : (
           <>
-            {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-muted-foreground" size={12} />}
+            <Tooltip
+              label={
+                build === "success"
+                  ? "Build succeeded"
+                  : build === "failure" || build === "failed"
+                    ? "Build failed"
+                    : "No build result yet"
+              }
+            >
+              {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-muted-foreground" size={12} />}
+            </Tooltip>
             {normalize(workspace.test.state) !== "none" && total > 0 ? (
-              <TestBar fail={workspace.test.fail} pass={workspace.test.pass} total={total} />
+              <Tooltip label={`Tests: ${workspace.test.pass} passed, ${workspace.test.fail} failed of ${total}`}>
+                <TestBar fail={workspace.test.fail} pass={workspace.test.pass} total={total} />
+              </Tooltip>
             ) : (
-              <span className="w-10 text-right font-mono text-[10px] text-muted-foreground">—</span>
+              <Tooltip label="No tests run yet">
+                <span className="w-10 text-right font-mono text-[10px] text-muted-foreground">—</span>
+              </Tooltip>
             )}
           </>
         )}
