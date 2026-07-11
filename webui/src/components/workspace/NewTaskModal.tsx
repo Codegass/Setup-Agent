@@ -56,43 +56,43 @@ export function NewTaskModal({
         }
       }}
     >
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[520px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
-        <DialogHeader className="border-b border-slate-100 px-4 py-3">
-          <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-slate-800">
-            <Plus size={16} className="text-blue-600" />
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[520px] gap-0 border-border bg-card p-0 shadow-xl">
+        <DialogHeader className="border-b border-border px-4 py-3">
+          <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
+            <Plus size={16} className="text-status-running" />
             New task
           </DialogTitle>
-          <DialogDescription className="font-mono text-[11px] text-slate-500">
+          <DialogDescription className="font-mono text-[11px] text-muted-foreground">
             Creates a new execution session in {workspace.id}
           </DialogDescription>
         </DialogHeader>
         <form className="p-4" onSubmit={handleSubmit}>
           {sourceSession ? (
-            <div className="mb-3 rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-[12px] text-blue-700">
+            <div className="mb-3 rounded-md border border-status-running-border bg-status-running-soft px-3 py-2 text-[12px] text-status-running">
               Prefilled from <span className="font-mono">{sourceSession}</span>. This starts a new
               workspace task, not a continuation of the session as chat.
             </div>
           ) : null}
           <label
-            className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500"
+            className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground"
             htmlFor="workspace-task"
           >
             Task description
           </label>
           <textarea
             autoFocus
-            className="mt-1.5 w-full resize-none rounded-md border border-slate-200 p-3 text-[13px] text-slate-700 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20"
+            className="mt-1.5 w-full resize-none rounded-md border border-border p-3 text-[13px] text-foreground outline-none focus:border-ring focus:ring-2 focus:ring-ring/30"
             id="workspace-task"
             onChange={(event) => setTask(event.target.value)}
             placeholder="e.g. add a health check and run the smoke tests"
             rows={4}
             value={task}
           />
-          <div className="mt-2 flex items-center gap-2 font-mono text-[10.5px] text-slate-500">
+          <div className="mt-2 flex items-center gap-2 font-mono text-[10.5px] text-muted-foreground">
             <Box size={12} />
             POST /api/workspaces/{workspace.id}/tasks
           </div>
-          {error ? <div className="mt-3 text-[12px] text-red-600">{error}</div> : null}
+          {error ? <div className="mt-3 text-[12px] text-status-failed">{error}</div> : null}
           <DialogFooter className="mt-4 gap-2 sm:space-x-0">
             <Button disabled={submitting} onClick={onClose} type="button" variant="outline">
               Cancel

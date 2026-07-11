@@ -47,11 +47,11 @@ export function TestCard({
     return (
       <Card className="p-4">
         <div className="flex items-center justify-between gap-3">
-          <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">Tests</div>
+          <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Tests</div>
           <StatusBadge status={test.state} />
         </div>
-        <div className="mt-2 text-[14px] font-semibold text-slate-700">No test evidence</div>
-        <div className="mt-1 font-mono text-[11px] text-slate-500">Runner XML not found</div>
+        <div className="mt-2 text-[14px] font-semibold text-foreground">No test evidence</div>
+        <div className="mt-1 font-mono text-[11px] text-muted-foreground">Runner XML not found</div>
       </Card>
     )
   }
@@ -59,36 +59,36 @@ export function TestCard({
   return (
     <Card className="p-4">
       <div className="flex items-center justify-between gap-3">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">Tests</div>
+        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Tests</div>
         <StatusBadge status={test.state} />
       </div>
 
-      <div className="mt-2 text-[22px] font-semibold tabular-nums text-slate-900">
+      <div className="mt-2 text-[22px] font-semibold tabular-nums text-foreground">
         {passRate ? `${passRate} passed` : `${test.pass.toLocaleString()} passed`}
       </div>
 
-      <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-slate-100" aria-label="runner pass rate">
-        <div className="h-full bg-emerald-500" style={{ width: barWidth(test.pass, test.total) }} />
-        <div className="h-full bg-red-500" style={{ width: barWidth(failed, test.total) }} />
+      <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-muted" aria-label="runner pass rate">
+        <div className="h-full bg-status-success" style={{ width: barWidth(test.pass, test.total) }} />
+        <div className="h-full bg-status-failed" style={{ width: barWidth(failed, test.total) }} />
       </div>
 
-      <div className="mt-2.5 space-y-1 font-mono text-[11px] text-slate-600">
+      <div className="mt-2.5 space-y-1 font-mono text-[11px] text-muted-foreground">
         <div>{test.pass.toLocaleString()} / {test.total.toLocaleString()} runner executions passed</div>
         <div>
-          <span className={failed ? "text-red-600" : ""}>{failed} failed</span>
-          {errors ? <span className="text-red-600">{" · "}{errors} errors</span> : null}
+          <span className={failed ? "text-status-failed" : ""}>{failed} failed</span>
+          {errors ? <span className="text-status-failed">{" · "}{errors} errors</span> : null}
           {" · "}{test.skip} skipped
           {test.reportFileCount != null ? <> · {test.reportFileCount.toLocaleString()} XML reports</> : null}
         </div>
         {uniqueTotal ? (
-          <div className="text-slate-500">
+          <div className="text-muted-foreground">
             {uniqueTotal} unique methods{methodCoverage ? ` · ${methodCoverage} method coverage` : ""}
           </div>
         ) : null}
       </div>
 
       {(test.conflicts ?? []).length ? (
-        <div className="mt-2 inline-flex rounded bg-amber-50 px-1.5 py-0.5 font-mono text-[10px] text-amber-700">
+        <div className="mt-2 inline-flex rounded bg-status-attention-soft px-1.5 py-0.5 font-mono text-[10px] text-status-attention">
           {(test.conflicts ?? []).length} conflict{(test.conflicts ?? []).length > 1 ? "s" : ""}
         </div>
       ) : null}
@@ -97,7 +97,7 @@ export function TestCard({
         <Tooltip className="mt-3" label="Open the full test breakdown">
           <button
             aria-label="Open test details"
-            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-muted-foreground transition-colors hover:text-foreground"
             onClick={onOpenDetail}
             type="button"
           >

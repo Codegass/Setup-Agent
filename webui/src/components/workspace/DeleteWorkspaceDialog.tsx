@@ -63,23 +63,23 @@ export function DeleteWorkspaceDialog({
         }
       }}
     >
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[480px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
-        <DialogHeader className="border-b border-slate-100 px-4 py-3">
-          <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-slate-800">
-            <Trash2 size={16} className="text-red-600" />
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[480px] gap-0 border-border bg-card p-0 shadow-xl">
+        <DialogHeader className="border-b border-border px-4 py-3">
+          <DialogTitle className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
+            <Trash2 size={16} className="text-status-failed" />
             {title}
           </DialogTitle>
-          <DialogDescription className="font-mono text-[11px] text-slate-500">
+          <DialogDescription className="font-mono text-[11px] text-muted-foreground">
             {batch ? `${count} workspaces selected` : `DELETE /api/workspaces/${target.workspaceId}`}
           </DialogDescription>
         </DialogHeader>
 
-        <div className="px-4 py-4 text-[13px] leading-relaxed text-slate-600">
+        <div className="px-4 py-4 text-[13px] leading-relaxed text-muted-foreground">
           <p>
-            This removes <span className="font-medium text-slate-800">{target.label}</span>{" "}
+            This removes <span className="font-medium text-foreground">{target.label}</span>{" "}
             and cannot be undone. SAG will:
           </p>
-          <ul className="mt-2 list-disc space-y-1 pl-5 text-[12.5px] text-slate-600">
+          <ul className="mt-2 list-disc space-y-1 pl-5 text-[12.5px] text-muted-foreground">
             <li>
               {isWorkspace
                 ? "Stop and remove its Docker container"
@@ -90,10 +90,10 @@ export function DeleteWorkspaceDialog({
         </div>
 
         {error ? (
-          <div className="px-4 pb-1 text-[12px] text-red-600">{error}</div>
+          <div className="px-4 pb-1 text-[12px] text-status-failed">{error}</div>
         ) : null}
 
-        <DialogFooter className="gap-2 border-t border-slate-100 px-4 py-3 sm:space-x-0">
+        <DialogFooter className="gap-2 border-t border-border px-4 py-3 sm:space-x-0">
           <Button
             disabled={submitting}
             onClick={onCancel}

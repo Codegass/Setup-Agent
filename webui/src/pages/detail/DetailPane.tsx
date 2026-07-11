@@ -31,7 +31,7 @@ function TabBar({
   return (
     <nav
       aria-label="Detail tabs"
-      className="flex shrink-0 items-center gap-0.5 overflow-x-auto border-b border-slate-200 bg-white px-5 sm:px-7"
+      className="flex shrink-0 items-center gap-0.5 overflow-x-auto border-b border-border bg-card px-5 sm:px-7"
     >
       {tabs.map((tab) => {
         const on = active === tab.id
@@ -42,8 +42,8 @@ function TabBar({
             className={cn(
               "inline-flex shrink-0 items-center gap-2 border-b-2 px-3 py-2.5 text-[13px] font-semibold transition-colors",
               on
-                ? "border-primary text-slate-700"
-                : "border-transparent text-slate-500 hover:text-slate-700",
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
             )}
             onClick={() => onSelect(tab.id)}
             type="button"
@@ -55,7 +55,7 @@ function TabBar({
                   "inline-flex h-[18px] min-w-[18px] items-center justify-center rounded-full px-1.5 text-[11px] font-bold tabular-nums",
                   tab.tone === "red"
                     ? "bg-status-failed-soft text-status-failed"
-                    : "bg-slate-200 text-slate-600",
+                    : "bg-accent text-muted-foreground",
                 )}
               >
                 {tab.count}
@@ -118,7 +118,7 @@ export function DetailPane({
         workspace={workspace}
       />
 
-      <div className="shrink-0 bg-white px-5 pb-4 pt-4 sm:px-7">
+      <div className="shrink-0 bg-card px-5 pb-4 pt-4 sm:px-7">
         <VerdictBand detail={detail} />
       </div>
 

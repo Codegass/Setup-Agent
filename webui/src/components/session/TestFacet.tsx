@@ -27,11 +27,11 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
     <Card className="p-4">
       <div className="flex items-end justify-between gap-4">
         <div>
-          <div className="text-[26px] font-semibold tabular-nums text-slate-900">
+          <div className="text-[26px] font-semibold tabular-nums text-foreground">
             {fmtNum(test.pass)}
-            <span className="text-[16px] font-normal text-slate-400"> / {fmtNum(total)}</span>
+            <span className="text-[16px] font-normal text-muted-foreground"> / {fmtNum(total)}</span>
           </div>
-          <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">
+          <div className="mt-0.5 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
             runner executions passed
           </div>
         </div>
@@ -47,8 +47,8 @@ export function TestConclusionCard({ test }: { test: ExecutionSessionDetail["tes
       <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 font-mono text-[12px]">
         <span className="text-status-success">{fmtNum(test.pass)} passed</span>
         <span className="text-status-failed">{fmtNum(test.fail)} failed</span>
-        <span className="text-slate-500">{fmtNum(test.skip)} skipped</span>
-        {test.note ? <span className="text-slate-400">· {test.note}</span> : null}
+        <span className="text-muted-foreground">{fmtNum(test.skip)} skipped</span>
+        {test.note ? <span className="text-muted-foreground">· {test.note}</span> : null}
       </div>
     </Card>
   )

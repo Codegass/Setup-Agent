@@ -27,7 +27,7 @@ export function Tooltip({
         role="tooltip"
         className={cn(
           "pointer-events-none absolute left-1/2 z-[var(--z-popover,40)] -translate-x-1/2",
-          "whitespace-nowrap rounded-md bg-slate-900 px-2 py-1 text-[11px] font-medium text-white shadow-md",
+          "whitespace-nowrap rounded-md bg-foreground px-2 py-1 text-[11px] font-medium text-background shadow-md",
           "opacity-0 transition-opacity delay-200 duration-100",
           "group-hover/tt:opacity-100 group-focus-within/tt:opacity-100",
           side === "top" ? "bottom-full mb-1.5" : "top-full mt-1.5",

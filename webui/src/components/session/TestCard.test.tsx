@@ -68,7 +68,7 @@ describe("TestCard", () => {
     expect(screen.getByText(/3 errors/)).toBeInTheDocument()
     // the red bar must not be empty when only errors are present
     const bar = screen.getByLabelText("runner pass rate")
-    const red = bar.querySelector(".bg-red-500") as HTMLElement
+    const red = bar.querySelector(".bg-status-failed") as HTMLElement
     expect(red.style.width).not.toBe("0%")
   })
 })

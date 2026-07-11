@@ -21,7 +21,7 @@ function SecondaryButton({
   return (
     <Tooltip label={hint} side="bottom">
       <button
-        className="inline-flex h-[34px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-[13px] font-semibold text-slate-700 hover:bg-slate-50"
+        className="inline-flex h-[34px] items-center gap-1.5 rounded-lg border border-border bg-card px-3 text-[13px] font-semibold text-foreground hover:bg-accent"
         onClick={onClick}
         type="button"
       >
@@ -88,19 +88,19 @@ export function DetailHeader({
     .join(" · ")
 
   return (
-    <div className="sticky top-0 z-[var(--z-sticky)] flex-none border-b border-slate-200 bg-white/90 px-5 pb-4 pt-4 backdrop-blur-md sm:px-6">
+    <div className="sticky top-0 z-[var(--z-sticky)] flex-none border-b border-border bg-card/90 px-5 pb-4 pt-4 backdrop-blur-md sm:px-6">
       <div className="flex items-start gap-4">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2.5">
-            <h2 className="truncate text-[19px] font-bold leading-tight tracking-[-0.02em] text-slate-900">
+            <h2 className="truncate text-[19px] font-bold leading-tight tracking-[-0.02em] text-foreground">
               {workspace.project}
             </h2>
             {entry ? (
-              <span className="shrink-0 font-mono text-[11px] text-slate-400">{entry}</span>
+              <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{entry}</span>
             ) : null}
           </div>
           {meta ? (
-            <div className="mt-[3px] truncate font-mono text-[12px] leading-snug text-slate-500">
+            <div className="mt-[3px] truncate font-mono text-[12px] leading-snug text-muted-foreground">
               {meta}
             </div>
           ) : null}
@@ -109,7 +109,7 @@ export function DetailHeader({
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip label="Run a new task in this workspace" side="bottom">
             <button
-              className="inline-flex h-[34px] items-center gap-1.5 rounded-lg bg-primary px-3.5 text-[13px] font-semibold text-white hover:opacity-90"
+              className="inline-flex h-[34px] items-center gap-1.5 rounded-lg bg-primary px-3.5 text-[13px] font-semibold text-primary-foreground hover:opacity-90"
               onClick={onNewTask}
               type="button"
             >
@@ -126,7 +126,7 @@ export function DetailHeader({
                 aria-haspopup="menu"
                 aria-expanded={menuOpen}
                 aria-label="More"
-                className="inline-flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-slate-200 bg-white text-slate-500 hover:bg-slate-50"
+                className="inline-flex h-[34px] w-[34px] items-center justify-center rounded-lg border border-border bg-card text-muted-foreground hover:bg-accent"
                 onClick={() => setMenuOpen((open) => !open)}
                 type="button"
               >
@@ -136,12 +136,12 @@ export function DetailHeader({
 
             {menuOpen ? (
               <div
-                className="absolute right-0 top-[40px] z-[var(--z-popover,40)] w-[240px] rounded-xl border border-slate-200 bg-white p-1.5 shadow-[0_12px_30px_-8px_rgba(15,23,42,0.22)]"
+                className="absolute right-0 top-[40px] z-[var(--z-popover,40)] w-[240px] rounded-xl border border-border bg-card p-1.5 shadow-lg"
                 role="menu"
               >
                 {sessions.length > 1 ? (
-                  <div className="border-b border-slate-100 pb-1.5">
-                    <div className="px-2 py-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+                  <div className="border-b border-border pb-1.5">
+                    <div className="px-2 py-1 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                       Sessions
                     </div>
                     {sessions.map((s) => {
@@ -154,7 +154,7 @@ export function DetailHeader({
                             "flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12.5px] transition-colors",
                             active
                               ? "bg-status-running-soft text-status-running"
-                              : "text-slate-600 hover:bg-slate-50",
+                              : "text-muted-foreground hover:bg-accent",
                           )}
                           onClick={() => {
                             onSession(s.id)
@@ -172,7 +172,7 @@ export function DetailHeader({
                             )}
                           />
                           <span className="font-mono">{s.id}</span>
-                          <span className="truncate text-slate-400">{s.title}</span>
+                          <span className="truncate text-muted-foreground">{s.title}</span>
                         </button>
                       )
                     })}

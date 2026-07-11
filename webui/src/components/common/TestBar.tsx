@@ -14,23 +14,23 @@ function percent(value: number, total: number): string {
 
 export function TestBar({ pass, fail, total, className, ...props }: TestBarProps) {
   if (total <= 0) {
-    return <span className="text-slate-400">—</span>
+    return <span className="text-muted-foreground">—</span>
   }
 
   return (
     <div className={cn("flex items-center gap-2", className)} {...props}>
       <div
         aria-label={`${pass} passed, ${fail} failed, ${total} total`}
-        className="flex h-1.5 w-20 overflow-hidden rounded-full bg-slate-100"
+        className="flex h-1.5 w-20 overflow-hidden rounded-full bg-muted"
         role="img"
       >
-        <div className="h-full bg-emerald-500" style={{ width: percent(pass, total) }} />
-        <div className="h-full bg-red-500" style={{ width: percent(fail, total) }} />
+        <div className="h-full bg-status-success" style={{ width: percent(pass, total) }} />
+        <div className="h-full bg-status-failed" style={{ width: percent(fail, total) }} />
       </div>
-      <span className="font-mono text-[11px] text-slate-500">
-        <span className="text-emerald-600">{pass}</span>
-        {fail ? <span className="text-red-600"> / {fail}</span> : null}{" "}
-        <span className="text-slate-500">· {total}</span>
+      <span className="font-mono text-[11px] text-muted-foreground">
+        <span className="text-status-success">{pass}</span>
+        {fail ? <span className="text-status-failed"> / {fail}</span> : null}{" "}
+        <span className="text-muted-foreground">· {total}</span>
       </span>
     </div>
   )

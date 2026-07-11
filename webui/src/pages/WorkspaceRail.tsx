@@ -68,28 +68,28 @@ function RailRow({
       </span>
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
-          <span className={cn("truncate text-[13px] font-medium", selected && !selectMode ? "text-status-running" : "text-slate-800")}>
+          <span className={cn("truncate text-[13px] font-medium", selected && !selectMode ? "text-status-running" : "text-foreground")}>
             {workspace.project}
           </span>
-          {workspace.release ? <span className="shrink-0 font-mono text-[9.5px] text-slate-500">{workspace.release}</span> : null}
+          {workspace.release ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{workspace.release}</span> : null}
           {workspace.activeSession ? <Activity className="shrink-0 text-status-running" size={11} /> : null}
         </span>
-        <span className="mt-0.5 block truncate font-mono text-[10px] text-slate-500">
+        <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
           {[workspace.stack, workspace.commit].filter(Boolean).join(" · ")}
         </span>
       </span>
       <span className="flex shrink-0 items-center gap-2">
         {deleting ? (
-          <span className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-500">
+          <span className="inline-flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
             <Loader2 className="animate-spin" size={11} /> deleting…
           </span>
         ) : (
           <>
-            {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-slate-400" size={12} />}
+            {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-muted-foreground" size={12} />}
             {normalize(workspace.test.state) !== "none" && total > 0 ? (
               <TestBar fail={workspace.test.fail} pass={workspace.test.pass} total={total} />
             ) : (
-              <span className="w-10 text-right font-mono text-[10px] text-slate-400">—</span>
+              <span className="w-10 text-right font-mono text-[10px] text-muted-foreground">—</span>
             )}
           </>
         )}
@@ -101,8 +101,8 @@ function RailRow({
     return (
       <label
         className={cn(
-          "flex w-full cursor-pointer items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 last:border-b-0",
-          checked ? "bg-status-running-soft" : "hover:bg-slate-50/80",
+          "flex w-full cursor-pointer items-center gap-3 border-b border-border px-3.5 py-2.5 last:border-b-0",
+          checked ? "bg-status-running-soft" : "hover:bg-accent",
         )}
       >
         <input
@@ -122,15 +122,15 @@ function RailRow({
       aria-current={selected}
       aria-label={`Open workspace ${workspace.project}`}
       className={cn(
-        "group flex w-full items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 text-left transition-colors last:border-b-0",
+        "group flex w-full items-center gap-3 border-b border-border px-3.5 py-2.5 text-left transition-colors last:border-b-0",
         deleting
           ? "cursor-default opacity-60"
           : selected
             ? "bg-status-running-soft"
             : attention
               ? "bg-status-failed-soft/40 hover:bg-status-failed-soft/60"
-              : "hover:bg-slate-50/80",
-        highlighted && !selected && !deleting ? "bg-blue-50/60" : "",
+              : "hover:bg-accent",
+        highlighted && !selected && !deleting ? "bg-status-running-soft" : "",
       )}
       disabled={deleting}
       onClick={() => onSelect(workspace.id)}
@@ -155,18 +155,18 @@ function PendingRailRow({
     <div
       aria-label={`Pending launch ${project}`}
       className={cn(
-        "flex w-full items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 text-left last:border-b-0",
-        failed ? "bg-status-failed-soft/40" : "bg-slate-50/40",
+        "flex w-full items-center gap-3 border-b border-border px-3.5 py-2.5 text-left last:border-b-0",
+        failed ? "bg-status-failed-soft/40" : "bg-muted",
       )}
     >
       <span className={cn("inline-flex h-1.5 w-1.5 shrink-0 rounded-full", dot)} />
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
-          <span className="truncate text-[13px] font-medium text-slate-600">{project}</span>
-          {item.ref ? <span className="shrink-0 font-mono text-[9.5px] text-slate-500">{item.ref}</span> : null}
+          <span className="truncate text-[13px] font-medium text-muted-foreground">{project}</span>
+          {item.ref ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{item.ref}</span> : null}
         </span>
         <span
-          className={cn("mt-0.5 block truncate text-[10px]", failed ? "text-status-failed" : "text-slate-500")}
+          className={cn("mt-0.5 block truncate text-[10px]", failed ? "text-status-failed" : "text-muted-foreground")}
           title={failed ? item.error ?? undefined : undefined}
         >
           {launchStatusLine(item)}
@@ -178,7 +178,7 @@ function PendingRailRow({
           <Tooltip label="Remove this failed launch from the list">
             <button
               aria-label={`Remove failed launch ${project}`}
-              className="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
+              className="rounded-md p-1 text-muted-foreground hover:bg-status-failed-soft hover:text-status-failed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-failed/40"
               onClick={() =>
                 onRemove({ workspaceId: item.workspace_id, label: project, kind: "launch" })
               }
@@ -195,11 +195,11 @@ function PendingRailRow({
 
 function Chip({ label, value, tone }: { label: string; value: number; tone?: "blue" | "red" }) {
   return (
-    <div className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2">
-      <div className={cn("text-[18px] font-semibold tabular-nums", tone === "red" ? "text-status-failed" : tone === "blue" ? "text-status-running" : "text-slate-900")}>
+    <div className="flex-1 rounded-lg border border-border bg-card px-3 py-2">
+      <div className={cn("text-[18px] font-semibold tabular-nums", tone === "red" ? "text-status-failed" : tone === "blue" ? "text-status-running" : "text-foreground")}>
         {value}
       </div>
-      <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-500">{label}</div>
+      <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -222,10 +222,10 @@ function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
   if (!rows.length) return null
 
   return (
-    <div className="mt-2 space-y-1 rounded-md border border-slate-200 bg-slate-50/50 px-2.5 py-2">
+    <div className="mt-2 space-y-1 rounded-md border border-border bg-muted px-2.5 py-2">
       {rows.map((row) => (
         <Tooltip key={row.label} className="flex w-full items-center justify-between" label={row.hint} side="bottom">
-          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-slate-400">{row.label}</span>
+          <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">{row.label}</span>
           <span className={cn("font-mono text-[11px] font-semibold", parseFloat(row.value) >= 80 ? "text-status-success" : "text-status-attention")}>
             {row.value}
           </span>
@@ -328,30 +328,30 @@ export function WorkspaceRail({
   return (
     <aside
       aria-label="Workspaces"
-      className={cn("relative flex h-full min-h-0 shrink-0 flex-col border-r border-slate-200 bg-white", className)}
+      className={cn("relative flex h-full min-h-0 shrink-0 flex-col border-r border-border bg-card", className)}
       id="workspace-rail"
       style={{ width: railWidth }}
     >
       {/* Drag the right edge to resize (desktop only; the rail is a drawer on mobile). */}
       <div
         aria-orientation="vertical"
-        className="absolute right-0 top-0 z-10 hidden h-full w-1 cursor-col-resize hover:bg-slate-300 lg:block"
+        className="absolute right-0 top-0 z-10 hidden h-full w-1 cursor-col-resize hover:bg-accent lg:block"
         onMouseDown={startResize}
         role="separator"
       />
-      <div className="border-b border-slate-200 px-4 pb-3 pt-4">
+      <div className="border-b border-border px-4 pb-3 pt-4">
         <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-900 font-mono text-[11px] font-bold text-white">S</span>
+          <span className="flex h-6 w-6 items-center justify-center rounded bg-primary font-mono text-[11px] font-bold text-primary-foreground">S</span>
           <div className="min-w-0">
-            <div className="text-[13px] font-semibold tracking-tight text-slate-900">SAG Workbench</div>
-            <div className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-slate-500">
+            <div className="text-[13px] font-semibold tracking-tight text-foreground">SAG Workbench</div>
+            <div className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
               <span className={cn("inline-flex h-1 w-1 rounded-full", dockerDot)} /> docker {data.docker.version ?? data.docker.status}
             </div>
           </div>
         </div>
         <Tooltip className="mt-3 w-full" label="Queue project setups from a list of repo URLs" side="bottom">
           <button
-            className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-slate-900 px-3 py-2 text-[12.5px] font-medium text-white hover:bg-slate-800"
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[12.5px] font-medium text-primary-foreground hover:bg-primary/90"
             onClick={onLaunchSetups}
             type="button"
           >
@@ -365,10 +365,10 @@ export function WorkspaceRail({
         </div>
         <RailSummary workspaces={data.workspaces} />
         <div className="relative mt-3">
-          <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
+          <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" size={13} />
           <input
             aria-label="Filter workspaces"
-            className="w-full rounded-md border border-slate-200 bg-slate-50/60 py-1.5 pl-8 pr-2 text-[12.5px] text-slate-700 placeholder:text-slate-400 focus:border-blue-300 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+            className="w-full rounded-md border border-border bg-muted py-1.5 pl-8 pr-2 text-[12.5px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:bg-card focus:outline-none focus:ring-2 focus:ring-ring/30"
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Filter workspaces…"
             value={query}
@@ -378,7 +378,7 @@ export function WorkspaceRail({
           <div className="mt-2 flex justify-end">
             <Tooltip label={selectMode ? "Exit multi-select mode" : "Select multiple workspaces to delete"}>
               <button
-                className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500 hover:text-slate-700"
+                className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground hover:text-foreground"
                 onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
                 type="button"
               >
@@ -415,24 +415,24 @@ export function WorkspaceRail({
           </>
         ) : data.workspaces.length === 0 && pending.length === 0 ? (
           <div className="flex flex-col items-center px-4 py-12 text-center">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-muted text-muted-foreground">
               <GitBranch size={18} />
             </div>
-            <div className="mt-3 text-[13px] font-medium text-slate-700">No workspaces yet</div>
-            <p className="mt-1 text-[12px] leading-relaxed text-slate-500">
+            <div className="mt-3 text-[13px] font-medium text-foreground">No workspaces yet</div>
+            <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
               Launch a setup to add one. Paste a list of repo URLs to queue many at once.
             </p>
           </div>
         ) : (
-          <div className="px-4 py-10 text-center text-[12px] text-slate-500">No matches</div>
+          <div className="px-4 py-10 text-center text-[12px] text-muted-foreground">No matches</div>
         )}
       </div>
 
       {selectMode ? (
-        <div className="flex items-center gap-2 border-t border-slate-200 bg-white px-4 py-2">
+        <div className="flex items-center gap-2 border-t border-border bg-card px-4 py-2">
           <Tooltip className="flex-1" label="Delete the checked workspaces and their containers">
             <button
-              className="w-full rounded-md bg-status-failed px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-40"
+              className="w-full rounded-md bg-status-failed px-3 py-1.5 text-[12px] font-medium text-primary-foreground hover:opacity-90 disabled:opacity-40"
               disabled={picked.size === 0}
               onClick={() => setBatchConfirm(true)}
               type="button"
@@ -441,7 +441,7 @@ export function WorkspaceRail({
             </button>
           </Tooltip>
           <button
-            className="rounded-md border border-slate-200 px-3 py-1.5 text-[12px] text-slate-600 hover:bg-slate-50"
+            className="rounded-md border border-border px-3 py-1.5 text-[12px] text-muted-foreground hover:bg-accent"
             onClick={exitSelectMode}
             type="button"
           >
@@ -450,7 +450,7 @@ export function WorkspaceRail({
         </div>
       ) : null}
 
-      <div className="flex items-center gap-2 border-t border-slate-100 px-4 py-2 font-mono text-[9px] text-slate-500">
+      <div className="flex items-center gap-2 border-t border-border px-4 py-2 font-mono text-[9px] text-muted-foreground">
         <span>{lastUpdatedAt != null ? `Updated ${formatAgo(Date.now() - lastUpdatedAt)}` : "Updating…"}</span>
         {pollFailed ? (
           <span className="inline-flex items-center gap-1 text-status-attention">

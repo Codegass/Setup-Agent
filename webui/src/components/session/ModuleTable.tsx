@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils"
 function statusClass(s: string): string {
   if (s === "success") return "bg-status-success-soft text-status-success"
   if (s === "failure") return "bg-status-failed-soft text-status-failed"
-  if (s === "skipped") return "bg-slate-100 text-slate-500"
+  if (s === "skipped") return "bg-muted text-muted-foreground"
   return "bg-status-attention-soft text-status-attention"
 }
 
@@ -42,14 +42,14 @@ function buildLabel(s: string): string {
 function buildDotClass(s: string): string {
   if (s === "success") return "bg-status-success"
   if (s === "failure") return "bg-status-failed"
-  if (s === "skipped") return "bg-slate-400"
+  if (s === "skipped") return "bg-muted-foreground"
   return "bg-status-attention"
 }
 
 function buildTextClass(s: string): string {
   if (s === "success") return "text-status-success"
   if (s === "failure") return "text-status-failed"
-  if (s === "skipped") return "text-slate-500"
+  if (s === "skipped") return "text-muted-foreground"
   return "text-status-attention"
 }
 
@@ -59,7 +59,7 @@ function pct1(n: number): string {
 
 function ProgressBar({ rate, color }: { rate: number; color: string }) {
   return (
-    <span className="block h-[5px] overflow-hidden rounded-full bg-slate-100">
+    <span className="block h-[5px] overflow-hidden rounded-full bg-muted">
       <span
         className="block h-full rounded-full"
         style={{ width: `${Math.max(0, Math.min(100, rate))}%`, background: color }}
@@ -78,12 +78,12 @@ function OverviewRow({ m }: { m: ModuleSummary }) {
   const testColor = failing ? "var(--status-failed)" : "var(--status-success)"
   return (
     <div
-      className="grid items-center gap-3 border-t border-slate-100 px-4 py-3"
+      className="grid items-center gap-3 border-t border-border px-4 py-3"
       style={{ gridTemplateColumns: "1.5fr 0.8fr 1.3fr 1fr 1fr" }}
     >
       <div className="min-w-0">
-        <div className="text-[13px] font-semibold text-slate-800">{m.name}</div>
-        <div className="truncate font-mono text-[11px] text-slate-400">{m.path}</div>
+        <div className="text-[13px] font-semibold text-foreground">{m.name}</div>
+        <div className="truncate font-mono text-[11px] text-muted-foreground">{m.path}</div>
       </div>
       <div>
         <span className={cn("inline-flex items-center gap-1.5 text-[12px] font-semibold", buildTextClass(status))}>
@@ -94,34 +94,34 @@ function OverviewRow({ m }: { m: ModuleSummary }) {
       <div>
         {total > 0 ? (
           <>
-            <div className="mb-1.5 flex items-center justify-between font-mono text-[12px] text-slate-600">
+            <div className="mb-1.5 flex items-center justify-between font-mono text-[12px] text-muted-foreground">
               <span>{`${pass.toLocaleString()} / ${total.toLocaleString()}`}</span>
               {failing ? <span className="font-mono text-[11px] text-status-failed">{fc} failing</span> : null}
             </div>
             <ProgressBar rate={testRate} color={testColor} />
           </>
         ) : (
-          <span className="font-mono text-[12px] text-slate-400">—</span>
+          <span className="font-mono text-[12px] text-muted-foreground">—</span>
         )}
       </div>
       <div>
         {m.lineRate != null ? (
           <>
-            <div className="mb-1.5 font-mono text-[12px] text-slate-700">{pct1(m.lineRate)}</div>
+            <div className="mb-1.5 font-mono text-[12px] text-foreground">{pct1(m.lineRate)}</div>
             <ProgressBar rate={m.lineRate} color={covColor(m.lineRate)} />
           </>
         ) : (
-          <span className="font-mono text-[12px] text-slate-400">—</span>
+          <span className="font-mono text-[12px] text-muted-foreground">—</span>
         )}
       </div>
       <div>
         {m.branchRate != null ? (
           <>
-            <div className="mb-1.5 font-mono text-[12px] text-slate-700">{pct1(m.branchRate)}</div>
+            <div className="mb-1.5 font-mono text-[12px] text-foreground">{pct1(m.branchRate)}</div>
             <ProgressBar rate={m.branchRate} color={covColor(m.branchRate)} />
           </>
         ) : (
-          <span className="font-mono text-[12px] text-slate-400">—</span>
+          <span className="font-mono text-[12px] text-muted-foreground">—</span>
         )}
       </div>
     </div>
@@ -131,8 +131,8 @@ function OverviewRow({ m }: { m: ModuleSummary }) {
 function CoverageBar({ label, rate }: { label: string; rate: number }) {
   return (
     <div className="flex items-center gap-2 font-mono text-[11px]">
-      <span className="w-2 text-slate-500">{label}</span>
-      <span className="inline-block h-[7px] w-24 overflow-hidden rounded-full bg-slate-200">
+      <span className="w-2 text-muted-foreground">{label}</span>
+      <span className="inline-block h-[7px] w-24 overflow-hidden rounded-full bg-accent">
         <span className="block h-full" style={{ width: `${Math.max(0, Math.min(100, rate))}%`, background: covColor(rate) }} />
       </span>
       <span className={cn("w-9 font-semibold", covTextClass(rate))}>{Math.round(rate)}%</span>
@@ -161,7 +161,7 @@ export function ModuleTable({
     return (
       <div>
         <div
-          className="grid gap-3 bg-slate-50 px-4 py-2 font-mono text-[10px] uppercase tracking-[0.06em] text-slate-400"
+          className="grid gap-3 bg-muted px-4 py-2 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground"
           style={{ gridTemplateColumns: "1.5fr 0.8fr 1.3fr 1fr 1fr" }}
         >
           <div>Module</div>
@@ -180,7 +180,7 @@ export function ModuleTable({
   return (
     <table className="w-full border-collapse">
       <thead>
-        <tr className="border-b border-slate-200 font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">
+        <tr className="border-b border-border font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
           <th className="px-2 py-2 text-left">Module</th>
           {variant === "build" ? <th className="px-2 py-2 text-left">Build</th> : null}
           {variant === "build" ? (
@@ -213,7 +213,7 @@ export function ModuleTable({
           const canExpandBuild = variant === "build" && m.buildStatus === "failure" && errs.length > 0
           return (
             <Fragment key={m.path}>
-              <tr className="border-b border-slate-100 font-mono text-[12px] tabular-nums">
+              <tr className="border-b border-border font-mono text-[12px] tabular-nums">
                 <td className="px-2 py-2" style={{ paddingLeft: 8 + depth * 14 }}>{m.name}</td>
                 {variant === "build" ? (
                   <td className="px-2 py-2">
@@ -239,8 +239,8 @@ export function ModuleTable({
                           <ChevronDown className={cn("ml-1 inline", isOpen && "rotate-180")} size={12} />
                         </button>
                       ) : m.buildStatus === "skipped" ? (
-                        <span className="text-slate-500">upstream failed</span>
-                      ) : <span className="text-slate-300">—</span>}
+                        <span className="text-muted-foreground">upstream failed</span>
+                      ) : <span className="text-muted-foreground">—</span>}
                     </td>
                   </>
                 ) : (
@@ -251,7 +251,7 @@ export function ModuleTable({
                     <td className="px-2 py-2">{passRate(m.testsPassed, m.testsFailed)}</td>
                     <td className="px-2 py-2" style={{ minWidth: 150 }}>
                       {m.lineRate == null && m.branchRate == null ? (
-                        <span className="text-slate-500">— not measured</span>
+                        <span className="text-muted-foreground">— not measured</span>
                       ) : (
                         <div className="space-y-0.5">
                           {m.lineRate != null ? <CoverageBar label="L" rate={m.lineRate} /> : null}
@@ -266,7 +266,7 @@ export function ModuleTable({
                           View {fc} failure{fc > 1 ? "s" : ""}
                           <ChevronDown className={cn("ml-1 inline", isOpen && "rotate-180")} size={12} />
                         </button>
-                      ) : <span className="text-slate-300">—</span>}
+                      ) : <span className="text-muted-foreground">—</span>}
                     </td>
                   </>
                 )}
@@ -274,10 +274,10 @@ export function ModuleTable({
               {isOpen ? (
                 <tr className="bg-status-failed-soft/60">
                   <td colSpan={variant === "build" ? 5 : 7} className="px-3 py-2">
-                    <div className="mb-1.5 flex flex-wrap items-center gap-3 font-mono text-[10px] text-slate-500">
+                    <div className="mb-1.5 flex flex-wrap items-center gap-3 font-mono text-[10px] text-muted-foreground">
                       {variant === "test" && failing.length ? (
                         <button
-                          className="rounded border border-slate-300 px-1.5 py-0.5 hover:bg-white"
+                          className="rounded border border-border px-1.5 py-0.5 hover:bg-card"
                           onClick={() => navigator.clipboard?.writeText(failing.join("\n"))}
                           type="button"
                         >
@@ -285,7 +285,7 @@ export function ModuleTable({
                         </button>
                       ) : null}
                       {(m.evidenceRefs ?? [])[0] ? (
-                        <span>report: <span className="text-slate-600">{(m.evidenceRefs ?? [])[0]}</span></span>
+                        <span>report: <span className="text-muted-foreground">{(m.evidenceRefs ?? [])[0]}</span></span>
                       ) : null}
                     </div>
                     <div className="max-h-48 overflow-auto font-mono text-[11px] text-status-failed">
@@ -293,7 +293,7 @@ export function ModuleTable({
                         <div key={line} className="py-0.5">{line}</div>
                       ))}
                       {variant === "test" && hidden > 0 ? (
-                        <div className="text-slate-500">+{hidden} more — full list at {(m.evidenceRefs ?? [])[0] ?? "report dir"}</div>
+                        <div className="text-muted-foreground">+{hidden} more — full list at {(m.evidenceRefs ?? [])[0] ?? "report dir"}</div>
                       ) : null}
                     </div>
                   </td>

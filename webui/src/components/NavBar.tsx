@@ -15,10 +15,10 @@ function Readout({ label, value, hint }: { label: string; value: string; hint: s
   return (
     <Tooltip label={hint} side="bottom">
       <div className="flex items-baseline gap-1.5">
-        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-slate-400">
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
           {label}
         </span>
-        <span className="font-mono text-[12px] font-semibold text-slate-700">{value}</span>
+        <span className="font-mono text-[12px] font-semibold text-foreground">{value}</span>
       </div>
     </Tooltip>
   )
@@ -42,8 +42,8 @@ export function NavBar({
   const reclaimable = bytes(system?.dockerReclaimable)
 
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-background px-5 py-2 sm:px-6">
-      <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-slate-400">
+    <div className="flex items-center justify-between gap-3 border-b border-border bg-background px-5 py-2 sm:px-6">
+      <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
         SAG Workbench
       </span>
 
@@ -62,7 +62,7 @@ export function NavBar({
         <Tooltip label={dark ? "Switch to light mode" : "Switch to dark mode"} side="bottom">
           <button
             aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
-            className="rounded-md border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+            className="rounded-md border border-border p-1.5 text-muted-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
             onClick={onToggleTheme}
             type="button"
           >

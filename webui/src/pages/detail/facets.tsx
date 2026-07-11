@@ -42,7 +42,7 @@ export function buildDetailFacets(d: ExecutionSessionDetail): FacetMeta[] {
 
 export function Empty({ label }: { label: string }) {
   return (
-    <div className="rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-[12.5px] text-slate-500">
+    <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
       {label}
     </div>
   )

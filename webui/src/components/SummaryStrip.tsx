@@ -68,16 +68,16 @@ function Stat({
 }) {
   return (
     <Tooltip label={hint} side="bottom">
-      <div className="flex flex-col rounded-lg border border-slate-200 bg-white px-3 py-1.5">
-        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-slate-400">
+      <div className="flex flex-col rounded-lg border border-border bg-card px-3 py-1.5">
+        <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
           {label}
         </span>
         <span
           className={cn(
             "text-[15px] font-bold leading-tight",
-            tone === "good" && "text-emerald-600",
-            tone === "warn" && "text-amber-600",
-            tone === "neutral" && "text-slate-800",
+            tone === "good" && "text-status-success",
+            tone === "warn" && "text-status-attention",
+            tone === "neutral" && "text-foreground",
           )}
         >
           {value}
@@ -101,8 +101,8 @@ export function SummaryStrip({ workspaces }: { workspaces: WorkspaceSummary[] })
   const execRate = pct(r.executed, r.declared)
 
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-[#fbfbfc] px-5 py-2.5 sm:px-6">
-      <span className="mr-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+    <div className="flex flex-wrap items-center gap-2 border-b border-border bg-background px-5 py-2.5 sm:px-6">
+      <span className="mr-1 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
         Fleet
       </span>
       <Stat

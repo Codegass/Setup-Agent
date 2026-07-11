@@ -35,27 +35,27 @@ export function BuildCard({
   return (
     <Card className="p-4">
       <div className="flex items-center justify-between gap-3">
-        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">Build</div>
+        <div className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Build</div>
         <StatusBadge status={build.state} />
       </div>
 
       <div className="mt-2.5 flex items-center gap-2.5">
         <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-md",
-          tone === "ok" ? "bg-emerald-50 text-emerald-600"
-            : tone === "bad" ? "bg-red-50 text-red-600" : "bg-slate-100 text-slate-500")}>
+          tone === "ok" ? "bg-status-success-soft text-status-success"
+            : tone === "bad" ? "bg-status-failed-soft text-status-failed" : "bg-muted text-muted-foreground")}>
           {tone === "ok" ? <Check size={18} /> : tone === "bad" ? <X size={18} /> : <Box size={16} />}
         </div>
         <div className="min-w-0">
-          <div className="truncate text-[14px] font-semibold text-slate-800">{line}</div>
-          {meta ? <div className="font-mono text-[11px] text-slate-500">{meta}</div> : null}
+          <div className="truncate text-[14px] font-semibold text-foreground">{line}</div>
+          {meta ? <div className="font-mono text-[11px] text-muted-foreground">{meta}</div> : null}
         </div>
       </div>
 
       {(build.classCount != null || build.jarCount != null) ? (
-        <div className="mt-2 flex flex-wrap gap-3 font-mono text-[11px] text-slate-600">
+        <div className="mt-2 flex flex-wrap gap-3 font-mono text-[11px] text-muted-foreground">
           {build.classCount != null ? <span>{build.classCount.toLocaleString()} classes</span> : null}
           {build.jarCount != null ? <span>{build.jarCount.toLocaleString()} JARs</span> : null}
-          <span className="text-slate-500">Physical artifact scan</span>
+          <span className="text-muted-foreground">Physical artifact scan</span>
         </div>
       ) : null}
 
@@ -63,7 +63,7 @@ export function BuildCard({
         <Tooltip className="mt-3" label="Open the full build breakdown">
           <button
             aria-label="Open build details"
-            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+            className="inline-flex items-center gap-1 font-mono text-[10.5px] text-muted-foreground transition-colors hover:text-foreground"
             onClick={onOpenDetail}
             type="button"
           >

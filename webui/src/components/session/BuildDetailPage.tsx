@@ -13,9 +13,9 @@ function fmtNum(n?: number | null): string {
 
 function Stat({ label, value, tone }: { label: string; value: React.ReactNode; tone?: string }) {
   return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
-      <div className={cn("text-[20px] font-semibold tabular-nums", tone ?? "text-slate-900")}>{value}</div>
-      <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">{label}</div>
+    <div className="rounded-lg border border-border bg-card px-3 py-2">
+      <div className={cn("text-[20px] font-semibold tabular-nums", tone ?? "text-foreground")}>{value}</div>
+      <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -40,7 +40,7 @@ export function BuildDetailPage({ detail }: { detail: ExecutionSessionDetail }) 
         <Stat label="Success rate" value={rate != null ? `${rate}%` : "—"} />
       </div>
       {(s?.buildSystems ?? []).includes("gradle") ? (
-        <div className="font-mono text-[10px] text-slate-500">
+        <div className="font-mono text-[10px] text-muted-foreground">
           Gradle has no reactor summary — per-module build status is inferred from build outputs (best-effort).
         </div>
       ) : null}
@@ -50,7 +50,7 @@ export function BuildDetailPage({ detail }: { detail: ExecutionSessionDetail }) 
         </Card>
       ) : (
         <Card className="p-4">
-          <div className="font-mono text-[12px] text-slate-500">
+          <div className="font-mono text-[12px] text-muted-foreground">
             Single-module project — the conclusion and outputs cover the whole build.
           </div>
         </Card>
