@@ -1573,6 +1573,19 @@ class ReportTool(BaseTool, UIEventEmitter):
         if static_test_count and coverage_executed_tests is not None:
             try:
                 execution_rate = (coverage_executed_tests / static_test_count) * 100
+                # Clamp at 100%: the detected total is a collect-only/static
+                # denominator, so a re-run or parameterized drift can push the
+                # executed count one past it (live paramiko run 5: 559
+                # detected, 560 executed rendered "execution rate 100.2%" —
+                # nonsense on a report). Executed >= detected IS full
+                # coverage; the raw counts stay untouched and visible.
+                if execution_rate > 100.0:
+                    logger.info(
+                        "📊 Executed count exceeds the detected denominator "
+                        f"({coverage_executed_tests} > {static_test_count}); "
+                        "clamping execution rate at 100%"
+                    )
+                    execution_rate = 100.0
                 logger.info(
                     f"📊 Test Coverage: {execution_rate:.1f}% ({coverage_executed_tests} of {static_test_count} tests executed)"
                 )
@@ -1727,9 +1740,14 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
             * 100.0
         )
+        # executed >= detected is full coverage BY DEFINITION (the rate is
+        # clamped to exactly 100.0 above), so the gate can never fire there —
+        # not even under a strict 100% threshold. Below 100.0 the exact ratio
+        # and the threshold comparison are unchanged.
         if (
             status.get("static_test_count")
             and status.get("execution_rate") is not None
+            and status["execution_rate"] < 100.0
             and status["execution_rate"] < exec_threshold_pct
         ):
             ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
@@ -4175,7 +4193,12 @@ class ReportTool(BaseTool, UIEventEmitter):
                         f"**Test Coverage:** {tests_total or 0}/{static_test_count} tests executed"
                     )
                     if tests_total and static_test_count:
-                        execution_rate = (tests_total / static_test_count) * 100
+                        # Clamp at 100%: executed can exceed the collect-only
+                        # denominator (re-run/parameterized drift) and a rate
+                        # above 100% is nonsense; both raw counts stay visible.
+                        execution_rate = min(
+                            (tests_total / static_test_count) * 100, 100.0
+                        )
                         test_coverage_line += f" ({execution_rate:.1f}% execution rate)"
                     lines.append(test_coverage_line)
                     lines.append("")
