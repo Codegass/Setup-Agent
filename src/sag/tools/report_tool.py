@@ -3453,11 +3453,30 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # the live-run bug).
                 return None
             build_system = reported if reported in ("maven", "gradle") else "maven"
+        # Mixed-layout probe (live bigtop): a Maven-rooted project whose tests
+        # live in a Gradle subtree (the analyzer's test recommendation already
+        # records test_system='gradle' there). Scanning with ONE system's globs
+        # made the Gradle test cluster invisible — "1 built / 2 detected ·
+        # 0 tested / 2 not tested" while all 50 Gradle tests had passed. When
+        # marker files for BOTH systems exist, scan each and merge.
+        build_systems = [build_system]
+        other_system = "gradle" if build_system == "maven" else "maven"
+        probe = getattr(validator, "detect_java_build_systems", None)
+        if callable(probe):
+            try:
+                if other_system in (probe(project_dir) or []):
+                    build_systems.append(other_system)
+            except Exception as exc:
+                logger.debug(f"detect_java_build_systems failed: {exc}")
         try:
             modules = validator.scan_modules(project_dir, build_system)
         except Exception as exc:
             logger.debug(f"scan_modules failed: {exc}")
             return None
+        if len(build_systems) > 1:
+            modules = self._merge_mixed_system_modules(
+                validator, project_dir, build_system, modules, other_system
+            )
         if not modules:
             return None
 
@@ -3498,11 +3517,15 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # (e.g. carbondata's profile-gated modules): those built modules
                 # must still be counted, not collapsed to "0/1". A module that is
                 # neither declared nor produced artifacts (e.g. commons-chain's
-                # standalone apps/*) stays excluded.
+                # standalone apps/*) stays excluded. Gradle-scanned rows from a
+                # mixed layout are exempt: the root pom's <modules> can never
+                # declare a Gradle subtree, so narrowing would silently drop the
+                # whole Gradle test cluster (live bigtop).
                 modules = [
                     m
                     for m in modules
-                    if str(m.get("path") or ".") in active_rel
+                    if str(m.get("scan_build_system") or "").lower() == "gradle"
+                    or str(m.get("path") or ".") in active_rel
                     or (m.get("class_count") or 0) > 0
                     or (m.get("jar_count") or 0) > 0
                 ] or modules
@@ -3512,10 +3535,57 @@ class ReportTool(BaseTool, UIEventEmitter):
             modules=modules,
             reactor_status=reactor_status,
             tests=tests,
-            build_systems=[build_system],
+            build_systems=build_systems,
             build_error_samples=build_error_samples,
             generated_at=generated_at,
         )
+
+    @staticmethod
+    def _module_scan_richness(record: dict) -> tuple:
+        """Evidence order for deduping module rows found by BOTH scans."""
+        return (
+            len(record.get("report_dirs") or []),
+            1 if record.get("has_test_sources") else 0,
+            record.get("class_count") or 0,
+            record.get("jar_count") or 0,
+        )
+
+    def _merge_mixed_system_modules(
+        self, validator, project_dir: str, primary: str, primary_modules, secondary: str
+    ):
+        """Path-keyed union of the primary + secondary scan_modules rows.
+
+        Mixed maven+gradle layouts only (live bigtop). Each merged row is
+        tagged with scan_build_system so the assembler keeps the Maven reactor
+        authoritative for maven rows without dropping the gradle cluster. A
+        module found by both scans keeps the richer record (report dirs, test
+        sources, artifact counts). Secondary-scan failures degrade to the
+        primary rows alone — the merge is additive and never breaks the
+        single-system path.
+        """
+        merged: dict = {}
+        order: list = []
+        for rec in primary_modules or []:
+            row = dict(rec)
+            row["scan_build_system"] = primary
+            key = str(row.get("path") or ".")
+            merged[key] = row
+            order.append(key)
+        try:
+            secondary_modules = validator.scan_modules(project_dir, secondary) or []
+        except Exception as exc:
+            logger.debug(f"scan_modules({secondary}) failed: {exc}")
+            secondary_modules = []
+        for rec in secondary_modules:
+            row = dict(rec)
+            row["scan_build_system"] = secondary
+            key = str(row.get("path") or ".")
+            if key not in merged:
+                merged[key] = row
+                order.append(key)
+            elif self._module_scan_richness(row) > self._module_scan_richness(merged[key]):
+                merged[key] = row  # module found by both keeps the richer record
+        return [merged[k] for k in order]
 
     def _persist_module_metrics(self, metrics: dict) -> None:
         """Best-effort write of module_metrics.json (never blocks report gen)."""
