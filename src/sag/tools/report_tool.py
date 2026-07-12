@@ -20,7 +20,7 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metric
 # None, so None cannot double as "not computed yet").
 _MODULE_METRICS_UNSET = object()
 from sag.ui.events import EventType, UIEventEmitter
-from sag.verdict import combine_verdicts, run_verdict
+from sag.verdict import combine_verdicts, rescue_blocked_build, run_verdict
 
 from .base import BaseTool, ToolResult
 
@@ -327,6 +327,22 @@ class ReportTool(BaseTool, UIEventEmitter):
                     result_conflicts = list(evidence_result.get("conflicts") or [])
                 if evidence_refs is None:
                     result_evidence_refs = list(evidence_result.get("evidence_refs") or [])
+
+                # Blocked-build evidence-rescue, stats side (bug #11 secondary
+                # incoherence): when the rescue fired, the agent's report call
+                # often carries zeroed test_stats — it believed the run was
+                # blocked — which rendered "Tests: no tests executed" directly
+                # under a banner printing the physically-validated
+                # "1287 detected, 1287 executed" (pyyaml-6/7 probes). The
+                # rescue's principle (physical evidence outranks agent belief)
+                # applies to the stats line too: prefer the snapshot's
+                # validated stats. Runs where the rescue did not fire — and
+                # rescued runs with genuinely no executed tests (libcloud-2)
+                # — keep today's stats exactly.
+                if self._blocked_build_rescue_fired(report_snapshot):
+                    rescued_stats = self._snapshot_test_stats(report_snapshot)
+                    if rescued_stats is not None:
+                        result_test_stats = rescued_stats
 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -749,21 +765,46 @@ class ReportTool(BaseTool, UIEventEmitter):
         construction — including machine-capped runs (round-6 review: a
         blocked phase with green physical artifacts rendered ✅ SUCCESS while
         the CLI banner said verdict=failed).
+
+        Blocked-build evidence-rescue (bug #11, pyyaml-7/libcloud-2 probes):
+        the SAME shared rescue the agent finalization applies is applied here
+        — an agent-blocked build phase contradicted by physical build evidence
+        (phases.build IS validate_build_status().success) caps the machine
+        input at PARTIAL, not FAILED. When the rescue fires, the report-call
+        evidence status ("blocked"/"failed") merely restates the same agent
+        belief the machine recorded, so it is capped identically; the physical
+        input below still rules, keeping genuine failures FAILED. Before this,
+        the rescue lived only in the finalization and the banner read
+        "❌ FAILED" over a "verdict=partial" CLI final.
         """
         snapshot = snapshot or {}
         status = snapshot.get("status") or {}
         evidence = snapshot.get("evidence_result") or {}
+        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
+        raw_machine_outcome = self._trunk_phase_machine_outcome()
+        machine_outcome = rescue_blocked_build(raw_machine_outcome, build_evidence_ok)
+        evidence_verdict = _coerce_kernel_verdict(evidence.get("status"))
+        if machine_outcome != raw_machine_outcome:
+            evidence_verdict = rescue_blocked_build(evidence_verdict, build_evidence_ok)
         return run_verdict(
             # The kernel's two-verdict signature is kept; min() is associative,
             # so folding the machine outcome into the first input is identical
             # to a three-way combine.
             combine_verdicts(
-                self._trunk_phase_machine_outcome(),
+                machine_outcome,
                 self._physical_verdict_from_snapshot(status, snapshot),
             ),
-            _coerce_kernel_verdict(evidence.get("status")),
+            evidence_verdict,
             evidence.get("conflicts") or [],
         )
+
+    def _blocked_build_rescue_fired(self, snapshot: Optional[Dict[str, Any]]) -> bool:
+        """True when the blocked-build evidence-rescue applies to this
+        snapshot: the trunk phase machine recorded a blocked build phase while
+        the snapshot's physical build evidence shows a real build."""
+        snapshot = snapshot or {}
+        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
+        return build_evidence_ok and self._trunk_phase_machine_outcome() == "failed"
 
     @staticmethod
     def _physical_verdict_from_snapshot(
