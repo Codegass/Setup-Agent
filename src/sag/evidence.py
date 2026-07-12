@@ -55,7 +55,11 @@ class TestStats(BaseModel):
     def execution_rate(self) -> float | None:
         if not self.discovered:
             return None
-        return round((self.executed / self.discovered) * 100, 1)
+        # Clamp at 100%: `discovered` is a collect-only/static denominator, so
+        # a re-run or parameterized drift can push `executed` past it (live
+        # paramiko run 5: 559 detected, 560 executed read "100.2%"). Executed
+        # >= discovered is full coverage; the raw counts are never altered.
+        return min(round((self.executed / self.discovered) * 100, 1), 100.0)
 
     def as_summary(self) -> str:
         # Be explicit when nothing ran: "0 / 0 passed, 0.0% pass rate" reads like a

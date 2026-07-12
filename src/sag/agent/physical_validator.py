@@ -3500,6 +3500,39 @@ class PhysicalValidator:
 
         return "unknown"
 
+    def detect_java_build_systems(self, project_dir: str) -> List[str]:
+        """Every Java build system with marker files in the module-scan range.
+
+        _detect_build_system answers "what is THE build system" (first ROOT
+        marker wins), which is blind to mixed layouts: a Maven-rooted repo
+        whose tests live in a Gradle subtree (live bigtop:
+        bigtop-data-generators) reports only 'maven', so the Gradle test
+        cluster's modules never enter the module scan. This probe reports each
+        of maven/gradle whose markers exist at the root OR within the same
+        submodule depth range scan_modules enumerates (mindepth 2..maxdepth 3).
+        """
+        if not self.docker_orchestrator:
+            return []
+        markers = [
+            ("maven", ["pom.xml"]),
+            ("gradle", ["build.gradle", "build.gradle.kts"]),
+        ]
+        present: List[str] = []
+        for system, names in markers:
+            root_test = " || ".join(f"test -f {project_dir}/{n}" for n in names)
+            name_expr = " -o ".join(f"-name '{n}'" for n in names)
+            if len(names) > 1:
+                name_expr = f"\\( {name_expr} \\)"
+            cmd = (
+                f"({root_test}) && echo EXISTS || "
+                f"find {project_dir} -mindepth 2 -maxdepth 3 {name_expr} -type f "
+                f"2>/dev/null | head -1"
+            )
+            result = self._execute_command_with_logging(cmd, f"probing {system} markers")
+            if result.get("success") and (result.get("output") or "").strip():
+                present.append(system)
+        return present
+
     def _check_build_artifacts_complete(self, project_dir: str) -> Dict[str, any]:
         """
         Complete check of build artifacts without head limits.

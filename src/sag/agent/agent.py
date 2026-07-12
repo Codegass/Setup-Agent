@@ -1010,7 +1010,7 @@ START by working toward the current phase objective shown in my context.
         (`sag run --task`, legacy) are untouched. The returned boolean is
         flow control and keeps its pre-kernel behavior EXACTLY.
         """
-        from sag.verdict import run_verdict
+        from sag.verdict import rescue_blocked_build, run_verdict
 
         physical_ok = self._get_physical_final_status(react_engine_success)
         physical_verdict = self.final_verdict
@@ -1028,14 +1028,17 @@ START by working toward the current phase objective shown in my context.
         # surfaced (never promoted to success), so agent dishonesty stays
         # catchable; only the evidence-contradicted false-red is gone. With no
         # physical build evidence the cap stays FAILED exactly as before.
+        # The rescue is the SHARED kernel function rescue_blocked_build (bug
+        # #11): the report snapshot kernel applies the identical rule, so the
+        # banner, the stored snapshot, and this final verdict cannot split.
         build_status = getattr(self, "_last_build_status", None)
-        blocked_build_evidence_backed = (
-            machine_outcome == "failed"
-            and isinstance(build_status, dict)
-            and bool(build_status.get("success"))
+        build_evidence_ok = isinstance(build_status, dict) and bool(
+            build_status.get("success")
         )
+        rescued_outcome = rescue_blocked_build(machine_outcome, build_evidence_ok)
+        blocked_build_evidence_backed = rescued_outcome != machine_outcome
+        machine_outcome = rescued_outcome
         if blocked_build_evidence_backed:
-            machine_outcome = "partial"
             logger.warning(
                 "Phase machine recorded a blocked build phase, but physical "
                 "build evidence shows a real build; capping verdict to partial "

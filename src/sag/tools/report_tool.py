@@ -20,7 +20,7 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metric
 # None, so None cannot double as "not computed yet").
 _MODULE_METRICS_UNSET = object()
 from sag.ui.events import EventType, UIEventEmitter
-from sag.verdict import combine_verdicts, run_verdict
+from sag.verdict import combine_verdicts, rescue_blocked_build, run_verdict
 
 from .base import BaseTool, ToolResult
 
@@ -327,6 +327,22 @@ class ReportTool(BaseTool, UIEventEmitter):
                     result_conflicts = list(evidence_result.get("conflicts") or [])
                 if evidence_refs is None:
                     result_evidence_refs = list(evidence_result.get("evidence_refs") or [])
+
+                # Blocked-build evidence-rescue, stats side (bug #11 secondary
+                # incoherence): when the rescue fired, the agent's report call
+                # often carries zeroed test_stats — it believed the run was
+                # blocked — which rendered "Tests: no tests executed" directly
+                # under a banner printing the physically-validated
+                # "1287 detected, 1287 executed" (pyyaml-6/7 probes). The
+                # rescue's principle (physical evidence outranks agent belief)
+                # applies to the stats line too: prefer the snapshot's
+                # validated stats. Runs where the rescue did not fire — and
+                # rescued runs with genuinely no executed tests (libcloud-2)
+                # — keep today's stats exactly.
+                if self._blocked_build_rescue_fired(report_snapshot):
+                    rescued_stats = self._snapshot_test_stats(report_snapshot)
+                    if rescued_stats is not None:
+                        result_test_stats = rescued_stats
 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -749,21 +765,46 @@ class ReportTool(BaseTool, UIEventEmitter):
         construction — including machine-capped runs (round-6 review: a
         blocked phase with green physical artifacts rendered ✅ SUCCESS while
         the CLI banner said verdict=failed).
+
+        Blocked-build evidence-rescue (bug #11, pyyaml-7/libcloud-2 probes):
+        the SAME shared rescue the agent finalization applies is applied here
+        — an agent-blocked build phase contradicted by physical build evidence
+        (phases.build IS validate_build_status().success) caps the machine
+        input at PARTIAL, not FAILED. When the rescue fires, the report-call
+        evidence status ("blocked"/"failed") merely restates the same agent
+        belief the machine recorded, so it is capped identically; the physical
+        input below still rules, keeping genuine failures FAILED. Before this,
+        the rescue lived only in the finalization and the banner read
+        "❌ FAILED" over a "verdict=partial" CLI final.
         """
         snapshot = snapshot or {}
         status = snapshot.get("status") or {}
         evidence = snapshot.get("evidence_result") or {}
+        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
+        raw_machine_outcome = self._trunk_phase_machine_outcome()
+        machine_outcome = rescue_blocked_build(raw_machine_outcome, build_evidence_ok)
+        evidence_verdict = _coerce_kernel_verdict(evidence.get("status"))
+        if machine_outcome != raw_machine_outcome:
+            evidence_verdict = rescue_blocked_build(evidence_verdict, build_evidence_ok)
         return run_verdict(
             # The kernel's two-verdict signature is kept; min() is associative,
             # so folding the machine outcome into the first input is identical
             # to a three-way combine.
             combine_verdicts(
-                self._trunk_phase_machine_outcome(),
+                machine_outcome,
                 self._physical_verdict_from_snapshot(status, snapshot),
             ),
-            _coerce_kernel_verdict(evidence.get("status")),
+            evidence_verdict,
             evidence.get("conflicts") or [],
         )
+
+    def _blocked_build_rescue_fired(self, snapshot: Optional[Dict[str, Any]]) -> bool:
+        """True when the blocked-build evidence-rescue applies to this
+        snapshot: the trunk phase machine recorded a blocked build phase while
+        the snapshot's physical build evidence shows a real build."""
+        snapshot = snapshot or {}
+        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
+        return build_evidence_ok and self._trunk_phase_machine_outcome() == "failed"
 
     @staticmethod
     def _physical_verdict_from_snapshot(
@@ -1532,6 +1573,19 @@ class ReportTool(BaseTool, UIEventEmitter):
         if static_test_count and coverage_executed_tests is not None:
             try:
                 execution_rate = (coverage_executed_tests / static_test_count) * 100
+                # Clamp at 100%: the detected total is a collect-only/static
+                # denominator, so a re-run or parameterized drift can push the
+                # executed count one past it (live paramiko run 5: 559
+                # detected, 560 executed rendered "execution rate 100.2%" —
+                # nonsense on a report). Executed >= detected IS full
+                # coverage; the raw counts stay untouched and visible.
+                if execution_rate > 100.0:
+                    logger.info(
+                        "📊 Executed count exceeds the detected denominator "
+                        f"({coverage_executed_tests} > {static_test_count}); "
+                        "clamping execution rate at 100%"
+                    )
+                    execution_rate = 100.0
                 logger.info(
                     f"📊 Test Coverage: {execution_rate:.1f}% ({coverage_executed_tests} of {static_test_count} tests executed)"
                 )
@@ -1686,9 +1740,14 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
             * 100.0
         )
+        # executed >= detected is full coverage BY DEFINITION (the rate is
+        # clamped to exactly 100.0 above), so the gate can never fire there —
+        # not even under a strict 100% threshold. Below 100.0 the exact ratio
+        # and the threshold comparison are unchanged.
         if (
             status.get("static_test_count")
             and status.get("execution_rate") is not None
+            and status["execution_rate"] < 100.0
             and status["execution_rate"] < exec_threshold_pct
         ):
             ev_conflicts = snapshot["evidence_result"].setdefault("conflicts", [])
@@ -3394,11 +3453,30 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # the live-run bug).
                 return None
             build_system = reported if reported in ("maven", "gradle") else "maven"
+        # Mixed-layout probe (live bigtop): a Maven-rooted project whose tests
+        # live in a Gradle subtree (the analyzer's test recommendation already
+        # records test_system='gradle' there). Scanning with ONE system's globs
+        # made the Gradle test cluster invisible — "1 built / 2 detected ·
+        # 0 tested / 2 not tested" while all 50 Gradle tests had passed. When
+        # marker files for BOTH systems exist, scan each and merge.
+        build_systems = [build_system]
+        other_system = "gradle" if build_system == "maven" else "maven"
+        probe = getattr(validator, "detect_java_build_systems", None)
+        if callable(probe):
+            try:
+                if other_system in (probe(project_dir) or []):
+                    build_systems.append(other_system)
+            except Exception as exc:
+                logger.debug(f"detect_java_build_systems failed: {exc}")
         try:
             modules = validator.scan_modules(project_dir, build_system)
         except Exception as exc:
             logger.debug(f"scan_modules failed: {exc}")
             return None
+        if len(build_systems) > 1:
+            modules = self._merge_mixed_system_modules(
+                validator, project_dir, build_system, modules, other_system
+            )
         if not modules:
             return None
 
@@ -3439,11 +3517,15 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # (e.g. carbondata's profile-gated modules): those built modules
                 # must still be counted, not collapsed to "0/1". A module that is
                 # neither declared nor produced artifacts (e.g. commons-chain's
-                # standalone apps/*) stays excluded.
+                # standalone apps/*) stays excluded. Gradle-scanned rows from a
+                # mixed layout are exempt: the root pom's <modules> can never
+                # declare a Gradle subtree, so narrowing would silently drop the
+                # whole Gradle test cluster (live bigtop).
                 modules = [
                     m
                     for m in modules
-                    if str(m.get("path") or ".") in active_rel
+                    if str(m.get("scan_build_system") or "").lower() == "gradle"
+                    or str(m.get("path") or ".") in active_rel
                     or (m.get("class_count") or 0) > 0
                     or (m.get("jar_count") or 0) > 0
                 ] or modules
@@ -3453,10 +3535,66 @@ class ReportTool(BaseTool, UIEventEmitter):
             modules=modules,
             reactor_status=reactor_status,
             tests=tests,
-            build_systems=[build_system],
+            build_systems=build_systems,
             build_error_samples=build_error_samples,
             generated_at=generated_at,
         )
+
+    @staticmethod
+    def _module_scan_richness(record: dict) -> tuple:
+        """Evidence order for deduping module rows found by BOTH scans."""
+        return (
+            len(record.get("report_dirs") or []),
+            1 if record.get("has_test_sources") else 0,
+            record.get("class_count") or 0,
+            record.get("jar_count") or 0,
+        )
+
+    def _merge_mixed_system_modules(
+        self, validator, project_dir: str, primary: str, primary_modules, secondary: str
+    ):
+        """Path-keyed union of the primary + secondary scan_modules rows.
+
+        Mixed maven+gradle layouts only (live bigtop). Each merged row is
+        tagged with scan_build_system so the assembler keeps the Maven reactor
+        authoritative for maven rows without dropping the gradle cluster. A
+        module found by both scans keeps the richer record (report dirs, test
+        sources, artifact counts). Secondary-scan failures degrade to the
+        primary rows alone — the merge is additive and never breaks the
+        single-system path.
+        """
+        merged: dict = {}
+        order: list = []
+        for rec in primary_modules or []:
+            row = dict(rec)
+            row["scan_build_system"] = primary
+            key = str(row.get("path") or ".")
+            merged[key] = row
+            order.append(key)
+        try:
+            secondary_modules = validator.scan_modules(project_dir, secondary) or []
+        except Exception as exc:
+            logger.debug(f"scan_modules({secondary}) failed: {exc}")
+            secondary_modules = []
+        for rec in secondary_modules:
+            row = dict(rec)
+            row["scan_build_system"] = secondary
+            key = str(row.get("path") or ".")
+            if key not in merged:
+                merged[key] = row
+                order.append(key)
+                continue
+            # Found by BOTH scans (dual-marker dirs; the root "." collides in
+            # every mixed layout because scan_modules prepends it to each scan).
+            # The richer record wins the row, but the richness winner must not
+            # erase the loser's membership: a gradle-won collision row can still
+            # be IN the maven reactor, and blanket-exempting it left its reactor
+            # entry unmatched — a phantom second row plus a lost reactor verdict.
+            row["scan_found_by_both"] = True
+            merged[key]["scan_found_by_both"] = True
+            if self._module_scan_richness(row) > self._module_scan_richness(merged[key]):
+                merged[key] = row  # module found by both keeps the richer record
+        return [merged[k] for k in order]
 
     def _persist_module_metrics(self, metrics: dict) -> None:
         """Best-effort write of module_metrics.json (never blocks report gen)."""
@@ -4134,7 +4272,12 @@ class ReportTool(BaseTool, UIEventEmitter):
                         f"**Test Coverage:** {tests_total or 0}/{static_test_count} tests executed"
                     )
                     if tests_total and static_test_count:
-                        execution_rate = (tests_total / static_test_count) * 100
+                        # Clamp at 100%: executed can exceed the collect-only
+                        # denominator (re-run/parameterized drift) and a rate
+                        # above 100% is nonsense; both raw counts stay visible.
+                        execution_rate = min(
+                            (tests_total / static_test_count) * 100, 100.0
+                        )
                         test_coverage_line += f" ({execution_rate:.1f}% execution rate)"
                     lines.append(test_coverage_line)
                     lines.append("")

@@ -35,3 +35,26 @@ def run_verdict(machine_outcome: Optional[str], physical_verdict: Optional[str],
     if any(c not in ADJUDICATED_CONFLICTS for c in conflicts):
         return combine_verdicts(base, "partial")
     return base
+
+
+def rescue_blocked_build(outcome: Optional[str], build_evidence_ok: bool) -> Optional[str]:
+    """The blocked-build evidence-rescue (live 2026-06-24 pyyaml false-red;
+    bug #11 2026-07-10 pyyaml-7 / libcloud-2 banner-vs-final split).
+
+    ``outcome == "failed"`` here means the agent BLOCKED the critical build
+    phase (or restated that belief through the report call's evidence status).
+    When physical build evidence disagrees — validate_build_status found a
+    real build (success=True: Java artifacts/fingerprints, or the Python
+    ladder's success/partial-with-imports) — evidence outranks agent belief
+    and the cap is PARTIAL, never FAILED and never promoted to success. With
+    no physical build evidence the outcome passes through untouched, so an
+    evidence-absent block stays FAILED on every surface.
+
+    This is ONE function consumed by BOTH the agent finalization
+    (SetupAgent._get_verified_final_status) and the report snapshot kernel
+    (ReportTool._snapshot_kernel_verdict), so the report banner, the stored
+    snapshot verdict, and the CLI final can never split on it.
+    """
+    if outcome == "failed" and build_evidence_ok:
+        return "partial"
+    return outcome
