@@ -3583,7 +3583,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             if key not in merged:
                 merged[key] = row
                 order.append(key)
-            elif self._module_scan_richness(row) > self._module_scan_richness(merged[key]):
+                continue
+            # Found by BOTH scans (dual-marker dirs; the root "." collides in
+            # every mixed layout because scan_modules prepends it to each scan).
+            # The richer record wins the row, but the richness winner must not
+            # erase the loser's membership: a gradle-won collision row can still
+            # be IN the maven reactor, and blanket-exempting it left its reactor
+            # entry unmatched — a phantom second row plus a lost reactor verdict.
+            row["scan_found_by_both"] = True
+            merged[key]["scan_found_by_both"] = True
+            if self._module_scan_richness(row) > self._module_scan_richness(merged[key]):
                 merged[key] = row  # module found by both keeps the richer record
         return [merged[k] for k in order]
 

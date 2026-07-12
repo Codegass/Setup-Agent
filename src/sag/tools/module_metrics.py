@@ -127,13 +127,20 @@ def assemble_module_metrics(
         jar_count = _int_or_none(scan.get("jar_count"))
 
         # Mixed maven+gradle layout (live bigtop): the reactor summary is a
-        # MAVEN artifact, so it speaks only for maven-scanned rows. Rows tagged
-        # scan_build_system='gradle' by the merged scan must neither be dropped
-        # by the authoritative-reactor filter (they can never appear in a maven
-        # reactor) nor inherit reactor-derived inference. Untagged rows
-        # (single-system scans) keep the exact pre-merge behavior.
+        # MAVEN artifact, so it speaks only for maven-scanned rows. Rows found
+        # EXCLUSIVELY by the gradle scan must neither be dropped by the
+        # authoritative-reactor filter (they can never appear in a maven
+        # reactor) nor inherit reactor-derived inference. A collision row —
+        # found by BOTH scans (dual-marker dir, or the root "." that every
+        # mixed scan contains) — keeps its maven membership even when the
+        # gradle record won on richness: it still gets the reactor match, so
+        # the reactor verdict wins and its reactor entry is consumed (no
+        # phantom fallback row). Untagged rows (single-system scans) keep the
+        # exact pre-merge behavior.
         scan_system = str(scan.get("scan_build_system") or "").strip().lower()
-        reactor_exempt = bool(scan_system) and scan_system != "maven"
+        gradle_scanned = bool(scan_system) and scan_system != "maven"
+        both_scans = bool(scan.get("scan_found_by_both"))
+        reactor_exempt = gradle_scanned and not both_scans
 
         # Build status: reactor wins; match descriptive Maven <name> labels by
         # normalizing both sides (name, path, trailing path segment).
@@ -143,9 +150,16 @@ def assemble_module_metrics(
         if reactor_present and not reactor_exempt:
             # Authoritative reactor: skip scanned dirs not in the reactor, and
             # dedupe if two scanned dirs map to the same reactor entry.
-            if reactor_key is None or reactor_key in matched_reactor_keys:
+            if reactor_key is not None and reactor_key not in matched_reactor_keys:
+                matched_reactor_keys.add(reactor_key)
+            elif gradle_scanned:
+                # Gradle-won collision row outside the captured reactor (or a
+                # duplicate tail-match): maven does not speak for it, but the
+                # gradle evidence does — keep it as a gradle row rather than
+                # dropping the gradle cluster.
+                reactor = None
+            else:
                 continue
-            matched_reactor_keys.add(reactor_key)
 
         if reactor is not None:
             build_status, build_source = reactor, "reactor"
@@ -159,9 +173,10 @@ def assemble_module_metrics(
             # failed dependency resolution (commons-vfs read 7/7 with 4 dep
             # failures). Such a module stays detected but not built.
             build_status, build_source = "success", "artifacts"
-        elif any_failure and not reactor_exempt:
+        elif any_failure and not gradle_scanned:
             # A maven reactor failure implies downstream MAVEN modules were
-            # skipped; it says nothing about a coexisting gradle cluster.
+            # skipped; it says nothing about a coexisting gradle cluster (nor
+            # about a gradle-won collision row the reactor did not match).
             build_status, build_source = "skipped", "partial"
         else:
             build_status, build_source = "unknown", "none"

@@ -184,6 +184,151 @@ def test_assemble_gradle_tagged_rows_bypass_reactor_drop_and_skip_inference():
     assert metrics["module_summary"]["modules_tested"] == 1
 
 
+DUAL = "dual-module"  # has pom.xml AND build.gradle; built by the maven reactor
+
+
+class DualMarkerValidator:
+    """A dir with BOTH markers: found by both scans, gradle record is richer
+    (gradle ran the tests there -> report_dirs), and the maven reactor built it
+    too. Root '.' is prepended to BOTH scans, exactly like scan_modules."""
+
+    def _detect_build_system(self, project_dir):
+        return "maven"
+
+    def detect_java_build_systems(self, project_dir):
+        return ["maven", "gradle"]
+
+    def scan_modules(self, project_dir, build_system):
+        if build_system == "maven":
+            return [
+                {"path": ".", "name": ".", "class_count": 120, "jar_count": 2,
+                 "report_dirs": [], "has_test_sources": False},
+                {"path": DUAL, "name": DUAL, "class_count": 10, "jar_count": 1,
+                 "report_dirs": [], "has_test_sources": True},
+            ]
+        return [
+            {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+             "report_dirs": [], "has_test_sources": False},
+            {"path": DUAL, "name": DUAL, "class_count": 10, "jar_count": 1,
+             "report_dirs": [f"/workspace/p/{DUAL}/build/test-results/test"],
+             "has_test_sources": True},
+        ]
+
+    def parse_module_test_reports(self, module_dir, report_dirs):
+        if not report_dirs:
+            return {}
+        return {"tests_total": 12, "tests_passed": 12, "tests_failed": 0,
+                "tests_errors": 0, "tests_skipped": 0, "failing_names": [],
+                "failing_count": 0, "evidence_refs": report_dirs}
+
+
+def test_dual_marker_module_not_double_counted_and_reactor_stays_authoritative(
+    monkeypatch,
+):
+    """PoC repro: a module found by BOTH scans where the gradle record wins
+    richness was tagged 'gradle' -> reactor-exempt -> its maven reactor entry
+    went unmatched -> the fallback appended a phantom second row, AND the
+    surviving row reported artifact-inferred success while the reactor said
+    FAILURE. One physical module must yield ONE row with the reactor verdict,
+    keeping the gradle test evidence on that same row."""
+    tool = ReportTool()
+    monkeypatch.setattr(tool, "_get_project_info", lambda: {
+        "directory": "/workspace/p", "build_system": "Maven"})
+    tool.physical_validator = DualMarkerValidator()
+
+    metrics = tool._build_module_metrics({
+        "reactor_records": [
+            {"module": ".", "status": "success"},
+            {"module": DUAL, "status": "failure"},  # maven says it FAILED
+        ],
+    }, generated_at="t")
+
+    dual_rows = [m for m in metrics["modules"]
+                 if m["name"] == DUAL or m["path"] == DUAL]
+    assert len(dual_rows) == 1  # no phantom reactor fallback row
+    row = dual_rows[0]
+    assert row["build_status"] == "failure"   # reactor verdict wins
+    assert row["build_source"] == "reactor"
+    assert row["tests_total"] == 12           # gradle test evidence kept
+    assert metrics["module_summary"]["modules_total"] == 2
+    assert metrics["module_summary"]["modules_failed"] == 1
+    # merge-internal tags never leak into the emitted artifact
+    assert "scan_found_by_both" not in json.dumps(metrics)
+    assert "scan_build_system" not in json.dumps(metrics)
+
+
+def test_aggregator_root_collision_keeps_reactor_verdict(monkeypatch):
+    """Root variant: '.' is in BOTH scans unconditionally. An aggregator-pom
+    maven root (0 classes / 0 jars, richness (0,0,0,0)) loses to a gradle root
+    with test-results -> root flipped to gradle-tagged, the reactor's '.' entry
+    went unmatched (phantom row) and its 'success' verdict was ignored."""
+    tool = ReportTool()
+    monkeypatch.setattr(tool, "_get_project_info", lambda: {
+        "directory": "/workspace/p", "build_system": "Maven"})
+
+    class RootV(DualMarkerValidator):
+        def scan_modules(self, project_dir, build_system):
+            if build_system == "maven":
+                return [
+                    {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+                     "report_dirs": [], "has_test_sources": False},  # aggregator
+                    {"path": "core", "name": "core", "class_count": 50,
+                     "jar_count": 1, "report_dirs": [], "has_test_sources": False},
+                ]
+            return [
+                {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+                 "report_dirs": ["/workspace/p/build/test-results/test"],
+                 "has_test_sources": True},  # gradle tests at root
+            ]
+
+    tool.physical_validator = RootV()
+    metrics = tool._build_module_metrics({
+        "reactor_records": [
+            {"module": ".", "status": "success"},
+            {"module": "core", "status": "success"},
+        ],
+    }, generated_at="t")
+
+    root_rows = [m for m in metrics["modules"]
+                 if m["name"] == "." or m["path"] == "."]
+    assert len(root_rows) == 1
+    assert root_rows[0]["build_status"] == "success"  # reactor verdict, not unknown
+    assert root_rows[0]["build_source"] == "reactor"
+    assert root_rows[0]["tests_total"] == 12          # gradle root tests kept
+    assert metrics["module_summary"]["modules_total"] == 2
+
+
+def test_assemble_both_found_gradle_row_outside_reactor_survives():
+    """A collision row (found by both scans, gradle record won) whose module is
+    NOT in the captured reactor must not be dropped by the authoritative-reactor
+    filter: maven does not speak for it, but the gradle evidence does."""
+    metrics = assemble_module_metrics(
+        modules=[
+            {"path": ".", "name": ".", "class_count": 10, "jar_count": 1,
+             "report_dirs": [], "scan_build_system": "maven",
+             "scan_found_by_both": True},
+            {"path": "dual", "name": "dual", "class_count": 5, "jar_count": 1,
+             "report_dirs": ["/w/dual/build/test-results/test"],
+             "has_test_sources": True, "scan_build_system": "gradle",
+             "scan_found_by_both": True},
+        ],
+        reactor_status={".": "failure"},  # partial reactor: 'dual' not in it
+        tests={"dual": {"tests_total": 4, "tests_passed": 4, "tests_failed": 0,
+                        "tests_errors": 0, "tests_skipped": 0,
+                        "failing_names": [], "failing_count": 0,
+                        "evidence_refs": ["/w/dual/build/test-results/test"]}},
+        build_systems=["maven", "gradle"],
+        build_error_samples={},
+        generated_at="t",
+    )
+    by_path = {m["path"]: m for m in metrics["modules"]}
+    assert "dual" in by_path                    # not dropped, not phantom-duplicated
+    assert by_path["dual"]["build_status"] == "success"   # artifacts, not "skipped"
+    assert by_path["dual"]["build_source"] == "artifacts"
+    assert by_path["dual"]["tests_total"] == 4
+    assert metrics["module_summary"]["modules_total"] == 2
+
+
 def _single_system_validator(system, scan, *, with_probe):
     class V:
         def __init__(self):
