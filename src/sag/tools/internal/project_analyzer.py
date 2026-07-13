@@ -50,13 +50,34 @@ def _path_exists(orch, path: str) -> bool:
 # search order — the first that ships its own setup.py/pyproject.toml wins.
 _PYTHON_SUBDIR_CANDIDATES = ("python", "bindings/python")
 
-# A root pyproject that declares a [project] table WITH dependencies is a real
-# installable package at the root — no need to look for a subdir package. The
-# absence of that signal (bare/PEP-517-shell pyproject) is one of the two
-# triggers for subdir detection.
-_PYPROJECT_HAS_PROJECT_DEPS_RE = re.compile(
-    r"^\s*\[project\][^\[]*?^\s*dependencies\s*=", re.MULTILINE | re.DOTALL
-)
+
+def _root_has_installable_package(root_files: set, root_pyproject: str) -> bool:
+    """True when the repo ROOT itself declares an installable python package.
+
+    Established POSITIVELY, not inferred from a bracket-fragile deps regex:
+
+      * ``setup.py`` at the root — a classic (requirements.txt +) setup.py
+        package; OR
+      * ``setup.cfg`` at the root — a declarative setuptools package (setup.py
+        is often a one-line shim or absent); OR
+      * ``pyproject.toml`` that names a package — a ``[project]`` table with a
+        ``name`` (PEP 621) or a ``[tool.poetry]`` table. This uses the same
+        section-scoped parser as package discovery, so it is immune to the
+        ``[`` characters in ``authors``/``classifiers``/``keywords`` arrays (the
+        standard modern ordering, which this repo's own pyproject uses),
+        recognizes Poetry roots (deps under ``[tool.poetry.dependencies]``,
+        no ``[project]`` table), and recognizes ``dynamic = ["dependencies"]``
+        packages (deps resolved by the backend, still a real root package).
+
+    A bare PEP-517 build-shell pyproject (only ``[build-system]`` /
+    ``[build-backend]``, no package name) is NOT a root package — that is the
+    TVM shape whose real package lives under ``python/``.
+    """
+    from .python_env import project_name_from_pyproject
+
+    if "setup.py" in root_files or "setup.cfg" in root_files:
+        return True
+    return project_name_from_pyproject(root_pyproject or "") is not None
 
 
 def detect_python_package_root(
@@ -69,7 +90,7 @@ def detect_python_package_root(
 
     Live TVM regression (session 20260713_014403): the repo root carried a
     ``CMakeLists.txt`` (native ``libtvm.so``) and a build-shell pyproject with
-    no ``[project]`` deps, while the actual installable python package lived in
+    no root package, while the actual installable python package lived in
     ``python/`` (``python/setup.py``). A root ``pip install -e .`` therefore
     targeted the wrong thing, and nothing said the native library had to be
     built first.
@@ -77,9 +98,15 @@ def detect_python_package_root(
     Detection is GUIDANCE-level and conservative — it only redirects the python
     root when BOTH hold:
 
-      * the root looks like a build shell — it has a ``CMakeLists.txt`` OR its
-        pyproject lacks a ``[project]`` dependencies table (so the root is not
-        itself an installable package), AND
+      * the root ships NO installable package of its own — no root
+        ``setup.py``/``setup.cfg`` and no package-naming ``pyproject.toml``
+        (``[project]`` name or ``[tool.poetry]``); see
+        ``_root_has_installable_package``. Package-less-ness is established
+        POSITIVELY, so a real root package with the standard modern pyproject
+        ordering (``authors``/``classifiers`` before ``dependencies``), a
+        Poetry root, a ``dynamic = ["dependencies"]`` root, or a plain
+        setup.py/setup.cfg root is never mistaken for a shell and redirected —
+        the mirror image of the TVM bug. AND
       * a conventional subdirectory (``python/`` or ``bindings/python/``) ships
         its OWN ``setup.py``/``pyproject.toml`` (a real package there).
 
@@ -91,9 +118,7 @@ def detect_python_package_root(
     """
     root = project_path.rstrip("/")
     has_native_build = "CMakeLists.txt" in root_files
-    root_is_shell = has_native_build or not _PYPROJECT_HAS_PROJECT_DEPS_RE.search(
-        root_pyproject or ""
-    )
+    root_is_shell = not _root_has_installable_package(root_files, root_pyproject)
 
     python_root = root
     if root_is_shell:

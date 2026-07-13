@@ -170,10 +170,22 @@ _TVM_FILES = {
 
 _PLAIN_ROOT = "/workspace/pyproj"
 _PLAIN_FILES = {
-    # Pure-python repo: root pyproject WITH [project] deps, src layout, no
+    # Pure-python repo: a REAL root [project] package, src layout, no
     # CMakeLists, no python/ subdir package. Nothing native anywhere.
+    #
+    # The pyproject deliberately uses the STANDARD modern ordering —
+    # authors/classifiers arrays BEFORE dependencies (this repo's own
+    # pyproject shape). A bracket-fragile "[project] ... dependencies ="
+    # regex truncates at the first '[' inside authors=[...] and mis-reads
+    # this real package as a build shell, redirecting install/venv/test into
+    # a python/ subdir (the mirror image of the TVM bug). This fixture is the
+    # regression guard: package-less-ness must be established positively, so
+    # this root stays the install/test root and the intro below is byte-
+    # identical to the pre-change shape.
     "pyproject.toml": (
         '[project]\nname = "pypkg"\nrequires-python = ">=3.9"\n'
+        'authors = [{name = "Plain Author"}]\n'
+        'classifiers = ["Programming Language :: Python :: 3"]\n'
         'dependencies = ["requests"]\n'
     ),
     "src/pypkg/__init__.py": "",
