@@ -151,3 +151,43 @@ def test_non_version_failures_return_none():
     assert classify_version_error("[ERROR] Failed to execute goal ... test failures") is None
     assert classify_version_error("") is None
     assert classify_version_error("BUILD SUCCESS") is None
+
+
+def test_groovy_transform_typeresolver_maps_to_jdk8():
+    # Live bigtop re-probe (R3): bigtop-test-framework's `mvn test` failed 27
+    # attempts with the old-Groovy vs new-JDK compiler transform error. The
+    # classic remediation is JDK 8. classify_version_error is pure-text, so it
+    # returns the "8" sentinel; the caller's `needed != active` gate fires the
+    # single re-provision when the active JDK is >= 11.
+    out = (
+        "[ERROR] Failed to execute goal org.codehaus.gmavenplus:gmavenplus-plugin:1.5:compile "
+        "(default) on project bigtop-test-framework: Error occurred while calling a method on a "
+        "Groovy class from classpath.\n"
+        "Groovy:A transform used a generics containing ClassNode List <String> "
+        "for the method public void install(java.util.List <String>) "
+        "{ ... } directly. You are not supposed to do this. "
+        "Please create a new ClassNode referring to the old ClassNode and use the new ClassNode "
+        "instead of the old one. Otherwise the compiler will create wrong descriptors and a "
+        "potential NullPointerException in TypeResolver in the OpenJDK. "
+        "This was made with a call to public class org.apache.bigtop.itest.pmanager.PackageManager\n"
+        "@ line 146, column 1."
+    )
+    assert classify_version_error(out) == "8"
+
+
+def test_groovy_classnode_substring_alone_maps_to_jdk8():
+    # The other robust substring the fix keys on — either shape is sufficient.
+    out = "Groovy:A transform used a generics containing ClassNode List <String>"
+    assert classify_version_error(out) == "8"
+
+
+def test_groovy_error_already_on_jdk8_is_a_noop_via_the_needed_active_gate():
+    # The classifier is pure-text, so it always returns "8" for this shape.
+    # A build ALREADY on JDK 8 must NOT rerun: that is enforced by the call
+    # sites' `needed != active` gate, not the classifier. Assert the contract
+    # directly — needed == active ("8") means no re-provision fires.
+    out = "Groovy:A transform used a generics containing ClassNode List <String>"
+    needed = classify_version_error(out)
+    active = "8"
+    assert needed == "8"
+    assert not (needed and needed != active)  # gate is False -> no rerun

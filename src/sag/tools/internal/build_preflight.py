@@ -194,6 +194,20 @@ _VERSION_ERROR_PATTERNS = [
 ]
 _CLASS_FILE_VERSION = re.compile(r"class file version (\d+)\.")
 
+# Old-Groovy vs new-JDK compiler transform incompatibility (live bigtop R3):
+# bigtop's Groovy AST-transforming plugins emit this on JDK >= 11 while the
+# maven modules are meant to build on JDK 8. Unlike the other signatures the
+# error text names no target version — the remediation is the classic
+# groovy-on-jdk8 downgrade, so this is a fixed "8" SENTINEL. classify_version_error
+# is pure-text; the caller's `needed != active` gate makes it a no-op when the
+# build is already on JDK 8 (needed == active), so the retry stays bounded and
+# never fires spuriously.
+_GROOVY_TRANSFORM_TYPERESOLVER = re.compile(
+    r"wrong descriptors and a potential NullPointerException in TypeResolver"
+    r"|Groovy:A transform used a generics containing ClassNode",
+    re.IGNORECASE,
+)
+
 
 def classify_version_error(output: str) -> Optional[str]:
     """Extract the JDK major a failed build says it needs, else None."""
@@ -207,6 +221,9 @@ def classify_version_error(output: str) -> Optional[str]:
     if match:
         # Class-file major 52 = JDK 8, 61 = JDK 17: major - 44.
         return str(int(match.group(1)) - 44)
+    if _GROOVY_TRANSFORM_TYPERESOLVER.search(output):
+        # Old-Groovy AST transform breaks on JDK >= 11: remediate to JDK 8.
+        return "8"
     return None
 
 
