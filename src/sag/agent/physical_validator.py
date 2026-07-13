@@ -655,6 +655,28 @@ class PhysicalValidator:
         self.last_validation = validation_result
         return validation_result
 
+    def validate_build_artifacts_fresh(self, project_name: str = None) -> Dict[str, any]:
+        """Report-time artifact validation that never serves a stale count.
+
+        The mid-run artifact caches (``class_files`` / ``jar_files`` /
+        ``artifacts_complete``, 60s TTL) exist so agent iterations don't hammer
+        docker with repeated ``find`` scans. But at report generation those
+        caches can hold a count taken minutes earlier — before later build/test
+        phases compiled more classes. Live bigtop (session 20260713_014403): an
+        early Maven module build cached 6 .class files, a later Gradle test
+        compile brought the container to 162, and the report header still said
+        "6 classes" while the per-module breakdown (which counts fresh via
+        scan_modules) showed the Gradle modules as built.
+
+        This helper clears the cache so the FINAL validation pass reflects the
+        container's real state, then delegates to :meth:`validate_build_artifacts`.
+        It is the report path's entry point ONLY — the agent-facing
+        :meth:`validate_build_artifacts` keeps its mid-run caching untouched, so
+        two consecutive checks within the TTL during the run still hit the cache.
+        """
+        self.clear_cache()
+        return self.validate_build_artifacts(project_name=project_name)
+
     def _check_class_files(self, project_dir: str) -> Dict[str, any]:
         """Check for .class files in the project with caching."""
         cache_key = self._get_cache_key("class_files", project_dir)

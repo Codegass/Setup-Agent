@@ -2332,6 +2332,22 @@ class ReportTool(BaseTool, UIEventEmitter):
                 if "physical_validation" not in actual_accomplishments:
                     actual_accomplishments["physical_validation"] = {}
 
+                # Report-time freshness: the final validation pass must never
+                # serve a stale artifact count. The mid-run TTL cache (60s) can
+                # hold a count taken minutes earlier — before later build/test
+                # phases compiled more classes. Live bigtop (session
+                # 20260713_014403): an early Maven module build cached 6 .class
+                # files, a later Gradle test compile brought the container to
+                # 162, and the header still said "6 classes" while the
+                # per-module breakdown (fresh via scan_modules) showed the
+                # Gradle modules built. Clearing once here forces BOTH the build
+                # verdict (validate_build_status -> _check_build_artifacts_
+                # complete) and the header counts (validate_build_artifacts ->
+                # _check_class_files/_check_jar_files) to recompute from a single
+                # consistent scan of the container's real report-time state.
+                # Mid-run caching is untouched: this is the report path only.
+                self.physical_validator.clear_cache()
+
                 # Primary build verdict must match agent-facing validation
                 build_status = self.physical_validator.validate_build_status(
                     project_name_for_validator
