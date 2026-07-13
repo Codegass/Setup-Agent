@@ -4138,6 +4138,31 @@ class ReportTool(BaseTool, UIEventEmitter):
         # Actionable Recommendations
         lines.extend(["### Actionable Recommendations"])
 
+        # Language-aware advice: a python snapshot must NOT be handed maven
+        # commands. TVM (python-primary, jvm/ Maven binding) got a report
+        # recommending 'mvn clean test -DskipTests=false' — meaningless for a
+        # pytest project. Branch on the snapshot's build system.
+        if self._snapshot_build_system(snapshot) == "python":
+            if exec_rate and exec_rate < 90:
+                lines.append("1. **Increase Test Execution Rate**:")
+                lines.append("   ```bash")
+                lines.append("   pytest -p no:cacheprovider")
+                lines.append("   ```")
+
+            lines.append("2. **Run All Tests**:")
+            lines.append("   ```bash")
+            lines.append("   pip install -e . && pytest")
+            lines.append("   ```")
+
+            if warnings or blockers:
+                lines.append("3. **Check Skipped Reasons**:")
+                lines.append("   ```bash")
+                lines.append('   pytest -rs | grep -i "skip\\|deselect"')
+                lines.append("   ```")
+
+            lines.append("")
+            return lines
+
         if exec_rate and exec_rate < 90:
             skipped_modules = status.get("skipped_modules", [])[:3]
             if skipped_modules:
@@ -4161,6 +4186,25 @@ class ReportTool(BaseTool, UIEventEmitter):
         lines.append("")
 
         return lines
+
+    def _snapshot_build_system(self, snapshot: Dict[str, Any]) -> str:
+        """The canonical build-system label for this snapshot, lowercased.
+
+        Prefers the physically-detected build system (physical_evidence, same
+        source the module-metrics scan trusts) and falls back to the reported
+        project build system. 'pip/poetry' normalizes to 'python' so the
+        recommendation branch keys off one label.
+        """
+        for candidate in (
+            (snapshot.get("physical_evidence") or {}).get("build_system"),
+            (snapshot.get("project") or {}).get("build_system"),
+        ):
+            label = str(candidate or "").strip().lower()
+            if label in ("python", "pip/poetry", "pip", "poetry"):
+                return "python"
+            if label in ("maven", "gradle"):
+                return label
+        return ""
 
     def _render_task_progress(self, actual_accomplishments: dict = None) -> List[str]:
         """Render task progress in improved table format."""

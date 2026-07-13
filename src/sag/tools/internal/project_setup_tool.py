@@ -19,6 +19,58 @@ from .python_env import detect_installer, ensure_venv_pip, venv_repair_note
 # requireMavenVersion enforcement without waiting for build failures.
 MAVEN_PROVISION_VERSION = "3.9.9"
 
+# The python toolchain the provision phase MUST install for a python-primary
+# repo. python3-venv/python3-pip are split out on Debian/Ubuntu (ensurepip is
+# not bundled), so a bare python3 cannot create a working venv without them —
+# this was the direct cause of TVM's broken venv (session 20260713_014403).
+PYTHON_TOOLCHAIN_APT = ["python3", "python3-venv", "python3-pip"]
+
+
+def _is_python_primary(analysis: Dict[str, Any]) -> bool:
+    """True when the project analysis classifies the repo as Python-primary.
+
+    Two authoritative signals, either sufficient:
+      * analysis['project_type'] == 'Python' (root-marker classification from
+        ProjectAnalyzer._analyze_project_structure), or
+      * analysis['build_recommendation']['build_system'] == 'python' (the
+        canonical ecosystem label the analyzer derives for python projects).
+
+    A Java binding subdirectory (jvm/pom.xml) never appears in either signal,
+    so it cannot flip a python-primary repo to Java.
+    """
+    project_type = str((analysis or {}).get("project_type") or "").strip().lower()
+    if project_type == "python":
+        return True
+    rec = (analysis or {}).get("build_recommendation") or {}
+    return str(rec.get("build_system") or "").strip().lower() == "python"
+
+
+def provision_requirements(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute the REQUIRED provisioning for a repo from its analysis.
+
+    The primary language drives provisioning; a binding subdirectory in another
+    language is ADDITIVE, never SUBSTITUTIVE. For a Python-primary repo the
+    python toolchain (python3, python3-venv, python3-pip) is always required —
+    even when a Java binding (jvm/pom.xml) is present — because that binding
+    must not displace the python setup (live TVM regression: Java+Maven got
+    installed and python3-venv/pip never did, leaving a broken venv).
+
+    Returns {'primary': <language>, 'apt_packages': [...]}. Java-primary and
+    other ecosystems are returned unchanged (no python packages), so this is a
+    no-op for non-python repos.
+    """
+    if _is_python_primary(analysis):
+        return {"primary": "python", "apt_packages": list(PYTHON_TOOLCHAIN_APT)}
+
+    rec = (analysis or {}).get("build_recommendation") or {}
+    build_system = str(
+        rec.get("build_system") or (analysis or {}).get("build_system") or ""
+    ).strip().lower()
+    project_type = str((analysis or {}).get("project_type") or "").strip().lower()
+    if project_type == "java" or build_system in ("maven", "gradle"):
+        return {"primary": "java", "apt_packages": []}
+    return {"primary": project_type or "unknown", "apt_packages": []}
+
 
 class ProjectSetupTool(BaseTool):
     """Tool for project setup tasks like cloning repositories and installing dependencies."""
@@ -607,7 +659,27 @@ class ProjectSetupTool(BaseTool):
         dependencies = []
         suggested_tools = []
 
-        for file in build_files:
+        # Root markers WIN over nested (subdirectory) markers. The find above is
+        # maxdepth-2, so a binding subdirectory's build file (TVM's jvm/pom.xml)
+        # can appear alongside — and before — the repo's root marker
+        # (pyproject.toml). First-match-wins over the raw list let the java
+        # binding displace the python primary; classify from the root files when
+        # any exist, so the PRIMARY language wins. Only when the root has no
+        # marker at all do we fall back to the nested ones (single-module repos
+        # whose only pom.xml lives one level down).
+        directory_prefix = directory.rstrip("/") + "/"
+
+        def _is_root_file(path: str) -> bool:
+            # A file directly in `directory` has no further "/" after the prefix.
+            if not path.startswith(directory_prefix):
+                # Relative or unexpected shape: treat "bare-name" (no slash) as root.
+                return "/" not in path
+            return "/" not in path[len(directory_prefix):]
+
+        root_files = [f for f in build_files if _is_root_file(f)]
+        classify_files = root_files or build_files
+
+        for file in classify_files:
             if "pom.xml" in file:
                 project_type = "maven"
                 language = "java"
