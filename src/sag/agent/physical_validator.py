@@ -3714,11 +3714,30 @@ class PhysicalValidator:
 
         totals = {"tests_total": 0, "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0}
         failing: List[str] = []
+
+        # Collect XML file paths from ALL report dirs, then dedupe by absolute
+        # path BEFORE parsing. Gradle's modern layout nests report dirs
+        # (build/test-results/test lives inside build/test-results), and
+        # scan_modules lists both because older layouts drop XMLs directly in
+        # the parent. A recursive `find` on the parent re-lists every file the
+        # child find already returned, so parsing per-dir would count each XML
+        # twice (live bigtop: 72=2x36, 2=2x1, 26=2x13). File-level dedupe is the
+        # robust guarantee: nested (ancestor+descendant) dirs can never
+        # double-count, while genuinely distinct files across sibling dirs
+        # (Maven surefire + failsafe) are still each counted once.
+        seen_files: set = set()
+        ordered_files: List[str] = []
         for rd in report_dirs:
             find_cmd = f"find {rd} -name 'TEST-*.xml' -o -name '*.xml' -path '*{rd}*' 2>/dev/null"
             listing = self._execute_command_with_logging(find_cmd, f"listing reports {rd}")
-            files = [f for f in (listing.get("output") or "").splitlines() if f.strip().endswith(".xml")]
-            for xml_file in files:
+            for f in (listing.get("output") or "").splitlines():
+                f = f.strip()
+                if not f.endswith(".xml") or f in seen_files:
+                    continue
+                seen_files.add(f)
+                ordered_files.append(f)
+
+        for xml_file in ordered_files:
                 cat = self._execute_command_with_logging(
                     f"cat '{xml_file}'", f"reading {xml_file}"
                 )
