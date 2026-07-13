@@ -630,14 +630,25 @@ class ReActEngine(UIEventEmitter):
     @staticmethod
     def _island_build_line(islands) -> str:
         """Render the build-phase call-out that lists EVERY independent build
-        island for a pathological aggregator (each must be built on its own)."""
+        island for a pathological aggregator (each must be built on its own),
+        naming the recommended GOAL beside each island and appending the
+        cross-island dependency guidance (see below)."""
         items = "; ".join(
-            f"{n}) {isl.get('system') or 'unknown'} in {isl.get('root')}"
+            f"{n}) {isl.get('system') or 'unknown'} '{isl.get('goal') or 'build'}' "
+            f"in {isl.get('root')}"
             for n, isl in enumerate(islands, 1)
         )
         return (
             f"Recommended Build: this repo has {len(islands)} independent build "
             f"islands — build EACH: {items}. "
+            # CROSS-ISLAND dependency guidance (live bigtop re-probe: the
+            # transaction-queue island died 13x resolving an org-internal
+            # SNAPSHOT the data-generators island produces but never PUBLISHED).
+            "Islands may depend on each other through the local maven repo: if a "
+            "build fails resolving an org-internal SNAPSHOT artifact (searched in "
+            "file:/root/.m2/...), FIRST build/publish the island that produces it "
+            "(maven 'install' / gradle 'publishToMavenLocal'), then retry this "
+            "island once. "
             "In the test phase, run tests in EACH test island."
         )
 

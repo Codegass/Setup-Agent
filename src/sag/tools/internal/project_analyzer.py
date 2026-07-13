@@ -1630,15 +1630,53 @@ PY"""
         # it is NOT an island (vendored/example sources). Signal exclusion.
         return {"root": None, "system": None}
 
+    def _island_build_goal(self, root: str, system: Optional[str]) -> str:
+        """The recommended build action (GOAL) for one independent island.
+
+        LIVE EVIDENCE (bigtop re-probe): the transaction-queue gradle island died
+        13x resolving org.apache.bigtop:bigpetstore-data-generator:3.5.0-SNAPSHOT
+        from file:/root/.m2/... — an artifact the data-generators island PRODUCES
+        but only if it PUBLISHES to the local maven repo, which a bare `build`
+        never does. This is the gradle-island version of the reactor-install
+        lesson (a maven island `install`s so siblings resolve its artifact).
+
+        So: maven island -> 'install'; gradle island whose build.gradle(.kts)
+        applies the maven-publish plugin -> 'publishToMavenLocal' (it publishes a
+        SNAPSHOT other islands consume); every other gradle island -> 'build'.
+        """
+        if system == "maven":
+            return "install"
+        if system == "gradle" and self._island_applies_maven_publish(root):
+            return "publishToMavenLocal"
+        return "build"
+
+    def _island_applies_maven_publish(self, root: str) -> bool:
+        """True iff the island's own build.gradle(.kts) applies the maven-publish
+        plugin — the signal that it publishes an artifact to the local maven repo
+        that a cross-island SNAPSHOT dependency can resolve."""
+        orch = self.docker_orchestrator
+        if not orch:
+            return False
+        root = root.rstrip("/")
+        cmd = (
+            f"grep -lE 'maven-publish' {root}/build.gradle {root}/build.gradle.kts "
+            f"2>/dev/null"
+        )
+        found = orch.execute_command(cmd)
+        return bool((found.get("output") or "").strip())
+
     def _enumerate_build_islands(
         self, project_path: str, source_modules: List[Dict[str, Any]], preferred_dir: str
     ) -> List[Dict[str, Any]]:
         """Group every source-bearing module into its independent build island
         (pathological-aggregator path only).
 
-        Each island is ``{root, system, rationale}``, deduped by root, with the
-        preferred module's island FIRST (so build_islands[0]["root"] ==
-        build_root for backward compatibility).
+        Each island is ``{root, system, goal, rationale}``, deduped by root, with
+        the preferred module's island FIRST (so build_islands[0]["root"] ==
+        build_root for backward compatibility). ``goal`` is the recommended build
+        action for that island (maven -> 'install', gradle-with-maven-publish ->
+        'publishToMavenLocal', else 'build') so a cross-island SNAPSHOT
+        dependency resolves from the local maven repo.
         """
         islands: List[Dict[str, Any]] = []
         by_root: Dict[str, Dict[str, Any]] = {}
@@ -1654,18 +1692,22 @@ PY"""
                 continue
             existing = by_root.get(root)
             if existing is None:
+                goal = self._island_build_goal(root, info["system"])
                 island = {
                     "root": root,
                     "system": info["system"],
+                    "goal": goal,
                     "rationale": (
                         f"Independent {info['system'] or 'unknown'} build island "
-                        f"under the aggregator; build it on its own."
+                        f"under the aggregator; build it on its own with '{goal}'."
                     ),
                 }
                 by_root[root] = island
                 islands.append(island)
             elif existing.get("system") is None and info["system"]:
                 existing["system"] = info["system"]
+                # System resolved late -> recompute the goal now that we know it.
+                existing["goal"] = self._island_build_goal(root, info["system"])
 
         # Preferred module's island leads (matches build_root).
         islands.sort(key=lambda i: 0 if i["root"] == preferred_island_root else 1)

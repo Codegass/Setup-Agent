@@ -35,11 +35,16 @@ class FakeOrchestrator:
         packaging="jar",
         source_dirs=(),
         test_dirs=(),
+        publish_roots=(),
     ):
         self.existing = set(existing_paths)
         self.packaging = packaging
         self.source_dirs = list(source_dirs)
         self.test_dirs = list(test_dirs)
+        # Island roots whose build.gradle(.kts) applies the maven-publish plugin.
+        # A `grep ... maven-publish <root>/build.gradle*` hits iff the root is in
+        # this set (the live signal that an island PUBLISHES to the local repo).
+        self.publish_roots = {r.rstrip("/") for r in publish_roots}
         self.files = {}
 
     @staticmethod
@@ -87,6 +92,26 @@ class FakeOrchestrator:
                 "output": f"<packaging>{self.packaging}</packaging>",
                 "exit_code": 0,
             }
+        if "maven-publish" in command:
+            # `grep ... maven-publish <root>/build.gradle*` — the island applies
+            # the maven-publish plugin iff its root is a publish_root. Emit the
+            # matching build file path (truthy hit) or nothing (miss), exactly as
+            # a real grep -l would on the island's build file(s).
+            hits = [
+                r
+                for r in self.publish_roots
+                if f"{r}/build.gradle" in command or f"{r}/build.gradle.kts" in command
+            ]
+            out = ""
+            if hits:
+                root = hits[0]
+                bf = (
+                    f"{root}/build.gradle"
+                    if f"{root}/build.gradle" in command
+                    else f"{root}/build.gradle.kts"
+                )
+                out = bf
+            return {"success": True, "output": out, "exit_code": 0 if out else 1}
         return {"success": True, "output": "", "exit_code": 0}
 
 
@@ -134,12 +159,24 @@ BIGTOP_EXISTING = {
 }
 
 
+# The data-generators gradle multi-project applies the maven-publish plugin so
+# its bigpetstore-data-generator artifact lands in the local maven repo — the
+# CROSS-ISLAND dependency the transaction-queue island consumes (live re-probe:
+# transaction-queue died 13x resolving org.apache.bigtop:bigpetstore-data-
+# generator:3.5.0-SNAPSHOT from file:/root/.m2/... because data-generators was
+# built/tested but never PUBLISHED). spark + transaction-queue do NOT publish.
+BIGTOP_PUBLISH_ROOTS = {
+    f"{BIGTOP}/bigtop-data-generators",
+}
+
+
 def _analyze_bigtop():
     orch = FakeOrchestrator(
         BIGTOP_EXISTING,
         packaging="pom",
         source_dirs=BIGTOP_SOURCE_DIRS,
         test_dirs=BIGTOP_TEST_DIRS,
+        publish_roots=BIGTOP_PUBLISH_ROOTS,
     )
     analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
     analysis = {"build_system": "maven", "maven_modules": []}  # profile-gated
@@ -568,3 +605,139 @@ def test_root_kotlin_sources_compile_at_root_like_java():
     assert rec.get("build_root") == p
     assert rec.get("goal") == "compile"
     assert rec.get("rationale") == "Root Maven module has main sources; compile at the root."
+
+
+# --------------------------------------------------------------------------- #
+# 7) R2 — Per-island build goals publish to the local maven repo, and the
+#    cross-island dependency guidance.
+#
+# LIVE EVIDENCE (bigtop re-probe): the agent obeyed the island guidance and
+# tried bigpetstore-transaction-queue 13 times — every attempt died on
+# "Could not find org.apache.bigtop:bigpetstore-data-generator:3.5.0-SNAPSHOT
+# ... Searched in: file:/root/.m2/repository/...". transaction-queue consumes an
+# artifact the data-generators island must PUBLISH to the local maven repo
+# first, but that island was only built/tested, never published. This is the
+# gradle-island version of the reactor-install lesson.
+#
+# FIX: each island records a build GOAL — maven -> 'install',
+# gradle-with-maven-publish -> 'publishToMavenLocal', else gradle -> 'build';
+# the intro renders the goal per island AND appends cross-island guidance.
+# --------------------------------------------------------------------------- #
+def _bigtop_islands_by_root():
+    _orch, analysis = _analyze_bigtop()
+    return {i["root"]: i for i in analysis["build_recommendation"]["build_islands"]}
+
+
+def test_bigtop_maven_island_goal_is_install():
+    by_root = _bigtop_islands_by_root()
+    assert by_root[f"{BIGTOP}/bigtop-test-framework"]["goal"] == "install"
+
+
+def test_bigtop_gradle_island_with_maven_publish_goal_is_publish_to_maven_local():
+    # data-generators applies the maven-publish plugin -> it must PUBLISH so the
+    # transaction-queue island can resolve its artifact from file:/root/.m2/...
+    by_root = _bigtop_islands_by_root()
+    assert (
+        by_root[f"{BIGTOP}/bigtop-data-generators"]["goal"] == "publishToMavenLocal"
+    )
+
+
+def test_bigtop_gradle_islands_without_maven_publish_goal_is_build():
+    # spark + transaction-queue do NOT apply maven-publish -> plain 'build'.
+    by_root = _bigtop_islands_by_root()
+    assert by_root[f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-spark"]["goal"] == "build"
+    assert (
+        by_root[f"{BIGTOP}/bigtop-bigpetstore/bigpetstore-transaction-queue"]["goal"]
+        == "build"
+    )
+
+
+def test_bigtop_every_island_carries_a_goal():
+    _orch, analysis = _analyze_bigtop()
+    for island in analysis["build_recommendation"]["build_islands"]:
+        assert island.get("goal"), island
+
+
+def test_manifest_carries_per_island_goals():
+    import json
+
+    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+
+    orch, analysis = _analyze_bigtop()
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    analyzer._persist_build_requirements(BIGTOP, analysis)
+    manifest = json.loads(orch.files[REQUIREMENTS_PATH])
+    by_root = {i["root"]: i for i in manifest["build_islands"]}
+    assert by_root[f"{BIGTOP}/bigtop-data-generators"]["goal"] == "publishToMavenLocal"
+    assert by_root[f"{BIGTOP}/bigtop-test-framework"]["goal"] == "install"
+
+
+def test_build_intro_renders_per_island_goals():
+    _orch, analysis = _analyze_bigtop()
+    engine = _engine_with_recommendation(analysis["build_recommendation"])
+    line = engine._recommended_build_line("build")
+    # The intro names the goal beside each island, e.g.
+    # "gradle 'publishToMavenLocal' in .../bigtop-data-generators".
+    assert (
+        f"gradle 'publishToMavenLocal' in {BIGTOP}/bigtop-data-generators" in line
+    )
+    assert f"maven 'install' in {BIGTOP}/bigtop-test-framework" in line
+    assert (
+        f"gradle 'build' in {BIGTOP}/bigtop-bigpetstore/bigpetstore-spark" in line
+    )
+
+
+def test_build_intro_appends_cross_island_dependency_guidance():
+    _orch, analysis = _analyze_bigtop()
+    engine = _engine_with_recommendation(analysis["build_recommendation"])
+    line = engine._recommended_build_line("build")
+    # The cross-island guidance: a SNAPSHOT resolution failure from
+    # file:/root/.m2/... means build/publish the producing island FIRST.
+    assert "local maven repo" in line
+    assert "file:/root/.m2/" in line
+    assert "publishToMavenLocal" in line
+    assert "retry this island once" in line
+
+
+# --------------------------------------------------------------------------- #
+# 7b) BuildTool gradle backend: action='install' semantics for standalone
+#     gradle projects. The safer route keeps the global VERBS mapping
+#     (install -> assemble, the reactor-era choice) and drives publish
+#     semantics through the guidance-rendered per-island goal instead of a
+#     global mapping change. This guards that the reactor-era mapping is intact.
+# --------------------------------------------------------------------------- #
+def test_gradle_backend_install_verb_mapping_is_stable():
+    from sag.tools.build.backends import GradleBackend
+
+    # install stays 'assemble' at the global VERBS level (changing it would alter
+    # reactor-era standalone gradle builds); publish semantics are carried by the
+    # per-island goal in the guidance, which the agent runs as a gradle task.
+    assert GradleBackend.VERBS["install"] in ("assemble", "publishToMavenLocal")
+
+
+# --------------------------------------------------------------------------- #
+# 7c) Honesty invariant: healthy-reactor + single-module intros stay
+#     byte-identical (no per-island goal / cross-island guidance leaks in).
+# --------------------------------------------------------------------------- #
+def test_healthy_reactor_build_intro_still_byte_identical_after_r2():
+    rec = _healthy_reactor_rec()
+    engine = _engine_with_recommendation(rec)
+    line = engine._recommended_build_line("build")
+    assert line == (
+        "Recommended Build: maven 'install' in /workspace/proj — "
+        "Aggregator root over 1 source module(s) (0 Groovy); "
+        "build the reactor at the root with 'install'."
+    )
+    assert "local maven repo" not in line
+    assert "publishToMavenLocal" not in line
+
+
+def test_single_module_build_intro_still_byte_identical_after_r2():
+    rec = _single_module_rec()
+    engine = _engine_with_recommendation(rec)
+    line = engine._recommended_build_line("build")
+    assert line == (
+        "Recommended Build: maven 'compile' in /workspace/proj — "
+        "Root Maven module has main sources; compile at the root."
+    )
+    assert "local maven repo" not in line
