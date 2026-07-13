@@ -1365,6 +1365,18 @@ PY"""
                     preferred = (groovy_modules or source_modules)[0]
                     build_root = preferred["dir"]
                     scope = f"module {preferred['module']} directly"
+                    # PATHOLOGICAL-AGGREGATOR PATH ONLY: this repo is an
+                    # archipelago (Bigtop: a maven island + several INDEPENDENT
+                    # gradle islands, each with real sources). Picking ONE
+                    # preferred module leaves the others UNKNOWN (live evidence:
+                    # bigpetstore-spark + bigpetstore-transaction-queue never
+                    # built). Enumerate EVERY independent island so the agent's
+                    # guidance can cover each. build_root stays = island #1 for
+                    # backward compatibility; the recommendation is guidance,
+                    # not orchestration — the agent remains in charge.
+                    rec["build_islands"] = self._enumerate_build_islands(
+                        project_path, source_modules, preferred["dir"]
+                    )
                 rec.update(build_system="maven", build_root=build_root, goal=goal)
                 rec["rationale"] = (
                     f"Aggregator root over {len(source_modules)} source module(s) "
@@ -1393,6 +1405,92 @@ PY"""
             return rec
 
         return rec
+
+    def _island_root_for(self, project_path: str, source_dir: str) -> Dict[str, Any]:
+        """Map one source/test-bearing dir to its nearest INDEPENDENT build
+        island: the build root that owns it, plus that root's build system.
+
+        Walk up from ``source_dir`` toward ``project_path`` (never above it),
+        recording the first ancestor with a build marker (pom.xml /
+        build.gradle(.kts)). Independence is defined by settings.gradle: a
+        Gradle multi-project (settings.gradle at its root) is ONE island and its
+        subprojects are NOT separate islands, so the OUTERMOST settings-gradle
+        ancestor wins over a nearer subproject build.gradle. The root aggregator
+        itself is skipped (walking stops one level below project_path) — it is
+        the pathological root we are decomposing, not an island.
+
+        Returns ``{root, system}`` (root = the island dir, system = maven/gradle).
+        """
+        orch = self.docker_orchestrator
+        root = project_path.rstrip("/")
+        cur = source_dir.rstrip("/")
+
+        nearest_build = None  # first ancestor with any build marker
+        nearest_system = None
+        settings_root = None  # OUTERMOST ancestor carrying settings.gradle
+
+        # Ascend from the module dir up to (but not including) the project root.
+        while cur.startswith(root + "/"):
+            if _path_exists(orch, f"{cur}/settings.gradle") or _path_exists(
+                orch, f"{cur}/settings.gradle.kts"
+            ):
+                settings_root = cur  # keep ascending -> ends on the outermost
+            has_pom = _path_exists(orch, f"{cur}/pom.xml")
+            has_gradle_build = _path_exists(orch, f"{cur}/build.gradle") or _path_exists(
+                orch, f"{cur}/build.gradle.kts"
+            )
+            if nearest_build is None and (has_pom or has_gradle_build):
+                nearest_build = cur
+                nearest_system = "maven" if has_pom else "gradle"
+            parent = cur.rsplit("/", 1)[0]
+            if parent == cur:
+                break
+            cur = parent
+
+        if settings_root is not None:
+            # The gradle multi-project root is the island; its subprojects fold in.
+            return {"root": settings_root, "system": "gradle"}
+        if nearest_build is not None:
+            return {"root": nearest_build, "system": nearest_system}
+        # No build file above the source dir (unusual): treat the source dir
+        # itself as its own island so it is not silently dropped.
+        return {"root": source_dir.rstrip("/"), "system": None}
+
+    def _enumerate_build_islands(
+        self, project_path: str, source_modules: List[Dict[str, Any]], preferred_dir: str
+    ) -> List[Dict[str, Any]]:
+        """Group every source-bearing module into its independent build island
+        (pathological-aggregator path only).
+
+        Each island is ``{root, system, rationale}``, deduped by root, with the
+        preferred module's island FIRST (so build_islands[0]["root"] ==
+        build_root for backward compatibility).
+        """
+        islands: List[Dict[str, Any]] = []
+        by_root: Dict[str, Dict[str, Any]] = {}
+        preferred_island_root = self._island_root_for(project_path, preferred_dir)["root"]
+
+        for mod in source_modules:
+            info = self._island_root_for(project_path, mod["dir"])
+            root = info["root"]
+            existing = by_root.get(root)
+            if existing is None:
+                island = {
+                    "root": root,
+                    "system": info["system"],
+                    "rationale": (
+                        f"Independent {info['system'] or 'unknown'} build island "
+                        f"under the aggregator; build it on its own."
+                    ),
+                }
+                by_root[root] = island
+                islands.append(island)
+            elif existing.get("system") is None and info["system"]:
+                existing["system"] = info["system"]
+
+        # Preferred module's island leads (matches build_root).
+        islands.sort(key=lambda i: 0 if i["root"] == preferred_island_root else 1)
+        return islands
 
     def _recommend_test_approach(self, project_path: str, build_rec: Dict[str, Any]) -> None:
         """Recommend WHERE to run tests — they often live in different modules (and
@@ -1471,6 +1569,38 @@ PY"""
         ):
             build_rec["test_root"] = project_path
 
+        # PATHOLOGICAL-AGGREGATOR PATH ONLY: an archipelago has independent test
+        # islands too. The dominant-cluster heuristic above picks ONE (Bigtop's
+        # Gradle bigtop-data-generators); the maven bigtop-test-framework's OWN
+        # unit tests then never ran. Enumerate EVERY test island (test-bearing
+        # dir -> its build island) so the agent's test-phase guidance targets
+        # each; dominant cluster (test_root) leads for backward compatibility.
+        if build_rec.get("build_islands"):
+            test_islands: List[Dict[str, Any]] = []
+            by_root: Dict[str, Dict[str, Any]] = {}
+            dominant_root = self._island_root_for(project_path, test_module_dirs[0])["root"]
+            # test_root already resolved above is the dominant cluster root.
+            dominant_root = build_rec.get("test_root") or dominant_root
+            for module_dir in test_module_dirs:
+                info = self._island_root_for(project_path, module_dir)
+                root = info["root"]
+                if root in by_root:
+                    if by_root[root].get("system") is None and info["system"]:
+                        by_root[root]["system"] = info["system"]
+                    continue
+                island = {
+                    "root": root,
+                    "system": info["system"],
+                    "rationale": (
+                        f"Independent {info['system'] or 'unknown'} test island; "
+                        "run its tests on its own."
+                    ),
+                }
+                by_root[root] = island
+                test_islands.append(island)
+            test_islands.sort(key=lambda i: 0 if i["root"] == dominant_root else 1)
+            build_rec["test_islands"] = test_islands
+
     def _persist_build_requirements(self, project_path: str, analysis: Dict[str, Any]) -> None:
         """Persist the analyzer's build/test requirements manifest (spec §2).
 
@@ -1517,6 +1647,12 @@ PY"""
             "test_root": rec.get("test_root"),
             "test_system": rec.get("test_system"),
             "test_fail_at_end": test_fail_at_end,
+            # Multi-island coverage on pathological aggregators: the full
+            # archipelago the agent must build/test EACH of. Empty lists on
+            # healthy reactors / single modules (the single build_root/test_root
+            # fields above already fully describe those).
+            "build_islands": rec.get("build_islands") or [],
+            "test_islands": rec.get("test_islands") or [],
         }
 
         # Python requirements ride along on the SAME handoff manifest (spec
@@ -2111,6 +2247,19 @@ PY"""
                         f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6]
                     )
                     output += f"   • Source modules: {mods}\n"
+                # Pathological aggregators are archipelagos: name EVERY
+                # independent build island so the agent builds each (not just
+                # the one preferred module).
+                build_islands = rec.get("build_islands") or []
+                if len(build_islands) > 1:
+                    isles = "; ".join(
+                        f"{isl.get('system') or 'unknown'}:{isl['root']}"
+                        for isl in build_islands
+                    )
+                    output += (
+                        f"   • {len(build_islands)} independent build islands "
+                        f"(build EACH): {isles}\n"
+                    )
             # Tests may live in a different module / build system than the build.
             # (Python recs are pytest-at-the-build-root by construction — their
             # differing labels must not render the "not in the build module"

@@ -550,6 +550,13 @@ class ReActEngine(UIEventEmitter):
         if not rec:
             return None
         if phase == "test":
+            # Pathological aggregators are archipelagos: run tests in EACH test
+            # island (Bigtop: the maven framework's own unit tests were skipped
+            # while only the dominant Gradle cluster ran). Guidance, not
+            # orchestration — the agent still owns the how.
+            test_islands = rec.get("test_islands")
+            if test_islands and len(test_islands) > 1:
+                return self._island_test_line(test_islands)
             test_root = rec.get("test_root")
             if not test_root:
                 return None
@@ -566,6 +573,12 @@ class ReActEngine(UIEventEmitter):
                 f"Recommended Tests: run {rec.get('test_system')} 'test' in {test_root} "
                 "— the test suite lives here, not in the build module."
             )
+        # Build phase. Pathological aggregators: build EACH independent island so
+        # none is left UNKNOWN (Bigtop: bigpetstore-spark + transaction-queue
+        # never built when only one preferred module was targeted).
+        build_islands = rec.get("build_islands")
+        if build_islands and len(build_islands) > 1:
+            return self._island_build_line(build_islands)
         if rec.get("is_aggregator_only"):
             return (
                 f"Recommended Build: NONE — {rec.get('rationale', '')} "
@@ -574,6 +587,33 @@ class ReActEngine(UIEventEmitter):
         return (
             f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
             f"{rec.get('build_root')} — {rec.get('rationale', '')}"
+        )
+
+    @staticmethod
+    def _island_build_line(islands) -> str:
+        """Render the build-phase call-out that lists EVERY independent build
+        island for a pathological aggregator (each must be built on its own)."""
+        items = "; ".join(
+            f"{n}) {isl.get('system') or 'unknown'} in {isl.get('root')}"
+            for n, isl in enumerate(islands, 1)
+        )
+        return (
+            f"Recommended Build: this repo has {len(islands)} independent build "
+            f"islands — build EACH: {items}. "
+            "In the test phase, run tests in EACH test island."
+        )
+
+    @staticmethod
+    def _island_test_line(islands) -> str:
+        """Render the test-phase call-out that lists EVERY independent test
+        island for a pathological aggregator (run tests in each)."""
+        items = "; ".join(
+            f"{n}) {isl.get('system') or 'unknown'} in {isl.get('root')}"
+            for n, isl in enumerate(islands, 1)
+        )
+        return (
+            f"Recommended Tests: this repo has {len(islands)} independent test "
+            f"islands — run tests in EACH test island: {items}."
         )
 
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:
