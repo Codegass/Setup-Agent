@@ -141,6 +141,19 @@ PYTHON_TEST_PHASE_GUIDANCE = (
     "report; a partial pass above threshold is a valid, honest outcome."
 )
 
+# Native-first block, PREPENDED to the python build guidance when the analyzer
+# flagged has_native_build (live TVM: root CMakeLists.txt native core, real
+# python package in python/). Licenses the cmake dance instead of railroading a
+# root `pip install -e .` that targets the wrong thing and imports nothing until
+# libtvm.so exists. {python_root} is the analyzer's detected install target.
+NATIVE_FIRST_BUILD_GUIDANCE = (
+    "This package has a NATIVE core (CMakeLists.txt at the repo root). Read the "
+    "project's install docs and build the native library FIRST (cmake + the "
+    "documented deps) — the python package will not import without it. Then "
+    "install the python package from {python_root}. Long native builds detach; "
+    "poll with search."
+)
+
 # Build-system labels the analyzer emits for Python projects: structure
 # detection records "pip/poetry"; the physical validator and manifest say
 # "python"; installer variants may surface too.
@@ -527,17 +540,42 @@ class ReActEngine(UIEventEmitter):
         rec = env.get("build_recommendation") or {}
         return rec.get("build_system") or env.get("build_system")
 
+    def _build_recommendation(self) -> Dict:
+        """The analyzer's build recommendation off the trunk, best-effort ({} on
+        any failure — the same plumbing as _detected_build_system)."""
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            env = getattr(trunk, "environment_summary", None) or {}
+        except Exception:
+            return {}
+        return env.get("build_recommendation") or {}
+
     def _python_phase_guidance(self, phase: str) -> Optional[str]:
         """Explicit python guidance block for the build/test intros, keyed off
         the analyzer's recorded build system (build_recommendation or the env
         summary — the same best-effort plumbing as _recommended_build_line).
         Returns None for every non-python project, keeping Java intros
-        byte-identical."""
+        byte-identical.
+
+        Native-core repos (has_native_build on the recommendation, live TVM):
+        the build-phase guidance PREPENDS the native-first block — build the
+        native library before installing the python package, from the analyzer's
+        detected python root. A plain-python repo carries no native text, so its
+        intro is byte-identical to before."""
         if phase not in ("build", "test"):
             return None
         if not is_python_build_system(self._detected_build_system()):
             return None
-        return PYTHON_BUILD_PHASE_GUIDANCE if phase == "build" else PYTHON_TEST_PHASE_GUIDANCE
+        if phase == "test":
+            return PYTHON_TEST_PHASE_GUIDANCE
+        guidance = PYTHON_BUILD_PHASE_GUIDANCE
+        rec = self._build_recommendation()
+        if rec.get("has_native_build"):
+            native = NATIVE_FIRST_BUILD_GUIDANCE.format(
+                python_root=rec.get("build_root") or "the detected python root"
+            )
+            guidance = f"{native}\n{guidance}"
+        return guidance
 
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
         """One-line build/test recommendation from the analyzer, read from the

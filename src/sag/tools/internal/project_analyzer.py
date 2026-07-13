@@ -44,6 +44,70 @@ def _path_exists(orch, path: str) -> bool:
     return "yes" in (result.get("output") or "")
 
 
+# Subdirectories a python-primary repo conventionally uses to hold the real
+# installable python package when the repo ROOT is a build shell (native-core
+# projects such as TVM: root CMakeLists.txt + python/setup.py). Order is the
+# search order — the first that ships its own setup.py/pyproject.toml wins.
+_PYTHON_SUBDIR_CANDIDATES = ("python", "bindings/python")
+
+# A root pyproject that declares a [project] table WITH dependencies is a real
+# installable package at the root — no need to look for a subdir package. The
+# absence of that signal (bare/PEP-517-shell pyproject) is one of the two
+# triggers for subdir detection.
+_PYPROJECT_HAS_PROJECT_DEPS_RE = re.compile(
+    r"^\s*\[project\][^\[]*?^\s*dependencies\s*=", re.MULTILINE | re.DOTALL
+)
+
+
+def detect_python_package_root(
+    orch,
+    project_path: str,
+    root_files: set,
+    root_pyproject: str,
+) -> Dict[str, Any]:
+    """Where the REAL python package lives, and whether a native core precedes it.
+
+    Live TVM regression (session 20260713_014403): the repo root carried a
+    ``CMakeLists.txt`` (native ``libtvm.so``) and a build-shell pyproject with
+    no ``[project]`` deps, while the actual installable python package lived in
+    ``python/`` (``python/setup.py``). A root ``pip install -e .`` therefore
+    targeted the wrong thing, and nothing said the native library had to be
+    built first.
+
+    Detection is GUIDANCE-level and conservative — it only redirects the python
+    root when BOTH hold:
+
+      * the root looks like a build shell — it has a ``CMakeLists.txt`` OR its
+        pyproject lacks a ``[project]`` dependencies table (so the root is not
+        itself an installable package), AND
+      * a conventional subdirectory (``python/`` or ``bindings/python/``) ships
+        its OWN ``setup.py``/``pyproject.toml`` (a real package there).
+
+    Returns ``{"python_root": <dir>, "has_native_build": <bool>}``. When no
+    subdir package is found the python_root stays the repo root (a plain-python
+    repo is byte-identical to before). ``has_native_build`` is True purely on a
+    root-level ``CMakeLists.txt`` — the native core the python package needs
+    built first — independent of whether the root redirected.
+    """
+    root = project_path.rstrip("/")
+    has_native_build = "CMakeLists.txt" in root_files
+    root_is_shell = has_native_build or not _PYPROJECT_HAS_PROJECT_DEPS_RE.search(
+        root_pyproject or ""
+    )
+
+    python_root = root
+    if root_is_shell:
+        for candidate in _PYTHON_SUBDIR_CANDIDATES:
+            sub = f"{root}/{candidate}"
+            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(
+                orch, f"{sub}/pyproject.toml"
+            ):
+                python_root = sub
+                break
+
+    return {"python_root": python_root, "has_native_build": has_native_build}
+
+
 class ProjectAnalyzerTool(BaseTool):
     """Tool for analyzing project structure and generating intelligent execution plans."""
 
@@ -319,6 +383,17 @@ class ProjectAnalyzerTool(BaseTool):
         elif "go.mod" in existing_files:
             project_type = "Go"
             build_system = "Go modules"
+        elif "CMakeLists.txt" in existing_files and self._python_subdir_package(
+            project_path
+        ):
+            # Native-core python repo (live TVM): the root is a CMake build shell
+            # with NO root python marker, but the real installable python package
+            # lives in python/ (or bindings/python/). Classify as Python so the
+            # python analysis + native-first guidance run — this branch is reached
+            # ONLY after every root marker above missed, so it can never reclassify
+            # a Java/Node/Rust/Go repo, and it requires an actual subdir package.
+            project_type = "Python"
+            build_system = "pip/poetry"
 
         logger.info(f"Detected project type: {project_type}, build system: {build_system}")
 
@@ -343,6 +418,25 @@ class ProjectAnalyzerTool(BaseTool):
                 structure["root_listing"] = (listing.get("output") or "").strip()
 
         return structure
+
+    def _python_subdir_package(self, project_path: str) -> bool:
+        """True when a conventional python subdir ships its own package metadata.
+
+        Native-core repos (TVM) keep the installable python package in
+        ``python/`` (or ``bindings/python/``) beside a CMake build shell at the
+        root. Used only as the LAST classification fallback — a CMake root with
+        no root python marker is Python iff such a subdir package exists."""
+        orch = self.docker_orchestrator
+        if not orch:
+            return False
+        root = project_path.rstrip("/")
+        for candidate in _PYTHON_SUBDIR_CANDIDATES:
+            sub = f"{root}/{candidate}"
+            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(
+                orch, f"{sub}/pyproject.toml"
+            ):
+                return True
+        return False
 
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
         """分析项目文档，提取关键信息"""
@@ -523,22 +617,47 @@ class ProjectAnalyzerTool(BaseTool):
         if not orch:
             return
 
-        listing = orch.execute_command(f"ls -1 {project_path} 2>/dev/null")
-        files_present = {
-            line.strip()
-            for line in (listing.get("output") or "").splitlines()
-            if line.strip()
-        }
+        def list_dir(directory: str) -> set:
+            listing = orch.execute_command(f"ls -1 {directory} 2>/dev/null")
+            return {
+                line.strip()
+                for line in (listing.get("output") or "").splitlines()
+                if line.strip()
+            }
 
-        def read(name: str) -> str:
-            if name not in files_present:
+        def read_from(directory: str, name: str, present: set) -> str:
+            if name not in present:
                 return ""
             # Untruncated like the pom reads: this content is parsed
             # internally by regex and never reaches the model's context.
             result = orch.execute_command(
-                f"cat {project_path}/{name}", truncate_output=False
+                f"cat {directory}/{name}", truncate_output=False
             )
             return result.get("output", "") if result.get("success") else ""
+
+        # Native-core detection (live TVM regression): when the repo ROOT is a
+        # build shell (root CMakeLists.txt, or a pyproject with no [project]
+        # deps) and the real python package lives in python/ (or
+        # bindings/python/), redirect ALL python analysis to that subdir root —
+        # constraint/installer/C-extension parsing, package discovery, and the
+        # venv path — so the recommendation and manifest target the package that
+        # actually installs, not the CMake shell. has_native_build rides along.
+        root_files = list_dir(project_path)
+        root_pyproject = read_from(project_path, "pyproject.toml", root_files)
+        native = detect_python_package_root(
+            orch, project_path, root_files, root_pyproject
+        )
+        python_root = native["python_root"]
+        has_native_build = native["has_native_build"]
+
+        # All metadata reads now come from the DETECTED python root (identical to
+        # the repo root for a plain-python project).
+        files_present = (
+            root_files if python_root == project_path else list_dir(python_root)
+        )
+
+        def read(name: str) -> str:
+            return read_from(python_root, name, files_present)
 
         pyproject = read("pyproject.toml")
         setup_py = read("setup.py")
@@ -591,9 +710,14 @@ class ProjectAnalyzerTool(BaseTool):
             # Bug #13 defect 3: no-test-extras rides the manifest so
             # setup_env narrates the hole instead of failing silently.
             "python_install_note": installer.get("note"),
-            "python_packages": discover_packages(orch, project_path),
-            "python_venv": f"{project_path.rstrip('/')}/.venv",
+            "python_packages": discover_packages(orch, python_root),
+            "python_venv": f"{python_root.rstrip('/')}/.venv",
             "has_c_extensions": has_c_extensions,
+            # The directory the python package actually installs from (the repo
+            # root for a plain project; a python/ subdir for a native-core repo)
+            # and whether a native library must be built before it imports.
+            "python_root": python_root,
+            "has_native_build": has_native_build,
             "test_hints": hints,
         }
 
@@ -1272,13 +1396,23 @@ PY"""
         python_config = analysis.get("python_config") or {}
         if python_config or str(analysis.get("project_type", "")).strip().lower() == "python":
             installer = python_config.get("python_installer") or "pip"
+            # The real install target: a python/ subdir for a native-core repo
+            # (TVM), the repo root for a plain project. python_root is set by
+            # _analyze_python_project; fall back to the repo root when the
+            # python branch did not run (label-only python signal).
+            python_root = python_config.get("python_root") or project_path
             rec.update(
                 build_system="python",
-                build_root=project_path,
+                build_root=python_root,
                 goal="deps",
-                test_root=project_path,
+                test_root=python_root,
                 test_system="pytest",
             )
+            # Native-core flag rides the recommendation so the phase-intro
+            # guidance can prepend the native-first block (build libtvm.so before
+            # the python package can import). False/absent for plain projects.
+            if python_config.get("has_native_build"):
+                rec["has_native_build"] = True
             rec["rationale"] = (
                 f"Python project ({installer}): create the venv and install "
                 "with build(action='deps'), verify with build(action='compile'), "
@@ -1688,6 +1822,10 @@ PY"""
                     "python_packages": python_config.get("python_packages") or [],
                     "python_venv": python_config.get("python_venv"),
                     "has_c_extensions": bool(python_config.get("has_c_extensions")),
+                    # Native core (root CMakeLists.txt) that must be built before
+                    # the python package imports — read by the validator's native
+                    # evidence rung.
+                    "has_native_build": bool(python_config.get("has_native_build")),
                     "test_hints": python_config.get("test_hints") or {},
                 }
             )

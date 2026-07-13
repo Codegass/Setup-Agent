@@ -2313,6 +2313,7 @@ class PhysicalValidator:
                     "import_failures",
                     "compileall_coverage",
                     "ext_modules_ok",
+                    "native_artifact_ok",
                 )
             }
             # Skipped-rung warnings (e.g. "imports rung skipped: ...") must be
@@ -2614,6 +2615,10 @@ class PhysicalValidator:
             "import_failures": [],
             "compileall_coverage": None,
             "ext_modules_ok": None,
+            # Native core (root CMakeLists.txt, live TVM): whether a build native
+            # artifact (.so/.dylib) is present. None until probed / not
+            # applicable; False caps the build at PARTIAL "native core not built".
+            "native_artifact_ok": None,
             "success": False,
             "complete": False,
             "reason": "",
@@ -2747,6 +2752,34 @@ class PhysicalValidator:
             )
             result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
             so_missing = not result["ext_modules_ok"]
+
+        # Native-core rung (live TVM, root CMakeLists.txt): the python package
+        # cannot import without its native library (libtvm.so). When the manifest
+        # flags has_native_build, look for a BUILT native artifact (.so/.dylib)
+        # under the package dir or a build/ tree — its ABSENCE caps the build at
+        # PARTIAL ("native core not built"), NEVER a hard block: pure-python
+        # parts and tests may still run.
+        native_missing = False
+        if manifest.get("has_native_build"):
+            # Search the python package (project_dir) and venv — where a copied
+            # libtvm.so lands — PLUS the repo-root build/ tree CMake conventionally
+            # emits into (the python root is a subdir, so its parent is the repo
+            # root). All paths deduped/guarded so a missing build/ dir is silent.
+            search_roots = {project_dir.rstrip("/"), venv.rstrip("/")}
+            repo_root = project_dir.rstrip("/").rsplit("/", 1)[0]
+            if repo_root and repo_root != project_dir.rstrip("/"):
+                search_roots.add(f"{repo_root}/build")
+            native_probe = self._execute_command_with_logging(
+                f"find {' '.join(sorted(search_roots))} "
+                f"\\( -name '*.so' -o -name '*.dylib' \\) "
+                f"-type f 2>/dev/null | head -1",
+                "native core artifacts",
+            )
+            result["native_artifact_ok"] = bool(
+                (native_probe.get("output") or "").strip()
+            )
+            native_missing = not result["native_artifact_ok"]
+
         if optional_ext_failures:
             # Bug #14: an unimportable optional extension module is
             # C-extension-rung evidence — the rung goes red even when a .so
@@ -2779,6 +2812,11 @@ class PhysicalValidator:
             partial_reasons.append(
                 "declared C-extensions have no built .so artifact"
             )
+        if native_missing:
+            # Live TVM: root CMakeLists.txt native core with no built .so/.dylib.
+            # PARTIAL, never a block — the python package will not fully import,
+            # but pure-python parts and tests may still run.
+            partial_reasons.append("native core not built")
         if optional_ext_failures:
             partial_reasons.append(
                 "optional extension module(s) not importable: "
