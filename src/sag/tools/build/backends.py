@@ -96,19 +96,50 @@ class GradleBackend:
         "compile": "compileJava",
         "test": "test",
         "package": "assemble",
-        # Gradle resolves sibling modules via project() deps in-build, so there is
-        # no local-repo install step to mirror Maven's; `assemble` builds every
-        # subproject's artifacts, which is the closest equivalent.
+        # Within ONE gradle build, project() deps resolve in-build — but
+        # independent build ISLANDS consume each other's artifacts through the
+        # local maven repo (live bigtop: transaction-queue failed 13x resolving
+        # data-generators' SNAPSHOT because install ran assemble and never
+        # published). install therefore publishes to ~/.m2 when the project
+        # applies the maven-publish plugin; without the plugin that task would
+        # fail, so assemble stays the fallback (see _install_task).
         "install": "assemble",
     }
+
+    _GRADLE_BUILD_FILES = ("build.gradle", "build.gradle.kts")
 
     def __init__(self, gradle_tool):
         self.gradle_tool = gradle_tool
 
+    def _install_task(self, working_directory: str) -> str:
+        """publishToMavenLocal when the build applies maven-publish, else assemble.
+
+        A plain 'maven-publish' substring match covers both DSLs (apply plugin:
+        'maven-publish' — incl. subprojects{} blocks — and plugins{} entries);
+        the string has no other meaning in gradle build files.
+        """
+        orch = getattr(self.gradle_tool, "orchestrator", None)
+        if orch is None:
+            return "assemble"
+        root = working_directory.rstrip("/")
+        for name in self._GRADLE_BUILD_FILES:
+            try:
+                result = orch.execute_command(f"cat {root}/{name} 2>/dev/null")
+            except Exception:
+                continue
+            if result.get("success") and "maven-publish" in (result.get("output") or ""):
+                return "publishToMavenLocal"
+        return "assemble"
+
     def run(self, verb: str, args: Optional[str], working_directory: str,
             timeout: Optional[int]) -> ToolResult:
+        task = (
+            self._install_task(working_directory)
+            if verb == "install"
+            else self.VERBS[verb]
+        )
         kwargs: Dict[str, Any] = {
-            "tasks": self.VERBS[verb],
+            "tasks": task,
             "working_directory": working_directory,
             # Single pre-flight ownership: the facade owns pre-flight/retry/
             # [scope] on this path (see MavenBackend.run).
