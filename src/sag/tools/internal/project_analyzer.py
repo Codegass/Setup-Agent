@@ -1458,6 +1458,8 @@ PY"""
 
         root_main_java = _path_exists(orch, f"{project_path}/src/main/java")
         root_main_groovy = _path_exists(orch, f"{project_path}/src/main/groovy")
+        root_main_scala = _path_exists(orch, f"{project_path}/src/main/scala")
+        root_main_kotlin = _path_exists(orch, f"{project_path}/src/main/kotlin")
 
         packaging = None
         if has_pom:
@@ -1468,11 +1470,16 @@ PY"""
         # Find source-bearing modules DIRECTLY rather than trusting the root
         # pom's <modules> — Bigtop declares its modules inside a profile, so the
         # parsed list is empty and the Groovy iTest framework was missed. Scan for
-        # both Java and Groovy main-source dirs, excluding build output.
+        # Java, Groovy, Scala AND Kotlin main-source dirs, excluding build output.
+        # (Live re-probe: bigpetstore-spark's only sources are src/main/scala with
+        # its own build.gradle; a java/groovy-only find never enumerated it, so
+        # the real archipelago produced 3 islands where the fixture had 4. Kotlin
+        # is the same class of gap.)
         source_modules = []
         find_cmd = (
             f"find {project_path} -maxdepth 5 -type d "
-            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' \\) "
+            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' "
+            f"-o -path '*/src/main/scala' -o -path '*/src/main/kotlin' \\) "
             f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
         )
         found = orch.execute_command(find_cmd)
@@ -1481,7 +1488,8 @@ PY"""
             line = line.strip()
             if not line or "/src/main/" not in line:
                 continue
-            lang = "groovy" if line.endswith("/src/main/groovy") else "java"
+            suffix = line.rsplit("/src/main/", 1)[1]
+            lang = suffix if suffix in ("groovy", "scala", "kotlin") else "java"
             module_dir = line.rsplit("/src/main/", 1)[0]
             if module_dir == project_path or module_dir in seen_dirs:
                 continue
@@ -1496,7 +1504,7 @@ PY"""
         rec["source_modules"] = source_modules
 
         # 1) Plain Maven module with its own sources: compile at the root.
-        if has_pom and (root_main_java or root_main_groovy):
+        if has_pom and (root_main_java or root_main_groovy or root_main_scala or root_main_kotlin):
             rec.update(build_system="maven", build_root=project_path, goal="compile")
             rec["rationale"] = "Root Maven module has main sources; compile at the root."
             return rec
@@ -1688,7 +1696,8 @@ PY"""
 
         find_cmd = (
             f"find {project_path} -maxdepth 6 -type d "
-            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' \\) "
+            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' "
+            f"-o -path '*/src/test/scala' -o -path '*/src/test/kotlin' \\) "
             f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
         )
         found = orch.execute_command(find_cmd)

@@ -42,6 +42,18 @@ class FakeOrchestrator:
         self.test_dirs = list(test_dirs)
         self.files = {}
 
+    @staticmethod
+    def _matching(command, candidate_dirs):
+        """Emulate the real shell `find`: only return candidate dirs whose path
+        matches one of the command's `-path '*/...'` globs. A predicate gap in
+        the analyzer's `find` (e.g. no `*/src/main/scala`) therefore drops the
+        matching dirs here exactly as it did on the live re-probe — the fake no
+        longer masks the gap by returning every candidate unconditionally."""
+        suffixes = re.findall(r"-path '\*(/src/(?:main|test)/[^']+)'", command)
+        if not suffixes:  # no path predicate parsed -> emit all (defensive)
+            return list(candidate_dirs)
+        return [d for d in candidate_dirs if any(d.endswith(s) for s in suffixes)]
+
     def execute_command(self, command, **kwargs):
         if command.startswith("mkdir -p"):
             return {"success": True, "output": "", "exit_code": 0}
@@ -51,9 +63,17 @@ class FakeOrchestrator:
             self.files[path] = body
             return {"success": True, "output": "", "exit_code": 0}
         if command.startswith("find ") and "src/test" in command:
-            return {"success": True, "output": "\n".join(self.test_dirs), "exit_code": 0}
+            return {
+                "success": True,
+                "output": "\n".join(self._matching(command, self.test_dirs)),
+                "exit_code": 0,
+            }
         if command.startswith("find ") and "src/main" in command:
-            return {"success": True, "output": "\n".join(self.source_dirs), "exit_code": 0}
+            return {
+                "success": True,
+                "output": "\n".join(self._matching(command, self.source_dirs)),
+                "exit_code": 0,
+            }
         m = re.search(r"test -e (\S+)", command)
         if m:
             return {
@@ -431,3 +451,120 @@ def test_patho_guidance_never_says_build_unknown_in_vendored_dir():
     assert "unknown in" not in test_line
     assert f"{PATHO}/examples/demo" not in build_line
     assert f"{PATHO}/examples/demo" not in test_line
+
+
+# --------------------------------------------------------------------------- #
+# 6) R1 — Scala (and Kotlin) source modules count in the island + root-shape
+#    scans exactly like Java/Groovy.
+#
+# LIVE EVIDENCE (bigtop re-probe): bigpetstore-spark's only sources are under
+# src/main/scala with its own build.gradle. The analyzer's source-module `find`
+# matched only */src/main/java and */src/main/groovy, so the scala island was
+# never enumerated — the real repo produced 3 islands where the archipelago has
+# 4. The FakeOrchestrator now honors the `find` path predicate (see _matching),
+# so a scala/kotlin predicate gap drops those dirs here just as it did live.
+#
+# A gradle island whose ONLY sources are src/main/scala (or src/main/kotlin)
+# must be enumerated with system=gradle; a scala/kotlin test dir must be a test
+# island. Java/Groovy fixtures above are unchanged (still 15 passing before this
+# section's assertions on the extended predicate).
+# --------------------------------------------------------------------------- #
+def _analyze_lang_island(lang):
+    """A packaging=pom aggregator over one gradle island whose ONLY main/test
+    sources live under src/main/<lang> and src/test/<lang>."""
+    p = "/workspace/langrepo"
+    existing = {
+        f"{p}/pom.xml",
+        f"{p}/mod/build.gradle",  # the island's own build root
+    }
+    orch = FakeOrchestrator(
+        existing,
+        packaging="pom",
+        source_dirs=[f"{p}/mod/src/main/{lang}"],
+        test_dirs=[f"{p}/mod/src/test/{lang}"],
+    )
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    analysis = {"build_system": "maven", "maven_modules": []}  # profile-gated
+    analysis["build_recommendation"] = analyzer._recommend_build_approach(p, analysis)
+    analyzer._recommend_test_approach(p, analysis["build_recommendation"])
+    return p, analysis["build_recommendation"]
+
+
+def test_scala_only_gradle_island_is_enumerated():
+    p, rec = _analyze_lang_island("scala")
+    islands = rec.get("build_islands") or []
+    roots = [i["root"] for i in islands]
+    assert f"{p}/mod" in roots, "scala-only source island must be enumerated"
+    by_root = {i["root"]: i["system"] for i in islands}
+    assert by_root[f"{p}/mod"] == "gradle"
+
+
+def test_scala_source_module_lang_is_scala():
+    p, rec = _analyze_lang_island("scala")
+    mods = {m["module"]: m["lang"] for m in rec.get("source_modules", [])}
+    assert mods.get("mod") == "scala"
+
+
+def test_scala_test_dir_is_a_test_island():
+    p, rec = _analyze_lang_island("scala")
+    roots = [i["root"] for i in (rec.get("test_islands") or [])]
+    assert f"{p}/mod" in roots
+
+
+def test_kotlin_only_gradle_island_is_enumerated():
+    p, rec = _analyze_lang_island("kotlin")
+    islands = rec.get("build_islands") or []
+    by_root = {i["root"]: i["system"] for i in islands}
+    assert by_root.get(f"{p}/mod") == "gradle", "kotlin-only source island must be enumerated"
+
+
+def test_kotlin_source_module_lang_is_kotlin():
+    p, rec = _analyze_lang_island("kotlin")
+    mods = {m["module"]: m["lang"] for m in rec.get("source_modules", [])}
+    assert mods.get("mod") == "kotlin"
+
+
+def test_java_and_groovy_lang_derivation_unchanged():
+    """Regression guard: java/groovy still derive their own lang labels."""
+    _pj, rec_j = _analyze_lang_island("java")
+    _pg, rec_g = _analyze_lang_island("groovy")
+    assert {m["lang"] for m in rec_j.get("source_modules", [])} == {"java"}
+    assert {m["lang"] for m in rec_g.get("source_modules", [])} == {"groovy"}
+
+
+# Root-shape signal: a root whose ONLY main sources are src/main/scala (no
+# aggregator subdir, no pom modules) is a plain single-module build compiled at
+# the root — the same shape a src/main/java root has. The root_main_* probes
+# must recognise scala/kotlin, not just java/groovy.
+def _analyze_root_lang(lang):
+    p = "/workspace/rootlang"
+    orch = FakeOrchestrator(
+        {f"{p}/pom.xml", f"{p}/src/main/{lang}"},
+        packaging="jar",
+        source_dirs=[],
+        test_dirs=[],
+    )
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    analysis = {"build_system": "maven", "maven_modules": []}
+    analysis["build_recommendation"] = analyzer._recommend_build_approach(p, analysis)
+    return p, analysis["build_recommendation"]
+
+
+def test_root_scala_sources_compile_at_root_like_java():
+    p, rec = _analyze_root_lang("scala")
+    assert rec.get("build_system") == "maven"
+    assert rec.get("build_root") == p
+    assert rec.get("goal") == "compile"
+    assert not rec.get("build_islands")
+    # Must take the "root has main sources" branch (#1), not fall through to the
+    # default rec — assert the branch's own rationale so a root_main_* probe gap
+    # (scala not recognised) cannot pass on the accidental default.
+    assert rec.get("rationale") == "Root Maven module has main sources; compile at the root."
+
+
+def test_root_kotlin_sources_compile_at_root_like_java():
+    p, rec = _analyze_root_lang("kotlin")
+    assert rec.get("build_system") == "maven"
+    assert rec.get("build_root") == p
+    assert rec.get("goal") == "compile"
+    assert rec.get("rationale") == "Root Maven module has main sources; compile at the root."
