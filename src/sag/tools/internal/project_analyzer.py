@@ -1419,7 +1419,14 @@ PY"""
         itself is skipped (walking stops one level below project_path) — it is
         the pathological root we are decomposing, not an island.
 
-        Returns ``{root, system}`` (root = the island dir, system = maven/gradle).
+        Returns ``{root, system}`` when an owning build root exists (root = the
+        island dir, system = maven/gradle), or ``{"root": None, "system": None}``
+        when NO build file sits between the source dir and the aggregator root.
+        An island REQUIRES its own build root: a source dir with no build marker
+        above it (an example / vendored copy) is NOT an island — callers must
+        exclude it, never promote it (doing so manufactured a bogus system=null
+        island for examples/demo that the manifest persisted and the agent
+        guidance rendered as "build unknown in .../examples/demo").
         """
         orch = self.docker_orchestrator
         root = project_path.rstrip("/")
@@ -1452,9 +1459,9 @@ PY"""
             return {"root": settings_root, "system": "gradle"}
         if nearest_build is not None:
             return {"root": nearest_build, "system": nearest_system}
-        # No build file above the source dir (unusual): treat the source dir
-        # itself as its own island so it is not silently dropped.
-        return {"root": source_dir.rstrip("/"), "system": None}
+        # No build file above the source dir: it has no build root of its own, so
+        # it is NOT an island (vendored/example sources). Signal exclusion.
+        return {"root": None, "system": None}
 
     def _enumerate_build_islands(
         self, project_path: str, source_modules: List[Dict[str, Any]], preferred_dir: str
@@ -1473,6 +1480,11 @@ PY"""
         for mod in source_modules:
             info = self._island_root_for(project_path, mod["dir"])
             root = info["root"]
+            if root is None:
+                # No build root above this source dir -> not an island
+                # (vendored/example copy); exclude it rather than manufacture a
+                # bogus system=null island.
+                continue
             existing = by_root.get(root)
             if existing is None:
                 island = {
@@ -1578,12 +1590,16 @@ PY"""
         if build_rec.get("build_islands"):
             test_islands: List[Dict[str, Any]] = []
             by_root: Dict[str, Dict[str, Any]] = {}
-            dominant_root = self._island_root_for(project_path, test_module_dirs[0])["root"]
-            # test_root already resolved above is the dominant cluster root.
-            dominant_root = build_rec.get("test_root") or dominant_root
+            # test_root (resolved above) is the dominant cluster root and always
+            # truthy here — it leads for backward compatibility.
+            dominant_root = build_rec.get("test_root")
             for module_dir in test_module_dirs:
                 info = self._island_root_for(project_path, module_dir)
                 root = info["root"]
+                if root is None:
+                    # No build root above this test dir -> not a test island
+                    # (vendored/example copy); exclude it.
+                    continue
                 if root in by_root:
                     if by_root[root].get("system") is None and info["system"]:
                         by_root[root]["system"] = info["system"]

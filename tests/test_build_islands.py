@@ -320,10 +320,13 @@ def test_healthy_reactor_build_intro_byte_identical_to_pre_change_snapshot():
     rec = _healthy_reactor_rec()
     engine = _engine_with_recommendation(rec)
     line = engine._recommended_build_line("build")
-    # Pre-change snapshot: the single-target recommendation, unchanged.
+    # Pre-change snapshot: the single-target recommendation, unchanged. The
+    # expected string is a FULL literal (not prefix + rec["rationale"]) so a
+    # rationale drift on the healthy path cannot slip past the byte-compare.
     assert line == (
         "Recommended Build: maven 'install' in /workspace/proj — "
-        + rec["rationale"]
+        "Aggregator root over 1 source module(s) (0 Groovy); "
+        "build the reactor at the root with 'install'."
     )
     assert "independent build islands" not in line
 
@@ -332,8 +335,99 @@ def test_single_module_build_intro_byte_identical_to_pre_change_snapshot():
     rec = _single_module_rec()
     engine = _engine_with_recommendation(rec)
     line = engine._recommended_build_line("build")
+    # Full literal (see healthy-reactor snapshot rationale above).
     assert line == (
         "Recommended Build: maven 'compile' in /workspace/proj — "
-        + rec["rationale"]
+        "Root Maven module has main sources; compile at the root."
     )
     assert "independent build islands" not in line
+
+
+# --------------------------------------------------------------------------- #
+# 5) Vendored / no-build-file source dirs must NOT be promoted to islands.
+#
+# LIVE EVIDENCE (patho): a packaging=pom aggregator with framework/ (its own
+# pom.xml) plus examples/demo/src/main/java that has NO build file anywhere
+# between it and the aggregator root. An island REQUIRES its own build root; a
+# source dir with no pom.xml/build.gradle above it (an example / vendored copy)
+# is NOT an island — promoting it manufactures a bogus system=null island that
+# is persisted into the manifest and rendered into agent guidance as
+# "build ... unknown in .../examples/demo", instructing the agent to build a
+# dir with an unknown build system. Such dirs must be EXCLUDED, not promoted.
+# --------------------------------------------------------------------------- #
+PATHO = "/workspace/patho"
+
+PATHO_EXISTING = {
+    f"{PATHO}/pom.xml",
+    f"{PATHO}/framework/pom.xml",
+    # examples/demo has main sources but NO build file anywhere above them.
+}
+PATHO_SOURCE_DIRS = [
+    f"{PATHO}/framework/src/main/java",
+    f"{PATHO}/examples/demo/src/main/java",  # no build file -> not an island
+]
+PATHO_TEST_DIRS = [
+    f"{PATHO}/framework/src/test/java",
+    f"{PATHO}/examples/demo/src/test/java",  # no build file -> not a test island
+]
+
+
+def _analyze_patho():
+    orch = FakeOrchestrator(
+        PATHO_EXISTING,
+        packaging="pom",
+        source_dirs=PATHO_SOURCE_DIRS,
+        test_dirs=PATHO_TEST_DIRS,
+    )
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    analysis = {"build_system": "maven", "maven_modules": []}  # profile-gated
+    analysis["build_recommendation"] = analyzer._recommend_build_approach(PATHO, analysis)
+    analyzer._recommend_test_approach(PATHO, analysis["build_recommendation"])
+    return orch, analysis
+
+
+def test_patho_no_build_file_source_dir_is_not_a_build_island():
+    _orch, analysis = _analyze_patho()
+    islands = analysis["build_recommendation"].get("build_islands") or []
+    roots = _island_roots(islands)
+    # framework has its own pom.xml -> a real island.
+    assert f"{PATHO}/framework" in roots
+    # examples/demo has NO build file -> must be excluded, never promoted.
+    assert f"{PATHO}/examples/demo" not in roots
+    # No system=null island manufactured for the vendored dir.
+    assert all(isl.get("system") is not None for isl in islands)
+
+
+def test_patho_no_build_file_source_dir_is_not_a_test_island():
+    _orch, analysis = _analyze_patho()
+    islands = analysis["build_recommendation"].get("test_islands") or []
+    roots = _island_roots(islands)
+    assert f"{PATHO}/framework" in roots
+    assert f"{PATHO}/examples/demo" not in roots
+    assert all(isl.get("system") is not None for isl in islands)
+
+
+def test_patho_manifest_excludes_bogus_islands():
+    import json
+
+    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+
+    orch, analysis = _analyze_patho()
+    analyzer = ProjectAnalyzerTool(docker_orchestrator=orch)
+    analyzer._persist_build_requirements(PATHO, analysis)
+    manifest = json.loads(orch.files[REQUIREMENTS_PATH])
+    for key in ("build_islands", "test_islands"):
+        roots = [i["root"] for i in manifest.get(key, [])]
+        assert f"{PATHO}/examples/demo" not in roots, key
+        assert all(i.get("system") is not None for i in manifest.get(key, [])), key
+
+
+def test_patho_guidance_never_says_build_unknown_in_vendored_dir():
+    _orch, analysis = _analyze_patho()
+    engine = _engine_with_recommendation(analysis["build_recommendation"])
+    build_line = engine._recommended_build_line("build") or ""
+    test_line = engine._recommended_build_line("test") or ""
+    assert "unknown in" not in build_line
+    assert "unknown in" not in test_line
+    assert f"{PATHO}/examples/demo" not in build_line
+    assert f"{PATHO}/examples/demo" not in test_line
