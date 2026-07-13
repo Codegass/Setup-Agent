@@ -19,7 +19,11 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from sag.tools.internal.python_env import ensure_venv_pip, resolve_python_version
+from sag.tools.internal.python_env import (
+    _REPAIR_ACTION_PHRASE,
+    ensure_venv_pip,
+    resolve_python_version,
+)
 
 REQUIREMENTS_PATH = "/workspace/.setup_agent/build_requirements.json"
 
@@ -352,23 +356,23 @@ class PythonPreflight:
 
     def _ensure_venv_pip(self, venv: str, version: Optional[str] = None) -> Optional[str]:
         """Verify pip exists inside the fresh venv; repair via the shared
-        python_env.ensure_venv_pip ladder (bug #12 / bug #13 defect 1):
-        probe -> ensurepip -> recreate -> re-probe. Never blocks: a
-        still-missing pip returns a narration line and the run continues."""
+        python_env.ensure_venv_pip ladder (bug #12 / bug #13 defect 1, live
+        TVM failure): probe -> ensurepip -> recreate -> apt python3-venv ->
+        uv venv --seed -> re-probe between each. Never blocks: a still-missing
+        pip returns a narration line naming every rung and the run continues."""
         repair = ensure_venv_pip(self.orchestrator, venv, python_version=version)
         action = repair.get("action")
+        ladder = repair.get("ladder") or []
         if repair.get("ok"):
             if action is None:
                 return None
-            if action == "ensurepip":
-                return (
-                    f"→ venv had no pip; repaired with "
-                    f"'{venv}/bin/python -m ensurepip --upgrade'"
-                )
-            return f"→ venv had no pip; recreated {venv} with a seeded venv"
+            phrase = _REPAIR_ACTION_PHRASE.get(action, "repaired")
+            return f"→ venv had no pip; {phrase} at {venv}"
+        tried = "; ".join(ladder) if ladder else "ensurepip and recreation"
         return (
-            f"→ pip still missing in {venv} after ensurepip and recreation — "
-            f"pip-based install commands will fail; continuing (never blocks)"
+            f"→ pip still missing in {venv} after the repair ladder "
+            f"(tried: {tried}) — pip-based install commands will fail; "
+            f"continuing (never blocks)"
         )
 
     def _apt_provision(self, version: str, venv: str) -> bool:

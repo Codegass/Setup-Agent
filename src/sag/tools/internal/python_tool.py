@@ -26,7 +26,12 @@ from .build_preflight import (
     classify_python_version_error,
     read_build_requirements,
 )
-from .python_env import detect_installer, discover_packages, ensure_venv_pip
+from .python_env import (
+    detect_installer,
+    discover_packages,
+    ensure_venv_pip,
+    venv_repair_note,
+)
 
 # The verifier (Task 6) reads both: the JUnit XML under PYTEST_REPORT_DIR for
 # executed counts, COLLECTED_JSON as the detected-tests denominator feeding
@@ -246,16 +251,9 @@ class PythonTool(BaseTool):
         repair = ensure_venv_pip(
             self.orchestrator, venv, python_version=requirements.get("python_version")
         )
-        if repair.get("action") == "ensurepip":
-            preamble.append("[env] existing venv was missing pip — repaired with ensurepip")
-        elif repair.get("action") == "recreated":
-            if repair.get("ok"):
-                preamble.append(f"[env] existing venv was missing pip — recreated at {venv}")
-            else:
-                preamble.append(
-                    f"[env] venv at {venv} still has no working pip after ensurepip "
-                    "and recreation — pip installs will fail honestly"
-                )
+        repair_note = venv_repair_note(repair, venv)
+        if repair_note:
+            preamble.append(repair_note)
 
         installer = requirements.get("python_installer") or "pip"
         note = requirements.get("python_install_note")

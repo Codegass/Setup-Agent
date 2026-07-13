@@ -200,34 +200,128 @@ def detect_installer(files_present, contents: Optional[Dict[str, str]] = None) -
 
 # uv lands in ~/.local/bin (same PATH note as build_preflight).
 _LOCAL_BIN_PATH = 'export PATH="$HOME/.local/bin:$PATH"'
+_UV_INSTALL = "curl -LsSf https://astral.sh/uv/install.sh | sh"
+
+_ACTIVE_PY_RE = re.compile(r"Python\s+(\d+\.\d+)")
+
+
+def _active_python_minor(orchestrator) -> Optional[str]:
+    """major.minor of the container's system ``python3``, or None."""
+    result = orchestrator.execute_command("python3 --version 2>&1")
+    match = _ACTIVE_PY_RE.search(result.get("output") or "")
+    return match.group(1) if match else None
 
 
 def ensure_venv_pip(orchestrator, venv: str, python_version: Optional[str] = None) -> Dict[str, Any]:
     """Guarantee ``{venv}/bin/python -m pip`` works before anything installs.
 
-    Probe -> ensurepip once -> RECREATE the venv (python3 -m venv --clear,
-    then a seeded uv venv) -> re-probe. Returns ``{"ok": bool, "action":
-    None | "ensurepip" | "recreated"}``. Check-and-fix only: callers narrate
-    the repair; a still-broken pip never blocks here — the install commands
-    fail honestly downstream."""
+    Straight-line repair ladder, ONE attempt per rung, re-probing pip between
+    each (live TVM failure, session 20260713_014403_27874 — Debian splits
+    ``ensurepip`` out of the system python, so a plain ``python3 -m venv``
+    yields a venv with only symlinks: no pip, no ensurepip module):
+
+      1. probe   ``{venv}/bin/python -m pip --version``
+      2. ensurepip
+      3. recreate with the current interpreter (``python3 -m venv --clear``)
+      4. apt-get install ``python3-venv python3-pip`` + the versioned
+         ``python3.<minor>-venv`` for the ACTIVE minor, then recreate
+      5. install uv (``curl | sh``, PATH=$HOME/.local/bin) then
+         ``uv venv --seed``
+      6. all exhausted -> ``ok=False``.
+
+    Returns ``{"ok": bool, "action": None | "ensurepip" | "recreated" |
+    "apt-venv" | "uv", "ladder": [<rungs tried, narrated>]}``. Check-and-fix
+    only: callers narrate the ladder; a still-broken pip never blocks here —
+    the install commands fail honestly downstream. No loop: each rung fires at
+    most once, in order."""
+
+    ladder: List[str] = []
 
     def pip_ok() -> bool:
         probe = orchestrator.execute_command(f"{venv}/bin/python -m pip --version")
         return bool(probe.get("success"))
 
+    # Rung 1: probe. A healthy venv issues zero repair commands.
     if pip_ok():
-        return {"ok": True, "action": None}
+        return {"ok": True, "action": None, "ladder": []}
+
+    # Rung 2: ensurepip (fails outright when Debian split the module out —
+    # 'No module named ensurepip').
+    ladder.append("ensurepip")
     orchestrator.execute_command(f"{venv}/bin/python -m ensurepip --upgrade")
     if pip_ok():
-        return {"ok": True, "action": "ensurepip"}
-    recreated = orchestrator.execute_command(f"python3 -m venv --clear {venv}")
-    if recreated.get("success") and pip_ok():
-        return {"ok": True, "action": "recreated"}
-    python_arg = f" --python {python_version}" if python_version else ""
-    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}")
+        return {"ok": True, "action": "ensurepip", "ladder": ladder}
+
+    # Rung 3: recreate with the CURRENT interpreter. If that interpreter is the
+    # ensurepip-less system python, the fresh venv is pip-less again (the TVM
+    # trap the old ladder dead-ended on).
+    ladder.append("recreate (current interpreter, python3 -m venv --clear)")
+    orchestrator.execute_command(f"python3 -m venv --clear {venv}")
     if pip_ok():
-        return {"ok": True, "action": "recreated"}
-    return {"ok": False, "action": "recreated"}
+        return {"ok": True, "action": "recreated", "ladder": ladder}
+
+    # Rung 4: install the split-out venv/pip packages — the generic ones plus
+    # the versioned python3.<minor>-venv that actually ships ensurepip for the
+    # active interpreter — then recreate. This is the rung the live TVM run
+    # needed and never had.
+    minor = _active_python_minor(orchestrator)
+    versioned = f" python3.{minor.split('.')[1]}-venv" if minor else ""
+    ladder.append(
+        "apt python3-venv/python3-pip"
+        + (f" (+python3.{minor.split('.')[1]}-venv)" if minor else "")
+        + " then recreate"
+    )
+    apt = orchestrator.execute_command(
+        "DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1; "
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+        f"python3-venv python3-pip{versioned}"
+    )
+    if apt.get("success"):
+        orchestrator.execute_command(f"python3 -m venv --clear {venv}")
+        if pip_ok():
+            return {"ok": True, "action": "apt-venv", "ladder": ladder}
+
+    # Rung 5: install uv, then a seeded venv (ships pip inside — bug #12).
+    ladder.append("install uv then uv venv --seed")
+    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; {_UV_INSTALL}")
+    python_arg = f" --python {python_version}" if python_version else ""
+    orchestrator.execute_command(
+        f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}"
+    )
+    if pip_ok():
+        return {"ok": True, "action": "uv", "ladder": ladder}
+
+    # Rung 6: exhausted. Honest failure; the full ladder is narrated by callers.
+    return {"ok": False, "action": "exhausted", "ladder": ladder}
+
+
+# The winning rung -> the short human phrase callers prepend. Kept beside the
+# ladder so the narration vocabulary lives exactly once.
+_REPAIR_ACTION_PHRASE = {
+    "ensurepip": "repaired with ensurepip",
+    "recreated": "recreated with the current interpreter",
+    "apt-venv": "recreated after apt-installing python3-venv/python3-pip",
+    "uv": "recreated with a seeded uv venv",
+}
+
+
+def venv_repair_note(repair: Dict[str, Any], venv: str) -> Optional[str]:
+    """One ``[env]`` narration line for an ``ensure_venv_pip`` result, or None
+    when no repair ran. A successful repair names the winning rung; an
+    exhausted ladder is an HONEST failure that names every rung tried (no
+    silent success)."""
+    action = repair.get("action")
+    if not action:
+        return None
+    ladder = repair.get("ladder") or []
+    if repair.get("ok"):
+        phrase = _REPAIR_ACTION_PHRASE.get(action, "repaired")
+        return f"[env] existing venv was missing pip — {phrase} at {venv}"
+    tried = "; ".join(ladder) if ladder else "ensurepip and recreation"
+    return (
+        f"[env] venv at {venv} still has no working pip after the repair ladder "
+        f"(tried: {tried}) — pip installs will fail honestly"
+    )
 
 
 # package_dir root mapping ({'': '<dir>'}): the project's own declaration of

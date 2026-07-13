@@ -12,7 +12,7 @@ from sag.runtime import EnvOverlayStore
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import PythonPreflight, read_build_requirements
 from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
-from .python_env import detect_installer, ensure_venv_pip
+from .python_env import detect_installer, ensure_venv_pip, venv_repair_note
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
@@ -1046,16 +1046,8 @@ class ProjectSetupTool(BaseTool):
         repair = ensure_venv_pip(
             self.orchestrator, venv, python_version=requirements.get("python_version")
         )
-        if repair.get("action"):
-            if not repair.get("ok"):
-                repair_note = (
-                    f"[env] venv at {venv} still has no working pip after ensurepip "
-                    "and recreation — pip installs will fail honestly"
-                )
-            elif repair.get("action") == "ensurepip":
-                repair_note = "[env] existing venv was missing pip — repaired with ensurepip"
-            else:
-                repair_note = f"[env] existing venv was missing pip — recreated at {venv}"
+        repair_note = venv_repair_note(repair, venv)
+        if repair_note:
             logger.info(repair_note)
             output_lines.append(repair_note)
 
