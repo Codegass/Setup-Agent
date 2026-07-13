@@ -279,7 +279,16 @@ class PythonPreflight:
         active = active_python_version(self.orchestrator)
         if active == required or self._constraint_satisfied(active, constraint):
             logger.debug(f"Python pre-flight: active {active} satisfies requirement")
-            return PreflightOutcome(True, active, required)
+            # A version MATCH is necessary but not sufficient: the live TVM run
+            # (session 20260713_014403_27874) had system python 3.12.3 satisfy
+            # '>=3.10' yet ship NO ensurepip, so it could not create a working
+            # venv and the broken toolchain sailed through to fail later in
+            # deps. Verify FUNCTION, not just version — cheaply (module presence
+            # probe, no side effects), and repair via the SAME rungs a mismatch
+            # would use. Never flips the (correct) version match to a mismatch.
+            if self._can_create_venvs():
+                return PreflightOutcome(True, active, required)
+            return self._repair_matched_but_broken(active, required, source)
 
         header = (
             f"[pre-flight] Required: Python {required} (source: {source}). "
@@ -318,6 +327,64 @@ class PythonPreflight:
         if not active or not constraint:
             return False
         return resolve_python_version(constraint, [active]) == active
+
+    def _can_create_venvs(self) -> bool:
+        """Cheaply verify the ACTIVE interpreter can create a working venv:
+        probe for the ``ensurepip`` module (Debian splits it out, so a
+        version-matching python can still yield a pip-less venv — the live TVM
+        trap). ``python3 -m ensurepip --version`` is a pure module-presence
+        check with no side effects; the ``importlib.util.find_spec`` fallback
+        covers interpreters whose ensurepip lacks ``--version``.
+
+        Cached PER RUN on the shared orchestrator: multiple tools each build
+        their own PythonPreflight in one run, but the probe touches the
+        container exactly once (the interpreter does not change mid-run)."""
+        cached = getattr(self.orchestrator, "_python_ensurepip_ok", None)
+        if cached is not None:
+            return cached
+        probe = self.orchestrator.execute_command(
+            "python3 -m ensurepip --version 2>/dev/null "
+            "|| python3 -c \"import importlib.util,sys; "
+            "sys.exit(0 if importlib.util.find_spec('ensurepip') else 1)\""
+        )
+        ok = bool(probe.get("success"))
+        try:
+            self.orchestrator._python_ensurepip_ok = ok
+        except Exception:  # a read-only/exotic orchestrator: skip the cache
+            pass
+        return ok
+
+    def _repair_matched_but_broken(
+        self, active: Optional[str], required: str, source: str
+    ) -> PreflightOutcome:
+        """Version matched but the interpreter cannot create venvs (no
+        ensurepip). Narrate the honest defect and run the SAME apt/uv repair
+        rungs a mismatch uses (shared ``ensure_venv_pip`` via
+        ``_ensure_venv_pip`` — never duplicated). Provisioning failure keeps the
+        existing degrade semantics: narrated, never a hard block, and — because
+        the VERSION genuinely matched — never a version mismatch flag."""
+        venv = self._venv_path()
+        header = (
+            f"[pre-flight] Python {active} matches the constraint but cannot "
+            f"create venvs (no ensurepip) — repairing (source: {source})"
+        )
+        pip_note = self._ensure_venv_pip(venv, required)
+        # A successful repair means later tools in this run need neither probe
+        # nor repair: flip the per-run cache to healthy. A still-broken pip
+        # leaves the cache False so the honest narration recurs (never silent).
+        if pip_note is None or "still missing" not in pip_note:
+            try:
+                self.orchestrator._python_ensurepip_ok = True
+            except Exception:
+                pass
+        _register_python_overlay(self.orchestrator, venv, required)
+        narration = header
+        if pip_note:
+            narration += f"\n{pip_note}"
+        return PreflightOutcome(
+            matched=True, active_version=active, required_version=required,
+            provisioned=True, mismatch=False, narration=narration,
+        )
 
     def _venv_path(self) -> str:
         """Project venv from the analyzer manifest; /workspace/.venv fallback."""
