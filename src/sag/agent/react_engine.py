@@ -141,6 +141,19 @@ PYTHON_TEST_PHASE_GUIDANCE = (
     "report; a partial pass above threshold is a valid, honest outcome."
 )
 
+# Native-first block, PREPENDED to the python build guidance when the analyzer
+# flagged has_native_build (live TVM: root CMakeLists.txt native core, real
+# python package in python/). Licenses the cmake dance instead of railroading a
+# root `pip install -e .` that targets the wrong thing and imports nothing until
+# libtvm.so exists. {python_root} is the analyzer's detected install target.
+NATIVE_FIRST_BUILD_GUIDANCE = (
+    "This package has a NATIVE core (CMakeLists.txt at the repo root). Read the "
+    "project's install docs and build the native library FIRST (cmake + the "
+    "documented deps) — the python package will not import without it. Then "
+    "install the python package from {python_root}. Long native builds detach; "
+    "poll with search."
+)
+
 # Build-system labels the analyzer emits for Python projects: structure
 # detection records "pip/poetry"; the physical validator and manifest say
 # "python"; installer variants may surface too.
@@ -527,17 +540,42 @@ class ReActEngine(UIEventEmitter):
         rec = env.get("build_recommendation") or {}
         return rec.get("build_system") or env.get("build_system")
 
+    def _build_recommendation(self) -> Dict:
+        """The analyzer's build recommendation off the trunk, best-effort ({} on
+        any failure — the same plumbing as _detected_build_system)."""
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            env = getattr(trunk, "environment_summary", None) or {}
+        except Exception:
+            return {}
+        return env.get("build_recommendation") or {}
+
     def _python_phase_guidance(self, phase: str) -> Optional[str]:
         """Explicit python guidance block for the build/test intros, keyed off
         the analyzer's recorded build system (build_recommendation or the env
         summary — the same best-effort plumbing as _recommended_build_line).
         Returns None for every non-python project, keeping Java intros
-        byte-identical."""
+        byte-identical.
+
+        Native-core repos (has_native_build on the recommendation, live TVM):
+        the build-phase guidance PREPENDS the native-first block — build the
+        native library before installing the python package, from the analyzer's
+        detected python root. A plain-python repo carries no native text, so its
+        intro is byte-identical to before."""
         if phase not in ("build", "test"):
             return None
         if not is_python_build_system(self._detected_build_system()):
             return None
-        return PYTHON_BUILD_PHASE_GUIDANCE if phase == "build" else PYTHON_TEST_PHASE_GUIDANCE
+        if phase == "test":
+            return PYTHON_TEST_PHASE_GUIDANCE
+        guidance = PYTHON_BUILD_PHASE_GUIDANCE
+        rec = self._build_recommendation()
+        if rec.get("has_native_build"):
+            native = NATIVE_FIRST_BUILD_GUIDANCE.format(
+                python_root=rec.get("build_root") or "the detected python root"
+            )
+            guidance = f"{native}\n{guidance}"
+        return guidance
 
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
         """One-line build/test recommendation from the analyzer, read from the
@@ -550,6 +588,13 @@ class ReActEngine(UIEventEmitter):
         if not rec:
             return None
         if phase == "test":
+            # Pathological aggregators are archipelagos: run tests in EACH test
+            # island (Bigtop: the maven framework's own unit tests were skipped
+            # while only the dominant Gradle cluster ran). Guidance, not
+            # orchestration — the agent still owns the how.
+            test_islands = rec.get("test_islands")
+            if test_islands and len(test_islands) > 1:
+                return self._island_test_line(test_islands)
             test_root = rec.get("test_root")
             if not test_root:
                 return None
@@ -566,6 +611,12 @@ class ReActEngine(UIEventEmitter):
                 f"Recommended Tests: run {rec.get('test_system')} 'test' in {test_root} "
                 "— the test suite lives here, not in the build module."
             )
+        # Build phase. Pathological aggregators: build EACH independent island so
+        # none is left UNKNOWN (Bigtop: bigpetstore-spark + transaction-queue
+        # never built when only one preferred module was targeted).
+        build_islands = rec.get("build_islands")
+        if build_islands and len(build_islands) > 1:
+            return self._island_build_line(build_islands)
         if rec.get("is_aggregator_only"):
             return (
                 f"Recommended Build: NONE — {rec.get('rationale', '')} "
@@ -574,6 +625,44 @@ class ReActEngine(UIEventEmitter):
         return (
             f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
             f"{rec.get('build_root')} — {rec.get('rationale', '')}"
+        )
+
+    @staticmethod
+    def _island_build_line(islands) -> str:
+        """Render the build-phase call-out that lists EVERY independent build
+        island for a pathological aggregator (each must be built on its own),
+        naming the recommended GOAL beside each island and appending the
+        cross-island dependency guidance (see below)."""
+        items = "; ".join(
+            f"{n}) {isl.get('system') or 'unknown'} '{isl.get('goal') or 'build'}' "
+            f"in {isl.get('root')}"
+            for n, isl in enumerate(islands, 1)
+        )
+        return (
+            f"Recommended Build: this repo has {len(islands)} independent build "
+            f"islands — build EACH: {items}. "
+            # CROSS-ISLAND dependency guidance (live bigtop re-probe: the
+            # transaction-queue island died 13x resolving an org-internal
+            # SNAPSHOT the data-generators island produces but never PUBLISHED).
+            "Islands may depend on each other through the local maven repo: if a "
+            "build fails resolving an org-internal SNAPSHOT artifact (searched in "
+            "file:/root/.m2/...), FIRST build/publish the island that produces it "
+            "(maven 'install' / gradle 'publishToMavenLocal'), then retry this "
+            "island once. "
+            "In the test phase, run tests in EACH test island."
+        )
+
+    @staticmethod
+    def _island_test_line(islands) -> str:
+        """Render the test-phase call-out that lists EVERY independent test
+        island for a pathological aggregator (run tests in each)."""
+        items = "; ".join(
+            f"{n}) {isl.get('system') or 'unknown'} in {isl.get('root')}"
+            for n, isl in enumerate(islands, 1)
+        )
+        return (
+            f"Recommended Tests: this repo has {len(islands)} independent test "
+            f"islands — run tests in EACH test island: {items}."
         )
 
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:

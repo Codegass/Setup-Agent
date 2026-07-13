@@ -44,6 +44,95 @@ def _path_exists(orch, path: str) -> bool:
     return "yes" in (result.get("output") or "")
 
 
+# Subdirectories a python-primary repo conventionally uses to hold the real
+# installable python package when the repo ROOT is a build shell (native-core
+# projects such as TVM: root CMakeLists.txt + python/setup.py). Order is the
+# search order — the first that ships its own setup.py/pyproject.toml wins.
+_PYTHON_SUBDIR_CANDIDATES = ("python", "bindings/python")
+
+
+def _root_has_installable_package(root_files: set, root_pyproject: str) -> bool:
+    """True when the repo ROOT itself declares an installable python package.
+
+    Established POSITIVELY, not inferred from a bracket-fragile deps regex:
+
+      * ``setup.py`` at the root — a classic (requirements.txt +) setup.py
+        package; OR
+      * ``setup.cfg`` at the root — a declarative setuptools package (setup.py
+        is often a one-line shim or absent); OR
+      * ``pyproject.toml`` that names a package — a ``[project]`` table with a
+        ``name`` (PEP 621) or a ``[tool.poetry]`` table. This uses the same
+        section-scoped parser as package discovery, so it is immune to the
+        ``[`` characters in ``authors``/``classifiers``/``keywords`` arrays (the
+        standard modern ordering, which this repo's own pyproject uses),
+        recognizes Poetry roots (deps under ``[tool.poetry.dependencies]``,
+        no ``[project]`` table), and recognizes ``dynamic = ["dependencies"]``
+        packages (deps resolved by the backend, still a real root package).
+
+    A bare PEP-517 build-shell pyproject (only ``[build-system]`` /
+    ``[build-backend]``, no package name) is NOT a root package — that is the
+    TVM shape whose real package lives under ``python/``.
+    """
+    from .python_env import project_name_from_pyproject
+
+    if "setup.py" in root_files or "setup.cfg" in root_files:
+        return True
+    return project_name_from_pyproject(root_pyproject or "") is not None
+
+
+def detect_python_package_root(
+    orch,
+    project_path: str,
+    root_files: set,
+    root_pyproject: str,
+) -> Dict[str, Any]:
+    """Where the REAL python package lives, and whether a native core precedes it.
+
+    Live TVM regression (session 20260713_014403): the repo root carried a
+    ``CMakeLists.txt`` (native ``libtvm.so``) and a build-shell pyproject with
+    no root package, while the actual installable python package lived in
+    ``python/`` (``python/setup.py``). A root ``pip install -e .`` therefore
+    targeted the wrong thing, and nothing said the native library had to be
+    built first.
+
+    Detection is GUIDANCE-level and conservative — it only redirects the python
+    root when BOTH hold:
+
+      * the root ships NO installable package of its own — no root
+        ``setup.py``/``setup.cfg`` and no package-naming ``pyproject.toml``
+        (``[project]`` name or ``[tool.poetry]``); see
+        ``_root_has_installable_package``. Package-less-ness is established
+        POSITIVELY, so a real root package with the standard modern pyproject
+        ordering (``authors``/``classifiers`` before ``dependencies``), a
+        Poetry root, a ``dynamic = ["dependencies"]`` root, or a plain
+        setup.py/setup.cfg root is never mistaken for a shell and redirected —
+        the mirror image of the TVM bug. AND
+      * a conventional subdirectory (``python/`` or ``bindings/python/``) ships
+        its OWN ``setup.py``/``pyproject.toml`` (a real package there).
+
+    Returns ``{"python_root": <dir>, "has_native_build": <bool>}``. When no
+    subdir package is found the python_root stays the repo root (a plain-python
+    repo is byte-identical to before). ``has_native_build`` is True purely on a
+    root-level ``CMakeLists.txt`` — the native core the python package needs
+    built first — independent of whether the root redirected.
+    """
+    root = project_path.rstrip("/")
+    has_native_build = "CMakeLists.txt" in root_files
+    root_is_shell = not _root_has_installable_package(root_files, root_pyproject)
+
+    python_root = root
+    if root_is_shell:
+        for candidate in _PYTHON_SUBDIR_CANDIDATES:
+            sub = f"{root}/{candidate}"
+            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(
+                orch, f"{sub}/pyproject.toml"
+            ):
+                python_root = sub
+                break
+
+    return {"python_root": python_root, "has_native_build": has_native_build}
+
+
 class ProjectAnalyzerTool(BaseTool):
     """Tool for analyzing project structure and generating intelligent execution plans."""
 
@@ -319,6 +408,17 @@ class ProjectAnalyzerTool(BaseTool):
         elif "go.mod" in existing_files:
             project_type = "Go"
             build_system = "Go modules"
+        elif "CMakeLists.txt" in existing_files and self._python_subdir_package(
+            project_path
+        ):
+            # Native-core python repo (live TVM): the root is a CMake build shell
+            # with NO root python marker, but the real installable python package
+            # lives in python/ (or bindings/python/). Classify as Python so the
+            # python analysis + native-first guidance run — this branch is reached
+            # ONLY after every root marker above missed, so it can never reclassify
+            # a Java/Node/Rust/Go repo, and it requires an actual subdir package.
+            project_type = "Python"
+            build_system = "pip/poetry"
 
         logger.info(f"Detected project type: {project_type}, build system: {build_system}")
 
@@ -343,6 +443,25 @@ class ProjectAnalyzerTool(BaseTool):
                 structure["root_listing"] = (listing.get("output") or "").strip()
 
         return structure
+
+    def _python_subdir_package(self, project_path: str) -> bool:
+        """True when a conventional python subdir ships its own package metadata.
+
+        Native-core repos (TVM) keep the installable python package in
+        ``python/`` (or ``bindings/python/``) beside a CMake build shell at the
+        root. Used only as the LAST classification fallback — a CMake root with
+        no root python marker is Python iff such a subdir package exists."""
+        orch = self.docker_orchestrator
+        if not orch:
+            return False
+        root = project_path.rstrip("/")
+        for candidate in _PYTHON_SUBDIR_CANDIDATES:
+            sub = f"{root}/{candidate}"
+            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(
+                orch, f"{sub}/pyproject.toml"
+            ):
+                return True
+        return False
 
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
         """分析项目文档，提取关键信息"""
@@ -523,22 +642,47 @@ class ProjectAnalyzerTool(BaseTool):
         if not orch:
             return
 
-        listing = orch.execute_command(f"ls -1 {project_path} 2>/dev/null")
-        files_present = {
-            line.strip()
-            for line in (listing.get("output") or "").splitlines()
-            if line.strip()
-        }
+        def list_dir(directory: str) -> set:
+            listing = orch.execute_command(f"ls -1 {directory} 2>/dev/null")
+            return {
+                line.strip()
+                for line in (listing.get("output") or "").splitlines()
+                if line.strip()
+            }
 
-        def read(name: str) -> str:
-            if name not in files_present:
+        def read_from(directory: str, name: str, present: set) -> str:
+            if name not in present:
                 return ""
             # Untruncated like the pom reads: this content is parsed
             # internally by regex and never reaches the model's context.
             result = orch.execute_command(
-                f"cat {project_path}/{name}", truncate_output=False
+                f"cat {directory}/{name}", truncate_output=False
             )
             return result.get("output", "") if result.get("success") else ""
+
+        # Native-core detection (live TVM regression): when the repo ROOT is a
+        # build shell (root CMakeLists.txt, or a pyproject with no [project]
+        # deps) and the real python package lives in python/ (or
+        # bindings/python/), redirect ALL python analysis to that subdir root —
+        # constraint/installer/C-extension parsing, package discovery, and the
+        # venv path — so the recommendation and manifest target the package that
+        # actually installs, not the CMake shell. has_native_build rides along.
+        root_files = list_dir(project_path)
+        root_pyproject = read_from(project_path, "pyproject.toml", root_files)
+        native = detect_python_package_root(
+            orch, project_path, root_files, root_pyproject
+        )
+        python_root = native["python_root"]
+        has_native_build = native["has_native_build"]
+
+        # All metadata reads now come from the DETECTED python root (identical to
+        # the repo root for a plain-python project).
+        files_present = (
+            root_files if python_root == project_path else list_dir(python_root)
+        )
+
+        def read(name: str) -> str:
+            return read_from(python_root, name, files_present)
 
         pyproject = read("pyproject.toml")
         setup_py = read("setup.py")
@@ -591,9 +735,14 @@ class ProjectAnalyzerTool(BaseTool):
             # Bug #13 defect 3: no-test-extras rides the manifest so
             # setup_env narrates the hole instead of failing silently.
             "python_install_note": installer.get("note"),
-            "python_packages": discover_packages(orch, project_path),
-            "python_venv": f"{project_path.rstrip('/')}/.venv",
+            "python_packages": discover_packages(orch, python_root),
+            "python_venv": f"{python_root.rstrip('/')}/.venv",
             "has_c_extensions": has_c_extensions,
+            # The directory the python package actually installs from (the repo
+            # root for a plain project; a python/ subdir for a native-core repo)
+            # and whether a native library must be built before it imports.
+            "python_root": python_root,
+            "has_native_build": has_native_build,
             "test_hints": hints,
         }
 
@@ -1272,13 +1421,23 @@ PY"""
         python_config = analysis.get("python_config") or {}
         if python_config or str(analysis.get("project_type", "")).strip().lower() == "python":
             installer = python_config.get("python_installer") or "pip"
+            # The real install target: a python/ subdir for a native-core repo
+            # (TVM), the repo root for a plain project. python_root is set by
+            # _analyze_python_project; fall back to the repo root when the
+            # python branch did not run (label-only python signal).
+            python_root = python_config.get("python_root") or project_path
             rec.update(
                 build_system="python",
-                build_root=project_path,
+                build_root=python_root,
                 goal="deps",
-                test_root=project_path,
+                test_root=python_root,
                 test_system="pytest",
             )
+            # Native-core flag rides the recommendation so the phase-intro
+            # guidance can prepend the native-first block (build libtvm.so before
+            # the python package can import). False/absent for plain projects.
+            if python_config.get("has_native_build"):
+                rec["has_native_build"] = True
             rec["rationale"] = (
                 f"Python project ({installer}): create the venv and install "
                 "with build(action='deps'), verify with build(action='compile'), "
@@ -1299,6 +1458,8 @@ PY"""
 
         root_main_java = _path_exists(orch, f"{project_path}/src/main/java")
         root_main_groovy = _path_exists(orch, f"{project_path}/src/main/groovy")
+        root_main_scala = _path_exists(orch, f"{project_path}/src/main/scala")
+        root_main_kotlin = _path_exists(orch, f"{project_path}/src/main/kotlin")
 
         packaging = None
         if has_pom:
@@ -1309,11 +1470,16 @@ PY"""
         # Find source-bearing modules DIRECTLY rather than trusting the root
         # pom's <modules> — Bigtop declares its modules inside a profile, so the
         # parsed list is empty and the Groovy iTest framework was missed. Scan for
-        # both Java and Groovy main-source dirs, excluding build output.
+        # Java, Groovy, Scala AND Kotlin main-source dirs, excluding build output.
+        # (Live re-probe: bigpetstore-spark's only sources are src/main/scala with
+        # its own build.gradle; a java/groovy-only find never enumerated it, so
+        # the real archipelago produced 3 islands where the fixture had 4. Kotlin
+        # is the same class of gap.)
         source_modules = []
         find_cmd = (
             f"find {project_path} -maxdepth 5 -type d "
-            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' \\) "
+            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' "
+            f"-o -path '*/src/main/scala' -o -path '*/src/main/kotlin' \\) "
             f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
         )
         found = orch.execute_command(find_cmd)
@@ -1322,7 +1488,8 @@ PY"""
             line = line.strip()
             if not line or "/src/main/" not in line:
                 continue
-            lang = "groovy" if line.endswith("/src/main/groovy") else "java"
+            suffix = line.rsplit("/src/main/", 1)[1]
+            lang = suffix if suffix in ("groovy", "scala", "kotlin") else "java"
             module_dir = line.rsplit("/src/main/", 1)[0]
             if module_dir == project_path or module_dir in seen_dirs:
                 continue
@@ -1337,7 +1504,7 @@ PY"""
         rec["source_modules"] = source_modules
 
         # 1) Plain Maven module with its own sources: compile at the root.
-        if has_pom and (root_main_java or root_main_groovy):
+        if has_pom and (root_main_java or root_main_groovy or root_main_scala or root_main_kotlin):
             rec.update(build_system="maven", build_root=project_path, goal="compile")
             rec["rationale"] = "Root Maven module has main sources; compile at the root."
             return rec
@@ -1365,6 +1532,18 @@ PY"""
                     preferred = (groovy_modules or source_modules)[0]
                     build_root = preferred["dir"]
                     scope = f"module {preferred['module']} directly"
+                    # PATHOLOGICAL-AGGREGATOR PATH ONLY: this repo is an
+                    # archipelago (Bigtop: a maven island + several INDEPENDENT
+                    # gradle islands, each with real sources). Picking ONE
+                    # preferred module leaves the others UNKNOWN (live evidence:
+                    # bigpetstore-spark + bigpetstore-transaction-queue never
+                    # built). Enumerate EVERY independent island so the agent's
+                    # guidance can cover each. build_root stays = island #1 for
+                    # backward compatibility; the recommendation is guidance,
+                    # not orchestration — the agent remains in charge.
+                    rec["build_islands"] = self._enumerate_build_islands(
+                        project_path, source_modules, preferred["dir"]
+                    )
                 rec.update(build_system="maven", build_root=build_root, goal=goal)
                 rec["rationale"] = (
                     f"Aggregator root over {len(source_modules)} source module(s) "
@@ -1394,6 +1573,146 @@ PY"""
 
         return rec
 
+    def _island_root_for(self, project_path: str, source_dir: str) -> Dict[str, Any]:
+        """Map one source/test-bearing dir to its nearest INDEPENDENT build
+        island: the build root that owns it, plus that root's build system.
+
+        Walk up from ``source_dir`` toward ``project_path`` (never above it),
+        recording the first ancestor with a build marker (pom.xml /
+        build.gradle(.kts)). Independence is defined by settings.gradle: a
+        Gradle multi-project (settings.gradle at its root) is ONE island and its
+        subprojects are NOT separate islands, so the OUTERMOST settings-gradle
+        ancestor wins over a nearer subproject build.gradle. The root aggregator
+        itself is skipped (walking stops one level below project_path) — it is
+        the pathological root we are decomposing, not an island.
+
+        Returns ``{root, system}`` when an owning build root exists (root = the
+        island dir, system = maven/gradle), or ``{"root": None, "system": None}``
+        when NO build file sits between the source dir and the aggregator root.
+        An island REQUIRES its own build root: a source dir with no build marker
+        above it (an example / vendored copy) is NOT an island — callers must
+        exclude it, never promote it (doing so manufactured a bogus system=null
+        island for examples/demo that the manifest persisted and the agent
+        guidance rendered as "build unknown in .../examples/demo").
+        """
+        orch = self.docker_orchestrator
+        root = project_path.rstrip("/")
+        cur = source_dir.rstrip("/")
+
+        nearest_build = None  # first ancestor with any build marker
+        nearest_system = None
+        settings_root = None  # OUTERMOST ancestor carrying settings.gradle
+
+        # Ascend from the module dir up to (but not including) the project root.
+        while cur.startswith(root + "/"):
+            if _path_exists(orch, f"{cur}/settings.gradle") or _path_exists(
+                orch, f"{cur}/settings.gradle.kts"
+            ):
+                settings_root = cur  # keep ascending -> ends on the outermost
+            has_pom = _path_exists(orch, f"{cur}/pom.xml")
+            has_gradle_build = _path_exists(orch, f"{cur}/build.gradle") or _path_exists(
+                orch, f"{cur}/build.gradle.kts"
+            )
+            if nearest_build is None and (has_pom or has_gradle_build):
+                nearest_build = cur
+                nearest_system = "maven" if has_pom else "gradle"
+            parent = cur.rsplit("/", 1)[0]
+            if parent == cur:
+                break
+            cur = parent
+
+        if settings_root is not None:
+            # The gradle multi-project root is the island; its subprojects fold in.
+            return {"root": settings_root, "system": "gradle"}
+        if nearest_build is not None:
+            return {"root": nearest_build, "system": nearest_system}
+        # No build file above the source dir: it has no build root of its own, so
+        # it is NOT an island (vendored/example sources). Signal exclusion.
+        return {"root": None, "system": None}
+
+    def _island_build_goal(self, root: str, system: Optional[str]) -> str:
+        """The recommended build action (GOAL) for one independent island.
+
+        LIVE EVIDENCE (bigtop re-probe): the transaction-queue gradle island died
+        13x resolving org.apache.bigtop:bigpetstore-data-generator:3.5.0-SNAPSHOT
+        from file:/root/.m2/... — an artifact the data-generators island PRODUCES
+        but only if it PUBLISHES to the local maven repo, which a bare `build`
+        never does. This is the gradle-island version of the reactor-install
+        lesson (a maven island `install`s so siblings resolve its artifact).
+
+        So: maven island -> 'install'; gradle island whose build.gradle(.kts)
+        applies the maven-publish plugin -> 'publishToMavenLocal' (it publishes a
+        SNAPSHOT other islands consume); every other gradle island -> 'build'.
+        """
+        if system == "maven":
+            return "install"
+        if system == "gradle" and self._island_applies_maven_publish(root):
+            return "publishToMavenLocal"
+        return "build"
+
+    def _island_applies_maven_publish(self, root: str) -> bool:
+        """True iff the island's own build.gradle(.kts) applies the maven-publish
+        plugin — the signal that it publishes an artifact to the local maven repo
+        that a cross-island SNAPSHOT dependency can resolve."""
+        orch = self.docker_orchestrator
+        if not orch:
+            return False
+        root = root.rstrip("/")
+        cmd = (
+            f"grep -lE 'maven-publish' {root}/build.gradle {root}/build.gradle.kts "
+            f"2>/dev/null"
+        )
+        found = orch.execute_command(cmd)
+        return bool((found.get("output") or "").strip())
+
+    def _enumerate_build_islands(
+        self, project_path: str, source_modules: List[Dict[str, Any]], preferred_dir: str
+    ) -> List[Dict[str, Any]]:
+        """Group every source-bearing module into its independent build island
+        (pathological-aggregator path only).
+
+        Each island is ``{root, system, goal, rationale}``, deduped by root, with
+        the preferred module's island FIRST (so build_islands[0]["root"] ==
+        build_root for backward compatibility). ``goal`` is the recommended build
+        action for that island (maven -> 'install', gradle-with-maven-publish ->
+        'publishToMavenLocal', else 'build') so a cross-island SNAPSHOT
+        dependency resolves from the local maven repo.
+        """
+        islands: List[Dict[str, Any]] = []
+        by_root: Dict[str, Dict[str, Any]] = {}
+        preferred_island_root = self._island_root_for(project_path, preferred_dir)["root"]
+
+        for mod in source_modules:
+            info = self._island_root_for(project_path, mod["dir"])
+            root = info["root"]
+            if root is None:
+                # No build root above this source dir -> not an island
+                # (vendored/example copy); exclude it rather than manufacture a
+                # bogus system=null island.
+                continue
+            existing = by_root.get(root)
+            if existing is None:
+                goal = self._island_build_goal(root, info["system"])
+                island = {
+                    "root": root,
+                    "system": info["system"],
+                    "goal": goal,
+                    "rationale": (
+                        f"Independent {info['system'] or 'unknown'} build island "
+                        f"under the aggregator; build it on its own with '{goal}'."
+                    ),
+                }
+                by_root[root] = island
+                islands.append(island)
+            elif existing.get("system") is None and info["system"]:
+                existing["system"] = info["system"]
+                # System resolved late -> recompute the goal now that we know it.
+                existing["goal"] = self._island_build_goal(root, info["system"])
+
+        # Preferred module's island leads (matches build_root).
+        islands.sort(key=lambda i: 0 if i["root"] == preferred_island_root else 1)
+        return islands
+
     def _recommend_test_approach(self, project_path: str, build_rec: Dict[str, Any]) -> None:
         """Recommend WHERE to run tests — they often live in different modules (and
         a different build system) than the main build.
@@ -1419,7 +1738,8 @@ PY"""
 
         find_cmd = (
             f"find {project_path} -maxdepth 6 -type d "
-            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' \\) "
+            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' "
+            f"-o -path '*/src/test/scala' -o -path '*/src/test/kotlin' \\) "
             f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
         )
         found = orch.execute_command(find_cmd)
@@ -1471,6 +1791,42 @@ PY"""
         ):
             build_rec["test_root"] = project_path
 
+        # PATHOLOGICAL-AGGREGATOR PATH ONLY: an archipelago has independent test
+        # islands too. The dominant-cluster heuristic above picks ONE (Bigtop's
+        # Gradle bigtop-data-generators); the maven bigtop-test-framework's OWN
+        # unit tests then never ran. Enumerate EVERY test island (test-bearing
+        # dir -> its build island) so the agent's test-phase guidance targets
+        # each; dominant cluster (test_root) leads for backward compatibility.
+        if build_rec.get("build_islands"):
+            test_islands: List[Dict[str, Any]] = []
+            by_root: Dict[str, Dict[str, Any]] = {}
+            # test_root (resolved above) is the dominant cluster root and always
+            # truthy here — it leads for backward compatibility.
+            dominant_root = build_rec.get("test_root")
+            for module_dir in test_module_dirs:
+                info = self._island_root_for(project_path, module_dir)
+                root = info["root"]
+                if root is None:
+                    # No build root above this test dir -> not a test island
+                    # (vendored/example copy); exclude it.
+                    continue
+                if root in by_root:
+                    if by_root[root].get("system") is None and info["system"]:
+                        by_root[root]["system"] = info["system"]
+                    continue
+                island = {
+                    "root": root,
+                    "system": info["system"],
+                    "rationale": (
+                        f"Independent {info['system'] or 'unknown'} test island; "
+                        "run its tests on its own."
+                    ),
+                }
+                by_root[root] = island
+                test_islands.append(island)
+            test_islands.sort(key=lambda i: 0 if i["root"] == dominant_root else 1)
+            build_rec["test_islands"] = test_islands
+
     def _persist_build_requirements(self, project_path: str, analysis: Dict[str, Any]) -> None:
         """Persist the analyzer's build/test requirements manifest (spec §2).
 
@@ -1517,6 +1873,12 @@ PY"""
             "test_root": rec.get("test_root"),
             "test_system": rec.get("test_system"),
             "test_fail_at_end": test_fail_at_end,
+            # Multi-island coverage on pathological aggregators: the full
+            # archipelago the agent must build/test EACH of. Empty lists on
+            # healthy reactors / single modules (the single build_root/test_root
+            # fields above already fully describe those).
+            "build_islands": rec.get("build_islands") or [],
+            "test_islands": rec.get("test_islands") or [],
         }
 
         # Python requirements ride along on the SAME handoff manifest (spec
@@ -1536,6 +1898,10 @@ PY"""
                     "python_packages": python_config.get("python_packages") or [],
                     "python_venv": python_config.get("python_venv"),
                     "has_c_extensions": bool(python_config.get("has_c_extensions")),
+                    # Native core (root CMakeLists.txt) that must be built before
+                    # the python package imports — read by the validator's native
+                    # evidence rung.
+                    "has_native_build": bool(python_config.get("has_native_build")),
                     "test_hints": python_config.get("test_hints") or {},
                 }
             )
@@ -2111,6 +2477,19 @@ PY"""
                         f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6]
                     )
                     output += f"   • Source modules: {mods}\n"
+                # Pathological aggregators are archipelagos: name EVERY
+                # independent build island so the agent builds each (not just
+                # the one preferred module).
+                build_islands = rec.get("build_islands") or []
+                if len(build_islands) > 1:
+                    isles = "; ".join(
+                        f"{isl.get('system') or 'unknown'}:{isl['root']}"
+                        for isl in build_islands
+                    )
+                    output += (
+                        f"   • {len(build_islands)} independent build islands "
+                        f"(build EACH): {isles}\n"
+                    )
             # Tests may live in a different module / build system than the build.
             # (Python recs are pytest-at-the-build-root by construction — their
             # differing labels must not render the "not in the build module"

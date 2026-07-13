@@ -19,7 +19,11 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
-from sag.tools.internal.python_env import ensure_venv_pip, resolve_python_version
+from sag.tools.internal.python_env import (
+    _REPAIR_ACTION_PHRASE,
+    ensure_venv_pip,
+    resolve_python_version,
+)
 
 REQUIREMENTS_PATH = "/workspace/.setup_agent/build_requirements.json"
 
@@ -190,6 +194,20 @@ _VERSION_ERROR_PATTERNS = [
 ]
 _CLASS_FILE_VERSION = re.compile(r"class file version (\d+)\.")
 
+# Old-Groovy vs new-JDK compiler transform incompatibility (live bigtop R3):
+# bigtop's Groovy AST-transforming plugins emit this on JDK >= 11 while the
+# maven modules are meant to build on JDK 8. Unlike the other signatures the
+# error text names no target version — the remediation is the classic
+# groovy-on-jdk8 downgrade, so this is a fixed "8" SENTINEL. classify_version_error
+# is pure-text; the caller's `needed != active` gate makes it a no-op when the
+# build is already on JDK 8 (needed == active), so the retry stays bounded and
+# never fires spuriously.
+_GROOVY_TRANSFORM_TYPERESOLVER = re.compile(
+    r"wrong descriptors and a potential NullPointerException in TypeResolver"
+    r"|Groovy:A transform used a generics containing ClassNode",
+    re.IGNORECASE,
+)
+
 
 def classify_version_error(output: str) -> Optional[str]:
     """Extract the JDK major a failed build says it needs, else None."""
@@ -203,6 +221,9 @@ def classify_version_error(output: str) -> Optional[str]:
     if match:
         # Class-file major 52 = JDK 8, 61 = JDK 17: major - 44.
         return str(int(match.group(1)) - 44)
+    if _GROOVY_TRANSFORM_TYPERESOLVER.search(output):
+        # Old-Groovy AST transform breaks on JDK >= 11: remediate to JDK 8.
+        return "8"
     return None
 
 
@@ -275,7 +296,16 @@ class PythonPreflight:
         active = active_python_version(self.orchestrator)
         if active == required or self._constraint_satisfied(active, constraint):
             logger.debug(f"Python pre-flight: active {active} satisfies requirement")
-            return PreflightOutcome(True, active, required)
+            # A version MATCH is necessary but not sufficient: the live TVM run
+            # (session 20260713_014403_27874) had system python 3.12.3 satisfy
+            # '>=3.10' yet ship NO ensurepip, so it could not create a working
+            # venv and the broken toolchain sailed through to fail later in
+            # deps. Verify FUNCTION, not just version — cheaply (module presence
+            # probe, no side effects), and repair via the SAME rungs a mismatch
+            # would use. Never flips the (correct) version match to a mismatch.
+            if self._can_create_venvs():
+                return PreflightOutcome(True, active, required)
+            return self._repair_matched_but_broken(active, required, source)
 
         header = (
             f"[pre-flight] Required: Python {required} (source: {source}). "
@@ -315,6 +345,64 @@ class PythonPreflight:
             return False
         return resolve_python_version(constraint, [active]) == active
 
+    def _can_create_venvs(self) -> bool:
+        """Cheaply verify the ACTIVE interpreter can create a working venv:
+        probe for the ``ensurepip`` module (Debian splits it out, so a
+        version-matching python can still yield a pip-less venv — the live TVM
+        trap). ``python3 -m ensurepip --version`` is a pure module-presence
+        check with no side effects; the ``importlib.util.find_spec`` fallback
+        covers interpreters whose ensurepip lacks ``--version``.
+
+        Cached PER RUN on the shared orchestrator: multiple tools each build
+        their own PythonPreflight in one run, but the probe touches the
+        container exactly once (the interpreter does not change mid-run)."""
+        cached = getattr(self.orchestrator, "_python_ensurepip_ok", None)
+        if cached is not None:
+            return cached
+        probe = self.orchestrator.execute_command(
+            "python3 -m ensurepip --version 2>/dev/null "
+            "|| python3 -c \"import importlib.util,sys; "
+            "sys.exit(0 if importlib.util.find_spec('ensurepip') else 1)\""
+        )
+        ok = bool(probe.get("success"))
+        try:
+            self.orchestrator._python_ensurepip_ok = ok
+        except Exception:  # a read-only/exotic orchestrator: skip the cache
+            pass
+        return ok
+
+    def _repair_matched_but_broken(
+        self, active: Optional[str], required: str, source: str
+    ) -> PreflightOutcome:
+        """Version matched but the interpreter cannot create venvs (no
+        ensurepip). Narrate the honest defect and run the SAME apt/uv repair
+        rungs a mismatch uses (shared ``ensure_venv_pip`` via
+        ``_ensure_venv_pip`` — never duplicated). Provisioning failure keeps the
+        existing degrade semantics: narrated, never a hard block, and — because
+        the VERSION genuinely matched — never a version mismatch flag."""
+        venv = self._venv_path()
+        header = (
+            f"[pre-flight] Python {active} matches the constraint but cannot "
+            f"create venvs (no ensurepip) — repairing (source: {source})"
+        )
+        pip_note = self._ensure_venv_pip(venv, required)
+        # A successful repair means later tools in this run need neither probe
+        # nor repair: flip the per-run cache to healthy. A still-broken pip
+        # leaves the cache False so the honest narration recurs (never silent).
+        if pip_note is None or "still missing" not in pip_note:
+            try:
+                self.orchestrator._python_ensurepip_ok = True
+            except Exception:
+                pass
+        _register_python_overlay(self.orchestrator, venv, required)
+        narration = header
+        if pip_note:
+            narration += f"\n{pip_note}"
+        return PreflightOutcome(
+            matched=True, active_version=active, required_version=required,
+            provisioned=True, mismatch=False, narration=narration,
+        )
+
     def _venv_path(self) -> str:
         """Project venv from the analyzer manifest; /workspace/.venv fallback."""
         return read_build_requirements(self.orchestrator).get("python_venv") or "/workspace/.venv"
@@ -352,23 +440,23 @@ class PythonPreflight:
 
     def _ensure_venv_pip(self, venv: str, version: Optional[str] = None) -> Optional[str]:
         """Verify pip exists inside the fresh venv; repair via the shared
-        python_env.ensure_venv_pip ladder (bug #12 / bug #13 defect 1):
-        probe -> ensurepip -> recreate -> re-probe. Never blocks: a
-        still-missing pip returns a narration line and the run continues."""
+        python_env.ensure_venv_pip ladder (bug #12 / bug #13 defect 1, live
+        TVM failure): probe -> ensurepip -> recreate -> apt python3-venv ->
+        uv venv --seed -> re-probe between each. Never blocks: a still-missing
+        pip returns a narration line naming every rung and the run continues."""
         repair = ensure_venv_pip(self.orchestrator, venv, python_version=version)
         action = repair.get("action")
+        ladder = repair.get("ladder") or []
         if repair.get("ok"):
             if action is None:
                 return None
-            if action == "ensurepip":
-                return (
-                    f"→ venv had no pip; repaired with "
-                    f"'{venv}/bin/python -m ensurepip --upgrade'"
-                )
-            return f"→ venv had no pip; recreated {venv} with a seeded venv"
+            phrase = _REPAIR_ACTION_PHRASE.get(action, "repaired")
+            return f"→ venv had no pip; {phrase} at {venv}"
+        tried = "; ".join(ladder) if ladder else "ensurepip and recreation"
         return (
-            f"→ pip still missing in {venv} after ensurepip and recreation — "
-            f"pip-based install commands will fail; continuing (never blocks)"
+            f"→ pip still missing in {venv} after the repair ladder "
+            f"(tried: {tried}) — pip-based install commands will fail; "
+            f"continuing (never blocks)"
         )
 
     def _apt_provision(self, version: str, venv: str) -> bool:

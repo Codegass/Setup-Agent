@@ -1409,24 +1409,47 @@ class ReportTool(BaseTool, UIEventEmitter):
             (test_status_pv.get("test_stats") or {}).get("discovered")
         ) or to_int(test_status_pv.get("static_test_count"))
 
-        # Python denominator priority: validate_test_status carries the pytest
-        # --collect-only count (COLLECTED_JSON, written by python_tool at test
-        # time — ground truth from the actual runner). It OUTRANKS any static
-        # heuristic the trunk carries: static scans sweep the project dir, and
-        # the setup plants the venv INSIDE it (live 2026-07-10 click run:
-        # site-packages pushed the static count to 32927 while pytest collected
-        # 1927, so 1902 green executions read as 5.8% coverage and
-        # tests_not_fully_executed capped the run at PARTIAL). The trunk static
-        # count remains the fallback below when no collected count exists.
-        # Java priority order unchanged (trunk/catalog win).
-        if collected_discovered and self._is_python_project(project_info):
-            if static_test_count and static_test_count != collected_discovered:
+        # Python denominator priority + cross-language isolation.
+        #
+        # The trunk static_test_count is populated ONLY by the Java catalog
+        # scanner (project_analyzer runs build_java_test_catalog exclusively on
+        # project_type == "Java"). On a python run the only way that field
+        # carries a value is a hybrid/vendored Java binding
+        # (live 2026-07-13 TVM, session 20260713_014403_27874: 17 @Test methods
+        # from the vendored jvm/ binding). Judging a pytest suite of thousands
+        # against a Java @Test count is cross-language contamination — TVM's
+        # report read "17 detected / 0 executed (0.0%)" and falsely fired
+        # tests_not_fully_executed.
+        #
+        # So on python the denominator comes EXCLUSIVELY from pytest
+        # --collect-only (COLLECTED_JSON, carried on
+        # test_status.test_stats.discovered — ground truth from the actual
+        # runner). It OUTRANKS any static heuristic the trunk carries (live
+        # 2026-07-10 click run: a venv planted inside the project pushed the
+        # count to 32927 vs 1927 collected). When NO collected count exists the
+        # denominator is honestly UNKNOWN: the Java @Test count is discarded
+        # rather than used as a static fallback, and the tests line renders
+        # "N executed" without a fabricated detected total. Java runs keep the
+        # trunk/catalog static count untouched (priority order unchanged).
+        if self._is_python_project(project_info):
+            if collected_discovered:
+                if static_test_count and static_test_count != collected_discovered:
+                    logger.info(
+                        "📊 python denominator priority: pytest collect-only "
+                        f"{collected_discovered} overrides the trunk static count "
+                        f"{static_test_count}"
+                    )
+                static_test_count = collected_discovered
+            elif static_test_count:
+                # No collect-only manifest: the trunk value can only be Java
+                # @Test noise (the python path never persists a static count
+                # there). Drop it — an UNKNOWN denominator over a wrong one.
                 logger.info(
-                    "📊 python denominator priority: pytest collect-only "
-                    f"{collected_discovered} overrides the trunk static count "
-                    f"{static_test_count}"
+                    "📊 python denominator isolation: discarding the Java static "
+                    f"test count {static_test_count} (no pytest collect-only "
+                    "count for a python run; denominator is UNKNOWN)"
                 )
-            static_test_count = collected_discovered
+                static_test_count = None
 
         # Backfill: when analyze never persisted the static test total to the
         # trunk, fall back to the catalog count from the test scan so the
@@ -1434,7 +1457,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         # catalog already counted them — e.g. 100 methods). Persist it back to the
         # trunk (best-effort) so other consumers + validate_project_analysis_status
         # stop reporting it as missing.
-        if not static_test_count:
+        #
+        # Java-only: catalog_test_count is the Java @Test catalog scan. Never
+        # let it seed the python denominator (same cross-language isolation as
+        # the priority block above — TVM's vendored jvm/ binding). Python uses
+        # the collect-only fallback immediately below instead.
+        if not static_test_count and not self._is_python_project(project_info):
             catalog_count = to_int(test_analysis.get("catalog_test_count"))
             if catalog_count:
                 static_test_count = catalog_count
@@ -2331,6 +2359,22 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # Ensure physical_validation container exists
                 if "physical_validation" not in actual_accomplishments:
                     actual_accomplishments["physical_validation"] = {}
+
+                # Report-time freshness: the final validation pass must never
+                # serve a stale artifact count. The mid-run TTL cache (60s) can
+                # hold a count taken minutes earlier — before later build/test
+                # phases compiled more classes. Live bigtop (session
+                # 20260713_014403): an early Maven module build cached 6 .class
+                # files, a later Gradle test compile brought the container to
+                # 162, and the header still said "6 classes" while the
+                # per-module breakdown (fresh via scan_modules) showed the
+                # Gradle modules built. Clearing once here forces BOTH the build
+                # verdict (validate_build_status -> _check_build_artifacts_
+                # complete) and the header counts (validate_build_artifacts ->
+                # _check_class_files/_check_jar_files) to recompute from a single
+                # consistent scan of the container's real report-time state.
+                # Mid-run caching is untouched: this is the report path only.
+                self.physical_validator.clear_cache()
 
                 # Primary build verdict must match agent-facing validation
                 build_status = self.physical_validator.validate_build_status(
@@ -4122,6 +4166,31 @@ class ReportTool(BaseTool, UIEventEmitter):
         # Actionable Recommendations
         lines.extend(["### Actionable Recommendations"])
 
+        # Language-aware advice: a python snapshot must NOT be handed maven
+        # commands. TVM (python-primary, jvm/ Maven binding) got a report
+        # recommending 'mvn clean test -DskipTests=false' — meaningless for a
+        # pytest project. Branch on the snapshot's build system.
+        if self._snapshot_build_system(snapshot) == "python":
+            if exec_rate and exec_rate < 90:
+                lines.append("1. **Increase Test Execution Rate**:")
+                lines.append("   ```bash")
+                lines.append("   pytest -p no:cacheprovider")
+                lines.append("   ```")
+
+            lines.append("2. **Run All Tests**:")
+            lines.append("   ```bash")
+            lines.append("   pip install -e . && pytest")
+            lines.append("   ```")
+
+            if warnings or blockers:
+                lines.append("3. **Check Skipped Reasons**:")
+                lines.append("   ```bash")
+                lines.append('   pytest -rs | grep -i "skip\\|deselect"')
+                lines.append("   ```")
+
+            lines.append("")
+            return lines
+
         if exec_rate and exec_rate < 90:
             skipped_modules = status.get("skipped_modules", [])[:3]
             if skipped_modules:
@@ -4145,6 +4214,25 @@ class ReportTool(BaseTool, UIEventEmitter):
         lines.append("")
 
         return lines
+
+    def _snapshot_build_system(self, snapshot: Dict[str, Any]) -> str:
+        """The canonical build-system label for this snapshot, lowercased.
+
+        Prefers the physically-detected build system (physical_evidence, same
+        source the module-metrics scan trusts) and falls back to the reported
+        project build system. 'pip/poetry' normalizes to 'python' so the
+        recommendation branch keys off one label.
+        """
+        for candidate in (
+            (snapshot.get("physical_evidence") or {}).get("build_system"),
+            (snapshot.get("project") or {}).get("build_system"),
+        ):
+            label = str(candidate or "").strip().lower()
+            if label in ("python", "pip/poetry", "pip", "poetry"):
+                return "python"
+            if label in ("maven", "gradle"):
+                return label
+        return ""
 
     def _render_task_progress(self, actual_accomplishments: dict = None) -> List[str]:
         """Render task progress in improved table format."""

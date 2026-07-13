@@ -27,7 +27,7 @@ class PyOrch:
     def __init__(self, python_output, uv_present=True, uv_install_ok=True,
                  uv_python_ok=True, uv_venv_ok=True, apt_ok=True,
                  apt_venv_ok=True, manifest=None, venv_pip_ok=True,
-                 ensurepip_ok=True):
+                 ensurepip_ok=True, ensurepip_module_ok=True):
         self.python_output = python_output
         self.uv_present = uv_present
         self.uv_install_ok = uv_install_ok
@@ -38,6 +38,10 @@ class PyOrch:
         self.manifest = manifest
         self.venv_pip_ok = venv_pip_ok      # `python -m pip --version` probe
         self.ensurepip_ok = ensurepip_ok    # `python -m ensurepip` repair
+        # Debian's ensurepip split: the system interpreter can match a version
+        # constraint yet ship NO ensurepip module, so a plain `-m venv` yields
+        # a pip-less venv. The matched-path functionality probe reads this.
+        self.ensurepip_module_ok = ensurepip_module_ok
         self.commands = []
 
     def execute_command(self, cmd, workdir=None):
@@ -66,6 +70,10 @@ class PyOrch:
             return result(self.apt_ok)
         if "-m venv" in cmd:
             return result(self.apt_venv_ok)
+        # The functionality probe: side-effect-free module presence check.
+        # It must be distinguished from the `-m ensurepip --upgrade` repair.
+        if "-m ensurepip --version" in cmd:
+            return result(self.ensurepip_module_ok)
         if "-m pip --version" in cmd:
             return result(self.venv_pip_ok, "pip 25.0" if self.venv_pip_ok else
                           "No module named pip")
@@ -99,6 +107,108 @@ def test_no_requirement_is_a_noop():
     orch = PyOrch("Python 3.12.4")
     outcome = PythonPreflight(orch).run(None)
     assert outcome.matched is True and outcome.narration == ""
+
+
+# ---------------------------------------------------------------------------
+# Matched-version functionality probe (live TVM failure, session
+# 20260713_014403_27874): system python 3.12.3 satisfied '>=3.10' so the
+# pre-flight returned matched/no-op, but that interpreter had NO ensurepip and
+# could not create a working venv — the broken toolchain sailed through to
+# fail later in deps. A version MATCH must also verify the interpreter can
+# actually create venvs, repairing via the SAME apt/uv rungs as a mismatch.
+# ---------------------------------------------------------------------------
+
+
+def test_matched_version_probes_functionality_exactly_once_when_healthy():
+    # matched + functional interpreter -> pure no-op: EXACTLY one probe
+    # command (the ensurepip module check), no repair traffic at all.
+    orch = PyOrch("Python 3.12.3")
+    outcome = PythonPreflight(orch).run("3.12", constraint=">=3.10",
+                                        source="requires-python")
+    assert outcome.matched is True
+    assert outcome.provisioned is False
+    assert outcome.narration == ""
+    probes = [c for c in orch.commands if "-m ensurepip --version" in c]
+    assert len(probes) == 1  # exactly one cheap probe, no repeats
+    # A healthy interpreter triggers no repair traffic on the matched path.
+    assert not any(
+        "-m ensurepip --upgrade" in c or "apt-get" in c
+        or "uv venv" in c or "-m venv" in c
+        for c in orch.commands
+    )
+
+
+def test_matched_version_but_missing_ensurepip_repairs_and_narrates(monkeypatch):
+    # The live TVM shape: 3.12.3 matches '>=3.10' but has no ensurepip, so the
+    # venv it creates has no pip either; the matched path must run the SAME
+    # repair ladder (ensure_venv_pip) and narrate honestly.
+    orch = PyOrch("Python 3.12.3", ensurepip_module_ok=False, venv_pip_ok=False,
+                  manifest={"python_venv": "/workspace/tvm/.venv"})
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    outcome = PythonPreflight(orch).run("3.12", constraint=">=3.10",
+                                        source="requires-python")
+    # Still matched on VERSION (never a mismatch: the version is right), but the
+    # repair had to run so the toolchain can actually build a venv.
+    assert outcome.mismatch is False
+    # The narration names the exact defect and the repair.
+    assert "cannot create venvs" in outcome.narration
+    assert "no ensurepip" in outcome.narration
+    assert "repairing" in outcome.narration
+    # It shared the SAME apt/uv repair rungs (ensure_venv_pip), not a duplicate.
+    assert any("-m ensurepip --upgrade" in c for c in orch.commands)
+    # Exactly one functionality probe even though repair ran.
+    probes = [c for c in orch.commands if "-m ensurepip --version" in c]
+    assert len(probes) == 1
+
+
+def test_matched_missing_ensurepip_repair_exhausted_never_blocks(monkeypatch):
+    # Repair ladder exhausted on the matched path degrades honestly (narrated
+    # hole) but NEVER blocks and NEVER flips the version match to a mismatch.
+    # Broken interpreter -> broken venv -> every repair rung fails.
+    orch = PyOrch("Python 3.12.3", ensurepip_module_ok=False, venv_pip_ok=False,
+                  ensurepip_ok=False, apt_ok=False, apt_venv_ok=False,
+                  uv_present=False, uv_install_ok=False)
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    outcome = PythonPreflight(orch).run("3.12", constraint=">=3.10",
+                                        source="requires-python")
+    assert outcome.mismatch is False  # the version genuinely matched
+    assert outcome.provisioned is True  # never a hard block
+    # Both the defect and the exhausted-ladder hole are narrated honestly.
+    assert "cannot create venvs" in outcome.narration
+    assert "pip still missing" in outcome.narration
+
+
+def test_matched_probe_cached_per_run_across_tools(monkeypatch):
+    # Called by multiple tools in one run (each builds its own PythonPreflight
+    # off the shared orchestrator), the cheap probe runs ONCE, not once per
+    # tool — the result is cached on the orchestrator for the run.
+    orch = PyOrch("Python 3.12.3")
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    PythonPreflight(orch).run("3.12", constraint=">=3.10", source="python_tool")
+    PythonPreflight(orch).run("3.12", constraint=">=3.10", source="setup_tool")
+    probes = [c for c in orch.commands if "-m ensurepip --version" in c]
+    assert len(probes) == 1  # one probe for the whole run, not per tool
+
+
+def test_matched_repair_runs_once_per_run_then_second_tool_noops(monkeypatch):
+    # A broken interpreter is probed + repaired by the FIRST tool; a second
+    # tool in the same run reuses the healthy cache — no second probe, no
+    # second repair (the fix took, the run does not re-repair per tool).
+    orch = PyOrch("Python 3.12.3", ensurepip_module_ok=False, venv_pip_ok=False)
+    monkeypatch.setattr(bp, "_register_python_overlay", lambda *a, **k: True)
+    first = PythonPreflight(orch).run("3.12", constraint=">=3.10", source="python_tool")
+    assert "cannot create venvs" in first.narration
+    repair_cmds_after_first = len(
+        [c for c in orch.commands if "-m ensurepip --upgrade" in c]
+    )
+    second = PythonPreflight(orch).run("3.12", constraint=">=3.10", source="setup_tool")
+    assert second.matched is True and second.narration == ""  # pure no-op
+    assert len([c for c in orch.commands if "-m ensurepip --version" in c]) == 1
+    # The repair ladder never fires a second time.
+    assert (
+        len([c for c in orch.commands if "-m ensurepip --upgrade" in c])
+        == repair_cmds_after_first
+    )
 
 
 def test_active_python_version_parses_major_minor():

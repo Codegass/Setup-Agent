@@ -12,12 +12,53 @@ from sag.runtime import EnvOverlayStore
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import PythonPreflight, read_build_requirements
 from .project_analyzer import ENFORCER_JAVA_PATTERN, _normalize_java_version
-from .python_env import detect_installer, ensure_venv_pip
+from .python_env import detect_installer, ensure_venv_pip, venv_repair_note
 
 # Standalone Maven version provisioned when a project enforces a minimum greater
 # than the base image's Maven (typically 3.8.7). Satisfies the common ">=3.9"
 # requireMavenVersion enforcement without waiting for build failures.
 MAVEN_PROVISION_VERSION = "3.9.9"
+
+# Build-file basenames that mark a JVM (Java) binding when they appear in a
+# SUBDIRECTORY of a python-primary repo (e.g. TVM's jvm/pom.xml). Detecting one
+# of these under the root drives ADDITIVE Java provisioning on top of the python
+# toolchain — never a substitution of one for the other.
+_JVM_BINDING_MARKERS = ("pom.xml", "build.gradle", "build.gradle.kts")
+
+
+def detect_jvm_binding_dir(project_type: Dict[str, Any], directory: str) -> Optional[str]:
+    """Return the nested JVM-binding directory for a python-primary repo, else None.
+
+    A python-primary repo (root pyproject.toml/requirements.txt) can ship a Java
+    binding in a subdirectory (TVM: jvm/pom.xml). The maxdepth-2 ``build_files``
+    scan captures both the root python marker AND that nested pom.xml. When the
+    repo classifies as python but a build file for the JVM (pom.xml / build.gradle)
+    lives strictly below the root, that subdirectory is a Java binding and its
+    toolchain must be provisioned ADDITIVELY.
+
+    Returns the absolute path of the binding subdirectory (the directory holding
+    the nested build file), or None when there is no JVM binding to add. Only
+    fires for python-primary repos, so Java-primary provisioning is untouched.
+    """
+    if (project_type or {}).get("type") != "python":
+        return None
+
+    root = directory.rstrip("/")
+    root_prefix = root + "/"
+    for path in (project_type or {}).get("build_files") or []:
+        path = str(path).strip()
+        if not path:
+            continue
+        base = path.rsplit("/", 1)[-1]
+        if base not in _JVM_BINDING_MARKERS:
+            continue
+        # Root-level build files are the python repo's own; only a build file
+        # strictly below the root is a binding subdirectory.
+        if path.startswith(root_prefix):
+            remainder = path[len(root_prefix):]
+            if "/" in remainder:  # e.g. "jvm/pom.xml" -> nested
+                return f"{root}/{remainder.rsplit('/', 1)[0]}"
+    return None
 
 
 class ProjectSetupTool(BaseTool):
@@ -607,7 +648,27 @@ class ProjectSetupTool(BaseTool):
         dependencies = []
         suggested_tools = []
 
-        for file in build_files:
+        # Root markers WIN over nested (subdirectory) markers. The find above is
+        # maxdepth-2, so a binding subdirectory's build file (TVM's jvm/pom.xml)
+        # can appear alongside — and before — the repo's root marker
+        # (pyproject.toml). First-match-wins over the raw list let the java
+        # binding displace the python primary; classify from the root files when
+        # any exist, so the PRIMARY language wins. Only when the root has no
+        # marker at all do we fall back to the nested ones (single-module repos
+        # whose only pom.xml lives one level down).
+        directory_prefix = directory.rstrip("/") + "/"
+
+        def _is_root_file(path: str) -> bool:
+            # A file directly in `directory` has no further "/" after the prefix.
+            if not path.startswith(directory_prefix):
+                # Relative or unexpected shape: treat "bare-name" (no slash) as root.
+                return "/" not in path
+            return "/" not in path[len(directory_prefix):]
+
+        root_files = [f for f in build_files if _is_root_file(f)]
+        classify_files = root_files or build_files
+
+        for file in classify_files:
             if "pom.xml" in file:
                 project_type = "maven"
                 language = "java"
@@ -996,13 +1057,64 @@ class ProjectSetupTool(BaseTool):
                 }
 
         elif project_type["type"] == "python":
-            return self._install_python_dependencies(directory)
+            result = self._install_python_dependencies(directory)
+            # ADDITIVE, never substitutive: a python-primary repo that also ships
+            # a JVM binding (TVM's jvm/pom.xml) still needs Java+Maven for that
+            # binding. Python provisioning above must not displace it. This runs
+            # regardless of the python result so a python hiccup never silently
+            # drops the Java toolchain the binding requires.
+            binding_dir = detect_jvm_binding_dir(project_type, directory)
+            if binding_dir:
+                jvm = self._provision_jvm_binding(binding_dir)
+                self._merge_jvm_binding_result(result, jvm)
+            return result
 
         # Add more project types as needed
         return {
             "success": False,
             "error": f"Auto-installation not implemented for project type: {project_type['type']}",
         }
+
+    def _provision_jvm_binding(self, binding_dir: str) -> Dict[str, Any]:
+        """Provision Java + Maven for a JVM binding subdirectory of a python repo.
+
+        Reuses the same Java-version detection and apt install path the Maven
+        branch uses, so the JDK/Maven install is identical to a Java-primary
+        repo's — this is the ADDITIVE half of the python+jvm contract. Returns a
+        result dict describing what was installed; failures are surfaced (never a
+        false green) but do not raise, so python setup already done is preserved.
+        """
+        binding_dir = binding_dir.rstrip("/")
+        binding_type = {"type": "maven", "build_files": [f"{binding_dir}/pom.xml"]}
+        java_version = self._detect_java_version_requirement(binding_dir, binding_type)
+        logger.info(
+            f"Python-primary repo ships a JVM binding at {binding_dir}; "
+            f"additively provisioning Java+Maven (required Java: {java_version or 'default'})"
+        )
+        return self._install_dependencies_for_project_type(
+            binding_type, binding_dir, java_version
+        )
+
+    @staticmethod
+    def _merge_jvm_binding_result(python_result: Dict[str, Any], jvm_result: Dict[str, Any]) -> None:
+        """Fold an additive JVM-binding install into the python result in place.
+
+        The overall install is a success only when python succeeded; the Java
+        toolchain is recorded under a dedicated key so neither result masks the
+        other (additive, honest — a Java failure is reported, not swallowed, and
+        never flips python's success to false or vice versa).
+        """
+        python_result["jvm_binding"] = jvm_result
+        if jvm_result.get("success"):
+            installed = jvm_result.get("installed", "Java toolchain for JVM binding")
+            existing = python_result.get("installed")
+            python_result["installed"] = (
+                f"{existing}; additionally {installed}" if existing else installed
+            )
+        else:
+            python_result["jvm_binding_error"] = jvm_result.get(
+                "error", "JVM binding provisioning failed"
+            )
 
     def _install_python_dependencies(self, directory: str) -> Dict[str, Any]:
         """Real python setup via the shared helpers (spec 2026-07-07):
@@ -1046,16 +1158,8 @@ class ProjectSetupTool(BaseTool):
         repair = ensure_venv_pip(
             self.orchestrator, venv, python_version=requirements.get("python_version")
         )
-        if repair.get("action"):
-            if not repair.get("ok"):
-                repair_note = (
-                    f"[env] venv at {venv} still has no working pip after ensurepip "
-                    "and recreation — pip installs will fail honestly"
-                )
-            elif repair.get("action") == "ensurepip":
-                repair_note = "[env] existing venv was missing pip — repaired with ensurepip"
-            else:
-                repair_note = f"[env] existing venv was missing pip — recreated at {venv}"
+        repair_note = venv_repair_note(repair, venv)
+        if repair_note:
             logger.info(repair_note)
             output_lines.append(repair_note)
 

@@ -655,6 +655,28 @@ class PhysicalValidator:
         self.last_validation = validation_result
         return validation_result
 
+    def validate_build_artifacts_fresh(self, project_name: str = None) -> Dict[str, any]:
+        """Report-time artifact validation that never serves a stale count.
+
+        The mid-run artifact caches (``class_files`` / ``jar_files`` /
+        ``artifacts_complete``, 60s TTL) exist so agent iterations don't hammer
+        docker with repeated ``find`` scans. But at report generation those
+        caches can hold a count taken minutes earlier — before later build/test
+        phases compiled more classes. Live bigtop (session 20260713_014403): an
+        early Maven module build cached 6 .class files, a later Gradle test
+        compile brought the container to 162, and the report header still said
+        "6 classes" while the per-module breakdown (which counts fresh via
+        scan_modules) showed the Gradle modules as built.
+
+        This helper clears the cache so the FINAL validation pass reflects the
+        container's real state, then delegates to :meth:`validate_build_artifacts`.
+        It is the report path's entry point ONLY — the agent-facing
+        :meth:`validate_build_artifacts` keeps its mid-run caching untouched, so
+        two consecutive checks within the TTL during the run still hit the cache.
+        """
+        self.clear_cache()
+        return self.validate_build_artifacts(project_name=project_name)
+
     def _check_class_files(self, project_dir: str) -> Dict[str, any]:
         """Check for .class files in the project with caching."""
         cache_key = self._get_cache_key("class_files", project_dir)
@@ -2291,6 +2313,7 @@ class PhysicalValidator:
                     "import_failures",
                     "compileall_coverage",
                     "ext_modules_ok",
+                    "native_artifact_ok",
                 )
             }
             # Skipped-rung warnings (e.g. "imports rung skipped: ...") must be
@@ -2592,6 +2615,10 @@ class PhysicalValidator:
             "import_failures": [],
             "compileall_coverage": None,
             "ext_modules_ok": None,
+            # Native core (root CMakeLists.txt, live TVM): whether a build native
+            # artifact (.so/.dylib) is present. None until probed / not
+            # applicable; False caps the build at PARTIAL "native core not built".
+            "native_artifact_ok": None,
             "success": False,
             "complete": False,
             "reason": "",
@@ -2725,6 +2752,34 @@ class PhysicalValidator:
             )
             result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
             so_missing = not result["ext_modules_ok"]
+
+        # Native-core rung (live TVM, root CMakeLists.txt): the python package
+        # cannot import without its native library (libtvm.so). When the manifest
+        # flags has_native_build, look for a BUILT native artifact (.so/.dylib)
+        # under the package dir or a build/ tree — its ABSENCE caps the build at
+        # PARTIAL ("native core not built"), NEVER a hard block: pure-python
+        # parts and tests may still run.
+        native_missing = False
+        if manifest.get("has_native_build"):
+            # Search the python package (project_dir) and venv — where a copied
+            # libtvm.so lands — PLUS the repo-root build/ tree CMake conventionally
+            # emits into (the python root is a subdir, so its parent is the repo
+            # root). All paths deduped/guarded so a missing build/ dir is silent.
+            search_roots = {project_dir.rstrip("/"), venv.rstrip("/")}
+            repo_root = project_dir.rstrip("/").rsplit("/", 1)[0]
+            if repo_root and repo_root != project_dir.rstrip("/"):
+                search_roots.add(f"{repo_root}/build")
+            native_probe = self._execute_command_with_logging(
+                f"find {' '.join(sorted(search_roots))} "
+                f"\\( -name '*.so' -o -name '*.dylib' \\) "
+                f"-type f 2>/dev/null | head -1",
+                "native core artifacts",
+            )
+            result["native_artifact_ok"] = bool(
+                (native_probe.get("output") or "").strip()
+            )
+            native_missing = not result["native_artifact_ok"]
+
         if optional_ext_failures:
             # Bug #14: an unimportable optional extension module is
             # C-extension-rung evidence — the rung goes red even when a .so
@@ -2757,6 +2812,11 @@ class PhysicalValidator:
             partial_reasons.append(
                 "declared C-extensions have no built .so artifact"
             )
+        if native_missing:
+            # Live TVM: root CMakeLists.txt native core with no built .so/.dylib.
+            # PARTIAL, never a block — the python package will not fully import,
+            # but pure-python parts and tests may still run.
+            partial_reasons.append("native core not built")
         if optional_ext_failures:
             partial_reasons.append(
                 "optional extension module(s) not importable: "
@@ -3692,11 +3752,30 @@ class PhysicalValidator:
 
         totals = {"tests_total": 0, "tests_failed": 0, "tests_errors": 0, "tests_skipped": 0}
         failing: List[str] = []
+
+        # Collect XML file paths from ALL report dirs, then dedupe by absolute
+        # path BEFORE parsing. Gradle's modern layout nests report dirs
+        # (build/test-results/test lives inside build/test-results), and
+        # scan_modules lists both because older layouts drop XMLs directly in
+        # the parent. A recursive `find` on the parent re-lists every file the
+        # child find already returned, so parsing per-dir would count each XML
+        # twice (live bigtop: 72=2x36, 2=2x1, 26=2x13). File-level dedupe is the
+        # robust guarantee: nested (ancestor+descendant) dirs can never
+        # double-count, while genuinely distinct files across sibling dirs
+        # (Maven surefire + failsafe) are still each counted once.
+        seen_files: set = set()
+        ordered_files: List[str] = []
         for rd in report_dirs:
             find_cmd = f"find {rd} -name 'TEST-*.xml' -o -name '*.xml' -path '*{rd}*' 2>/dev/null"
             listing = self._execute_command_with_logging(find_cmd, f"listing reports {rd}")
-            files = [f for f in (listing.get("output") or "").splitlines() if f.strip().endswith(".xml")]
-            for xml_file in files:
+            for f in (listing.get("output") or "").splitlines():
+                f = f.strip()
+                if not f.endswith(".xml") or f in seen_files:
+                    continue
+                seen_files.add(f)
+                ordered_files.append(f)
+
+        for xml_file in ordered_files:
                 cat = self._execute_command_with_logging(
                     f"cat '{xml_file}'", f"reading {xml_file}"
                 )
