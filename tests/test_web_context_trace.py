@@ -280,3 +280,78 @@ def test_context_trace_builder_handles_missing_phase_files_and_journals(tmp_path
 
     assert trace.trunk.progress == {"done": 0, "total": 1}
     assert trace.phases[0].tasks[0].iterations == []
+
+
+def test_journal_only_iterations_without_history_are_not_shown_as_empty_steps(
+    tmp_path: Path,
+):
+    """Live mid-run shape (TVM session 20260713_111610): the journal records a
+    context-window snapshot every iteration, but history detail flushes a little
+    behind. Iterations the journal has reached but history has not yet filled
+    must NOT render as fake "No action taken — reasoning step" rows — the flow
+    shows the agent's trajectory (thoughts + actions), not context bookkeeping.
+    """
+    contexts = tmp_path / ".setup_agent" / "contexts"
+    journal = contexts / "journal"
+    journal.mkdir(parents=True)
+
+    (contexts / "trunk_x.json").write_text(
+        json.dumps(
+            {
+                "goal": "Build native project",
+                "todo_list": [
+                    {"id": "phase_build", "description": "Build", "status": "active"}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # history has iterations 1 (thought) and 2 (action) only.
+    (contexts / "phase_build.json").write_text(
+        json.dumps(
+            {
+                "task_id": "phase_build",
+                "task_description": "Build",
+                "history": [
+                    {"type": "thought", "iteration": 1, "content": "Plan the build."},
+                    {
+                        "type": "action",
+                        "iteration": 2,
+                        "tool_name": "build",
+                        "parameters": {"action": "compile"},
+                        "success": True,
+                        "output": "ok",
+                        "observation": "compiled",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    # journal has reached iterations 1..4 — 3 and 4 have no history yet.
+    (journal / "phase_build.journal.jsonl").write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "iteration": i,
+                    "phase": "build",
+                    "segments": {"intro": 100, "ledger": 0, "steps": i},
+                    "delta": {"added": 1, "compacted": 0},
+                    "total_chars": 1000 * i,
+                    "step_span": 1,
+                }
+            )
+            for i in (1, 2, 3, 4)
+        ),
+        encoding="utf-8",
+    )
+
+    trace = ContextTraceBuilder(contexts).build()
+    task = trace.phases[0].tasks[0]
+
+    # 3 and 4 (journal-only, no history) are dropped; 1 and 2 stay with content.
+    assert [it.iteration for it in task.iterations] == [1, 2]
+    assert task.iterations[0].thoughts == ["Plan the build."]
+    assert task.iterations[1].actions[0].tool_name == "build"
+    # no empty iteration is emitted
+    assert all(it.thoughts or it.actions for it in task.iterations)

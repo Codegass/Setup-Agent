@@ -182,7 +182,15 @@ class ContextTraceBuilder:
             buckets.setdefault(iteration, {"iteration": iteration, "history": [], "window": None})
             buckets[iteration]["history"].append(entry)
 
-        ordered = [buckets[key] for key in sorted(buckets)]
+        # A journal record is a context-window snapshot written every iteration;
+        # history (thoughts + actions) flushes slightly behind. Buckets that exist
+        # ONLY because of a journal record — no history entries — are not
+        # trajectory steps: mid-run they are iterations the journal reached before
+        # history was flushed, and rendering them shows misleading "No action
+        # taken — reasoning step" rows (live TVM run: iterations 14–52 all blank).
+        # Keep only buckets with real history; genuine reasoning steps carry a
+        # `thought` history entry and survive.
+        ordered = [buckets[key] for key in sorted(buckets) if buckets[key]["history"]]
         ordered.extend(synthetic)
         iterations = [
             self._iteration(bucket, sequence) for sequence, bucket in enumerate(ordered, start=1)
