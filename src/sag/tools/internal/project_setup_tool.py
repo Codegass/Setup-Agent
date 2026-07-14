@@ -428,6 +428,14 @@ class ProjectSetupTool(BaseTool):
             if checkout_result is not None:
                 return checkout_result
 
+        # Recurse git submodules AFTER the ref is checked out (submodule pins
+        # follow the checked-out commit). `git clone` is not recursive, so a repo
+        # whose real sources live in submodules (TVM's 3rdparty/tvm-ffi, dlpack,
+        # ...) would otherwise clone empty and fail the native build — and the
+        # agent burns iterations rediscovering it. Best-effort: a submodule fetch
+        # failure (network, private submodule) must never fail the clone.
+        submodule_status = self._init_submodules(clone_path, working_directory)
+
         resolved_commit = self._resolve_commit(clone_path, working_directory)
 
         output = f"✅ Repository cloned successfully!\n\n"
@@ -439,6 +447,8 @@ class ProjectSetupTool(BaseTool):
             output += f"🔖 Ref: {requested_ref}\n"
         if resolved_commit:
             output += f"🧾 Commit: {resolved_commit}\n"
+        if submodule_status:
+            output += f"🔗 Submodules: {submodule_status}\n"
 
         # Detect project type
         project_type = self._detect_project_type_in_directory(clone_path)
@@ -548,6 +558,32 @@ class ProjectSetupTool(BaseTool):
             )
 
         return None
+
+    def _init_submodules(self, clone_path: str, working_directory: str) -> Optional[str]:
+        """Recurse git submodules when the repo declares any (`.gitmodules`).
+
+        Returns a short status for the clone output, or None when the repo has no
+        submodules. Best-effort: submodule fetch failures are logged and reported
+        but never fail the clone (the agent can still work with what cloned).
+        """
+        probe = self.orchestrator.execute_command(
+            f"test -f {shlex.quote(clone_path)}/.gitmodules", workdir=working_directory
+        )
+        if probe.get("exit_code") != 0:
+            return None  # no submodules declared
+
+        logger.info("Repository declares submodules — recursing (git submodule update)")
+        result = self.orchestrator.execute_command(
+            f"git -C {shlex.quote(clone_path)} submodule update --init --recursive",
+            workdir=working_directory,
+            timeout=1200,
+        )
+        if result.get("exit_code") == 0:
+            return "initialized"
+        logger.warning(
+            f"Submodule init did not fully complete (continuing): {result.get('output', '')[:200]}"
+        )
+        return "init incomplete"
 
     def _resolve_commit(self, clone_path: str, working_directory: str) -> Optional[str]:
         """Resolve the checked-out commit SHA for traceable setup reports."""

@@ -149,7 +149,9 @@ PYTHON_TEST_PHASE_GUIDANCE = (
 NATIVE_FIRST_BUILD_GUIDANCE = (
     "This package has a NATIVE core (CMakeLists.txt at the repo root). Read the "
     "project's install docs and build the native library FIRST (cmake + the "
-    "documented deps) — the python package will not import without it. Then "
+    "documented deps) — the python package will not import without it. If a "
+    "3rdparty/ dependency dir is empty (submodule not fetched), run "
+    "`git submodule update --init --recursive` before cmake. Then "
     "install the python package from {python_root}. Long native builds detach; "
     "poll with search."
 )

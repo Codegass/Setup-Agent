@@ -109,8 +109,10 @@ class FakeProjectSetupOrchestrator:
 
 
 class FakeCloneOrchestrator:
-    def __init__(self, *, checkout_success=True):
+    def __init__(self, *, checkout_success=True, has_submodules=False, submodule_success=True):
         self.checkout_success = checkout_success
+        self.has_submodules = has_submodules
+        self.submodule_success = submodule_success
         self.commands = []
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
@@ -118,6 +120,19 @@ class FakeCloneOrchestrator:
 
         if command == "which git":
             return {"success": True, "output": "/usr/bin/git\n", "exit_code": 0}
+
+        if command == "test -f /workspace/commons-cli/.gitmodules":
+            ok = self.has_submodules
+            return {"success": ok, "output": "", "exit_code": 0 if ok else 1}
+
+        if command.startswith("git -C /workspace/commons-cli submodule update"):
+            if self.submodule_success:
+                return {
+                    "success": True,
+                    "output": "Submodule path '3rdparty/x': checked out 'abc'",
+                    "exit_code": 0,
+                }
+            return {"success": False, "output": "fatal: clone of ... failed", "exit_code": 1}
 
         if command == "git clone https://github.com/apache/commons-cli.git commons-cli":
             return {"success": True, "output": "Cloning into 'commons-cli'...", "exit_code": 0}
@@ -214,6 +229,64 @@ def test_project_setup_clone_bad_ref_fails_without_project_detection():
         command.startswith("find /workspace/commons-cli ")
         for command, _, _ in orchestrator.commands
     )
+
+
+def test_clone_initializes_submodules_when_gitmodules_present():
+    # TVM-shape: a repo whose native build lives in git submodules (3rdparty/*).
+    # The framework must recurse them so the agent does not burn iterations
+    # rediscovering that `git clone` left them empty.
+    orchestrator = FakeCloneOrchestrator(has_submodules=True)
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        auto_install_deps=False,
+    )
+
+    assert result.success is True
+    assert (
+        "git -C /workspace/commons-cli submodule update --init --recursive",
+        "/workspace",
+        1200,
+    ) in orchestrator.commands
+    assert "🔗 Submodules: initialized" in result.output
+
+
+def test_clone_skips_submodules_when_gitmodules_absent():
+    orchestrator = FakeCloneOrchestrator(has_submodules=False)
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        auto_install_deps=False,
+    )
+
+    assert result.success is True
+    assert not any(
+        "submodule update" in command for command, _, _ in orchestrator.commands
+    )
+    assert "Submodules" not in result.output
+
+
+def test_clone_submodule_failure_is_best_effort_and_does_not_fail_clone():
+    orchestrator = FakeCloneOrchestrator(has_submodules=True, submodule_success=False)
+    tool = ProjectSetupTool(orchestrator)
+
+    result = tool.execute(
+        action="clone",
+        repository_url="https://github.com/apache/commons-cli.git",
+        auto_install_deps=False,
+    )
+
+    # A submodule fetch failure (network, private repo) must not fail the clone —
+    # the agent can still work with what cloned.
+    assert result.success is True
+    assert any(
+        "submodule update" in command for command, _, _ in orchestrator.commands
+    )
+    assert "🔗 Submodules: init incomplete" in result.output
 
 
 def test_project_setup_legacy_branch_maps_to_ref_when_ref_absent():
