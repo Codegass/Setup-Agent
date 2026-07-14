@@ -14,6 +14,7 @@ import fnmatch
 import io
 import re
 import shlex
+import shutil
 import tarfile
 import time
 from pathlib import Path
@@ -69,6 +70,20 @@ def extract_artifacts(container: Any, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     _extract(container, "/workspace/.setup_agent", dest)
     _extract_report(container, dest)
+
+
+def prune_mirrors(logs_root: Path, live_names: set[str]) -> None:
+    """Delete mirrors of containers that no longer exist. Only sag-* entries are
+    touched, so the __missing__ sentinel and any stray user files survive."""
+    root = mirror_root(logs_root)
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and entry.name.startswith("sag-") and entry.name not in live_names:
+            shutil.rmtree(entry, ignore_errors=True)
+            _last_fetch.pop(entry.name, None)
 
 
 class _ChunkReader(io.RawIOBase):
