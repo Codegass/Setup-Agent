@@ -7,6 +7,14 @@ export interface DockerSummary {
   endpoint?: string | null
 }
 
+export interface SystemSummary {
+  dockerDiskUsed?: number | null
+  dockerReclaimable?: number | null
+  memUsed?: number | null
+  memTotal?: number | null
+  cpuLoad?: number | null
+}
+
 export interface TestSummary {
   state: string
   pass: number

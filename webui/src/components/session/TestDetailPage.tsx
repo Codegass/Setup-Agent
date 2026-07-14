@@ -19,9 +19,9 @@ function Tile({ label, value, tone, dashed }: {
   label: string; value: React.ReactNode; tone?: string; dashed?: boolean
 }) {
   return (
-    <div className={cn("rounded-lg border px-3 py-2", dashed ? "border-dashed bg-slate-50" : "border-slate-200")}>
-      <div className={cn("text-[22px] font-semibold tabular-nums", tone ?? "text-slate-900")}>{value}</div>
-      <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">{label}</div>
+    <div className={cn("rounded-lg border px-3 py-2", dashed ? "border-dashed bg-muted" : "border-border")}>
+      <div className={cn("text-[22px] font-semibold tabular-nums", tone ?? "text-foreground")}>{value}</div>
+      <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -32,7 +32,7 @@ function CoverageTile({ summary }: { summary?: ModuleRollup | null }) {
   const line = summary?.lineRate
   const branch = summary?.branchRate
   if (line == null && branch == null) {
-    return <Tile label="Coverage" value={<span className="text-slate-400">— not measured</span>} dashed />
+    return <Tile label="Coverage" value={<span className="text-muted-foreground">— not measured</span>} dashed />
   }
   const primary = line != null ? line : (branch as number)
   const primaryLabel = line != null ? "line" : "branch"
@@ -46,7 +46,7 @@ function CoverageTile({ summary }: { summary?: ModuleRollup | null }) {
         <>
           {`${Math.round(primary)}%`}
           {hasSub ? (
-            <span className="block font-mono text-[10px] font-normal text-slate-500">
+            <span className="block font-mono text-[10px] font-normal text-muted-foreground">
               {showBranchSub ? `${Math.round(branch as number)}% branch` : ""}
               {showBranchSub && summary?.coverageSource ? " · " : ""}
               {summary?.coverageSource ? "jacoco" : ""}
@@ -75,7 +75,7 @@ export function TestDetailPage({ detail }: { detail: ExecutionSessionDetail }) {
         </Card>
       ) : (
         <Card className="p-4">
-          <div className="font-mono text-[12px] text-slate-500">
+          <div className="font-mono text-[12px] text-muted-foreground">
             Single-module project — the coverage and counts above are project-wide.
           </div>
         </Card>

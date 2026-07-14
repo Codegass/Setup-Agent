@@ -43,33 +43,33 @@ export function NeedsAttention({
   }
 
   return (
-    <section className="overflow-hidden rounded-xl border border-status-attention-border bg-white">
-      <div className="flex items-center gap-2 border-b border-slate-100 px-4 py-3">
+    <section className="overflow-hidden rounded-xl border border-status-attention-border bg-card">
+      <div className="flex items-center gap-2 border-b border-border px-4 py-3">
         <span className="h-[7px] w-[7px] rounded-full bg-status-failed" />
-        <h2 className="text-[14px] font-bold text-slate-800">Needs attention</h2>
+        <h2 className="text-[14px] font-bold text-foreground">Needs attention</h2>
       </div>
       {groups.map((g) => (
-        <div key={g.name} className="border-t border-slate-100 px-4 py-3">
+        <div key={g.name} className="border-t border-border px-4 py-3">
           <div className="mb-2 flex items-center gap-2">
-            <span className="text-[13px] font-semibold text-slate-800">{g.name}</span>
+            <span className="text-[13px] font-semibold text-foreground">{g.name}</span>
             <span className="font-mono text-[11px] text-status-failed">{g.count} failing</span>
           </div>
           {g.names.map((n) => (
-            <div key={n} className="pl-3.5 font-mono text-[12px] leading-[1.7] text-slate-600">
+            <div key={n} className="pl-3.5 font-mono text-[12px] leading-[1.7] text-muted-foreground">
               {n}
             </div>
           ))}
           {g.hidden > 0 ? (
-            <div className="pl-3.5 font-mono text-[12px] leading-[1.7] text-slate-400">
+            <div className="pl-3.5 font-mono text-[12px] leading-[1.7] text-muted-foreground">
               +{g.hidden} more
             </div>
           ) : null}
         </div>
       ))}
       {warnings.map((w) => (
-        <div key={w} className="flex items-center gap-2 border-t border-slate-100 px-4 py-3">
+        <div key={w} className="flex items-center gap-2 border-t border-border px-4 py-3">
           <span className="h-[7px] w-[7px] rounded-full bg-status-attention" />
-          <span className="text-[12px] text-slate-600">{w}</span>
+          <span className="text-[12px] text-muted-foreground">{w}</span>
         </div>
       ))}
     </section>

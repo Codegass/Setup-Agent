@@ -70,10 +70,10 @@ function ActionRow({ action, onOpen }: { action: PhaseAction; onOpen: () => void
     <button
       type="button"
       onClick={onOpen}
-      className="mt-1.5 w-full rounded-lg border border-slate-100 bg-slate-50 px-3 py-2.5 text-left transition-colors hover:border-slate-200 hover:bg-slate-100"
+      className="mt-1.5 w-full rounded-lg border border-border bg-muted px-3 py-2.5 text-left transition-colors hover:border-border hover:bg-accent"
     >
       <div className="flex items-center gap-2">
-        <span className="inline-flex h-5 items-center rounded-md bg-slate-700 px-2.5 font-mono text-[11px] font-semibold text-slate-200">
+        <span className="inline-flex h-5 items-center rounded-md bg-primary px-2.5 font-mono text-[11px] font-semibold text-primary-foreground">
           {action.toolName}
         </span>
         <span
@@ -97,12 +97,12 @@ function ActionRow({ action, onOpen }: { action: PhaseAction; onOpen: () => void
         <span className="ml-auto text-[11px] font-semibold text-primary">Details ↗</span>
       </div>
       {action.output ? (
-        <div className="mt-1.5 truncate font-mono text-[12px] leading-relaxed text-slate-700">
+        <div className="mt-1.5 truncate font-mono text-[12px] leading-relaxed text-foreground">
           {action.output}
         </div>
       ) : null}
       {action.observation ? (
-        <div className="mt-1 truncate text-[12px] leading-relaxed text-slate-500">
+        <div className="mt-1 truncate text-[12px] leading-relaxed text-muted-foreground">
           ↳ {action.observation}
         </div>
       ) : null}
@@ -122,15 +122,15 @@ function IterationBlock({
   const hasTrace = iteration.thoughts.length > 0 || iteration.actions.length > 0
   return (
     <div className="px-3.5 py-3">
-      <div className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.06em] text-slate-400">
+      <div className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
         {iterationLabel(iteration)}
       </div>
       {iteration.thoughts.map((thought, index) => (
         <div className="mb-2.5 flex items-start gap-2.5" key={`think-${index}`}>
-          <span className="mt-px inline-flex h-[18px] shrink-0 items-center rounded-md bg-slate-100 px-1.5 font-sans text-[10px] font-semibold uppercase tracking-[0.04em] text-slate-500">
+          <span className="mt-px inline-flex h-[18px] shrink-0 items-center rounded-md bg-muted px-1.5 font-sans text-[10px] font-semibold uppercase tracking-[0.04em] text-muted-foreground">
             think
           </span>
-          <span className="min-w-0 text-[13px] italic leading-relaxed text-slate-600">
+          <span className="min-w-0 text-[13px] italic leading-relaxed text-muted-foreground">
             {thought}
           </span>
         </div>
@@ -143,7 +143,7 @@ function IterationBlock({
         />
       ))}
       {!hasTrace ? (
-        <p className="text-[12px] leading-relaxed text-slate-400">
+        <p className="text-[12px] leading-relaxed text-muted-foreground">
           No action taken — reasoning step.
         </p>
       ) : null}
@@ -160,9 +160,9 @@ function TaskCard({
   onOpenAction: (action: PhaseAction) => void
 }) {
   return (
-    <div className="mt-2.5 overflow-hidden rounded-[10px] border border-slate-200">
-      <div className="flex items-center gap-2 border-b border-slate-100 bg-slate-50 px-3.5 py-2.5">
-        <span className="text-[13px] font-semibold text-slate-700">{task.title}</span>
+    <div className="mt-2.5 overflow-hidden rounded-[10px] border border-border">
+      <div className="flex items-center gap-2 border-b border-border bg-muted px-3.5 py-2.5">
+        <span className="text-[13px] font-semibold text-foreground">{task.title}</span>
       </div>
       {task.iterations.map((iteration, index) => (
         <IterationBlock
@@ -195,16 +195,16 @@ function PhaseRow({
             "h-3.5 w-3.5 shrink-0 rounded-full ring-4",
             tone === "success" && "bg-status-success ring-status-success-soft",
             tone === "failed" && "bg-status-failed ring-status-failed-soft",
-            tone === "neutral" && "bg-slate-300 ring-slate-100",
+            tone === "neutral" && "bg-accent ring-border",
           )}
         />
-        {!last ? <div className="mt-1 w-0.5 flex-1 bg-slate-200" /> : null}
+        {!last ? <div className="mt-1 w-0.5 flex-1 bg-accent" /> : null}
       </div>
 
       <div className={cn("min-w-0", last ? "pb-0" : "pb-5")}>
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-[14px] font-bold text-slate-800">{phase.title}</span>
-          <span className="font-mono text-[11px] text-slate-400">{phase.name}</span>
+          <span className="text-[14px] font-bold text-foreground">{phase.title}</span>
+          <span className="font-mono text-[11px] text-muted-foreground">{phase.name}</span>
           {tone === "success" ? (
             <span className="inline-flex h-[18px] items-center rounded-full bg-status-success-soft px-2 text-[10px] font-semibold uppercase tracking-[0.04em] text-status-success">
               completed
@@ -215,7 +215,7 @@ function PhaseRow({
               failed
             </span>
           ) : null}
-          <span className="ml-auto font-mono text-[11px] text-slate-400">{phaseMeta(phase)}</span>
+          <span className="ml-auto font-mono text-[11px] text-muted-foreground">{phaseMeta(phase)}</span>
         </div>
 
         {phase.tasks.map((task) => (
@@ -237,7 +237,7 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
 
   if (!context) {
     return (
-      <div className="rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-[12.5px] text-slate-500">
+      <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
         Context trace unavailable for this session.
       </div>
     )
@@ -253,9 +253,9 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
 
   return (
     <div>
-      <div className="rounded-xl border border-slate-200 bg-white px-[18px] py-4">
+      <div className="rounded-xl border border-border bg-card px-[18px] py-4">
         <div className="flex items-center gap-2">
-          <span className="font-sans text-[11px] font-semibold uppercase tracking-[0.06em] text-slate-400">
+          <span className="font-sans text-[11px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
             Agent goal
           </span>
           <span
@@ -277,15 +277,15 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
             {trunk.state}
           </span>
         </div>
-        <div className="mt-1.5 text-[15px] font-semibold leading-snug text-slate-700">
+        <div className="mt-1.5 text-[15px] font-semibold leading-snug text-foreground">
           {trunk.goal}
         </div>
         {trunk.summary ? (
-          <div className="mt-1.5 text-[13px] leading-relaxed text-slate-500">{trunk.summary}</div>
+          <div className="mt-1.5 text-[13px] leading-relaxed text-muted-foreground">{trunk.summary}</div>
         ) : null}
         {percent != null ? (
           <div className="mt-3 flex items-center gap-2.5">
-            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-slate-100">
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
               <div
                 className={cn(
                   "h-full rounded-full",
@@ -297,7 +297,7 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
               />
             </div>
             {steps ? (
-              <span className="shrink-0 font-mono text-[12px] text-slate-500">{steps}</span>
+              <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{steps}</span>
             ) : null}
           </div>
         ) : null}
@@ -314,7 +314,7 @@ export function FlowTab({ detail }: { detail: ExecutionSessionDetail }) {
             />
           ))
         ) : (
-          <div className="rounded-lg border border-dashed border-slate-200 px-4 py-8 text-center text-[12.5px] text-slate-500">
+          <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-[12.5px] text-muted-foreground">
             No phases were recorded for this run.
           </div>
         )}

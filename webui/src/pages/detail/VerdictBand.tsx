@@ -68,13 +68,13 @@ export function VerdictBand({ detail }: { detail: ExecutionSessionDetail }) {
           aria-hidden
         />
       )}
-      <div className="min-w-0 text-[13px] leading-snug text-slate-700">
+      <div className="min-w-0 text-[13px] leading-snug text-foreground">
         {verdict ? (
           <>
             <span>{verdict.headline}</span>
             {verdict.detail ? (
-              <span className="mt-0.5 block text-[12.5px] text-slate-500">
-                <b className="font-medium text-slate-600">Why —</b> {verdict.detail}
+              <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
+                <b className="font-medium text-muted-foreground">Why —</b> {verdict.detail}
               </span>
             ) : null}
           </>

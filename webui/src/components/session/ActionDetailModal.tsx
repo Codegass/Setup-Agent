@@ -28,10 +28,10 @@ function fullRef(refs: ContextRef[]): ContextReference | null {
 function SectionLabel({ title, hint }: { title: string; hint: string }) {
   return (
     <div className="flex items-baseline gap-2">
-      <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-slate-400">
+      <span className="font-sans text-[10px] font-semibold uppercase tracking-[0.06em] text-muted-foreground">
         {title}
       </span>
-      <span className="text-[11px] text-slate-300">{hint}</span>
+      <span className="text-[11px] text-muted-foreground">{hint}</span>
     </div>
   )
 }
@@ -49,9 +49,9 @@ export function ActionDetailModal({
 
   return (
     <Dialog open onOpenChange={(open) => (!open ? onClose() : undefined)}>
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[660px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
-        <DialogHeader className="flex-row items-center gap-2.5 border-b border-slate-100 px-[18px] py-[15px]">
-          <DialogTitle className="flex h-[22px] items-center rounded-md bg-slate-700 px-2.5 font-mono text-[12px] font-semibold text-slate-200">
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[660px] gap-0 border-border bg-card p-0 shadow-xl">
+        <DialogHeader className="flex-row items-center gap-2.5 border-b border-border px-[18px] py-[15px]">
+          <DialogTitle className="flex h-[22px] items-center rounded-md bg-primary px-2.5 font-mono text-[12px] font-semibold text-primary-foreground">
             {action.toolName}
           </DialogTitle>
           <span
@@ -78,11 +78,11 @@ export function ActionDetailModal({
           <div className="space-y-1.5">
             <SectionLabel hint="raw tool result" title="Tool output" />
             {action.output?.trim() ? (
-              <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg border border-slate-100 bg-slate-50 px-3 py-3 font-mono text-[12.5px] leading-relaxed text-slate-700">
+              <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-muted px-3 py-3 font-mono text-[12.5px] leading-relaxed text-foreground">
                 {action.output}
               </pre>
             ) : (
-              <div className="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 font-mono text-[12px] text-slate-400">
+              <div className="rounded-lg border border-dashed border-border bg-muted px-3 py-3 font-mono text-[12px] text-muted-foreground">
                 no raw output captured
               </div>
             )}
@@ -90,7 +90,7 @@ export function ActionDetailModal({
               <div>
                 <button
                   aria-expanded={showFull}
-                  className="inline-flex items-center gap-2 py-0.5 font-mono text-[11px] text-slate-400 transition-colors hover:text-slate-600"
+                  className="inline-flex items-center gap-2 py-0.5 font-mono text-[11px] text-muted-foreground transition-colors hover:text-foreground"
                   onClick={() => setShowFull((value) => !value)}
                   type="button"
                 >
@@ -100,7 +100,7 @@ export function ActionDetailModal({
                   </span>
                 </button>
                 {showFull ? (
-                  <pre className="mt-1.5 max-h-[40vh] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-slate-100 bg-slate-50 px-3 py-3 font-mono text-[12.5px] leading-relaxed text-slate-700">
+                  <pre className="mt-1.5 max-h-[40vh] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-muted px-3 py-3 font-mono text-[12.5px] leading-relaxed text-foreground">
                     {ref.content}
                   </pre>
                 ) : null}
@@ -111,7 +111,7 @@ export function ActionDetailModal({
           {action.observation ? (
             <div className="space-y-1.5">
               <SectionLabel hint="agent's interpretation" title="Observation" />
-              <div className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-3 text-[13px] leading-relaxed text-slate-600">
+              <div className="rounded-lg border border-border bg-muted px-3 py-3 text-[13px] leading-relaxed text-muted-foreground">
                 {action.observation}
               </div>
             </div>

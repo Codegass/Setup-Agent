@@ -17,7 +17,7 @@ function fmtNum(n?: number | null): string {
 
 function MonoLabel({ children, className }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className={cn("font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500", className)}>
+    <div className={cn("font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground", className)}>
       {children}
     </div>
   )
@@ -28,18 +28,18 @@ function KV({ k, v }: { k: string; v?: string | null }) {
     return null
   }
   return (
-    <div className="flex items-baseline justify-between gap-4 border-b border-slate-100 py-1.5 last:border-b-0">
-      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">{k}</span>
-      <span className="truncate text-right font-mono text-[12px] text-slate-700">{v}</span>
+    <div className="flex items-baseline justify-between gap-4 border-b border-border py-1.5 last:border-b-0">
+      <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">{k}</span>
+      <span className="truncate text-right font-mono text-[12px] text-foreground">{v}</span>
     </div>
   )
 }
 
 function Stat({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2">
-      <div className="text-[20px] font-semibold tabular-nums text-slate-900">{value}</div>
-      <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">{label}</div>
+    <div className="rounded-lg border border-border bg-card px-3 py-2">
+      <div className="text-[20px] font-semibold tabular-nums text-foreground">{value}</div>
+      <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{label}</div>
     </div>
   )
 }
@@ -53,13 +53,13 @@ function ConclusionCard({ build }: { build: BuildSummary }) {
   return (
     <Card className="p-4">
       <div className="flex items-center justify-between gap-3">
-        <span className="inline-flex items-center gap-2 text-[14px] font-medium text-slate-800">
+        <span className="inline-flex items-center gap-2 text-[14px] font-medium text-foreground">
           {ok ? (
             <Check className="text-status-success" size={16} />
           ) : bad ? (
             <X className="text-status-failed" size={16} />
           ) : (
-            <Clock className="text-slate-400" size={15} />
+            <Clock className="text-muted-foreground" size={15} />
           )}
           {statusMeta(build.state).label}
         </span>
@@ -95,7 +95,7 @@ function OutputsCard({ build }: { build: BuildSummary }) {
           </MonoLabel>
           <ul className="mt-1.5 space-y-1">
             {warnings.map((w) => (
-              <li key={w} className="text-[12px] text-slate-500">· {w}</li>
+              <li key={w} className="text-[12px] text-muted-foreground">· {w}</li>
             ))}
           </ul>
         </div>

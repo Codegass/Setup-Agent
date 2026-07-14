@@ -1,7 +1,8 @@
-import { Activity, AlertTriangle, Check, Clock, GitBranch, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
-import { useState } from "react"
+import { Activity, AlertTriangle, Check, CircleCheck, Clock, Gauge, GitBranch, Hammer, Loader2, Rocket, Search, Trash2, X } from "lucide-react"
+import { type MouseEvent as ReactMouseEvent, useState } from "react"
 
 import type { DashboardResponse, LaunchQueueItem, LaunchQueueState, WorkspaceSummary } from "@/api/types"
+import { rollup } from "@/components/SummaryStrip"
 import { StatusBadge } from "@/components/common/Badge"
 import { TestBar } from "@/components/common/TestBar"
 import { statusMeta } from "@/components/common/status"
@@ -14,6 +15,7 @@ import {
   DeleteWorkspaceDialog,
   type DeleteWorkspaceTarget,
 } from "@/components/workspace/DeleteWorkspaceDialog"
+import { Tooltip } from "@/components/ui/tooltip"
 import { formatAgo } from "@/lib/relativeTime"
 import { cn } from "@/lib/utils"
 
@@ -66,28 +68,42 @@ function RailRow({
       </span>
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
-          <span className={cn("truncate text-[13px] font-medium", selected && !selectMode ? "text-status-running" : "text-slate-800")}>
+          <span className={cn("truncate text-[13px] font-medium", selected && !selectMode ? "text-status-running" : "text-foreground")}>
             {workspace.project}
           </span>
-          {workspace.release ? <span className="shrink-0 font-mono text-[9.5px] text-slate-500">{workspace.release}</span> : null}
+          {workspace.release ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{workspace.release}</span> : null}
           {workspace.activeSession ? <Activity className="shrink-0 text-status-running" size={11} /> : null}
         </span>
-        <span className="mt-0.5 block truncate font-mono text-[10px] text-slate-500">
+        <span className="mt-0.5 block truncate font-mono text-[10px] text-muted-foreground">
           {[workspace.stack, workspace.commit].filter(Boolean).join(" · ")}
         </span>
       </span>
       <span className="flex shrink-0 items-center gap-2">
         {deleting ? (
-          <span className="inline-flex items-center gap-1 font-mono text-[10px] text-slate-500">
+          <span className="inline-flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
             <Loader2 className="animate-spin" size={11} /> deleting…
           </span>
         ) : (
           <>
-            {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-slate-400" size={12} />}
+            <Tooltip
+              label={
+                build === "success"
+                  ? "Build succeeded"
+                  : build === "failure" || build === "failed"
+                    ? "Build failed"
+                    : "No build result yet"
+              }
+            >
+              {build === "success" ? <Check className="text-status-success" size={13} /> : build === "failure" || build === "failed" ? <X className="text-status-failed" size={13} /> : <Clock className="text-muted-foreground" size={12} />}
+            </Tooltip>
             {normalize(workspace.test.state) !== "none" && total > 0 ? (
-              <TestBar fail={workspace.test.fail} pass={workspace.test.pass} total={total} />
+              <Tooltip label={`Tests: ${workspace.test.pass} passed, ${workspace.test.fail} failed of ${total}`}>
+                <TestBar fail={workspace.test.fail} pass={workspace.test.pass} total={total} />
+              </Tooltip>
             ) : (
-              <span className="w-10 text-right font-mono text-[10px] text-slate-400">—</span>
+              <Tooltip label="No tests run yet">
+                <span className="w-10 text-right font-mono text-[10px] text-muted-foreground">—</span>
+              </Tooltip>
             )}
           </>
         )}
@@ -99,8 +115,8 @@ function RailRow({
     return (
       <label
         className={cn(
-          "flex w-full cursor-pointer items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 last:border-b-0",
-          checked ? "bg-status-running-soft" : "hover:bg-slate-50/80",
+          "flex w-full cursor-pointer items-center gap-3 border-b border-border px-3.5 py-2.5 last:border-b-0",
+          checked ? "bg-status-running-soft" : "hover:bg-accent",
         )}
       >
         <input
@@ -120,15 +136,15 @@ function RailRow({
       aria-current={selected}
       aria-label={`Open workspace ${workspace.project}`}
       className={cn(
-        "group flex w-full items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 text-left transition-colors last:border-b-0",
+        "group flex w-full items-center gap-3 border-b border-border px-3.5 py-2.5 text-left transition-colors last:border-b-0",
         deleting
           ? "cursor-default opacity-60"
           : selected
             ? "bg-status-running-soft"
             : attention
               ? "bg-status-failed-soft/40 hover:bg-status-failed-soft/60"
-              : "hover:bg-slate-50/80",
-        highlighted && !selected && !deleting ? "bg-blue-50/60" : "",
+              : "hover:bg-accent",
+        highlighted && !selected && !deleting ? "bg-status-running-soft" : "",
       )}
       disabled={deleting}
       onClick={() => onSelect(workspace.id)}
@@ -153,18 +169,18 @@ function PendingRailRow({
     <div
       aria-label={`Pending launch ${project}`}
       className={cn(
-        "flex w-full items-center gap-3 border-b border-slate-100 px-3.5 py-2.5 text-left last:border-b-0",
-        failed ? "bg-status-failed-soft/40" : "bg-slate-50/40",
+        "flex w-full items-center gap-3 border-b border-border px-3.5 py-2.5 text-left last:border-b-0",
+        failed ? "bg-status-failed-soft/40" : "bg-muted",
       )}
     >
       <span className={cn("inline-flex h-1.5 w-1.5 shrink-0 rounded-full", dot)} />
       <span className="min-w-0 flex-1">
         <span className="flex items-center gap-1.5">
-          <span className="truncate text-[13px] font-medium text-slate-600">{project}</span>
-          {item.ref ? <span className="shrink-0 font-mono text-[9.5px] text-slate-500">{item.ref}</span> : null}
+          <span className="truncate text-[13px] font-medium text-muted-foreground">{project}</span>
+          {item.ref ? <span className="shrink-0 font-mono text-[9.5px] text-muted-foreground">{item.ref}</span> : null}
         </span>
         <span
-          className={cn("mt-0.5 block truncate text-[10px]", failed ? "text-status-failed" : "text-slate-500")}
+          className={cn("mt-0.5 block truncate text-[10px]", failed ? "text-status-failed" : "text-muted-foreground")}
           title={failed ? item.error ?? undefined : undefined}
         >
           {launchStatusLine(item)}
@@ -173,16 +189,18 @@ function PendingRailRow({
       <span className="flex shrink-0 items-center gap-1.5">
         <StatusBadge status={item.status} />
         {failed ? (
-          <button
-            aria-label={`Remove failed launch ${project}`}
-            className="rounded-md p-1 text-slate-400 hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500/30"
-            onClick={() =>
-              onRemove({ workspaceId: item.workspace_id, label: project, kind: "launch" })
-            }
-            type="button"
-          >
-            <Trash2 size={14} />
-          </button>
+          <Tooltip label="Remove this failed launch from the list">
+            <button
+              aria-label={`Remove failed launch ${project}`}
+              className="rounded-md p-1 text-muted-foreground hover:bg-status-failed-soft hover:text-status-failed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-status-failed/40"
+              onClick={() =>
+                onRemove({ workspaceId: item.workspace_id, label: project, kind: "launch" })
+              }
+              type="button"
+            >
+              <Trash2 size={14} />
+            </button>
+          </Tooltip>
         ) : null}
       </span>
     </div>
@@ -191,11 +209,93 @@ function PendingRailRow({
 
 function Chip({ label, value, tone }: { label: string; value: number; tone?: "blue" | "red" }) {
   return (
-    <div className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-2">
-      <div className={cn("text-[18px] font-semibold tabular-nums", tone === "red" ? "text-status-failed" : tone === "blue" ? "text-status-running" : "text-slate-900")}>
+    <div className="flex-1 rounded-lg border border-border bg-card px-3 py-2">
+      <div className={cn("text-[18px] font-semibold tabular-nums", tone === "red" ? "text-status-failed" : tone === "blue" ? "text-status-running" : "text-foreground")}>
         {value}
       </div>
-      <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-slate-500">{label}</div>
+      <div className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted-foreground">{label}</div>
+    </div>
+  )
+}
+
+function pct(num: number, den: number): number | null {
+  return den > 0 ? (100 * num) / den : null
+}
+
+function compact(n: number): string {
+  return n >= 10000 ? `${(n / 1000).toFixed(1)}k` : n.toLocaleString()
+}
+
+function StatCard({
+  icon: Icon,
+  label,
+  rate,
+  detail,
+  hint,
+}: {
+  icon: typeof Hammer
+  label: string
+  rate: number
+  detail: string
+  hint: string
+}) {
+  const tone = rate >= 80 ? "text-status-success" : "text-status-attention"
+  return (
+    <Tooltip className="flex-1" label={hint} side="bottom">
+      <div className="w-full rounded-lg border border-border bg-card px-2.5 py-2">
+        <div className="flex items-center gap-1.5">
+          <Icon className={cn("shrink-0", tone)} size={14} />
+          <span className={cn("text-[17px] font-bold leading-none tabular-nums", tone)}>
+            {rate.toFixed(0)}%
+          </span>
+        </div>
+        <div className="mt-1.5 font-mono text-[8.5px] uppercase tracking-[0.1em] text-muted-foreground">
+          {label}
+        </div>
+        <div className="font-mono text-[10px] font-medium tabular-nums text-foreground">{detail}</div>
+      </div>
+    </Tooltip>
+  )
+}
+
+/** Fleet rollup shown in the sidebar under the workspace chips. */
+function RailSummary({ workspaces }: { workspaces: WorkspaceSummary[] }) {
+  if (!workspaces.length) return null
+  const r = rollup(workspaces)
+  const build = pct(r.buildSuccess, r.buildKnown)
+  const pass = pct(r.passed, r.executedNonSkip)
+  const exec = pct(r.executed, r.declared)
+  if (build === null && pass === null && exec === null) return null
+
+  return (
+    <div className="mt-2 flex gap-2">
+      {build !== null ? (
+        <StatCard
+          detail={`${r.buildSuccess}/${r.buildKnown}`}
+          hint={`${r.buildSuccess} of ${r.buildKnown} workspaces built successfully`}
+          icon={Hammer}
+          label="Build"
+          rate={build}
+        />
+      ) : null}
+      {pass !== null ? (
+        <StatCard
+          detail={`${compact(r.passed)}/${compact(r.executedNonSkip)}`}
+          hint={`${r.passed.toLocaleString()} passed of ${r.executedNonSkip.toLocaleString()} executed (skips excluded)`}
+          icon={CircleCheck}
+          label="Pass"
+          rate={pass}
+        />
+      ) : null}
+      {exec !== null ? (
+        <StatCard
+          detail={`${compact(r.executed)}/${compact(r.declared)}`}
+          hint={`${r.executed.toLocaleString()} executed of ${r.declared.toLocaleString()} declared test methods`}
+          icon={Gauge}
+          label="Exec"
+          rate={exec}
+        />
+      ) : null}
     </div>
   )
 }
@@ -256,6 +356,25 @@ export function WorkspaceRail({
     setBatchConfirm(false)
   }
   const [removeTarget, setRemoveTarget] = useState<DeleteWorkspaceTarget | null>(null)
+  const [railWidth, setRailWidth] = useState(() => {
+    const saved = Number(localStorage.getItem("sag.railWidth"))
+    return saved >= 240 && saved <= 560 ? saved : 320
+  })
+  const startResize = (e: ReactMouseEvent) => {
+    e.preventDefault()
+    let latest = railWidth
+    const onMove = (ev: globalThis.MouseEvent) => {
+      latest = Math.min(560, Math.max(240, ev.clientX))
+      setRailWidth(latest)
+    }
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove)
+      window.removeEventListener("mouseup", onUp)
+      localStorage.setItem("sag.railWidth", String(latest))
+    }
+    window.addEventListener("mousemove", onMove)
+    window.addEventListener("mouseup", onUp)
+  }
   const ordered = sortByAttentionFirst(data.workspaces)
   const q = query.trim().toLowerCase()
   const rows = q
@@ -274,36 +393,47 @@ export function WorkspaceRail({
   return (
     <aside
       aria-label="Workspaces"
-      className={cn("flex h-full min-h-0 w-[320px] shrink-0 flex-col border-r border-slate-200 bg-white", className)}
+      className={cn("relative flex h-full min-h-0 shrink-0 flex-col border-r border-border bg-card", className)}
       id="workspace-rail"
+      style={{ width: railWidth }}
     >
-      <div className="border-b border-slate-200 px-4 pb-3 pt-4">
+      {/* Drag the right edge to resize (desktop only; the rail is a drawer on mobile). */}
+      <div
+        aria-orientation="vertical"
+        className="absolute right-0 top-0 z-10 hidden h-full w-1 cursor-col-resize hover:bg-accent lg:block"
+        onMouseDown={startResize}
+        role="separator"
+      />
+      <div className="border-b border-border px-4 pb-3 pt-4">
         <div className="flex items-center gap-2">
-          <span className="flex h-6 w-6 items-center justify-center rounded bg-slate-900 font-mono text-[11px] font-bold text-white">S</span>
+          <span className="flex h-6 w-6 items-center justify-center rounded bg-primary font-mono text-[11px] font-bold text-primary-foreground">S</span>
           <div className="min-w-0">
-            <div className="text-[13px] font-semibold tracking-tight text-slate-900">SAG Workbench</div>
-            <div className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-slate-500">
+            <div className="text-[13px] font-semibold tracking-tight text-foreground">SAG Workbench</div>
+            <div className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
               <span className={cn("inline-flex h-1 w-1 rounded-full", dockerDot)} /> docker {data.docker.version ?? data.docker.status}
             </div>
           </div>
         </div>
-        <button
-          className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-slate-900 px-3 py-2 text-[12.5px] font-medium text-white hover:bg-slate-800"
-          onClick={onLaunchSetups}
-          type="button"
-        >
-          <Rocket size={14} /> Launch setups
-        </button>
+        <Tooltip className="mt-3 w-full" label="Queue project setups from a list of repo URLs" side="bottom">
+          <button
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2 text-[12.5px] font-medium text-primary-foreground hover:bg-primary/90"
+            onClick={onLaunchSetups}
+            type="button"
+          >
+            <Rocket size={14} /> Launch setups
+          </button>
+        </Tooltip>
         <div className="mt-3 flex gap-2">
           <Chip label="Workspaces" value={data.workspaces.length} />
           <Chip label="Running" value={running} tone="blue" />
           <Chip label="Attention" value={attention} tone={attention ? "red" : undefined} />
         </div>
+        <RailSummary workspaces={data.workspaces} />
         <div className="relative mt-3">
-          <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-400" size={13} />
+          <Search aria-hidden className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" size={13} />
           <input
             aria-label="Filter workspaces"
-            className="w-full rounded-md border border-slate-200 bg-slate-50/60 py-1.5 pl-8 pr-2 text-[12.5px] text-slate-700 placeholder:text-slate-400 focus:border-blue-300 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+            className="w-full rounded-md border border-border bg-muted py-1.5 pl-8 pr-2 text-[12.5px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:bg-card focus:outline-none focus:ring-2 focus:ring-ring/30"
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Filter workspaces…"
             value={query}
@@ -311,13 +441,15 @@ export function WorkspaceRail({
         </div>
         {onDeleteMany && data.workspaces.length ? (
           <div className="mt-2 flex justify-end">
-            <button
-              className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500 hover:text-slate-700"
-              onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
-              type="button"
-            >
-              {selectMode ? "Cancel" : "Select"}
-            </button>
+            <Tooltip label={selectMode ? "Exit multi-select mode" : "Select multiple workspaces to delete"}>
+              <button
+                className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground hover:text-foreground"
+                onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+                type="button"
+              >
+                {selectMode ? "Cancel" : "Select"}
+              </button>
+            </Tooltip>
           </div>
         ) : null}
       </div>
@@ -348,31 +480,33 @@ export function WorkspaceRail({
           </>
         ) : data.workspaces.length === 0 && pending.length === 0 ? (
           <div className="flex flex-col items-center px-4 py-12 text-center">
-            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 bg-slate-50 text-slate-500">
+            <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-muted text-muted-foreground">
               <GitBranch size={18} />
             </div>
-            <div className="mt-3 text-[13px] font-medium text-slate-700">No workspaces yet</div>
-            <p className="mt-1 text-[12px] leading-relaxed text-slate-500">
+            <div className="mt-3 text-[13px] font-medium text-foreground">No workspaces yet</div>
+            <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground">
               Launch a setup to add one. Paste a list of repo URLs to queue many at once.
             </p>
           </div>
         ) : (
-          <div className="px-4 py-10 text-center text-[12px] text-slate-500">No matches</div>
+          <div className="px-4 py-10 text-center text-[12px] text-muted-foreground">No matches</div>
         )}
       </div>
 
       {selectMode ? (
-        <div className="flex items-center gap-2 border-t border-slate-200 bg-white px-4 py-2">
+        <div className="flex items-center gap-2 border-t border-border bg-card px-4 py-2">
+          <Tooltip className="flex-1" label="Delete the checked workspaces and their containers">
+            <button
+              className="w-full rounded-md bg-status-failed px-3 py-1.5 text-[12px] font-medium text-primary-foreground hover:opacity-90 disabled:opacity-40"
+              disabled={picked.size === 0}
+              onClick={() => setBatchConfirm(true)}
+              type="button"
+            >
+              Delete {picked.size} selected
+            </button>
+          </Tooltip>
           <button
-            className="flex-1 rounded-md bg-status-failed px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-40"
-            disabled={picked.size === 0}
-            onClick={() => setBatchConfirm(true)}
-            type="button"
-          >
-            Delete {picked.size} selected
-          </button>
-          <button
-            className="rounded-md border border-slate-200 px-3 py-1.5 text-[12px] text-slate-600 hover:bg-slate-50"
+            className="rounded-md border border-border px-3 py-1.5 text-[12px] text-muted-foreground hover:bg-accent"
             onClick={exitSelectMode}
             type="button"
           >
@@ -381,7 +515,7 @@ export function WorkspaceRail({
         </div>
       ) : null}
 
-      <div className="flex items-center gap-2 border-t border-slate-100 px-4 py-2 font-mono text-[9px] text-slate-500">
+      <div className="flex items-center gap-2 border-t border-border px-4 py-2 font-mono text-[9px] text-muted-foreground">
         <span>{lastUpdatedAt != null ? `Updated ${formatAgo(Date.now() - lastUpdatedAt)}` : "Updating…"}</span>
         {pollFailed ? (
           <span className="inline-flex items-center gap-1 text-status-attention">

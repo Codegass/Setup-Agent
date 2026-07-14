@@ -35,7 +35,7 @@ type PhaseAction = PhaseIteration["actions"][number]
 // Status color lives on the rail node only (the "status earns color" rule):
 // the dot fill carries hue, the surrounding ring stays neutral.
 const nodeFill: Record<Tone, string> = {
-  neutral: "bg-slate-300",
+  neutral: "bg-accent",
   blue: "bg-status-running",
   green: "bg-status-success",
   red: "bg-status-failed",
@@ -132,7 +132,7 @@ function RefChips({ refs, onOpen }: { refs: ContextRef[]; onOpen: (ref: ContextR
           </button>
         ) : (
           <span
-            className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[10px] text-slate-600"
+            className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
             key={refKey(ref)}
           >
             {refLabel(ref)}
@@ -147,8 +147,8 @@ function RefChips({ refs, onOpen }: { refs: ContextRef[]; onOpen: (ref: ContextR
 function ThoughtBlock({ text }: { text: string }) {
   return (
     <div className="flex gap-2">
-      <Sparkles aria-hidden className="mt-0.5 shrink-0 text-slate-400" size={12} />
-      <p className="min-w-0 whitespace-pre-wrap text-[12.5px] leading-relaxed text-slate-600">
+      <Sparkles aria-hidden className="mt-0.5 shrink-0 text-muted-foreground" size={12} />
+      <p className="min-w-0 whitespace-pre-wrap text-[12.5px] leading-relaxed text-muted-foreground">
         {text}
       </p>
     </div>
@@ -171,14 +171,14 @@ function ActionRow({
   return (
     <div className="space-y-1.5">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="font-mono text-[12px] font-semibold text-slate-800">{action.toolName}</span>
+        <span className="font-mono text-[12px] font-semibold text-foreground">{action.toolName}</span>
         {action.success === true ? <Badge tone="green">success</Badge> : null}
         {action.success === false ? <Badge tone="red">failed</Badge> : null}
         {action.dispatchStatus ? <Badge tone="blue">{action.dispatchStatus}</Badge> : null}
       </div>
 
       {parameters ? (
-        <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-slate-50 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-slate-600">
+        <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted px-2 py-1.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
           {parameters}
         </pre>
       ) : null}
@@ -187,7 +187,7 @@ function ActionRow({
         <div
           className={cn(
             "rounded px-2 py-1.5 text-[12px] leading-relaxed",
-            tone === "red" ? "bg-status-failed-soft/60 text-slate-700" : "bg-status-success-soft/50 text-slate-700",
+            tone === "red" ? "bg-status-failed-soft/60 text-foreground" : "bg-status-success-soft/50 text-foreground",
           )}
         >
           {action.observation}
@@ -198,7 +198,7 @@ function ActionRow({
         <div>
           <button
             aria-expanded={showOutput}
-            className="inline-flex items-center gap-1 py-0.5 font-mono text-[10.5px] text-slate-500 transition-colors hover:text-slate-700"
+            className="inline-flex items-center gap-1 py-0.5 font-mono text-[10.5px] text-muted-foreground transition-colors hover:text-foreground"
             onClick={() => setShowOutput((value) => !value)}
             type="button"
           >
@@ -210,7 +210,7 @@ function ActionRow({
             {showOutput ? "hide output" : `output · ${action.output.length.toLocaleString()} chars`}
           </button>
           {showOutput ? (
-            <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded bg-slate-50 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-slate-600">
+            <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded bg-muted px-2 py-1.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
               {action.output}
             </pre>
           ) : null}
@@ -234,22 +234,22 @@ function WindowPanel({
 }) {
   const [open, setOpen] = useState(false)
   return (
-    <div className="rounded bg-slate-50">
+    <div className="rounded bg-muted">
       <button
         aria-expanded={open}
-        className="flex w-full items-center gap-1.5 px-2 py-2 text-left transition-colors hover:bg-slate-100"
+        className="flex w-full items-center gap-1.5 px-2 py-2 text-left transition-colors hover:bg-accent"
         onClick={() => setOpen((value) => !value)}
         type="button"
       >
-        <ChevronRight aria-hidden className={cn("text-slate-400 transition-transform", open && "rotate-90")} size={11} />
+        <ChevronRight aria-hidden className={cn("text-muted-foreground transition-transform", open && "rotate-90")} size={11} />
         {icon}
-        <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">{label}</span>
-        <span className="ml-auto font-mono text-[10px] text-slate-500">
+        <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">{label}</span>
+        <span className="ml-auto font-mono text-[10px] text-muted-foreground">
           {text.length.toLocaleString()} chars
         </span>
       </button>
       {open ? (
-        <pre className="max-h-52 overflow-auto whitespace-pre-wrap border-t border-slate-200 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-slate-600">
+        <pre className="max-h-52 overflow-auto whitespace-pre-wrap border-t border-border px-2 py-1.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
           {text}
         </pre>
       ) : null}
@@ -279,16 +279,16 @@ function IterationStep({
     <li className="relative grid grid-cols-[14px_1fr] gap-x-3">
       <div className="relative flex justify-center">
         {!last ? (
-          <span aria-hidden className="absolute left-1/2 top-2.5 bottom-0 w-px -translate-x-1/2 bg-slate-200" />
+          <span aria-hidden className="absolute left-1/2 top-2.5 bottom-0 w-px -translate-x-1/2 bg-accent" />
         ) : null}
-        <span className="relative z-10 mt-1 h-2 w-2 rounded-full bg-slate-300 ring-2 ring-white" />
+        <span className="relative z-10 mt-1 h-2 w-2 rounded-full bg-accent ring-2 ring-background" />
       </div>
 
       <div className={cn("min-w-0", last ? "pb-0" : "pb-4")}>
         <div className="flex items-baseline justify-between gap-3">
-          <span className="font-mono text-[11px] font-medium text-slate-600">{label}</span>
+          <span className="font-mono text-[11px] font-medium text-muted-foreground">{label}</span>
           {iteration.window ? (
-            <span className="truncate font-mono text-[10px] text-slate-500">
+            <span className="truncate font-mono text-[10px] text-muted-foreground">
               {windowMeta(iteration.window)}
             </span>
           ) : null}
@@ -305,21 +305,21 @@ function IterationStep({
 
           {iteration.window?.introText ? (
             <WindowPanel
-              icon={<PanelTop aria-hidden className="text-slate-400" size={11} />}
+              icon={<PanelTop aria-hidden className="text-muted-foreground" size={11} />}
               label="window intro"
               text={iteration.window.introText}
             />
           ) : null}
           {iteration.window?.ledgerText ? (
             <WindowPanel
-              icon={<History aria-hidden className="text-slate-400" size={11} />}
+              icon={<History aria-hidden className="text-muted-foreground" size={11} />}
               label="attempt ledger"
               text={iteration.window.ledgerText}
             />
           ) : null}
 
           {!hasTrace ? (
-            <p className="text-[12px] leading-relaxed text-slate-500">
+            <p className="text-[12px] leading-relaxed text-muted-foreground">
               No branch trace was recorded for this iteration.
             </p>
           ) : null}
@@ -343,7 +343,7 @@ function IterationTimeline({
 }) {
   const [shown, setShown] = useState(ITERATION_BATCH)
   if (!iterations.length) {
-    return <p className="text-[12px] leading-relaxed text-slate-500">No iteration records.</p>
+    return <p className="text-[12px] leading-relaxed text-muted-foreground">No iteration records.</p>
   }
   const visible = iterations.length <= shown ? iterations : iterations.slice(0, shown)
   const remaining = iterations.length - visible.length
@@ -361,7 +361,7 @@ function IterationTimeline({
       {remaining > 0 ? (
         <li className="relative grid grid-cols-[14px_1fr] gap-x-3">
           <div className="relative flex justify-center">
-            <span className="relative z-10 mt-1 h-2 w-2 rounded-full border border-slate-300 bg-white ring-2 ring-white" />
+            <span className="relative z-10 mt-1 h-2 w-2 rounded-full border border-border bg-card ring-2 ring-background" />
           </div>
           <button
             className="min-w-0 self-start py-0.5 text-left font-mono text-[11px] text-status-running transition-colors hover:text-status-running"
@@ -385,7 +385,7 @@ function TaskGroup({
 }) {
   const [open, setOpen] = useState(false)
   return (
-    <div className="border-t border-slate-100 pt-2">
+    <div className="border-t border-border pt-2">
       <button
         aria-expanded={open}
         className="flex w-full items-center gap-2 text-left"
@@ -394,14 +394,14 @@ function TaskGroup({
       >
         <ChevronDown
           aria-hidden
-          className={cn("shrink-0 text-slate-300 transition-transform", !open && "-rotate-90")}
+          className={cn("shrink-0 text-muted-foreground transition-transform", !open && "-rotate-90")}
           size={13}
         />
-        <span className="font-mono text-[10px] text-slate-500">{task.id}</span>
-        <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-slate-700">
+        <span className="font-mono text-[10px] text-muted-foreground">{task.id}</span>
+        <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-foreground">
           {task.title}
         </span>
-        <span className="font-mono text-[10px] text-slate-500">{task.iterations.length} iter</span>
+        <span className="font-mono text-[10px] text-muted-foreground">{task.iterations.length} iter</span>
       </button>
       {open ? <IterationTimeline iterations={task.iterations} onOpenRef={onOpenRef} /> : null}
     </div>
@@ -437,11 +437,11 @@ function PhaseRow({
     <li className="relative grid grid-cols-[20px_1fr] gap-x-2.5">
       <div className="relative flex justify-center">
         {!last ? (
-          <span aria-hidden className="absolute left-1/2 top-6 bottom-0 w-px -translate-x-1/2 bg-slate-200" />
+          <span aria-hidden className="absolute left-1/2 top-6 bottom-0 w-px -translate-x-1/2 bg-accent" />
         ) : null}
         <span
           className={cn(
-            "relative z-10 mt-2 h-2.5 w-2.5 rounded-full ring-4 ring-white",
+            "relative z-10 mt-2 h-2.5 w-2.5 rounded-full ring-4 ring-background",
             nodeFill[meta.tone],
           )}
         />
@@ -456,14 +456,14 @@ function PhaseRow({
         >
           <ChevronDown
             aria-hidden
-            className={cn("shrink-0 text-slate-300 transition-transform", !open && "-rotate-90")}
+            className={cn("shrink-0 text-muted-foreground transition-transform", !open && "-rotate-90")}
             size={14}
           />
-          <span className="font-mono text-[10px] text-slate-500">{phase.id}</span>
-          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-slate-800">
+          <span className="font-mono text-[10px] text-muted-foreground">{phase.id}</span>
+          <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-foreground">
             {phase.title}
           </span>
-          <span className="hidden font-mono text-[10px] text-slate-500 sm:inline">
+          <span className="hidden font-mono text-[10px] text-muted-foreground sm:inline">
             {phaseStat(phase.progress)}
           </span>
           {showEvidence ? <StatusBadge dot={false} status={evidenceStatus} /> : null}
@@ -473,10 +473,10 @@ function PhaseRow({
         {open ? (
           <div className="mt-1.5 space-y-2.5 pl-6">
             {phase.keyResults ? (
-              <p className="text-[12.5px] leading-relaxed text-slate-600">{phase.keyResults}</p>
+              <p className="text-[12.5px] leading-relaxed text-muted-foreground">{phase.keyResults}</p>
             ) : null}
             {phase.notes ? (
-              <div className="rounded bg-status-attention-soft/50 px-2.5 py-2 text-[12px] leading-relaxed text-slate-700">
+              <div className="rounded bg-status-attention-soft/50 px-2.5 py-2 text-[12px] leading-relaxed text-foreground">
                 {phase.notes}
               </div>
             ) : null}
@@ -487,7 +487,7 @@ function PhaseRow({
                 </span>
                 <ul className="mt-1 space-y-0.5">
                   {conflicts.map((conflict, index) => (
-                    <li className="text-[12px] leading-relaxed text-slate-700" key={`${conflict}-${index}`}>
+                    <li className="text-[12px] leading-relaxed text-foreground" key={`${conflict}-${index}`}>
                       {conflict}
                     </li>
                   ))}
@@ -529,18 +529,18 @@ export function ContextTrace({
   return (
     <div className="space-y-4">
       <Card className="overflow-hidden">
-        <div className="border-b border-slate-100 bg-slate-50/70 px-4 py-3.5">
+        <div className="border-b border-border bg-muted px-4 py-3.5">
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <Target aria-hidden className="text-status-running" size={15} />
-              <span className="truncate text-[13px] font-semibold text-slate-800">Trunk goal</span>
+              <span className="truncate text-[13px] font-semibold text-foreground">Trunk goal</span>
             </div>
             <StatusBadge status={trunk.state} />
           </div>
-          <p className="mt-2 text-[13px] leading-relaxed text-slate-700">{trunk.goal}</p>
+          <p className="mt-2 text-[13px] leading-relaxed text-foreground">{trunk.goal}</p>
           {progress ? (
             <div className="mt-3 flex items-center gap-3">
-              <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.1em] text-slate-500">
+              <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.1em] text-muted-foreground">
                 Done / Total
               </span>
               <div
@@ -548,18 +548,18 @@ export function ContextTrace({
                 aria-valuemax={progress.total}
                 aria-valuemin={0}
                 aria-valuenow={progress.done}
-                className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-slate-200"
+                className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-accent"
                 role="progressbar"
               >
                 <div className="h-full rounded-full bg-status-running" style={{ width: progressWidth(progress.percent) }} />
               </div>
-              <span className="shrink-0 text-right font-mono text-[11px] text-slate-500">
+              <span className="shrink-0 text-right font-mono text-[11px] text-muted-foreground">
                 {progress.done} / {progress.total}
               </span>
             </div>
           ) : null}
           {!preview && (trunk.summary ?? "").trim() ? (
-            <p className="mt-3 text-[12px] leading-relaxed text-slate-500">{trunk.summary}</p>
+            <p className="mt-3 text-[12px] leading-relaxed text-muted-foreground">{trunk.summary}</p>
           ) : null}
         </div>
 
@@ -585,18 +585,18 @@ export function ContextTrace({
       {!preview ? (
         <>
           <Dialog onOpenChange={(open) => !open && setSelectedRef(null)} open={Boolean(selectedRef)}>
-            <DialogContent className="max-h-[82vh] w-[calc(100vw-2rem)] max-w-[920px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
-              <DialogHeader className="border-b border-slate-100 px-4 py-3">
-                <DialogTitle className="text-[13px] font-semibold text-slate-800">
+            <DialogContent className="max-h-[82vh] w-[calc(100vw-2rem)] max-w-[920px] gap-0 border-border bg-card p-0 shadow-xl">
+              <DialogHeader className="border-b border-border px-4 py-3">
+                <DialogTitle className="text-[13px] font-semibold text-foreground">
                   Output preview
                 </DialogTitle>
-                <DialogDescription className="font-mono text-[11px] text-slate-500">
+                <DialogDescription className="font-mono text-[11px] text-muted-foreground">
                   {selectedRef ? refLabel(selectedRef) : ""}
                   {selectedRef && refTool(selectedRef) ? ` · ${refTool(selectedRef)}` : ""}
                   {selectedRef && refLength(selectedRef) ? ` · ${refLength(selectedRef)} chars` : ""}
                 </DialogDescription>
               </DialogHeader>
-              <pre className="max-h-[68vh] overflow-auto whitespace-pre-wrap p-4 font-mono text-[12px] leading-relaxed text-slate-700">
+              <pre className="max-h-[68vh] overflow-auto whitespace-pre-wrap p-4 font-mono text-[12px] leading-relaxed text-foreground">
                 {selectedRef ? refContent(selectedRef) : ""}
               </pre>
             </DialogContent>
@@ -605,22 +605,22 @@ export function ContextTrace({
           <Card className="overflow-hidden">
             <button
               aria-expanded={debugOpen}
-              className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-50"
+              className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-accent"
               onClick={() => setDebugOpen((value) => !value)}
               type="button"
             >
-              <span className="flex items-center gap-2 text-[13px] font-medium text-slate-600">
-                <FileText aria-hidden className="text-slate-400" size={14} />
+              <span className="flex items-center gap-2 text-[13px] font-medium text-muted-foreground">
+                <FileText aria-hidden className="text-muted-foreground" size={14} />
                 Debug drawer · raw trace files
               </span>
               <ChevronDown
                 aria-hidden
-                className={cn("text-slate-300 transition-transform", debugOpen && "rotate-180")}
+                className={cn("text-muted-foreground transition-transform", debugOpen && "rotate-180")}
                 size={14}
               />
             </button>
             {debugOpen ? (
-              <pre className="max-h-72 overflow-auto border-t border-slate-100 bg-slate-50 p-3 font-mono text-[11px] leading-relaxed text-slate-600">
+              <pre className="max-h-72 overflow-auto border-t border-border bg-muted p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
                 {JSON.stringify(ctx.debug, null, 2)}
               </pre>
             ) : null}

@@ -6,7 +6,7 @@ import { Card, CardHead } from "@/components/common/Card"
 export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
   if (!doc) {
     return (
-      <div className="px-4 py-10 text-center text-[13px] text-slate-500">
+      <div className="px-4 py-10 text-center text-[13px] text-muted-foreground">
         No report generated for this session.
       </div>
     )
@@ -15,11 +15,11 @@ export function ReportDoc({ doc }: { doc?: ReportDocument | null }) {
   return (
     <Card className="overflow-hidden">
       <CardHead
-        icon={<FileText size={16} className="text-slate-500" />}
+        icon={<FileText size={16} className="text-muted-foreground" />}
         right={
           doc.path ? (
             <span
-              className="block max-w-[280px] truncate rounded-md border border-slate-200 bg-slate-50 px-2 py-1 font-mono text-[10.5px] text-slate-500"
+              className="block max-w-[280px] truncate rounded-md border border-border bg-muted px-2 py-1 font-mono text-[10.5px] text-muted-foreground"
               title={doc.path}
             >
               {doc.path}
@@ -48,33 +48,33 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
 
   if ((type === "summary" || type === "evidence") && body) {
     return (
-      <section className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2.5">
+      <section className="rounded-md border border-border bg-muted px-3 py-2.5">
         {heading ? (
-          <div className="text-[13px] font-semibold text-slate-800">{heading}</div>
+          <div className="text-[13px] font-semibold text-foreground">{heading}</div>
         ) : null}
-        <p className="mt-1 text-[13px] leading-relaxed text-slate-600">{body}</p>
+        <p className="mt-1 text-[13px] leading-relaxed text-muted-foreground">{body}</p>
       </section>
     )
   }
 
   if (type === "h1") {
-    return <h1 className="text-[20px] font-semibold tracking-tight text-slate-900">{text}</h1>
+    return <h1 className="text-[20px] font-semibold tracking-tight text-foreground">{text}</h1>
   }
 
   if (type === "h2") {
     return (
-      <h2 className="!mt-6 border-b border-slate-100 pb-1.5 text-[15px] font-semibold text-slate-800">
+      <h2 className="!mt-6 border-b border-border pb-1.5 text-[15px] font-semibold text-foreground">
         {text}
       </h2>
     )
   }
 
   if (type === "meta") {
-    return <div className="font-mono text-[11px] text-slate-500">{text}</div>
+    return <div className="font-mono text-[11px] text-muted-foreground">{text}</div>
   }
 
   if (type === "p") {
-    return <p className="text-[13.5px] leading-relaxed text-slate-600">{text}</p>
+    return <p className="text-[13.5px] leading-relaxed text-muted-foreground">{text}</p>
   }
 
   if (type === "status") {
@@ -95,8 +95,8 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
     return (
       <ul className="space-y-1.5">
         {block.items.map((item, index) => (
-          <li key={index} className="flex gap-2 text-[13.5px] text-slate-600">
-            <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-slate-400" />
+          <li key={index} className="flex gap-2 text-[13.5px] text-muted-foreground">
+            <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-muted-foreground" />
             {String(item)}
           </li>
         ))}
@@ -108,18 +108,18 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
     const rows = block.rows.filter((row): row is unknown[] => Array.isArray(row))
 
     return (
-      <div className="overflow-hidden rounded-md border border-slate-200">
+      <div className="overflow-hidden rounded-md border border-border">
         <table className="w-full border-collapse text-[13px]">
-          <tbody className="divide-y divide-slate-100">
+          <tbody className="divide-y divide-border">
             {rows.map((row, index) => (
-              <tr key={index} className="bg-white">
+              <tr key={index} className="bg-card">
                 {row.map((cell, cellIndex) => (
                   <td
                     key={`${index}-${cellIndex}`}
                     className={
                       cellIndex === 0
-                        ? "w-40 bg-slate-50 px-3 py-2 font-medium text-slate-600"
-                        : "px-3 py-2 text-slate-600"
+                        ? "w-40 bg-muted px-3 py-2 font-medium text-muted-foreground"
+                        : "px-3 py-2 text-muted-foreground"
                     }
                   >
                     {String(cell)}
@@ -134,7 +134,7 @@ function ReportBlock({ block }: { block: Record<string, unknown> }) {
   }
 
   return (
-    <pre className="overflow-auto rounded-md border border-slate-200 bg-slate-50 p-3 font-mono text-[11px] leading-relaxed text-slate-500">
+    <pre className="overflow-auto rounded-md border border-border bg-muted p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
       {JSON.stringify(block, null, 2)}
     </pre>
   )

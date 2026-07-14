@@ -31,12 +31,12 @@ function Tile({
   valueClass?: string
 }) {
   return (
-    <div className="rounded-[10px] border border-slate-200 bg-white px-4 py-3.5">
-      <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-slate-400">{label}</div>
-      <div className={cn("mt-1 text-[27px] font-bold leading-[1.1] tracking-[-0.02em] text-slate-800", valueClass)}>
+    <div className="rounded-[10px] border border-border bg-card px-4 py-3.5">
+      <div className="font-mono text-[11px] uppercase tracking-[0.06em] text-muted-foreground">{label}</div>
+      <div className={cn("mt-1 text-[27px] font-bold leading-[1.1] tracking-[-0.02em] text-foreground", valueClass)}>
         {value}
       </div>
-      {sub ? <div className="mt-1 font-mono text-[12px] text-slate-500">{sub}</div> : null}
+      {sub ? <div className="mt-1 font-mono text-[12px] text-muted-foreground">{sub}</div> : null}
     </div>
   )
 }
@@ -81,11 +81,11 @@ export function OverviewTab({
         <button
           type="button"
           onClick={onOpenFlow}
-          className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-slate-200 bg-white px-4 py-2.5 text-left"
+          className="mb-3 flex w-full items-center gap-3 rounded-[10px] border border-border bg-card px-4 py-2.5 text-left"
         >
-          <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-slate-400">Goal</span>
-          <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-slate-700">{goal}</span>
-          {progress ? <span className="shrink-0 font-mono text-[12px] text-slate-400">{progress}</span> : null}
+          <span className="shrink-0 font-mono text-[10px] uppercase tracking-[0.06em] text-muted-foreground">Goal</span>
+          <span className="min-w-0 flex-1 truncate text-[13px] leading-snug text-foreground">{goal}</span>
+          {progress ? <span className="shrink-0 font-mono text-[12px] text-muted-foreground">{progress}</span> : null}
           <span className="shrink-0 text-[12px] font-semibold text-primary">View flow →</span>
         </button>
       ) : null}
@@ -150,10 +150,10 @@ export function OverviewTab({
       </div>
 
       {!singleModule && modules.length > 0 ? (
-        <section className="mt-5 overflow-hidden rounded-xl border border-slate-200 bg-white">
-          <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
-            <h2 className="text-[14px] font-bold text-slate-800">Per-module breakdown</h2>
-            <span className="font-mono text-[12px] text-slate-400">
+        <section className="mt-5 overflow-hidden rounded-xl border border-border bg-card">
+          <div className="flex items-center justify-between border-b border-border px-4 py-3">
+            <h2 className="text-[14px] font-bold text-foreground">Per-module breakdown</h2>
+            <span className="font-mono text-[12px] text-muted-foreground">
               {ms?.modulesTotal ?? modules.length} modules
               {ms?.coverageSource ? ` · ${ms.coverageSource}` : ""}
             </span>

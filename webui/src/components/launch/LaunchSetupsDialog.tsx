@@ -16,9 +16,9 @@ import {
 import { emptyLaunchRow, parsePastedRepoLines, type LaunchRowDraft } from "./launchRows"
 
 const cellBase =
-  "w-full rounded-md border px-2 py-1.5 font-mono text-[12px] text-slate-700 outline-none focus:ring-2"
-const cellNormal = "border-slate-200 focus:border-blue-500 focus:ring-blue-500/20"
-const cellError = "border-red-400 focus:border-red-500 focus:ring-red-500/20"
+  "w-full rounded-md border px-2 py-1.5 font-mono text-[12px] text-foreground outline-none focus:ring-2"
+const cellNormal = "border-border focus:border-ring focus:ring-ring/30"
+const cellError = "border-status-failed-border focus:border-status-failed focus:ring-status-failed/30"
 
 const VERSION_HELP =
   "Branch, release tag, or commit hash (short or full), e.g. rel/commons-cli-1.11.0 or 1a2b3c4. Leave empty for the default branch."
@@ -190,8 +190,8 @@ export function LaunchSetupsDialog({
         }
       }}
     >
-      <DialogContent className="w-[calc(100vw-2rem)] max-w-[920px] gap-0 border-slate-200 bg-white p-0 shadow-xl">
-        <DialogHeader className="border-b border-slate-100 px-4 py-3">
+      <DialogContent className="w-[calc(100vw-2rem)] max-w-[920px] gap-0 border-border bg-card p-0 shadow-xl">
+        <DialogHeader className="border-b border-border px-4 py-3">
           <DialogTitle>Launch setups</DialogTitle>
           <DialogDescription>
             One row per repository. Each accepted row runs sag project in its own process.
@@ -205,7 +205,7 @@ export function LaunchSetupsDialog({
           >
             <div className="flex items-center gap-2">
               <label
-                className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500"
+                className="font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground"
                 htmlFor="launch-concurrency"
               >
                 Concurrency
@@ -219,7 +219,7 @@ export function LaunchSetupsDialog({
                 type="number"
                 value={concurrency}
               />
-              <span className="text-[11px] text-slate-500">
+              <span className="text-[11px] text-muted-foreground">
                 parallel setups for this batch (1 or more)
               </span>
             </div>
@@ -228,18 +228,18 @@ export function LaunchSetupsDialog({
               {["Repo URL", "Name", "Version", "Goal"].map((header) => (
                 <div
                   key={header}
-                  className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500"
+                  className="flex items-center gap-1 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground"
                 >
                   {header}
                   {header === "Version" ? (
                     <span
                       aria-label="Version help"
-                      className="group relative inline-flex cursor-help text-slate-400 hover:text-slate-600 focus-visible:text-slate-600 focus-visible:outline-none"
+                      className="group relative inline-flex cursor-help text-muted-foreground hover:text-foreground focus-visible:text-foreground focus-visible:outline-none"
                       tabIndex={0}
                     >
                       <Info aria-hidden="true" size={12} />
                       <span
-                        className="pointer-events-none absolute left-1/2 top-full z-[var(--z-tooltip)] mt-1.5 hidden w-64 -translate-x-1/2 whitespace-normal rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-left font-sans text-[11px] font-normal normal-case tracking-normal text-slate-600 shadow-md group-hover:block group-focus-visible:block"
+                        className="pointer-events-none absolute left-1/2 top-full z-[var(--z-tooltip)] mt-1.5 hidden w-64 -translate-x-1/2 whitespace-normal rounded-md border border-border bg-card px-2.5 py-1.5 text-left font-sans text-[11px] font-normal normal-case tracking-normal text-muted-foreground shadow-md group-hover:block group-focus-visible:block"
                         role="tooltip"
                       >
                         {VERSION_HELP}
@@ -248,22 +248,22 @@ export function LaunchSetupsDialog({
                   ) : null}
                 </div>
               ))}
-              <div className="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
+              <div className="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                 Record
                 <button
                   aria-label="Select all record"
-                  className="text-[9px] normal-case tracking-normal text-blue-600 underline"
+                  className="text-[9px] normal-case tracking-normal text-status-running underline"
                   onClick={() => setAllFlag("record")}
                   type="button"
                 >
                   all
                 </button>
               </div>
-              <div className="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
+              <div className="flex flex-col items-center gap-0.5 font-mono text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                 Coverage
                 <button
                   aria-label="Select all coverage"
-                  className="text-[9px] normal-case tracking-normal text-blue-600 underline"
+                  className="text-[9px] normal-case tracking-normal text-status-running underline"
                   onClick={() => setAllFlag("coverage")}
                   type="button"
                 >
@@ -289,18 +289,18 @@ export function LaunchSetupsDialog({
                 <Plus size={13} />
                 Add row
               </Button>
-              <span className="text-[11px] text-slate-500">
+              <span className="text-[11px] text-muted-foreground">
                 Tip: paste <span className="font-mono">repo-url version</span> lines into a
                 URL cell to fill multiple rows.
               </span>
             </div>
 
             {formError ? (
-              <div className="mt-3 text-[12px] text-red-600">{formError}</div>
+              <div className="mt-3 text-[12px] text-status-failed">{formError}</div>
             ) : null}
           </fieldset>
 
-          <DialogFooter className="gap-2 border-t border-slate-100 px-4 py-3 sm:space-x-0">
+          <DialogFooter className="gap-2 border-t border-border px-4 py-3 sm:space-x-0">
             <Button disabled={submitting} onClick={onClose} type="button" variant="outline">
               Cancel
             </Button>
@@ -388,16 +388,20 @@ function RowCells({
           type="checkbox"
         />
       </div>
+      {/* Native title (not <Tooltip>): this dialog's own version-help tooltip is
+          asserted with getByRole("tooltip") in its test; a second role=tooltip
+          in the tree would break that query. */}
       <button
         aria-label={`Remove row ${rowLabel}`}
-        className="rounded-md p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/30 disabled:opacity-40"
+        title="Remove this row"
+        className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40 disabled:opacity-40"
         onClick={onRemove}
         type="button"
       >
         <X size={14} />
       </button>
       {error ? (
-        <div className="col-span-7 -mt-1 text-[12px] text-red-600">{error}</div>
+        <div className="col-span-7 -mt-1 text-[12px] text-status-failed">{error}</div>
       ) : null}
     </>
   )

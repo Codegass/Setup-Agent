@@ -8,7 +8,7 @@ export interface CardProps extends React.HTMLAttributes<HTMLDivElement> {}
 export function Card({ className, ...props }: CardProps) {
   return (
     <ShadCard
-      className={cn("rounded-lg border-slate-200 bg-white shadow-none", className)}
+      className={cn("rounded-lg border-border bg-card shadow-none", className)}
       {...props}
     />
   )
@@ -33,7 +33,7 @@ export function CardHead({
   return (
     <div
       className={cn(
-        "flex items-start justify-between gap-3 border-b border-slate-100 px-4 py-3",
+        "flex items-start justify-between gap-3 border-b border-border px-4 py-3",
         className,
       )}
       {...props}
@@ -41,10 +41,10 @@ export function CardHead({
       <div className="flex min-w-0 items-center gap-2">
         {icon}
         <div className="min-w-0">
-          <div className="truncate text-[13px] font-semibold leading-tight text-slate-800">
+          <div className="truncate text-[13px] font-semibold leading-tight text-foreground">
             {title}
           </div>
-          {sub ? <div className="mt-0.5 truncate text-[11px] text-slate-500">{sub}</div> : null}
+          {sub ? <div className="mt-0.5 truncate text-[11px] text-muted-foreground">{sub}</div> : null}
         </div>
       </div>
       {right ? <div className="shrink-0">{right}</div> : null}

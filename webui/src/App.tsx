@@ -6,6 +6,7 @@ import {
   fetchDashboard,
   fetchLaunchQueue,
   fetchSession,
+  fetchSystem,
   submitProjectBatch,
   submitTask,
 } from "@/api/client"
@@ -15,9 +16,12 @@ import type {
   LaunchBatchResult,
   LaunchQueueState,
   SubmitTaskResponse,
+  SystemSummary,
 } from "@/api/types"
 import { Button } from "@/components/common/Button"
 import { Card } from "@/components/common/Card"
+import { NavBar } from "@/components/NavBar"
+import { Tooltip } from "@/components/ui/tooltip"
 import { LaunchSetupsDialog } from "@/components/launch/LaunchSetupsDialog"
 import { RailSkeleton } from "@/pages/RailSkeleton"
 import { WorkspaceRail } from "@/pages/WorkspaceRail"
@@ -31,6 +35,7 @@ const LAUNCH_HIGHLIGHT_MS = 8000
 
 export function App() {
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
+  const [system, setSystem] = useState<SystemSummary | null>(null)
   const [dashboardError, setDashboardError] = useState<string | null>(null)
   const [routeError, setRouteError] = useState<string | null>(null)
   const [sessionDetails, setSessionDetails] = useState<Record<string, ExecutionSessionDetail>>({})
@@ -47,6 +52,31 @@ export function App() {
   const [railOpen, setRailOpen] = useState(false)
   const [deletingIds, setDeletingIds] = useState<Set<string>>(new Set())
   const highlightTimers = useRef<number[]>([])
+
+  const [dark, setDark] = useState(() => {
+    const saved = localStorage.getItem("sag.theme")
+    if (saved) return saved === "dark"
+    return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false
+  })
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", dark)
+    localStorage.setItem("sag.theme", dark ? "dark" : "light")
+  }, [dark])
+
+  useEffect(() => {
+    let active = true
+    const load = () => {
+      void fetchSystem()
+        .then((s) => active && setSystem(s))
+        .catch(() => {})
+    }
+    load()
+    const id = window.setInterval(load, DASHBOARD_POLL_MS)
+    return () => {
+      active = false
+      window.clearInterval(id)
+    }
+  }, [])
 
   const loadLaunchQueue = useCallback(async () => {
     try {
@@ -263,12 +293,12 @@ export function App() {
   }
 
   return (
-    <div className="flex h-screen min-h-0 w-full overflow-hidden bg-[#fbfbfc] text-slate-900">
+    <div className="flex h-screen min-h-0 w-full overflow-hidden bg-background text-foreground">
       {/* Mobile-only backdrop behind the rail drawer. */}
       {railOpen ? (
         <button
           aria-label="Close workspaces menu"
-          className="fixed inset-0 z-[var(--z-overlay)] bg-slate-900/30 lg:hidden"
+          className="fixed inset-0 z-[var(--z-overlay)] bg-overlay lg:hidden"
           onClick={() => setRailOpen(false)}
           type="button"
         />
@@ -298,30 +328,34 @@ export function App() {
         />
       ) : null}
 
-      <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-white">
+      <main className="flex min-h-0 flex-1 flex-col overflow-hidden bg-card">
         {/* Mobile top bar: opens the workspace rail drawer (hidden at lg+). */}
-        <div className="flex items-center gap-2 border-b border-slate-200 px-4 py-2 lg:hidden">
-          <button
-            aria-controls="workspace-rail"
-            aria-expanded={railOpen}
-            aria-label="Workspaces menu"
-            className="rounded-md border border-slate-200 p-1.5 text-slate-600 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
-            onClick={() => setRailOpen((value) => !value)}
-            type="button"
-          >
-            <Menu size={16} />
-          </button>
-          <span className="truncate font-mono text-[12px] font-semibold text-slate-700">
+        <div className="flex items-center gap-2 border-b border-border px-4 py-2 lg:hidden">
+          <Tooltip label="Open the workspaces list" side="bottom">
+            <button
+              aria-controls="workspace-rail"
+              aria-expanded={railOpen}
+              aria-label="Workspaces menu"
+              className="rounded-md border border-border p-1.5 text-muted-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]"
+              onClick={() => setRailOpen((value) => !value)}
+              type="button"
+            >
+              <Menu size={16} />
+            </button>
+          </Tooltip>
+          <span className="truncate font-mono text-[12px] font-semibold text-foreground">
             {selectedWorkspace ? selectedWorkspace.project : "SAG Workbench"}
           </span>
         </div>
+
+        <NavBar dark={dark} onToggleTheme={() => setDark((v) => !v)} system={system} />
 
         <div className="min-h-0 flex-1 overflow-hidden">
         {!dashboard && !loading && dashboardError ? (
           <div className="p-6">
             <Card className="max-w-xl p-5">
-              <div className="text-[15px] font-semibold text-slate-900">Dashboard unavailable</div>
-              <div className="mt-2 font-mono text-[12px] text-red-600">{dashboardError}</div>
+              <div className="text-[15px] font-semibold text-foreground">Dashboard unavailable</div>
+              <div className="mt-2 font-mono text-[12px] text-status-failed">{dashboardError}</div>
               <Button className="mt-4" onClick={() => void loadDashboard()} type="button" variant="outline">
                 Retry
               </Button>
@@ -341,22 +375,22 @@ export function App() {
         ) : dashboard && selectedWorkspace && sessionId && sessionErrors[sessionId] ? (
           <div className="p-6">
             <Card className="max-w-xl p-5">
-              <div className="text-[15px] font-semibold text-slate-900">Session {sessionId} unavailable</div>
-              <div className="mt-2 font-mono text-[12px] text-red-600">{sessionErrors[sessionId]}</div>
+              <div className="text-[15px] font-semibold text-foreground">Session {sessionId} unavailable</div>
+              <div className="mt-2 font-mono text-[12px] text-status-failed">{sessionErrors[sessionId]}</div>
               <Button className="mt-4" onClick={() => void ensureSessionDetail(sessionId)} type="button" variant="outline">
                 Retry
               </Button>
             </Card>
           </div>
         ) : dashboard && selectedWorkspace ? (
-          <div className="p-6 font-mono text-[13px] text-slate-500">
+          <div className="p-6 font-mono text-[13px] text-muted-foreground">
             {sessionId ? `Loading session ${sessionId}…` : "This workspace has no execution session yet."}
           </div>
         ) : dashboard ? (
           <div className="flex h-full items-center justify-center p-6 text-center">
             <div>
-              <div className="text-[15px] font-semibold text-slate-800">Select a workspace</div>
-              <p className="mt-1 text-[13px] text-slate-500">Pick a workspace from the rail, or launch a new setup.</p>
+              <div className="text-[15px] font-semibold text-foreground">Select a workspace</div>
+              <p className="mt-1 text-[13px] text-muted-foreground">Pick a workspace from the rail, or launch a new setup.</p>
             </div>
           </div>
         ) : null}
@@ -365,8 +399,8 @@ export function App() {
 
       {launchNotice ? (
         <div className="fixed bottom-4 left-1/2 z-[var(--z-modal)] -translate-x-1/2">
-          <Card className="flex items-center gap-3 border-blue-100 bg-blue-50/90 px-4 py-3 text-[13px] shadow-lg backdrop-blur">
-            <span className="text-blue-700">{launchNotice}</span>
+          <Card className="flex items-center gap-3 border-status-running-border bg-status-running-soft px-4 py-3 text-[13px] shadow-lg backdrop-blur">
+            <span className="text-status-running">{launchNotice}</span>
             <Button onClick={() => setLaunchNotice(null)} type="button" variant="outline">Dismiss</Button>
           </Card>
         </div>

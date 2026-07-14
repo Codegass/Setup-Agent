@@ -41,10 +41,10 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
         className={cn(
           "gap-1.5 shadow-none",
           sizeClasses[size],
-          variant === "outline" && "border-slate-200 bg-white text-slate-700 hover:bg-slate-50",
-          variant === "ghost" && "text-slate-600 hover:bg-slate-100 hover:text-slate-900",
-          variant === "subtle" && "bg-slate-100 text-slate-700 hover:bg-slate-200",
-          variant === "destructive" && "border border-red-200 bg-white text-red-600 hover:bg-red-50",
+          variant === "outline" && "border-border bg-card text-foreground hover:bg-accent",
+          variant === "ghost" && "text-muted-foreground hover:bg-accent hover:text-foreground",
+          variant === "subtle" && "bg-muted text-foreground hover:bg-accent",
+          variant === "destructive" && "border border-status-failed-border bg-card text-status-failed hover:bg-status-failed-soft",
           className,
         )}
         {...props}

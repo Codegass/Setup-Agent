@@ -20,6 +20,17 @@ class DockerSummary(WebModel):
     endpoint: str | None = None
 
 
+class SystemSummary(WebModel):
+    """Host + docker resource usage for the nav bar. Any field is None when its
+    source is unavailable (docker down, non-Linux host)."""
+
+    docker_disk_used: int | None = Field(default=None, serialization_alias="dockerDiskUsed")
+    docker_reclaimable: int | None = Field(default=None, serialization_alias="dockerReclaimable")
+    mem_used: int | None = Field(default=None, serialization_alias="memUsed")
+    mem_total: int | None = Field(default=None, serialization_alias="memTotal")
+    cpu_load: float | None = Field(default=None, serialization_alias="cpuLoad")
+
+
 class BuildSummary(WebModel):
     state: str = "none"
     tool: str = "—"

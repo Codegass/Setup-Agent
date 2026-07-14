@@ -36,6 +36,11 @@ SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
 _EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
 _EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
 _CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
+# Cap the context trace payload: a huge full_outputs.jsonl (big runs like camel)
+# shipped raw to the browser and rendered can crash the renderer. Skip files over
+# the per-file cap and stop once the total budget is spent.
+_MAX_CONTEXT_FILE_CHARS = 1_000_000
+_MAX_CONTEXT_TOTAL_CHARS = 8_000_000
 
 
 class SessionRegistry:
@@ -98,9 +103,10 @@ class ContainerSessionRegistry:
         self.logs_root = logs_root if logs_root is not None else _resolve_logs_root()
         self._now = now_fn if now_fn is not None else time.monotonic
         self._missing_sessions: dict[str, float] = {}
+        self._client: Any = None
 
     def list_workspace_sessions(self, workspace: WorkspaceSummary) -> list[ExecutionSessionSummary]:
-        orchestrator = self._orchestrator(workspace.id)
+        orchestrator = self._reader(workspace)
         raw = _read_container_file(orchestrator, SESSION_INDEX_PATH)
         rows = parse_session_index(raw, workspace.id) if raw is not None else []
         return _merge_session_summaries(
@@ -137,7 +143,7 @@ class ContainerSessionRegistry:
         workspace: WorkspaceSummary,
         session_id: str,
     ) -> ExecutionSessionDetail | None:
-        orchestrator = self._orchestrator(workspace.id)
+        orchestrator = self._reader(workspace)
         raw = _read_container_file(orchestrator, SESSION_INDEX_PATH)
 
         item = _find_session_item(raw, session_id) if raw is not None else None
@@ -153,6 +159,32 @@ class ContainerSessionRegistry:
 
         context = _read_context_trace(orchestrator)
         return _session_detail(item, workspace.id, context)
+
+    def _reader(self, workspace: WorkspaceSummary) -> Any:
+        """A reader for a workspace's result files. Tests inject a fake via
+        orchestrator_factory; production reads from the host mirror (no docker
+        exec, so viewing results never revives a stopped container)."""
+        if self.orchestrator_factory is not None:
+            return self.orchestrator_factory(workspace.id)
+
+        from sag.web.session_mirror import MirrorReader, ensure_mirror
+
+        client = self._docker_client()
+        mirror = None
+        if client is not None:
+            running = getattr(getattr(workspace, "docker", None), "status", "") == "running"
+            mirror = ensure_mirror(client, workspace.id, running, self.logs_root)
+        return MirrorReader(mirror if mirror is not None else self.logs_root / "web_mirror" / "__missing__")
+
+    def _docker_client(self) -> Any:
+        if self._client is None:
+            try:
+                import docker
+
+                self._client = docker.from_env()
+            except Exception:
+                self._client = None
+        return self._client
 
     def _orchestrator(self, workspace_id: str) -> Any:
         if self.orchestrator_factory is not None:
@@ -1472,6 +1504,7 @@ def _read_context_trace(orchestrator: Any) -> ContextTrace | None:
         contexts_dir = Path(temp_dir) / "contexts"
         contexts_dir.mkdir()
 
+        total = 0
         for filename in filenames[:100]:
             raw = _read_container_file(
                 orchestrator,
@@ -1479,6 +1512,11 @@ def _read_context_trace(orchestrator: Any) -> ContextTrace | None:
             )
             if raw is None:
                 continue
+            # ponytail: drop oversized context files rather than crash the browser
+            # render; raise the caps if the trace ever needs the full outputs.
+            if len(raw) > _MAX_CONTEXT_FILE_CHARS or total + len(raw) > _MAX_CONTEXT_TOTAL_CHARS:
+                continue
+            total += len(raw)
             target = contexts_dir / filename
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(raw, encoding="utf-8")

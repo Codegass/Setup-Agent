@@ -22,7 +22,7 @@ export function FilesDigest({
 
   if (!digest) {
     return (
-      <div className="px-4 py-6 text-center text-[13px] text-slate-500">
+      <div className="px-4 py-6 text-center text-[13px] text-muted-foreground">
         No file snapshot was captured for this execution.
       </div>
     )
@@ -33,17 +33,17 @@ export function FilesDigest({
   return (
     <div>
       {!preview ? (
-        <div className="flex flex-wrap items-center gap-3 border-b border-slate-100 px-4 py-2.5">
+        <div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2.5">
           <CountDot color="bg-status-success" label={`${digest.counts.added} added`} />
           <CountDot color="bg-status-running" label={`${digest.counts.modified} modified`} />
           <CountDot color="bg-status-failed" label={`${digest.counts.deleted} deleted`} />
           <CountDot color="bg-status-attention" label={`${digest.counts.renamed} renamed`} />
-          <div className="ml-auto font-mono text-[10.5px] text-slate-500">
+          <div className="ml-auto font-mono text-[10.5px] text-muted-foreground">
             snapshot {digest.snapshot.base} - {digest.snapshot.head} / {digest.snapshot.mode}
           </div>
         </div>
       ) : null}
-      <div className="divide-y divide-slate-100">
+      <div className="divide-y divide-border">
         {items.length ? (
           items.map((file) => {
             const open = openPath === file.path
@@ -52,7 +52,7 @@ export function FilesDigest({
               <div key={file.path}>
                 <button
                   className={`flex w-full items-center gap-2.5 px-4 py-2.5 text-left ${
-                    preview ? "" : "hover:bg-slate-50/70"
+                    preview ? "" : "hover:bg-accent"
                   }`}
                   onClick={() => {
                     if (!preview) {
@@ -68,22 +68,22 @@ export function FilesDigest({
                     {file.change}
                   </Badge>
                   {file.type === "dir" ? (
-                    <Folder size={14} className="shrink-0 text-slate-500" />
+                    <Folder size={14} className="shrink-0 text-muted-foreground" />
                   ) : (
-                    <FileText size={14} className="shrink-0 text-slate-500" />
+                    <FileText size={14} className="shrink-0 text-muted-foreground" />
                   )}
-                  <span className="truncate font-mono text-[12px] text-slate-600">{file.path}</span>
-                  <span className="ml-auto shrink-0 font-mono text-[11px] text-slate-500">
+                  <span className="truncate font-mono text-[12px] text-muted-foreground">{file.path}</span>
+                  <span className="ml-auto shrink-0 font-mono text-[11px] text-muted-foreground">
                     {file.size}
                   </span>
-                  <span className="hidden shrink-0 font-mono text-[10px] text-slate-500 sm:block">
+                  <span className="hidden shrink-0 font-mono text-[10px] text-muted-foreground sm:block">
                     {file.mtime}
                   </span>
                 </button>
                 {open && !preview ? (
-                  <div className="border-t border-slate-100 bg-slate-50/50 px-4 py-3 sm:pl-[88px]">
-                    <div className="text-[12px] text-slate-500">{file.note}</div>
-                    <div className="mt-2 inline-flex items-center gap-1.5 font-mono text-[11px] text-slate-500">
+                  <div className="border-t border-border bg-muted px-4 py-3 sm:pl-[88px]">
+                    <div className="text-[12px] text-muted-foreground">{file.note}</div>
+                    <div className="mt-2 inline-flex items-center gap-1.5 font-mono text-[11px] text-muted-foreground">
                       <Search size={12} />
                       Content diff is intentionally on demand.
                     </div>
@@ -93,7 +93,7 @@ export function FilesDigest({
             )
           })
         ) : (
-          <div className="px-4 py-6 text-center text-[13px] text-slate-500">
+          <div className="px-4 py-6 text-center text-[13px] text-muted-foreground">
             No file changes captured in this digest.
           </div>
         )}
@@ -106,7 +106,7 @@ function CountDot({ color, label }: { color: string; label: string }) {
   return (
     <div className="flex items-center gap-1.5 text-[12px]">
       <span className={`h-2 w-2 rounded-full ${color}`} />
-      <span className="text-slate-500">{label}</span>
+      <span className="text-muted-foreground">{label}</span>
     </div>
   )
 }

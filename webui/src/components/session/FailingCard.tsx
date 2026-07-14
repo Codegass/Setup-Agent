@@ -23,11 +23,11 @@ export function FailingCard({
         {names.map((n) => (
           <div key={n} className="flex items-center gap-2 px-4 py-2">
             <X className="shrink-0 text-status-failed" size={13} />
-            <span className="truncate font-mono text-[12px] text-slate-700">{n}</span>
+            <span className="truncate font-mono text-[12px] text-foreground">{n}</span>
           </div>
         ))}
         {hiddenCount > 0 ? (
-          <div className="px-4 py-2 font-mono text-[10px] text-slate-500">
+          <div className="px-4 py-2 font-mono text-[10px] text-muted-foreground">
             +{hiddenCount} more{evidenceRef ? ` — full list at ${evidenceRef}` : ""}
           </div>
         ) : null}

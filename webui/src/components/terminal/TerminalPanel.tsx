@@ -94,19 +94,19 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
   }, [workspaceId])
 
   return (
-    <div className="rounded-lg border border-slate-800 bg-[#0d1117]">
-      <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-3 py-2">
+    <div className="rounded-lg border border-border bg-code-surface">
+      <div className="flex items-center justify-between gap-3 border-b border-border px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <div className="flex gap-1.5">
             <span className="h-2.5 w-2.5 rounded-full bg-red-400/80" />
             <span className="h-2.5 w-2.5 rounded-full bg-amber-400/80" />
             <span className="h-2.5 w-2.5 rounded-full bg-emerald-400/80" />
           </div>
-          <span className="ml-2 truncate font-mono text-[11px] text-slate-400">
+          <span className="ml-2 truncate font-mono text-[11px] text-code-foreground/60">
             {workspaceId} - interactive shell
           </span>
         </div>
-        <span className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-slate-500">
+        <span className="font-mono text-[10.5px] uppercase tracking-[0.14em] text-code-foreground/60">
           {status}
         </span>
       </div>
@@ -116,7 +116,7 @@ export function TerminalPanel({ workspaceId }: TerminalPanelProps) {
         ref={terminalRef}
       />
       {error ? (
-        <div className="border-t border-slate-800 px-3 py-2 font-mono text-[11px] text-red-300">
+        <div className="border-t border-border px-3 py-2 font-mono text-[11px] text-red-300">
           {error}
         </div>
       ) : null}

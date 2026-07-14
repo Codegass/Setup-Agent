@@ -15,25 +15,25 @@ export function WorkspaceSettings({
 }) {
   return (
     <div className="grid gap-4 md:grid-cols-2">
-      <SettingsCard icon={<Box size={15} className="text-slate-500" />} title="Container">
+      <SettingsCard icon={<Box size={15} className="text-muted-foreground" />} title="Container">
         <SettingsRow label="Name" value={workspace.container} />
         <SettingsRow label="Status" value={<StatusBadge status={workspace.docker.status} />} />
         <SettingsRow label="Image" value={workspace.docker.image ?? "unknown"} />
         <SettingsRow label="Endpoint" value={workspace.docker.endpoint ?? "local Docker"} />
       </SettingsCard>
-      <SettingsCard icon={<GitBranch size={15} className="text-slate-500" />} title="Workspace">
+      <SettingsCard icon={<GitBranch size={15} className="text-muted-foreground" />} title="Workspace">
         <SettingsRow label="Project" value={workspace.project} />
         <SettingsRow label="Stack" value={workspace.stack} />
         <SettingsRow label="Tag" value={workspace.tag ?? "untracked"} />
         <SettingsRow label="Commit" value={workspace.commit ?? "unknown"} />
       </SettingsCard>
-      <SettingsCard icon={<Activity size={15} className="text-slate-500" />} title="Sessions">
+      <SettingsCard icon={<Activity size={15} className="text-muted-foreground" />} title="Sessions">
         <SettingsRow label="Active" value={workspace.activeSession ?? "none"} />
         <SettingsRow label="Latest" value={workspace.latestSession ?? "none"} />
         <SettingsRow label="Latest status" value={latest ? <StatusBadge status={latest.status} /> : "not loaded"} />
         <SettingsRow label="Updated" value={workspace.updated} />
       </SettingsCard>
-      <SettingsCard icon={<SettingsIcon size={15} className="text-slate-500" />} title="Read model">
+      <SettingsCard icon={<SettingsIcon size={15} className="text-muted-foreground" />} title="Read model">
         <SettingsRow label="Build" value={normalizeWorkspaceBuild(workspace.build).state} />
         <SettingsRow label="Test" value={workspace.test.state} />
         <SettingsRow label="Report" value={workspace.report} />
@@ -56,7 +56,7 @@ function SettingsCard({
     <Card className="p-4">
       <div className="mb-1.5 flex items-center gap-2">
         {icon}
-        <span className="text-[13px] font-semibold text-slate-800">{title}</span>
+        <span className="text-[13px] font-semibold text-foreground">{title}</span>
       </div>
       {children}
     </Card>
@@ -71,11 +71,11 @@ function SettingsRow({
   value: React.ReactNode
 }) {
   return (
-    <div className="flex items-baseline justify-between gap-4 border-b border-slate-100 py-2 last:border-b-0">
-      <span className="text-[12.5px] text-slate-500">{label}</span>
+    <div className="flex items-baseline justify-between gap-4 border-b border-border py-2 last:border-b-0">
+      <span className="text-[12.5px] text-muted-foreground">{label}</span>
       <span
         className={cn(
-          "min-w-0 truncate text-right text-[12.5px] text-slate-700",
+          "min-w-0 truncate text-right text-[12.5px] text-foreground",
           typeof value === "string" && "font-mono text-[12px]",
         )}
       >
