@@ -98,6 +98,13 @@ def test_missing_path_skipped(tmp_path):
     assert not (dest / ".sag_last_comment.json").exists()  # NotFound → skipped, no crash
 
 
+def test_extract_artifacts_copies_setup_agent_and_report(tmp_path):
+    session_mirror.extract_artifacts(FakeContainer(ARCHIVES), tmp_path)
+    assert (tmp_path / ".setup_agent" / "sessions" / "index.json").is_file()
+    assert (tmp_path / REPORT).read_text() == "# report"
+    assert not (tmp_path / ".sag_last_comment.json").exists()  # mirror-only file
+
+
 def test_reader_answers_cat_and_finds(tmp_path):
     dest = ensure_mirror(FakeClient(FakeContainer(ARCHIVES)), "sag-x", running=False, logs_root=tmp_path)
     r = MirrorReader(dest)
