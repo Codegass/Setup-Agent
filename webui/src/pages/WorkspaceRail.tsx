@@ -17,6 +17,7 @@ import {
 } from "@/components/workspace/DeleteWorkspaceDialog"
 import { Tooltip } from "@/components/ui/tooltip"
 import { formatAgo } from "@/lib/relativeTime"
+import { readStored, writeStored } from "@/lib/safeStorage"
 import { cn } from "@/lib/utils"
 
 import { needsAttention, sortByAttentionFirst } from "./dashboardAttention"
@@ -357,7 +358,7 @@ export function WorkspaceRail({
   }
   const [removeTarget, setRemoveTarget] = useState<DeleteWorkspaceTarget | null>(null)
   const [railWidth, setRailWidth] = useState(() => {
-    const saved = Number(localStorage.getItem("sag.railWidth"))
+    const saved = Number(readStored("sag.railWidth"))
     return saved >= 240 && saved <= 560 ? saved : 320
   })
   const startResize = (e: ReactMouseEvent) => {
@@ -370,7 +371,7 @@ export function WorkspaceRail({
     const onUp = () => {
       window.removeEventListener("mousemove", onMove)
       window.removeEventListener("mouseup", onUp)
-      localStorage.setItem("sag.railWidth", String(latest))
+      writeStored("sag.railWidth", String(latest))
     }
     window.addEventListener("mousemove", onMove)
     window.addEventListener("mouseup", onUp)

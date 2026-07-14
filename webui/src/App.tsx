@@ -27,6 +27,7 @@ import { RailSkeleton } from "@/pages/RailSkeleton"
 import { WorkspaceRail } from "@/pages/WorkspaceRail"
 import { sortByAttentionFirst } from "@/pages/dashboardAttention"
 import { DetailPane } from "@/pages/detail/DetailPane"
+import { readStored, writeStored } from "@/lib/safeStorage"
 import { cn } from "@/lib/utils"
 
 const DASHBOARD_POLL_MS = 5000
@@ -54,13 +55,13 @@ export function App() {
   const highlightTimers = useRef<number[]>([])
 
   const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("sag.theme")
+    const saved = readStored("sag.theme")
     if (saved) return saved === "dark"
     return window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false
   })
   useEffect(() => {
     document.documentElement.classList.toggle("dark", dark)
-    localStorage.setItem("sag.theme", dark ? "dark" : "light")
+    writeStored("sag.theme", dark ? "dark" : "light")
   }, [dark])
 
   useEffect(() => {
