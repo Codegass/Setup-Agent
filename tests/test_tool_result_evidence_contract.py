@@ -1,3 +1,5 @@
+import pytest
+
 from sag.evidence import EvidenceAssessment
 from sag.tools.base import ToolResult
 from sag.tools.bash import BashTool, BashToolConfig
@@ -41,31 +43,42 @@ def test_tool_result_coerces_string_status_inputs():
     assert result.status == EvidenceAssessment.PARTIAL
 
 
-def test_tool_result_coerces_status_assignment_after_init():
+def test_tool_result_rejects_status_assignment_after_init():
     result = ToolResult(success=True, output="ok")
+    before = result.model_dump()
 
-    result.status = "blocked"
+    with pytest.raises(TypeError, match="status.*read-only"):
+        result.status = "blocked"
 
-    assert isinstance(result.status, EvidenceAssessment)
-    assert result.status == EvidenceAssessment.BLOCKED
+    assert result.model_dump() == before
+    assert result.status == EvidenceAssessment.SUCCESS
 
 
-def test_tool_result_updates_default_status_when_success_changes():
+def test_tool_result_rejects_success_assignment_after_init():
     result = ToolResult(success=True, output="ok")
+    before = result.model_dump()
 
-    result.success = False
+    with pytest.raises(TypeError, match="success.*read-only"):
+        result.success = False
 
-    assert result.success is False
-    assert result.status == EvidenceAssessment.BLOCKED
+    assert result.model_dump() == before
+    assert result.success is True
+    assert result.status == EvidenceAssessment.SUCCESS
 
 
-def test_tool_result_preserves_explicit_domain_status_when_success_changes():
+def test_tool_result_preserves_explicit_domain_status_after_rejected_success_change():
     partial = ToolResult(success=True, status=EvidenceAssessment.PARTIAL, output="partial")
     conflict = ToolResult(success=False, status=EvidenceAssessment.CONFLICT, output="conflict")
+    partial_before = partial.model_dump()
+    conflict_before = conflict.model_dump()
 
-    partial.success = False
-    conflict.success = True
+    with pytest.raises(TypeError, match="success.*read-only"):
+        partial.success = False
+    with pytest.raises(TypeError, match="success.*read-only"):
+        conflict.success = True
 
+    assert partial.model_dump() == partial_before
+    assert conflict.model_dump() == conflict_before
     assert partial.status == EvidenceAssessment.PARTIAL
     assert conflict.status == EvidenceAssessment.CONFLICT
 
