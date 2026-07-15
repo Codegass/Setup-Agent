@@ -265,7 +265,7 @@ class AgentStateEvaluator:
                 step.tool_name == "project"
                 and (getattr(step, "tool_params", None) or {}).get("action") == "analyze"
             )
-            if is_analyzer_step and step.tool_result.success:
+            if is_analyzer_step and step.tool_result.succeeded:
                 project_analyzer_used = True
                 break
 
@@ -635,7 +635,7 @@ class AgentStateEvaluator:
     def _is_task_complete(self, steps: List[Any]) -> bool:
         """Check if the overall task is complete."""
         # Machine-driven setup runs end when the report PHASE completes — the
-        # engine consults PhaseMachine.overall_outcome(), not this signal. The
+        # engine consults PhaseMachine.termination_state(), not this signal. The
         # evaluator is still consulted every iteration while the machine is
         # incomplete, so this path must stand down entirely in machine mode.
         if getattr(self, "phase_machine_active", False):
@@ -649,7 +649,7 @@ class AgentStateEvaluator:
                     and step.tool_name == "report"
                     and hasattr(step, "tool_result")
                     and step.tool_result
-                    and step.tool_result.success
+                    and step.tool_result.succeeded
                 ):
                     # Check for completion signal in metadata
                     metadata = getattr(step.tool_result, "metadata", {})
@@ -760,7 +760,7 @@ class AgentStateEvaluator:
             if getattr(step, "tool_name", None) == "manage_context":
                 continue
             result = getattr(step, "tool_result", None)
-            if result and result.success:
+            if result and result.succeeded:
                 logger.info("Run task completion detected after successful tool action")
                 return True
 

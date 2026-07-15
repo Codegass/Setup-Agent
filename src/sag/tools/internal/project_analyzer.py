@@ -16,9 +16,7 @@ from ..base import BaseTool, ToolResult
 
 # Enforcer version accepts range syntax ([1.8,), [11,17)); capture the lower
 # bound including a legacy "1.x" form (the old \d+ captured "1" from "1.8").
-ENFORCER_JAVA_PATTERN = (
-    r"<requireJavaVersion>.*?<version>\s*\[?\s*(\d+(?:\.\d+)?)"
-)
+ENFORCER_JAVA_PATTERN = r"<requireJavaVersion>.*?<version>\s*\[?\s*(\d+(?:\.\d+)?)"
 
 
 def _normalize_java_version(raw) -> Optional[str]:
@@ -124,9 +122,7 @@ def detect_python_package_root(
     if root_is_shell:
         for candidate in _PYTHON_SUBDIR_CANDIDATES:
             sub = f"{root}/{candidate}"
-            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(
-                orch, f"{sub}/pyproject.toml"
-            ):
+            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(orch, f"{sub}/pyproject.toml"):
                 python_root = sub
                 break
 
@@ -167,8 +163,7 @@ class ProjectAnalyzerTool(BaseTool):
         # Check for unexpected parameters
         if kwargs:
             invalid_params = list(kwargs.keys())
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=(
                     f"❌ Invalid parameters for project analysis: {invalid_params}\n\n"
                     f"✅ Valid parameters:\n"
@@ -188,8 +183,7 @@ class ProjectAnalyzerTool(BaseTool):
                 # Step 1: Validate and discover project path
                 validated_path = self._validate_and_discover_project_path(project_path)
                 if not validated_path:
-                    return ToolResult(
-                        success=False,
+                    return ToolResult.completed_failure(
                         output="",
                         error=f"No valid project found at {project_path} or in common subdirectories",
                         suggestions=[
@@ -208,8 +202,7 @@ class ProjectAnalyzerTool(BaseTool):
 
                 # Step 3: Validate analysis results
                 if not self._is_analysis_valid(analysis_result):
-                    return ToolResult(
-                        success=False,
+                    return ToolResult.completed_failure(
                         output="",
                         error="Project analysis failed to detect valid project structure",
                         suggestions=[
@@ -230,14 +223,12 @@ class ProjectAnalyzerTool(BaseTool):
                         analysis_result["context_updated"] = False
                         analysis_result["context_error"] = "Failed to update trunk context"
 
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=self._format_analysis_output(analysis_result),
                     metadata=analysis_result,
                 )
             else:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=(
                         f"❌ Invalid action for project analysis: '{action}'\n\n"
                         f"✅ Valid actions:\n"
@@ -255,8 +246,7 @@ class ProjectAnalyzerTool(BaseTool):
 
         except Exception as e:
             logger.error(f"Failed to analyze project: {e}")
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Project analysis failed: {str(e)}",
                 suggestions=[
@@ -383,8 +373,13 @@ class ProjectAnalyzerTool(BaseTool):
             if result.get("success") and "exists" in result.get("output", ""):
                 existing_files.append(file)
 
-        gradle_markers = ("build.gradle", "build.gradle.kts", "settings.gradle",
-                          "settings.gradle.kts", "gradlew")
+        gradle_markers = (
+            "build.gradle",
+            "build.gradle.kts",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "gradlew",
+        )
 
         # 检测项目类型
         project_type = "unknown"
@@ -408,9 +403,7 @@ class ProjectAnalyzerTool(BaseTool):
         elif "go.mod" in existing_files:
             project_type = "Go"
             build_system = "Go modules"
-        elif "CMakeLists.txt" in existing_files and self._python_subdir_package(
-            project_path
-        ):
+        elif "CMakeLists.txt" in existing_files and self._python_subdir_package(project_path):
             # Native-core python repo (live TVM): the root is a CMake build shell
             # with NO root python marker, but the real installable python package
             # lives in python/ (or bindings/python/). Classify as Python so the
@@ -457,9 +450,7 @@ class ProjectAnalyzerTool(BaseTool):
         root = project_path.rstrip("/")
         for candidate in _PYTHON_SUBDIR_CANDIDATES:
             sub = f"{root}/{candidate}"
-            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(
-                orch, f"{sub}/pyproject.toml"
-            ):
+            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(orch, f"{sub}/pyproject.toml"):
                 return True
         return False
 
@@ -645,9 +636,7 @@ class ProjectAnalyzerTool(BaseTool):
         def list_dir(directory: str) -> set:
             listing = orch.execute_command(f"ls -1 {directory} 2>/dev/null")
             return {
-                line.strip()
-                for line in (listing.get("output") or "").splitlines()
-                if line.strip()
+                line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
             }
 
         def read_from(directory: str, name: str, present: set) -> str:
@@ -655,9 +644,7 @@ class ProjectAnalyzerTool(BaseTool):
                 return ""
             # Untruncated like the pom reads: this content is parsed
             # internally by regex and never reaches the model's context.
-            result = orch.execute_command(
-                f"cat {directory}/{name}", truncate_output=False
-            )
+            result = orch.execute_command(f"cat {directory}/{name}", truncate_output=False)
             return result.get("output", "") if result.get("success") else ""
 
         # Native-core detection (live TVM regression): when the repo ROOT is a
@@ -669,17 +656,13 @@ class ProjectAnalyzerTool(BaseTool):
         # actually installs, not the CMake shell. has_native_build rides along.
         root_files = list_dir(project_path)
         root_pyproject = read_from(project_path, "pyproject.toml", root_files)
-        native = detect_python_package_root(
-            orch, project_path, root_files, root_pyproject
-        )
+        native = detect_python_package_root(orch, project_path, root_files, root_pyproject)
         python_root = native["python_root"]
         has_native_build = native["has_native_build"]
 
         # All metadata reads now come from the DETECTED python root (identical to
         # the repo root for a plain-python project).
-        files_present = (
-            root_files if python_root == project_path else list_dir(python_root)
-        )
+        files_present = root_files if python_root == project_path else list_dir(python_root)
 
         def read(name: str) -> str:
             return read_from(python_root, name, files_present)
@@ -1496,7 +1479,7 @@ PY"""
             seen_dirs.add(module_dir)
             source_modules.append(
                 {
-                    "module": module_dir[len(project_path):].lstrip("/"),
+                    "module": module_dir[len(project_path) :].lstrip("/"),
                     "dir": module_dir,
                     "lang": lang,
                 }
@@ -1659,8 +1642,7 @@ PY"""
             return False
         root = root.rstrip("/")
         cmd = (
-            f"grep -lE 'maven-publish' {root}/build.gradle {root}/build.gradle.kts "
-            f"2>/dev/null"
+            f"grep -lE 'maven-publish' {root}/build.gradle {root}/build.gradle.kts " f"2>/dev/null"
         )
         found = orch.execute_command(cmd)
         return bool((found.get("output") or "").strip())
@@ -1754,21 +1736,23 @@ PY"""
         if not test_module_dirs:
             return
         build_rec["test_modules"] = [
-            d[len(project_path):].lstrip("/") or "." for d in test_module_dirs
+            d[len(project_path) :].lstrip("/") or "." for d in test_module_dirs
         ]
 
         # Group test modules by their first path segment under the project root and
         # pick the segment that owns the most test modules (where the tests cluster).
         seg_counts: Dict[str, int] = {}
         for module_dir in test_module_dirs:
-            rel = module_dir[len(project_path):].lstrip("/")
+            rel = module_dir[len(project_path) :].lstrip("/")
             top = rel.split("/")[0] if rel else ""
             seg_counts[top] = seg_counts.get(top, 0) + 1
         top_seg = max(seg_counts.items(), key=lambda kv: kv[1])[0]
         test_root = f"{project_path}/{top_seg}" if top_seg else project_path
 
         # The test cluster's own build system can differ from the main build's.
-        if _path_exists(orch, f"{test_root}/settings.gradle") or _path_exists(orch, f"{test_root}/build.gradle"):
+        if _path_exists(orch, f"{test_root}/settings.gradle") or _path_exists(
+            orch, f"{test_root}/build.gradle"
+        ):
             test_system = "gradle"
         elif _path_exists(orch, f"{test_root}/pom.xml"):
             test_system = "maven"
@@ -1785,9 +1769,8 @@ PY"""
         # root and the tests are the same system, a single leaf segment is the wrong
         # target (httpcomponents-client: 5 sibling modules tie at 1 test dir each,
         # so the heuristic picked an arbitrary leaf and ran 16 of 1856 tests).
-        if (
-            build_rec.get("build_root") == project_path
-            and test_system == build_rec.get("build_system")
+        if build_rec.get("build_root") == project_path and test_system == build_rec.get(
+            "build_system"
         ):
             build_rec["test_root"] = project_path
 
@@ -1858,9 +1841,7 @@ PY"""
         fail_at_end = root_shape == "healthy_reactor"
         # Fail-at-end testing only makes sense at reactor scope; when the test
         # cluster lives elsewhere (Bigtop's Gradle subtree) leave it alone.
-        test_fail_at_end = (
-            fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
-        )
+        test_fail_at_end = fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
 
         data = {
             "java_version": analysis.get("java_version"),
@@ -2258,7 +2239,7 @@ PY"""
             # ALWAYS record environment metrics (like static test count) unconditionally
             # This ensures we don't lose test counts if the execution plan is rejected
             self._record_environment_metrics(trunk_context, analysis)
-            
+
             # Save the metrics immediately in case we return early
             self.context_manager._save_trunk_context(trunk_context)
 
@@ -2483,8 +2464,7 @@ PY"""
                 build_islands = rec.get("build_islands") or []
                 if len(build_islands) > 1:
                     isles = "; ".join(
-                        f"{isl.get('system') or 'unknown'}:{isl['root']}"
-                        for isl in build_islands
+                        f"{isl.get('system') or 'unknown'}:{isl['root']}" for isl in build_islands
                     )
                     output += (
                         f"   • {len(build_islands)} independent build islands "

@@ -42,8 +42,7 @@ class WebSearchTool(BaseTool):
             results = self._search_duckduckgo(query, max_results)
 
             if not results:
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output="No search results found for the query.",
                     metadata={"query": query, "results_count": 0},
                 )
@@ -55,8 +54,7 @@ class WebSearchTool(BaseTool):
                 output += f"   {result['url']}\n"
                 output += f"   {result['snippet']}\n\n"
 
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=output,
                 metadata={"query": query, "results_count": len(results), "results": results},
             )
@@ -64,7 +62,9 @@ class WebSearchTool(BaseTool):
         except Exception as e:
             error_msg = f"Web search failed: {str(e)}"
             logger.error(f"Web search error for query '{query}': {error_msg}")
-            return ToolResult(success=False, output="", error=error_msg, metadata={"query": query})
+            return ToolResult.completed_failure(
+                output="", error=error_msg, metadata={"query": query}
+            )
 
     def _search_duckduckgo(self, query: str, max_results: int) -> List[Dict[str, str]]:
         """Search using DuckDuckGo API."""

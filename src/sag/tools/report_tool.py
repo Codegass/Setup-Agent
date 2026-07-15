@@ -8,7 +8,6 @@ from loguru import logger
 
 from sag import __version__
 from sag.agent.context_manager import TaskStatus
-from sag.agent.phase_machine import CRITICAL_PHASE
 from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_EXECUTION_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
@@ -20,7 +19,7 @@ from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metric
 # None, so None cannot double as "not computed yet").
 _MODULE_METRICS_UNSET = object()
 from sag.ui.events import EventType, UIEventEmitter
-from sag.verdict import combine_verdicts, rescue_blocked_build, run_verdict
+from sag.verdict import rescue_blocked_build, run_verdict
 
 from .base import BaseTool, ToolResult
 
@@ -207,8 +206,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     )
 
                     # Return the information about the existing report
-                    return ToolResult(
-                        success=True,
+                    return ToolResult.completed_success(
                         output=self._append_evidence_summary_to_output(
                             f"📄 Report already generated: {existing_report}\n"
                             f"Status: {status.upper()}\n"
@@ -218,7 +216,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                             result_test_stats,
                             result_conflicts,
                         ),
-                        status=result_evidence_status,
+                        evidence_assessment=result_evidence_status,
                         test_stats=result_test_stats,
                         conflicts=result_conflicts,
                         evidence_refs=result_evidence_refs,
@@ -247,8 +245,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # Check for unexpected parameters
         if kwargs:
             invalid_params = list(kwargs.keys())
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=(
                     f"❌ Invalid parameters for report tool: {invalid_params}\n\n"
                     f"✅ Valid parameters:\n"
@@ -270,8 +267,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
 
         if not status:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="❌ Missing required parameter: 'status'. Must be either 'success' or 'fail'\n"
                 "• 'success': Build passed AND test pass rate >= 80%\n"
                 "• 'fail': Build failed OR tests not found OR pass rate < 80%",
@@ -285,8 +281,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # CRITICAL: Verify all prerequisite tasks are completed before generating report
                 context_validation = self._validate_context_prerequisites()
                 if not context_validation["valid"]:
-                    return ToolResult(
-                        success=False,
+                    return ToolResult.completed_failure(
                         output="",
                         error=context_validation["error"],
                         suggestions=context_validation["suggestions"],
@@ -339,10 +334,13 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # validated stats. Runs where the rescue did not fire — and
                 # rescued runs with genuinely no executed tests (libcloud-2)
                 # — keep today's stats exactly.
-                if self._blocked_build_rescue_fired(report_snapshot):
-                    rescued_stats = self._snapshot_test_stats(report_snapshot)
-                    if rescued_stats is not None:
-                        result_test_stats = rescued_stats
+                validated_stats = self._snapshot_test_stats(report_snapshot)
+                if (
+                    validated_stats is not None
+                    and validated_stats.executed > 0
+                    and (result_test_stats is None or result_test_stats.executed == 0)
+                ):
+                    result_test_stats = validated_stats
 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
@@ -397,10 +395,9 @@ class ReportTool(BaseTool, UIEventEmitter):
                     .get("passed_tests", 0),
                 )
 
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=condensed_output,
-                    status=metadata["evidence_status"],
+                    evidence_assessment=metadata["evidence_status"],
                     metadata=metadata,
                     documentation_links=[],
                     test_stats=result_test_stats,
@@ -422,8 +419,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     },  # Store full report outside condensed metadata
                 )
             else:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output="",
                     error=f"Invalid action '{action}'. Use 'generate' to create report.",
                     suggestions=["Use action='generate' to create the final report"],
@@ -431,8 +427,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         except Exception as e:
             logger.error(f"Failed to generate report: {e}")
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Report generation failed: {str(e)}",
                 suggestions=["Check if all required information is available"],
@@ -722,6 +717,8 @@ class ReportTool(BaseTool, UIEventEmitter):
         '977/977 passed, 100%' over a dashboard showing 420/430.)
         """
         status = (snapshot or {}).get("status") or {}
+        if not isinstance(status, dict):
+            return None
         executed = status.get("tests_total")
         passed = status.get("tests_passed")
         discovered = status.get("static_test_count") or None
@@ -756,55 +753,22 @@ class ReportTool(BaseTool, UIEventEmitter):
     def _snapshot_kernel_verdict(self, snapshot: Optional[Dict[str, Any]]) -> str:
         """The run verdict for this report, via the verdict kernel (spec §6).
 
-        Combines the same inputs the agent's final status uses — the
-        phase-machine outcome (reconstructed from the trunk's phase_* tasks),
-        the physically-verified overall status, the evidence status, and the
-        evidence conflicts (which cap at partial). The header Result line and
-        the stored snapshot verdict both read this, so the round-5 iceberg
-        divergence (report PARTIAL vs CLI success) is impossible by
-        construction — including machine-capped runs (round-6 review: a
-        blocked phase with green physical artifacts rendered ✅ SUCCESS while
-        the CLI banner said verdict=failed).
-
-        Blocked-build evidence-rescue (bug #11, pyyaml-7/libcloud-2 probes):
-        the SAME shared rescue the agent finalization applies is applied here
-        — an agent-blocked build phase contradicted by physical build evidence
-        (phases.build IS validate_build_status().success) caps the machine
-        input at PARTIAL, not FAILED. When the rescue fires, the report-call
-        evidence status ("blocked"/"failed") merely restates the same agent
-        belief the machine recorded, so it is capped identically; the physical
-        input below still rules, keeping genuine failures FAILED. Before this,
-        the rescue lived only in the finalization and the banner read
-        "❌ FAILED" over a "verdict=partial" CLI final.
+        Combines physically verified status, evidence assessment, and conflict
+        caps. Phase termination records are deliberately absent from verdict
+        math. When physical build evidence contradicts a blocked evidence
+        assessment, the shared evidence-rescue caps that assessment at partial.
         """
         snapshot = snapshot or {}
         status = snapshot.get("status") or {}
         evidence = snapshot.get("evidence_result") or {}
-        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
-        raw_machine_outcome = self._trunk_phase_machine_outcome()
-        machine_outcome = rescue_blocked_build(raw_machine_outcome, build_evidence_ok)
         evidence_verdict = _coerce_kernel_verdict(evidence.get("status"))
-        if machine_outcome != raw_machine_outcome:
-            evidence_verdict = rescue_blocked_build(evidence_verdict, build_evidence_ok)
+        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
+        evidence_verdict = rescue_blocked_build(evidence_verdict, build_evidence_ok)
         return run_verdict(
-            # The kernel's two-verdict signature is kept; min() is associative,
-            # so folding the machine outcome into the first input is identical
-            # to a three-way combine.
-            combine_verdicts(
-                machine_outcome,
-                self._physical_verdict_from_snapshot(status, snapshot),
-            ),
+            self._physical_verdict_from_snapshot(status, snapshot),
             evidence_verdict,
             evidence.get("conflicts") or [],
         )
-
-    def _blocked_build_rescue_fired(self, snapshot: Optional[Dict[str, Any]]) -> bool:
-        """True when the blocked-build evidence-rescue applies to this
-        snapshot: the trunk phase machine recorded a blocked build phase while
-        the snapshot's physical build evidence shows a real build."""
-        snapshot = snapshot or {}
-        build_evidence_ok = bool((snapshot.get("phases") or {}).get("build"))
-        return build_evidence_ok and self._trunk_phase_machine_outcome() == "failed"
 
     @staticmethod
     def _physical_verdict_from_snapshot(
@@ -825,40 +789,6 @@ class ReportTool(BaseTool, UIEventEmitter):
         if build_green and not tests_total:
             return "partial"
         return coerced
-
-    def _trunk_phase_machine_outcome(self) -> Optional[str]:
-        """Phase-machine outcome reconstructed from the trunk's phase_* tasks.
-
-        Mirrors the agent's machine input (PhaseMachine.overall_outcome): the
-        engine persists every finished phase as a phase_<name> trunk task —
-        FAILED means blocked — so a blocked build phase fails the run and any
-        other blocked phase caps at partial. Runs without phase_* tasks
-        (`sag run --task`, legacy) abstain with None.
-        """
-        if not self.context_manager:
-            return None
-        try:
-            trunk = self.context_manager.load_trunk_context()
-        except Exception as exc:
-            logger.debug(f"Could not load trunk for phase-machine outcome: {exc}")
-            return None
-        blocked = set()
-        seen_phase_tasks = False
-        for task in getattr(trunk, "todo_list", None) or []:
-            task_id = str(getattr(task, "id", "") or "")
-            if not task_id.startswith("phase_"):
-                continue
-            seen_phase_tasks = True
-            status = getattr(task, "status", None)
-            if str(getattr(status, "value", status)) == "failed":
-                blocked.add(task_id[len("phase_") :])
-        if not seen_phase_tasks:
-            return None
-        if CRITICAL_PHASE in blocked:
-            return "failed"
-        if blocked:
-            return "partial"
-        return "success"
 
     def _should_render_report_evidence_result(self, evidence: Dict[str, Any]) -> bool:
         if not evidence:
@@ -989,9 +919,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # build-completeness numbers (detected = active reactor modules).
         try:
             module_metrics = self._build_module_metrics(
-                (execution_metrics or {}).get("test_history")
-                or self._load_test_history()
-                or {},
+                (execution_metrics or {}).get("test_history") or self._load_test_history() or {},
                 generated_at=timestamp,
             )
         except Exception as exc:  # pragma: no cover - defensive
@@ -1058,9 +986,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         try:
             module_metrics = self._build_module_metrics(
-                (execution_metrics or {}).get("test_history")
-                or self._load_test_history()
-                or {},
+                (execution_metrics or {}).get("test_history") or self._load_test_history() or {},
                 generated_at=timestamp,
             )
             if module_metrics:
@@ -1221,9 +1147,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             # submodule metrics assembler.
             reactor_summary = entry.get("reactor_summary")
             if isinstance(reactor_summary, list):
-                reactor_records.extend(
-                    rec for rec in reactor_summary if isinstance(rec, dict)
-                )
+                reactor_records.extend(rec for rec in reactor_summary if isinstance(rec, dict))
             entry_failed_modules = entry.get("failed_modules")
             if isinstance(entry_failed_modules, list):
                 failed_modules.extend(str(mod) for mod in entry_failed_modules if mod)
@@ -1466,9 +1390,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             catalog_count = to_int(test_analysis.get("catalog_test_count"))
             if catalog_count:
                 static_test_count = catalog_count
-                logger.info(
-                    f"📊 Backfilled static test count from catalog scan: {catalog_count}"
-                )
+                logger.info(f"📊 Backfilled static test count from catalog scan: {catalog_count}")
                 if trunk_context is not None and self.context_manager:
                     try:
                         trunk_context.environment_summary["static_test_count"] = catalog_count
@@ -1492,9 +1414,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 )
                 if trunk_context is not None and self.context_manager:
                     try:
-                        trunk_context.environment_summary["static_test_count"] = (
-                            fallback_discovered
-                        )
+                        trunk_context.environment_summary["static_test_count"] = fallback_discovered
                         self.context_manager._save_trunk_context(trunk_context)
                     except Exception as exc:
                         logger.debug(f"Could not persist backfilled static_test_count: {exc}")
@@ -1706,9 +1626,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # appropriate to the ecosystem: on python the fingerprint_details ARE
         # the build evidence (venv/pip check/imports/compileall ladder) and the
         # Java "0 .class, 0 .jar" line is suppressed.
-        build_evidence = (physical_validation.get("build_status") or {}).get(
-            "evidence"
-        ) or {}
+        build_evidence = (physical_validation.get("build_status") or {}).get("evidence") or {}
         physical_evidence = {
             "class_files": physical_validation.get("class_files"),
             "jar_files": physical_validation.get("jar_files"),
@@ -2235,10 +2153,12 @@ class ReportTool(BaseTool, UIEventEmitter):
 
                                 # Check success/failure
                                 success = False
-                                if hasattr(tool_result, "success"):
-                                    success = tool_result.success
+                                if hasattr(tool_result, "succeeded"):
+                                    success = tool_result.succeeded
                                 elif isinstance(tool_result, dict):
-                                    success = tool_result.get("success", False)
+                                    success = tool_result.get(
+                                        "succeeded", tool_result.get("success", False)
+                                    )
 
                                 if success:
                                     metrics["successful_actions"] += 1
@@ -3552,9 +3472,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 logger.debug(f"_active_maven_module_dirs failed: {exc}")
             if active_dirs:
                 root = project_dir.rstrip("/")
-                active_rel = {
-                    (d.rstrip("/")[len(root):].strip("/") or ".") for d in active_dirs
-                }
+                active_rel = {(d.rstrip("/")[len(root) :].strip("/") or ".") for d in active_dirs}
                 # Keep the active-declared modules AND any scanned module that
                 # actually produced compiled artifacts. The latter matters when the
                 # build happened in submodules with no captured reactor summary
@@ -3936,8 +3854,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         if modules_detected:
             mod_icon = (
-                "✅" if modules_built >= modules_detected
-                else "⚠️" if modules_built > 0 else "❌"
+                "✅" if modules_built >= modules_detected else "⚠️" if modules_built > 0 else "❌"
             )
             mod_msg = f"{mod_icon} {modules_built}/{modules_detected} built"
             lines.append(f"│ Module Coverage │ {mod_msg:<32} │")
@@ -4363,9 +4280,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                         # Clamp at 100%: executed can exceed the collect-only
                         # denominator (re-run/parameterized drift) and a rate
                         # above 100% is nonsense; both raw counts stay visible.
-                        execution_rate = min(
-                            (tests_total / static_test_count) * 100, 100.0
-                        )
+                        execution_rate = min((tests_total / static_test_count) * 100, 100.0)
                         test_coverage_line += f" ({execution_rate:.1f}% execution rate)"
                     lines.append(test_coverage_line)
                     lines.append("")

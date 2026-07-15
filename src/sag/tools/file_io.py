@@ -97,8 +97,7 @@ class FileIOTool(BaseTool):
         selected_lines = lines[start_line:end_line]
         output = "\n".join(selected_lines)
 
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=output,
             metadata={
                 "path": path,
@@ -150,8 +149,8 @@ with open('{path}', 'w') as f:
                 retryable=True,
             )
 
-        return ToolResult(
-            success=True, output=f"Successfully wrote {len(content)} characters to {path}"
+        return ToolResult.completed_success(
+            output=f"Successfully wrote {len(content)} characters to {path}"
         )
 
     def _list(self, path: str) -> ToolResult:
@@ -181,4 +180,4 @@ with open('{path}', 'w') as f:
                 retryable=True,
             )
 
-        return ToolResult(success=True, output=result["output"])
+        return ToolResult.completed_success(output=result["output"])

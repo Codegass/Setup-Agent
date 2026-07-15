@@ -33,7 +33,7 @@ def test_done_passes_gate_and_signals_engine():
 
     result = tool.execute(action="done", key_results="compiled 115 classes", evidence=["output_x"])
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata["phase_signal"] == "done"
     assert result.metadata["key_results"] == "compiled 115 classes"
     assert gate.calls == ["build"]
@@ -45,9 +45,9 @@ def test_done_rejected_by_gate_returns_options_no_signal():
 
     result = tool.execute(action="done", key_results="done!", evidence=[])
 
-    assert result.success is False
+    assert result.succeeded is False
     assert "phase_signal" not in result.metadata
-    assert result.verdict == "failed"
+    assert result.operation_outcome.value == "failed"
     assert any("compile" in s for s in result.suggestions)
     assert any("blocked" in s for s in result.suggestions), "escape valve must be advertised"
 
@@ -60,7 +60,7 @@ def test_blocked_always_accepted():
         action="blocked", reason="develocity plugin unresolvable", evidence=["job:a"]
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata["phase_signal"] == "blocked"
     assert result.metadata["reason"] == "develocity plugin unresolvable"
     assert gate.calls == [], "blocked is never gated"
@@ -68,12 +68,12 @@ def test_blocked_always_accepted():
 
 def test_blocked_requires_reason():
     result = _tool(GateRecorder()).execute(action="blocked", reason="")
-    assert result.success is False
+    assert result.succeeded is False
 
 
 def test_note_signals_engine_for_durable_phase_notes():
     result = _tool(GateRecorder()).execute(action="note", text="trying maven 3.9.9 next")
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata == {
         "phase_signal": "note",
         "text": "trying maven 3.9.9 next",
@@ -90,4 +90,4 @@ def test_machine_complete_rejects_actions():
         gate_fn=GateRecorder(),
     )
     result = tool.execute(action="done", key_results="x")
-    assert result.success is False
+    assert result.succeeded is False

@@ -40,9 +40,7 @@ class PhaseTool(BaseTool):
         text: str = "",
     ) -> ToolResult:
         if self.machine.is_complete:
-            return ToolResult(
-                success=False,
-                verdict="failed",
+            return ToolResult.completed_failure(
                 output="All phases already complete.",
                 error="machine complete",
             )
@@ -51,14 +49,11 @@ class PhaseTool(BaseTool):
 
         if verb == "note":
             if not text:
-                return ToolResult(
-                    success=False,
-                    verdict="failed",
+                return ToolResult.completed_failure(
                     output="note requires text",
                     error="missing text",
                 )
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Noted ({phase}): {text}",
                 facts={"phase": phase},
                 metadata={"phase_signal": "note", "text": text},
@@ -66,17 +61,13 @@ class PhaseTool(BaseTool):
 
         if verb == "blocked":
             if not (reason or "").strip():
-                return ToolResult(
-                    success=False,
-                    verdict="failed",
+                return ToolResult.completed_failure(
                     output="blocked requires a concrete reason (and evidence refs if available)",
                     error="missing reason",
                 )
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Phase '{phase}' recorded as BLOCKED: {reason}. The run will reflect "
                 "this honestly; moving to the next phase.",
-                verdict="partial",
                 facts={"phase": phase},
                 metadata={
                     "phase_signal": "blocked",
@@ -88,9 +79,7 @@ class PhaseTool(BaseTool):
         if verb == "done":
             gate = self.gate_fn(phase, self.validator, self.orchestrator, self.project_name)
             if not gate["ok"]:
-                return ToolResult(
-                    success=False,
-                    verdict="failed",
+                return ToolResult.completed_failure(
                     output=f"Phase '{phase}' done-claim rejected: {gate['reason']}",
                     error=gate["reason"],
                     suggestions=list(gate["suggestions"])
@@ -99,8 +88,7 @@ class PhaseTool(BaseTool):
                         "reason=..., evidence=[...]) — that is always accepted and recorded honestly",
                     ],
                 )
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Phase '{phase}' complete. Advancing.",
                 facts={"phase": phase},
                 metadata={
@@ -110,9 +98,7 @@ class PhaseTool(BaseTool):
                 },
             )
 
-        return ToolResult(
-            success=False,
-            verdict="failed",
+        return ToolResult.completed_failure(
             output=f"Unknown phase action: {action!r}",
             error="invalid action",
             suggestions=["Use action= done | blocked | note"],

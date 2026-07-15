@@ -21,11 +21,16 @@ class Recorder:
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
-        return ToolResult(success=True, output=f"{self.name} ok")
+        return ToolResult.completed_success(output=f"{self.name} ok")
 
 
 def _tool():
-    setup, analyzer, system, env = Recorder("setup"), Recorder("analyzer"), Recorder("system"), Recorder("env")
+    setup, analyzer, system, env = (
+        Recorder("setup"),
+        Recorder("analyzer"),
+        Recorder("system"),
+        Recorder("env"),
+    )
     tool = ProjectTool(setup_tool=setup, analyzer_tool=analyzer, system_tool=system, env_tool=env)
     return tool, setup, analyzer, system, env
 
@@ -33,7 +38,7 @@ def _tool():
 def test_clone_routes_to_setup():
     tool, setup, *_ = _tool()
     result = tool.execute(action="clone", repo_url="https://github.com/x/y.git")
-    assert result.success
+    assert result.succeeded
     # ProjectSetupTool's real signature takes repository_url, not repo_url.
     assert setup.calls and setup.calls[0]["repository_url"] == "https://github.com/x/y.git"
     assert setup.calls[0]["action"] == "clone"
@@ -72,5 +77,5 @@ def test_provision_with_packages_uses_system_install():
 def test_unknown_action_fails_with_options():
     tool, *_ = _tool()
     result = tool.execute(action="dance")
-    assert result.verdict == "failed"
+    assert result.operation_outcome.value == "failed"
     assert any("clone" in s for s in result.suggestions)

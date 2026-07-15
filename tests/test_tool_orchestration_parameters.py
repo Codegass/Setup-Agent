@@ -11,8 +11,7 @@ class BashLikeTool(BaseTool):
         super().__init__("bash", "Bash-like test tool")
 
     def execute(self, command: str, timeout: int, working_directory: str = "") -> ToolResult:
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=f"{working_directory}: {command} ({timeout})",
             metadata={
                 "command": command,
@@ -36,7 +35,7 @@ class ProjectSetupLikeTool(BaseTool):
         }
 
     def execute(self, **params) -> ToolResult:
-        return ToolResult(success=True, output=str(params))
+        return ToolResult.completed_success(output=str(params))
 
 
 def _orchestrator(**overrides):
@@ -303,7 +302,7 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
 
         def execute(self, command: str) -> ToolResult:
             execution_attempts.append(command)
-            return ToolResult(success=True, output=command)
+            return ToolResult.completed_success(output=command)
 
     orchestrator, events, tracking_calls, state_updates = _orchestrator(tools={"echo": EchoTool()})
 
@@ -315,7 +314,7 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
     execution = orchestrator.execute(ToolCall(name="echo", raw_params={"command": "run"}))
 
     assert execution.status == "validation_failed"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "PARAMETER_VALIDATION_FAILED"
     assert execution.attempted_execution is False
     assert execution.executed_params is None

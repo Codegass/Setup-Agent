@@ -44,7 +44,9 @@ def test_branch_receives_previous_summary_and_evidence_digest(tmp_path):
     trunk.update_task_status(task_1, TaskStatus.COMPLETED)
     trunk.update_task_key_results(task_1, "Build completed but test reports were not checked.")
     manager._save_trunk_context(trunk)
-    manager.update_task_evidence(task_1, evidence_status="partial", evidence_refs=["output_build"], conflicts=[])
+    manager.update_task_evidence(
+        task_1, evidence_status="partial", evidence_refs=["output_build"], conflicts=[]
+    )
 
     result = manager.start_new_branch(task_2)
     branch = manager.load_branch_history(task_2)
@@ -130,9 +132,7 @@ def test_get_current_context_info_branch_includes_evidence_fields(tmp_path):
     manager.start_new_branch(task_2)
     branch = manager.load_branch_history(task_2)
     branch.current_task_evidence_refs = ["output_test"]
-    manager._save_branch_history(
-        branch, str(manager.contexts_dir / f"{task_2}.json")
-    )
+    manager._save_branch_history(branch, str(manager.contexts_dir / f"{task_2}.json"))
     manager.current_task_id = task_2
 
     info = manager.get_current_context_info()
@@ -161,7 +161,7 @@ def test_complete_with_results_preserves_narrative_and_evidence(tmp_path):
         evidence_refs=["output_abc", "surefire_xml"],
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata["evidence_status"] == "partial"
     assert result.metadata["evidence_refs"] == ["output_abc", "surefire_xml"]
     assert result.metadata["conflicts"] == []
@@ -197,7 +197,7 @@ def test_complete_with_results_preserves_existing_evidence_when_omitted(tmp_path
         key_results="Evidence preserved for later review.",
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata["evidence_status"] == "partial"
     assert result.metadata["evidence_refs"] == ["output_abc", "surefire_xml"]
     assert result.metadata["conflicts"] == ["report_mismatch"]
@@ -236,7 +236,7 @@ def test_complete_with_results_explicitly_clears_evidence_refs_and_conflicts(tmp
         conflicts=[],
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata["evidence_status"] == "unknown"
     assert result.metadata["evidence_refs"] == []
     assert result.metadata["conflicts"] == []

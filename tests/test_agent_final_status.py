@@ -247,9 +247,7 @@ def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatc
     accomplishments = {
         "repository_cloned": True,
         "build_success": True,
-        "physical_validation": {
-            "test_analysis": {"total_tests": 184, "passed_tests": 177}
-        },
+        "physical_validation": {"test_analysis": {"total_tests": 184, "passed_tests": 177}},
     }
 
     validator = PhysicalValidator(project_path="/workspace")
@@ -265,9 +263,7 @@ def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatc
             "skipped_tests": 0,
             "test_exclusions": [],
             "modules_without_tests": [],
-            "report_files": [
-                "/workspace/commons-vfs/target/surefire-reports/TEST-Vfs.xml"
-            ],
+            "report_files": ["/workspace/commons-vfs/target/surefire-reports/TEST-Vfs.xml"],
             "parsing_errors": [],
         },
     )
@@ -316,7 +312,9 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
             "report_files": [
                 "/workspace/demo/target/surefire-reports/TEST-com.example.DemoTest.xml"
             ],
-            "parsing_errors": ["Error parsing /workspace/demo/target/surefire-reports/TEST-bad.xml"],
+            "parsing_errors": [
+                "Error parsing /workspace/demo/target/surefire-reports/TEST-bad.xml"
+            ],
         },
     )
 
@@ -609,29 +607,21 @@ def _attach_phase_machine(agent, block_phase=None):
     return machine
 
 
-def test_machine_failed_outcome_scoped_by_real_build_evidence():
-    """Scoped blocked-build cap (2026-06-24 pyyaml false-red): the agent
-    blocked the build phase, but physical validation found a real build
-    (success=True) — evidence outranks agent belief, so the cap is PARTIAL
-    (the block stays surfaced; never promoted to success), not FAILED.
-    A blocked build WITHOUT physical evidence still fails (see
-    test_machine_success_still_subject_to_physical_validation and
-    tests/test_python_phase_verdict.py)."""
+def test_blocked_phase_termination_does_not_cap_evidence_verdict():
     agent = _agent_with_validator(_all_green_validator())
     _attach_phase_machine(agent, block_phase="build")
 
     assert agent._get_verified_final_status(react_engine_success=True) is True
-    assert agent.final_verdict == "partial"
-    assert "blocked" in agent.final_verdict_reason
-    assert "real build" in agent.final_verdict_reason
+    assert agent.final_verdict == "success"
+    assert agent.final_verdict_reason == ""
 
 
-def test_machine_partial_outcome_caps_success_verdict_to_partial():
+def test_blocked_test_phase_does_not_cap_evidence_verdict():
     agent = _agent_with_validator(_all_green_validator())
     _attach_phase_machine(agent, block_phase="test")
 
     assert agent._get_verified_final_status(react_engine_success=True) is True
-    assert agent.final_verdict == "partial"
+    assert agent.final_verdict == "success"
 
 
 def test_machine_success_still_subject_to_physical_validation():
@@ -661,10 +651,17 @@ def test_final_verdict_uses_kernel_conflict_cap():
         FakePhysicalValidator(
             build_status={"success": True, "reason": "fingerprints"},
             test_status={
-                "has_test_reports": True, "status": "PARTIAL", "reason": "",
-                "pass_rate": 99.3, "total_tests": 2913, "passed_tests": 2893,
-                "failed_tests": 15, "error_tests": 0, "skipped_tests": 5,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "reason": "",
+                "pass_rate": 99.3,
+                "total_tests": 2913,
+                "passed_tests": 2893,
+                "failed_tests": 15,
+                "error_tests": 0,
+                "skipped_tests": 5,
+                "test_exclusions": [],
+                "modules_without_tests": [],
                 "conflicts": ["test_report_parse_error"],
             },
         )
@@ -682,10 +679,17 @@ def test_partial_reason_for_conflict_capped_run():
         FakePhysicalValidator(
             build_status={"success": True, "reason": "fingerprints"},
             test_status={
-                "has_test_reports": True, "status": "PARTIAL", "reason": "",
-                "pass_rate": 96.2, "total_tests": 184, "passed_tests": 177,
-                "failed_tests": 3, "error_tests": 0, "skipped_tests": 4,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "reason": "",
+                "pass_rate": 96.2,
+                "total_tests": 184,
+                "passed_tests": 177,
+                "failed_tests": 3,
+                "error_tests": 0,
+                "skipped_tests": 4,
+                "test_exclusions": [],
+                "modules_without_tests": [],
                 "conflicts": ["test_report_parse_error"],
             },
         )
@@ -701,9 +705,15 @@ def test_partial_reason_for_missing_test_evidence():
         FakePhysicalValidator(
             build_status={"success": True, "reason": "fingerprints"},
             test_status={
-                "has_test_reports": False, "status": "WARNING", "reason": "",
-                "pass_rate": 0.0, "total_tests": 0, "passed_tests": 0,
-                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
+                "has_test_reports": False,
+                "status": "WARNING",
+                "reason": "",
+                "pass_rate": 0.0,
+                "total_tests": 0,
+                "passed_tests": 0,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
                 "test_exclusions": [],
             },
             analysis_status={"analyzed": False},

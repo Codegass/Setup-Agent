@@ -23,8 +23,7 @@ class BuildLikeTool(BaseTool):
         }
 
     def execute(self, action="compile", working_directory="", **_):
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=working_directory,
             metadata={"working_directory": working_directory, "action": action},
         )
@@ -84,7 +83,9 @@ def test_test_defaults_to_recommended_test_root():
 def test_explicit_working_directory_is_respected():
     orch = _orchestrator(_REC)
     execution = orch.execute(
-        ToolCall(name="build", raw_params={"action": "test", "working_directory": "/workspace/other"})
+        ToolCall(
+            name="build", raw_params={"action": "test", "working_directory": "/workspace/other"}
+        )
     )
     assert _workdir(execution) == "/workspace/other"
 

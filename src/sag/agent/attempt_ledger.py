@@ -57,7 +57,7 @@ def compact_steps(steps: List, keep_recent: int = 30) -> Tuple[Optional[str], Li
             lines.extend(_previous_ledger_lines(step))
             continue
         result = getattr(step, "tool_result", None)
-        ok = bool(getattr(result, "success", False))
+        ok = bool(getattr(result, "succeeded", False))
         summary = (getattr(result, "output", "") or "")[:90].replace("\n", " ")
         ref = ""
         metadata = getattr(result, "metadata", None) or {}

@@ -20,8 +20,7 @@ class FakeContextManager:
 
 
 def test_tool_result_preserves_declared_raw_data():
-    result = ToolResult(
-        success=True,
+    result = ToolResult.completed_success(
         output="ok",
         raw_data={"full_report": "report text", "report_snapshot": {"status": "success"}},
     )
@@ -146,7 +145,7 @@ def test_agent_state_evaluator_run_task_completion_ignores_setup_todo_workflow()
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -171,7 +170,7 @@ def test_agent_state_evaluator_run_task_completion_accepts_verified_no_more_acti
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -199,7 +198,7 @@ def test_agent_state_evaluator_run_task_completion_accepts_bare_task_complete():
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(step_type=StepType.THOUGHT, content="TASK COMPLETE"),
     ]
@@ -220,7 +219,7 @@ def test_agent_state_evaluator_run_task_completion_rejects_negated_task_complete
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="partial output"),
+            tool_result=ToolResult.completed_success(output="partial output"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -244,7 +243,7 @@ def test_agent_state_evaluator_run_task_completion_rejects_negated_verification(
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="partial output"),
+            tool_result=ToolResult.completed_success(output="partial output"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -268,7 +267,7 @@ def test_agent_state_evaluator_setup_mode_keeps_setup_todo_workflow_guard():
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,

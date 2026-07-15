@@ -102,8 +102,7 @@ class EnvTool(BaseTool):
                 overlay = self.store.clear(params.get("tool"))
                 return self._result("clear", overlay)
 
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Invalid env action: {action_name}",
                 error_code="ENV_INVALID_ACTION",
@@ -113,8 +112,7 @@ class EnvTool(BaseTool):
                 raw_data={"action": action_name},
             )
         except KeyError as exc:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Missing required env parameter: {exc.args[0]}",
                 error_code="ENV_MISSING_PARAMETER",
@@ -124,8 +122,7 @@ class EnvTool(BaseTool):
                 raw_data={"action": params.get("action"), "missing": exc.args[0]},
             )
         except ValueError as exc:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=str(exc),
                 error_code="ENV_VALIDATION_ERROR",
@@ -135,8 +132,7 @@ class EnvTool(BaseTool):
                 raw_data={"action": params.get("action")},
             )
         except Exception as exc:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Env overlay operation failed: {exc}",
                 error_code="ENV_OPERATION_FAILED",
@@ -171,8 +167,7 @@ class EnvTool(BaseTool):
         if result.get("exit_code") == 0 and "EXISTS" in output:
             return None
 
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error=f"Env overlay executable is not executable or does not exist: {executable}",
             error_code="ENV_EXECUTABLE_NOT_FOUND",
@@ -195,8 +190,7 @@ class EnvTool(BaseTool):
         raw_data: dict[str, Any] = {"action": action, "overlay": overlay}
         if active_candidate is not None:
             raw_data["active_candidate"] = active_candidate
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=json.dumps(raw_data, indent=2, sort_keys=True),
             raw_data=raw_data,
             metadata={"action": action},

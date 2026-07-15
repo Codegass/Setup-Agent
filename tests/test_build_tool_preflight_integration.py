@@ -46,12 +46,10 @@ class ScriptedOrch:
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
         if "java -version" in cmd:
-            return {"success": True, "exit_code": 0,
-                    "output": f'openjdk version "{self.java}.0.1"'}
+            return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd == f"cat {REQUIREMENTS_PATH}":
             if self.manifest:
-                return {"success": True, "exit_code": 0,
-                        "output": json.dumps(self.manifest)}
+                return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
         if "test -f" in cmd:  # build-marker probes
             tokens = shlex.split(cmd)
@@ -59,8 +57,11 @@ class ScriptedOrch:
                 path = tokens[tokens.index("-f") + 1]
             except (ValueError, IndexError):
                 path = ""
-            return {"success": True, "exit_code": 0,
-                    "output": "exists" if path in self.markers else "missing"}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "exists" if path in self.markers else "missing",
+            }
         return {"success": True, "exit_code": 0, "output": ""}
 
 
@@ -69,7 +70,7 @@ class ScriptedBackendTool:
 
     def __init__(self, *results):
         self.calls = []
-        self._results = list(results) or [ToolResult(success=True, output="BUILD SUCCESS")]
+        self._results = list(results) or [ToolResult.completed_success(output="BUILD SUCCESS")]
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
@@ -78,8 +79,10 @@ class ScriptedBackendTool:
         return self._results.pop(0) if len(self._results) > 1 else self._results[0]
 
 
-ENFORCER_FAIL = ("[ERROR] RequireJavaVersion failed ... Detected JDK Version: "
-                 "11.0.2 is not in the allowed range [17,). BUILD FAILURE")
+ENFORCER_FAIL = (
+    "[ERROR] RequireJavaVersion failed ... Detected JDK Version: "
+    "11.0.2 is not in the allowed range [17,). BUILD FAILURE"
+)
 
 
 def _tool(orch, maven=None, gradle=None):
@@ -119,35 +122,29 @@ def test_mismatch_narrated_in_observation(monkeypatch):
 def test_version_error_triggers_single_retry_then_success(monkeypatch):
     _patch_provision(monkeypatch)
     maven = ScriptedBackendTool(
-        ToolResult(success=False, output=ENFORCER_FAIL),
-        ToolResult(success=True, output="BUILD SUCCESS"),
+        ToolResult.completed_failure(output=ENFORCER_FAIL),
+        ToolResult.completed_success(output="BUILD SUCCESS"),
     )
     orch = ScriptedOrch(java="11", manifest={})
-    result = _tool(orch, maven=maven).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
-    assert len(maven.calls) == 2          # original + exactly one retry
+    result = _tool(orch, maven=maven).execute(action="compile", working_directory="/workspace/proj")
+    assert len(maven.calls) == 2  # original + exactly one retry
     assert "[pre-flight] build error requires Java 17, re-provisioned, retry 1/1" in result.output
     assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
-    assert result.success
+    assert result.succeeded
 
 
 def test_retry_is_bounded_to_exactly_once(monkeypatch):
     _patch_provision(monkeypatch)
     # Backend keeps failing with a version-shaped error even after retry.
-    maven = ScriptedBackendTool(ToolResult(success=False, output=ENFORCER_FAIL))
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output=ENFORCER_FAIL))
     orch = ScriptedOrch(java="11", manifest={})
-    result = _tool(orch, maven=maven).execute(
-        action="test", working_directory="/workspace/proj"
-    )
-    assert len(maven.calls) == 2          # never a second retry
-    assert result.verdict == "failed"     # honest failure after the bounded retry
+    result = _tool(orch, maven=maven).execute(action="test", working_directory="/workspace/proj")
+    assert len(maven.calls) == 2  # never a second retry
+    assert result.operation_outcome.value == "failed"
 
 
 def test_non_version_failure_does_not_retry():
-    maven = ScriptedBackendTool(
-        ToolResult(success=False, output="BUILD FAILURE: test failures")
-    )
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output="BUILD FAILURE: test failures"))
     orch = ScriptedOrch(java="17", manifest={"java_version": "17"})
     _tool(orch, maven=maven).execute(action="test", working_directory="/workspace/proj")
     assert len(maven.calls) == 1
@@ -155,23 +152,19 @@ def test_non_version_failure_does_not_retry():
 
 def test_no_retry_when_error_version_matches_active():
     # The error demands 17 and 17 is already active: re-provisioning can't help.
-    maven = ScriptedBackendTool(ToolResult(success=False, output=ENFORCER_FAIL))
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output=ENFORCER_FAIL))
     orch = ScriptedOrch(java="17", manifest={})
-    result = _tool(orch, maven=maven).execute(
-        action="test", working_directory="/workspace/proj"
-    )
+    result = _tool(orch, maven=maven).execute(action="test", working_directory="/workspace/proj")
     assert len(maven.calls) == 1
     assert "retry 1/1" not in (result.output or "")
 
 
 def test_no_rerun_when_reprovision_fails(monkeypatch):
     _patch_provision(monkeypatch, ok=False)
-    maven = ScriptedBackendTool(ToolResult(success=False, output=ENFORCER_FAIL))
+    maven = ScriptedBackendTool(ToolResult.completed_failure(output=ENFORCER_FAIL))
     orch = ScriptedOrch(java="11", manifest={})
-    result = _tool(orch, maven=maven).execute(
-        action="test", working_directory="/workspace/proj"
-    )
-    assert len(maven.calls) == 1          # nothing changed, a rerun would lie
+    result = _tool(orch, maven=maven).execute(action="test", working_directory="/workspace/proj")
+    assert len(maven.calls) == 1  # nothing changed, a rerun would lie
     assert "retry 1/1" not in (result.output or "")
 
 
@@ -282,11 +275,10 @@ def test_deps_action_skips_preflight():
 def test_gradle_version_error_single_retry(monkeypatch):
     _patch_provision(monkeypatch)
     gradle = ScriptedBackendTool(
-        ToolResult(
-            success=False,
+        ToolResult.completed_failure(
             output="Unsupported class file major version 61 ... class file version 61.0",
         ),
-        ToolResult(success=True, output="BUILD SUCCESSFUL"),
+        ToolResult.completed_success(output="BUILD SUCCESSFUL"),
     )
     orch = ScriptedOrch(java="11", manifest={}, markers=("/workspace/proj/build.gradle",))
     result = _tool(orch, gradle=gradle).execute(
@@ -312,8 +304,14 @@ def test_gradle_version_error_single_retry(monkeypatch):
 class MavenScriptedOrch:
     """Canned results for the internal MavenTool; records every command."""
 
-    def __init__(self, java="17", manifest=None, build_output="BUILD SUCCESS",
-                 build_ok=True, project_name="proj"):
+    def __init__(
+        self,
+        java="17",
+        manifest=None,
+        build_output="BUILD SUCCESS",
+        build_ok=True,
+        project_name="proj",
+    ):
         self.java = java
         self.manifest = manifest or {}
         self.build_output = build_output
@@ -324,19 +322,24 @@ class MavenScriptedOrch:
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
         if "java -version" in cmd:
-            return {"success": True, "exit_code": 0,
-                    "output": f'openjdk version "{self.java}.0.1"'}
+            return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd == f"cat {REQUIREMENTS_PATH}":
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
         if cmd.startswith("mvn") and ("test" in cmd or "install" in cmd or "compile" in cmd):
-            return {"success": self.build_ok, "exit_code": 0 if self.build_ok else 1,
-                    "output": self.build_output}
+            return {
+                "success": self.build_ok,
+                "exit_code": 0 if self.build_ok else 1,
+                "output": self.build_output,
+            }
         if cmd.startswith("find") and "target/classes" in cmd:
             # post-build artifact validation for compile/package/install
-            return {"success": True, "exit_code": 0,
-                    "output": "/workspace/proj/target/classes/Foo.class"}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "/workspace/proj/target/classes/Foo.class",
+            }
         if "test -f" in cmd or "test -e" in cmd:  # pom probes
             return {"success": True, "exit_code": 0, "output": "EXISTS"}
         if "command -v mvn" in cmd or "which mvn" in cmd:
@@ -380,29 +383,36 @@ def test_maven_tool_mismatch_narrated_in_observation(monkeypatch):
 
 def test_maven_tool_version_error_triggers_single_retry(monkeypatch):
     _patch_provision(monkeypatch)
-    orch = MavenScriptedOrch(java="11", manifest={},
-                             build_output=ENFORCER_FAIL, build_ok=False)
+    orch = MavenScriptedOrch(java="11", manifest={}, build_output=ENFORCER_FAIL, build_ok=False)
     result = _internal_maven_tool(orch).execute(
         command="compile", working_directory="/workspace/proj"
     )
     mvn_runs = _mvn_runs(orch, "compile")
-    assert len(mvn_runs) == 2          # original + exactly one retry
+    assert len(mvn_runs) == 2  # original + exactly one retry
     assert "retry 1/1" in (result.output or "")
     assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
 
 
 def test_maven_tool_non_version_failure_does_not_retry():
-    orch = MavenScriptedOrch(java="17", manifest={"java_version": "17"},
-                             build_output="BUILD FAILURE: test failures", build_ok=False)
+    orch = MavenScriptedOrch(
+        java="17",
+        manifest={"java_version": "17"},
+        build_output="BUILD FAILURE: test failures",
+        build_ok=False,
+    )
     _internal_maven_tool(orch).execute(command="test", working_directory="/workspace/proj")
     assert len(_mvn_runs(orch, "test")) == 1
 
 
 def test_maven_tool_scope_warning_when_leaf_targeted():
-    orch = MavenScriptedOrch(java="17", manifest={
-        "java_version": "17", "root_shape": "healthy_reactor",
-        "build_root": "/workspace/proj",
-    })
+    orch = MavenScriptedOrch(
+        java="17",
+        manifest={
+            "java_version": "17",
+            "root_shape": "healthy_reactor",
+            "build_root": "/workspace/proj",
+        },
+    )
     result = _internal_maven_tool(orch).execute(
         command="test", working_directory="/workspace/proj/core"
     )
@@ -410,13 +420,15 @@ def test_maven_tool_scope_warning_when_leaf_targeted():
 
 
 def test_maven_tool_no_scope_warning_at_recommended_root():
-    orch = MavenScriptedOrch(java="17", manifest={
-        "java_version": "17", "root_shape": "healthy_reactor",
-        "build_root": "/workspace/proj",
-    })
-    result = _internal_maven_tool(orch).execute(
-        command="test", working_directory="/workspace/proj"
+    orch = MavenScriptedOrch(
+        java="17",
+        manifest={
+            "java_version": "17",
+            "root_shape": "healthy_reactor",
+            "build_root": "/workspace/proj",
+        },
     )
+    result = _internal_maven_tool(orch).execute(command="test", working_directory="/workspace/proj")
     assert "[scope]" not in (result.output or "")
 
 
@@ -425,10 +437,14 @@ def test_maven_tool_unscoped_invocation_never_retargets_or_warns():
     # manifest build_root: not an explicit narrowing, so stay quiet. The
     # donor's re-targeting default is superseded by PR #12's orchestration
     # injection and is deliberately not ported.
-    orch = MavenScriptedOrch(java="17", manifest={
-        "java_version": "17", "root_shape": "healthy_reactor",
-        "build_root": "/workspace",
-    })
+    orch = MavenScriptedOrch(
+        java="17",
+        manifest={
+            "java_version": "17",
+            "root_shape": "healthy_reactor",
+            "build_root": "/workspace",
+        },
+    )
     result = _internal_maven_tool(orch).execute(command="test")  # default "/workspace"
     assert "defaulting to the recommended reactor root" not in (result.output or "")
     assert "[scope]" not in (result.output or "")
@@ -471,8 +487,7 @@ def test_maven_tool_env_preflight_false_never_retries(monkeypatch):
     # A version-shaped failure on the facade path is the FACADE's retry to
     # make; the internal tool reruns nothing.
     _patch_provision(monkeypatch)
-    orch = MavenScriptedOrch(java="11", manifest={},
-                             build_output=ENFORCER_FAIL, build_ok=False)
+    orch = MavenScriptedOrch(java="11", manifest={}, build_output=ENFORCER_FAIL, build_ok=False)
     result = _internal_maven_tool(orch).execute(
         command="compile", working_directory="/workspace/proj", _env_preflight=False
     )
@@ -492,8 +507,7 @@ class GradleScriptedOrch(MavenScriptedOrch):
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
         if "java -version" in cmd:
-            return {"success": True, "exit_code": 0,
-                    "output": f'openjdk version "{self.java}.0.1"'}
+            return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if cmd == f"cat {REQUIREMENTS_PATH}":
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
@@ -503,8 +517,11 @@ class GradleScriptedOrch(MavenScriptedOrch):
         # bare substring match would swallow them and feed probes the canned
         # build output. Anchor on the executable at the start of the command.
         if cmd.startswith("gradle") and ("build" in cmd or "test" in cmd or "check" in cmd):
-            return {"success": self.build_ok, "exit_code": 0 if self.build_ok else 1,
-                    "output": self.build_output}
+            return {
+                "success": self.build_ok,
+                "exit_code": 0 if self.build_ok else 1,
+                "output": self.build_output,
+            }
         if "test -f" in cmd:  # wrapper detection, build-file/settings probes
             return {"success": True, "exit_code": 0, "output": "yes"}
         if "which gradle" in cmd:
@@ -542,15 +559,19 @@ def test_gradle_tool_version_error_single_retry(monkeypatch):
         command="build", working_directory="/workspace/proj"
     )
     runs = _gradle_runs(orch, "build")
-    assert len(runs) == 2          # original + exactly one retry
+    assert len(runs) == 2  # original + exactly one retry
     assert "retry 1/1" in (result.output or "")
 
 
 def test_gradle_tool_scope_warning_when_leaf_targeted():
-    orch = GradleScriptedOrch(java="17", manifest={
-        "java_version": "17", "root_shape": "healthy_reactor",
-        "build_root": "/workspace/proj",
-    })
+    orch = GradleScriptedOrch(
+        java="17",
+        manifest={
+            "java_version": "17",
+            "root_shape": "healthy_reactor",
+            "build_root": "/workspace/proj",
+        },
+    )
     result = _internal_gradle_tool(orch).execute(
         command="build", working_directory="/workspace/proj/core"
     )
@@ -561,10 +582,14 @@ def test_gradle_tool_no_auto_continue_mutation_on_healthy_reactor():
     # No auto --continue mutation on the internal tool: the BuildTool
     # backends (PR #12) own fail-at-end/--continue wiring; the internal
     # tool only honors an explicit fail_at_end=True.
-    orch = GradleScriptedOrch(java="17", manifest={
-        "java_version": "17", "root_shape": "healthy_reactor",
-        "build_root": "/workspace/proj",
-    })
+    orch = GradleScriptedOrch(
+        java="17",
+        manifest={
+            "java_version": "17",
+            "root_shape": "healthy_reactor",
+            "build_root": "/workspace/proj",
+        },
+    )
     _internal_gradle_tool(orch).execute(command="build", working_directory="/workspace/proj")
     runs = _gradle_runs(orch, "build")
     assert runs and "--continue" not in runs[0]
@@ -616,36 +641,31 @@ class EndToEndOrch(MavenScriptedOrch):
         if "&& echo exists || echo missing" in cmd:  # facade marker probe
             self.commands.append(cmd)
             exists = "pom.xml" in cmd
-            return {"success": True, "exit_code": 0,
-                    "output": "exists" if exists else "missing"}
+            return {"success": True, "exit_code": 0, "output": "exists" if exists else "missing"}
         if cmd.startswith("mvn"):
             self.commands.append(cmd)
             ok, output = (
-                self.mvn_results.pop(0)
-                if len(self.mvn_results) > 1
-                else self.mvn_results[0]
+                self.mvn_results.pop(0) if len(self.mvn_results) > 1 else self.mvn_results[0]
             )
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
         return super().execute_command(cmd, workdir, timeout)
 
 
 def _e2e_build_tool(orch):
-    return BuildTool(orch, maven_tool=_internal_maven_tool(orch),
-                     gradle_tool=ScriptedBackendTool())
+    return BuildTool(orch, maven_tool=_internal_maven_tool(orch), gradle_tool=ScriptedBackendTool())
 
 
 def test_exactly_one_version_driven_rerun_end_to_end(monkeypatch):
     _patch_provision(monkeypatch)
     orch = EndToEndOrch(
         [(False, ENFORCER_FAIL), (True, "BUILD SUCCESS")],
-        java="11", manifest={},
+        java="11",
+        manifest={},
     )
-    result = _e2e_build_tool(orch).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
+    result = _e2e_build_tool(orch).execute(action="compile", working_directory="/workspace/proj")
     mvn_runs = [c for c in orch.commands if c.startswith("mvn")]
-    assert len(mvn_runs) == 2                       # original + exactly one rerun
-    assert result.success
+    assert len(mvn_runs) == 2  # original + exactly one rerun
+    assert result.succeeded
     assert (result.output or "").count("retry 1/1") == 1
     assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
 
@@ -655,12 +675,10 @@ def test_persistent_version_failure_stays_within_single_rerun_bound(monkeypatch)
     # (the old two-layer wiring could rerun once per layer).
     _patch_provision(monkeypatch)
     orch = EndToEndOrch([(False, ENFORCER_FAIL)], java="11", manifest={})
-    result = _e2e_build_tool(orch).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
+    result = _e2e_build_tool(orch).execute(action="compile", working_directory="/workspace/proj")
     mvn_runs = [c for c in orch.commands if c.startswith("mvn")]
-    assert len(mvn_runs) == 2                       # bound: 1 original + 1 rerun
-    assert not result.success
+    assert len(mvn_runs) == 2  # bound: 1 original + 1 rerun
+    assert not result.succeeded
     assert (result.output or "").count("retry 1/1") == 1
 
 
@@ -669,14 +687,14 @@ def test_end_to_end_single_manifest_probe(monkeypatch):
     # manifest; the internal MavenTool (facade path) must not re-read it.
     _patch_provision(monkeypatch)
     orch = EndToEndOrch(
-        [(True, "BUILD SUCCESS")], java="17", manifest={"java_version": "17"},
+        [(True, "BUILD SUCCESS")],
+        java="17",
+        manifest={"java_version": "17"},
     )
-    result = _e2e_build_tool(orch).execute(
-        action="compile", working_directory="/workspace/proj"
-    )
-    assert result.success
+    result = _e2e_build_tool(orch).execute(action="compile", working_directory="/workspace/proj")
+    assert result.succeeded
     manifest_reads = [c for c in orch.commands if REQUIREMENTS_PATH in c]
     assert len(manifest_reads) == 1
     java_probes = [c for c in orch.commands if "java -version" in c]
-    assert len(java_probes) == 1                    # facade pre-flight only
+    assert len(java_probes) == 1  # facade pre-flight only
     assert (result.output or "").count("[pre-flight]") == 0  # matched: silent

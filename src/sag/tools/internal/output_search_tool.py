@@ -154,8 +154,7 @@ class OutputSearchTool(BaseTool):
                 truncation_note = f"\n\n[Output truncated to {max_chars} chars. Original: {original_length} chars]"
                 output += truncation_note
 
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"📄 Full output for {ref_id}:\n\n{output}",
                 metadata={
                     "original_length": original_length,
@@ -163,7 +162,9 @@ class OutputSearchTool(BaseTool):
                 },
             )
         else:
-            return ToolResult(success=False, output=f"No output found with reference ID: {ref_id}")
+            return ToolResult.completed_failure(
+                output=f"No output found with reference ID: {ref_id}"
+            )
 
     def _search_outputs(
         self, pattern: Optional[str], task_id: Optional[str], tool_name: Optional[str], limit: int
@@ -174,7 +175,7 @@ class OutputSearchTool(BaseTool):
         )
 
         if not results:
-            return ToolResult(success=True, output="No matching outputs found")
+            return ToolResult.completed_success(output="No matching outputs found")
 
         output_lines = [f"🔍 Found {len(results)} matching outputs:\n"]
 
@@ -202,7 +203,7 @@ class OutputSearchTool(BaseTool):
 
         output_lines.append(f"\n💡 Use action='retrieve' with ref_id to get full output")
 
-        return ToolResult(success=True, output="\n".join(output_lines))
+        return ToolResult.completed_success(output="\n".join(output_lines))
 
     def _list_outputs(
         self, task_id: Optional[str], tool_name: Optional[str], limit: int
@@ -229,7 +230,9 @@ class OutputSearchTool(BaseTool):
 
         output = self.storage_manager.retrieve_output(ref_id)
         if not output:
-            return ToolResult(success=False, output=f"No output found with reference ID: {ref_id}")
+            return ToolResult.completed_failure(
+                output=f"No output found with reference ID: {ref_id}"
+            )
 
         lines = output.split("\n")
         total_lines = len(lines)
@@ -265,8 +268,7 @@ class OutputSearchTool(BaseTool):
                 else:
                     result_lines.append(line)
 
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output="\n".join(result_lines),
             metadata={
                 "total_lines": total_lines,
@@ -304,7 +306,9 @@ class OutputSearchTool(BaseTool):
 
         output = self.storage_manager.retrieve_output(ref_id)
         if not output:
-            return ToolResult(success=False, output=f"No output found with reference ID: {ref_id}")
+            return ToolResult.completed_failure(
+                output=f"No output found with reference ID: {ref_id}"
+            )
 
         try:
             import re
@@ -330,8 +334,8 @@ class OutputSearchTool(BaseTool):
                     break
 
         if not matches:
-            return ToolResult(
-                success=True, output=f"No matches found for pattern '{grep_pattern}' in {ref_id}"
+            return ToolResult.completed_success(
+                output=f"No matches found for pattern '{grep_pattern}' in {ref_id}"
             )
 
         # Build result with context lines
@@ -362,8 +366,7 @@ class OutputSearchTool(BaseTool):
         if len(matches) > limit:
             result_lines.append(f"\n... ({len(matches) - limit} more matches not shown)")
 
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output="\n".join(result_lines),
             metadata={
                 "total_matches": len(matches),

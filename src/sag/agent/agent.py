@@ -213,9 +213,7 @@ class SetupAgent:
         # Lifecycle surface is mode-aware: setup runs talk to the engine-owned
         # phase machine through the `phase` tool (done/blocked/note) and never
         # see manage_context; run-task keeps the legacy manage_context surface.
-        phase_mode = (
-            workflow_mode == "setup" and getattr(self, "phase_machine", None) is not None
-        )
+        phase_mode = workflow_mode == "setup" and getattr(self, "phase_machine", None) is not None
         if phase_mode:
             lifecycle_tool = PhaseTool(
                 machine=self.phase_machine,
@@ -244,9 +242,7 @@ class SetupAgent:
                 system_tool=system_tool,
                 env_tool=env_tool,
             ),
-            SearchTool(
-                self.orchestrator, output_search=output_search, web_search=WebSearchTool()
-            ),
+            SearchTool(self.orchestrator, output_search=output_search, web_search=WebSearchTool()),
             ReportTool(
                 self.orchestrator,
                 execution_history_callback=self._get_execution_history,
@@ -524,9 +520,7 @@ class SetupAgent:
             else:
                 self._provide_setup_summary(success)
 
-            cmd_logger.info(
-                f"Project setup completed: success={success}, verdict={final_verdict}"
-            )
+            cmd_logger.info(f"Project setup completed: success={success}, verdict={final_verdict}")
             return success
 
         except Exception as e:
@@ -1000,53 +994,15 @@ START by working toward the current phase objective shown in my context.
             return verified_success
 
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
-        """Combine physical validation with the phase machine's honest view.
-
-        The surfaced verdict string flows through the verdict kernel (spec §6):
-        ``run_verdict`` takes the MINIMUM of the machine outcome and the
-        physical verdict, with evidence conflicts capping at partial — the
-        machine caps but never promotes (stage-2 Task 8), and physical
-        validation still rules exactly as before. Runs without a machine
-        (`sag run --task`, legacy) are untouched. The returned boolean is
-        flow control and keeps its pre-kernel behavior EXACTLY.
-        """
-        from sag.verdict import rescue_blocked_build, run_verdict
+        """Combine physical validation and evidence conflicts through the kernel."""
+        from sag.verdict import run_verdict
 
         physical_ok = self._get_physical_final_status(react_engine_success)
         physical_verdict = self.final_verdict
         test_status = getattr(self, "_last_test_status", None)
 
-        machine = getattr(getattr(self, "react_engine", None), "phase_machine", None)
-        machine_outcome = machine.overall_outcome() if machine is not None else None
-
-        # Scoped blocked-build cap (live-run 2026-06-24 pyyaml false-red):
-        # machine_outcome == "failed" means the agent blocked the build phase.
-        # When the PHYSICAL build evidence disagrees — validate_build_status
-        # found a real build (success=True: Java artifacts/fingerprints, or the
-        # Python ladder's success/partial-with-imports) — evidence outranks
-        # agent belief and the cap is PARTIAL, not FAILED. The block is still
-        # surfaced (never promoted to success), so agent dishonesty stays
-        # catchable; only the evidence-contradicted false-red is gone. With no
-        # physical build evidence the cap stays FAILED exactly as before.
-        # The rescue is the SHARED kernel function rescue_blocked_build (bug
-        # #11): the report snapshot kernel applies the identical rule, so the
-        # banner, the stored snapshot, and this final verdict cannot split.
-        build_status = getattr(self, "_last_build_status", None)
-        build_evidence_ok = isinstance(build_status, dict) and bool(
-            build_status.get("success")
-        )
-        rescued_outcome = rescue_blocked_build(machine_outcome, build_evidence_ok)
-        blocked_build_evidence_backed = rescued_outcome != machine_outcome
-        machine_outcome = rescued_outcome
-        if blocked_build_evidence_backed:
-            logger.warning(
-                "Phase machine recorded a blocked build phase, but physical "
-                "build evidence shows a real build; capping verdict to partial "
-                "instead of failed"
-            )
-
         conflicts = test_status.get("conflicts", []) if isinstance(test_status, dict) else []
-        self.final_verdict = run_verdict(machine_outcome, physical_verdict, conflicts)
+        self.final_verdict = run_verdict(None, physical_verdict, conflicts)
 
         # Report-mirror cap (cayenne 2026-06-24 probe): conflicts emitted at
         # the report-snapshot stage (_build_report_snapshot appends
@@ -1066,8 +1022,7 @@ START by working toward the current phase objective shown in my context.
         # absent) keep today's behavior exactly.
         snapshot_verdict, snapshot_conflicts = self._report_snapshot_verdict()
         snapshot_capped = (
-            snapshot_verdict in ("partial", "failed")
-            and self.final_verdict == "success"
+            snapshot_verdict in ("partial", "failed") and self.final_verdict == "success"
         )
         if snapshot_capped:
             self.final_verdict = "partial"
@@ -1080,25 +1035,16 @@ START by working toward the current phase objective shown in my context.
         # a conflict-capped vfs run printed "no test reports found" while its
         # 96.2% test results sat right there in the report.
         if self.final_verdict == "partial":
-            if blocked_build_evidence_backed:
-                # Record BOTH sides: the agent's block stays visible, and so
-                # does the physical evidence that contradicts it.
-                self.final_verdict_reason = (
-                    "build phase blocked by agent, but physical evidence shows a real build"
-                )
-            elif snapshot_capped:
-                self.final_verdict_reason = (
-                    "report verdict is partial"
-                    + (
-                        f" (conflicts at report time: {', '.join(snapshot_conflicts[:3])})"
-                        if snapshot_conflicts
-                        else " (see report)"
-                    )
+            if snapshot_capped:
+                self.final_verdict_reason = "report verdict is partial" + (
+                    f" (conflicts at report time: {', '.join(snapshot_conflicts[:3])})"
+                    if snapshot_conflicts
+                    else " (see report)"
                 )
             elif physical_verdict == "partial":
-                self.final_verdict_reason = "build verified, tests not verified (no test reports found)"
-            elif machine_outcome == "partial":
-                self.final_verdict_reason = "one or more phases were blocked (see report)"
+                self.final_verdict_reason = (
+                    "build verified, tests not verified (no test reports found)"
+                )
             else:
                 self.final_verdict_reason = (
                     f"test evidence carries unresolved conflicts ({', '.join(conflicts[:3])})"
@@ -1106,17 +1052,6 @@ START by working toward the current phase objective shown in my context.
         else:
             self.final_verdict_reason = ""
 
-        if machine_outcome == "failed":
-            if physical_ok:
-                logger.warning(
-                    "Phase machine recorded a blocked build phase; capping verdict "
-                    "to failed despite physical artifacts"
-                )
-            return False
-        if machine_outcome == "partial" and physical_verdict == "success":
-            logger.info(
-                "Phase machine recorded blocked phases; capping verdict to partial"
-            )
         return physical_ok
 
     def _report_snapshot_verdict(self) -> tuple:
@@ -1186,9 +1121,7 @@ START by working toward the current phase objective shown in my context.
         self._last_test_status = test_status
         analysis_status = {}
         try:
-            analysis_status = self.physical_validator.validate_project_analysis_status(
-                project_name
-            )
+            analysis_status = self.physical_validator.validate_project_analysis_status(project_name)
         except Exception as exc:
             logger.warning(f"Could not validate project analysis status: {exc}")
 
@@ -1249,9 +1182,7 @@ START by working toward the current phase objective shown in my context.
                     DEFAULT_TEST_PASS_THRESHOLD,
                 )
                 threshold_pct = threshold * 100.0
-                verdict = evaluate_run_verdict(
-                    True, pass_rate, test_pass_threshold=threshold
-                )
+                verdict = evaluate_run_verdict(True, pass_rate, test_pass_threshold=threshold)
 
                 if verdict != "success":
                     logger.error(
@@ -1333,9 +1264,7 @@ START by working toward the current phase objective shown in my context.
                 # success on build artifacts alone.
                 self.final_verdict = "partial"
                 if tests_expected:
-                    logger.error(
-                        "❌ Test validation: No test reports found despite detected tests"
-                    )
+                    logger.error("❌ Test validation: No test reports found despite detected tests")
                     return False
                 logger.info(
                     "⚠️ Test validation: No test reports found — build verified, "

@@ -30,7 +30,7 @@ class FakePythonTool:
 
     def __init__(self, result=None):
         self.calls = []
-        self.result = result or ToolResult(success=True, output="ok")
+        self.result = result or ToolResult.completed_success(output="ok")
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
@@ -42,7 +42,7 @@ class FakeBackendTool:
 
     def __init__(self, result=None):
         self.calls = []
-        self.result = result or ToolResult(success=True, output="BUILD SUCCESS")
+        self.result = result or ToolResult.completed_success(output="BUILD SUCCESS")
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
@@ -63,12 +63,10 @@ class ScriptedOrch:
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append(command)
         if "java -version" in command:
-            return {"success": True, "exit_code": 0,
-                    "output": f'openjdk version "{self.java}.0.1"'}
+            return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
         if command == f"cat {REQUIREMENTS_PATH}":
             if self.manifest:
-                return {"success": True, "exit_code": 0,
-                        "output": json.dumps(self.manifest)}
+                return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
         if "test -f" in command:
             tokens = shlex.split(command)
@@ -156,9 +154,7 @@ def test_args_and_timeout_pass_through():
     python = FakePythonTool()
     tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
 
-    tool.execute(
-        action="test", args="-k smoke", working_directory="/workspace/p", timeout=120
-    )
+    tool.execute(action="test", args="-k smoke", working_directory="/workspace/p", timeout=120)
 
     call = python.calls[0]
     assert call["args"] == "-k smoke"
@@ -171,13 +167,13 @@ def test_args_and_timeout_pass_through():
 
 
 def test_python_test_envelope_reports_system_python():
-    python = FakePythonTool(ToolResult(success=True, output="3 passed"))
+    python = FakePythonTool(ToolResult.completed_success(output="3 passed"))
     tool, _ = _tool({"/workspace/p/pyproject.toml"}, python=python)
 
     result = tool.execute(action="test", working_directory="/workspace/p")
 
-    assert result.success
-    assert result.verdict == "success"
+    assert result.succeeded
+    assert result.operation_outcome.value == "success"
     assert result.facts["system"] == "python"
 
 
@@ -186,8 +182,8 @@ def test_no_python_backend_registered_is_an_honest_failure():
 
     result = tool.execute(action="test", working_directory="/workspace/p")
 
-    assert not result.success
-    assert result.verdict == "failed"
+    assert not result.succeeded
+    assert result.operation_outcome.value == "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +212,7 @@ def test_python_system_skips_jdk_preflight():
 
 def test_maven_system_still_runs_jdk_preflight():
     maven = FakeBackendTool()
-    tool, orch = _tool(
-        {"/workspace/p/pom.xml"}, maven=maven, manifest={"java_version": "17"}
-    )
+    tool, orch = _tool({"/workspace/p/pom.xml"}, maven=maven, manifest={"java_version": "17"})
 
     tool.execute(action="test", working_directory="/workspace/p")
 

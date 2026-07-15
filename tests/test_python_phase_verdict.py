@@ -29,7 +29,6 @@ from sag.agent.phase_machine import PHASE_NAMES, PhaseMachine
 from sag.agent.react_engine import PHASE_OBJECTIVES, ReActEngine, phase_objective
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 
-
 # ---------------------------------------------------------------------------
 # fakes (pattern mirrors tests/test_agent_final_status.py)
 # ---------------------------------------------------------------------------
@@ -113,11 +112,7 @@ def _python_partial_build_status():
 # ---------------------------------------------------------------------------
 
 
-def test_python_evidence_backed_blocked_build_caps_to_partial_not_failed():
-    """LIVE-RUN REPRODUCTION (pyyaml): build system python, physical evidence
-    success=True/complete=False (ladder PARTIAL), 1287/1287 pytest passed,
-    phase machine says blocked build. Today: FAILED. Required: PARTIAL —
-    evidence outranks agent belief."""
+def test_python_partial_physical_evidence_drives_partial_verdict():
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status=_python_partial_build_status(),
@@ -133,14 +128,11 @@ def test_python_evidence_backed_blocked_build_caps_to_partial_not_failed():
 
     result = agent._get_verified_final_status(react_engine_success=True)
 
-    assert agent.final_verdict == "partial", (
-        "an agent-blocked build phase contradicted by real physical build "
-        "evidence must cap at PARTIAL, not FAILED"
-    )
+    assert agent.final_verdict == "partial"
     assert result is True, "flow-control follows the physical evidence"
 
 
-def test_python_blocked_build_reason_records_both_sides():
+def test_python_phase_termination_does_not_leak_into_verdict_reason():
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status=_python_partial_build_status(),
@@ -153,8 +145,7 @@ def test_python_blocked_build_reason_records_both_sides():
 
     assert agent.final_verdict == "partial"
     reason = agent.final_verdict_reason
-    assert "blocked" in reason, reason
-    assert "physical evidence" in reason and "real build" in reason, reason
+    assert "blocked" not in reason, reason
 
 
 def test_blocked_build_with_no_physical_evidence_stays_failed():
@@ -187,10 +178,7 @@ def test_blocked_build_with_no_physical_evidence_stays_failed():
     assert agent.final_verdict == "failed"
 
 
-def test_java_real_artifacts_blocked_build_caps_to_partial_with_dual_reason():
-    """The scope is the EVIDENCE, not the language: a Java run with real
-    compiled artifacts whose build phase was agent-blocked is the same
-    evidence-contradicted block -> PARTIAL with the dual reason."""
+def test_java_green_evidence_is_not_capped_by_phase_termination():
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status={
@@ -217,10 +205,9 @@ def test_java_real_artifacts_blocked_build_caps_to_partial_with_dual_reason():
 
     result = agent._get_verified_final_status(react_engine_success=True)
 
-    assert agent.final_verdict == "partial"
+    assert agent.final_verdict == "success"
     assert result is True
-    reason = agent.final_verdict_reason
-    assert "blocked" in reason and "real build" in reason, reason
+    assert agent.final_verdict_reason == ""
 
 
 def test_blocked_build_with_evidence_never_promotes_past_physical_failure():

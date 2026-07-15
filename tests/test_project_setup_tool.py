@@ -194,7 +194,7 @@ def test_project_setup_clone_checks_out_ref_and_records_resolved_commit():
         auto_install_deps=False,
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert (
         "git -C /workspace/commons-cli fetch --tags --force",
         "/workspace",
@@ -222,7 +222,7 @@ def test_project_setup_clone_bad_ref_fails_without_project_detection():
         auto_install_deps=False,
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "REF_CHECKOUT_FAILED"
     assert result.metadata["ref"] == "missing-ref"
     assert not any(
@@ -244,7 +244,7 @@ def test_clone_initializes_submodules_when_gitmodules_present():
         auto_install_deps=False,
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert (
         "git -C /workspace/commons-cli submodule update --init --recursive",
         "/workspace",
@@ -263,10 +263,8 @@ def test_clone_skips_submodules_when_gitmodules_absent():
         auto_install_deps=False,
     )
 
-    assert result.success is True
-    assert not any(
-        "submodule update" in command for command, _, _ in orchestrator.commands
-    )
+    assert result.succeeded is True
+    assert not any("submodule update" in command for command, _, _ in orchestrator.commands)
     assert "Submodules" not in result.output
 
 
@@ -282,10 +280,8 @@ def test_clone_submodule_failure_is_best_effort_and_does_not_fail_clone():
 
     # A submodule fetch failure (network, private repo) must not fail the clone —
     # the agent can still work with what cloned.
-    assert result.success is True
-    assert any(
-        "submodule update" in command for command, _, _ in orchestrator.commands
-    )
+    assert result.succeeded is True
+    assert any("submodule update" in command for command, _, _ in orchestrator.commands)
     assert "🔗 Submodules: init incomplete" in result.output
 
 
@@ -300,7 +296,7 @@ def test_project_setup_legacy_branch_maps_to_ref_when_ref_absent():
         auto_install_deps=False,
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert (
         "git -C /workspace/commons-cli checkout --detach rel/commons-cli-1.11.0",
         "/workspace",
@@ -385,7 +381,9 @@ def test_gradle_dependency_install_installs_detected_jdk_and_returns_success():
     assert install_cmds, "expected an apt-get install command"
     assert any("openjdk-17-jdk" in cmd for cmd in install_cmds)
     # Gradle uses the gradlew wrapper, so the maven package must NOT be installed.
-    assert all(not cmd.split("openjdk-17-jdk")[-1].strip().startswith("maven") for cmd in install_cmds)
+    assert all(
+        not cmd.split("openjdk-17-jdk")[-1].strip().startswith("maven") for cmd in install_cmds
+    )
     assert all(" maven" not in cmd for cmd in install_cmds)
 
     overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
@@ -489,9 +487,7 @@ def test_maven_install_does_not_provision_when_base_satisfies_requirement():
     )
 
     assert result["success"] is True
-    assert not any(
-        "apache-maven-3.9.9-bin.tar.gz" in cmd for cmd, _, _ in orchestrator.commands
-    )
+    assert not any("apache-maven-3.9.9-bin.tar.gz" in cmd for cmd, _, _ in orchestrator.commands)
 
     overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
     assert overlay["tools"]["maven"]["active"] == MVN_BIN

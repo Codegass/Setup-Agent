@@ -7,7 +7,7 @@ class EchoTool(BaseTool):
         super().__init__(name, "Echo test tool")
 
     def execute(self, command: str, working_directory: str = "/workspace") -> ToolResult:
-        return ToolResult(success=True, output=f"ran {command}", metadata={"command": command})
+        return ToolResult.completed_success(output=f"ran {command}", metadata={"command": command})
 
 
 class ManageContextTool(BaseTool):
@@ -16,12 +16,14 @@ class ManageContextTool(BaseTool):
         self.success = success
 
     def execute(self, action: str, summary: str = "") -> ToolResult:
-        return ToolResult(success=self.success, output=f"{action} result")
+        return ToolResult.completed(
+            operation_outcome="success" if self.success else "failed",
+            output=f"{action} result",
+        )
 
 
 def test_format_tool_result_surfaces_maven_version_contract():
-    result = ToolResult(
-        success=False,
+    result = ToolResult.completed_failure(
         output="[ERROR] Detected Maven Version: 3.6.3 is not in the allowed range [3.9,).",
         error="Maven build failed",
         error_code="MAVEN_BUILD_FAILED",
@@ -66,9 +68,7 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append(
-            (signature, success)
-        ),
+        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
         update_successful_states=update_successful_states,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -84,7 +84,7 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
     assert "echo executed successfully" in execution.observation_text
     assert [event.event_type for event in events] == ["tool_start", "tool_result"]
     assert events[-1].metadata["status"] == "success"
-    assert events[-1].metadata["result_success"] is True
+    assert events[-1].metadata["result_succeeded"] is True
     assert events[-1].metadata["error_code"] is None
     assert events[-1].metadata["executed_params"] == {"command": "pwd"}
     assert events[-1].metadata["recovery_applied"] is False
@@ -134,7 +134,7 @@ def test_lifecycle_events_include_required_metadata():
     assert parameters_fixed.metadata["params_changed"] is True
     assert result.metadata["status"] == execution.status
     assert result.metadata["duration_ms"] is not None
-    assert result.metadata["result_success"] is True
+    assert result.metadata["result_succeeded"] is True
     assert result.metadata["error_code"] is None
     assert result.metadata["executed_params"] == {
         "command": "pwd",
@@ -153,9 +153,7 @@ def test_orchestrator_returns_missing_tool_execution_with_existing_feedback():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append(
-            (signature, success)
-        ),
+        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -167,7 +165,7 @@ def test_orchestrator_returns_missing_tool_execution_with_existing_feedback():
     execution = orchestrator.execute(ToolCall(name="ls", raw_params={"path": "/workspace"}))
 
     assert execution.status == "missing_tool"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.attempted_execution is False
     assert execution.executed_params is None
     assert "Tool 'ls' does not exist" in execution.result.output
@@ -196,7 +194,7 @@ def test_empty_validated_params_are_used_instead_of_raw_params():
 
     assert execution.status == "failure"
     assert execution.executed_params == {}
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "MISSING_PARAMETERS"
 
 
@@ -223,9 +221,7 @@ def test_tool_error_metadata_and_suggestions_are_preserved():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append(
-            (signature, success)
-        ),
+        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -258,9 +254,7 @@ def test_manage_context_invalidation_metadata_only_for_successful_context_change
             add_system_guidance=lambda message, priority=5: None,
             get_timestamp=lambda: "ts",
         )
-        return orchestrator.execute(
-            ToolCall(name="manage_context", raw_params={"action": action})
-        )
+        return orchestrator.execute(ToolCall(name="manage_context", raw_params={"action": action}))
 
     changing_execution = execute_manage_context("complete_task")
     info_execution = execute_manage_context("get_info")
@@ -278,7 +272,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
             super().__init__("explode", "Exploding tool")
 
         def execute(self, command: str) -> ToolResult:
-            return ToolResult(success=True, output="unused")
+            return ToolResult.completed_success(output="unused")
 
         def safe_execute(self, **kwargs) -> ToolResult:
             raise RuntimeError("boom")
@@ -290,9 +284,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append(
-            (signature, success)
-        ),
+        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -301,7 +293,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
     execution = orchestrator.execute(ToolCall(name="explode", raw_params={"command": "pwd"}))
 
     assert execution.status == "exception"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
     assert execution.attempted_execution is True
     assert tracking_calls == [("explode:[('command', 'pwd')]", False)]

@@ -10,7 +10,7 @@ from loguru import logger
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
-from sag.evidence import EvidenceAssessment, coerce_evidence_status
+from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
 from sag.reporting import render_condensed_summary
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
@@ -736,9 +736,9 @@ class ReActEngine(UIEventEmitter):
                     counts["tools_used"][tool_name] = counts["tools_used"].get(tool_name, 0) + 1
                 result = getattr(s, "tool_result", None)
                 if result is not None:
-                    if getattr(result, "success", False):
+                    if result.succeeded:
                         counts["successful_actions"] += 1
-                    else:
+                    elif result.operation_outcome is OperationOutcome.FAILED:
                         counts["failed_actions"] += 1
                         if tool_name:
                             counts["tool_failures"][tool_name] = (
@@ -1066,7 +1066,7 @@ class ReActEngine(UIEventEmitter):
                 # guaranteeing the run always reaches report and ends honestly.
                 if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
                     self._export_token_usage_csv()
-                    return self.phase_machine.overall_outcome() == "success"
+                    return self.phase_machine.termination_state() == "completed"
 
                 self.current_iteration += 1
                 self._phase_iterations += 1
@@ -1114,10 +1114,12 @@ class ReActEngine(UIEventEmitter):
                 if phase_mode:
                     self._handle_phase_signals(parsed_steps)
                     if self.phase_machine.is_complete:
-                        outcome = self.phase_machine.overall_outcome()
-                        self.agent_logger.info(f"All phases complete; overall outcome: {outcome}")
+                        termination = self.phase_machine.termination_state()
+                        self.agent_logger.info(
+                            f"All phases complete; flow termination: {termination}"
+                        )
                         self._export_token_usage_csv()
-                        return outcome == "success"
+                        return termination == "completed"
                     # Mid-phase evidence nudge: when the gate already passes,
                     # tell the model — break rabbit holes with evidence.
                     self._maybe_nudge_phase_done()
@@ -1152,7 +1154,7 @@ class ReActEngine(UIEventEmitter):
                     and step.tool_name == "manage_context"
                     and (step.tool_params or {}).get("action") == "complete_with_results"
                     and step.tool_result is not None
-                    and step.tool_result.success
+                    and step.tool_result.succeeded
                     for step in parsed_steps
                 )
                 if completed_task_this_iteration and self._check_progress_after_task():
@@ -1278,7 +1280,9 @@ class ReActEngine(UIEventEmitter):
         recent_errors = [
             s
             for s in recent_steps
-            if s.step_type == StepType.ACTION and s.tool_result and not s.tool_result.success
+            if s.step_type == StepType.ACTION
+            and s.tool_result
+            and s.tool_result.operation_outcome is OperationOutcome.FAILED
         ]
 
         if len(recent_errors) >= 2:  # Lower threshold for quicker analysis
@@ -1427,12 +1431,17 @@ class ReActEngine(UIEventEmitter):
                 self._add_observation_step(execution.observation_text)
 
                 # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
-                evidence_status = coerce_evidence_status(result.status)
-                should_force_thinking = result.success or evidence_status in {
-                    EvidenceAssessment.PARTIAL,
-                    EvidenceAssessment.CONFLICT,
-                    EvidenceAssessment.UNKNOWN,
-                }
+                evidence_assessment = result.evidence_assessment
+                should_force_thinking = (
+                    result.invocation_status is InvocationStatus.PENDING
+                    or result.succeeded
+                    or evidence_assessment
+                    in {
+                        EvidenceAssessment.PARTIAL,
+                        EvidenceAssessment.CONFLICT,
+                        EvidenceAssessment.UNKNOWN,
+                    }
+                )
                 if should_force_thinking:
                     self._force_thinking_after_success = True
                     logger.debug(
@@ -1458,7 +1467,9 @@ class ReActEngine(UIEventEmitter):
                                 output=output_to_store,
                                 timestamp=timestamp,
                                 metadata={
-                                    "success": result.success,
+                                    "invocation_status": result.invocation_status.value,
+                                    "operation_outcome": result.operation_outcome.value,
+                                    "evidence_status": result.evidence_status.value,
                                     "iteration": self.current_iteration,
                                 },
                             )
@@ -1477,7 +1488,10 @@ class ReActEngine(UIEventEmitter):
                             "iteration": self.current_iteration,
                             "tool_name": step.tool_name,
                             "parameters": step.tool_params or {},
-                            "success": result.success,
+                            "succeeded": result.succeeded,
+                            "invocation_status": result.invocation_status.value,
+                            "operation_outcome": result.operation_outcome.value,
+                            "evidence_status": result.evidence_status.value,
                             "output": output_to_store,
                             "observation": execution.observation_text,
                             "output_refs": self._dedupe_strings(
@@ -1487,9 +1501,8 @@ class ReActEngine(UIEventEmitter):
                                 ]
                             ),
                         }
-                        # A dispatch-and-poll handoff is success=True but is NOT
-                        # build-execution evidence (the command is still
-                        # running); completion gates must be able to tell.
+                        # A pending dispatch is not build-execution evidence;
+                        # completion gates must be able to tell.
                         dispatch_status = (result.metadata or {}).get("dispatch_status")
                         if dispatch_status:
                             history_entry["dispatch_status"] = dispatch_status
@@ -1534,7 +1547,7 @@ class ReActEngine(UIEventEmitter):
                 if action in context_changing_actions:
                     # Reset the counter regardless of success/failure
                     self.steps_since_context_switch = 0
-                    if result.success:
+                    if result.succeeded:
                         logger.info(
                             f"✅ Reset steps_since_context_switch counter after successful {action}"
                         )
@@ -1602,7 +1615,7 @@ class ReActEngine(UIEventEmitter):
                 # tool needed the output marker; the consolidated build tool's
                 # success already reflects the backend verdict.
                 build_succeeded = (
-                    result.success
+                    result.succeeded
                     if tool_name == "build"
                     else "BUILD SUCCESS" in (result.output or "")
                 )
@@ -1808,7 +1821,7 @@ class ReActEngine(UIEventEmitter):
                     step.step_type == StepType.ACTION
                     and step.tool_name == "maven"
                     and step.tool_result
-                    and step.tool_result.success
+                    and step.tool_result.succeeded
                 ):
 
                     output = step.tool_result.output or ""
@@ -1844,7 +1857,7 @@ class ReActEngine(UIEventEmitter):
                 step.step_type == StepType.ACTION
                 and step.tool_name == "report"
                 and step.tool_result
-                and step.tool_result.success
+                and step.tool_result.succeeded
             ):
                 return True
         return False
@@ -1976,7 +1989,10 @@ class ReActEngine(UIEventEmitter):
             "event": "tool_execution_result",
             "tool_name": tool_name,
             "iteration": self.current_iteration,
-            "success": result.success,
+            "succeeded": result.succeeded,
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
             "output_length": len(result.output) if result.output else 0,
             "full_output": result.output,  # Show full output instead of preview
             "error": result.error if hasattr(result, "error") else None,
@@ -2032,7 +2048,7 @@ class ReActEngine(UIEventEmitter):
                 continue
             tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
             result = getattr(s, "tool_result", None)
-            if result is not None and not getattr(result, "success", False):
+            if result is not None and result.operation_outcome is OperationOutcome.FAILED:
                 tool_failures[tool_name] = tool_failures.get(tool_name, 0) + 1
 
         return {
@@ -2054,7 +2070,7 @@ class ReActEngine(UIEventEmitter):
                 [
                     s
                     for s in self.steps
-                    if s.step_type == StepType.ACTION and s.tool_result and s.tool_result.success
+                    if s.step_type == StepType.ACTION and s.tool_result and s.tool_result.succeeded
                 ]
             )
             + archived.get("successful_actions", 0),
@@ -2064,7 +2080,7 @@ class ReActEngine(UIEventEmitter):
                     for s in self.steps
                     if s.step_type == StepType.ACTION
                     and s.tool_result
-                    and not s.tool_result.success
+                    and s.tool_result.operation_outcome is OperationOutcome.FAILED
                 ]
             )
             + archived.get("failed_actions", 0),

@@ -11,12 +11,13 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
-from sag.evidence import EvidenceAssessment, coerce_evidence_status
+from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolResult
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
 ToolExecutionStatus = Literal[
     "success",
+    "pending",
     "failure",
     "missing_tool",
     "validation_failed",
@@ -133,11 +134,7 @@ def _format_maven_version_contract(result: ToolResult) -> str:
 
 
 def _format_evidence_observation(result: ToolResult) -> list[str]:
-    normalized_status = (
-        ToolResult._status_from_success(result.success)
-        if result.status is None
-        else coerce_evidence_status(result.status)
-    )
+    normalized_status = result.evidence_assessment
     include_status = bool(
         normalized_status != EvidenceAssessment.SUCCESS
         or result.evidence_refs
@@ -161,17 +158,15 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
     """Format tool result for observation. Output truncation is now handled in BaseTool."""
     evidence_lines = _format_evidence_observation(result)
 
-    if result.success:
-        # For successful results, preserve key status information
-        verdict = getattr(result, "verdict", None) or "success"
-        if (result.metadata or {}).get("dispatch_status") == "running_detached":
-            # A handoff is not a completed command — don't announce success.
+    if result.operation_outcome is not OperationOutcome.FAILED:
+        if result.invocation_status is InvocationStatus.PENDING:
             formatted = f"⏳ {tool_name} dispatched — command still running in background"
-        elif verdict == "success":
+        elif result.succeeded:
             formatted = f"✅ {tool_name} executed successfully"
         else:
-            icon = {"partial": "⚠️", "running": "⏳", "unknown": "❔", "skipped": "⏭"}.get(verdict, "✅")
-            formatted = f"{icon} {tool_name} result: {verdict.upper()}"
+            outcome = result.operation_outcome.value
+            icon = {"partial": "⚠️", "unknown": "❔", "skipped": "⏭"}.get(outcome, "✅")
+            formatted = f"{icon} {tool_name} result: {outcome.upper()}"
 
         if evidence_lines:
             formatted += "\n" + "\n".join(evidence_lines)
@@ -300,9 +295,7 @@ class ToolOrchestrator:
         """
         try:
             trunk = self.context_manager.load_trunk_context()
-            rec = (getattr(trunk, "environment_summary", None) or {}).get(
-                "build_recommendation"
-            )
+            rec = (getattr(trunk, "environment_summary", None) or {}).get("build_recommendation")
         except Exception:
             return None
         if not rec:
@@ -322,9 +315,7 @@ class ToolOrchestrator:
                 call.name, call.raw_params
             )
             if resolved_name != call.name:
-                self.logger.info(
-                    f"Legacy tool alias resolved: {call.name} -> {resolved_name}"
-                )
+                self.logger.info(f"Legacy tool alias resolved: {call.name} -> {resolved_name}")
                 call.name = resolved_name
                 call.raw_params = resolved_params
         start_signature = call.execution_signature or self._execution_signature(
@@ -346,8 +337,7 @@ class ToolOrchestrator:
         if call.name not in self.tools:
             feedback = self._generate_unknown_tool_feedback(call.name)
             self._log_unknown_tool_attempt(call, feedback)
-            result = ToolResult(
-                success=False,
+            result = ToolResult.completed_failure(
                 output=feedback,
                 error=f"Unknown tool requested: {call.name}",
                 error_code="UNKNOWN_TOOL",
@@ -409,8 +399,7 @@ class ToolOrchestrator:
                     call.name, call.raw_params, parameter_fixes
                 )
             except Exception as exc:
-                result = ToolResult(
-                    success=False,
+                result = ToolResult.completed_failure(
                     output="",
                     error=f"Tool {call.name} parameter validation failed: {exc}",
                     error_code="PARAMETER_VALIDATION_FAILED",
@@ -498,11 +487,11 @@ class ToolOrchestrator:
                         "tool_result",
                         call,
                         message=execution.observation_text,
-                        level="success" if execution.result.success else "error",
+                        level="success" if execution.result.succeeded else "error",
                         metadata={
                             "status": execution.status,
                             "duration_ms": execution.duration_ms,
-                            "result_success": execution.result.success,
+                            "result_succeeded": execution.result.succeeded,
                             "error_code": execution.result.error_code,
                             "executed_params": execution.executed_params,
                             "recovery_applied": execution.recovery_applied,
@@ -514,8 +503,7 @@ class ToolOrchestrator:
                     )
                     return execution
 
-                result = ToolResult(
-                    success=False,
+                result = ToolResult.completed_failure(
                     output=(
                         f"INFINITE LOOP BROKEN: {call.name} was called "
                         f"{len(recent_executions)} times without progress.\n"
@@ -569,8 +557,7 @@ class ToolOrchestrator:
             result = self.tools[call.name].safe_execute(**validated_params)
         except Exception as exc:
             self._track_tool_execution(signature, False)
-            result = ToolResult(
-                success=False,
+            result = ToolResult.completed_failure(
                 output="",
                 error=f"Tool {call.name} execution failed unexpectedly: {exc}",
                 error_code="TOOL_EXECUTION_EXCEPTION",
@@ -611,9 +598,13 @@ class ToolOrchestrator:
         recovery_applied = False
         recovery_strategy: Optional[str] = None
         recovery_metadata: Optional[Dict[str, Any]] = None
-        status: ToolExecutionStatus = "success" if result.success else "failure"
+        status: ToolExecutionStatus = (
+            "pending"
+            if result.invocation_status is InvocationStatus.PENDING
+            else ("success" if result.succeeded else "failure")
+        )
 
-        if not result.success:
+        if result.invocation_status is not InvocationStatus.PENDING and not result.succeeded:
             decision = self.recovery_handler.recover(call.name, validated_params, result)
             recovery_metadata = dict(decision.metadata)
             recovery_metadata.setdefault("attempted", decision.should_recover)
@@ -623,7 +614,7 @@ class ToolOrchestrator:
 
             if decision.should_recover:
                 replacement_success = (
-                    decision.replacement_result.success
+                    decision.replacement_result.succeeded
                     if decision.replacement_result is not None
                     else False
                 )
@@ -638,8 +629,8 @@ class ToolOrchestrator:
                         "attempted": True,
                         "success": replacement_success,
                         "guidance": decision.guidance,
-                        "replacement_result_success": (
-                            decision.replacement_result.success
+                        "replacement_result_succeeded": (
+                            decision.replacement_result.succeeded
                             if decision.replacement_result is not None
                             else None
                         ),
@@ -655,14 +646,14 @@ class ToolOrchestrator:
                     if recovery_metadata.get("guidance_only"):
                         status = "recovery_attempted"
                     else:
-                        status = "recovered" if result.success else "recovery_failed"
+                        status = "recovered" if result.succeeded else "recovery_failed"
                     recovery_applied = True
-                    recovery_metadata["success"] = result.success
+                    recovery_metadata["success"] = result.succeeded
                 else:
                     status = "recovery_attempted"
 
-        self._track_tool_execution(signature, result.success)
-        if result.success:
+        self._track_tool_execution(signature, result.succeeded)
+        if result.succeeded:
             self._update_successful_states(call.name, executed_params, result)
 
         if repetition_level in {1, 2}:
@@ -700,7 +691,7 @@ class ToolOrchestrator:
             parameter_fixes=call.parameter_fixes,
             metadata=execution_metadata,
         )
-        if result.success and call.name == "manage_context":
+        if result.succeeded and call.name == "manage_context":
             action = executed_params.get("action", "")
             if action in {
                 "start_task",
@@ -717,7 +708,7 @@ class ToolOrchestrator:
         event_metadata = {
             "status": execution.status,
             "duration_ms": duration_ms,
-            "result_success": result.success,
+            "result_succeeded": result.succeeded,
             "error_code": result.error_code,
             "executed_params": executed_params,
             "recovery_applied": recovery_applied,
@@ -737,7 +728,7 @@ class ToolOrchestrator:
             "tool_result",
             call,
             message=observation_text,
-            level="success" if result.success else "error",
+            level="success" if result.succeeded else "error",
             metadata=event_metadata,
         )
         return execution
@@ -983,24 +974,23 @@ class ToolOrchestrator:
         try:
             result = self._auto_fix_java_configuration()
         except Exception as exc:
-            result = ToolResult(
-                success=False,
+            result = ToolResult.completed_failure(
                 output="Could not auto-fix Java configuration. Skipping to next task.",
                 error=f"Auto-fix failed: {exc}",
                 error_code="JAVA_AUTO_FIX_EXCEPTION",
                 metadata={"exception_type": type(exc).__name__},
             )
 
-        self._track_tool_execution(signature, result.success)
-        status: ToolExecutionStatus = "recovered" if result.success else "recovery_failed"
+        self._track_tool_execution(signature, result.succeeded)
+        status: ToolExecutionStatus = "recovered" if result.succeeded else "recovery_failed"
         observation_text = format_tool_result(call.name, result)
         recovery_params = self._java_auto_fix_recovery_params(result)
         recovery_metadata = {
             "attempted": True,
-            "success": result.success,
+            "success": result.succeeded,
             "message": observation_text,
             "strategy": recovery_strategy,
-            "replacement_result_success": result.success,
+            "replacement_result_succeeded": result.succeeded,
             "recovery_params": recovery_params,
             "parameter_diff": self._parameter_diff(validated_params, recovery_params),
         }
@@ -1028,13 +1018,13 @@ class ToolOrchestrator:
             "tool_recovery",
             call,
             message=observation_text,
-            level="success" if result.success else "error",
+            level="success" if result.succeeded else "error",
             metadata={
                 "recovery_strategy": recovery_strategy,
                 "attempted": True,
-                "success": result.success,
+                "success": result.succeeded,
                 "guidance": observation_text,
-                "replacement_result_success": result.success,
+                "replacement_result_succeeded": result.succeeded,
                 "recovery_params": recovery_params,
                 "parameter_diff": recovery_metadata["parameter_diff"],
                 **metadata,
@@ -1075,13 +1065,10 @@ class ToolOrchestrator:
                 self.logger.info(
                     "Detected Java 17 requirement, using system tool for proper installation"
                 )
-                install_result = system_tool.safe_execute(
-                    action="install_java", java_version="17"
-                )
+                install_result = system_tool.safe_execute(action="install_java", java_version="17")
 
-                if install_result.success:
-                    return ToolResult(
-                        success=True,
+                if install_result.succeeded:
+                    return ToolResult.completed_success(
                         output=(
                             "Auto-fixed Java configuration using enhanced system tool\n"
                             + install_result.output
@@ -1089,8 +1076,7 @@ class ToolOrchestrator:
                         metadata={"auto_fixed": True, "java_version": "17"},
                     )
 
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="Could not auto-fix Java configuration. Skipping to next task.",
             error="Auto-fix failed",
             error_code="AUTO_FIX_FAILED",
@@ -1188,7 +1174,9 @@ class ToolOrchestrator:
         feedback_parts.append("\n\n💡 Tips:")
         feedback_parts.append("• For shell commands, use 'bash' tool with command parameter")
         feedback_parts.append("• For file operations, use 'file_io' tool with action parameter")
-        feedback_parts.append("• For builds and tests, use the 'build' tool (auto-selects maven/gradle)")
+        feedback_parts.append(
+            "• For builds and tests, use the 'build' tool (auto-selects maven/gradle)"
+        )
         feedback_parts.append(
             "• Check tool parameter requirements with action='help' where supported"
         )

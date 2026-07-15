@@ -71,8 +71,7 @@ _SUMMARY_STATS_RE = re.compile(r"\b\d+ (?:passed|failed)\b")
 # band. Applied only when the exit code is unreliable (0/None) and no
 # summary stats line exists.
 _COLLECTION_ERROR_RE = re.compile(
-    r"^_*\s*ERROR collecting\b"
-    r"|!!+\s*Interrupted: \d+ errors? during collection",
+    r"^_*\s*ERROR collecting\b" r"|!!+\s*Interrupted: \d+ errors? during collection",
     re.MULTILINE,
 )
 _USAGE_ERROR_RE = re.compile(r"^ERROR: usage:", re.MULTILINE)
@@ -192,8 +191,7 @@ class PythonTool(BaseTool):
     ) -> ToolResult:
         op = (operation or "").strip().lower()
         if op not in _OPERATIONS:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Unknown python operation: {operation!r}",
                 error_code="UNKNOWN_PYTHON_OPERATION",
@@ -214,8 +212,12 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _setup_env(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         # Pre-flight FIRST (narration prepended, same pattern as the ported
         # maven/gradle tools): check-and-fix, never a hard block.
@@ -234,8 +236,7 @@ class PythonTool(BaseTool):
             made = self._run(f"python3 -m venv {venv}", working_directory, timeout)
             if not made.get("success"):
                 return self._finish(
-                    ToolResult(
-                        success=False,
+                    ToolResult.completed_failure(
                         output=self._tail(made.get("output") or ""),
                         error=f"could not create venv at {venv}",
                         error_code="VENV_CREATE_FAILED",
@@ -276,8 +277,7 @@ class PythonTool(BaseTool):
                 preamble.append("[setup] manifest empty — detected installer ladder inline")
             else:
                 return self._finish(
-                    ToolResult(
-                        success=False,
+                    ToolResult.completed_failure(
                         output="",
                         error=(
                             "no python install commands: the manifest is empty and no "
@@ -352,13 +352,11 @@ class PythonTool(BaseTool):
                 break
 
         return self._finish(
-            ToolResult(
-                success=overall_ok,
+            ToolResult.completed(
+                operation_outcome="success" if overall_ok else "failed",
                 output="\n".join(transcript),
                 error=(
-                    None
-                    if overall_ok
-                    else f"dependency installation failed — {failure_detail}"
+                    None if overall_ok else f"dependency installation failed — {failure_detail}"
                 ),
                 error_code=None if overall_ok else "PYTHON_SETUP_FAILED",
                 metadata={
@@ -379,16 +377,12 @@ class PythonTool(BaseTool):
         same extras rules (the strings live ONLY in python_env)."""
         listing = self.orchestrator.execute_command(f"ls -A1 {working_directory}")
         files_present = {
-            line.strip()
-            for line in (listing.get("output") or "").splitlines()
-            if line.strip()
+            line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
         }
         contents: Dict[str, str] = {}
         for name in ("pyproject.toml", "setup.cfg"):
             if name in files_present:
-                read = self.orchestrator.execute_command(
-                    f"cat {working_directory}/{name}"
-                )
+                read = self.orchestrator.execute_command(f"cat {working_directory}/{name}")
                 contents[name] = (read.get("output") or "") if read.get("success") else ""
         return detect_installer(files_present, contents)
 
@@ -416,8 +410,12 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _run_tests(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         python = f"{venv}/bin/python"
         preamble: List[str] = []
@@ -427,12 +425,9 @@ class PythonTool(BaseTool):
         hints = requirements.get("test_hints") or {}
         raw_args = (args or "").strip()
         if raw_args:
-            pytest_args, rejection = self._sanitize_pytest_args(
-                raw_args, working_directory
-            )
+            pytest_args, rejection = self._sanitize_pytest_args(raw_args, working_directory)
             if rejection:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=f"[test] rejected args {raw_args!r} — {rejection}",
                     error=rejection,
                     error_code="PYTEST_ARGS_REJECTED",
@@ -455,9 +450,7 @@ class PythonTool(BaseTool):
 
         # Detected-tests denominator FIRST (spec Component 3): the verifier
         # compares executed counts against it (tests_not_fully_executed).
-        collect = self._run(
-            f"{python} -m pytest --collect-only -q", working_directory, timeout
-        )
+        collect = self._run(f"{python} -m pytest --collect-only -q", working_directory, timeout)
         collected = self._parse_collected(collect.get("output") or "")
         self._write_collected(collected)
 
@@ -479,8 +472,11 @@ class PythonTool(BaseTool):
         if self.command_tracker:
             try:
                 self.command_tracker.track_test_command(
-                    command=command, tool="python", working_dir=working_directory,
-                    exit_code=exit_code, output=output,
+                    command=command,
+                    tool="python",
+                    working_dir=working_directory,
+                    exit_code=exit_code,
+                    output=output,
                 )
             except Exception as exc:  # tracking must never mask the honest result
                 logger.debug(f"python test tracking skipped: {exc}")
@@ -496,15 +492,16 @@ class PythonTool(BaseTool):
         tail = self._tail(output)
         if success:
             return self._finish(
-                ToolResult(
-                    success=True, output=tail,
-                    raw_output=output, metadata=metadata,
+                ToolResult.completed_success(
+                    output=tail,
+                    raw_output=output,
+                    metadata=metadata,
                 ),
                 preamble,
             )
         return self._finish(
-            ToolResult(
-                success=False, output=tail,
+            ToolResult.completed_failure(
+                output=tail,
                 raw_output=output,
                 error=error,
                 error_code=error_code,
@@ -541,14 +538,9 @@ class PythonTool(BaseTool):
                 cleaned.append(token)
                 continue
             if token.startswith("-"):
-                return None, (
-                    f"{token!r} is not an accepted pytest flag. {_PYTEST_USAGE_HINT}"
-                )
+                return None, (f"{token!r} is not an accepted pytest flag. {_PYTEST_USAGE_HINT}")
             path = token.split("::", 1)[0]
-            full = (
-                path if path.startswith("/")
-                else f"{working_directory.rstrip('/')}/{path}"
-            )
+            full = path if path.startswith("/") else f"{working_directory.rstrip('/')}/{path}"
             probe = self.orchestrator.execute_command(
                 f"test -e {shlex.quote(full)} && echo EXISTS || echo MISSING"
             )
@@ -568,13 +560,15 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _build_wheel(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         self._run(f"{venv}/bin/python -m pip install build", working_directory, timeout)
-        result = self._run(
-            f"{venv}/bin/python -m build --wheel", working_directory, timeout
-        )
+        result = self._run(f"{venv}/bin/python -m build --wheel", working_directory, timeout)
         success = bool(result.get("success"))
         metadata = {
             "operation": "build",
@@ -585,12 +579,13 @@ class PythonTool(BaseTool):
         }
         tail = self._tail(result.get("output") or "")
         if success:
-            return ToolResult(
-                success=True, output=tail,
-                raw_output=result.get("output"), metadata=metadata,
+            return ToolResult.completed_success(
+                output=tail,
+                raw_output=result.get("output"),
+                metadata=metadata,
             )
-        return ToolResult(
-            success=False, output=tail,
+        return ToolResult.completed_failure(
+            output=tail,
             raw_output=result.get("output"),
             error="wheel build failed (evidence only — never required for green)",
             error_code="WHEEL_BUILD_FAILED",
@@ -602,8 +597,12 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _compileall(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         dirs = self._package_dirs(working_directory, requirements)
         target = " ".join(dirs)
@@ -617,16 +616,13 @@ class PythonTool(BaseTool):
             f"find {target} -path '*/__pycache__/*.pyc' | wc -l", working_directory
         )
         failed = (
-            max(py_count - pyc_count, 0)
-            if py_count is not None and pyc_count is not None
-            else None
+            max(py_count - pyc_count, 0) if py_count is not None and pyc_count is not None else None
         )
         coverage = (pyc_count / py_count) if py_count else None
         if py_count == 0:
             # Bug #13 defect 8: 0/0 compiled is VACUOUS evidence — say so
             # instead of a misleading green ('0/0 sources compiled').
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"no sources found under {target} — nothing verified",
                 raw_output=result.get("output"),
                 metadata={
@@ -649,8 +645,8 @@ class PythonTool(BaseTool):
             summary += "source/bytecode counts unavailable"
         success = bool(result.get("success"))
         errors = self._tail(result.get("output") or "", lines=20)
-        return ToolResult(
-            success=success,
+        return ToolResult.completed(
+            operation_outcome="success" if success else "failed",
             output=summary + (f"\n{errors}" if errors else ""),
             raw_output=result.get("output"),
             error=None if success else "compileall reported errors",
@@ -693,9 +689,7 @@ class PythonTool(BaseTool):
         """Package source dirs: manifest packages (src-layout probed first),
         shared discovery as fallback, the project dir as the last resort."""
         root = working_directory.rstrip("/")
-        packages = requirements.get("python_packages") or discover_packages(
-            self.orchestrator, root
-        )
+        packages = requirements.get("python_packages") or discover_packages(self.orchestrator, root)
         dirs: List[str] = []
         for package in packages:
             for candidate in (f"{root}/src/{package}", f"{root}/{package}"):
@@ -727,9 +721,7 @@ class PythonTool(BaseTool):
     def _write_collected(self, collected: Optional[int]) -> None:
         body = json.dumps({"collected": collected})
         self.orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
-        self.orchestrator.execute_command(
-            f"cat > {COLLECTED_JSON} <<'SAGEOF'\n{body}\nSAGEOF"
-        )
+        self.orchestrator.execute_command(f"cat > {COLLECTED_JSON} <<'SAGEOF'\n{body}\nSAGEOF")
 
     @staticmethod
     def _tail(output: str, lines: int = 60) -> str:

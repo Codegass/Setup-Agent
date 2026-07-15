@@ -10,7 +10,7 @@ class CountingTool(BaseTool):
 
     def execute(self, command: str) -> ToolResult:
         self.calls += 1
-        return ToolResult(success=True, output=self.output, metadata={"command": command})
+        return ToolResult.completed_success(output=self.output, metadata={"command": command})
 
 
 class ContextWithForceNextTask:
@@ -34,10 +34,10 @@ class SystemTool(BaseTool):
     def execute(self, action: str, java_version: str = "") -> ToolResult:
         self.calls.append({"action": action, "java_version": java_version})
         if action == "verify_java":
-            return ToolResult(success=True, output="Java needs configuration")
+            return ToolResult.completed_success(output="Java needs configuration")
         if action == "install_java":
-            return ToolResult(success=True, output=f"Installed Java {java_version}")
-        return ToolResult(success=False, output="", error=f"Unsupported action: {action}")
+            return ToolResult.completed_success(output=f"Installed Java {java_version}")
+        return ToolResult.completed_failure(output="", error=f"Unsupported action: {action}")
 
 
 def _signature(tool_name, command, **extra_params):
@@ -66,9 +66,7 @@ def _orchestrator(*, tools, recent_tool_executions, context_manager=None, tracki
         recent_tool_executions=recent_tool_executions,
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append(
-            (signature, success)
-        ),
+        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -104,7 +102,7 @@ def test_java_repetition_auto_fix_emits_required_recovery_and_result_events():
     assert recovery_event.metadata["attempted"] is True
     assert recovery_event.metadata["success"] is True
     assert recovery_event.metadata["guidance"]
-    assert recovery_event.metadata["replacement_result_success"] is True
+    assert recovery_event.metadata["replacement_result_succeeded"] is True
     assert recovery_event.metadata["recovery_params"] == {
         "action": "install_java",
         "java_version": "17",
@@ -174,7 +172,7 @@ def test_repetition_level_three_breaks_without_execution_and_forces_next_task():
     execution = orchestrator.execute(ToolCall(name="echo", raw_params={"command": "pwd"}))
 
     assert execution.status == "repetition_blocked"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "INFINITE_LOOP_BROKEN"
     assert execution.attempted_execution is False
     assert execution.executed_params is None
@@ -205,7 +203,7 @@ def test_java_repetition_triggers_auto_fix():
     )
 
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert "Auto-fixed Java configuration" in execution.result.output
     assert execution.recovery_strategy == "java_configuration_auto_fix"
     assert execution.attempted_execution is False
@@ -233,7 +231,7 @@ def test_generic_java_path_repetition_breaks_without_java_auto_fix(monkeypatch):
 
     def auto_fix_java_configuration():
         auto_fix_calls.append(True)
-        return ToolResult(success=True, output="unexpected auto-fix")
+        return ToolResult.completed_success(output="unexpected auto-fix")
 
     monkeypatch.setattr(
         orchestrator,

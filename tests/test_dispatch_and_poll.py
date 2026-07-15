@@ -7,8 +7,12 @@ the agent gets the log tail + poll instructions and the process keeps running.
 
 from types import SimpleNamespace
 
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.docker_orch.orch import DockerOrchestrator
-from sag.tools.internal.build_utils import detached_handoff_tool_result
+from sag.tools.internal.build_utils import (
+    classify_detached_completion,
+    detached_handoff_tool_result,
+)
 
 
 def build_orchestrator(execute_command=None):
@@ -259,11 +263,12 @@ def test_soft_timeout_dispatch_failure_is_failure_result():
 # --- tool-level handoff -------------------------------------------------------
 
 
-def test_detached_handoff_tool_result_shape():
+def test_detached_handoff_is_a_promise_not_success():
     result = {
         "output": "still running; tail -n 50 /tmp/sag_jobs/abc.log",
         "dispatch_status": "running_detached",
         "dispatch": {
+            "job_id": "abc",
             "pid": 12345,
             "log_path": "/tmp/sag_jobs/abc.log",
             "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
@@ -273,11 +278,29 @@ def test_detached_handoff_tool_result_shape():
 
     tool_result = detached_handoff_tool_result("gradle", "./gradlew build", result)
 
-    assert tool_result.success is True
+    assert tool_result.invocation_status is InvocationStatus.PENDING
+    assert tool_result.operation_outcome is OperationOutcome.UNKNOWN
+    assert tool_result.evidence_status is EvidenceStatus.UNKNOWN
+    assert tool_result.poll_ref == "job:abc"
     assert "tail -n 50" in tool_result.output
     assert tool_result.metadata["dispatch_status"] == "running_detached"
     assert tool_result.metadata["pid"] == 12345
     assert tool_result.metadata["log_path"] == "/tmp/sag_jobs/abc.log"
+
+
+def test_fatal_tail_overrides_zero_exit_plumbing():
+    result = classify_detached_completion(
+        exit_code=0,
+        tail="CMake Error: configuration failed",
+        full_output_ref="output_cmake",
+    )
+
+    assert result.invocation_status is InvocationStatus.COMPLETED
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.error_code == "DETACHED_OPERATION_FAILED"
+    assert result.failure_signature
+    assert result.error_tail_preview == "CMake Error: configuration failed"
+    assert result.output_ref == "output_cmake"
 
 
 # --- review fixes: spoof-proof poll parsing, atomic exit file ----------------
@@ -286,10 +309,7 @@ def test_detached_handoff_tool_result_shape():
 def test_poll_markers_in_log_tail_cannot_spoof_completion():
     """STATE:/SIZE: lines printed by the build itself land in the tail and
     must not be parsed as completion markers."""
-    output = (
-        "STATE:RUNNING\nSIZE:100\n---TAIL---\n"
-        "some build output\nSTATE:EXIT:0\nSIZE:99999\n"
-    )
+    output = "STATE:RUNNING\nSIZE:100\n---TAIL---\n" "some build output\nSTATE:EXIT:0\nSIZE:99999\n"
     orchestrator = build_orchestrator(
         execute_command=lambda command, **kwargs: {"exit_code": 0, "output": output}
     )
@@ -395,7 +415,8 @@ def test_gradle_tool_routes_build_through_dispatch_and_returns_handoff():
 
     assert orchestrator.soft_timeout_calls, "gradle build must use dispatch-and-poll"
     assert orchestrator.monitoring_calls == []
-    assert result.success is True
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.metadata["dispatch_status"] == "running_detached"
     assert "/tmp/sag_jobs/abc.log" in result.output
 
@@ -421,7 +442,8 @@ def test_bash_tool_routes_long_command_through_dispatch():
     result = tool.execute(command="mvn verify", timeout=1200)
 
     assert orchestrator.soft_timeout_calls, "mvn verify must use dispatch-and-poll"
-    assert result.success is True
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.metadata["dispatch_status"] == "running_detached"
 
 
@@ -453,8 +475,7 @@ def test_repetition_detector_exempts_dispatch_poll_commands():
         "('working_directory', '/workspace')]"
     )
     recent = [
-        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"}
-        for i in range(9)
+        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"} for i in range(9)
     ]
     orchestrator = ToolOrchestrator(
         tools={},
@@ -485,7 +506,12 @@ def test_heredoc_body_keywords_do_not_trigger_dispatch():
     from sag.tools.bash import BashTool
 
     tool = BashTool(RoutingOrchestrator())
-    assert tool._is_long_running_command("python - <<'PY'\nimport subprocess\nsubprocess.run(['mvn','test'])\nPY") is False
+    assert (
+        tool._is_long_running_command(
+            "python - <<'PY'\nimport subprocess\nsubprocess.run(['mvn','test'])\nPY"
+        )
+        is False
+    )
 
 
 def test_version_probe_flags_are_quick():

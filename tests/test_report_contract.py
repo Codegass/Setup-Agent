@@ -137,7 +137,7 @@ def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
 
     result = tool.execute(action="generate", summary="done", status="success")
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.output == "condensed"
     assert result.raw_data["full_report"] == "# Full Report"
     assert result.raw_data["report_snapshot"]["status"] == "success"
@@ -187,8 +187,8 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
         evidence_refs=["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
     )
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert isinstance(result.test_stats, TestStats)
     assert result.test_stats.pass_rate == 96.3
     assert result.test_stats.failed == 3
@@ -276,8 +276,8 @@ def test_real_report_renderer_includes_evidence_result(monkeypatch):
         evidence_refs=["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
     )
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert "Result: PARTIAL" in result.raw_data["full_report"]
     assert "96.3% pass rate" in result.raw_data["full_report"]
     assert "3 failed" in result.raw_data["full_report"]
@@ -314,8 +314,8 @@ def test_report_failed_legacy_status_maps_to_blocked(monkeypatch):
 
     result = tool.execute(action="generate", summary="blocked", status="fail")
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.BLOCKED
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.BLOCKED
     assert result.metadata["evidence_status"] == "blocked"
     assert result.raw_data["evidence_status"] == "blocked"
 
@@ -391,8 +391,8 @@ def test_report_uses_validator_evidence_defaults_when_kwargs_missing(monkeypatch
 
     result = tool.execute(action="generate", summary="done", status="success")
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.metadata["verified_status"] == "success"
     assert result.metadata["evidence_status"] == "partial"
     assert "Result: PARTIAL" in result.raw_data["full_report"]
@@ -449,8 +449,8 @@ def test_ordinary_success_report_does_not_render_empty_test_stats(monkeypatch):
 
     result = tool.execute(action="generate", summary="done", status="success")
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.SUCCESS
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.SUCCESS
     assert result.raw_data["test_stats"] is None
     assert "0 / 0 passed" not in result.output
     assert "0 / 0 passed" not in result.raw_data["full_report"]
@@ -506,8 +506,8 @@ def test_invalid_explicit_evidence_status_is_unknown_without_success_fallback(mo
         evidence_status="bogus",
     )
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.UNKNOWN
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.UNKNOWN
     assert result.metadata["evidence_status"] == "unknown"
     assert result.raw_data["evidence_status"] == "unknown"
 
@@ -547,7 +547,7 @@ def test_report_tool_marks_final_report_task_completed(monkeypatch):
     result = tool.execute(action="generate", summary="done", status="success")
 
     final_task = context_manager.trunk.todo_list[1]
-    assert result.success is True
+    assert result.succeeded is True
     assert final_task.status == TaskStatus.COMPLETED
     assert final_task.completed_at is not None
     assert final_task.notes == "Final setup report generated."
@@ -857,14 +857,10 @@ def _all_green_kernel_snapshot():
     }
 
 
-def test_report_result_header_caps_on_blocked_trunk_phase():
-    """The header's kernel call must consume the phase-machine outcome too —
-    a machine-capped run (blocked phase_* trunk task) with green physical
-    evidence rendered '**Result:** ✅ SUCCESS' while the CLI banner said
-    verdict=partial/failed (round-6 review)."""
+def test_report_result_header_ignores_phase_termination_for_verdict():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"test"}))
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "partial"
+    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
     lines = tool._render_enhanced_header(
         "2026-06-12 12:00:00",
@@ -873,13 +869,13 @@ def test_report_result_header_caps_on_blocked_trunk_phase():
         snapshot=_all_green_kernel_snapshot(),
     )
     result_lines = [l for l in lines if l.startswith("**Result:**")]
-    assert result_lines and "PARTIAL" in result_lines[0].upper(), result_lines
+    assert result_lines and "SUCCESS" in result_lines[0].upper(), result_lines
 
 
-def test_report_result_header_blocked_build_phase_is_failed():
+def test_report_result_header_blocked_build_phase_does_not_imply_failure():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "failed"
+    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
 
 def test_report_kernel_verdict_abstains_without_phase_tasks():

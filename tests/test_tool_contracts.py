@@ -16,7 +16,7 @@ class ExampleTool(BaseTool):
         super().__init__("example", "Example tool")
 
     def execute(self, command: str) -> ToolResult:
-        return ToolResult(success=True, output=command)
+        return ToolResult.completed_success(output=command)
 
 
 class OptionalIntTool(BaseTool):
@@ -24,7 +24,7 @@ class OptionalIntTool(BaseTool):
         super().__init__("optional_int", "Optional integer tool")
 
     def execute(self, end_line: Optional[int] = None) -> ToolResult:
-        return ToolResult(success=True, output=str(end_line))
+        return ToolResult.completed_success(output=str(end_line))
 
 
 class DerivedReportTool(ReportTool):

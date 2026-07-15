@@ -37,10 +37,8 @@ class SearchTool(BaseTool):
             return self.output_search.execute(
                 action="grep", ref_id=target, grep_pattern=pattern or ".", limit=max_results
             )
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output=f"Unrecognized search target: {target!r}",
-            verdict="failed",
             error="unknown target",
             suggestions=[
                 "Use a ref id from a tool result (e.g. 'output_5b9a')",
@@ -58,17 +56,15 @@ class SearchTool(BaseTool):
         result = self.docker_orchestrator.execute_command(cmd, workdir=None, timeout=60)
         output = (result.get("output") or "").strip()
         matched = bool(output)
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=output if matched else f"No matches for {pattern!r} in {path}",
-            verdict="success" if matched else "unknown",
             facts={"target": path, "pattern": pattern, "matched": matched},
         )
 
     def _web(self, query: str, max_results: int) -> ToolResult:
         if self.web_search is None:
-            return ToolResult(
-                success=False, output="web search unavailable", verdict="failed",
+            return ToolResult.completed_failure(
+                output="web search unavailable",
                 error="web search unavailable",
             )
         return self.web_search.execute(query=query, max_results=min(max_results, 5))

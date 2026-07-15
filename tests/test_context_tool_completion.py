@@ -23,7 +23,6 @@ from sag.agent.react_types import StepType
 from sag.tools.base import ToolError
 from sag.tools.context_tool import ContextTool
 
-
 # --- fakes -----------------------------------------------------------------
 
 
@@ -169,7 +168,12 @@ def test_test_task_rejected_when_no_test_reports():
 def test_npm_build_task_not_gated_on_java_artifacts():
     """A Node build task must not be judged on .class/JAR presence."""
     validator = FakeValidator(build_success=False, build_system="nodejs")
-    npm_action = {"type": "action", "tool_name": "npm", "success": True, "output": "added 120 packages"}
+    npm_action = {
+        "type": "action",
+        "tool_name": "npm",
+        "success": True,
+        "output": "added 120 packages",
+    }
     tool = ContextTool(_branch_cm(history=[npm_action], validator=validator))
 
     result = tool._validate_task_completion(
@@ -185,7 +189,12 @@ def test_npm_build_task_not_gated_on_java_artifacts():
 def test_pytest_test_task_not_gated_on_java_test_reports():
     """A pytest task must not be blocked for missing surefire/gradle XML."""
     validator = FakeValidator(has_test_reports=False)
-    pytest_action = {"type": "action", "tool_name": "pytest", "success": True, "output": "42 passed"}
+    pytest_action = {
+        "type": "action",
+        "tool_name": "pytest",
+        "success": True,
+        "output": "42 passed",
+    }
     tool = ContextTool(_branch_cm(history=[pytest_action], validator=validator))
 
     result = tool._validate_task_completion(
@@ -274,7 +283,7 @@ def test_complete_task_allows_build_task_with_evidence():
         summary="Gradle build completed successfully with artifacts.",
     )
 
-    assert result.success is True
+    assert result.succeeded is True
 
 
 def test_completion_gate_probes_trunk_project_name():
@@ -300,7 +309,7 @@ def _report_completion_steps(status=None):
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="report",
-            tool_result=SimpleNamespace(success=True, metadata=metadata),
+            tool_result=SimpleNamespace(succeeded=True, metadata=metadata),
         )
     ]
 
@@ -457,15 +466,11 @@ def test_remediated_but_still_no_artifacts_blocked_by_physical_gate():
 def test_documents_unmet_requirement_ignores_thought_entries():
     """Agent musings ('the readme says this requires Java 17') must not arm
     the requirement gate; only observations/action outputs count."""
-    thought_history = [
-        {"type": "thought", "content": "the readme says this requires java 17"}
-    ]
+    thought_history = [{"type": "thought", "content": "the readme says this requires java 17"}]
     tool = ContextTool(_branch_cm(history=thought_history))
     assert tool._documents_unmet_requirement("clean summary") is False
 
-    observation_history = [
-        {"type": "observation", "content": "ERROR: JAVA_HOME is not set."}
-    ]
+    observation_history = [{"type": "observation", "content": "ERROR: JAVA_HOME is not set."}]
     tool = ContextTool(_branch_cm(history=observation_history))
     assert tool._documents_unmet_requirement("clean summary") is True
 
@@ -599,7 +604,9 @@ def _phase_trunk():
 
     return PhaseTrunk(
         [
-            PhaseTask("provision", PHASE_OBJECTIVES["provision"], "completed", "JDK 17; repo cloned"),
+            PhaseTask(
+                "provision", PHASE_OBJECTIVES["provision"], "completed", "JDK 17; repo cloned"
+            ),
             PhaseTask("analyze", PHASE_OBJECTIVES["analyze"], "completed", "maven; 184 tests"),
             PhaseTask("build", PHASE_OBJECTIVES["build"], "completed", "BUILD SUCCESS"),
             PhaseTask("test", PHASE_OBJECTIVES["test"], "in_progress"),

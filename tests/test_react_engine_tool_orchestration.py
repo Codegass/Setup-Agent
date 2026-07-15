@@ -55,7 +55,7 @@ class EchoTool(BaseTool):
         super().__init__("echo", "Echo test tool")
 
     def execute(self, command: str) -> ToolResult:
-        return ToolResult(success=True, output=f"ran {command}")
+        return ToolResult.completed_success(output=f"ran {command}")
 
 
 def _engine_with_context(context=None):
@@ -200,7 +200,7 @@ def test_react_engine_preserves_real_tool_result_lifecycle_metadata():
             metadata={
                 "status": "success",
                 "duration_ms": 125.0,
-                "result_success": True,
+                "result_succeeded": True,
                 "error_code": None,
                 "executed_params": {
                     "goal": "compile",
@@ -263,7 +263,7 @@ def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
         event_type="tool_result",
         call=ToolCall(name="echo", raw_params={"command": "pwd"}),
         message="echo finished",
-        metadata={"status": "success", "result_success": True},
+        metadata={"status": "success", "result_succeeded": True},
     )
     recovery_event = ToolLifecycleEvent(
         event_type="tool_recovery",
@@ -323,7 +323,7 @@ def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
 
 
 def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypatch):
-    result = ToolResult(success=True, output="ok")
+    result = ToolResult.completed_success(output="ok")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",
@@ -365,7 +365,7 @@ def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypa
 
 def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
     context = RecordingBranchContext()
-    result = ToolResult(success=True, output="Full output ref: output_build")
+    result = ToolResult.completed_success(output="Full output ref: output_build")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: build",
@@ -408,7 +408,7 @@ def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
 
 def test_execute_steps_records_action_even_if_tool_clears_current_task(monkeypatch):
     context = RecordingBranchContext()
-    result = ToolResult(success=True, output="Final setup report generated.")
+    result = ToolResult.completed_success(output="Final setup report generated.")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: report",
@@ -470,8 +470,10 @@ def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator(
     assert "echo executed successfully" in observation_events[0][1]["message"]
 
 
-def test_execute_steps_forces_thinking_after_partial_status_without_success(monkeypatch):
-    result = ToolResult(success=False, status=EvidenceAssessment.PARTIAL, output="needs review")
+def test_execute_steps_forces_thinking_after_partial_assessment_without_success(monkeypatch):
+    result = ToolResult.completed_failure(
+        evidence_assessment=EvidenceAssessment.PARTIAL, output="needs review"
+    )
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",
@@ -504,8 +506,8 @@ def test_execute_steps_forces_thinking_after_partial_status_without_success(monk
     assert engine._force_thinking_after_success is True
 
 
-def test_execute_steps_forces_thinking_after_raw_partial_status_without_success(monkeypatch):
-    result = ToolResult.model_construct(success=False, status=" partial ", output="needs review")
+def test_execute_steps_forces_thinking_after_string_partial_assessment(monkeypatch):
+    result = ToolResult.completed_failure(evidence_assessment="partial", output="needs review")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",
@@ -543,7 +545,7 @@ def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
     engine = _engine_with_context(context=context)
     execution = ToolExecution(
         call=ToolCall(name="manage_context", raw_params={"action": "complete_task"}),
-        result=ToolResult(success=False, output="loop broken"),
+        result=ToolResult.completed_failure(output="loop broken"),
         status="repetition_blocked",
         raw_params={"action": "complete_task"},
         metadata={
@@ -565,7 +567,7 @@ def test_apply_tool_execution_loop_effects_skips_unavailable_force_next_task():
     engine = _engine_with_context(context=ContextWithoutForceNextTask())
     execution = ToolExecution(
         call=ToolCall(name="bash", raw_params={"command": "pwd"}),
-        result=ToolResult(success=False, output="loop broken"),
+        result=ToolResult.completed_failure(output="loop broken"),
         status="repetition_blocked",
         raw_params={"command": "pwd"},
         metadata={"force_next_task": True},

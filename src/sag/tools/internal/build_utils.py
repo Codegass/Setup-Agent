@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
+
 from ..base import ToolResult
 
 
@@ -19,28 +21,70 @@ def detached_handoff_tool_result(
 ) -> ToolResult:
     """ToolResult for a build command handed off to background execution.
 
-    The command is still running (dispatch_status="running_detached"); success
-    is True because nothing failed — the observation tells the agent how to
-    poll the log tail and detect completion.
+    Dispatch only promises a future observation. It says nothing about the
+    operation's eventual outcome.
     """
     dispatch = result.get("dispatch") or {}
     job_id = dispatch.get("job_id")
+    log_path = dispatch.get("log_path")
+    poll_ref = f"job:{job_id}" if job_id else f"log:{log_path}"
     return ToolResult(
-        success=True,
+        invocation_status=InvocationStatus.PENDING,
+        operation_outcome=OperationOutcome.UNKNOWN,
+        evidence_status=EvidenceStatus.UNKNOWN,
+        poll_ref=poll_ref,
         output=result.get("output", ""),
         # The prompt promises a job log ref for detached builds; attach it so
         # search(target='job:<id>') has something real to poll.
-        refs=[f"job:{job_id}"] if job_id else [],
+        refs=[poll_ref],
         metadata={
             "dispatch_status": "running_detached",
             "tool": tool_name,
             "command": command,
             "job_id": job_id,
             "pid": dispatch.get("pid"),
-            "log_path": dispatch.get("log_path"),
+            "log_path": log_path,
             "exit_code_path": dispatch.get("exit_code_path"),
             "soft_timeout": dispatch.get("soft_timeout"),
         },
+    )
+
+
+def classify_detached_completion(
+    exit_code: int | None,
+    tail: str,
+    full_output_ref: str,
+) -> ToolResult:
+    """Classify a terminal detached observation, preferring fatal evidence."""
+    analyses = [
+        BuildAnalyzer.detect_build_status(tail, command)
+        for command in ("mvn", "gradle", "npm", "pytest", "make")
+    ]
+    fatal_markers = (
+        r"\bCMake Error\b",
+        r"\bconfiguration failed\b",
+        r"\bcompilation (?:error|failed)\b",
+        r"\bcannot find symbol\b",
+        r"\bTraceback \(most recent call last\)",
+        r"\bsegmentation fault\b",
+        r"\bfatal error\b",
+    )
+    fatal_tail = any(analysis["success"] is False for analysis in analyses) or any(
+        re.search(pattern, tail, flags=re.IGNORECASE) for pattern in fatal_markers
+    )
+    failed = exit_code not in (0, None) or fatal_tail
+    if failed:
+        return ToolResult.completed_failure(
+            output=tail,
+            error="Detached operation failed",
+            error_code="DETACHED_OPERATION_FAILED",
+            raw_output=tail,
+            error_tail_preview=tail[-400:],
+            output_ref=full_output_ref,
+        )
+    return ToolResult.completed_success(
+        output=tail,
+        output_ref=full_output_ref,
     )
 
 

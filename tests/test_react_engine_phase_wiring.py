@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from sag.agent.phase_machine import PhaseMachine
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
+from sag.evidence import OperationOutcome
 
 
 def _engine_with_machine():
@@ -64,7 +65,7 @@ def test_phase_blocked_signal_records_and_advances():
 
     engine._handle_phase_signals([step])
 
-    assert engine.phase_machine.records[0].status == "blocked"
+    assert engine.phase_machine.records[0].termination.value == "blocked"
     assert engine.phase_machine.current_phase == "analyze"
 
 
@@ -148,7 +149,7 @@ def test_floor_starvation_forces_blocked():
     forced = engine._enforce_phase_floors()
 
     assert forced is True
-    assert engine.phase_machine.records[0].status == "blocked"
+    assert engine.phase_machine.records[0].termination.value == "blocked"
     assert "reserved" in engine.phase_machine.records[0].reason.lower()
     assert engine.phase_machine.current_phase == "analyze"
 
@@ -270,7 +271,7 @@ def test_floor_exhaustion_auto_completes_when_gate_passes():
 
     assert forced is True
     rec = engine.phase_machine.records[0]
-    assert rec.status == "done", "green evidence at floor exhaustion must auto-complete"
+    assert rec.termination.value == "completed"
     assert "auto-completed" in rec.key_results.lower()
 
 
@@ -286,7 +287,7 @@ def test_floor_exhaustion_blocks_when_gate_fails():
     forced = engine._enforce_phase_floors()
 
     assert forced is True
-    assert engine.phase_machine.records[0].status == "blocked"
+    assert engine.phase_machine.records[0].termination.value == "blocked"
 
 
 def test_mid_phase_nudge_when_evidence_green():
@@ -344,7 +345,10 @@ def _action(tool_name, success=True, model="gpt-action"):
     return SimpleNamespace(
         step_type=StepType.ACTION,
         tool_name=tool_name,
-        tool_result=SimpleNamespace(success=success),
+        tool_result=SimpleNamespace(
+            succeeded=success,
+            operation_outcome=(OperationOutcome.SUCCESS if success else OperationOutcome.FAILED),
+        ),
         model_used=model,
         content="",
     )

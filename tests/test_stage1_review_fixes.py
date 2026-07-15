@@ -47,7 +47,7 @@ class RecorderTool(BaseTool):
         self.calls.append(dict(kwargs))
         if self.results:
             return self.results.pop(0)
-        return ToolResult(success=True, output=f"{self.name} ok")
+        return ToolResult.completed_success(output=f"{self.name} ok")
 
 
 def _bare_orchestrator(recent=None):
@@ -99,31 +99,27 @@ def _project_tool():
     analyzer = RecorderTool("analyzer")
     system = RecorderTool("system")
     env = RecorderTool("env")
-    tool = ProjectTool(
-        setup_tool=setup, analyzer_tool=analyzer, system_tool=system, env_tool=env
-    )
+    tool = ProjectTool(setup_tool=setup, analyzer_tool=analyzer, system_tool=system, env_tool=env)
     return tool, setup, analyzer, system, env
 
 
 def test_project_safe_execute_accepts_clone_parameters():
     tool, setup, *_ = _project_tool()
     result = tool.safe_execute(action="clone", repo_url="https://github.com/x/y.git")
-    assert result.success, f"{result.error_code}: {result.error}"
+    assert result.succeeded, f"{result.error_code}: {result.error}"
     assert setup.calls and setup.calls[0]["repository_url"] == "https://github.com/x/y.git"
 
 
 def test_project_safe_execute_accepts_provision_env_and_analyze_parameters():
     tool, _, analyzer, system, env = _project_tool()
 
-    assert tool.safe_execute(action="provision", java_version="17").success
+    assert tool.safe_execute(action="provision", java_version="17").succeeded
     assert system.calls[0]["java_version"] == "17"
 
-    assert tool.safe_execute(action="analyze", project_path="/workspace/p").success
+    assert tool.safe_execute(action="analyze", project_path="/workspace/p").succeeded
     assert analyzer.calls[0]["project_path"] == "/workspace/p"
 
-    assert tool.safe_execute(
-        action="env", tool="maven", executable="/opt/maven/bin/mvn"
-    ).success
+    assert tool.safe_execute(action="env", tool="maven", executable="/opt/maven/bin/mvn").succeeded
     assert env.calls[0]["executable"] == "/opt/maven/bin/mvn"
 
 
@@ -137,7 +133,7 @@ def test_project_safe_execute_passes_through_params_taught_elsewhere():
         target_directory="/workspace/custom",
         ref="v1.2.3",
     )
-    assert result.success, f"{result.error_code}: {result.error}"
+    assert result.succeeded, f"{result.error_code}: {result.error}"
     assert setup.calls[0]["target_directory"] == "/workspace/custom"
     assert setup.calls[0]["ref"] == "v1.2.3"
 
@@ -145,7 +141,7 @@ def test_project_safe_execute_passes_through_params_taught_elsewhere():
 def test_project_safe_execute_still_requires_action():
     tool, *_ = _project_tool()
     result = tool.safe_execute(repo_url="https://github.com/x/y.git")
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "MISSING_PARAMETERS"
 
 
@@ -185,9 +181,7 @@ def test_project_clone_duplicate_guard_switches_to_analyze():
         repository_url=url,
     )
 
-    params = normalizer.validate_and_fix(
-        "project", {"action": "clone", "repo_url": url}, []
-    )
+    params = normalizer.validate_and_fix("project", {"action": "clone", "repo_url": url}, [])
 
     assert params["action"] == "analyze"
 
@@ -230,7 +224,7 @@ def test_update_successful_states_records_project_clone():
     engine._update_successful_states(
         "project",
         {"action": "clone", "repo_url": "https://github.com/x/sample.git"},
-        ToolResult(success=True, output="cloned"),
+        ToolResult.completed_success(output="cloned"),
     )
     assert "https://github.com/x/sample.git" in engine.successful_states["cloned_repos"]
     assert engine.successful_states["working_directory"] == "/workspace/sample"
@@ -241,7 +235,7 @@ def test_update_successful_states_records_build_success_directory():
     engine._update_successful_states(
         "build",
         {"action": "test", "working_directory": "/workspace/app"},
-        ToolResult(success=True, output="BUILD SUCCESSFUL in 2m"),
+        ToolResult.completed_success(output="BUILD SUCCESSFUL in 2m"),
     )
     assert engine.successful_states["working_directory"] == "/workspace/app"
     assert engine.successful_states["maven_success"] is True
@@ -277,9 +271,7 @@ def test_legacy_maven_alias_falls_back_to_compile_with_args():
     build = BuildTool(None)
     normalizer = _normalizer({"build": build})
 
-    name, params = normalizer.resolve_legacy_alias(
-        "maven", {"command": "org.foo:plugin:goal"}
-    )
+    name, params = normalizer.resolve_legacy_alias("maven", {"command": "org.foo:plugin:goal"})
 
     assert name == "build"
     assert params["action"] == "compile"
@@ -328,13 +320,11 @@ class ProjectLayoutOrchestrator:
 
 def test_build_detection_falls_back_to_project_directory():
     maven = RecorderTool("maven")
-    tool = BuildTool(
-        ProjectLayoutOrchestrator("sample"), maven_tool=maven
-    )
+    tool = BuildTool(ProjectLayoutOrchestrator("sample"), maven_tool=maven)
 
     result = tool.execute(action="compile")
 
-    assert result.success, f"verdict={result.verdict}: {result.output}"
+    assert result.succeeded, f"outcome={result.operation_outcome.value}: {result.output}"
     assert maven.calls and maven.calls[0]["working_directory"] == "/workspace/sample"
 
 
@@ -342,12 +332,9 @@ def test_build_detection_falls_back_to_project_directory():
 
 
 def test_search_job_polling_is_exempt_from_repetition_detection():
-    poll_signature = (
-        "search:[('max_results', 50), ('pattern', '.'), ('target', 'job:abc123')]"
-    )
+    poll_signature = "search:[('max_results', 50), ('pattern', '.'), ('target', 'job:abc123')]"
     recent = [
-        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"}
-        for i in range(9)
+        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"} for i in range(9)
     ]
     orchestrator = _bare_orchestrator(recent=recent)
 
@@ -385,27 +372,24 @@ def _recovery_handler(tools, **overrides):
         successful_states=overrides.pop("successful_states", {}),
         repository_url=overrides.pop("repository_url", None),
         repository_ref=overrides.pop("repository_ref", None),
-        add_system_guidance=lambda message, priority=5: guidance.append(
-            (message, priority)
-        ),
+        add_system_guidance=lambda message, priority=5: guidance.append((message, priority)),
     )
 
 
 def test_build_failure_routes_to_maven_java_version_recovery():
-    maven = RecorderTool("maven", results=[ToolResult(success=True, output="build ok")])
+    maven = RecorderTool("maven", results=[ToolResult.completed_success(output="build ok")])
     system = RecorderTool(
         "system",
         results=[
-            ToolResult(success=False, output="", error="missing"),
-            ToolResult(success=True, output="installed"),
+            ToolResult.completed_failure(output="", error="missing"),
+            ToolResult.completed_success(output="installed"),
         ],
     )
     build = BuildTool(None, maven_tool=maven)
     project = ProjectTool(system_tool=system)
     handler = _recovery_handler({"build": build, "project": project})
 
-    failed = ToolResult(
-        success=False,
+    failed = ToolResult.completed_failure(
         output="",
         error="Java 17 is required",
         error_code="JAVA_VERSION_MISMATCH",
@@ -423,19 +407,16 @@ def test_build_failure_routes_to_maven_java_version_recovery():
         {"action": "verify_java", "java_version": "17"},
         {"action": "install_java", "java_version": "17"},
     ]
-    assert maven.calls == [
-        {"command": "test", "working_directory": "/workspace/app"}
-    ]
-    assert decision.replacement_result.success is True
+    assert maven.calls == [{"command": "test", "working_directory": "/workspace/app"}]
+    assert decision.replacement_result.succeeded is True
 
 
 def test_build_failure_routes_to_gradle_compile_before_test():
-    gradle = RecorderTool("gradle", results=[ToolResult(success=True, output="compiled")])
+    gradle = RecorderTool("gradle", results=[ToolResult.completed_success(output="compiled")])
     build = BuildTool(None, gradle_tool=gradle)
     handler = _recovery_handler({"build": build})
 
-    failed = ToolResult(
-        success=False,
+    failed = ToolResult.completed_failure(
         output="",
         error="Compilation failure before tests",
         error_code="BUILD_FAILED",
@@ -448,21 +429,18 @@ def test_build_failure_routes_to_gradle_compile_before_test():
 
     assert decision.should_recover is True
     assert decision.strategy == "gradle_compile_before_test"
-    assert gradle.calls == [
-        {"tasks": "compileJava", "working_directory": "/workspace/app"}
-    ]
+    assert gradle.calls == [{"tasks": "compileJava", "working_directory": "/workspace/app"}]
 
 
 def test_build_failure_routes_to_maven_known_working_directory():
-    maven = RecorderTool("maven", results=[ToolResult(success=True, output="build ok")])
+    maven = RecorderTool("maven", results=[ToolResult.completed_success(output="build ok")])
     build = BuildTool(None, maven_tool=maven)
     handler = _recovery_handler(
         {"build": build},
         successful_states={"working_directory": "/workspace/app"},
     )
 
-    failed = ToolResult(
-        success=False,
+    failed = ToolResult.completed_failure(
         output="",
         error="pom.xml not found: no such file",
         error_code="MISSING_PROJECT",
@@ -473,13 +451,11 @@ def test_build_failure_routes_to_maven_known_working_directory():
 
     assert decision.should_recover is True
     assert decision.strategy == "maven_known_working_directory"
-    assert maven.calls == [
-        {"command": "test", "working_directory": "/workspace/app"}
-    ]
+    assert maven.calls == [{"command": "test", "working_directory": "/workspace/app"}]
 
 
 def test_project_clone_failure_recovers_with_injected_repository_url():
-    setup = RecorderTool("setup", results=[ToolResult(success=True, output="cloned")])
+    setup = RecorderTool("setup", results=[ToolResult.completed_success(output="cloned")])
     project = ProjectTool(setup_tool=setup)
     handler = _recovery_handler(
         {"project": project},
@@ -487,9 +463,7 @@ def test_project_clone_failure_recovers_with_injected_repository_url():
         repository_ref="rel/1.2.3",
     )
 
-    failed = ToolResult(
-        success=False, output="", error="repository_url is required"
-    )
+    failed = ToolResult.completed_failure(output="", error="repository_url is required")
 
     decision = handler.recover("project", {"action": "clone"}, failed)
 

@@ -157,7 +157,7 @@ class GradleTool(BaseTool):
         )
         if not gradle_executable:
             install_result = self._install_gradle(working_directory)
-            if not install_result.success:
+            if not install_result.succeeded:
                 return install_result
             resolved_gradle = self._resolve_gradle_executable(
                 working_directory=working_directory,
@@ -169,8 +169,7 @@ class GradleTool(BaseTool):
                 resolved_gradle=resolved_gradle,
             )
             if not gradle_executable:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output="",
                     error="No Gradle executable could be resolved after installation",
                     error_code="GRADLE_EXECUTABLE_NOT_RESOLVED",
@@ -326,8 +325,8 @@ class GradleTool(BaseTool):
             if raw_output:
                 evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
                 return self._finalize_main_result(
-                    ToolResult(
-                        success=result["exit_code"] == 0,
+                    ToolResult.completed(
+                        operation_outcome=("success" if result["exit_code"] == 0 else "failed"),
                         output=result["output"],
                         raw_output=result["output"],
                         **evidence_fields,
@@ -345,8 +344,7 @@ class GradleTool(BaseTool):
             evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
             if result["exit_code"] == 0:
                 return self._finalize_main_result(
-                    ToolResult(
-                        success=True,
+                    ToolResult.completed_success(
                         output=self._format_success_output_enhanced(analysis, ref_id),
                         raw_output=result["output"],
                         **evidence_fields,
@@ -464,7 +462,7 @@ class GradleTool(BaseTool):
         result = self.orchestrator.execute_command(install_cmd, timeout=300)
 
         if result.get("exit_code") == 0:
-            return ToolResult(success=True, output="✅ Gradle installed successfully")
+            return ToolResult.completed_success(output="✅ Gradle installed successfully")
         else:
             raise ToolError(
                 message="Failed to install Gradle",
@@ -602,8 +600,7 @@ class GradleTool(BaseTool):
             "Run dependency resolution before the full build",
             "Retry with --info or --debug to inspect progress",
         ]
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output=(
                 f"Gradle task timed out due to {reason} after " f"{execution_time_display:.1f}s."
             ),
@@ -653,9 +650,7 @@ class GradleTool(BaseTool):
 
                 test_match = re.search(r"(\d+)\s+tests?\s+completed", line, re.IGNORECASE)
                 if not test_match:
-                    test_match = re.search(
-                        r"test run:\s*(\d+)\s+tests?", line, re.IGNORECASE
-                    )
+                    test_match = re.search(r"test run:\s*(\d+)\s+tests?", line, re.IGNORECASE)
                 if test_match:
                     analysis["test_results"]["total"] = int(test_match.group(1))
 
@@ -828,7 +823,7 @@ class GradleTool(BaseTool):
             analysis.get("build_successful") or analysis.get("exit_code") == 0
         )
         if has_test_failures and build_claimed_success:
-            fields["status"] = EvidenceAssessment.PARTIAL
+            fields["evidence_assessment"] = EvidenceAssessment.PARTIAL
             fields["conflicts"] = ["gradle_success_vs_test_failures"]
 
         if output_ref_id:
@@ -940,8 +935,7 @@ class GradleTool(BaseTool):
             metadata["output_ref_id"] = output_ref_id
 
         evidence_fields = self._gradle_evidence_fields(analysis, output_ref_id)
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output=error_snippet,
             error=error_message,
             error_code="GRADLE_BUILD_FAILED",

@@ -84,9 +84,7 @@ def _pyyaml7_test_status(total=PYYAML_TOTAL):
         "pass_rate": 100.0,
     }
     status["static_test_count"] = total
-    status["evidence_refs"] = [
-        "/workspace/.setup_agent/pytest-reports/pytest-1783686362.xml"
-    ]
+    status["evidence_refs"] = ["/workspace/.setup_agent/pytest-reports/pytest-1783686362.xml"]
     return status
 
 
@@ -105,9 +103,7 @@ def _pyyaml7_accomplishments(total=PYYAML_TOTAL):
                 "error_tests": 0,
                 "skipped_tests": 0,
                 "pass_rate": 100.0,
-                "report_files": [
-                    "/workspace/.setup_agent/pytest-reports/pytest-1783686362.xml"
-                ],
+                "report_files": ["/workspace/.setup_agent/pytest-reports/pytest-1783686362.xml"],
             },
         },
     }
@@ -211,9 +207,7 @@ def test_pyyaml7_snapshot_verdict_is_partial_not_failed():
 
 def test_pyyaml7_condensed_banner_says_partial_with_real_test_stats():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
-    snapshot = _build_real_snapshot(
-        tool, _pyyaml7_accomplishments(), _PYYAML_PROJECT_INFO
-    )
+    snapshot = _build_real_snapshot(tool, _pyyaml7_accomplishments(), _PYYAML_PROJECT_INFO)
 
     banner = tool._generate_condensed_log_output(
         "success", "setup-report-test.md", _pyyaml7_accomplishments(), snapshot
@@ -228,9 +222,7 @@ def test_pyyaml7_condensed_banner_says_partial_with_real_test_stats():
 
 def test_pyyaml7_markdown_header_says_partial_with_real_test_stats():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
-    snapshot = _build_real_snapshot(
-        tool, _pyyaml7_accomplishments(), _PYYAML_PROJECT_INFO
-    )
+    snapshot = _build_real_snapshot(tool, _pyyaml7_accomplishments(), _PYYAML_PROJECT_INFO)
 
     lines = tool._render_enhanced_header(
         "2026-07-10 08:26:16", "success", _PYYAML_PROJECT_INFO, snapshot=snapshot
@@ -248,9 +240,7 @@ def test_pyyaml7_all_three_surfaces_agree_on_partial():
     CLI final (finalization consuming the same snapshot — the bug #4 mirror)
     emit the SAME verdict."""
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
-    snapshot = _build_real_snapshot(
-        tool, _pyyaml7_accomplishments(), _PYYAML_PROJECT_INFO
-    )
+    snapshot = _build_real_snapshot(tool, _pyyaml7_accomplishments(), _PYYAML_PROJECT_INFO)
 
     agent = _agent_with_validator(
         FakePhysicalValidator(
@@ -304,11 +294,9 @@ def test_rescued_report_output_renders_real_stats_over_model_zeroed_stats(monkey
         ),
     )
 
-    result = tool.execute(
-        action="generate", summary="done", status="success", test_stats=zeroed
-    )
+    result = tool.execute(action="generate", summary="done", status="success", test_stats=zeroed)
 
-    assert result.success is True
+    assert result.succeeded is True
     assert "no tests executed" not in result.output, result.output
     assert "1287 / 1287 passed" in result.output, result.output
     assert result.test_stats is not None and result.test_stats.executed == PYYAML_TOTAL
@@ -536,12 +524,8 @@ def test_evidence_absent_blocked_build_stays_failed_on_all_surfaces():
 
     agent = _agent_with_validator(
         FakePhysicalValidator(
-            build_status=_no_evidence_accomplishments()["physical_validation"][
-                "build_status"
-            ],
-            test_status=_no_evidence_accomplishments()["physical_validation"][
-                "test_status"
-            ],
+            build_status=_no_evidence_accomplishments()["physical_validation"]["build_status"],
+            test_status=_no_evidence_accomplishments()["physical_validation"]["test_status"],
         )
     )
     _attach_engine_with_snapshot(agent, snapshot, block_phase="build")
@@ -614,38 +598,32 @@ def _java_artifact_accomplishments(total=100):
     }
 
 
-def test_java_artifact_backed_blocked_build_is_partial_on_all_surfaces():
+def test_java_artifact_backed_verdict_ignores_phase_termination_on_all_surfaces():
     project_info = {
         "directory": "/workspace/demo",
         "type": "Maven Java Project",
         "build_system": "Maven",
     }
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
-    snapshot = _build_real_snapshot(
-        tool, _java_artifact_accomplishments(), project_info
-    )
+    snapshot = _build_real_snapshot(tool, _java_artifact_accomplishments(), project_info)
 
-    assert snapshot["status"]["verdict"] == "partial"
+    assert snapshot["status"]["verdict"] == "success"
 
     banner = tool._generate_condensed_log_output(
         "success", "setup-report-test.md", _java_artifact_accomplishments(), snapshot
     )
-    assert "PARTIAL" in banner.splitlines()[0].upper(), banner
+    assert "SUCCESS" in banner.splitlines()[0].upper(), banner
     assert "100" in banner, banner
 
     agent = _agent_with_validator(
         FakePhysicalValidator(
-            build_status=_java_artifact_accomplishments()["physical_validation"][
-                "build_status"
-            ],
-            test_status=_java_artifact_accomplishments()["physical_validation"][
-                "test_status"
-            ],
+            build_status=_java_artifact_accomplishments()["physical_validation"]["build_status"],
+            test_status=_java_artifact_accomplishments()["physical_validation"]["test_status"],
         )
     )
     _attach_engine_with_snapshot(agent, snapshot, block_phase="build")
 
     ok = agent._get_verified_final_status(react_engine_success=True)
     assert ok is True
-    assert agent.final_verdict == "partial"
+    assert agent.final_verdict == "success"
     assert agent.final_verdict == snapshot["status"]["verdict"]

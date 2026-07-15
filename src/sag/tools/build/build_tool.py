@@ -62,10 +62,8 @@ class BuildTool(BaseTool):
     ) -> ToolResult:
         verb = (action or "").strip().lower()
         if verb not in ("deps", "compile", "test", "package", "install"):
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=f"Unknown build action: {action!r}",
-                verdict="failed",
                 error="invalid action",
                 suggestions=["Use action= deps | compile | test | package | install"],
             )
@@ -90,13 +88,13 @@ class BuildTool(BaseTool):
                     system = fallback_system
                     working_directory = candidate
         if system is None:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed(
+                operation_outcome="unknown",
+                evidence_status="unknown",
                 output=(
                     f"No known build system marker found in {working_directory}. "
                     "This is a detection result, not ground truth."
                 ),
-                verdict="unknown",
                 facts={"checked": checked},
                 suggestions=[
                     f"Inspect the directory: search('file:{working_directory}', '.') or bash ls",
@@ -106,10 +104,8 @@ class BuildTool(BaseTool):
 
         backend = self._backends.get(system)
         if backend is None:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=f"No backend for {system}",
-                verdict="failed",
                 error="backend unavailable",
             )
 
@@ -162,7 +158,7 @@ class BuildTool(BaseTool):
         # Bounded retry (spec §1c): a version-shaped failure means the JDK in
         # the error text is authoritative (static analysis cannot always see
         # it); re-provision from it and rerun EXACTLY once, never more.
-        if outcome is not None and not inner.success:
+        if outcome is not None and not inner.succeeded:
             failure_text = "\n".join(t for t in (inner.output, inner.raw_output) if t)
             needed = classify_version_error(failure_text)
             active = outcome.active_version or active_java_major(self.docker_orchestrator)
@@ -204,11 +200,7 @@ class BuildTool(BaseTool):
         jdk_retry: Optional[Dict[str, Optional[str]]] = None,
     ) -> ToolResult:
         facts: Dict[str, Any] = {"system": system, "action": verb}
-        verdict = (
-            inner.verdict
-            if inner.verdict in ("running", "skipped")
-            else ("success" if inner.success else "failed")
-        )
+        operation_outcome = inner.operation_outcome
         stats = inner.test_stats
         if stats is not None:
             facts.update(
@@ -218,8 +210,8 @@ class BuildTool(BaseTool):
                 skipped=stats.skipped,
                 pass_rate=stats.pass_rate,
             )
-            if inner.success and stats.failed > 0:
-                verdict = (
+            if inner.succeeded and stats.failed > 0:
+                operation_outcome = (
                     "partial" if stats.pass_rate >= self.test_pass_threshold * 100 else "failed"
                 )
         # The narration is the feature (transparency-by-construction, spec
@@ -234,19 +226,36 @@ class BuildTool(BaseTool):
         metadata = dict(inner.metadata)
         if jdk_retry:
             metadata["jdk_retry"] = jdk_retry
+        payload = {
+            "output": output,
+            "facts": facts,
+            "refs": list(inner.refs) + list(inner.evidence_refs),
+            "suggestions": inner.suggestions,
+            "error": inner.error,
+            "error_code": inner.error_code,
+            "metadata": metadata,
+            "test_stats": inner.test_stats,
+            "evidence_refs": inner.evidence_refs,
+            "raw_output": raw_output,
+        }
+        for field_name in ("failure_signature", "error_tail_preview", "output_ref"):
+            value = getattr(inner, field_name)
+            if value:
+                payload[field_name] = value
+        if inner.invocation_status.value == "completed":
+            return ToolResult.completed(
+                operation_outcome=operation_outcome,
+                evidence_status=inner.evidence_status,
+                evidence_assessment=inner.evidence_assessment,
+                **payload,
+            )
         return ToolResult(
-            success=inner.success,
-            output=output,
-            verdict=verdict,
-            facts=facts,
-            refs=list(inner.refs) + list(inner.evidence_refs),
-            suggestions=inner.suggestions,
-            error=inner.error,
-            error_code=inner.error_code,
-            metadata=metadata,
-            test_stats=inner.test_stats,
-            evidence_refs=inner.evidence_refs,
-            raw_output=raw_output,
+            invocation_status=inner.invocation_status,
+            operation_outcome=operation_outcome,
+            evidence_status=inner.evidence_status,
+            evidence_assessment=inner.evidence_assessment,
+            poll_ref=inner.poll_ref,
+            **payload,
         )
 
     def _get_parameters_schema(self) -> Dict[str, Any]:

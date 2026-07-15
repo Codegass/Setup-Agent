@@ -280,7 +280,7 @@ def test_aggregator_tracks_tool_lifecycle_and_evidence_events():
                 "tool_name": "maven",
                 "tool_params": {"goal": "compile"},
                 "status": "failure",
-                "result_success": False,
+                "result_succeeded": False,
                 "error_code": "MAVEN_FAILURE",
             },
         )

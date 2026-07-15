@@ -110,13 +110,9 @@ class ToolRecoveryHandler:
         """Route consolidated build failures to the backend-specific strategies."""
         system = (getattr(failed_result, "facts", None) or {}).get("system")
         if system == "maven":
-            return self._recover_maven_error(
-                self._maven_params_from_build(params), failed_result
-            )
+            return self._recover_maven_error(self._maven_params_from_build(params), failed_result)
         if system == "gradle":
-            return self._recover_gradle_error(
-                self._gradle_params_from_build(params), failed_result
-            )
+            return self._recover_gradle_error(self._gradle_params_from_build(params), failed_result)
         return self._no_strategy("build_no_strategy", "No build recovery strategy applicable")
 
     def _maven_params_from_build(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -376,7 +372,7 @@ class ToolRecoveryHandler:
         verify_result = system_tool.safe_execute(
             action="verify_java", java_version=required_version
         )
-        if verify_result.success:
+        if verify_result.succeeded:
             result = maven_tool.safe_execute(**params)
             return self._attempted(
                 strategy="maven_java_version",
@@ -393,7 +389,7 @@ class ToolRecoveryHandler:
         }
         install_result = system_tool.safe_execute(**install_params)
 
-        if install_result.success:
+        if install_result.succeeded:
             result = maven_tool.safe_execute(**params)
             return self._attempted(
                 strategy="maven_java_version",
@@ -543,8 +539,7 @@ class ToolRecoveryHandler:
             priority="high",
         )
 
-        result = ToolResult(
-            success=False,
+        result = ToolResult.completed_failure(
             output=(
                 f"Maven command timed out after {execution_time:.1f}s due to "
                 f"{termination_reason}.\n\nSuggestions:\n"
@@ -689,8 +684,7 @@ class ToolRecoveryHandler:
             priority="high",
         )
 
-        result = ToolResult(
-            success=False,
+        result = ToolResult.completed_failure(
             output=(
                 f"Command timed out after {execution_time:.1f}s due to "
                 f"{termination_reason}.\n\nSuggestions:\n"
@@ -757,7 +751,7 @@ class ToolRecoveryHandler:
         result = self.tools["bash"].safe_execute(**recovery_params)
         message = (
             "Recovered by recreating workspace directory and retrying command"
-            if result.success
+            if result.succeeded
             else "Workspace recreated but command still failed - may be a different issue"
         )
         return self._attempted(
@@ -780,7 +774,7 @@ class ToolRecoveryHandler:
         if bash_tool:
             bash_result = bash_tool.safe_execute(command=command, working_directory="/")
             return {
-                "success": bash_result.success,
+                "success": bash_result.succeeded,
                 "output": bash_result.output,
             }
 
@@ -834,8 +828,7 @@ class ToolRecoveryHandler:
             priority="high",
         )
 
-        result = ToolResult(
-            success=False,
+        result = ToolResult.completed_failure(
             output=(
                 f"Gradle task timed out after {execution_time:.1f}s due to "
                 f"{termination_reason}.\n\nSuggestions:\n"
@@ -912,10 +905,10 @@ class ToolRecoveryHandler:
     ) -> RecoveryDecision:
         recovery_metadata = {
             "attempted": True,
-            "success": result.success,
+            "success": result.succeeded,
             "message": message,
             "strategy": strategy,
-            "replacement_result_success": result.success,
+            "replacement_result_succeeded": result.succeeded,
             "recovery_params": recovery_params,
         }
         if metadata:
@@ -956,7 +949,7 @@ class ToolRecoveryHandler:
             "success": False,
             "message": message,
             "strategy": strategy,
-            "replacement_result_success": result.success,
+            "replacement_result_succeeded": result.succeeded,
             "recovery_params": params,
             "guidance_only": True,
         }

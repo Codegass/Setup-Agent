@@ -133,8 +133,7 @@ class BashTool(BaseTool):
         suggestions: Optional[List[str]] = None,
         raw_output: str = "",
     ) -> ToolResult:
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output=output,
             error=error,
             error_code=error_code,
@@ -715,9 +714,11 @@ class BashTool(BaseTool):
                 error_code = (
                     f"TIMEOUT_{termination_reason.upper()}"
                     if is_timeout
-                    else "MONITORING_ERROR"
-                    if termination_reason == "monitoring_error"
-                    else f"COMMAND_TERMINATED_{termination_reason.upper()}"
+                    else (
+                        "MONITORING_ERROR"
+                        if termination_reason == "monitoring_error"
+                        else f"COMMAND_TERMINATED_{termination_reason.upper()}"
+                    )
                 )
 
                 # Include monitoring info in suggestions
@@ -734,8 +735,7 @@ class BashTool(BaseTool):
                         f"CPU warnings detected: {monitoring_info['cpu_warnings']} (possible hang)"
                     )
 
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=result.get("output", ""),
                     error=error_msg,
                     suggestions=suggestions,
@@ -776,8 +776,7 @@ class BashTool(BaseTool):
                 stdout = result.get("stdout", result["output"])
                 stderr = result.get("stderr", "")
 
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=extracted_output,
                     raw_output=result["output"],
                     metadata=self._with_execution_metadata(
@@ -813,8 +812,7 @@ class BashTool(BaseTool):
                 stdout = result.get("stdout", result["output"])
                 stderr = result.get("stderr", "")
 
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=result["output"],
                     error=f"Command failed with exit code {result.get('exit_code', 'unknown')}",
                     suggestions=self._generate_error_suggestions(
@@ -893,8 +891,7 @@ class BashTool(BaseTool):
 
                 logger.info(f"🚀 Started background process with PID {pid}")
 
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=f"Background process started with PID: {pid}",
                     metadata=self._with_execution_metadata(
                         {
@@ -917,8 +914,7 @@ class BashTool(BaseTool):
                     ),
                 )
             else:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=result.get("output", ""),
                     error="Failed to start background process",
                     suggestions=[
@@ -1338,8 +1334,11 @@ class BashTool(BaseTool):
         # model retried './bin/mvn' 50x instead of using build(action='test').
         command_head = command.split("&&")[-1].strip().split()
         if command_head and any(
-            tok in ("mvn", "gradle") or tok.endswith("/mvn") or tok.endswith("/gradle")
-            or tok.endswith("mvnw") or tok.endswith("gradlew")
+            tok in ("mvn", "gradle")
+            or tok.endswith("/mvn")
+            or tok.endswith("/gradle")
+            or tok.endswith("mvnw")
+            or tok.endswith("gradlew")
             for tok in command_head[:1]
         ):
             suggestions.append(

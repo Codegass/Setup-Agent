@@ -1,5 +1,6 @@
 """Base classes for agent tools."""
 
+import hashlib
 import inspect
 import re
 from abc import ABC, abstractmethod
@@ -10,8 +11,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    ValidationInfo,
-    field_validator,
     model_validator,
 )
 
@@ -22,7 +21,6 @@ from sag.evidence import (
     InvocationStatus,
     OperationOutcome,
     TestStats,
-    coerce_evidence_status,
 )
 
 
@@ -64,8 +62,7 @@ class ToolError(Exception):
         if self.details:
             metadata["error_details"] = self.details
 
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error=self.message,
             error_code=self.error_code,
@@ -75,17 +72,6 @@ class ToolError(Exception):
             metadata=metadata,
         )
 
-
-LEGACY_VERDICT_STATES = {
-    "success": (InvocationStatus.COMPLETED, OperationOutcome.SUCCESS),
-    "partial": (InvocationStatus.COMPLETED, OperationOutcome.PARTIAL),
-    "failed": (InvocationStatus.COMPLETED, OperationOutcome.FAILED),
-    "unknown": (InvocationStatus.COMPLETED, OperationOutcome.UNKNOWN),
-    "skipped": (InvocationStatus.COMPLETED, OperationOutcome.SKIPPED),
-    "running": (InvocationStatus.PENDING, OperationOutcome.UNKNOWN),
-}
-
-VERDICTS = set(LEGACY_VERDICT_STATES)
 
 LEGAL_RESULT_STATES = {
     InvocationStatus.PENDING: {OperationOutcome.UNKNOWN},
@@ -105,8 +91,6 @@ LEGAL_RESULT_STATES = {
     InvocationStatus.CANCELLED: {OperationOutcome.UNKNOWN, OperationOutcome.SKIPPED},
 }
 
-_TEMPORARY_LEGACY_ADAPTER_MARKER = object()
-
 READ_ONLY_RESULT_FIELDS = {
     "invocation_status",
     "operation_outcome",
@@ -115,18 +99,14 @@ READ_ONLY_RESULT_FIELDS = {
     "failure_signature",
     "error_tail_preview",
     "output_ref",
-    "temporary_legacy_adapter",
-    "temporary_legacy_adapter_marker",
-    "success",
-    "status",
-    "verdict",
+    "evidence_assessment",
 }
 
 
 class ToolResult(BaseModel):
-    """Canonical tool result with a temporary legacy-input adapter."""
+    """Canonical, orthogonal tool execution result."""
 
-    model_config = ConfigDict(validate_assignment=True)
+    model_config = ConfigDict(validate_assignment=True, extra="forbid")
 
     invocation_status: InvocationStatus
     operation_outcome: OperationOutcome
@@ -135,12 +115,8 @@ class ToolResult(BaseModel):
     failure_signature: Optional[str] = None
     error_tail_preview: Optional[str] = None
     output_ref: Optional[str] = None
-    temporary_legacy_adapter_marker: Any = Field(default=None, exclude=True, repr=False)
-
-    # Task 2 removes these legacy compatibility views after all callers migrate.
-    success: bool | None = None
     output: str
-    status: EvidenceAssessment | str | None = None
+    evidence_assessment: EvidenceAssessment = EvidenceAssessment.UNKNOWN
     error: Optional[str] = None
     error_code: Optional[str] = None
     suggestions: List[str] = Field(default_factory=list)
@@ -153,125 +129,60 @@ class ToolResult(BaseModel):
     validator_findings: List[EvidenceFinding] = Field(default_factory=list)
     test_stats: Optional[TestStats] = None
 
-    verdict: Optional[str] = None
     facts: Dict[str, Any] = Field(default_factory=dict)
     refs: List[str] = Field(default_factory=list)
 
-    @model_validator(mode="before")
     @classmethod
-    def _adapt_legacy_inputs(cls, data: Any, info: ValidationInfo) -> Any:
-        if not isinstance(data, dict):
-            return data
-
-        values = dict(data)
-        if info.field_name is not None:
-            return values
-
-        canonical_fields = {"invocation_status", "operation_outcome", "evidence_status"}
-        provided_canonical = canonical_fields.intersection(values)
-        if provided_canonical:
-            if provided_canonical != canonical_fields:
-                raise ValueError("canonical result fields must be provided together")
-            marker = values.get("temporary_legacy_adapter_marker")
-            if marker is _TEMPORARY_LEGACY_ADAPTER_MARKER:
-                return values
-            if marker not in (None, False):
-                raise ValueError("temporary legacy adapter marker is internal-only")
-            cls._validate_legacy_consistency(values)
-            return values
-
-        if not any(field in values for field in ("success", "status", "verdict")):
-            return values
-
-        legacy_verdict = values.get("verdict")
-        legacy_success = values.get("success")
-        if legacy_verdict is not None:
-            invocation_status, operation_outcome = cls._legacy_verdict_state(legacy_verdict)
-        elif legacy_success is not None:
-            invocation_status = InvocationStatus.COMPLETED
-            operation_outcome = (
-                OperationOutcome.SUCCESS if bool(legacy_success) else OperationOutcome.FAILED
-            )
-        else:
-            return values
-
-        legacy_status = (
-            coerce_evidence_status(values.get("status"))
-            if values.get("status") is not None
-            else cls._status_from_success(bool(legacy_success))
+    def completed(
+        cls,
+        *,
+        output: str,
+        operation_outcome: OperationOutcome | str,
+        evidence_status: EvidenceStatus | str = EvidenceStatus.VERIFIED,
+        **payload: Any,
+    ) -> "ToolResult":
+        """Build a terminal result and fill stable provenance for failures."""
+        outcome = OperationOutcome(operation_outcome)
+        payload.setdefault(
+            "evidence_assessment",
+            {
+                OperationOutcome.SUCCESS: EvidenceAssessment.SUCCESS,
+                OperationOutcome.PARTIAL: EvidenceAssessment.PARTIAL,
+                OperationOutcome.FAILED: EvidenceAssessment.BLOCKED,
+            }.get(outcome, EvidenceAssessment.UNKNOWN),
         )
-        evidence_status = (
-            EvidenceStatus.CONFLICT
-            if legacy_status is EvidenceAssessment.CONFLICT
-            else (
-                EvidenceStatus.UNKNOWN
-                if operation_outcome is OperationOutcome.UNKNOWN
-                else EvidenceStatus.VERIFIED
-            )
-        )
-        values.update(
-            invocation_status=invocation_status,
-            operation_outcome=operation_outcome,
+        if outcome is OperationOutcome.FAILED:
+            source = str(payload.get("raw_output") or output or payload.get("error") or "")
+            digest = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()[:16]
+            error_code = str(payload.get("error_code") or "TOOL_OPERATION_FAILED")
+            payload.setdefault("error_code", error_code)
+            payload.setdefault("failure_signature", f"{error_code}:{digest}")
+            payload.setdefault("error_tail_preview", source[-400:] or error_code)
+            refs = payload.get("refs") or []
+            payload.setdefault("output_ref", refs[0] if refs else f"tool-result:{digest}")
+        return cls(
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=outcome,
             evidence_status=evidence_status,
-            temporary_legacy_adapter_marker=_TEMPORARY_LEGACY_ADAPTER_MARKER,
+            output=output,
+            **payload,
         )
-        return values
-
-    @staticmethod
-    def _legacy_verdict_state(value: Any) -> tuple[InvocationStatus, OperationOutcome]:
-        try:
-            return LEGACY_VERDICT_STATES[value]
-        except (KeyError, TypeError):
-            raise ValueError(f"verdict must be one of {sorted(VERDICTS)}, got {value!r}") from None
 
     @classmethod
-    def _validate_legacy_consistency(cls, values: Dict[str, Any]) -> None:
-        invocation_status = InvocationStatus(values["invocation_status"])
-        operation_outcome = OperationOutcome(values["operation_outcome"])
-        evidence_status = EvidenceStatus(values["evidence_status"])
+    def completed_success(cls, *, output: str, **payload: Any) -> "ToolResult":
+        return cls.completed(
+            output=output,
+            operation_outcome=OperationOutcome.SUCCESS,
+            **payload,
+        )
 
-        if "success" in values and values["success"] is not None:
-            expected_outcome = (
-                OperationOutcome.SUCCESS if bool(values["success"]) else OperationOutcome.FAILED
-            )
-            if (
-                invocation_status is not InvocationStatus.COMPLETED
-                or operation_outcome is not expected_outcome
-            ):
-                raise ValueError("legacy success contradicts canonical result fields")
-
-        if values.get("verdict") is not None:
-            expected_invocation, expected_outcome = cls._legacy_verdict_state(values["verdict"])
-            if (
-                invocation_status is not expected_invocation
-                or operation_outcome is not expected_outcome
-            ):
-                raise ValueError("legacy verdict contradicts canonical result fields")
-
-        if values.get("status") is not None:
-            legacy_status = coerce_evidence_status(values["status"])
-            expected_evidence = (
-                EvidenceStatus.CONFLICT
-                if legacy_status is EvidenceAssessment.CONFLICT
-                else (
-                    EvidenceStatus.UNKNOWN
-                    if operation_outcome is OperationOutcome.UNKNOWN
-                    else EvidenceStatus.VERIFIED
-                )
-            )
-            if evidence_status is not expected_evidence:
-                raise ValueError("legacy status contradicts canonical evidence")
-
-    @staticmethod
-    def _status_from_success(success: bool) -> EvidenceAssessment:
-        return EvidenceAssessment.SUCCESS if success else EvidenceAssessment.BLOCKED
-
-    @field_validator("status", mode="before")
     @classmethod
-    def _coerce_status(cls, value: EvidenceAssessment | str | None) -> EvidenceAssessment | None:
-        if value is None:
-            return None
-        return coerce_evidence_status(value)
+    def completed_failure(cls, *, output: str, **payload: Any) -> "ToolResult":
+        return cls.completed(
+            output=output,
+            operation_outcome=OperationOutcome.FAILED,
+            **payload,
+        )
 
     @model_validator(mode="after")
     def _validate_result_state(self) -> "ToolResult":
@@ -287,53 +198,17 @@ class ToolResult(BaseModel):
             if self.evidence_status is not EvidenceStatus.UNKNOWN:
                 raise ValueError("pending results require evidence_status='unknown'")
 
-        if self.operation_outcome is OperationOutcome.FAILED and not self.temporary_legacy_adapter:
+        if self.operation_outcome is OperationOutcome.FAILED:
             for field_name in ("failure_signature", "error_tail_preview", "output_ref"):
                 value = getattr(self, field_name)
                 if not value or not value.strip():
                     raise ValueError(f"canonical failed results require nonblank {field_name}")
             if len(self.error_tail_preview) > 400:
                 raise ValueError("error_tail_preview must be at most 400 characters")
+            if not self.error_code or not self.error_code.strip():
+                raise ValueError("canonical failed results require nonblank error_code")
 
-        if not self.temporary_legacy_adapter or self.success is None:
-            object.__setattr__(self, "success", self.succeeded)
-        elif self.invocation_status is InvocationStatus.PENDING:
-            object.__setattr__(self, "success", False)
-        if self.status is None:
-            legacy_status = (
-                self._status_from_success(bool(self.success))
-                if self.temporary_legacy_adapter
-                else self._legacy_status_from_canonical()
-            )
-            object.__setattr__(self, "status", legacy_status)
-        if self.verdict is None:
-            legacy_verdict = (
-                ("success" if self.success else "failed")
-                if self.temporary_legacy_adapter
-                else self._legacy_verdict()
-            )
-            object.__setattr__(self, "verdict", legacy_verdict)
         return self
-
-    def _legacy_status_from_canonical(self) -> EvidenceAssessment:
-        if self.evidence_status is EvidenceStatus.CONFLICT:
-            return EvidenceAssessment.CONFLICT
-        if self.operation_outcome is OperationOutcome.SUCCESS:
-            return EvidenceAssessment.SUCCESS
-        if self.operation_outcome is OperationOutcome.PARTIAL:
-            return EvidenceAssessment.PARTIAL
-        if self.operation_outcome is OperationOutcome.FAILED:
-            return EvidenceAssessment.BLOCKED
-        return EvidenceAssessment.UNKNOWN
-
-    @property
-    def temporary_legacy_adapter(self) -> bool:
-        return self.temporary_legacy_adapter_marker is _TEMPORARY_LEGACY_ADAPTER_MARKER
-
-    def _legacy_verdict(self) -> str:
-        if self.invocation_status is InvocationStatus.PENDING:
-            return "running"
-        return self.operation_outcome.value
 
     @property
     def is_terminal(self) -> bool:
@@ -703,7 +578,7 @@ class BaseTool(ABC):
             result = self.execute(**kwargs)
 
             # Apply output truncation if needed
-            if result.success and result.output:
+            if result.succeeded and result.output:
                 original_length = len(result.output)
                 result.output = self._truncate_output(result.output, self.name)
 
@@ -793,7 +668,7 @@ class BaseTool(ABC):
     def _log_execution(self, params: Dict[str, Any], result: ToolResult) -> None:
         """Log tool execution for debugging."""
         logger.debug(f"Tool {self.name} executed with params: {params}")
-        if result.success:
+        if result.succeeded:
             output_info = f"{len(result.output)} chars"
             if result.metadata.get("output_truncated"):
                 output_info += f" (truncated from {result.metadata.get('original_length', 0)})"

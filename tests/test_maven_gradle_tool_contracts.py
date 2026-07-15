@@ -164,7 +164,7 @@ def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
 
     result = tool.execute(command="test", working_directory="/workspace/project")
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "TIMEOUT_SILENT_TIMEOUT"
     assert result.metadata["termination_reason"] == "silent_timeout"
     assert result.metadata["execution_time"] == 1200.0
@@ -195,7 +195,7 @@ def test_maven_fail_at_end_test_reports_failures_despite_ignored_exit_code():
         working_directory="/workspace/project",
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "TEST_FAILURE"
     assert result.metadata["analysis"]["ignored_test_failures_detected"] is True
     assert result.metadata["analysis"]["test_failure_count"] == 1
@@ -222,8 +222,8 @@ def test_maven_success_marker_with_surefire_failures_returns_partial_evidence():
         working_directory="/workspace/project",
     )
 
-    assert result.success is False
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is False
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 214
     assert result.test_stats.failed == 3
     assert result.test_stats.skipped == 5
@@ -256,8 +256,8 @@ def test_maven_surefire_final_results_summary_does_not_double_count():
         working_directory="/workspace/project",
     )
 
-    assert result.success is False
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is False
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 2
     assert result.test_stats.failed == 1
     assert result.test_stats.skipped == 0
@@ -297,7 +297,7 @@ def test_maven_explicit_ignore_test_failures_preserves_success_result():
         working_directory="/workspace/project",
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata["analysis"]["test_failure_count"] == 1
     assert "ignored_test_failures_detected" not in result.metadata["analysis"]
 
@@ -321,8 +321,8 @@ def test_gradle_success_marker_with_failed_tests_returns_partial_evidence():
         use_wrapper=False,
     )
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 214
     assert result.test_stats.failed == 3
     assert result.test_stats.skipped == 5
@@ -352,8 +352,8 @@ def test_gradle_test_run_summary_variant_returns_partial_evidence():
         use_wrapper=False,
     )
 
-    assert result.success is True
-    assert result.status == EvidenceAssessment.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 12
     assert result.test_stats.failed == 1
     assert result.test_stats.skipped == 2
@@ -384,7 +384,7 @@ def test_maven_timeout_result_preserves_env_overlay_runtime_and_requested_versio
         maven_version_requirement="[3.9,4.0)",
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.metadata["termination_reason"] == "silent_timeout"
     assert result.metadata["maven_runtime"] == {
         "executable": "/opt/apache-maven-3.9.8/bin/mvn",
@@ -415,7 +415,7 @@ def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
         use_wrapper=False,
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "TIMEOUT_SILENT_TIMEOUT"
     assert result.metadata["termination_reason"] == "silent_timeout"
     assert result.metadata["execution_time"] == 1200.0
@@ -426,8 +426,7 @@ def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
 def test_gradle_does_not_run_path_gradle_when_manager_cannot_resolve():
     orchestrator = FakeBuildToolOrchestrator()
     tool = GradleTool(orchestrator, toolchain_manager=EmptyToolchainManager())
-    tool._install_gradle = lambda working_directory: ToolResult(
-        success=False,
+    tool._install_gradle = lambda working_directory: ToolResult.completed_failure(
         output="",
         error="Gradle unavailable",
         error_code="GRADLE_INSTALLATION_FAILED",
@@ -439,7 +438,7 @@ def test_gradle_does_not_run_path_gradle_when_manager_cannot_resolve():
         use_wrapper=False,
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "GRADLE_INSTALLATION_FAILED"
     assert all(
         not command.startswith("gradle ") for command, _kwargs in orchestrator.monitored_commands
@@ -456,15 +455,14 @@ def test_gradle_real_install_path_does_not_generate_wrapper_with_unresolved_mana
         use_wrapper=False,
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "GRADLE_EXECUTABLE_NOT_RESOLVED"
     assert any(
         "apt-get install -y gradle" in command
         for command, _workdir, _timeout in orchestrator.commands
     )
     assert all(
-        "gradle wrapper" not in command
-        for command, _workdir, _timeout in orchestrator.commands
+        "gradle wrapper" not in command for command, _workdir, _timeout in orchestrator.commands
     )
     assert all(
         not command.startswith("gradle ") for command, _kwargs in orchestrator.monitored_commands
@@ -483,7 +481,7 @@ def test_maven_tool_preserves_list_properties_when_fail_at_end_adds_ignore():
         working_directory="/workspace/project",
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     command = orchestrator.monitored_commands[0][0]
     assert "-DskipITs=true" in command
     assert "-Dmaven.test.failure.ignore=true" in command
@@ -503,7 +501,7 @@ def test_maven_tool_uses_resolved_toolchain_executable():
 
     result = tool.execute(command="compile", working_directory="/workspace/project")
 
-    assert result.success is True
+    assert result.succeeded is True
     assert orchestrator.monitored_commands[0][0].startswith("/tmp/apache-maven-3.9.6/bin/mvn ")
     assert toolchain_manager.seen_working_directory == "/workspace/project"
 
@@ -528,10 +526,8 @@ def test_maven_tool_uses_active_env_overlay_candidate():
         maven_version_requirement="[3.9,4.0)",
     )
 
-    assert result.success is True
-    assert orchestrator.monitored_commands[0][0].startswith(
-        "/opt/apache-maven-3.9.8/bin/mvn "
-    )
+    assert result.succeeded is True
+    assert orchestrator.monitored_commands[0][0].startswith("/opt/apache-maven-3.9.8/bin/mvn ")
     assert result.metadata["maven_runtime"] == {
         "executable": "/opt/apache-maven-3.9.8/bin/mvn",
         "version": "3.9.8",
@@ -564,7 +560,7 @@ def test_maven_tool_turns_explicit_version_parameter_into_requirement():
         maven_version_requirement="[3.9,4.0)",
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert toolchain_manager.seen_spec.version_requirement.raw == "[3.9,4.0)"
     assert toolchain_manager.seen_spec.version_requirement.source == "tool_parameter"
     assert toolchain_manager.seen_spec.version_requirement.kind == "range"
@@ -581,7 +577,7 @@ def test_maven_tool_does_not_fallback_when_explicit_version_is_unresolved():
         maven_version_requirement="3.9.6",
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
     assert orchestrator.monitored_commands == []
     # The JDK pre-flight's probes (manifest read, java -version) are the only
@@ -613,8 +609,7 @@ def test_maven_tool_installs_then_uses_resolved_default_executable():
     )
     tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
     install_calls = []
-    tool._install_maven = lambda: install_calls.append(True) or ToolResult(
-        success=True,
+    tool._install_maven = lambda: install_calls.append(True) or ToolResult.completed_success(
         output="Maven installed",
     )
     tool._record_test_summary = lambda *args, **kwargs: None
@@ -624,16 +619,14 @@ def test_maven_tool_installs_then_uses_resolved_default_executable():
         working_directory="/workspace/project",
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert install_calls == [True]
     assert len(toolchain_manager.seen_specs) == 2
     assert toolchain_manager.seen_working_directories == [
         "/workspace/project",
         "/workspace/project",
     ]
-    assert orchestrator.monitored_commands[0][0].startswith(
-        "/opt/apache-maven-3.9.9/bin/mvn "
-    )
+    assert orchestrator.monitored_commands[0][0].startswith("/opt/apache-maven-3.9.9/bin/mvn ")
     assert not orchestrator.monitored_commands[0][0].startswith("mvn ")
     assert result.metadata["maven_runtime"] == {
         "executable": "/opt/apache-maven-3.9.9/bin/mvn",
@@ -647,8 +640,7 @@ def test_maven_tool_does_not_use_raw_path_after_install_when_manager_cannot_reso
     toolchain_manager = EmptyToolchainManager()
     tool = MavenTool(orchestrator, toolchain_manager=toolchain_manager)
     install_calls = []
-    tool._install_maven = lambda: install_calls.append(True) or ToolResult(
-        success=True,
+    tool._install_maven = lambda: install_calls.append(True) or ToolResult.completed_success(
         output="Maven installed",
     )
 
@@ -657,7 +649,7 @@ def test_maven_tool_does_not_use_raw_path_after_install_when_manager_cannot_reso
         working_directory="/workspace/project",
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "MAVEN_EXECUTABLE_NOT_RESOLVED"
     assert install_calls == [True]
     assert orchestrator.monitored_commands == []
@@ -679,7 +671,7 @@ def test_gradle_uses_active_env_overlay_candidate():
         use_wrapper=True,
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert orchestrator.monitored_commands[0][0].startswith("/opt/gradle-8.7/bin/gradle ")
     assert toolchain_manager.seen_spec.name == "gradle"
     assert toolchain_manager.seen_spec.executable == "gradle"
@@ -701,7 +693,7 @@ def test_gradle_wrapper_keeps_priority_over_non_overlay_manager_candidate():
         use_wrapper=True,
     )
 
-    assert result.success is True
+    assert result.succeeded is True
     assert orchestrator.monitored_commands[0][0].startswith("./gradlew ")
     assert toolchain_manager.seen_spec.name == "gradle"
 
@@ -732,7 +724,7 @@ def test_maven_tool_failed_result_metadata_includes_detected_maven_requirement()
 
     result = tool.execute(command="test", working_directory="/workspace/project")
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.metadata["maven_version_requirement"] == {
         "raw": "[3.9,)",
         "source": "build_error",
@@ -762,7 +754,7 @@ def test_maven_failed_result_metadata_includes_runtime_facts_for_version_error()
 
     result = tool.execute(command="compile", working_directory="/workspace/project")
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.metadata["maven_version_requirement"]["raw"] == "[3.9,)"
     assert result.metadata["maven_runtime"] == {
         "executable": "/usr/bin/mvn",
@@ -794,7 +786,7 @@ def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidan
         raw_output=True,
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.output == output
     assert result.raw_output == output
     assert result.error_code == "MAVEN_VERSION_ERROR"
@@ -809,7 +801,9 @@ def test_maven_raw_output_failure_preserves_version_contract_and_recovery_guidan
         "source": "system",
     }
     assert any("project(action='env'" in suggestion for suggestion in result.suggestions)
-    assert any("bash" in suggestion and "download" in suggestion for suggestion in result.suggestions)
+    assert any(
+        "bash" in suggestion and "download" in suggestion for suggestion in result.suggestions
+    )
 
 
 def test_maven_tool_runs_version_command_as_diagnostic_without_pom_validation():
@@ -818,7 +812,7 @@ def test_maven_tool_runs_version_command_as_diagnostic_without_pom_validation():
 
     result = tool.execute(command="-version", working_directory="/workspace/project")
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.output == "Apache Maven 3.9.6"
     assert orchestrator.monitored_commands == []
     assert ("/usr/bin/mvn -version", "/workspace/project", None) in orchestrator.commands
@@ -830,7 +824,7 @@ def test_maven_tool_runs_prefixed_version_command_as_diagnostic():
 
     result = tool.execute(command="mvn -version", working_directory="/workspace/project")
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.output == "Apache Maven 3.9.6"
     assert orchestrator.monitored_commands == []
     assert ("/usr/bin/mvn -version", "/workspace/project", None) in orchestrator.commands

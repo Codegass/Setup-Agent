@@ -203,7 +203,7 @@ class ContextTool(BaseTool):
                 f"Context info retrieved successfully: {info.get('context_type', 'unknown')} context"
             )
 
-            return ToolResult(success=True, output=output, metadata=info)
+            return ToolResult.completed_success(output=output, metadata=info)
 
         except Exception as e:
             logger.error(f"Failed to get context info: {e}")
@@ -275,7 +275,7 @@ class ContextTool(BaseTool):
             output += f"• Use get_full_context() to review complete history\n"
             output += f"• Use complete_with_results() to summarize and switch to next task\n"
 
-            return ToolResult(success=True, output=output, metadata=result)
+            return ToolResult.completed_success(output=output, metadata=result)
 
         except ValueError as e:
             raise ToolError(
@@ -340,7 +340,7 @@ class ContextTool(BaseTool):
                 output += f"• {result.get('compression_warning', '')}\n"
                 output += f"• Consider using compact_context() for compression\n"
 
-            return ToolResult(success=True, output=output, metadata=result)
+            return ToolResult.completed_success(output=output, metadata=result)
 
         except Exception as e:
             raise ToolError(
@@ -390,8 +390,7 @@ class ContextTool(BaseTool):
             output += f"• Estimated tokens: {branch_history.token_count}\n"
             output += f"• Needs compression: {'Yes' if branch_history.token_count > branch_history.context_window_threshold else 'No'}\n"
 
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=output,
                 metadata={
                     "task_id": branch_history.task_id,
@@ -446,8 +445,7 @@ class ContextTool(BaseTool):
 
                 output += f"\n💡 Context optimized, can continue task execution\n"
 
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=output,
                     metadata={
                         "compacted_entries": len(new_context),
@@ -587,7 +585,7 @@ class ContextTool(BaseTool):
             elif result.get("all_tasks_completed"):
                 output += f"🎉 All tasks completed! Project setup finished.\n"
 
-            return ToolResult(success=True, output=output, metadata=result)
+            return ToolResult.completed_success(output=output, metadata=result)
 
         except Exception as e:
             raise ToolError(
@@ -910,7 +908,7 @@ class ContextTool(BaseTool):
                 }
             )
 
-            return ToolResult(success=True, output=output, metadata=enhanced_result)
+            return ToolResult.completed_success(output=output, metadata=enhanced_result)
 
         except Exception as e:
             raise ToolError(
@@ -1315,9 +1313,8 @@ IMPORTANT:
         build_terms = ["compile", "build", "package", "install"]
         test_terms = ["test", "tests", "verify"]
         tool_terms = ["maven", "mvn", "gradle", "gradlew", "npm", "yarn", "pnpm", "pytest"]
-        return (
-            any(term in task_description for term in build_terms + test_terms)
-            and any(term in task_description for term in tool_terms)
+        return any(term in task_description for term in build_terms + test_terms) and any(
+            term in task_description for term in tool_terms
         )
 
     def _has_required_build_or_test_tool_execution(self) -> Optional[bool]:
@@ -1525,9 +1522,7 @@ IMPORTANT:
 
             workspace = getattr(cm, "workspace_path", None)
             project_path = str(workspace) if workspace else "/workspace"
-            return PhysicalValidator(
-                docker_orchestrator=orchestrator, project_path=project_path
-            )
+            return PhysicalValidator(docker_orchestrator=orchestrator, project_path=project_path)
         except Exception as exc:
             logger.warning(f"Could not build PhysicalValidator for completion gate: {exc}")
             return None
@@ -1973,9 +1968,7 @@ IMPORTANT:
                 return True
 
             logger.warning("❌ No evidence of project analysis execution found in any source")
-            logger.info(
-                "💡 Hint: Use project(action='analyze') before completing this task"
-            )
+            logger.info("💡 Hint: Use project(action='analyze') before completing this task")
             return False
 
         except Exception as e:

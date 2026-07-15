@@ -13,7 +13,7 @@ class ExampleTool(BaseTool):
         super().__init__("example", "Example tool")
 
     def execute(self, command: str) -> ToolResult:
-        return ToolResult(success=True, output=command)
+        return ToolResult.completed_success(output=command)
 
 
 class FakeTokenTracker:
@@ -290,7 +290,7 @@ def test_gpt5_action_tool_call_request_omits_reasoning_effort(monkeypatch):
 
     def fake_completion(**params):
         captured.update(params)
-        return make_response("ACTION: example\nPARAMETERS: {\"command\": \"pwd\"}")
+        return make_response('ACTION: example\nPARAMETERS: {"command": "pwd"}')
 
     monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
     monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
@@ -306,7 +306,7 @@ def test_gpt5_action_tool_call_request_omits_reasoning_effort(monkeypatch):
 
     response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
 
-    assert response == "ACTION: example\nPARAMETERS: {\"command\": \"pwd\"}"
+    assert response == 'ACTION: example\nPARAMETERS: {"command": "pwd"}'
     assert captured["model"] == "gpt-5.4-mini"
     assert captured["temperature"] == pytest.approx(1.0)
     assert captured["max_tokens"] == 10000
