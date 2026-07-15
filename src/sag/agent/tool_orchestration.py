@@ -12,12 +12,15 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 from loguru import logger as default_logger
 
 from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
-from sag.tools.base import BaseTool, ToolResult
+from sag.tools.base import BaseTool, ToolResult, bind_tool_result_output_storage
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
 ToolExecutionStatus = Literal[
     "success",
     "pending",
+    "partial",
+    "unknown",
+    "skipped",
     "failure",
     "missing_tool",
     "validation_failed",
@@ -59,10 +62,11 @@ class ToolCall:
     model_used: Optional[str] = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ToolExecutionRecord:
     signature: str
-    success: bool
+    invocation_status: InvocationStatus
+    operation_outcome: OperationOutcome
     timestamp: str
 
 
@@ -246,11 +250,12 @@ class ToolOrchestrator:
         successful_states: Dict[str, Any],
         repository_url: Optional[str],
         repository_ref: Optional[str] = None,
-        track_tool_execution: Callable[[str, bool], None],
+        track_tool_execution: Callable[[str, ToolResult], None],
         update_successful_states: Callable[[str, Dict[str, Any], ToolResult], None],
         add_system_guidance: Callable[[str, GuidancePriority], None],
         get_timestamp: Callable[[], str],
         event_sink: Optional[Callable[[ToolLifecycleEvent], None]] = None,
+        output_storage: Any = None,
         logger: Any = None,
     ):
         from sag.agent.tool_parameters import ToolParameterNormalizer
@@ -267,6 +272,7 @@ class ToolOrchestrator:
         self.add_system_guidance = add_system_guidance
         self.get_timestamp = get_timestamp
         self.event_sink = event_sink
+        self.output_storage = output_storage
         self.logger = logger or default_logger
         self.parameter_normalizer = ToolParameterNormalizer(
             tools=self.tools,
@@ -304,6 +310,17 @@ class ToolOrchestrator:
         return root or None
 
     def execute(self, call: ToolCall) -> ToolExecution:
+        if self.output_storage is None:
+            return self._execute(call)
+        task_id = str(getattr(self.context_manager, "current_task_id", None) or call.name)
+        with bind_tool_result_output_storage(
+            self.output_storage,
+            task_id=task_id,
+            tool_name=call.name,
+        ):
+            return self._execute(call)
+
+    def _execute(self, call: ToolCall) -> ToolExecution:
         started_at = time.perf_counter()
         model_omitted_workdir = not str(
             (call.raw_params or {}).get("working_directory") or ""
@@ -466,7 +483,7 @@ class ToolOrchestrator:
         if repetition_level > 0:
             recent_executions = self._recent_executions_for_tool(call.name)
             failure_count = sum(
-                1 for execution in recent_executions if not self._execution_success(execution)
+                1 for execution in recent_executions if self._execution_failed(execution)
             )
             repetition_metadata = {
                 "repetition_level": repetition_level,
@@ -487,17 +504,17 @@ class ToolOrchestrator:
                         "tool_result",
                         call,
                         message=execution.observation_text,
-                        level="success" if execution.result.succeeded else "error",
+                        level=self._result_event_level(execution.result),
                         metadata={
                             "status": execution.status,
                             "duration_ms": execution.duration_ms,
-                            "result_succeeded": execution.result.succeeded,
                             "error_code": execution.result.error_code,
                             "executed_params": execution.executed_params,
                             "recovery_applied": execution.recovery_applied,
                             "execution_signature": signature,
                             "recovery_strategy": execution.recovery_strategy,
                             "recovery": execution.metadata.get("recovery"),
+                            **self._result_lifecycle_metadata(execution.result),
                             **repetition_metadata,
                         },
                     )
@@ -519,7 +536,7 @@ class ToolOrchestrator:
                     ],
                     metadata={"failure_category": "execution"},
                 )
-                self._track_tool_execution(signature, False)
+                self._track_tool_execution(signature, result)
                 duration_ms = self._duration_since(started_at)
                 observation_text = format_tool_result(call.name, result)
                 metadata = {
@@ -556,7 +573,6 @@ class ToolOrchestrator:
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
         except Exception as exc:
-            self._track_tool_execution(signature, False)
             result = ToolResult.completed_failure(
                 output="",
                 error=f"Tool {call.name} execution failed unexpectedly: {exc}",
@@ -566,6 +582,7 @@ class ToolOrchestrator:
                     "failure_category": "system",
                 },
             )
+            self._track_tool_execution(signature, result)
             duration_ms = self._duration_since(started_at)
             observation_text = format_tool_result(call.name, result)
             execution = ToolExecution(
@@ -598,13 +615,12 @@ class ToolOrchestrator:
         recovery_applied = False
         recovery_strategy: Optional[str] = None
         recovery_metadata: Optional[Dict[str, Any]] = None
-        status: ToolExecutionStatus = (
-            "pending"
-            if result.invocation_status is InvocationStatus.PENDING
-            else ("success" if result.succeeded else "failure")
-        )
+        status = self._result_execution_status(result)
 
-        if result.invocation_status is not InvocationStatus.PENDING and not result.succeeded:
+        if (
+            result.invocation_status is InvocationStatus.COMPLETED
+            and result.operation_outcome is OperationOutcome.FAILED
+        ):
             decision = self.recovery_handler.recover(call.name, validated_params, result)
             recovery_metadata = dict(decision.metadata)
             recovery_metadata.setdefault("attempted", decision.should_recover)
@@ -646,13 +662,17 @@ class ToolOrchestrator:
                     if recovery_metadata.get("guidance_only"):
                         status = "recovery_attempted"
                     else:
-                        status = "recovered" if result.succeeded else "recovery_failed"
+                        status = (
+                            "recovered"
+                            if result.operation_outcome is OperationOutcome.SUCCESS
+                            else "recovery_failed"
+                        )
                     recovery_applied = True
                     recovery_metadata["success"] = result.succeeded
                 else:
                     status = "recovery_attempted"
 
-        self._track_tool_execution(signature, result.succeeded)
+        self._track_tool_execution(signature, result)
         if result.succeeded:
             self._update_successful_states(call.name, executed_params, result)
 
@@ -708,11 +728,11 @@ class ToolOrchestrator:
         event_metadata = {
             "status": execution.status,
             "duration_ms": duration_ms,
-            "result_succeeded": result.succeeded,
             "error_code": result.error_code,
             "executed_params": executed_params,
             "recovery_applied": recovery_applied,
             "execution_signature": signature,
+            **self._result_lifecycle_metadata(result),
         }
         if recovery_strategy:
             event_metadata["recovery_strategy"] = recovery_strategy
@@ -728,7 +748,7 @@ class ToolOrchestrator:
             "tool_result",
             call,
             message=observation_text,
-            level="success" if result.succeeded else "error",
+            level=self._result_event_level(result),
             metadata=event_metadata,
         )
         return execution
@@ -790,10 +810,59 @@ class ToolOrchestrator:
             return execution.signature
         return str(execution.get("signature", ""))
 
-    def _execution_success(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
+    def _execution_failed(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
         if isinstance(execution, ToolExecutionRecord):
-            return execution.success
-        return bool(execution.get("success", False))
+            return execution.operation_outcome is OperationOutcome.FAILED
+        return execution.get("operation_outcome") in {
+            OperationOutcome.FAILED,
+            OperationOutcome.FAILED.value,
+        }
+
+    def _execution_succeeded(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
+        if isinstance(execution, ToolExecutionRecord):
+            return (
+                execution.invocation_status is InvocationStatus.COMPLETED
+                and execution.operation_outcome is OperationOutcome.SUCCESS
+            )
+        return execution.get("invocation_status") in {
+            InvocationStatus.COMPLETED,
+            InvocationStatus.COMPLETED.value,
+        } and execution.get("operation_outcome") in {
+            OperationOutcome.SUCCESS,
+            OperationOutcome.SUCCESS.value,
+        }
+
+    @staticmethod
+    def _result_execution_status(result: ToolResult) -> ToolExecutionStatus:
+        if result.invocation_status is InvocationStatus.PENDING:
+            return "pending"
+        return {
+            OperationOutcome.SUCCESS: "success",
+            OperationOutcome.PARTIAL: "partial",
+            OperationOutcome.UNKNOWN: "unknown",
+            OperationOutcome.SKIPPED: "skipped",
+            OperationOutcome.FAILED: "failure",
+        }[result.operation_outcome]
+
+    @staticmethod
+    def _result_event_level(result: ToolResult) -> ToolLifecycleLevel:
+        if result.invocation_status is InvocationStatus.PENDING:
+            return "info"
+        return {
+            OperationOutcome.SUCCESS: "success",
+            OperationOutcome.PARTIAL: "warning",
+            OperationOutcome.UNKNOWN: "info",
+            OperationOutcome.SKIPPED: "info",
+            OperationOutcome.FAILED: "error",
+        }[result.operation_outcome]
+
+    @staticmethod
+    def _result_lifecycle_metadata(result: ToolResult) -> Dict[str, str]:
+        return {
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
+        }
 
     def _recent_executions_for_tool(
         self, tool_name: str
@@ -981,7 +1050,7 @@ class ToolOrchestrator:
                 metadata={"exception_type": type(exc).__name__},
             )
 
-        self._track_tool_execution(signature, result.succeeded)
+        self._track_tool_execution(signature, result)
         status: ToolExecutionStatus = "recovered" if result.succeeded else "recovery_failed"
         observation_text = format_tool_result(call.name, result)
         recovery_params = self._java_auto_fix_recovery_params(result)
@@ -1212,9 +1281,9 @@ class ToolOrchestrator:
         except Exception as exc:
             self.logger.warning(f"Failed to log unknown tool to error logger: {exc}")
 
-    def _track_tool_execution(self, signature: str, success: bool) -> None:
+    def _track_tool_execution(self, signature: str, result: ToolResult) -> None:
         try:
-            self.track_tool_execution(signature, success)
+            self.track_tool_execution(signature, result)
         except Exception as exc:
             self.logger.warning(f"Failed to track tool execution: {exc}")
 

@@ -17,7 +17,11 @@ from .build_preflight import (
     classify_version_error,
     read_build_requirements,
 )
-from .build_utils import detached_handoff_tool_result
+from .build_utils import (
+    classify_detached_completion,
+    detached_handoff_tool_result,
+    detached_poll_ref,
+)
 from .toolchain_manager import ToolchainManager, ToolchainSpec
 
 
@@ -309,7 +313,7 @@ class GradleTool(BaseTool):
             # persist the complete log so output_search surfaces the real failure.
             full_output = result.get("full_output") or result["output"]
             ref_id = None
-            if len(full_output) > 800:
+            if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
                     contexts_dir = Path("/workspace/.setup_agent/contexts")
                     self.output_storage = OutputStorageManager(contexts_dir, self.orchestrator)
@@ -321,6 +325,30 @@ class GradleTool(BaseTool):
                     metadata={"command": gradle_cmd, "exit_code": result["exit_code"]},
                 )
                 logger.debug(f"Stored Gradle output with ref_id: {ref_id}")
+
+            if result.get("dispatch_status") == "completed_detached":
+                detached_result = classify_detached_completion(
+                    result.get("exit_code"),
+                    str(result.get("output") or ""),
+                    ref_id,
+                    full_output=str(full_output),
+                    poll_ref=detached_poll_ref(result),
+                )
+                if not detached_result.succeeded:
+                    detached_result.metadata.update(
+                        {
+                            "command": gradle_cmd,
+                            "exit_code": result.get("exit_code"),
+                            "analysis": analysis,
+                            "dispatch_status": "completed_detached",
+                            "output_ref_id": ref_id,
+                        }
+                    )
+                    return self._finalize_main_result(
+                        detached_result,
+                        preamble,
+                        jdk_retry_meta,
+                    )
 
             if raw_output:
                 evidence_fields = self._gradle_evidence_fields(analysis, ref_id)

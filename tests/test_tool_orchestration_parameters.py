@@ -56,7 +56,7 @@ def _orchestrator(**overrides):
             },
         ),
         repository_url=overrides.pop("repository_url", None),
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -105,7 +105,7 @@ def test_parameter_alias_default_and_state_injection_are_recorded():
         (
             "bash:[('command', 'echo hi'), ('timeout', 60), "
             "('working_directory', '/workspace/project')]",
-            True,
+            execution.result,
         )
     ]
     assert len(state_updates) == 1

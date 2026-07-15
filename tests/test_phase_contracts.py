@@ -88,3 +88,21 @@ def test_phase_records_are_append_only_and_skip_has_its_own_type():
         PhaseSkipRecord(phase="test", attempt_id="test-skip-1", transition="policy"),
         PhaseSkipRecord,
     )
+
+
+def test_phase_record_evidence_and_history_reject_external_mutation():
+    machine = PhaseMachine()
+    machine.mark_done("provisioned", ["overlay:java"])
+    record = machine.records[0]
+
+    assert record.evidence == ("overlay:java",)
+    with pytest.raises(AttributeError):
+        record.evidence.append("fabricated")
+    with pytest.raises(AttributeError):
+        machine.records.append(record)
+
+    projected_history = machine.records
+    with pytest.raises(TypeError):
+        projected_history[0] = record
+
+    assert machine.records == (record,)

@@ -54,7 +54,7 @@ class PhaseAttemptRecord:
     transition: str = ""
     key_results: str = ""
     reason: str = ""
-    evidence: List[str] = field(default_factory=list)
+    evidence: tuple[str, ...] = field(default_factory=tuple)
     legacy_claim: bool = False
 
     def __post_init__(self) -> None:
@@ -66,7 +66,7 @@ class PhaseAttemptRecord:
             )
         object.__setattr__(self, "termination", termination)
         object.__setattr__(self, "outcome", outcome)
-        object.__setattr__(self, "evidence", list(self.evidence))
+        object.__setattr__(self, "evidence", tuple(self.evidence))
 
 
 @dataclass(frozen=True)
@@ -78,7 +78,11 @@ class PhaseSkipRecord(PhaseAttemptRecord):
 class PhaseMachine:
     def __init__(self):
         self._index = 0
-        self.records: List[PhaseAttemptRecord] = []
+        self._records: List[PhaseAttemptRecord] = []
+
+    @property
+    def records(self) -> tuple[PhaseAttemptRecord, ...]:
+        return tuple(self._records)
 
     @property
     def current_phase(self) -> Optional[str]:
@@ -95,11 +99,11 @@ class PhaseMachine:
             raise ValueError(
                 f"phase record for {record.phase!r} cannot advance {self.current_phase!r}"
             )
-        self.records.append(record)
+        self._records.append(record)
         self._index += 1
 
     def _attempt_id(self) -> str:
-        return f"{self.current_phase}-{len(self.records) + 1}"
+        return f"{self.current_phase}-{len(self._records) + 1}"
 
     def mark_done(self, key_results: str, evidence: List[str]) -> None:
         """Adapt a legacy done claim without inventing an evidence outcome."""
@@ -133,7 +137,7 @@ class PhaseMachine:
 
     def termination_state(self) -> str:
         """Report flow closure only; phase outcomes never become a run verdict."""
-        if any(record.termination is PhaseTermination.ABORTED for record in self.records):
+        if any(record.termination is PhaseTermination.ABORTED for record in self._records):
             return "aborted"
         if self.is_complete:
             return "completed"
@@ -142,7 +146,7 @@ class PhaseMachine:
     def digest_lines(self) -> List[str]:
         """Compact trunk picture for the phase-start window (GTD digest)."""
         lines = []
-        for record in self.records:
+        for record in self._records:
             if record.termination is PhaseTermination.COMPLETED:
                 lines.append(f"✓ {record.phase}: {record.key_results[:200]}")
             else:

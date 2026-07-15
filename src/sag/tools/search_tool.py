@@ -8,7 +8,10 @@ WebSearchTool internals; file/job targets grep inside the container.
 import shlex
 from typing import Any, Dict
 
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
+
 from .base import BaseTool, ToolResult
+from .internal.build_utils import classify_detached_completion
 
 
 class SearchTool(BaseTool):
@@ -30,7 +33,7 @@ class SearchTool(BaseTool):
         if target.startswith("file:"):
             return self._grep_container(target[5:], pattern, max_results)
         if target.startswith("job:"):
-            return self._grep_container(f"/tmp/sag_jobs/{target[4:]}.log", pattern, max_results)
+            return self._poll_job(target[4:])
         if target.startswith("web:"):
             return self._web(target[4:], max_results)
         if target.startswith("output_") and self.output_search is not None:
@@ -46,6 +49,61 @@ class SearchTool(BaseTool):
                 "Use 'job:<id>' to grep a background job log",
                 "Use 'web:<query>' for a web search",
             ],
+        )
+
+    def _poll_job(self, job_id: str) -> ToolResult:
+        poll_ref = f"job:{job_id}"
+        try:
+            handle = self.docker_orchestrator.detached_handle(job_id)
+        except ValueError as exc:
+            return ToolResult.completed_failure(
+                output=f"Invalid background job reference: {poll_ref}",
+                error=str(exc),
+                error_code="INVALID_DETACHED_JOB_REF",
+            )
+
+        poll = self.docker_orchestrator.poll_detached_command(handle, tail_lines=50)
+        tail = str(poll.get("tail") or "")
+        if poll.get("running") or poll.get("state") == "running":
+            return ToolResult(
+                invocation_status=InvocationStatus.PENDING,
+                operation_outcome=OperationOutcome.UNKNOWN,
+                evidence_status=EvidenceStatus.UNKNOWN,
+                poll_ref=poll_ref,
+                output=tail or "Background operation is still running.",
+                refs=[poll_ref],
+                metadata={
+                    "dispatch_status": "running_detached",
+                    "job_id": job_id,
+                    "log_path": handle["log_path"],
+                    "log_size": poll.get("log_size", 0),
+                },
+            )
+
+        if poll.get("finished") or poll.get("state") in {"finished", "vanished"}:
+            completed = self.docker_orchestrator.collect_detached_result(handle, poll)
+            full_output = str(completed.get("full_output") or completed.get("output") or tail)
+            result = classify_detached_completion(
+                completed.get("exit_code"),
+                str(completed.get("output") or tail),
+                full_output=full_output,
+                poll_ref=poll_ref,
+            )
+            result.metadata.update(
+                {
+                    "dispatch_status": "completed_detached",
+                    "job_id": job_id,
+                    "log_path": handle["log_path"],
+                    "log_size": poll.get("log_size", 0),
+                }
+            )
+            result.refs.append(poll_ref)
+            return result
+
+        return classify_detached_completion(
+            None,
+            tail or "Detached process state could not be established.",
+            poll_ref=poll_ref,
         )
 
     def _grep_container(self, path: str, pattern: str, max_results: int) -> ToolResult:

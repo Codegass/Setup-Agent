@@ -2,7 +2,7 @@ from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
 from sag.config.prompt_loader import load_react_engine_prompts
-from sag.evidence import EvidenceAssessment
+from sag.evidence import EvidenceAssessment, EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType
 
@@ -72,6 +72,7 @@ def _engine_with_context(context=None):
         tools=engine.tools,
     )
     engine.recent_tool_executions = []
+    engine.max_recent_executions = 10
     engine.successful_states = {"working_directory": None}
     engine.repository_url = "https://example.test/repo.git"
     engine.current_iteration = 7
@@ -110,6 +111,24 @@ def test_build_tool_call_from_step_preserves_action_metadata():
     assert call.source_step_index == 7
     assert call.model_used == "action-model"
     assert call.validated_params is None
+
+
+def test_react_engine_tracks_pending_with_canonical_lifecycle_record():
+    engine = _engine_with_context()
+    result = ToolResult(
+        invocation_status=InvocationStatus.PENDING,
+        operation_outcome=OperationOutcome.UNKNOWN,
+        evidence_status=EvidenceStatus.UNKNOWN,
+        poll_ref="job:pending-1",
+        output="still running",
+    )
+
+    engine._track_tool_execution("build:[('action', 'test')]", result)
+
+    record = engine.recent_tool_executions[0]
+    assert record.invocation_status is InvocationStatus.PENDING
+    assert record.operation_outcome is OperationOutcome.UNKNOWN
+    assert not hasattr(record, "success")
 
 
 def test_get_tool_orchestrator_wires_engine_dependencies():

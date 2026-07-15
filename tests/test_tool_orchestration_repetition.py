@@ -1,4 +1,5 @@
-from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
+from sag.agent.tool_orchestration import ToolCall, ToolExecutionRecord, ToolOrchestrator
+from sag.evidence import InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolResult
 
 
@@ -51,7 +52,12 @@ def _bash_signature(command):
 
 def _recent_executions(signature, count, *, success=False):
     return [
-        {"signature": signature, "success": success, "timestamp": f"ts-{index}"}
+        ToolExecutionRecord(
+            signature=signature,
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=(OperationOutcome.SUCCESS if success else OperationOutcome.FAILED),
+            timestamp=f"ts-{index}",
+        )
         for index in range(count)
     ]
 
@@ -66,7 +72,7 @@ def _orchestrator(*, tools, recent_tool_executions, context_manager=None, tracki
         recent_tool_executions=recent_tool_executions,
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -84,7 +90,7 @@ def test_java_repetition_auto_fix_emits_required_recovery_and_result_events():
         recent_tool_executions=_recent_executions(signature, 5),
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -131,7 +137,7 @@ def test_repetition_level_one_executes_with_warning_output():
     assert execution.result.output.startswith("REPETITIVE EXECUTION WARNING")
     assert "real output" in execution.result.output
     assert execution.metadata["repetition_level"] == 1
-    assert tracking_calls == [(signature, True)]
+    assert tracking_calls == [(signature, execution.result)]
 
 
 def test_repetition_level_two_executes_with_force_thinking_metadata():
@@ -154,7 +160,7 @@ def test_repetition_level_two_executes_with_force_thinking_metadata():
     assert "guided output" in execution.result.output
     assert execution.metadata["repetition_level"] == 2
     assert execution.metadata["force_thinking_next"] is True
-    assert tracking_calls == [(signature, True)]
+    assert tracking_calls == [(signature, execution.result)]
 
 
 def test_repetition_level_three_breaks_without_execution_and_forces_next_task():
@@ -180,7 +186,7 @@ def test_repetition_level_three_breaks_without_execution_and_forces_next_task():
     assert execution.metadata["repetition_level"] == 3
     assert execution.metadata["force_next_task"] is True
     assert context.force_next_task_calls == 0
-    assert tracking_calls == [(signature, False)]
+    assert tracking_calls == [(signature, execution.result)]
 
 
 def test_java_repetition_triggers_auto_fix():
@@ -215,7 +221,7 @@ def test_java_repetition_triggers_auto_fix():
     ]
     assert execution.metadata["repetition_level"] == 3
     assert execution.metadata["recovery_strategy"] == "java_configuration_auto_fix"
-    assert tracking_calls == [(signature, True)]
+    assert tracking_calls == [(signature, execution.result)]
 
 
 def test_generic_java_path_repetition_breaks_without_java_auto_fix(monkeypatch):
@@ -250,4 +256,4 @@ def test_generic_java_path_repetition_breaks_without_java_auto_fix(monkeypatch):
     assert execution.executed_params is None
     assert tool.calls == 0
     assert auto_fix_calls == []
-    assert tracking_calls == [(signature, False)]
+    assert tracking_calls == [(signature, execution.result)]

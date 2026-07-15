@@ -57,7 +57,7 @@ def _orchestrator(rec):
         recent_tool_executions=[],
         successful_states={"working_directory": "/workspace", "cloned_repos": set()},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",

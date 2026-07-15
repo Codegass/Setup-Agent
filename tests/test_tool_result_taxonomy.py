@@ -3,7 +3,7 @@ import json
 import pytest
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
-from sag.tools.base import ToolResult
+from sag.tools.base import ToolResult, bind_tool_result_output_storage
 
 FAILURE_PROVENANCE = {
     "failure_signature": "maven:BUILD_FAILED:compiler",
@@ -122,6 +122,47 @@ def test_canonical_failed_result_bounds_error_tail_preview():
 
     with pytest.raises(ValueError, match="error_tail_preview.*400"):
         ToolResult(**values)
+
+
+def test_failure_factory_refuses_to_fabricate_output_storage_ref():
+    with bind_tool_result_output_storage(None):
+        with pytest.raises(ValueError, match="durable.*output"):
+            ToolResult.completed_failure(
+                output="short failure",
+                error="failed",
+                error_code="SHORT_FAILURE",
+            )
+
+
+def test_failure_factory_promotes_existing_output_storage_evidence_ref(tmp_path):
+    from sag.agent.output_storage import OutputStorageManager
+
+    storage = OutputStorageManager(tmp_path)
+    ref = storage.store_output(
+        task_id="maven",
+        tool_name="maven",
+        output="maven failed",
+    )
+    with bind_tool_result_output_storage(storage):
+        result = ToolResult.completed_failure(
+            output="maven failed",
+            error="failed",
+            error_code="MAVEN_BUILD_FAILED",
+            evidence_refs=[ref],
+        )
+
+    assert result.output_ref == ref
+    assert storage.retrieve_output(result.output_ref) == "maven failed"
+
+
+def test_failure_factory_rejects_unresolvable_output_ref():
+    with pytest.raises(ValueError, match="resolvable.*OutputStorage"):
+        ToolResult.completed_failure(
+            output="failed",
+            error="failed",
+            error_code="FAILED",
+            output_ref="tool-result:fabricated",
+        )
 
 
 def test_canonical_result_has_no_legacy_adapter_or_truth_fields():

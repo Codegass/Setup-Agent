@@ -33,7 +33,7 @@ def test_done_advances_and_records_key_results():
     assert rec.outcome is PhaseOutcome.UNKNOWN
     assert rec.legacy_claim is True
     assert rec.key_results == "cloned repo; JDK 17 installed"
-    assert rec.evidence == ["overlay:java"]
+    assert rec.evidence == ("overlay:java",)
 
 
 def test_blocked_advances_with_honest_record():

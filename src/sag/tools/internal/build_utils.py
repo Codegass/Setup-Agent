@@ -13,7 +13,20 @@ from loguru import logger
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 
-from ..base import ToolResult
+from ..base import ToolResult, is_output_storage_ref
+
+
+def detached_poll_ref(result: Dict[str, Any]) -> str:
+    """Return the stable public poll reference for a detached raw result."""
+    dispatch = result.get("dispatch") or {}
+    job_id = dispatch.get("job_id")
+    log_path = dispatch.get("log_path")
+    if not job_id and log_path:
+        match = re.fullmatch(r"/tmp/sag_jobs/([A-Za-z0-9_-]+)\.log", str(log_path))
+        job_id = match.group(1) if match else None
+    if not job_id:
+        raise ValueError("detached execution requires a stable job id")
+    return f"job:{job_id}"
 
 
 def detached_handoff_tool_result(
@@ -25,9 +38,9 @@ def detached_handoff_tool_result(
     operation's eventual outcome.
     """
     dispatch = result.get("dispatch") or {}
-    job_id = dispatch.get("job_id")
+    poll_ref = detached_poll_ref(result)
+    job_id = poll_ref.removeprefix("job:")
     log_path = dispatch.get("log_path")
-    poll_ref = f"job:{job_id}" if job_id else f"log:{log_path}"
     return ToolResult(
         invocation_status=InvocationStatus.PENDING,
         operation_outcome=OperationOutcome.UNKNOWN,
@@ -43,6 +56,7 @@ def detached_handoff_tool_result(
             "command": command,
             "job_id": job_id,
             "pid": dispatch.get("pid"),
+            "pid_path": dispatch.get("pid_path"),
             "log_path": log_path,
             "exit_code_path": dispatch.get("exit_code_path"),
             "soft_timeout": dispatch.get("soft_timeout"),
@@ -53,9 +67,14 @@ def detached_handoff_tool_result(
 def classify_detached_completion(
     exit_code: int | None,
     tail: str,
-    full_output_ref: str,
+    full_output_ref: str | None = None,
+    *,
+    full_output: str | None = None,
+    poll_ref: str | None = None,
 ) -> ToolResult:
     """Classify a terminal detached observation, preferring fatal evidence."""
+    if full_output_ref is not None and not is_output_storage_ref(full_output_ref):
+        raise ValueError("detached completion output ref must be an OutputStorage output_* ref")
     analyses = [
         BuildAnalyzer.detect_build_status(tail, command)
         for command in ("mvn", "gradle", "npm", "pytest", "make")
@@ -72,19 +91,30 @@ def classify_detached_completion(
     fatal_tail = any(analysis["success"] is False for analysis in analyses) or any(
         re.search(pattern, tail, flags=re.IGNORECASE) for pattern in fatal_markers
     )
-    failed = exit_code not in (0, None) or fatal_tail
+    failed = (exit_code is not None and exit_code != 0) or fatal_tail
     if failed:
         return ToolResult.completed_failure(
             output=tail,
             error="Detached operation failed",
             error_code="DETACHED_OPERATION_FAILED",
-            raw_output=tail,
+            raw_output=full_output or tail,
             error_tail_preview=tail[-400:],
+            output_ref=full_output_ref,
+            poll_ref=poll_ref,
+        )
+    if exit_code is None:
+        return ToolResult(
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            evidence_status=EvidenceStatus.UNKNOWN,
+            poll_ref=poll_ref,
+            output=tail,
             output_ref=full_output_ref,
         )
     return ToolResult.completed_success(
         output=tail,
         output_ref=full_output_ref,
+        poll_ref=poll_ref,
     )
 
 

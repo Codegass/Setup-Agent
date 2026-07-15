@@ -24,6 +24,35 @@ class FakeOrchestrator:
                 return resp
         return {"success": True, "output": "", "exit_code": 0}
 
+    def detached_handle(self, job_id):
+        return {
+            "job_id": job_id,
+            "log_path": f"/tmp/sag_jobs/{job_id}.log",
+            "exit_code_path": f"/tmp/sag_jobs/{job_id}.log.exit",
+            "pid_path": f"/tmp/sag_jobs/{job_id}.pid",
+        }
+
+    def poll_detached_command(self, handle, **kwargs):
+        response = self.responses.get("sag_jobs/abc.log", {})
+        exit_code = response.get("exit_code")
+        return {
+            "finished": exit_code is not None,
+            "running": exit_code is None,
+            "exit_code": exit_code,
+            "tail": response.get("output", ""),
+            "log_size": len(response.get("output", "")),
+            "probe_success": True,
+            "state": "finished" if exit_code is not None else "running",
+        }
+
+    def collect_detached_result(self, handle, poll):
+        return {
+            "exit_code": poll["exit_code"],
+            "output": poll["tail"],
+            "full_output": poll["tail"],
+            "dispatch_status": "completed_detached",
+        }
+
 
 def test_file_target_greps_in_container():
     orch = FakeOrchestrator(
@@ -40,7 +69,7 @@ def test_file_target_greps_in_container():
     assert any("grep" in c and "pom.xml" in c for c in orch.commands)
 
 
-def test_job_target_greps_job_log():
+def test_job_target_polls_original_operation():
     orch = FakeOrchestrator(
         responses={
             "sag_jobs/abc.log": {"success": True, "output": "BUILD SUCCESSFUL", "exit_code": 0}
@@ -50,8 +79,10 @@ def test_job_target_greps_job_log():
 
     result = tool.execute(target="job:abc", pattern="BUILD")
 
+    assert result.succeeded is True
+    assert result.poll_ref == "job:abc"
     assert "BUILD SUCCESSFUL" in result.output
-    assert any("/tmp/sag_jobs/abc.log" in c for c in orch.commands)
+    assert orch.commands == []
 
 
 def test_ref_target_delegates_to_output_search():

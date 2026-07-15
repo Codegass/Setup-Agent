@@ -1,6 +1,6 @@
 import json
 
-from sag.evidence import EvidenceAssessment, TestStats
+from sag.evidence import EvidenceAssessment, EvidenceStatus, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool, build_stored_test_analysis
@@ -202,6 +202,46 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     assert result.metadata["evidence_status"] == "partial"
     assert result.raw_data["evidence_status"] == "partial"
     assert result.raw_data["test_stats"]["pass_rate"] == 96.3
+
+
+def test_report_conflict_assessment_sets_canonical_conflict_status(monkeypatch):
+    tool = ReportTool()
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_generate_comprehensive_report",
+        lambda summary, status, details, **kwargs: (
+            "# Full Report",
+            "success",
+            "setup-report-test.md",
+            {"build_success": True, "test_success": True},
+            {
+                "status": "success",
+                "evidence_result": {
+                    "status": "conflict",
+                    "conflicts": ["build_vs_tests"],
+                    "evidence_refs": ["output_report_conflict"],
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_generate_condensed_log_output",
+        lambda *args, **kwargs: "condensed",
+    )
+
+    result = tool.execute(
+        action="generate",
+        summary="done",
+        status="success",
+        evidence_status="conflict",
+        conflicts=["build_vs_tests"],
+        evidence_refs=["output_report_conflict"],
+    )
+
+    assert result.evidence_assessment is EvidenceAssessment.CONFLICT
+    assert result.evidence_status is EvidenceStatus.CONFLICT
 
 
 def test_real_report_renderer_includes_evidence_result(monkeypatch):

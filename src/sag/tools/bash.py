@@ -11,7 +11,11 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolError, ToolResult
-from .internal.build_utils import detached_handoff_tool_result
+from .internal.build_utils import (
+    classify_detached_completion,
+    detached_handoff_tool_result,
+    detached_poll_ref,
+)
 
 
 @dataclass
@@ -686,6 +690,32 @@ class BashTool(BaseTool):
             # the background; tell the agent how to poll the log tail.
             if result.get("dispatch_status") == "running_detached":
                 return detached_handoff_tool_result("bash", command, result)
+
+            if result.get("dispatch_status") == "completed_detached":
+                detached_result = classify_detached_completion(
+                    result.get("exit_code"),
+                    str(result.get("output") or ""),
+                    full_output=str(result.get("full_output") or result.get("output") or ""),
+                    poll_ref=detached_poll_ref(result),
+                )
+                if not detached_result.succeeded:
+                    detached_result.metadata.update(
+                        self._with_execution_metadata(
+                            {
+                                "dispatch_status": "completed_detached",
+                                "exit_code": result.get("exit_code"),
+                                "execution_directory": workdir,
+                                "environment_vars": env_vars,
+                                "timeout": timeout,
+                            },
+                            command=command,
+                            working_directory=workdir,
+                            exit_code=result.get("exit_code"),
+                            timed_out=False,
+                            duration=result.get("duration"),
+                        )
+                    )
+                    return detached_result
 
             # Handle timeout terminations
             if result.get("termination_reason"):

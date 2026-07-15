@@ -29,6 +29,7 @@ from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ToolCall,
     ToolExecution,
+    ToolExecutionRecord,
     ToolLifecycleEvent,
     ToolOrchestrator,
 )
@@ -1306,6 +1307,7 @@ class ReActEngine(UIEventEmitter):
             add_system_guidance=self._add_system_guidance,
             get_timestamp=self._get_timestamp,
             event_sink=self._handle_tool_lifecycle_event,
+            output_storage=self.output_storage,
             logger=logger,
         )
 
@@ -1737,13 +1739,14 @@ class ReActEngine(UIEventEmitter):
         except Exception as e:
             logger.error(f"Failed to propagate working directory change: {e}")
 
-    def _track_tool_execution(self, tool_signature: str, success: bool):
+    def _track_tool_execution(self, tool_signature: str, result: ToolResult):
         """Track tool execution to detect repetitive patterns."""
-        execution_info = {
-            "signature": tool_signature,
-            "success": success,
-            "timestamp": self._get_timestamp(),
-        }
+        execution_info = ToolExecutionRecord(
+            signature=tool_signature,
+            invocation_status=result.invocation_status,
+            operation_outcome=result.operation_outcome,
+            timestamp=self._get_timestamp(),
+        )
 
         self.recent_tool_executions.append(execution_info)
 

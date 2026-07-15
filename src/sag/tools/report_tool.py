@@ -10,7 +10,13 @@ from sag import __version__
 from sag.agent.context_manager import TaskStatus
 from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_EXECUTION_THRESHOLD, DEFAULT_TEST_PASS_THRESHOLD
-from sag.evidence import TestStats, aggregate_evidence_status, coerce_evidence_status
+from sag.evidence import (
+    EvidenceAssessment,
+    EvidenceStatus,
+    TestStats,
+    aggregate_evidence_status,
+    coerce_evidence_status,
+)
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
 from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metrics
@@ -179,6 +185,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         result_conflicts = list(conflicts or [])
         result_evidence_refs = list(evidence_refs or [])
         result_evidence_status = self._coerce_report_evidence_status(evidence_status, status)
+        canonical_evidence_status = self._canonical_report_evidence_status(result_evidence_status)
 
         # IDEMPOTENCY CHECK: Prevent multiple report generation
         # Check if a report was already generated recently (within last 5 minutes)
@@ -216,6 +223,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                             result_test_stats,
                             result_conflicts,
                         ),
+                        evidence_status=canonical_evidence_status,
                         evidence_assessment=result_evidence_status,
                         test_stats=result_test_stats,
                         conflicts=result_conflicts,
@@ -397,6 +405,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
                 return ToolResult.completed_success(
                     output=condensed_output,
+                    evidence_status=canonical_evidence_status,
                     evidence_assessment=metadata["evidence_status"],
                     metadata=metadata,
                     documentation_links=[],
@@ -502,6 +511,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             mapped = self._map_report_status_to_evidence_status(status)
             return coerce_evidence_status(mapped)
         return coerce_evidence_status(None)
+
+    @staticmethod
+    def _canonical_report_evidence_status(
+        assessment: EvidenceAssessment,
+    ) -> EvidenceStatus:
+        if assessment is EvidenceAssessment.CONFLICT:
+            return EvidenceStatus.CONFLICT
+        if assessment is EvidenceAssessment.UNKNOWN:
+            return EvidenceStatus.UNKNOWN
+        return EvidenceStatus.VERIFIED
 
     def _resolve_report_evidence_result(
         self,

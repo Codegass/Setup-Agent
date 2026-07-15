@@ -96,7 +96,7 @@ def _orchestrator(
         successful_states=successful_states,
         repository_url=repository_url,
         repository_ref=repository_ref,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -245,7 +245,7 @@ def test_recovery_and_error_events_include_required_metadata():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",

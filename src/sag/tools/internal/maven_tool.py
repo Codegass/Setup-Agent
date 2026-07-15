@@ -20,7 +20,11 @@ from .build_preflight import (
     classify_version_error,
     read_build_requirements,
 )
-from .build_utils import detached_handoff_tool_result
+from .build_utils import (
+    classify_detached_completion,
+    detached_handoff_tool_result,
+    detached_poll_ref,
+)
 from .command_tracker import CommandTracker
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
@@ -468,7 +472,7 @@ class MavenTool(BaseTool):
             # can surface the real failure, not just a 50-line tail.
             full_output = result.get("full_output") or result["output"]
             ref_id = None
-            if len(full_output) > 800:
+            if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
                     contexts_dir = Path("/workspace/.setup_agent/contexts")
                     self.output_storage = OutputStorageManager(contexts_dir, self.orchestrator)
@@ -480,6 +484,31 @@ class MavenTool(BaseTool):
                     metadata={"command": maven_cmd, "exit_code": result["exit_code"]},
                 )
                 logger.debug(f"Stored Maven output with ref_id: {ref_id}")
+
+            if result.get("dispatch_status") == "completed_detached":
+                detached_result = classify_detached_completion(
+                    result.get("exit_code"),
+                    str(result.get("output") or ""),
+                    ref_id,
+                    full_output=str(full_output),
+                    poll_ref=detached_poll_ref(result),
+                )
+                if not detached_result.succeeded:
+                    detached_result.metadata.update(
+                        {
+                            "command": maven_cmd,
+                            "exit_code": result.get("exit_code"),
+                            "analysis": analysis,
+                            "dispatch_status": "completed_detached",
+                            "maven_runtime": maven_runtime,
+                            "output_ref_id": ref_id,
+                        }
+                    )
+                    return self._finalize_main_result(
+                        detached_result,
+                        preamble,
+                        jdk_retry_meta,
+                    )
 
             # Track command for fact-based validation
             if self.command_tracker:

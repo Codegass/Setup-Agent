@@ -1,4 +1,10 @@
-from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator, format_tool_result
+from sag.agent.tool_orchestration import (
+    ToolCall,
+    ToolExecutionRecord,
+    ToolOrchestrator,
+    format_tool_result,
+)
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolError, ToolResult
 
 
@@ -20,6 +26,45 @@ class ManageContextTool(BaseTool):
             operation_outcome="success" if self.success else "failed",
             output=f"{action} result",
         )
+
+
+class PendingTool(BaseTool):
+    def __init__(self):
+        super().__init__("pending", "Pending test tool")
+
+    def execute(self, command: str) -> ToolResult:
+        return ToolResult(
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            evidence_status=EvidenceStatus.UNKNOWN,
+            poll_ref="job:pending-1",
+            output="still running",
+        )
+
+
+class FailureTool(BaseTool):
+    def __init__(self):
+        super().__init__("failure", "Failure test tool")
+
+    def execute(self, command: str) -> ToolResult:
+        return ToolResult.completed_failure(
+            output="durable failure details",
+            error="failed",
+            error_code="FAILURE_TOOL_FAILED",
+        )
+
+
+class FakeDurableOutputStorage:
+    def __init__(self):
+        self.outputs = {}
+
+    def store_output(self, **kwargs):
+        ref = f"output_failure_{len(self.outputs) + 1}"
+        self.outputs[ref] = kwargs["output"]
+        return ref
+
+    def retrieve_output(self, ref):
+        return self.outputs.get(ref)
 
 
 def test_format_tool_result_surfaces_maven_version_contract():
@@ -68,7 +113,7 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=update_successful_states,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -84,16 +129,98 @@ def test_orchestrator_executes_successful_tool_and_emits_events():
     assert "echo executed successfully" in execution.observation_text
     assert [event.event_type for event in events] == ["tool_start", "tool_result"]
     assert events[-1].metadata["status"] == "success"
-    assert events[-1].metadata["result_succeeded"] is True
+    assert events[-1].metadata["invocation_status"] == "completed"
+    assert events[-1].metadata["operation_outcome"] == "success"
+    assert events[-1].metadata["evidence_status"] == "verified"
     assert events[-1].metadata["error_code"] is None
     assert events[-1].metadata["executed_params"] == {"command": "pwd"}
     assert events[-1].metadata["recovery_applied"] is False
     assert execution.call.execution_signature == "echo:[('command', 'pwd')]"
-    assert tracking_calls == [(execution.call.execution_signature, True)]
+    assert tracking_calls == [(execution.call.execution_signature, execution.result)]
     assert len(state_updates) == 1
     assert state_updates[0][0] == "echo"
     assert state_updates[0][1] == {"command": "pwd"}
     assert state_updates[0][2] is execution.result
+
+
+def test_orchestrator_persists_failure_before_emitting_canonical_result():
+    storage = FakeDurableOutputStorage()
+    orchestrator = ToolOrchestrator(
+        tools={"failure": FailureTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=storage,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="failure", raw_params={"command": "run"}))
+
+    assert execution.result.output_ref.startswith("output_")
+    assert storage.retrieve_output(execution.result.output_ref) == "durable failure details"
+
+
+def test_pending_execution_is_tracked_and_emitted_without_failure_shape():
+    events = []
+    tracking_calls = []
+    orchestrator = ToolOrchestrator(
+        tools={"pending": PendingTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: tracking_calls.append(args),
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        event_sink=events.append,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="pending", raw_params={"command": "run"}))
+
+    assert execution.status == "pending"
+    assert len(tracking_calls) == 1
+    assert tracking_calls[0][0] == execution.call.execution_signature
+    assert tracking_calls[0][1] is execution.result
+    assert events[-1].event_type == "tool_result"
+    assert events[-1].level == "info"
+    assert events[-1].metadata["invocation_status"] == "pending"
+    assert events[-1].metadata["operation_outcome"] == "unknown"
+    assert "result_succeeded" not in events[-1].metadata
+
+
+def test_execution_history_classifies_pending_without_boolean_truth():
+    pending = ToolExecutionRecord(
+        signature="build:[('action', 'test')]",
+        invocation_status=InvocationStatus.PENDING,
+        operation_outcome=OperationOutcome.UNKNOWN,
+        timestamp="ts-1",
+    )
+    failed = ToolExecutionRecord(
+        signature="build:[('action', 'test')]",
+        invocation_status=InvocationStatus.COMPLETED,
+        operation_outcome=OperationOutcome.FAILED,
+        timestamp="ts-2",
+    )
+    orchestrator = ToolOrchestrator(
+        tools={},
+        context_manager=None,
+        recent_tool_executions=[pending, failed],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+    )
+
+    assert not hasattr(pending, "success")
+    assert orchestrator._execution_failed(pending) is False
+    assert orchestrator._execution_failed(failed) is True
 
 
 def test_lifecycle_events_include_required_metadata():
@@ -104,7 +231,7 @@ def test_lifecycle_events_include_required_metadata():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -134,7 +261,9 @@ def test_lifecycle_events_include_required_metadata():
     assert parameters_fixed.metadata["params_changed"] is True
     assert result.metadata["status"] == execution.status
     assert result.metadata["duration_ms"] is not None
-    assert result.metadata["result_succeeded"] is True
+    assert result.metadata["invocation_status"] == "completed"
+    assert result.metadata["operation_outcome"] == "success"
+    assert result.metadata["evidence_status"] == "verified"
     assert result.metadata["error_code"] is None
     assert result.metadata["executed_params"] == {
         "command": "pwd",
@@ -153,7 +282,7 @@ def test_orchestrator_returns_missing_tool_execution_with_existing_feedback():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -182,7 +311,7 @@ def test_empty_validated_params_are_used_instead_of_raw_params():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -221,7 +350,7 @@ def test_tool_error_metadata_and_suggestions_are_preserved():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -237,7 +366,7 @@ def test_tool_error_metadata_and_suggestions_are_preserved():
     assert execution.result.metadata["failure_category"] == "validation"
     assert execution.result.metadata["retryable"] is True
     assert execution.call.execution_signature == "error_tool:[('command', 'bad')]"
-    assert tracking_calls == [(execution.call.execution_signature, False)]
+    assert tracking_calls == [(execution.call.execution_signature, execution.result)]
     assert state_updates == []
 
 
@@ -249,7 +378,7 @@ def test_manage_context_invalidation_metadata_only_for_successful_context_change
             recent_tool_executions=[],
             successful_states={},
             repository_url=None,
-            track_tool_execution=lambda signature, success: None,
+            track_tool_execution=lambda signature, result: None,
             update_successful_states=lambda tool_name, params, result: None,
             add_system_guidance=lambda message, priority=5: None,
             get_timestamp=lambda: "ts",
@@ -284,7 +413,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -296,7 +425,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
     assert execution.result.succeeded is False
     assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
     assert execution.attempted_execution is True
-    assert tracking_calls == [("explode:[('command', 'pwd')]", False)]
+    assert tracking_calls == [("explode:[('command', 'pwd')]", execution.result)]
 
 
 def test_event_sink_exception_does_not_abort_successful_execution():
@@ -309,7 +438,7 @@ def test_event_sink_exception_does_not_abort_successful_execution():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -332,7 +461,7 @@ def test_successful_state_callback_exception_does_not_abort_successful_execution
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=update_successful_states,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",

@@ -4,7 +4,10 @@ import hashlib
 import inspect
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Union, get_args, get_origin
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, Optional, Union, get_args, get_origin
 
 from loguru import logger
 from pydantic import (
@@ -103,6 +106,58 @@ READ_ONLY_RESULT_FIELDS = {
 }
 
 
+@dataclass(frozen=True)
+class _DurableOutputBinding:
+    storage: Any
+    task_id: str
+    tool_name: str
+
+
+_DURABLE_OUTPUT_BINDING: ContextVar[Optional[_DurableOutputBinding]] = ContextVar(
+    "sag_durable_tool_output_binding",
+    default=None,
+)
+
+
+def is_output_storage_ref(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"output_[A-Za-z0-9_-]+", value))
+
+
+@contextmanager
+def bind_tool_result_output_storage(
+    storage: Any,
+    *,
+    task_id: str = "tool_result",
+    tool_name: str = "tool",
+) -> Iterator[None]:
+    """Bind the existing OutputStorage owner for results built in this call."""
+    binding = (
+        _DurableOutputBinding(storage=storage, task_id=task_id, tool_name=tool_name)
+        if storage is not None
+        else None
+    )
+    token = _DURABLE_OUTPUT_BINDING.set(binding)
+    try:
+        yield
+    finally:
+        _DURABLE_OUTPUT_BINDING.reset(token)
+
+
+def _store_bound_output(output: str, *, metadata: Dict[str, Any]) -> Optional[str]:
+    binding = _DURABLE_OUTPUT_BINDING.get()
+    if binding is None:
+        return None
+    ref = binding.storage.store_output(
+        task_id=binding.task_id,
+        tool_name=binding.tool_name,
+        output=output,
+        metadata=metadata,
+    )
+    if not is_output_storage_ref(ref):
+        raise ValueError("OutputStorage failed to return a resolvable output_* reference")
+    return ref
+
+
 class ToolResult(BaseModel):
     """Canonical, orthogonal tool execution result."""
 
@@ -155,11 +210,39 @@ class ToolResult(BaseModel):
             source = str(payload.get("raw_output") or output or payload.get("error") or "")
             digest = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()[:16]
             error_code = str(payload.get("error_code") or "TOOL_OPERATION_FAILED")
-            payload.setdefault("error_code", error_code)
-            payload.setdefault("failure_signature", f"{error_code}:{digest}")
-            payload.setdefault("error_tail_preview", source[-400:] or error_code)
-            refs = payload.get("refs") or []
-            payload.setdefault("output_ref", refs[0] if refs else f"tool-result:{digest}")
+            payload["error_code"] = error_code
+            if not payload.get("failure_signature"):
+                payload["failure_signature"] = f"{error_code}:{digest}"
+            if not payload.get("error_tail_preview"):
+                payload["error_tail_preview"] = source[-400:] or error_code
+
+            output_ref = payload.get("output_ref")
+            if not output_ref:
+                output_ref = next(
+                    (
+                        ref
+                        for ref in payload.get("evidence_refs") or []
+                        if is_output_storage_ref(ref)
+                    ),
+                    None,
+                )
+            if not output_ref:
+                output_ref = _store_bound_output(
+                    source,
+                    metadata={
+                        "error_code": error_code,
+                        "failure_signature": payload["failure_signature"],
+                    },
+                )
+            if not output_ref:
+                raise ValueError(
+                    "canonical failed results require durable output storage before construction"
+                )
+            if not is_output_storage_ref(output_ref):
+                raise ValueError(
+                    "canonical failed results require a resolvable OutputStorage output_* ref"
+                )
+            payload["output_ref"] = output_ref
         return cls(
             invocation_status=InvocationStatus.COMPLETED,
             operation_outcome=outcome,
@@ -207,6 +290,10 @@ class ToolResult(BaseModel):
                 raise ValueError("error_tail_preview must be at most 400 characters")
             if not self.error_code or not self.error_code.strip():
                 raise ValueError("canonical failed results require nonblank error_code")
+            if not is_output_storage_ref(self.output_ref):
+                raise ValueError(
+                    "canonical failed results require a resolvable OutputStorage output_* ref"
+                )
 
         return self
 
@@ -668,15 +755,19 @@ class BaseTool(ABC):
     def _log_execution(self, params: Dict[str, Any], result: ToolResult) -> None:
         """Log tool execution for debugging."""
         logger.debug(f"Tool {self.name} executed with params: {params}")
-        if result.succeeded:
+        if result.invocation_status is InvocationStatus.PENDING:
+            logger.info(f"Tool {self.name} is pending: {result.poll_ref}")
+        elif result.succeeded:
             output_info = f"{len(result.output)} chars"
             if result.metadata.get("output_truncated"):
                 output_info += f" (truncated from {result.metadata.get('original_length', 0)})"
             logger.debug(f"Tool {self.name} succeeded: {output_info}")
-        else:
+        elif result.operation_outcome is OperationOutcome.FAILED:
             logger.warning(f"Tool {self.name} failed: {result.error}")
             if result.suggestions:
                 logger.info(f"Suggestions for {self.name}: {result.suggestions}")
+        else:
+            logger.info(f"Tool {self.name} completed with {result.operation_outcome.value} outcome")
 
     def get_schema(self) -> Dict[str, Any]:
         """Get the tool schema for the LLM."""

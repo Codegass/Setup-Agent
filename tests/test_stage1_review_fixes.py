@@ -57,7 +57,7 @@ def _bare_orchestrator(recent=None):
         recent_tool_executions=recent or [],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -334,7 +334,13 @@ def test_build_detection_falls_back_to_project_directory():
 def test_search_job_polling_is_exempt_from_repetition_detection():
     poll_signature = "search:[('max_results', 50), ('pattern', '.'), ('target', 'job:abc123')]"
     recent = [
-        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"} for i in range(9)
+        {
+            "signature": poll_signature,
+            "invocation_status": "completed",
+            "operation_outcome": "success",
+            "timestamp": f"ts-{i}",
+        }
+        for i in range(9)
     ]
     orchestrator = _bare_orchestrator(recent=recent)
 
