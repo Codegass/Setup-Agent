@@ -21,7 +21,7 @@ def test_verdict_derived_from_success_when_absent():
 
 
 def test_explicit_verdict_kept():
-    r = ToolResult(success=True, output="still going", verdict="running")
+    r = ToolResult(success=True, output="still going", verdict="running", poll_ref="job:still-going")
     assert r.verdict == "running"
 
 
@@ -62,7 +62,7 @@ def test_observation_shows_verdict_and_facts():
 def test_observation_running_keeps_dispatch_wording():
     r = ToolResult(
         success=True, output="still running; poll later", verdict="running",
-        metadata={"dispatch_status": "running_detached"},
+        poll_ref="job:background-build", metadata={"dispatch_status": "running_detached"},
     )
     obs = format_tool_result("build", r)
     assert "still running" in obs.lower()

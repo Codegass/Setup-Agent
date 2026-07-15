@@ -8,10 +8,32 @@ from typing import Iterable
 from pydantic import BaseModel, Field, field_serializer
 
 
-class EvidenceStatus(str, Enum):
+class EvidenceAssessment(str, Enum):
     SUCCESS = "success"
     PARTIAL = "partial"
     BLOCKED = "blocked"
+    CONFLICT = "conflict"
+    UNKNOWN = "unknown"
+
+
+class InvocationStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    TIMEOUT = "timeout"
+    CRASHED = "crashed"
+    CANCELLED = "cancelled"
+
+
+class OperationOutcome(str, Enum):
+    UNKNOWN = "unknown"
+    SUCCESS = "success"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class EvidenceStatus(str, Enum):
+    VERIFIED = "verified"
     CONFLICT = "conflict"
     UNKNOWN = "unknown"
 
@@ -27,12 +49,12 @@ class EvidenceRef(BaseModel):
 class EvidenceFinding(BaseModel):
     type: str
     reason: str
-    status: EvidenceStatus = EvidenceStatus.UNKNOWN
+    status: EvidenceAssessment = EvidenceAssessment.UNKNOWN
     refs: list[str] = Field(default_factory=list)
     details: dict[str, object] = Field(default_factory=dict)
 
     @field_serializer("status")
-    def _serialize_status(self, status: EvidenceStatus) -> str:
+    def _serialize_status(self, status: EvidenceAssessment) -> str:
         return status.value
 
 
@@ -79,27 +101,29 @@ class TestStats(BaseModel):
         )
 
 
-def coerce_evidence_status(value: EvidenceStatus | str | None) -> EvidenceStatus:
-    if isinstance(value, EvidenceStatus):
+def coerce_evidence_status(value: EvidenceAssessment | str | None) -> EvidenceAssessment:
+    if isinstance(value, EvidenceAssessment):
         return value
     if not value:
-        return EvidenceStatus.UNKNOWN
+        return EvidenceAssessment.UNKNOWN
     try:
-        return EvidenceStatus(str(value).strip().lower())
+        return EvidenceAssessment(str(value).strip().lower())
     except ValueError:
-        return EvidenceStatus.UNKNOWN
+        return EvidenceAssessment.UNKNOWN
 
 
-def aggregate_evidence_status(statuses: Iterable[EvidenceStatus | str | None]) -> EvidenceStatus:
+def aggregate_evidence_status(
+    statuses: Iterable[EvidenceAssessment | str | None],
+) -> EvidenceAssessment:
     normalized = [coerce_evidence_status(status) for status in statuses]
     if not normalized:
-        return EvidenceStatus.UNKNOWN
+        return EvidenceAssessment.UNKNOWN
     for candidate in (
-        EvidenceStatus.BLOCKED,
-        EvidenceStatus.CONFLICT,
-        EvidenceStatus.PARTIAL,
-        EvidenceStatus.UNKNOWN,
+        EvidenceAssessment.BLOCKED,
+        EvidenceAssessment.CONFLICT,
+        EvidenceAssessment.PARTIAL,
+        EvidenceAssessment.UNKNOWN,
     ):
         if candidate in normalized:
             return candidate
-    return EvidenceStatus.SUCCESS
+    return EvidenceAssessment.SUCCESS

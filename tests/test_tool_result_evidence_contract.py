@@ -1,4 +1,4 @@
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceAssessment
 from sag.tools.base import ToolResult
 from sag.tools.bash import BashTool, BashToolConfig
 
@@ -7,8 +7,8 @@ def test_tool_result_defaults_status_from_success_boolean():
     success = ToolResult(success=True, output="ok")
     failure = ToolResult(success=False, output="", error="bad")
 
-    assert success.status == EvidenceStatus.SUCCESS
-    assert failure.status == EvidenceStatus.BLOCKED
+    assert success.status == EvidenceAssessment.SUCCESS
+    assert failure.status == EvidenceAssessment.BLOCKED
     assert success.success is True
     assert failure.success is False
 
@@ -16,7 +16,7 @@ def test_tool_result_defaults_status_from_success_boolean():
 def test_tool_result_status_can_represent_partial_without_losing_legacy_success():
     result = ToolResult(
         success=True,
-        status=EvidenceStatus.PARTIAL,
+        status=EvidenceAssessment.PARTIAL,
         output="Build command exited 0 but tests failed.",
         evidence_refs=["output_abc"],
         conflicts=["maven_success_vs_surefire_failures"],
@@ -24,7 +24,7 @@ def test_tool_result_status_can_represent_partial_without_losing_legacy_success(
     )
 
     assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert result.evidence_refs == ["output_abc"]
     assert result.conflicts == ["maven_success_vs_surefire_failures"]
     assert result.test_stats.pass_rate == 96.3
@@ -37,8 +37,8 @@ def test_tool_result_coerces_string_status_inputs():
         output="Build command exited 0 but tests failed.",
     )
 
-    assert isinstance(result.status, EvidenceStatus)
-    assert result.status == EvidenceStatus.PARTIAL
+    assert isinstance(result.status, EvidenceAssessment)
+    assert result.status == EvidenceAssessment.PARTIAL
 
 
 def test_tool_result_coerces_status_assignment_after_init():
@@ -46,8 +46,8 @@ def test_tool_result_coerces_status_assignment_after_init():
 
     result.status = "blocked"
 
-    assert isinstance(result.status, EvidenceStatus)
-    assert result.status == EvidenceStatus.BLOCKED
+    assert isinstance(result.status, EvidenceAssessment)
+    assert result.status == EvidenceAssessment.BLOCKED
 
 
 def test_tool_result_updates_default_status_when_success_changes():
@@ -56,18 +56,18 @@ def test_tool_result_updates_default_status_when_success_changes():
     result.success = False
 
     assert result.success is False
-    assert result.status == EvidenceStatus.BLOCKED
+    assert result.status == EvidenceAssessment.BLOCKED
 
 
 def test_tool_result_preserves_explicit_domain_status_when_success_changes():
-    partial = ToolResult(success=True, status=EvidenceStatus.PARTIAL, output="partial")
-    conflict = ToolResult(success=False, status=EvidenceStatus.CONFLICT, output="conflict")
+    partial = ToolResult(success=True, status=EvidenceAssessment.PARTIAL, output="partial")
+    conflict = ToolResult(success=False, status=EvidenceAssessment.CONFLICT, output="conflict")
 
     partial.success = False
     conflict.success = True
 
-    assert partial.status == EvidenceStatus.PARTIAL
-    assert conflict.status == EvidenceStatus.CONFLICT
+    assert partial.status == EvidenceAssessment.PARTIAL
+    assert conflict.status == EvidenceAssessment.CONFLICT
 
 
 class FakeBashOrchestrator:

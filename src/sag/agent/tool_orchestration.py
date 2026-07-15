@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
-from sag.evidence import EvidenceStatus, coerce_evidence_status
+from sag.evidence import EvidenceAssessment, coerce_evidence_status
 from sag.tools.base import BaseTool, ToolResult
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
@@ -139,7 +139,7 @@ def _format_evidence_observation(result: ToolResult) -> list[str]:
         else coerce_evidence_status(result.status)
     )
     include_status = bool(
-        normalized_status != EvidenceStatus.SUCCESS
+        normalized_status != EvidenceAssessment.SUCCESS
         or result.evidence_refs
         or result.conflicts
         or result.test_stats

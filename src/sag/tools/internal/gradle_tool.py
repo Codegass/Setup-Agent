@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
-from sag.evidence import EvidenceStatus, TestStats
+from sag.evidence import EvidenceAssessment, TestStats
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
@@ -828,7 +828,7 @@ class GradleTool(BaseTool):
             analysis.get("build_successful") or analysis.get("exit_code") == 0
         )
         if has_test_failures and build_claimed_success:
-            fields["status"] = EvidenceStatus.PARTIAL
+            fields["status"] = EvidenceAssessment.PARTIAL
             fields["conflicts"] = ["gradle_success_vs_test_failures"]
 
         if output_ref_id:

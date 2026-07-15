@@ -1,4 +1,4 @@
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceAssessment
 from sag.tools.base import ToolResult
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
@@ -223,7 +223,7 @@ def test_maven_success_marker_with_surefire_failures_returns_partial_evidence():
     )
 
     assert result.success is False
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 214
     assert result.test_stats.failed == 3
     assert result.test_stats.skipped == 5
@@ -257,7 +257,7 @@ def test_maven_surefire_final_results_summary_does_not_double_count():
     )
 
     assert result.success is False
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 2
     assert result.test_stats.failed == 1
     assert result.test_stats.skipped == 0
@@ -322,7 +322,7 @@ def test_gradle_success_marker_with_failed_tests_returns_partial_evidence():
     )
 
     assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 214
     assert result.test_stats.failed == 3
     assert result.test_stats.skipped == 5
@@ -353,7 +353,7 @@ def test_gradle_test_run_summary_variant_returns_partial_evidence():
     )
 
     assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert result.test_stats.executed == 12
     assert result.test_stats.failed == 1
     assert result.test_stats.skipped == 2

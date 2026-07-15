@@ -1,5 +1,5 @@
 from sag.agent.context_manager import ContextManager, TaskStatus
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceAssessment
 from sag.tools.context_tool import ContextTool
 
 
@@ -27,7 +27,7 @@ def test_trunk_task_records_narrative_and_evidence(tmp_path):
     reloaded = manager.load_trunk_context()
     task = reloaded.todo_list[0]
     assert task.key_results == ""
-    assert task.evidence_status == EvidenceStatus.PARTIAL
+    assert task.evidence_status == EvidenceAssessment.PARTIAL
     assert task.evidence_refs == ["output_abc", "surefire_report"]
     assert task.conflicts == ["maven_success_vs_surefire_failures"]
 

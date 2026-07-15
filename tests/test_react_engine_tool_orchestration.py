@@ -2,7 +2,7 @@ from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
 from sag.config.prompt_loader import load_react_engine_prompts
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceAssessment
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType
 
@@ -471,7 +471,7 @@ def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator(
 
 
 def test_execute_steps_forces_thinking_after_partial_status_without_success(monkeypatch):
-    result = ToolResult(success=False, status=EvidenceStatus.PARTIAL, output="needs review")
+    result = ToolResult(success=False, status=EvidenceAssessment.PARTIAL, output="needs review")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",

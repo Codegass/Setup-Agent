@@ -1,5 +1,5 @@
 from sag.agent.tool_orchestration import format_tool_result
-from sag.evidence import EvidenceStatus, TestStats
+from sag.evidence import EvidenceAssessment, TestStats
 from sag.agent.tool_orchestration import (
     ParameterFix,
     ToolCall,
@@ -77,7 +77,7 @@ def test_lifecycle_event_is_ui_agnostic_metadata_carrier():
 def test_tool_observation_includes_evidence_status_refs_and_conflicts():
     result = ToolResult(
         success=True,
-        status=EvidenceStatus.PARTIAL,
+        status=EvidenceAssessment.PARTIAL,
         output="Maven exited zero but tests failed.",
         evidence_refs=["output_abc"],
         conflicts=["maven_success_vs_surefire_failures"],
@@ -93,7 +93,7 @@ def test_tool_observation_includes_evidence_status_refs_and_conflicts():
 def test_tool_observation_includes_test_stats_summary_when_present():
     result = ToolResult(
         success=True,
-        status=EvidenceStatus.PARTIAL,
+        status=EvidenceAssessment.PARTIAL,
         output="Maven exited zero but tests failed.",
         test_stats=TestStats(executed=214, passed=206, failed=3, skipped=5),
     )

@@ -8,7 +8,15 @@ from typing import Any, Dict, List, Optional, Union, get_args, get_origin
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from sag.evidence import EvidenceFinding, EvidenceStatus, TestStats, coerce_evidence_status
+from sag.evidence import (
+    EvidenceAssessment,
+    EvidenceFinding,
+    EvidenceStatus,
+    InvocationStatus,
+    OperationOutcome,
+    TestStats,
+    coerce_evidence_status,
+)
 
 
 class ToolError(Exception):
@@ -63,15 +71,35 @@ class ToolError(Exception):
 
 VERDICTS = {"success", "partial", "failed", "running", "unknown", "skipped"}
 
+LEGAL_RESULT_STATES = {
+    InvocationStatus.PENDING: {OperationOutcome.UNKNOWN},
+    InvocationStatus.COMPLETED: {
+        OperationOutcome.UNKNOWN,
+        OperationOutcome.SUCCESS,
+        OperationOutcome.PARTIAL,
+        OperationOutcome.FAILED,
+        OperationOutcome.SKIPPED,
+    },
+    InvocationStatus.TIMEOUT: {OperationOutcome.UNKNOWN, OperationOutcome.PARTIAL, OperationOutcome.FAILED},
+    InvocationStatus.CRASHED: {OperationOutcome.UNKNOWN, OperationOutcome.FAILED},
+    InvocationStatus.CANCELLED: {OperationOutcome.UNKNOWN, OperationOutcome.SKIPPED},
+}
+
 
 class ToolResult(BaseModel):
-    """Result of a tool execution."""
+    """Canonical tool result with a temporary legacy-input adapter."""
 
     model_config = ConfigDict(validate_assignment=True)
 
-    success: bool
+    invocation_status: InvocationStatus
+    operation_outcome: OperationOutcome
+    evidence_status: EvidenceStatus
+    poll_ref: Optional[str] = None
+
+    # Task 2 removes these legacy compatibility views after all callers migrate.
+    success: bool | None = None
     output: str
-    status: EvidenceStatus | str | None = None
+    status: EvidenceAssessment | str | None = None
     error: Optional[str] = None
     error_code: Optional[str] = None
     suggestions: List[str] = Field(default_factory=list)
@@ -84,52 +112,176 @@ class ToolResult(BaseModel):
     validator_findings: List[EvidenceFinding] = Field(default_factory=list)
     test_stats: Optional[TestStats] = None
 
-    # Result envelope (spec §5). verdict defaults from `success` so legacy
-    # construction keeps working; facts are machine-readable for gates;
-    # refs are retrieval handles for the search tool ("links, not dumps").
     verdict: Optional[str] = None
     facts: Dict[str, Any] = Field(default_factory=dict)
     refs: List[str] = Field(default_factory=list)
 
-    @field_validator("verdict")
+    @model_validator(mode="before")
     @classmethod
-    def _validate_verdict(cls, v):
-        if v is not None and v not in VERDICTS:
-            raise ValueError(f"verdict must be one of {sorted(VERDICTS)}, got {v!r}")
-        return v
+    def _adapt_legacy_inputs(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
 
-    @model_validator(mode="after")
-    def _default_verdict(self) -> "ToolResult":
-        if self.verdict is None:
-            object.__setattr__(self, "verdict", "success" if self.success else "failed")
-        return self
+        values = dict(data)
+        canonical_fields = {"invocation_status", "operation_outcome", "evidence_status"}
+        provided_canonical = canonical_fields.intersection(values)
+        if provided_canonical:
+            if provided_canonical != canonical_fields:
+                raise ValueError("canonical result fields must be provided together")
+            cls._validate_legacy_consistency(values)
+            return values
+
+        if not any(field in values for field in ("success", "status", "verdict")):
+            return values
+
+        legacy_verdict = values.get("verdict")
+        legacy_success = values.get("success")
+        if legacy_verdict is not None and legacy_verdict not in VERDICTS:
+            raise ValueError(f"verdict must be one of {sorted(VERDICTS)}, got {legacy_verdict!r}")
+        if legacy_verdict == "running":
+            invocation_status = InvocationStatus.PENDING
+            operation_outcome = OperationOutcome.UNKNOWN
+        elif legacy_success is not None:
+            invocation_status = InvocationStatus.COMPLETED
+            operation_outcome = (
+                OperationOutcome.SUCCESS if bool(legacy_success) else OperationOutcome.FAILED
+            )
+        else:
+            return values
+
+        legacy_status = (
+            coerce_evidence_status(values.get("status"))
+            if values.get("status") is not None
+            else cls._status_from_success(bool(legacy_success))
+        )
+        evidence_status = (
+            EvidenceStatus.CONFLICT
+            if legacy_status is EvidenceAssessment.CONFLICT
+            else (
+                EvidenceStatus.UNKNOWN
+                if operation_outcome is OperationOutcome.UNKNOWN
+                else EvidenceStatus.VERIFIED
+            )
+        )
+        values.update(
+            invocation_status=invocation_status,
+            operation_outcome=operation_outcome,
+            evidence_status=evidence_status,
+        )
+        return values
+
+    @classmethod
+    def _validate_legacy_consistency(cls, values: Dict[str, Any]) -> None:
+        invocation_status = InvocationStatus(values["invocation_status"])
+        operation_outcome = OperationOutcome(values["operation_outcome"])
+        evidence_status = EvidenceStatus(values["evidence_status"])
+
+        if "success" in values and values["success"] is not None:
+            expected_outcome = (
+                OperationOutcome.SUCCESS if bool(values["success"]) else OperationOutcome.FAILED
+            )
+            if (
+                invocation_status is not InvocationStatus.COMPLETED
+                or operation_outcome is not expected_outcome
+            ):
+                raise ValueError("legacy success contradicts canonical result fields")
+
+        if values.get("verdict") == "running" and (
+            invocation_status is not InvocationStatus.PENDING
+            or operation_outcome is not OperationOutcome.UNKNOWN
+        ):
+            raise ValueError("legacy verdict contradicts canonical result fields")
+
+        if values.get("status") is not None:
+            legacy_status = coerce_evidence_status(values["status"])
+            expected_evidence = (
+                EvidenceStatus.CONFLICT
+                if legacy_status is EvidenceAssessment.CONFLICT
+                else (
+                    EvidenceStatus.UNKNOWN
+                    if operation_outcome is OperationOutcome.UNKNOWN
+                    else EvidenceStatus.VERIFIED
+                )
+            )
+            if evidence_status is not expected_evidence:
+                raise ValueError("legacy status contradicts canonical evidence")
 
     @staticmethod
-    def _status_from_success(success: bool) -> EvidenceStatus:
-        return EvidenceStatus.SUCCESS if success else EvidenceStatus.BLOCKED
+    def _status_from_success(success: bool) -> EvidenceAssessment:
+        return EvidenceAssessment.SUCCESS if success else EvidenceAssessment.BLOCKED
 
     @field_validator("status", mode="before")
     @classmethod
-    def _coerce_status(cls, value: EvidenceStatus | str | None) -> EvidenceStatus | None:
+    def _coerce_status(
+        cls, value: EvidenceAssessment | str | None
+    ) -> EvidenceAssessment | None:
         if value is None:
             return None
         return coerce_evidence_status(value)
 
     @model_validator(mode="after")
-    def _normalize_evidence_fields(self) -> "ToolResult":
+    def _validate_result_state(self) -> "ToolResult":
+        allowed_outcomes = LEGAL_RESULT_STATES[self.invocation_status]
+        if self.operation_outcome not in allowed_outcomes:
+            raise ValueError(
+                f"{self.invocation_status.value} results require operation_outcome to be one of "
+                f"{sorted(outcome.value for outcome in allowed_outcomes)}"
+            )
+        if self.invocation_status is InvocationStatus.PENDING:
+            if not self.poll_ref or not self.poll_ref.strip():
+                raise ValueError("pending results require a stable poll_ref")
+            if self.evidence_status is not EvidenceStatus.UNKNOWN:
+                raise ValueError("pending results require evidence_status='unknown'")
+
+        object.__setattr__(self, "success", self.succeeded)
         if self.status is None:
-            object.__setattr__(self, "status", self._status_from_success(self.success))
+            object.__setattr__(self, "status", self._legacy_status_from_canonical())
+        if self.verdict is None:
+            object.__setattr__(self, "verdict", self._legacy_verdict())
         return self
 
+    def _legacy_status_from_canonical(self) -> EvidenceAssessment:
+        if self.evidence_status is EvidenceStatus.CONFLICT:
+            return EvidenceAssessment.CONFLICT
+        if self.operation_outcome is OperationOutcome.SUCCESS:
+            return EvidenceAssessment.SUCCESS
+        if self.operation_outcome is OperationOutcome.PARTIAL:
+            return EvidenceAssessment.PARTIAL
+        if self.operation_outcome is OperationOutcome.FAILED:
+            return EvidenceAssessment.BLOCKED
+        return EvidenceAssessment.UNKNOWN
+
+    def _legacy_verdict(self) -> str:
+        if self.invocation_status is InvocationStatus.PENDING:
+            return "running"
+        return self.operation_outcome.value
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.invocation_status is not InvocationStatus.PENDING
+
+    @property
+    def succeeded(self) -> bool:
+        return (
+            self.invocation_status is InvocationStatus.COMPLETED
+            and self.operation_outcome is OperationOutcome.SUCCESS
+        )
+
     def __setattr__(self, name: str, value: Any) -> None:
-        super().__setattr__(name, value)
-        if name == "success":
+        if name == "success" and "operation_outcome" in self.__dict__:
+            object.__setattr__(self, "success", bool(value))
+            super().__setattr__(
+                "operation_outcome",
+                OperationOutcome.SUCCESS if value else OperationOutcome.FAILED,
+            )
             status = getattr(self, "status", None)
-            if status in (None, EvidenceStatus.SUCCESS, EvidenceStatus.BLOCKED):
-                super().__setattr__("status", self._status_from_success(self.success))
+            if status in (None, EvidenceAssessment.SUCCESS, EvidenceAssessment.BLOCKED):
+                object.__setattr__(self, "status", self._status_from_success(bool(value)))
+            return
+        super().__setattr__(name, value)
 
     def __str__(self) -> str:
-        if self.success:
+        if self.succeeded:
             return self.output
         else:
             result = f"Error: {self.error}"

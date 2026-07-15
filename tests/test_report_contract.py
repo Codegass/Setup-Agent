@@ -1,6 +1,6 @@
 import json
 
-from sag.evidence import EvidenceStatus, TestStats
+from sag.evidence import EvidenceAssessment, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool, build_stored_test_analysis
@@ -188,7 +188,7 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     )
 
     assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert isinstance(result.test_stats, TestStats)
     assert result.test_stats.pass_rate == 96.3
     assert result.test_stats.failed == 3
@@ -277,7 +277,7 @@ def test_real_report_renderer_includes_evidence_result(monkeypatch):
     )
 
     assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert "Result: PARTIAL" in result.raw_data["full_report"]
     assert "96.3% pass rate" in result.raw_data["full_report"]
     assert "3 failed" in result.raw_data["full_report"]
@@ -315,7 +315,7 @@ def test_report_failed_legacy_status_maps_to_blocked(monkeypatch):
     result = tool.execute(action="generate", summary="blocked", status="fail")
 
     assert result.success is True
-    assert result.status == EvidenceStatus.BLOCKED
+    assert result.status == EvidenceAssessment.BLOCKED
     assert result.metadata["evidence_status"] == "blocked"
     assert result.raw_data["evidence_status"] == "blocked"
 
@@ -392,7 +392,7 @@ def test_report_uses_validator_evidence_defaults_when_kwargs_missing(monkeypatch
     result = tool.execute(action="generate", summary="done", status="success")
 
     assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.status == EvidenceAssessment.PARTIAL
     assert result.metadata["verified_status"] == "success"
     assert result.metadata["evidence_status"] == "partial"
     assert "Result: PARTIAL" in result.raw_data["full_report"]
@@ -450,7 +450,7 @@ def test_ordinary_success_report_does_not_render_empty_test_stats(monkeypatch):
     result = tool.execute(action="generate", summary="done", status="success")
 
     assert result.success is True
-    assert result.status == EvidenceStatus.SUCCESS
+    assert result.status == EvidenceAssessment.SUCCESS
     assert result.raw_data["test_stats"] is None
     assert "0 / 0 passed" not in result.output
     assert "0 / 0 passed" not in result.raw_data["full_report"]
@@ -507,7 +507,7 @@ def test_invalid_explicit_evidence_status_is_unknown_without_success_fallback(mo
     )
 
     assert result.success is True
-    assert result.status == EvidenceStatus.UNKNOWN
+    assert result.status == EvidenceAssessment.UNKNOWN
     assert result.metadata["evidence_status"] == "unknown"
     assert result.raw_data["evidence_status"] == "unknown"
 

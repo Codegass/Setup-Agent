@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from sag.evidence import EvidenceFinding, EvidenceStatus, coerce_evidence_status
+from sag.evidence import EvidenceAssessment, EvidenceFinding, coerce_evidence_status
 from sag.utils.container_io import write_container_text
 
 
@@ -34,7 +34,7 @@ class Task(BaseModel):
     completed_at: Optional[datetime] = None
     notes: str = ""
     key_results: str = ""  # Stores key results after task completion
-    evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
+    evidence_status: EvidenceAssessment = EvidenceAssessment.UNKNOWN
     evidence_refs: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     validator_findings: List[EvidenceFinding] = Field(default_factory=list)
@@ -199,7 +199,7 @@ class TrunkContext(BaseContext):
     def update_task_evidence(
         self,
         task_id: str,
-        evidence_status: EvidenceStatus | str | None = None,
+        evidence_status: EvidenceAssessment | str | None = None,
         evidence_refs: Optional[List[str]] = None,
         conflicts: Optional[List[str]] = None,
         validator_findings: Optional[List[EvidenceFinding | Dict[str, Any]]] = None,
@@ -545,7 +545,7 @@ CONTEXT_EOF"""
     def update_task_evidence(
         self,
         task_id: str,
-        evidence_status: EvidenceStatus | str | None = None,
+        evidence_status: EvidenceAssessment | str | None = None,
         evidence_refs: Optional[List[str]] = None,
         conflicts: Optional[List[str]] = None,
         validator_findings: Optional[List[EvidenceFinding | Dict[str, Any]]] = None,

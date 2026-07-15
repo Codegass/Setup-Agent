@@ -1,8 +1,8 @@
-from sag.evidence import EvidenceFinding, EvidenceStatus, TestStats, aggregate_evidence_status
+from sag.evidence import EvidenceAssessment, EvidenceFinding, TestStats, aggregate_evidence_status
 
 
 def test_evidence_status_values_are_constrained():
-    assert {state.value for state in EvidenceStatus} == {
+    assert {state.value for state in EvidenceAssessment} == {
         "success",
         "partial",
         "blocked",
@@ -12,11 +12,11 @@ def test_evidence_status_values_are_constrained():
 
 
 def test_aggregate_evidence_status_uses_blocked_conflict_partial_precedence():
-    assert aggregate_evidence_status([EvidenceStatus.SUCCESS]) == EvidenceStatus.SUCCESS
-    assert aggregate_evidence_status([EvidenceStatus.SUCCESS, EvidenceStatus.PARTIAL]) == EvidenceStatus.PARTIAL
-    assert aggregate_evidence_status([EvidenceStatus.PARTIAL, EvidenceStatus.CONFLICT]) == EvidenceStatus.CONFLICT
-    assert aggregate_evidence_status([EvidenceStatus.CONFLICT, EvidenceStatus.BLOCKED]) == EvidenceStatus.BLOCKED
-    assert aggregate_evidence_status([]) == EvidenceStatus.UNKNOWN
+    assert aggregate_evidence_status([EvidenceAssessment.SUCCESS]) == EvidenceAssessment.SUCCESS
+    assert aggregate_evidence_status([EvidenceAssessment.SUCCESS, EvidenceAssessment.PARTIAL]) == EvidenceAssessment.PARTIAL
+    assert aggregate_evidence_status([EvidenceAssessment.PARTIAL, EvidenceAssessment.CONFLICT]) == EvidenceAssessment.CONFLICT
+    assert aggregate_evidence_status([EvidenceAssessment.CONFLICT, EvidenceAssessment.BLOCKED]) == EvidenceAssessment.BLOCKED
+    assert aggregate_evidence_status([]) == EvidenceAssessment.UNKNOWN
 
 
 def test_test_stats_preserve_counts_and_percentages():
@@ -41,7 +41,7 @@ def test_test_stats_summary_no_tests_discovered_or_executed():
 
 
 def test_evidence_finding_serializes_status_as_json_safe_string():
-    finding = EvidenceFinding(type="validator", reason="partial pass", status=EvidenceStatus.PARTIAL)
+    finding = EvidenceFinding(type="validator", reason="partial pass", status=EvidenceAssessment.PARTIAL)
 
-    assert finding.status == EvidenceStatus.PARTIAL
+    assert finding.status == EvidenceAssessment.PARTIAL
     assert finding.model_dump()["status"] == "partial"
