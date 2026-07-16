@@ -7,6 +7,8 @@ import sag.agent.agent as agent_module
 from sag.agent.agent import SetupAgent
 from sag.agent.agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
 from sag.agent.react_types import StepType
+from sag.agent.tool_orchestration import ToolExecutionRecord
+from sag.evidence import InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
 
 
@@ -31,6 +33,53 @@ def test_tool_result_preserves_declared_raw_data():
 
 def test_agent_status_has_stuck_state():
     assert AgentStatus.STUCK.value == "stuck"
+
+
+def test_repetition_evaluator_consumes_canonical_execution_records():
+    evaluator = AgentStateEvaluator(FakeContextManager())
+    records = [
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            timestamp=f"ts-{index}",
+        )
+        for index in range(3)
+    ]
+
+    analysis = evaluator._check_repetitive_execution(records)
+
+    assert analysis.status is AgentStatus.STUCK_REPETITION
+    assert analysis.needs_guidance is True
+
+
+def test_repetition_evaluator_does_not_count_pending_as_failure():
+    evaluator = AgentStateEvaluator(FakeContextManager())
+    records = [
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            timestamp="ts-failed",
+        ),
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            timestamp="ts-pending-1",
+        ),
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            timestamp="ts-pending-2",
+        ),
+    ]
+
+    analysis = evaluator._check_repetitive_execution(records)
+
+    assert analysis.status is AgentStatus.PROCEEDING
+    assert analysis.needs_guidance is False
 
 
 def test_agent_state_analysis_uses_declared_guidance_fields():

@@ -6,9 +6,12 @@ from typing import Any, Dict, List
 
 from loguru import logger
 
+from sag.evidence import OperationOutcome
+
 from .context_manager import ContextManager
 from .physical_validator import PhysicalValidator
 from .react_types import StepType
+from .tool_orchestration import ToolExecutionRecord
 
 
 class AgentStatus(str, Enum):
@@ -116,7 +119,7 @@ class AgentStateEvaluator:
         self,
         steps: List[Any],
         current_iteration: int,
-        recent_tool_executions: List[Dict],
+        recent_tool_executions: List[ToolExecutionRecord],
         steps_since_context_switch: int,
     ) -> AgentStateAnalysis:
         """
@@ -381,19 +384,21 @@ class AgentStateEvaluator:
 
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
-    def _check_repetitive_execution(self, recent_tool_executions: List[Dict]) -> AgentStateAnalysis:
+    def _check_repetitive_execution(
+        self, recent_tool_executions: List[ToolExecutionRecord]
+    ) -> AgentStateAnalysis:
         """Check if agent is stuck in repetitive failed execution."""
         if not recent_tool_executions:
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
         # Count consecutive failures for the same tool
         if len(recent_tool_executions) >= 3:
-            last_tool = recent_tool_executions[-1].get("signature", "").split(":")[0]
+            last_tool = recent_tool_executions[-1].signature.split(":")[0]
             consecutive_failures = 0
 
             for exec_record in reversed(recent_tool_executions):
-                if exec_record["signature"].startswith(last_tool + ":"):
-                    if not exec_record["success"]:
+                if exec_record.signature.startswith(last_tool + ":"):
+                    if exec_record.operation_outcome is OperationOutcome.FAILED:
                         consecutive_failures += 1
                     else:
                         break

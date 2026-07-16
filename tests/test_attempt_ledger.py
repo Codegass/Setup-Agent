@@ -4,14 +4,26 @@ per attempt — failed attempts NEVER disappear entirely (anti-retry-loop)."""
 from types import SimpleNamespace
 
 from sag.agent.attempt_ledger import compact_steps
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
+from sag.tools.base import ToolResult
 
 
 def _action(tool, success, summary, ref=None):
     metadata = {"output_ref_id": ref} if ref else {}
+    result = (
+        ToolResult.completed_success(output=summary, metadata=metadata)
+        if success
+        else ToolResult.completed_failure(
+            output=summary,
+            error=summary,
+            error_code="ATTEMPT_FAILED",
+            metadata=metadata,
+        )
+    )
     return SimpleNamespace(
         step_type=SimpleNamespace(value="action"),
         tool_name=tool,
-        tool_result=SimpleNamespace(succeeded=success, output=summary, metadata=metadata),
+        tool_result=result,
         content="",
     )
 
@@ -19,6 +31,33 @@ def _action(tool, success, summary, ref=None):
 def _thought(text):
     return SimpleNamespace(
         step_type=SimpleNamespace(value="thought"), tool_name=None, tool_result=None, content=text
+    )
+
+
+def _pending_action(tool, summary, poll_ref):
+    return SimpleNamespace(
+        step_type=SimpleNamespace(value="action"),
+        tool_name=tool,
+        tool_result=ToolResult(
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            evidence_status=EvidenceStatus.UNKNOWN,
+            poll_ref=poll_ref,
+            output=summary,
+        ),
+        content="",
+    )
+
+
+def _terminal_action(tool, summary, poll_ref):
+    return SimpleNamespace(
+        step_type=SimpleNamespace(value="action"),
+        tool_name=tool,
+        tool_result=ToolResult.completed_success(
+            output=summary,
+            poll_ref=poll_ref,
+        ),
+        content="",
     )
 
 
@@ -37,6 +76,57 @@ def test_compacts_oldest_keeps_recent_verbatim():
     assert ledger is not None
     assert "build" in ledger and "✗" in ledger
     assert "output_a" in ledger, "evidence refs survive compaction"
+
+
+def test_pending_attempt_is_not_failure_and_preserves_poll_ref():
+    steps = [_pending_action("build", "still compiling", "job:abc")] + [_thought("later")] * 4
+
+    ledger, _ = compact_steps(steps, keep_recent=2)
+
+    assert "… build [PENDING]: still compiling → job:abc" in ledger
+    assert "✗ build" not in ledger
+    assert "pending handoffs require polling" in ledger
+
+
+def test_terminal_observation_replaces_pending_and_survives_cap():
+    steps = (
+        [
+            _pending_action("build", "still compiling", "job:abc"),
+            _terminal_action("search", "BUILD SUCCESS", "job:abc"),
+        ]
+        + [_action("bash", True, f"step-{index}") for index in range(70)]
+        + [_thought("tail")] * 5
+    )
+
+    ledger, _ = compact_steps(steps, keep_recent=5)
+
+    assert "… build [PENDING]" not in ledger
+    assert "✓ search [SUCCESS]: BUILD SUCCESS → job:abc" in ledger
+
+
+def test_recent_terminal_observation_removes_stale_pending_ledger_line():
+    terminal = _terminal_action("search", "BUILD SUCCESS", "job:abc")
+    steps = (
+        [_pending_action("build", "still compiling", "job:abc")]
+        + [_action("bash", True, f"step-{index}") for index in range(5)]
+        + [_thought("checking result"), terminal]
+    )
+
+    ledger, remaining = compact_steps(steps, keep_recent=2)
+
+    assert "… build [PENDING]" not in (ledger or "")
+    assert terminal in remaining
+
+
+def test_summary_mention_does_not_close_pending_without_structured_poll_ref():
+    steps = [
+        _pending_action("build", "still compiling", "job:abc"),
+        _action("bash", True, "inspected → job:abc documentation only"),
+    ] + [_thought("later")] * 4
+
+    ledger, _ = compact_steps(steps, keep_recent=2)
+
+    assert "… build [PENDING]: still compiling → job:abc" in ledger
 
 
 def test_failed_attempts_always_visible_in_ledger():
