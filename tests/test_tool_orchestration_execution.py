@@ -1,6 +1,7 @@
 import pytest
 
 from sag.agent.tool_orchestration import (
+    RecoveryDecision,
     ToolCall,
     ToolExecutionRecord,
     ToolOrchestrator,
@@ -54,6 +55,17 @@ class FailureTool(BaseTool):
             error="failed",
             error_code="FAILURE_TOOL_FAILED",
         )
+
+
+class ExplodingSafeExecuteTool(BaseTool):
+    def __init__(self):
+        super().__init__("explode", "Exploding tool")
+
+    def execute(self, command: str) -> ToolResult:
+        return ToolResult.completed_success(output="unused")
+
+    def safe_execute(self, **kwargs) -> ToolResult:
+        raise RuntimeError("boom")
 
 
 class FakeDurableOutputStorage:
@@ -440,21 +452,71 @@ def test_manage_context_invalidation_metadata_only_for_successful_context_change
     assert "invalidate_trunk_cache" not in failed_changing_execution.metadata
 
 
-def test_unexpected_safe_execute_exception_returns_exception_status():
-    class ExplodingTool(BaseTool):
-        def __init__(self):
-            super().__init__("explode", "Exploding tool")
-
-        def execute(self, command: str) -> ToolResult:
-            return ToolResult.completed_success(output="unused")
-
-        def safe_execute(self, **kwargs) -> ToolResult:
-            raise RuntimeError("boom")
-
+def test_unexpected_safe_execute_exception_reaches_recovery_and_preserves_crash(monkeypatch):
     tracking_calls = []
+    recovery_calls = []
     events = []
     orchestrator = ToolOrchestrator(
-        tools={"explode": ExplodingTool()},
+        tools={"explode": ExplodingSafeExecuteTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
+        update_successful_states=lambda tool_name, params, result: None,
+        add_system_guidance=lambda message, priority=5: None,
+        get_timestamp=lambda: "ts",
+        event_sink=events.append,
+    )
+    monkeypatch.setattr(
+        orchestrator.recovery_handler,
+        "recover",
+        lambda tool_name, params, result: (
+            recovery_calls.append((tool_name, params, result))
+            or RecoveryDecision(
+                should_recover=False,
+                strategy="crash_declined",
+                guidance="Crash recovery is unsupported",
+            )
+        ),
+    )
+
+    execution = orchestrator.execute(ToolCall(name="explode", raw_params={"command": "pwd"}))
+
+    assert len(recovery_calls) == 1
+    tool_name, params, crashed = recovery_calls[0]
+    assert tool_name == "explode"
+    assert params == {"command": "pwd"}
+    assert crashed is execution.result
+    assert execution.status == "exception"
+    assert execution.result.succeeded is False
+    assert execution.result.invocation_status is InvocationStatus.CRASHED
+    assert execution.result.operation_outcome is OperationOutcome.FAILED
+    assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
+    assert execution.attempted_execution is True
+    assert execution.metadata["recovery"]["strategy"] == "crash_declined"
+    assert execution.metadata["recovery"]["attempted"] is False
+    assert tracking_calls == [("explode:[('command', 'pwd')]", execution.result)]
+    error_event = events[-1]
+    assert error_event.event_type == "tool_error"
+    assert all(event.event_type != "tool_result" for event in events)
+    error_metadata = error_event.metadata
+    assert error_metadata["invocation_status"] == "crashed"
+    assert error_metadata["operation_outcome"] == "failed"
+    assert error_metadata["evidence_status"] == "verified"
+    assert error_metadata["failure_signature"] == execution.result.failure_signature
+    assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
+    assert error_metadata["output_ref"] == execution.result.output_ref
+    assert error_metadata["recovery_attempted"] is False
+
+
+def test_unexpected_safe_execute_exception_honors_supported_replacement(monkeypatch):
+    recovery_calls = []
+    tracking_calls = []
+    events = []
+    replacement = ToolResult.completed_success(output="recovered from crash")
+    orchestrator = ToolOrchestrator(
+        tools={"explode": ExplodingSafeExecuteTool()},
         context_manager=None,
         recent_tool_executions=[],
         successful_states={},
@@ -466,22 +528,44 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
         event_sink=events.append,
     )
 
+    def recover(tool_name, params, failed_result):
+        recovery_calls.append((tool_name, params, failed_result))
+        return RecoveryDecision(
+            should_recover=True,
+            strategy="crash_replacement",
+            guidance="Use the supported replacement",
+            replacement_result=replacement,
+            replacement_params={"command": "fallback"},
+        )
+
+    monkeypatch.setattr(orchestrator.recovery_handler, "recover", recover)
+
     execution = orchestrator.execute(ToolCall(name="explode", raw_params={"command": "pwd"}))
 
-    assert execution.status == "exception"
-    assert execution.result.succeeded is False
-    assert execution.result.invocation_status is InvocationStatus.CRASHED
-    assert execution.result.operation_outcome is OperationOutcome.FAILED
-    assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
-    assert execution.attempted_execution is True
-    assert tracking_calls == [("explode:[('command', 'pwd')]", execution.result)]
-    error_metadata = events[-1].metadata
-    assert error_metadata["invocation_status"] == "crashed"
-    assert error_metadata["operation_outcome"] == "failed"
-    assert error_metadata["evidence_status"] == "verified"
-    assert error_metadata["failure_signature"] == execution.result.failure_signature
-    assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
-    assert error_metadata["output_ref"] == execution.result.output_ref
+    assert len(recovery_calls) == 1
+    tool_name, params, crashed = recovery_calls[0]
+    assert tool_name == "explode"
+    assert params == {"command": "pwd"}
+    assert crashed.invocation_status is InvocationStatus.CRASHED
+    assert crashed.operation_outcome is OperationOutcome.FAILED
+    assert execution.status == "recovered"
+    assert execution.result is replacement
+    assert execution.recovery_applied is True
+    assert execution.recovery_strategy == "crash_replacement"
+    assert execution.executed_params == {"command": "fallback"}
+    assert execution.metadata["recovery"]["success"] is True
+    assert tracking_calls == [("explode:[('command', 'pwd')]", replacement)]
+    recovery_event = next(event for event in events if event.event_type == "tool_recovery")
+    assert recovery_event.metadata["recovery_strategy"] == "crash_replacement"
+    error_event = events[-1]
+    assert error_event.event_type == "tool_error"
+    assert all(event.event_type != "tool_result" for event in events)
+    assert error_event.metadata["invocation_status"] == "crashed"
+    assert error_event.metadata["operation_outcome"] == "failed"
+    assert error_event.metadata["failure_signature"] == crashed.failure_signature
+    assert error_event.metadata["error_tail_preview"] == crashed.error_tail_preview
+    assert error_event.metadata["output_ref"] == crashed.output_ref
+    assert error_event.metadata["recovery_attempted"] is True
 
 
 def test_event_sink_exception_does_not_abort_successful_execution():

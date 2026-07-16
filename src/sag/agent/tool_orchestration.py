@@ -582,6 +582,7 @@ class ToolOrchestrator:
                 )
                 return execution
 
+        escaped_exception_result: Optional[ToolResult] = None
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
         except Exception as exc:
@@ -595,40 +596,17 @@ class ToolOrchestrator:
                     "failure_category": "system",
                 },
             )
-            self._track_tool_execution(signature, result)
-            duration_ms = self._duration_since(started_at)
-            observation_text = format_tool_result(call.name, result)
-            execution = ToolExecution(
-                call=call,
-                result=result,
-                status="exception",
-                raw_params=call.raw_params,
-                validated_params=validated_params,
-                executed_params=validated_params,
-                duration_ms=duration_ms,
-                observation_text=observation_text,
-                attempted_execution=True,
-                parameter_fixes=call.parameter_fixes,
-                metadata={"execution_signature": signature, **repetition_metadata},
-            )
-            self._emit(
-                "tool_error",
-                call,
-                message=observation_text,
-                level="error",
-                metadata={
-                    "status": execution.status,
-                    "execution_signature": signature,
-                    **self._tool_error_metadata(result, recovery_attempted=False),
-                },
-            )
-            return execution
+            escaped_exception_result = result
 
         executed_params = validated_params
         recovery_applied = False
         recovery_strategy: Optional[str] = None
         recovery_metadata: Optional[Dict[str, Any]] = None
-        status = self._result_execution_status(result)
+        status = (
+            "exception"
+            if escaped_exception_result is not None
+            else self._result_execution_status(result)
+        )
 
         if result.is_terminal and result.operation_outcome is OperationOutcome.FAILED:
             decision = self.recovery_handler.recover(call.name, validated_params, result)
@@ -686,7 +664,7 @@ class ToolOrchestrator:
         if result.succeeded:
             self._update_successful_states(call.name, executed_params, result)
 
-        if repetition_level in {1, 2}:
+        if escaped_exception_result is None and repetition_level in {1, 2}:
             warning = self._build_repetition_warning(
                 call.name,
                 validated_params,
@@ -699,7 +677,7 @@ class ToolOrchestrator:
         duration_ms = self._duration_since(started_at)
         observation_text = format_tool_result(call.name, result)
         execution_metadata = {"execution_signature": signature, **repetition_metadata}
-        if repetition_level == 2:
+        if escaped_exception_result is None and repetition_level == 2:
             execution_metadata["force_thinking_next"] = True
         if recovery_metadata is not None:
             execution_metadata["recovery"] = recovery_metadata
@@ -754,13 +732,31 @@ class ToolOrchestrator:
         if execution.metadata.get("invalidate_trunk_cache"):
             event_metadata["invalidate_trunk_cache"] = True
 
-        self._emit(
-            "tool_result",
-            call,
-            message=observation_text,
-            level=self._result_event_level(result),
-            metadata=event_metadata,
-        )
+        if escaped_exception_result is not None:
+            self._emit(
+                "tool_error",
+                call,
+                message=format_tool_result(call.name, escaped_exception_result),
+                level="error",
+                metadata={
+                    "status": execution.status,
+                    "execution_signature": signature,
+                    **self._tool_error_metadata(
+                        escaped_exception_result,
+                        recovery_attempted=bool(
+                            recovery_metadata and recovery_metadata.get("attempted")
+                        ),
+                    ),
+                },
+            )
+        else:
+            self._emit(
+                "tool_result",
+                call,
+                message=observation_text,
+                level=self._result_event_level(result),
+                metadata=event_metadata,
+            )
         return execution
 
     def _execution_signature(self, tool_name: str, params: Dict[str, Any]) -> str:
