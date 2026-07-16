@@ -201,7 +201,12 @@ def _normalize_temporary_path(match: re.Match[str]) -> str:
                 stem,
                 flags=re.IGNORECASE,
             )
-            and re.search(r"\d", stem)
+            and any(
+                len(token) >= 6
+                and re.search(r"[A-Za-z]", token)
+                and re.search(r"\d", token)
+                for token in re.split(r"[-_.]", stem)
+            )
         )
     )
     stable_basename = f"<temp-entry>{stable_suffix}" if entropy_bearing else basename

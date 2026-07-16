@@ -161,6 +161,53 @@ def test_failure_signature_retains_stable_suffix_for_entropy_bearing_temp_file()
     assert first_log.failure_signature != json_output.failure_signature
 
 
+def test_failure_signature_keeps_short_semantic_temp_numbers_distinct():
+    not_found = ToolResult.completed_failure(
+        output="/tmp/result-404.json: request failed",
+        error="request failed",
+        error_code="REQUEST_FAILED",
+    )
+    server_error = ToolResult.completed_failure(
+        output="/tmp/result-500.json: request failed",
+        error="request failed",
+        error_code="REQUEST_FAILED",
+    )
+
+    assert not_found.failure_signature != server_error.failure_signature
+
+
+@pytest.mark.parametrize(
+    ("first_path", "second_path"),
+    [
+        (
+            "/tmp/550e8400-e29b-41d4-a716-446655440000.json",
+            "/var/tmp/123e4567-e89b-12d3-a456-426614174000.json",
+        ),
+        (
+            "/tmp/output-deadbeefcafebabe.log",
+            "/var/tmp/output-c001d00dcafed00d.log",
+        ),
+        (
+            "/tmp/sag-output-a1b2c3.log",
+            "/var/tmp/sag-output-z9y8x7.log",
+        ),
+    ],
+)
+def test_failure_signature_normalizes_genuine_temp_entry_entropy(first_path, second_path):
+    first = ToolResult.completed_failure(
+        output=f"{first_path}: parser failed",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    second = ToolResult.completed_failure(
+        output=f"{second_path}: parser failed",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+
+    assert first.failure_signature == second.failure_signature
+
+
 def test_failure_factory_keeps_explicit_domain_signature_authoritative():
     result = ToolResult.completed_failure(
         output="/tmp/run-a1b2/pom.xml: malformed project model",

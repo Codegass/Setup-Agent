@@ -470,11 +470,13 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
 
     assert execution.status == "exception"
     assert execution.result.succeeded is False
+    assert execution.result.invocation_status is InvocationStatus.CRASHED
+    assert execution.result.operation_outcome is OperationOutcome.FAILED
     assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
     assert execution.attempted_execution is True
     assert tracking_calls == [("explode:[('command', 'pwd')]", execution.result)]
     error_metadata = events[-1].metadata
-    assert error_metadata["invocation_status"] == "completed"
+    assert error_metadata["invocation_status"] == "crashed"
     assert error_metadata["operation_outcome"] == "failed"
     assert error_metadata["evidence_status"] == "verified"
     assert error_metadata["failure_signature"] == execution.result.failure_signature

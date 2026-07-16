@@ -164,7 +164,13 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
     if result.operation_outcome is not OperationOutcome.FAILED:
         if result.invocation_status is InvocationStatus.PENDING:
-            formatted = f"⏳ {tool_name} dispatched — command still running in background"
+            if result.metadata.get("dispatch_status") == "liveness_unknown_detached":
+                formatted = (
+                    f"⏳ {tool_name} dispatched — command liveness is unknown; "
+                    f"poll existing job {result.poll_ref}"
+                )
+            else:
+                formatted = f"⏳ {tool_name} dispatched — command still running in background"
         elif result.succeeded:
             formatted = f"✅ {tool_name} executed successfully"
         else:
@@ -579,7 +585,8 @@ class ToolOrchestrator:
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
         except Exception as exc:
-            result = ToolResult.completed_failure(
+            result = ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.CRASHED,
                 output="",
                 error=f"Tool {call.name} execution failed unexpectedly: {exc}",
                 error_code="TOOL_EXECUTION_EXCEPTION",

@@ -70,7 +70,7 @@ def test_observation_shows_outcome_and_facts():
     assert "output_5b9a" in observation
 
 
-def test_observation_pending_keeps_dispatch_wording():
+def test_observation_running_handoff_keeps_positive_running_wording():
     result = ToolResult(
         invocation_status="pending",
         operation_outcome="unknown",
@@ -81,9 +81,29 @@ def test_observation_pending_keeps_dispatch_wording():
     )
 
     observation = format_tool_result("build", result)
+    first_line = observation.splitlines()[0].lower()
 
-    assert "still running" in observation.lower()
+    assert "still running" in first_line
+    assert "liveness is unknown" not in first_line
     assert "✅" not in observation.split("\n")[0]
+
+
+def test_observation_unknown_liveness_instructs_polling_existing_job():
+    result = ToolResult(
+        invocation_status="pending",
+        operation_outcome="unknown",
+        evidence_status=EvidenceStatus.UNKNOWN,
+        poll_ref="job:background-build",
+        output="last known output",
+        metadata={"dispatch_status": "liveness_unknown_detached"},
+    )
+
+    observation = format_tool_result("build", result)
+    first_line = observation.splitlines()[0].lower()
+
+    assert "liveness is unknown" in first_line
+    assert "poll existing job job:background-build" in first_line
+    assert "still running" not in first_line
 
 
 def test_success_observation_shape_is_stable():
