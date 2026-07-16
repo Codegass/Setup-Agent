@@ -1090,11 +1090,10 @@ class DockerOrchestrator:
 
         The command runs detached with output in a container log file. If it
         finishes within soft_timeout, the result looks like a normal
-        execute_command result. If it is still running when the window closes,
-        the result is a handoff (dispatch_status="running_detached") carrying
-        the log tail and poll instructions — the process keeps running and the
-        agent checks the log tail across iterations; only the run-level
-        wall-clock cap bounds it.
+        execute_command result. If it is still running or its liveness cannot
+        be established when the window closes, the result is a handoff carrying
+        the log tail and poll instructions. Only terminal observations are
+        collected.
         """
         config = getattr(self, "config", None)
         if soft_timeout is None:
@@ -1129,18 +1128,33 @@ class DockerOrchestrator:
                 return self.collect_detached_result(handle, poll)
 
         final_poll = self.poll_detached_command(handle, tail_lines=tail_lines)
-        if self._detached_poll_state(final_poll) in {"finished", "vanished"}:
-            return self.collect_detached_result(handle, final_poll)
-        if self._detached_poll_state(final_poll) != "running":
+        final_state = self._detached_poll_state(final_poll)
+        if final_state in {"finished", "vanished"}:
             return self.collect_detached_result(handle, final_poll)
 
-        logger.info(
-            f"⏳ Soft window of {soft_timeout}s expired; handing off still-running command "
-            f"(pid {handle['pid']}, log {handle['log_path']})"
-        )
+        liveness_unknown = final_state == "unknown"
+        dispatch_status = "liveness_unknown_detached" if liveness_unknown else "running_detached"
+        if liveness_unknown:
+            logger.warning(
+                f"Soft window of {soft_timeout}s expired without a conclusive liveness "
+                f"probe; preserving detached command handle (pid {handle['pid']}, "
+                f"log {handle['log_path']})"
+            )
+            handoff_summary = (
+                "Command liveness could not be established after the soft window. "
+                "Its detached handle was preserved and the operation remains pending."
+            )
+        else:
+            logger.info(
+                f"⏳ Soft window of {soft_timeout}s expired; handing off still-running command "
+                f"(pid {handle['pid']}, log {handle['log_path']})"
+            )
+            handoff_summary = (
+                f"⏳ Command still running after the {soft_timeout}s soft window — it was left "
+                "running in the background (NOT killed)."
+            )
         handoff_output = (
-            f"⏳ Command still running after the {soft_timeout}s soft window — it was left "
-            f"running in the background (NOT killed).\n"
+            f"{handoff_summary}\n"
             f"Background job: pid {handle['pid']}, log file {handle['log_path']}\n"
             f"Last output:\n{final_poll.get('tail') or '(no output yet)'}\n\n"
             f"NEXT STEPS — poll the log instead of re-running the command:\n"
@@ -1154,7 +1168,9 @@ class DockerOrchestrator:
             "exit_code": None,
             "output": handoff_output,
             "termination_reason": None,
-            "dispatch_status": "running_detached",
+            "dispatch_status": dispatch_status,
+            "lifecycle_state": "pending",
+            "liveness_state": final_state,
             "dispatch": {
                 **handle,
                 "last_tail": final_poll.get("tail", ""),

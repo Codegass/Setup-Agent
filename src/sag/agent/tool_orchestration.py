@@ -623,10 +623,7 @@ class ToolOrchestrator:
         recovery_metadata: Optional[Dict[str, Any]] = None
         status = self._result_execution_status(result)
 
-        if (
-            result.invocation_status is InvocationStatus.COMPLETED
-            and result.operation_outcome is OperationOutcome.FAILED
-        ):
+        if result.is_terminal and result.operation_outcome is OperationOutcome.FAILED:
             decision = self.recovery_handler.recover(call.name, validated_params, result)
             recovery_metadata = dict(decision.metadata)
             recovery_metadata.setdefault("attempted", decision.should_recover)
@@ -773,6 +770,7 @@ class ToolOrchestrator:
         category: Optional[str] = None,
     ) -> Dict[str, Any]:
         return {
+            **self._result_lifecycle_metadata(result),
             "error_code": result.error_code,
             "category": category or result.metadata.get("failure_category") or "execution",
             "suggestions": list(result.suggestions),

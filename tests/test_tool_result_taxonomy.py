@@ -119,6 +119,59 @@ def test_failure_factory_signature_ignores_volatile_runtime_evidence():
     assert first.failure_signature == second.failure_signature
 
 
+def test_failure_signature_normalizes_temp_runs_without_erasing_semantic_basename():
+    first_pom = ToolResult.completed_failure(
+        output="/tmp/pytest-of-alice/pytest-41/run-a1b2/pom.xml: malformed project model",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    second_pom = ToolResult.completed_failure(
+        output="/var/tmp/pytest-of-bob/pytest-99/run-z9y8/pom.xml: malformed project model",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    settings = ToolResult.completed_failure(
+        output="/tmp/pytest-of-alice/pytest-41/run-a1b2/settings.xml: malformed project model",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+
+    assert first_pom.failure_signature == second_pom.failure_signature
+    assert first_pom.failure_signature != settings.failure_signature
+
+
+def test_failure_signature_retains_stable_suffix_for_entropy_bearing_temp_file():
+    first_log = ToolResult.completed_failure(
+        output="/tmp/sag-output-a1b2c3.log: parser failed",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    second_log = ToolResult.completed_failure(
+        output="/var/tmp/sag-output-z9y8x7.log: parser failed",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    json_output = ToolResult.completed_failure(
+        output="/tmp/sag-output-a1b2c3.json: parser failed",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+
+    assert first_log.failure_signature == second_log.failure_signature
+    assert first_log.failure_signature != json_output.failure_signature
+
+
+def test_failure_factory_keeps_explicit_domain_signature_authoritative():
+    result = ToolResult.completed_failure(
+        output="/tmp/run-a1b2/pom.xml: malformed project model",
+        error="build failed",
+        error_code="BUILD_FAILED",
+        failure_signature="maven:model:malformed-pom",
+    )
+
+    assert result.failure_signature == "maven:model:malformed-pom"
+
+
 def test_failure_factory_signature_keeps_distinct_root_causes_distinct():
     compiler_failure = ToolResult.completed_failure(
         output="pid=1234: compiler cannot find symbol Widget",

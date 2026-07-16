@@ -323,6 +323,13 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
     assert tracking_calls == []
     assert state_updates == []
     assert [event.event_type for event in events] == ["tool_start", "tool_error"]
+    error_metadata = events[-1].metadata
+    assert error_metadata["invocation_status"] == "completed"
+    assert error_metadata["operation_outcome"] == "failed"
+    assert error_metadata["evidence_status"] == "verified"
+    assert error_metadata["failure_signature"] == execution.result.failure_signature
+    assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
+    assert error_metadata["output_ref"] == execution.result.output_ref
 
 
 def test_react_engine_no_longer_exposes_parameter_wrapper():

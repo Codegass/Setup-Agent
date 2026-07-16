@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, Dict, Iterator, List, Optional, Union, get_args, get_origin
 
 from loguru import logger
@@ -179,6 +180,35 @@ def require_persisted_output_storage_ref(ref: str, *, storage: Any = None) -> No
         raise ValueError("output ref must be persisted in provided or bound OutputStorage")
 
 
+def _normalize_temporary_path(match: re.Match[str]) -> str:
+    raw_path = match.group(0)
+    trailing_period = raw_path.endswith(".")
+    path = raw_path[:-1] if trailing_period else raw_path
+    basename = PurePosixPath(path.rstrip("/")).name
+    parsed_basename = PurePosixPath(basename)
+    stable_suffix = "".join(parsed_basename.suffixes)
+    stem = basename[: -len(stable_suffix)] if stable_suffix else basename
+    entropy_bearing = bool(
+        re.fullmatch(
+            r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+            stem,
+            flags=re.IGNORECASE,
+        )
+        or re.search(r"[0-9a-f]{8,}", stem, flags=re.IGNORECASE)
+        or (
+            re.match(
+                r"^(?:sag|pytest|tmp|temp|run|output|result)(?:[-_.].*)?$",
+                stem,
+                flags=re.IGNORECASE,
+            )
+            and re.search(r"\d", stem)
+        )
+    )
+    stable_basename = f"<temp-entry>{stable_suffix}" if entropy_bearing else basename
+    normalized = f"<tmp-path>/{stable_basename}" if stable_basename else "<tmp-path>"
+    return normalized + ("." if trailing_period else "")
+
+
 def _stable_failure_signature_source(source: str) -> str:
     """Remove only runtime identifiers that do not identify a root cause."""
     normalized = re.sub(
@@ -193,7 +223,11 @@ def _stable_failure_signature_source(source: str) -> str:
         normalized,
         flags=re.IGNORECASE,
     )
-    normalized = re.sub(r"(?:/tmp|/var/tmp)/[^\s]+", "<tmp-path>", normalized)
+    normalized = re.sub(
+        r"(?:/tmp|/var/tmp)/[^\s:;,)\]\}>'\"]+",
+        _normalize_temporary_path,
+        normalized,
+    )
     normalized = re.sub(
         r"\b(?:progress|step|completed)\s+\d+\s*/\s*\d+\b",
         "progress <count>",

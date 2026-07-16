@@ -16,6 +16,9 @@ from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from ..base import ToolResult, require_persisted_output_storage_ref
 
 
+DETACHED_HANDOFF_STATUSES = frozenset({"running_detached", "liveness_unknown_detached"})
+
+
 def detached_poll_ref(result: Dict[str, Any]) -> str:
     """Return the stable public poll reference for a detached raw result."""
     dispatch = result.get("dispatch") or {}
@@ -51,7 +54,7 @@ def detached_handoff_tool_result(
         # search(target='job:<id>') has something real to poll.
         refs=[poll_ref],
         metadata={
-            "dispatch_status": "running_detached",
+            "dispatch_status": result.get("dispatch_status", "running_detached"),
             "tool": tool_name,
             "command": command,
             "job_id": job_id,

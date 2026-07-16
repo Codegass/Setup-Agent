@@ -452,6 +452,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
             raise RuntimeError("boom")
 
     tracking_calls = []
+    events = []
     orchestrator = ToolOrchestrator(
         tools={"explode": ExplodingTool()},
         context_manager=None,
@@ -462,6 +463,7 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
+        event_sink=events.append,
     )
 
     execution = orchestrator.execute(ToolCall(name="explode", raw_params={"command": "pwd"}))
@@ -471,6 +473,13 @@ def test_unexpected_safe_execute_exception_returns_exception_status():
     assert execution.result.error_code == "TOOL_EXECUTION_EXCEPTION"
     assert execution.attempted_execution is True
     assert tracking_calls == [("explode:[('command', 'pwd')]", execution.result)]
+    error_metadata = events[-1].metadata
+    assert error_metadata["invocation_status"] == "completed"
+    assert error_metadata["operation_outcome"] == "failed"
+    assert error_metadata["evidence_status"] == "verified"
+    assert error_metadata["failure_signature"] == execution.result.failure_signature
+    assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
+    assert error_metadata["output_ref"] == execution.result.output_ref
 
 
 def test_event_sink_exception_does_not_abort_successful_execution():

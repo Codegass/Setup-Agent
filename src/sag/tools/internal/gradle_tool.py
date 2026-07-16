@@ -18,6 +18,7 @@ from .build_preflight import (
     read_build_requirements,
 )
 from .build_utils import (
+    DETACHED_HANDOFF_STATUSES,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
@@ -299,7 +300,7 @@ class GradleTool(BaseTool):
                         jdk_retry_meta = {"from": active, "to": needed}
                         result = _run_build()
 
-            if result.get("dispatch_status") == "running_detached":
+            if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("gradle", gradle_cmd, result)
 
             if result.get("termination_reason"):

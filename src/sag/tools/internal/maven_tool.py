@@ -21,6 +21,7 @@ from .build_preflight import (
     read_build_requirements,
 )
 from .build_utils import (
+    DETACHED_HANDOFF_STATUSES,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
@@ -445,7 +446,7 @@ class MavenTool(BaseTool):
                         result = _run_build()
             _build_elapsed = time.monotonic() - _build_t0
 
-            if result.get("dispatch_status") == "running_detached":
+            if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("maven", maven_cmd, result)
 
             if result.get("termination_reason"):

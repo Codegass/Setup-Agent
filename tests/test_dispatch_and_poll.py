@@ -250,7 +250,7 @@ def test_soft_timeout_vanished_process_fails_safe():
     assert result["dispatch_status"] == "completed_detached"
 
 
-def test_soft_timeout_unknown_liveness_is_not_handed_off_as_active():
+def test_soft_timeout_unknown_liveness_returns_distinct_pending_handoff():
     unknown = {
         "finished": False,
         "running": False,
@@ -261,15 +261,22 @@ def test_soft_timeout_unknown_liveness_is_not_handed_off_as_active():
         "state": "unknown",
     }
     orchestrator = _soft_timeout_orchestrator([unknown], log_content="last known output")
+    collect_calls = []
+    orchestrator.collect_detached_result = lambda *args: collect_calls.append(args) or {}
 
     result = orchestrator.execute_command_with_soft_timeout(
         "./gradlew compileJava", soft_timeout=1, poll_interval=0.01
     )
 
-    assert result["success"] is False
+    assert result["success"] is True
     assert result["exit_code"] is None
-    assert result["dispatch_status"] == "completed_detached"
-    assert result["lifecycle_state"] == "unknown"
+    assert result["dispatch_status"] == "liveness_unknown_detached"
+    assert result["lifecycle_state"] == "pending"
+    assert result["liveness_state"] == "unknown"
+    assert result["dispatch"]["job_id"] == "abc"
+    assert result["dispatch"]["last_tail"] == "last known output"
+    assert "last known output" in result["output"]
+    assert collect_calls == []
 
 
 def test_soft_timeout_dispatch_failure_is_failure_result():
@@ -577,11 +584,12 @@ class RoutingOrchestrator:
     tests/test_maven_gradle_tool_contracts.py's fake does.
     """
 
-    def __init__(self, handoff=True):
+    def __init__(self, handoff=True, handoff_status="running_detached"):
         self.soft_timeout_calls = []
         self.monitoring_calls = []
         self.project_name = None
         self._handoff = handoff
+        self._handoff_status = handoff_status
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         if command in ("which mvn", "command -v mvn"):
@@ -616,7 +624,7 @@ class RoutingOrchestrator:
                 "exit_code": None,
                 "output": "still running; poll /tmp/sag_jobs/abc.log",
                 "termination_reason": None,
-                "dispatch_status": "running_detached",
+                "dispatch_status": self._handoff_status,
                 "dispatch": {
                     "pid": 1,
                     "log_path": "/tmp/sag_jobs/abc.log",
@@ -677,6 +685,32 @@ def test_bash_tool_routes_long_command_through_dispatch():
     assert result.invocation_status is InvocationStatus.PENDING
     assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.metadata["dispatch_status"] == "running_detached"
+
+
+@pytest.mark.parametrize("tool_name", ["bash", "maven", "gradle"])
+def test_build_tools_preserve_unknown_liveness_as_pending_handoff(tool_name):
+    orchestrator = RoutingOrchestrator(
+        handoff=True,
+        handoff_status="liveness_unknown_detached",
+    )
+    if tool_name == "bash":
+        from sag.tools.bash import BashTool
+
+        result = BashTool(orchestrator).execute(command="mvn verify", timeout=1200)
+    elif tool_name == "maven":
+        from sag.tools.internal.maven_tool import MavenTool
+
+        result = MavenTool(orchestrator).execute(command="test", working_directory="/workspace/p")
+    else:
+        from sag.tools.internal.gradle_tool import GradleTool
+
+        result = GradleTool(orchestrator).execute(tasks="build", working_directory="/workspace/p")
+
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
+    assert result.evidence_status is EvidenceStatus.UNKNOWN
+    assert result.poll_ref == "job:abc"
+    assert result.metadata["dispatch_status"] == "liveness_unknown_detached"
 
 
 def test_bash_quick_inspection_commands_not_dispatched():

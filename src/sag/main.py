@@ -17,8 +17,8 @@ from rich.text import Text
 
 from sag import __version__
 from sag.agent.agent import SetupAgent
-from sag.coverage.runner import apply_coverage
 from sag.agent.context_journal import JOURNAL_DIR
+from sag.agent.history_state import HistoryActionState, decode_history_action_state
 from sag.agent.phase_machine import PHASE_NAMES
 from sag.config import (
     Config,
@@ -29,6 +29,7 @@ from sag.config import (
     set_config,
     suppress_console_logging,
 )
+from sag.coverage.runner import apply_coverage
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.utils.git_utils import extract_project_name_from_url
 from sag.web.server import run_web_server
@@ -1330,4 +1331,3 @@ def version():
 
 if __name__ == "__main__":
     cli()
-from sag.agent.history_state import HistoryActionState, decode_history_action_state

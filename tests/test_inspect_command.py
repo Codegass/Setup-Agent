@@ -2,6 +2,8 @@
 saw (spec §7). Helpers are pure; sources (container/session-dir) are injected."""
 
 import json
+import subprocess
+import sys
 
 from click.testing import CliRunner
 
@@ -126,6 +128,32 @@ def test_inspect_iter_can_resolve_global_iteration_without_phase(monkeypatch, tm
     assert "phase build" in result.output
     assert "BUILD FAILED: enforcer" in result.output
     assert not (tmp_path / "logs").exists()
+
+
+def test_python_module_inspect_binds_history_decoder_before_cli_execution(tmp_path):
+    session_dir = _write_recorded_session(tmp_path)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "sag.main",
+            "inspect",
+            "unused",
+            "--session",
+            str(session_dir),
+            "--iter",
+            "3",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "BUILD FAILED: enforcer" in result.stdout
+    assert "Inspect failed" not in result.stdout
 
 
 def test_inspect_iter_expands_full_output_refs(monkeypatch, tmp_path):

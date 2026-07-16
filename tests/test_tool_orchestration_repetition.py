@@ -62,7 +62,14 @@ def _recent_executions(signature, count, *, success=False):
     ]
 
 
-def _orchestrator(*, tools, recent_tool_executions, context_manager=None, tracking_calls=None):
+def _orchestrator(
+    *,
+    tools,
+    recent_tool_executions,
+    context_manager=None,
+    tracking_calls=None,
+    events=None,
+):
     if tracking_calls is None:
         tracking_calls = []
 
@@ -76,6 +83,7 @@ def _orchestrator(*, tools, recent_tool_executions, context_manager=None, tracki
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
+        event_sink=events.append if events is not None else None,
     )
 
 
@@ -168,11 +176,13 @@ def test_repetition_level_three_breaks_without_execution_and_forces_next_task():
     context = ContextWithForceNextTask()
     signature = _signature("echo", "pwd")
     tracking_calls = []
+    events = []
     orchestrator = _orchestrator(
         tools={"echo": tool},
         context_manager=context,
         recent_tool_executions=_recent_executions(signature, 5),
         tracking_calls=tracking_calls,
+        events=events,
     )
 
     execution = orchestrator.execute(ToolCall(name="echo", raw_params={"command": "pwd"}))
@@ -187,6 +197,13 @@ def test_repetition_level_three_breaks_without_execution_and_forces_next_task():
     assert execution.metadata["force_next_task"] is True
     assert context.force_next_task_calls == 0
     assert tracking_calls == [(signature, execution.result)]
+    error_metadata = events[-1].metadata
+    assert error_metadata["invocation_status"] == "completed"
+    assert error_metadata["operation_outcome"] == "failed"
+    assert error_metadata["evidence_status"] == "verified"
+    assert error_metadata["failure_signature"] == execution.result.failure_signature
+    assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
+    assert error_metadata["output_ref"] == execution.result.output_ref
 
 
 def test_java_repetition_triggers_auto_fix():

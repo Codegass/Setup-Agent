@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
+from sag.evidence import InvocationStatus
 from sag.tools.base import BaseTool, ToolResult
 
 
@@ -400,6 +401,34 @@ def test_generic_recovery_returns_failure_without_silent_success():
     assert execution.metadata["recovery"]["message"] == "No generic recovery strategy available"
 
 
+def test_crashed_failure_reaches_recovery_without_losing_guidance_or_metadata():
+    crashed = ToolResult.terminal_failure(
+        invocation_status=InvocationStatus.CRASHED,
+        output="worker crashed after writing diagnostics",
+        error="worker crashed",
+        error_code="WORKER_CRASHED",
+        suggestions=["inspect the worker diagnostics"],
+        metadata={"crash_report": "output_crash_report"},
+    )
+    tool = ResultTool("echo", [crashed])
+    orchestrator = _orchestrator(tools={"echo": tool})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="echo",
+            raw_params={"command": "run"},
+            validated_params={"command": "run"},
+        )
+    )
+
+    assert execution.result is crashed
+    assert execution.result.invocation_status is InvocationStatus.CRASHED
+    assert execution.result.suggestions == ["inspect the worker diagnostics"]
+    assert execution.result.metadata["crash_report"] == "output_crash_report"
+    assert execution.metadata["recovery"]["attempted"] is False
+    assert execution.metadata["recovery"]["strategy"] == "generic_no_strategy"
+
+
 def test_maven_java_version_recovery_installs_and_retries():
     maven = ResultTool(
         "maven",
@@ -781,7 +810,8 @@ def test_maven_timeout_returns_guidance_without_retry():
     maven = ResultTool(
         "maven",
         [
-            ToolResult.completed_failure(
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="timed out",
                 error_code="TIMEOUT_WALL",
@@ -821,7 +851,8 @@ def test_maven_timeout_takes_precedence_over_retry_recovery():
     maven = ResultTool(
         "maven",
         [
-            ToolResult.completed_failure(
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="pom not found during timeout",
                 error_code="TIMEOUT_IDLE",
@@ -861,7 +892,8 @@ def test_gradle_timeout_returns_guidance_without_retry():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult.completed_failure(
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="timed out",
                 error_code="TIMEOUT_WALL",
@@ -1063,7 +1095,8 @@ def test_bash_timeout_guidance_adds_system_guidance():
     bash = ResultTool(
         "bash",
         [
-            ToolResult.completed_failure(
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="timed out",
                 error_code="TIMEOUT_WALL",

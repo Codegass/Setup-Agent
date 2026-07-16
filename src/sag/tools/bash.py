@@ -12,6 +12,7 @@ from loguru import logger
 
 from .base import BaseTool, ToolError, ToolResult
 from .internal.build_utils import (
+    DETACHED_HANDOFF_STATUSES,
     classify_detached_completion,
     detached_handoff_tool_result,
     detached_poll_ref,
@@ -686,9 +687,9 @@ class BashTool(BaseTool):
                     timeout=timeout,
                 )
 
-            # Handle dispatch-and-poll handoff: the command is still running in
-            # the background; tell the agent how to poll the log tail.
-            if result.get("dispatch_status") == "running_detached":
+            # Handle a nonterminal dispatch-and-poll handoff; tell the agent how
+            # to poll the same job even when the latest liveness probe was inconclusive.
+            if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("bash", command, result)
 
             if result.get("dispatch_status") == "completed_detached":
