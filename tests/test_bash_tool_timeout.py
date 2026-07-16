@@ -1,4 +1,5 @@
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.evidence import InvocationStatus
 from sag.tools.bash import BashTool
 
 
@@ -149,6 +150,7 @@ def test_bash_tool_regular_timeout_result_uses_timeout_error_code():
     result = tool.execute(command="sleep 99", timeout=5)
 
     assert result.succeeded is False
+    assert result.invocation_status is InvocationStatus.TIMEOUT
     assert result.error_code == "TIMEOUT_ABSOLUTE_TIMEOUT"
     assert result.metadata["timeout"] == 5
     assert result.metadata["termination_reason"] == "absolute_timeout"
@@ -206,6 +208,7 @@ def test_bash_tool_timeout_termination_reports_requested_timeout():
     result = tool.execute(command="npm install", timeout=120)
 
     assert result.succeeded is False
+    assert result.invocation_status is InvocationStatus.TIMEOUT
     assert "2 minutes" in result.error
     assert result.metadata["timeout"] == 120
     assert result.metadata["termination_reason"] == "absolute_timeout"

@@ -93,6 +93,10 @@ class PhaseMachine:
         return self._index >= len(PHASE_NAMES)
 
     def _advance(self, record: PhaseAttemptRecord) -> None:
+        self._append(record)
+        self._index += 1
+
+    def _append(self, record: PhaseAttemptRecord) -> None:
         if self.is_complete:
             raise RuntimeError("phase machine already complete")
         if record.phase != self.current_phase:
@@ -100,7 +104,6 @@ class PhaseMachine:
                 f"phase record for {record.phase!r} cannot advance {self.current_phase!r}"
             )
         self._records.append(record)
-        self._index += 1
 
     def _attempt_id(self) -> str:
         return f"{self.current_phase}-{len(self._records) + 1}"
@@ -135,6 +138,22 @@ class PhaseMachine:
             )
         )
 
+    def record_abort(self, reason: str, evidence: List[str]) -> PhaseAttemptRecord:
+        """Record an abnormal exit for the current attempt without advancing."""
+        if self._records and self._records[-1].termination is PhaseTermination.ABORTED:
+            return self._records[-1]
+        record = PhaseAttemptRecord(
+            phase=self.current_phase,
+            attempt_id=self._attempt_id(),
+            termination=PhaseTermination.ABORTED,
+            outcome=PhaseOutcome.UNKNOWN,
+            transition="abort",
+            reason=reason or "setup phase aborted",
+            evidence=list(evidence or []),
+        )
+        self._append(record)
+        return record
+
     def termination_state(self) -> str:
         """Report flow closure only; phase outcomes never become a run verdict."""
         if any(record.termination is PhaseTermination.ABORTED for record in self._records):
@@ -149,8 +168,10 @@ class PhaseMachine:
         for record in self._records:
             if record.termination is PhaseTermination.COMPLETED:
                 lines.append(f"✓ {record.phase}: {record.key_results[:200]}")
-            else:
+            elif record.termination is PhaseTermination.BLOCKED:
                 lines.append(f"⛔ {record.phase} BLOCKED: {record.reason[:200]}")
+            else:
+                lines.append(f"⛔ {record.phase} ABORTED: {record.reason[:200]}")
         if not self.is_complete:
             lines.append(f"→ current: {self.current_phase}")
         return lines

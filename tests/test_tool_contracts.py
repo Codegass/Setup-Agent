@@ -5,6 +5,7 @@ from sag.agent.react_llm import ReactLLMClient
 from sag.agent.react_types import ReactModelMode
 from sag.config.models import LogLevel
 from sag.config.settings import Config
+from sag.evidence import InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
 from sag.tools.context_tool import ContextTool
@@ -63,6 +64,21 @@ def test_base_tool_infers_optional_integer_schema():
 
     assert schema["properties"]["end_line"]["type"] == "integer"
     assert schema["properties"]["end_line"]["default"] is None
+
+
+def test_base_tool_safe_execute_marks_unexpected_exceptions_as_crashed():
+    class ExplodingTool(BaseTool):
+        def __init__(self):
+            super().__init__("exploding", "Explodes for a contract test")
+
+        def execute(self, command: str) -> ToolResult:
+            raise RuntimeError("boom")
+
+    result = ExplodingTool().safe_execute(command="run")
+
+    assert result.invocation_status is InvocationStatus.CRASHED
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.error_code == "UNEXPECTED_ERROR"
 
 
 def test_react_llm_client_uses_public_tool_schema_without_empty_fallback():

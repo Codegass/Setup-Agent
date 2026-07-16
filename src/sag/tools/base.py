@@ -52,7 +52,11 @@ class ToolError(Exception):
         self.details = details or {}
         self.retryable = retryable
 
-    def to_result(self, duration: Optional[float] = None) -> "ToolResult":
+    def to_result(
+        self,
+        duration: Optional[float] = None,
+        invocation_status: InvocationStatus | str = InvocationStatus.COMPLETED,
+    ) -> "ToolResult":
         """Convert ToolError to ToolResult with preserved metadata."""
         metadata = {
             "failure_category": self.category,
@@ -66,7 +70,8 @@ class ToolError(Exception):
         if self.details:
             metadata["error_details"] = self.details
 
-        return ToolResult.completed_failure(
+        return ToolResult.terminal_failure(
+            invocation_status=invocation_status,
             output="",
             error=self.message,
             error_code=self.error_code,
@@ -174,6 +179,30 @@ def require_persisted_output_storage_ref(ref: str, *, storage: Any = None) -> No
         raise ValueError("output ref must be persisted in provided or bound OutputStorage")
 
 
+def _stable_failure_signature_source(source: str) -> str:
+    """Remove only runtime identifiers that do not identify a root cause."""
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\b",
+        "<timestamp>",
+        source,
+    )
+    normalized = re.sub(r"\bjob:[A-Za-z0-9_-]+\b", "job:<id>", normalized)
+    normalized = re.sub(
+        r"\b(?:pid|process(?:\s+id)?)[=:#\s]*\d+\b",
+        "pid=<id>",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(r"(?:/tmp|/var/tmp)/[^\s]+", "<tmp-path>", normalized)
+    normalized = re.sub(
+        r"\b(?:progress|step|completed)\s+\d+\s*/\s*\d+\b",
+        "progress <count>",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(normalized.split())
+
+
 class ToolResult(BaseModel):
     """Canonical, orthogonal tool execution result."""
 
@@ -215,6 +244,49 @@ class ToolResult(BaseModel):
         **payload: Any,
     ) -> "ToolResult":
         """Build a terminal result and fill stable provenance for failures."""
+        return cls._terminal(
+            invocation_status=InvocationStatus.COMPLETED,
+            output=output,
+            operation_outcome=operation_outcome,
+            evidence_status=evidence_status,
+            output_ref_storage=output_ref_storage,
+            **payload,
+        )
+
+    @classmethod
+    def terminal_failure(
+        cls,
+        *,
+        invocation_status: InvocationStatus | str,
+        output: str,
+        evidence_status: EvidenceStatus | str = EvidenceStatus.VERIFIED,
+        output_ref_storage: Any = None,
+        **payload: Any,
+    ) -> "ToolResult":
+        """Build a failed terminal result with its observed lifecycle status."""
+        status = InvocationStatus(invocation_status)
+        if status is InvocationStatus.PENDING:
+            raise ValueError("terminal failures require a non-pending invocation_status")
+        return cls._terminal(
+            invocation_status=status,
+            output=output,
+            operation_outcome=OperationOutcome.FAILED,
+            evidence_status=evidence_status,
+            output_ref_storage=output_ref_storage,
+            **payload,
+        )
+
+    @classmethod
+    def _terminal(
+        cls,
+        *,
+        invocation_status: InvocationStatus,
+        output: str,
+        operation_outcome: OperationOutcome | str,
+        evidence_status: EvidenceStatus | str,
+        output_ref_storage: Any,
+        **payload: Any,
+    ) -> "ToolResult":
         outcome = OperationOutcome(operation_outcome)
         payload.setdefault(
             "evidence_assessment",
@@ -226,7 +298,10 @@ class ToolResult(BaseModel):
         )
         if outcome is OperationOutcome.FAILED:
             source = str(payload.get("raw_output") or output or payload.get("error") or "")
-            digest = hashlib.sha256(source.encode("utf-8", errors="replace")).hexdigest()[:16]
+            signature_source = _stable_failure_signature_source(source)
+            digest = hashlib.sha256(
+                signature_source.encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
             error_code = str(payload.get("error_code") or "TOOL_OPERATION_FAILED")
             payload["error_code"] = error_code
             if not payload.get("failure_signature"):
@@ -258,7 +333,7 @@ class ToolResult(BaseModel):
                 )
             payload["output_ref"] = output_ref
         result_values = {
-            "invocation_status": InvocationStatus.COMPLETED,
+            "invocation_status": invocation_status,
             "operation_outcome": outcome,
             "evidence_status": evidence_status,
             "output": output,
@@ -750,7 +825,10 @@ class BaseTool(ABC):
                 retryable=False,
             )
 
-            result = system_error.to_result(duration=duration)
+            result = system_error.to_result(
+                duration=duration,
+                invocation_status=InvocationStatus.CRASHED,
+            )
 
             # Log system error to centralized logger
             try:

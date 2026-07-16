@@ -76,6 +76,20 @@ def test_termination_state_does_not_leak_phase_outcomes():
     assert m.termination_state() == "completed"
 
 
+def test_abort_records_current_attempt_without_advancing_or_duplicating_cleanup():
+    m = PhaseMachine()
+
+    first = m.record_abort("wall clock exceeded", evidence=["job:build"])
+    second = m.record_abort("wall clock exceeded", evidence=["job:build"])
+
+    assert first is second
+    assert len(m.records) == 1
+    assert m.current_phase == "provision"
+    assert m.termination_state() == "aborted"
+    assert m.records[0].reason == "wall clock exceeded"
+    assert "ABORTED" in m.digest_lines()[0]
+
+
 def test_digest_lines_for_prompt():
     m = PhaseMachine()
     m.mark_done("JDK 17 + repo at /workspace/p", evidence=[])

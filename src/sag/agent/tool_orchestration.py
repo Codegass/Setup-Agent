@@ -228,6 +228,12 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
         if result.error_code:
             formatted += f"\nError code: {result.error_code}"
+        if result.failure_signature:
+            formatted += f"\nFailure signature: {result.failure_signature}"
+        if result.error_tail_preview:
+            formatted += f"\nError tail: {result.error_tail_preview}"
+        if result.output_ref:
+            formatted += f"\nFull output ref: {result.output_ref}"
 
         # Add full raw output if available and error message is unclear (and no specific output was provided)
         if (
@@ -857,12 +863,17 @@ class ToolOrchestrator:
         }[result.operation_outcome]
 
     @staticmethod
-    def _result_lifecycle_metadata(result: ToolResult) -> Dict[str, str]:
-        return {
+    def _result_lifecycle_metadata(result: ToolResult) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
             "invocation_status": result.invocation_status.value,
             "operation_outcome": result.operation_outcome.value,
             "evidence_status": result.evidence_status.value,
         }
+        for field_name in ("failure_signature", "error_tail_preview", "output_ref"):
+            value = getattr(result, field_name)
+            if value:
+                metadata[field_name] = value
+        return metadata
 
     def _recent_executions_for_tool(
         self, tool_name: str

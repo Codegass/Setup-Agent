@@ -89,6 +89,7 @@ class FakeBashOrchestrator:
     def __init__(self, result):
         self.container_name = "demo-container"
         self.result = result
+        self.detached_calls = []
 
     def execute_command(
         self,
@@ -110,6 +111,23 @@ class FakeBashOrchestrator:
 
     def execute_command_with_monitoring(self, **kwargs):
         return self.result
+
+    def execute_command_detached(self, command, workdir=None, environment=None):
+        self.detached_calls.append(
+            {"command": command, "workdir": workdir, "environment": environment}
+        )
+        if not self.result.get("success"):
+            return {
+                "started": False,
+                "job_id": "bash-background",
+                "launch_output": self.result.get("output", ""),
+            }
+        return {
+            "started": True,
+            "job_id": "bash-background",
+            "pid": 1234,
+            "log_path": "/tmp/sag_jobs/bash-background.log",
+        }
 
 
 def test_bash_success_reports_execution_facts_without_domain_status():
@@ -192,24 +210,29 @@ def test_bash_interactive_command_reports_pre_execution_facts():
     assert result.metadata["execution"]["timed_out"] is False
 
 
-def test_bash_background_success_reports_execution_facts():
-    tool = BashTool(
-        docker_orchestrator=FakeBashOrchestrator(
-            {
-                "success": True,
-                "output": "1234",
-                "exit_code": 0,
-            }
-        )
+def test_bash_background_dispatch_is_pending_and_uses_canonical_job_handle():
+    orchestrator = FakeBashOrchestrator(
+        {
+            "success": True,
+            "output": "1234",
+            "exit_code": 0,
+        }
     )
+    tool = BashTool(docker_orchestrator=orchestrator)
 
     result = tool.execute(command="sleep 60 &", working_directory="/workspace/project")
 
-    assert result.succeeded is True
-    assert result.metadata["execution"]["executed"] is True
-    assert result.metadata["execution"]["exit_code"] is None
-    assert result.metadata["execution"]["timed_out"] is False
-    assert result.metadata["background_pids"] == [1234]
+    assert result.invocation_status.value == "pending"
+    assert result.operation_outcome.value == "unknown"
+    assert result.evidence_status.value == "unknown"
+    assert result.poll_ref == "job:bash-background"
+    assert orchestrator.detached_calls == [
+        {
+            "command": "sleep 60",
+            "workdir": "/workspace/project",
+            "environment": {"SAG_CLI": "1"},
+        }
+    ]
 
 
 def test_bash_background_failed_start_preserves_execution_facts():
@@ -227,8 +250,8 @@ def test_bash_background_failed_start_preserves_execution_facts():
 
     assert result.succeeded is False
     assert result.error_code == "BACKGROUND_START_FAILED"
-    assert result.metadata["execution"]["executed"] is True
-    assert result.metadata["execution"]["exit_code"] == 126
+    assert result.metadata["execution"]["executed"] is False
+    assert result.metadata["execution"]["exit_code"] is None
     assert result.metadata["execution"]["timed_out"] is False
 
 

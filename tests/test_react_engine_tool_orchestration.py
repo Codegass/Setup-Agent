@@ -29,6 +29,13 @@ class RecordingBranchContext:
         self.entries.append((task_id, entry))
         return {"success": True}
 
+    def load_branch_history(self, task_id):
+        return type(
+            "BranchHistory",
+            (),
+            {"history": [entry for entry_task_id, entry in self.entries if entry_task_id == task_id]},
+        )()
+
 
 class FakeAgentLogger:
     def __init__(self):
@@ -423,6 +430,51 @@ def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
     assert entry["parameters"] == {"action": "compile"}
     assert entry["observation"] == "build succeeded"
     assert entry["output_refs"] == ["output_build"]
+
+
+def test_execute_steps_persists_short_failed_output_ref_in_branch_history(
+    monkeypatch, durable_tool_result_storage
+):
+    context = RecordingBranchContext()
+    result = ToolResult.completed_failure(
+        output="compiler cannot find symbol Widget",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: build",
+        tool_name="build",
+        tool_params={"action": "compile"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="build", raw_params={"action": "compile"}),
+        result=result,
+        status="failure",
+        raw_params={"action": "compile"},
+        validated_params={"action": "compile"},
+        executed_params={"action": "compile"},
+        observation_text="build failed",
+        attempted_execution=True,
+    )
+    engine = _engine_with_context(context=context)
+    engine.tools = {}
+
+    monkeypatch.setattr(
+        engine,
+        "_get_tool_orchestrator",
+        lambda: type("Orchestrator", (), {"execute": lambda self, call: execution})(),
+    )
+
+    assert engine._execute_steps([step]) is True
+
+    entry = context.load_branch_history("phase_build").history[0]
+    assert result.output_ref in entry["output_refs"]
+    assert entry["failure_signature"] == result.failure_signature
+    assert entry["error_tail_preview"] == result.error_tail_preview
+    assert durable_tool_result_storage.retrieve_output(result.output_ref) == result.output
 
 
 def test_execute_steps_records_action_even_if_tool_clears_current_task(monkeypatch):

@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.agent.history_state import HistoryActionState, decode_history_action_state
+
 from sag.agent.context_manager import BranchContextHistory, ContextManager, TaskStatus
 
 from .base import BaseTool, ToolError, ToolResult
@@ -1344,7 +1346,10 @@ IMPORTANT:
         for entry in getattr(branch_history, "history", []) or []:
             if not isinstance(entry, dict):
                 continue
-            if entry.get("type") != "action" or not entry.get("success"):
+            if (
+                entry.get("type") != "action"
+                or decode_history_action_state(entry) is not HistoryActionState.SUCCESS
+            ):
                 continue
             # A dispatch-and-poll handoff (build still running detached) is
             # success=True but NOT execution evidence — the build may yet fail.

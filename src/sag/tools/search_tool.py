@@ -88,6 +88,11 @@ class SearchTool(BaseTool):
                 str(completed.get("output") or tail),
                 full_output=full_output,
                 poll_ref=poll_ref,
+                invocation_status=(
+                    InvocationStatus.CRASHED
+                    if poll.get("state") == "vanished"
+                    else InvocationStatus.COMPLETED
+                ),
             )
             result.metadata.update(
                 {

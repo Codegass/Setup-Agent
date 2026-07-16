@@ -72,8 +72,10 @@ def classify_detached_completion(
     full_output: str | None = None,
     poll_ref: str | None = None,
     output_ref_storage: Any = None,
+    invocation_status: InvocationStatus | str = InvocationStatus.COMPLETED,
 ) -> ToolResult:
     """Classify a terminal detached observation, preferring fatal evidence."""
+    terminal_status = InvocationStatus(invocation_status)
     analyses = [
         BuildAnalyzer.detect_build_status(tail, command)
         for command in ("mvn", "gradle", "npm", "pytest", "make")
@@ -92,7 +94,8 @@ def classify_detached_completion(
     )
     failed = (exit_code is not None and exit_code != 0) or fatal_tail
     if failed:
-        return ToolResult.completed_failure(
+        return ToolResult.terminal_failure(
+            invocation_status=terminal_status,
             output=tail,
             error="Detached operation failed",
             error_code="DETACHED_OPERATION_FAILED",
@@ -108,13 +111,16 @@ def classify_detached_completion(
             storage=output_ref_storage,
         )
     if exit_code is None:
+        if not poll_ref:
+            raise ValueError("inconclusive detached completion requires a stable poll_ref")
         return ToolResult(
-            invocation_status=InvocationStatus.COMPLETED,
+            invocation_status=InvocationStatus.PENDING,
             operation_outcome=OperationOutcome.UNKNOWN,
             evidence_status=EvidenceStatus.UNKNOWN,
             poll_ref=poll_ref,
             output=tail,
             output_ref=full_output_ref,
+            refs=[poll_ref],
         )
     return ToolResult.completed_success(
         output=tail,

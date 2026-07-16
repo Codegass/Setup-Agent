@@ -697,6 +697,11 @@ class BashTool(BaseTool):
                     str(result.get("output") or ""),
                     full_output=str(result.get("full_output") or result.get("output") or ""),
                     poll_ref=detached_poll_ref(result),
+                    invocation_status=(
+                        "crashed"
+                        if result.get("lifecycle_state") == "vanished"
+                        else "completed"
+                    ),
                 )
                 if not detached_result.succeeded:
                     detached_result.metadata.update(
@@ -765,7 +770,8 @@ class BashTool(BaseTool):
                         f"CPU warnings detected: {monitoring_info['cpu_warnings']} (possible hang)"
                     )
 
-                return ToolResult.completed_failure(
+                return ToolResult.terminal_failure(
+                    invocation_status=("timeout" if is_timeout else "crashed"),
                     output=result.get("output", ""),
                     error=error_msg,
                     suggestions=suggestions,
@@ -896,72 +902,39 @@ class BashTool(BaseTool):
     def _execute_background_command(
         self, command: str, workdir: str, env_vars: Dict[str, str]
     ) -> ToolResult:
-        """Execute a command in the background and return immediately with PID."""
+        """Dispatch a background command and return its stable poll handle."""
         try:
-            # Build command that starts process in background and returns PID
-            # Use nohup to prevent SIGHUP when shell exits
-            pid_command = f"nohup {command} > /tmp/sag_bg_$$.out 2>&1 & echo $!"
-
-            # Add environment variables to the command
-            if env_vars:
-                env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
-                pid_command = f"{env_prefix} {pid_command}"
-
-            # Execute command to get PID
-            result = self.docker_orchestrator.execute_command(pid_command, workdir=workdir)
-
-            if result["success"] and result["output"].strip().isdigit():
-                pid = int(result["output"].strip())
-
-                # Track the background process
-                container_name = self.docker_orchestrator.container_name
-                if container_name not in self.background_processes:
-                    self.background_processes[container_name] = []
-                self.background_processes[container_name].append(pid)
-
-                logger.info(f"🚀 Started background process with PID {pid}")
-
-                return ToolResult.completed_success(
-                    output=f"Background process started with PID: {pid}",
-                    metadata=self._with_execution_metadata(
-                        {
-                            "background_pids": [pid],
-                            "execution_directory": workdir,
-                            "environment_vars": env_vars,
-                            "command_type": "background",
-                            "output_file": f"/tmp/sag_bg_{pid}.out",
-                            "stdout": "",
-                            "stderr": "",
-                            "exit_code": None,
-                            "signal": None,
-                        },
-                        command=command,
-                        working_directory=workdir,
-                        exit_code=None,
-                        timed_out=False,
-                        duration=result.get("duration"),
-                        executed=True,
-                    ),
+            handle = self.docker_orchestrator.execute_command_detached(
+                command, workdir=workdir, environment=env_vars
+            )
+            if handle.get("started"):
+                return detached_handoff_tool_result(
+                    "bash",
+                    command,
+                    {
+                        "output": f"Background command dispatched as job:{handle['job_id']}",
+                        "dispatch": handle,
+                    },
                 )
-            else:
-                return ToolResult.completed_failure(
-                    output=result.get("output", ""),
-                    error="Failed to start background process",
-                    suggestions=[
-                        "Check command syntax",
-                        "Verify the command can run in the container",
-                        "Check container logs for errors",
-                    ],
-                    error_code="BACKGROUND_START_FAILED",
-                    metadata=self._with_execution_metadata(
-                        {"background_pids": []},
-                        command=command,
-                        working_directory=workdir,
-                        exit_code=result.get("exit_code"),
-                        timed_out=False,
-                        duration=result.get("duration"),
-                    ),
-                )
+            return ToolResult.completed_failure(
+                output=handle.get("launch_output", ""),
+                error="Failed to dispatch background process",
+                suggestions=[
+                    "Check command syntax",
+                    "Verify the command can run in the container",
+                    "Check container logs for errors",
+                ],
+                error_code="BACKGROUND_START_FAILED",
+                metadata=self._with_execution_metadata(
+                    {},
+                    command=command,
+                    working_directory=workdir,
+                    exit_code=None,
+                    timed_out=False,
+                    duration=None,
+                    executed=False,
+                ),
+            )
 
         except Exception as e:
             logger.error(f"Failed to execute background command: {e}")

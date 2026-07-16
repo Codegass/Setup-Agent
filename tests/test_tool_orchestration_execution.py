@@ -101,6 +101,31 @@ def test_format_tool_result_surfaces_maven_version_contract():
     assert "Maven version requirement: [3.9,) (source: build_error)" in formatted_for_build
 
 
+def test_failed_observation_and_lifecycle_event_preserve_failure_provenance():
+    events = []
+    orchestrator = ToolOrchestrator(
+        tools={"failure": FailureTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        event_sink=events.append,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="failure", raw_params={"command": "run"}))
+
+    assert "Failure signature:" in execution.observation_text
+    assert "Error tail:" in execution.observation_text
+    metadata = events[-1].metadata
+    assert metadata["failure_signature"] == execution.result.failure_signature
+    assert metadata["error_tail_preview"] == execution.result.error_tail_preview
+    assert metadata["output_ref"] == execution.result.output_ref
+
+
 def test_orchestrator_executes_successful_tool_and_emits_events():
     events = []
     tracking_calls = []

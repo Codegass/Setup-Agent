@@ -343,7 +343,7 @@ def test_fatal_tail_overrides_zero_exit_plumbing(tmp_path):
     assert origin_storage.retrieve_output(output_ref) == "CMake Error: configuration failed"
 
 
-def test_missing_exit_code_is_unknown_not_success(tmp_path):
+def test_missing_exit_code_preserves_pending_unknown_with_poll_ref(tmp_path):
     storage = OutputStorageManager(tmp_path)
     output_ref = storage.store_output(
         task_id="detached",
@@ -355,11 +355,13 @@ def test_missing_exit_code_is_unknown_not_success(tmp_path):
             exit_code=None,
             tail="detached process state could not be established",
             full_output_ref=output_ref,
+            poll_ref="job:detached",
         )
 
-    assert result.invocation_status is InvocationStatus.COMPLETED
+    assert result.invocation_status is InvocationStatus.PENDING
     assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.evidence_status is EvidenceStatus.UNKNOWN
+    assert result.poll_ref == "job:detached"
     assert result.succeeded is False
 
 
@@ -369,6 +371,7 @@ def test_detached_completion_rejects_shape_valid_unpersisted_output_ref():
             exit_code=None,
             tail="detached process state could not be established",
             full_output_ref="output_missing",
+            poll_ref="job:missing",
         )
 
 
@@ -445,6 +448,30 @@ def test_search_job_poll_preserves_pending_for_active_original_operation():
     assert "compiling module 3/10" in result.output
 
 
+def test_search_job_poll_keeps_same_ref_when_probe_cannot_establish_liveness():
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": False,
+            "running": False,
+            "exit_code": None,
+            "tail": "last known output",
+            "log_size": 17,
+            "probe_success": False,
+            "state": "unknown",
+        }
+    )
+
+    first = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+    second = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    for result in (first, second):
+        assert result.invocation_status is InvocationStatus.PENDING
+        assert result.operation_outcome is OperationOutcome.UNKNOWN
+        assert result.evidence_status is EvidenceStatus.UNKNOWN
+        assert result.poll_ref == "job:abc"
+    assert len(orchestrator.handles) == 2
+
+
 def test_search_job_poll_classifies_terminal_fatal_tail_for_original_operation(tmp_path):
     orchestrator = PollingJobOrchestrator(
         {
@@ -474,6 +501,34 @@ def test_search_job_poll_classifies_terminal_fatal_tail_for_original_operation(t
     assert result.output_ref.startswith("output_")
     assert storage.retrieve_output(result.output_ref) == "CMake Error: configuration failed"
     assert result.error_code == "DETACHED_OPERATION_FAILED"
+
+
+def test_search_job_poll_reports_observed_vanish_as_crashed(tmp_path):
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": False,
+            "running": False,
+            "exit_code": None,
+            "tail": "process disappeared",
+            "log_size": 19,
+            "probe_success": True,
+            "state": "vanished",
+        },
+        {
+            "exit_code": 1,
+            "output": "process disappeared",
+            "full_output": "process disappeared",
+            "dispatch_status": "completed_detached",
+        },
+    )
+    storage = OutputStorageManager(tmp_path)
+
+    with bind_tool_result_output_storage(storage, task_id="detached", tool_name="search"):
+        result = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    assert result.invocation_status is InvocationStatus.CRASHED
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.poll_ref == "job:abc"
 
 
 # --- review fixes: spoof-proof poll parsing, atomic exit file ----------------

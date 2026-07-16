@@ -1059,6 +1059,7 @@ class ReActEngine(UIEventEmitter):
                         f"ReAct loop stopped: global wall-clock cap of {wall_clock_cap}s "
                         f"reached after {elapsed:.0f}s / {self.current_iteration} iterations"
                     )
+                    self._record_setup_abort(phase_mode, "wall clock cap exceeded")
                     self._export_token_usage_csv()
                     return False
 
@@ -1089,6 +1090,7 @@ class ReActEngine(UIEventEmitter):
                 if not response:
                     logger.error("Failed to get LLM response")
                     # Export token usage before early return due to failed LLM response
+                    self._record_setup_abort(phase_mode, "LLM response unavailable")
                     self._export_token_usage_csv()
                     return False
 
@@ -1229,16 +1231,22 @@ class ReActEngine(UIEventEmitter):
 
             logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
             # Export token usage before max iterations completion
+            self._record_setup_abort(phase_mode, "iteration budget exhausted")
             self._export_token_usage_csv()
             return False
 
         except Exception as e:
             logger.error(f"ReAct loop failed: {e}", exc_info=True)
             # Export token usage before exception completion
+            self._record_setup_abort(phase_mode, f"engine exception: {type(e).__name__}")
             self._export_token_usage_csv()
             return False
         finally:
             self.state_evaluator.completion_mode = previous_completion_mode
+
+    def _record_setup_abort(self, phase_mode: bool, reason: str) -> None:
+        if phase_mode and not self.phase_machine.is_complete:
+            self.phase_machine.record_abort(reason, evidence=[])
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""
@@ -1499,10 +1507,15 @@ class ReActEngine(UIEventEmitter):
                             "output_refs": self._dedupe_strings(
                                 [
                                     *stored_output_refs,
+                                    result.output_ref,
                                     *self._output_refs_from_text(output_to_store),
                                 ]
                             ),
                         }
+                        for field_name in ("failure_signature", "error_tail_preview"):
+                            value = getattr(result, field_name)
+                            if value:
+                                history_entry[field_name] = value
                         # A pending dispatch is not build-execution evidence;
                         # completion gates must be able to tell.
                         dispatch_status = (result.metadata or {}).get("dispatch_status")

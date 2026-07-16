@@ -84,6 +84,56 @@ def test_terminal_failure_is_orthogonal_to_invocation_completion(
     assert result.output_ref == output_ref
 
 
+def test_terminal_failure_factory_preserves_explicit_timeout_status():
+    result = ToolResult.terminal_failure(
+        invocation_status=InvocationStatus.TIMEOUT,
+        output="command exceeded the configured timeout",
+        error="command timed out",
+        error_code="TIMEOUT_WALL_CLOCK",
+    )
+
+    assert result.invocation_status is InvocationStatus.TIMEOUT
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.evidence_status is EvidenceStatus.VERIFIED
+    assert result.succeeded is False
+
+
+def test_failure_factory_signature_ignores_volatile_runtime_evidence():
+    first = ToolResult.completed_failure(
+        output=(
+            "2026-07-16T17:48:00Z pid=1234 job:build-a1b2 "
+            "/tmp/sag-a1b2/progress.log progress 2/10: compiler cannot find symbol Widget"
+        ),
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    second = ToolResult.completed_failure(
+        output=(
+            "2026-07-16T18:03:59Z pid=9876 job:build-z9y8 "
+            "/tmp/sag-z9y8/progress.log progress 9/10: compiler cannot find symbol Widget"
+        ),
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+
+    assert first.failure_signature == second.failure_signature
+
+
+def test_failure_factory_signature_keeps_distinct_root_causes_distinct():
+    compiler_failure = ToolResult.completed_failure(
+        output="pid=1234: compiler cannot find symbol Widget",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    dependency_failure = ToolResult.completed_failure(
+        output="pid=9876: dependency org.example:widget:1.0 could not be resolved",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+
+    assert compiler_failure.failure_signature != dependency_failure.failure_signature
+
+
 @pytest.mark.parametrize("field", ["success", "status", "verdict"])
 def test_legacy_truth_inputs_are_rejected(field):
     values = _canonical_kwargs("completed", "success")

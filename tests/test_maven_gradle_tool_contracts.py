@@ -1,4 +1,5 @@
 from sag.evidence import EvidenceAssessment
+from sag.evidence import InvocationStatus
 from sag.tools.base import ToolResult
 from sag.tools.internal.gradle_tool import GradleTool
 from sag.tools.internal.maven_tool import MavenTool
@@ -170,6 +171,7 @@ def test_maven_tool_converts_monitored_silent_timeout_to_timeout_result():
     result = tool.execute(command="test", working_directory="/workspace/project")
 
     assert result.succeeded is False
+    assert result.invocation_status is InvocationStatus.TIMEOUT
     assert result.error_code == "TIMEOUT_SILENT_TIMEOUT"
     assert result.metadata["termination_reason"] == "silent_timeout"
     assert result.metadata["execution_time"] == 1200.0
@@ -421,6 +423,7 @@ def test_gradle_tool_converts_monitored_silent_timeout_to_timeout_result():
     )
 
     assert result.succeeded is False
+    assert result.invocation_status is InvocationStatus.TIMEOUT
     assert result.error_code == "TIMEOUT_SILENT_TIMEOUT"
     assert result.metadata["termination_reason"] == "silent_timeout"
     assert result.metadata["execution_time"] == 1200.0

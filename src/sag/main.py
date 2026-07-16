@@ -784,7 +784,13 @@ def _inspect_format_history_entry(
     lines: List[str] = []
 
     if etype == "action":
-        status = "ok" if entry.get("success") else "failed"
+        history_state = decode_history_action_state(entry)
+        status = {
+            HistoryActionState.SUCCESS: "ok",
+            HistoryActionState.FAILED: "failed",
+            HistoryActionState.PENDING: "pending",
+            HistoryActionState.UNKNOWN: "unknown",
+        }[history_state]
         lines.append(f"{prefix}[action] {entry.get('tool_name', '?')} ({status})")
         parameters = entry.get("parameters")
         if parameters is None:
@@ -1324,3 +1330,4 @@ def version():
 
 if __name__ == "__main__":
     cli()
+from sag.agent.history_state import HistoryActionState, decode_history_action_state

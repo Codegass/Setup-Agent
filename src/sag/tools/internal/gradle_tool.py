@@ -334,6 +334,11 @@ class GradleTool(BaseTool):
                     full_output=str(full_output),
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
+                    invocation_status=(
+                        "crashed"
+                        if result.get("lifecycle_state") == "vanished"
+                        else "completed"
+                    ),
                 )
                 if not detached_result.succeeded:
                     detached_result.metadata.update(
@@ -629,7 +634,8 @@ class GradleTool(BaseTool):
             "Run dependency resolution before the full build",
             "Retry with --info or --debug to inspect progress",
         ]
-        return ToolResult.completed_failure(
+        return ToolResult.terminal_failure(
+            invocation_status="timeout",
             output=(
                 f"Gradle task timed out due to {reason} after " f"{execution_time_display:.1f}s."
             ),

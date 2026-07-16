@@ -136,7 +136,8 @@ def test_failed_attempts_always_visible_in_ledger():
         _action("bash", False, "fail-2", ref="r2"),
     ] + [_thought("x")] * 10
     ledger, _ = compact_steps(steps, keep_recent=2)
-    assert "fail-1"[:6] not in (ledger or "") or True  # summaries may truncate...
+    assert "fail-1" in ledger
+    assert "fail-2" in ledger
     assert "r1" in ledger and "r2" in ledger, "failed-attempt refs must survive"
 
 
