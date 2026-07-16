@@ -59,20 +59,29 @@ def test_pending_result_requires_unknown_evidence_and_poll_ref():
         )
 
 
-def test_terminal_failure_is_orthogonal_to_invocation_completion():
+def test_terminal_failure_is_orthogonal_to_invocation_completion(
+    durable_tool_result_storage,
+):
+    output_ref = durable_tool_result_storage.store_output(
+        task_id="taxonomy",
+        tool_name="build",
+        output="BUILD FAILURE",
+    )
     result = ToolResult(
         invocation_status=InvocationStatus.COMPLETED,
         operation_outcome=OperationOutcome.FAILED,
         evidence_status=EvidenceStatus.VERIFIED,
         output="BUILD FAILURE",
         error_code="BUILD_FAILED",
-        **FAILURE_PROVENANCE,
+        failure_signature=FAILURE_PROVENANCE["failure_signature"],
+        error_tail_preview=FAILURE_PROVENANCE["error_tail_preview"],
+        output_ref=output_ref,
     )
     assert result.is_terminal is True
     assert result.succeeded is False
     assert result.failure_signature == FAILURE_PROVENANCE["failure_signature"]
     assert result.error_tail_preview == FAILURE_PROVENANCE["error_tail_preview"]
-    assert result.output_ref == FAILURE_PROVENANCE["output_ref"]
+    assert result.output_ref == output_ref
 
 
 @pytest.mark.parametrize("field", ["success", "status", "verdict"])
@@ -163,6 +172,67 @@ def test_failure_factory_rejects_unresolvable_output_ref():
             error_code="FAILED",
             output_ref="tool-result:fabricated",
         )
+
+
+def test_failure_factory_rejects_shape_valid_but_unpersisted_output_ref(tmp_path):
+    from sag.agent.output_storage import OutputStorageManager
+
+    storage = OutputStorageManager(tmp_path)
+    with bind_tool_result_output_storage(storage):
+        with pytest.raises(ValueError, match="persisted.*OutputStorage"):
+            ToolResult.completed_failure(
+                output="failed",
+                error="failed",
+                error_code="FAILED",
+                output_ref="output_missing",
+            )
+
+
+def test_direct_failure_rejects_shape_valid_but_unpersisted_output_ref():
+    with pytest.raises(ValueError, match="persisted.*OutputStorage"):
+        ToolResult(
+            invocation_status="completed",
+            operation_outcome="failed",
+            evidence_status="verified",
+            output="failed",
+            error_code="FAILED",
+            failure_signature="FAILED:missing",
+            error_tail_preview="failed",
+            output_ref="output_missing",
+        )
+
+
+def test_failure_factory_accepts_ref_from_explicit_origin_storage(tmp_path):
+    from sag.agent.output_storage import OutputStorageManager
+
+    outer_storage = OutputStorageManager(tmp_path / "outer")
+    origin_storage = OutputStorageManager(tmp_path / "origin")
+    output_ref = origin_storage.store_output(
+        task_id="maven",
+        tool_name="maven",
+        output="maven failed",
+    )
+
+    with bind_tool_result_output_storage(outer_storage):
+        result = ToolResult.completed_failure(
+            output="maven failed",
+            error="failed",
+            error_code="MAVEN_BUILD_FAILED",
+            evidence_refs=[output_ref],
+            output_ref_storage=origin_storage,
+        )
+        outer_result = ToolResult.completed_failure(
+            output="outer failure",
+            error="failed",
+            error_code="OUTER_FAILED",
+        )
+
+    assert result.output_ref == output_ref
+    assert origin_storage.retrieve_output(output_ref) == "maven failed"
+    assert outer_storage.retrieve_output(outer_result.output_ref) == "outer failure"
+    dumped = result.model_dump()
+    assert "output_ref_storage" not in dumped
+    assert "_output_ref_verified" not in dumped
 
 
 def test_canonical_result_has_no_legacy_adapter_or_truth_fields():

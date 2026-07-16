@@ -7,6 +7,8 @@ the agent gets the log tail + poll instructions and the process keeps running.
 
 from types import SimpleNamespace
 
+import pytest
+
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.agent.output_storage import OutputStorageManager
 from sag.docker_orch.orch import DockerOrchestrator
@@ -316,32 +318,82 @@ def test_detached_handoff_is_a_promise_not_success():
     assert tool_result.metadata["log_path"] == "/tmp/sag_jobs/abc.log"
 
 
-def test_fatal_tail_overrides_zero_exit_plumbing():
-    result = classify_detached_completion(
-        exit_code=0,
-        tail="CMake Error: configuration failed",
-        full_output_ref="output_cmake",
+def test_fatal_tail_overrides_zero_exit_plumbing(tmp_path):
+    outer_storage = OutputStorageManager(tmp_path / "outer")
+    origin_storage = OutputStorageManager(tmp_path / "origin")
+    output_ref = origin_storage.store_output(
+        task_id="detached",
+        tool_name="build",
+        output="CMake Error: configuration failed",
     )
+    with bind_tool_result_output_storage(outer_storage):
+        result = classify_detached_completion(
+            exit_code=0,
+            tail="CMake Error: configuration failed",
+            full_output_ref=output_ref,
+            output_ref_storage=origin_storage,
+        )
 
     assert result.invocation_status is InvocationStatus.COMPLETED
     assert result.operation_outcome is OperationOutcome.FAILED
     assert result.error_code == "DETACHED_OPERATION_FAILED"
     assert result.failure_signature
     assert result.error_tail_preview == "CMake Error: configuration failed"
-    assert result.output_ref == "output_cmake"
+    assert result.output_ref == output_ref
+    assert origin_storage.retrieve_output(output_ref) == "CMake Error: configuration failed"
 
 
-def test_missing_exit_code_is_unknown_not_success():
-    result = classify_detached_completion(
-        exit_code=None,
-        tail="detached process state could not be established",
-        full_output_ref="output_detached_unknown",
+def test_missing_exit_code_is_unknown_not_success(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    output_ref = storage.store_output(
+        task_id="detached",
+        tool_name="build",
+        output="detached process state could not be established",
     )
+    with bind_tool_result_output_storage(storage):
+        result = classify_detached_completion(
+            exit_code=None,
+            tail="detached process state could not be established",
+            full_output_ref=output_ref,
+        )
 
     assert result.invocation_status is InvocationStatus.COMPLETED
     assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.evidence_status is EvidenceStatus.UNKNOWN
     assert result.succeeded is False
+
+
+def test_detached_completion_rejects_shape_valid_unpersisted_output_ref():
+    with pytest.raises(ValueError, match="persisted.*OutputStorage"):
+        classify_detached_completion(
+            exit_code=None,
+            tail="detached process state could not be established",
+            full_output_ref="output_missing",
+        )
+
+
+def test_detached_failure_checks_origin_index_once_without_loading_output():
+    class IndexedOutputStorage:
+        def __init__(self):
+            self.lookups = 0
+
+        def has_output_ref(self, ref_id):
+            self.lookups += 1
+            return ref_id == "output_detached_failure"
+
+        def retrieve_output(self, ref_id):
+            raise AssertionError("ref validation must not load full output")
+
+    storage = IndexedOutputStorage()
+    result = classify_detached_completion(
+        exit_code=0,
+        tail="CMake Error: configuration failed",
+        full_output_ref="output_detached_failure",
+        output_ref_storage=storage,
+    )
+
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert storage.lookups == 1
 
 
 class PollingJobOrchestrator:

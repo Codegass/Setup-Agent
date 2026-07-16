@@ -299,6 +299,11 @@ class OutputStorageManager:
 
         return None
 
+    def has_output_ref(self, ref_id: str) -> bool:
+        """Check the durable index without loading the stored output body."""
+        self.current_index = self._load_index()
+        return ref_id in self.current_index
+
     def search_outputs(
         self,
         pattern: Optional[str] = None,

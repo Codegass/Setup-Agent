@@ -1,3 +1,5 @@
+import pytest
+
 from sag.agent.tool_orchestration import (
     ToolCall,
     ToolExecutionRecord,
@@ -5,7 +7,7 @@ from sag.agent.tool_orchestration import (
     format_tool_result,
 )
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
-from sag.tools.base import BaseTool, ToolError, ToolResult
+from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_output_storage
 
 
 class EchoTool(BaseTool):
@@ -162,6 +164,24 @@ def test_orchestrator_persists_failure_before_emitting_canonical_result():
 
     assert execution.result.output_ref.startswith("output_")
     assert storage.retrieve_output(execution.result.output_ref) == "durable failure details"
+
+
+def test_orchestrator_refuses_failure_without_output_storage_boundary():
+    orchestrator = ToolOrchestrator(
+        tools={"failure": FailureTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+    )
+
+    with bind_tool_result_output_storage(None):
+        with pytest.raises(ValueError, match="durable output storage"):
+            orchestrator.execute(ToolCall(name="failure", raw_params={"command": "run"}))
 
 
 def test_pending_execution_is_tracked_and_emitted_without_failure_shape():

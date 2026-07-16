@@ -87,10 +87,15 @@ class FakeOutputStorage:
     def __init__(self, ref_id="output_build_log"):
         self.ref_id = ref_id
         self.stored = []
+        self.outputs = {}
 
     def store_output(self, **kwargs):
         self.stored.append(kwargs)
+        self.outputs[self.ref_id] = kwargs["output"]
         return self.ref_id
+
+    def retrieve_output(self, ref_id):
+        return self.outputs.get(ref_id)
 
 
 class WrapperBuildToolOrchestrator(FakeBuildToolOrchestrator):

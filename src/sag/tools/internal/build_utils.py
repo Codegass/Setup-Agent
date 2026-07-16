@@ -13,7 +13,7 @@ from loguru import logger
 
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 
-from ..base import ToolResult, is_output_storage_ref
+from ..base import ToolResult, require_persisted_output_storage_ref
 
 
 def detached_poll_ref(result: Dict[str, Any]) -> str:
@@ -71,10 +71,9 @@ def classify_detached_completion(
     *,
     full_output: str | None = None,
     poll_ref: str | None = None,
+    output_ref_storage: Any = None,
 ) -> ToolResult:
     """Classify a terminal detached observation, preferring fatal evidence."""
-    if full_output_ref is not None and not is_output_storage_ref(full_output_ref):
-        raise ValueError("detached completion output ref must be an OutputStorage output_* ref")
     analyses = [
         BuildAnalyzer.detect_build_status(tail, command)
         for command in ("mvn", "gradle", "npm", "pytest", "make")
@@ -100,7 +99,13 @@ def classify_detached_completion(
             raw_output=full_output or tail,
             error_tail_preview=tail[-400:],
             output_ref=full_output_ref,
+            output_ref_storage=output_ref_storage,
             poll_ref=poll_ref,
+        )
+    if full_output_ref is not None:
+        require_persisted_output_storage_ref(
+            full_output_ref,
+            storage=output_ref_storage,
         )
     if exit_code is None:
         return ToolResult(

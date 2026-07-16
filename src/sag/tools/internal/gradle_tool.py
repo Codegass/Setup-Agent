@@ -333,6 +333,7 @@ class GradleTool(BaseTool):
                     ref_id,
                     full_output=str(full_output),
                     poll_ref=detached_poll_ref(result),
+                    output_ref_storage=self.output_storage,
                 )
                 if not detached_result.succeeded:
                     detached_result.metadata.update(
@@ -856,6 +857,7 @@ class GradleTool(BaseTool):
 
         if output_ref_id:
             fields["evidence_refs"] = [output_ref_id]
+            fields["output_ref_storage"] = self.output_storage
 
         return fields
 

@@ -139,6 +139,22 @@ def test_retrieve_returns_none_for_genuinely_missing_ref():
     assert storage.retrieve_output("output_does_not_exist") is None
 
 
+def test_has_output_ref_refreshes_index_without_loading_output_body():
+    orchestrator = FakeOutputStorageOrchestrator()
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    writer = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    ref_id = writer.store_output(
+        task_id="maven_build",
+        tool_name="maven",
+        output="large build log" * 1000,
+    )
+
+    orchestrator.commands.clear()
+    assert reader.has_output_ref(ref_id) is True
+    assert reader.has_output_ref("output_missing") is False
+    assert not any(command.startswith("sed -n ") for command in orchestrator.commands)
+
+
 def test_second_writer_does_not_clobber_first_writers_index_entry():
     """Two manager instances append to the shared store; the second's _save_index
     (a full overwrite) must not drop the first's ref.

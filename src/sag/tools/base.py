@@ -14,6 +14,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     model_validator,
 )
 
@@ -158,10 +159,26 @@ def _store_bound_output(output: str, *, metadata: Dict[str, Any]) -> Optional[st
     return ref
 
 
+def require_persisted_output_storage_ref(ref: str, *, storage: Any = None) -> None:
+    if not is_output_storage_ref(ref):
+        raise ValueError("output ref must be a resolvable OutputStorage output_* ref")
+    binding = _DURABLE_OUTPUT_BINDING.get()
+    resolver = storage if storage is not None else (binding.storage if binding else None)
+    index_lookup = getattr(resolver, "has_output_ref", None) if resolver is not None else None
+    persisted = (
+        bool(index_lookup(ref))
+        if callable(index_lookup)
+        else resolver is not None and resolver.retrieve_output(ref) is not None
+    )
+    if not persisted:
+        raise ValueError("output ref must be persisted in provided or bound OutputStorage")
+
+
 class ToolResult(BaseModel):
     """Canonical, orthogonal tool execution result."""
 
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
+    _output_ref_verified: bool = PrivateAttr(default=False)
 
     invocation_status: InvocationStatus
     operation_outcome: OperationOutcome
@@ -194,6 +211,7 @@ class ToolResult(BaseModel):
         output: str,
         operation_outcome: OperationOutcome | str,
         evidence_status: EvidenceStatus | str = EvidenceStatus.VERIFIED,
+        output_ref_storage: Any = None,
         **payload: Any,
     ) -> "ToolResult":
         """Build a terminal result and fill stable provenance for failures."""
@@ -238,18 +256,18 @@ class ToolResult(BaseModel):
                 raise ValueError(
                     "canonical failed results require durable output storage before construction"
                 )
-            if not is_output_storage_ref(output_ref):
-                raise ValueError(
-                    "canonical failed results require a resolvable OutputStorage output_* ref"
-                )
             payload["output_ref"] = output_ref
-        return cls(
-            invocation_status=InvocationStatus.COMPLETED,
-            operation_outcome=outcome,
-            evidence_status=evidence_status,
-            output=output,
+        result_values = {
+            "invocation_status": InvocationStatus.COMPLETED,
+            "operation_outcome": outcome,
+            "evidence_status": evidence_status,
+            "output": output,
             **payload,
-        )
+        }
+        if outcome is OperationOutcome.FAILED and output_ref_storage is not None:
+            with bind_tool_result_output_storage(output_ref_storage):
+                return cls(**result_values)
+        return cls(**result_values)
 
     @classmethod
     def completed_success(cls, *, output: str, **payload: Any) -> "ToolResult":
@@ -294,6 +312,9 @@ class ToolResult(BaseModel):
                 raise ValueError(
                     "canonical failed results require a resolvable OutputStorage output_* ref"
                 )
+            if not self._output_ref_verified:
+                require_persisted_output_storage_ref(self.output_ref)
+                self._output_ref_verified = True
 
         return self
 
