@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
 from .evidence_state import RunEvidenceState, StateScope
+from .loop_memory import LoopMemory
 from .phase_machine import (
     PhaseAttemptRecord,
     PhaseOutcome,
@@ -157,34 +158,20 @@ class RepairRecurrenceGuard(Protocol):
     ) -> str | None: ...
 
 
-class StateBackedRepairGuard:
-    """Reject an accepted repair signature repeated without relevant progress."""
-
-    def __init__(self, state: RunEvidenceState):
-        self.state = state
-
-    def check(
-        self,
-        request: RepairRequest,
-        relevant_state_vector: Mapping[str, int],
-    ) -> str | None:
-        vector = dict(relevant_state_vector)
-        for record in reversed(self.state.repair_records):
-            if not record.accepted:
-                continue
-            if (
-                record.from_phase == request.from_phase
-                and record.target_phase == request.target_phase
-                and record.failure_signature == request.failure_signature
-                and record.state_vector == vector
-            ):
-                return "repair_without_progress"
-        return None
-
-
 class PhaseTransitionPolicy:
     def __init__(self, repair_guard: RepairRecurrenceGuard | None = None):
         self.repair_guard = repair_guard
+        self._default_repair_guards: dict[int, tuple[RunEvidenceState, LoopMemory]] = {}
+
+    def _repair_guard_for(self, state: RunEvidenceState) -> RepairRecurrenceGuard:
+        if self.repair_guard is not None:
+            return self.repair_guard
+        cached = self._default_repair_guards.get(id(state))
+        if cached is not None and cached[0] is state:
+            return cached[1]
+        guard = LoopMemory.from_repair_records(state.repair_records)
+        self._default_repair_guards[id(state)] = (state, guard)
+        return guard
 
     @staticmethod
     def _route(
@@ -402,7 +389,7 @@ class PhaseTransitionPolicy:
         current_refs = set(state.evidence_refs_for_attempt(request.source_attempt_id))
         if not current_refs.intersection(request.evidence_refs):
             return "stale_repair_evidence"
-        guard = self.repair_guard or StateBackedRepairGuard(state)
+        guard = self._repair_guard_for(state)
         return guard.check(request, vector)
 
     @staticmethod

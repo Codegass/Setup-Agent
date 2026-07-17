@@ -216,14 +216,14 @@ def test_facade_jdk_retry_preserves_two_maven_actual_executions(tmp_path, monkey
     )
 
 
-class _NeverExecutedBash(BaseTool):
+class _ObservedBash(BaseTool):
     def __init__(self):
-        super().__init__("bash", "must be replaced by Java auto recovery")
+        super().__init__("bash", "ordinary observed command")
         self.calls = 0
 
     def execute(self, command: str, working_directory: str = "/workspace") -> ToolResult:
         self.calls += 1
-        return ToolResult.completed_success(output="unexpected bash execution")
+        return ToolResult.completed_success(output="bash execution observed")
 
 
 class _JavaSystemTool(BaseTool):
@@ -239,10 +239,10 @@ class _JavaSystemTool(BaseTool):
         return ToolResult.completed_success(output=f"system {action} complete")
 
 
-def test_java_auto_fix_records_verify_and_install_as_system_executions(tmp_path):
+def test_java_repetition_is_observed_without_hidden_system_actions(tmp_path):
     engine, _ = _engine(tmp_path, phase="build")
     engine.context_manager.get_current_context = lambda: "Project requires Java 17"
-    bash = _NeverExecutedBash()
+    bash = _ObservedBash()
     system = _JavaSystemTool()
     command = "update-alternatives --config java"
     signature = (
@@ -267,22 +267,15 @@ def test_java_auto_fix_records_verify_and_install_as_system_executions(tmp_path)
 
     engine._execute_steps([_action_step("bash", {"command": command})])
 
-    assert bash.calls == 0
-    assert system.calls == [
-        {"action": "verify_java"},
-        {"action": "install_java", "java_version": "17"},
-    ]
+    assert bash.calls == 1
+    assert system.calls == []
     observations = engine.run_evidence_state.tool_observations
-    assert len(observations) == 2
-    assert [observation.tool_name for observation in observations] == ["system", "system"]
-    assert [observation.scope for observation in observations] == [
-        StateScope.ENVIRONMENT,
-        StateScope.ENVIRONMENT,
-    ]
-    assert [_role_values(observation) for observation in observations] == [set(), set()]
+    assert len(observations) == 1
+    assert observations[0].tool_name == "bash"
+    assert observations[0].scope is StateScope.ARTIFACTS
+    assert _role_values(observations[0]) == set()
     assert [attempt.action for attempt in engine.run_evidence_state.action_attempts] == [
-        "system:verify_java",
-        "system:install_java",
+        "bash:update-alternatives --config java",
     ]
     assert all(
         observation.provenance == observation.result.output_ref for observation in observations

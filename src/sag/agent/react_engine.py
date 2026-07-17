@@ -28,7 +28,14 @@ from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .output_storage import OutputStorageManager, attach_durable_output_ref
-from .phase_gates import GateResult, ValidatorState, check_phase_claim, validate_phase_claim
+from .loop_memory import LoopDecision, LoopEvent, LoopMemory
+from .phase_gates import (
+    ClaimDisposition,
+    GateResult,
+    ValidatorState,
+    check_phase_claim,
+    validate_phase_claim,
+)
 from .phase_handoff import PhaseHandoff
 from .phase_machine import (
     PHASE_NAMES,
@@ -302,7 +309,13 @@ class ReActEngine(UIEventEmitter):
         self.context_journal = context_journal
         self.run_evidence_state = run_evidence_state
         self.verdict_finalizer = verdict_finalizer
-        self.transition_policy = transition_policy or PhaseTransitionPolicy()
+        self.loop_memory = LoopMemory()
+        if transition_policy is None:
+            self.transition_policy = PhaseTransitionPolicy(repair_guard=self.loop_memory)
+        else:
+            self.transition_policy = transition_policy
+            if self.transition_policy.repair_guard is None:
+                self.transition_policy.repair_guard = self.loop_memory
         self._repair_global_remaining = 2
         self._repair_phase_remaining = {"test": 1, "build": 1}
         self._report_attempted = False
@@ -2120,8 +2133,102 @@ class ReActEngine(UIEventEmitter):
                 state.record_conflict("output_storage_failed")
             raise
 
-    def _apply_tool_execution_loop_effects(self, execution: ToolExecution) -> None:
-        """Apply loop-level side effects requested by orchestration metadata."""
+    def _loop_event_for_execution(self, execution: ToolExecution) -> LoopEvent:
+        result = execution.result
+        params = execution.executed_params or execution.validated_params or execution.raw_params
+        state = getattr(self, "run_evidence_state", None)
+        state_vector = (
+            state.state_vector(tuple(StateScope))
+            if state is not None
+            else {scope.value: 0 for scope in StateScope}
+        )
+        machine = getattr(self, "phase_machine", None)
+        metadata = result.metadata or {}
+        output_cursor = next(
+            (
+                str(metadata[key])
+                for key in ("output_cursor", "cursor", "bytes_read", "poll_sequence")
+                if metadata.get(key) not in (None, "")
+            ),
+            "",
+        )
+        evidence_ref = next(
+            (
+                str(ref)
+                for ref in [result.output_ref, *result.evidence_refs, *result.refs]
+                if ref
+            ),
+            "",
+        )
+        return LoopEvent(
+            tool_name=execution.call.name,
+            args=params or {},
+            operation_outcome=result.operation_outcome.value,
+            error_code=result.error_code or "",
+            failure_signature=result.failure_signature or "",
+            relevant_state=state_vector,
+            phase=getattr(machine, "current_phase", "") or "",
+            attempt_id=getattr(machine, "current_attempt_id", "") or "",
+            iteration=getattr(self, "current_iteration", 0),
+            evidence_ref=evidence_ref,
+            invocation_status=result.invocation_status.value,
+            job_id=str(result.poll_ref or metadata.get("job_id") or ""),
+            output_cursor=output_cursor,
+        )
+
+    def _loop_guidance(self, decision: LoopDecision) -> str:
+        attempts = ", ".join(decision.prior_attempt_ids) or "current run"
+        scopes = ", ".join(decision.missing_progress_scopes) or "declared scopes"
+        if decision.decision == "diversity_advisory":
+            return (
+                "ACTION DIVERSITY ADVISORY: many distinct actions have been tried in this "
+                "phase attempt. Consolidate evidence before expanding the search further."
+            )
+        if decision.decision == "force_break":
+            return (
+                "LOOP FORCE-BREAK ARMED: the identical action/outcome recurred four times "
+                f"with no progress in {scopes}. Prior attempts: {attempts}. Reason once, "
+                "then choose a materially different action; an immediate identical repeat "
+                "will close this phase as failed."
+            )
+        return (
+            "RECURRENCE WITHOUT PROGRESS: the same action and outcome recurred while "
+            f"{scopes} stayed unchanged. Prior attempts: {attempts}. Use the failure "
+            "reference and choose a different hypothesis before retrying."
+        )
+
+    def _record_loop_blocker(self, decision: LoopDecision) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        machine = getattr(self, "phase_machine", None)
+        if state is None or state.sealed:
+            return
+        state.record_blocker(
+            category="loop",
+            error_code="LOOP_WITHOUT_PROGRESS",
+            failure_signature=decision.blocker_signature,
+            evidence_ref=decision.failure_ref or None,
+            source_phase=getattr(machine, "current_phase", None),
+            source_attempt_id=getattr(machine, "current_attempt_id", None),
+        )
+
+    def _resolve_progressed_loop_blockers(self, decision: LoopDecision) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return
+        signatures = set(decision.resolved_blocker_signatures)
+        for blocker in state.blockers:
+            if blocker.status == "active" and blocker.failure_signature in signatures:
+                state.resolve_blocker(
+                    blocker.blocker_id,
+                    resolution="relevant state epoch progressed",
+                    evidence_ref=decision.failure_ref or None,
+                )
+
+    def _apply_tool_execution_loop_effects(
+        self,
+        execution: ToolExecution,
+    ) -> LoopDecision | None:
+        """Consume orchestrator metadata, then consult engine-owned loop memory."""
         metadata = execution.metadata or {}
 
         if metadata.get("force_thinking_next"):
@@ -2130,8 +2237,66 @@ class ReActEngine(UIEventEmitter):
         if metadata.get("invalidate_trunk_cache"):
             self.prompt_builder.invalidate_trunk_cache()
 
-        if metadata.get("force_next_task") and hasattr(self.context_manager, "force_next_task"):
-            self.context_manager.force_next_task()
+        memory = getattr(self, "loop_memory", None)
+        if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
+            return None
+        decision = memory.observe(self._loop_event_for_execution(execution))
+        execution.metadata["loop_decision"] = decision.to_metadata()
+        self._resolve_progressed_loop_blockers(decision)
+        if decision.decision in {"guide", "force_break", "diversity_advisory"}:
+            priority = 9 if decision.decision == "force_break" else 7
+            if decision.decision == "diversity_advisory":
+                priority = 4
+            self._add_system_guidance(self._loop_guidance(decision), priority=priority)
+        if decision.decision == "force_break":
+            self._record_loop_blocker(decision)
+        if decision.request_thinking:
+            self._force_thinking_next = True
+        return decision
+
+    def _close_phase_for_loop(
+        self,
+        decision: LoopDecision,
+        execution: ToolExecution,
+    ) -> bool:
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if machine is None or state is None or state.sealed or machine.is_complete:
+            return False
+        refs = tuple(
+            self._dedupe_strings(
+                [
+                    decision.failure_ref,
+                    execution.result.output_ref,
+                    *execution.result.evidence_refs,
+                    *execution.result.refs,
+                ]
+            )
+        )
+        claim = PhaseClaim(
+            phase=machine.current_phase,
+            signal="done",
+            claimed_outcome=PhaseOutcome.FAILED,
+            reason="loop repeated after an engine force-break",
+            evidence_refs=refs,
+        )
+        gate = GateResult(
+            accepted=True,
+            validated_outcome=PhaseOutcome.FAILED,
+            claim_disposition=ClaimDisposition.CONFIRMED,
+            validator_state=ValidatorState.RED,
+            reason="identical typed failure recurred without relevant state progress",
+            evidence_refs=refs,
+            claim=claim,
+        )
+        record = machine.close_attempt(gate)
+        route = self.transition_policy.decide(
+            record,
+            state=state,
+            budgets=self._repair_budgets(),
+        )
+        self._apply_phase_decision(record, route)
+        return True
 
     def _execute_steps(self, steps: List[ReActStep]) -> bool:
         """Execute a list of ReAct steps."""
@@ -2231,7 +2396,7 @@ class ReActEngine(UIEventEmitter):
                     execution.result = result
                     execution.observation_text = format_tool_result(call.name, result)
                 step.tool_result = result
-                self._apply_tool_execution_loop_effects(execution)
+                loop_decision = self._apply_tool_execution_loop_effects(execution)
 
                 # Log tool result in verbose mode
                 if self.config.verbose:
@@ -2257,6 +2422,12 @@ class ReActEngine(UIEventEmitter):
                     logger.debug(
                         f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
                     )
+                if loop_decision is not None and loop_decision.request_thinking:
+                    # LoopMemory owns this reasoning trigger.  Collapse the
+                    # generic success trigger so one decision yields exactly
+                    # one thinking step, never two consecutive forced turns.
+                    self._force_thinking_after_success = False
+                    self._force_thinking_next = True
 
                 # Log to branch context if we're in one
                 if branch_task_id:
@@ -2331,6 +2502,14 @@ class ReActEngine(UIEventEmitter):
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log action to branch history: {e}")
+
+                if (
+                    loop_decision is not None
+                    and loop_decision.close_phase
+                    and self._close_phase_for_loop(loop_decision, execution)
+                ):
+                    logger.debug("Stopping the action batch after loop-driven phase closure")
+                    break
 
                 phase_signal = (result.metadata or {}).get("phase_signal")
                 if phase_signal in {"done", "blocked", "repair"}:

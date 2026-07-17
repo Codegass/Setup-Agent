@@ -611,7 +611,7 @@ def test_execute_steps_forces_thinking_after_string_partial_assessment(monkeypat
     assert engine._force_thinking_after_success is True
 
 
-def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
+def test_apply_tool_execution_loop_effects_ignores_legacy_force_next_task():
     context = ContextWithForceNextTask()
     engine = _engine_with_context(context=context)
     execution = ToolExecution(
@@ -631,7 +631,7 @@ def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
     assert engine._force_thinking_next is True
     assert engine.prompt_builder._cached_trunk_context is None
     assert engine.prompt_builder._trunk_context_cache_timestamp is None
-    assert context.force_next_task_calls == 1
+    assert context.force_next_task_calls == 0
 
 
 def test_apply_tool_execution_loop_effects_skips_unavailable_force_next_task():
