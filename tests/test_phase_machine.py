@@ -23,6 +23,9 @@ def test_starts_in_provision():
     m = PhaseMachine()
     assert m.current_phase == "provision"
     assert m.is_complete is False
+    assert m.current_record.attempt_id == "provision-1"
+    assert m.current_record.termination is PhaseTermination.RUNNING
+    assert m.current_record.outcome is PhaseOutcome.UNKNOWN
 
 
 def test_done_advances_and_records_key_results():
@@ -88,6 +91,7 @@ def test_abort_records_current_attempt_without_advancing_or_duplicating_cleanup(
     assert first is second
     assert len(m.records) == 1
     assert m.current_phase == "provision"
+    assert m.current_record is first
     assert m.termination_state() == "aborted"
     assert m.records[0].reason == "wall clock exceeded"
     assert "ABORTED" in m.digest_lines()[0]
@@ -138,3 +142,4 @@ def test_invalid_transition_leaves_pending_attempt_and_history_unchanged():
     machine.apply(valid)
     assert machine.current_phase == "test"
     assert [item.attempt_id for item in machine.records] == ["build-1"]
+    assert machine.records[0].transition == "advance"

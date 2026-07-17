@@ -237,6 +237,8 @@ def test_setup_yaml_sections_teach_phase_verbs():
     lifecycle = sections["initial_system.context_management"]
     assert 'phase(action="done"' in lifecycle or "phase(action='done'" in lifecycle
     assert 'phase(action="blocked"' in lifecycle or "phase(action='blocked'" in lifecycle
+    assert 'phase(action="repair"' in lifecycle or "phase(action='repair'" in lifecycle
+    assert "outcome=" in lifecycle
     assert (
         "provision" in lifecycle and "report" in lifecycle
     ), "phase order must be visible so the model never tries to reorder phases"
@@ -278,6 +280,8 @@ def test_setup_prompt_teaches_phase_verbs_not_task_ceremony():
     prompt = _initial_prompt("setup")
     assert 'phase(action="done"' in prompt or "phase(action='done'" in prompt
     assert 'phase(action="blocked"' in prompt or "phase(action='blocked'" in prompt
+    assert 'phase(action="repair"' in prompt or "phase(action='repair'" in prompt
+    assert "outcome=" in prompt
     assert "complete_with_results" not in prompt
     assert "manage_context" not in prompt
     assert "start_task" not in prompt

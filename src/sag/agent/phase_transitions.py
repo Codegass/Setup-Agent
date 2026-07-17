@@ -41,7 +41,9 @@ class RepairRequest:
         hypothesis = str(self.hypothesis).strip()
         refs = tuple(
             dict.fromkeys(
-                str(ref).strip() for ref in self.evidence_refs if str(ref).strip()
+                str(ref).strip()
+                for ref in self.evidence_refs
+                if ref is not None and str(ref).strip()
             )
         )
         if not from_phase or not target_phase:
@@ -119,7 +121,7 @@ class PhaseRoute:
     def __post_init__(self) -> None:
         if self.kind not in _ROUTE_KINDS:
             raise ValueError(f"unknown phase route kind: {self.kind!r}")
-        if not str(self.reason_code).strip():
+        if not _REASON_CODE.fullmatch(str(self.reason_code).strip()):
             raise ValueError("phase route requires a typed reason code")
         if self.kind in {"advance", "repair", "report"} and not self.target:
             raise ValueError(f"{self.kind} route requires a target")
@@ -152,23 +154,22 @@ class RepairRecurrenceGuard(Protocol):
         self,
         request: RepairRequest,
         relevant_state_vector: Mapping[str, int],
-        *,
-        state: RunEvidenceState,
     ) -> str | None: ...
 
 
 class StateBackedRepairGuard:
     """Reject an accepted repair signature repeated without relevant progress."""
 
+    def __init__(self, state: RunEvidenceState):
+        self.state = state
+
     def check(
         self,
         request: RepairRequest,
         relevant_state_vector: Mapping[str, int],
-        *,
-        state: RunEvidenceState,
     ) -> str | None:
         vector = dict(relevant_state_vector)
-        for record in reversed(state.repair_records):
+        for record in reversed(self.state.repair_records):
             if not record.accepted:
                 continue
             if (
@@ -183,7 +184,7 @@ class StateBackedRepairGuard:
 
 class PhaseTransitionPolicy:
     def __init__(self, repair_guard: RepairRecurrenceGuard | None = None):
-        self.repair_guard = repair_guard or StateBackedRepairGuard()
+        self.repair_guard = repair_guard
 
     @staticmethod
     def _route(
@@ -339,6 +340,8 @@ class PhaseTransitionPolicy:
             vector=vector,
             source_outcome=source_outcome,
         )
+        if rejection is not None and not _REASON_CODE.fullmatch(str(rejection)):
+            raise ValueError("repair guard must return a typed reason code")
         accepted = rejection is None
         reason = "repair_accepted" if accepted else rejection
         state.record_repair(
@@ -399,7 +402,8 @@ class PhaseTransitionPolicy:
         current_refs = set(state.evidence_refs_for_attempt(request.source_attempt_id))
         if not current_refs.intersection(request.evidence_refs):
             return "stale_repair_evidence"
-        return self.repair_guard.check(request, vector, state=state)
+        guard = self.repair_guard or StateBackedRepairGuard(state)
+        return guard.check(request, vector)
 
     @staticmethod
     def _repair_state_vector(

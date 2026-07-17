@@ -212,6 +212,12 @@ class PhaseMachine:
     def current_record(self) -> Optional[PhaseAttemptRecord]:
         if self._pending_record is not None:
             return self._pending_record
+        if (
+            self._records
+            and self._records[-1].attempt_id == self._current_attempt_id
+            and self._records[-1].is_terminal
+        ):
+            return self._records[-1]
         if self._current_phase is None or self._current_attempt_id is None:
             return None
         return PhaseAttemptRecord(
@@ -231,6 +237,8 @@ class PhaseMachine:
 
     def _advance(self, record: PhaseAttemptRecord) -> None:
         """Replay-only adapter for pre-WS3 transcripts and fixtures."""
+        if self._pending_record is not None:
+            raise RuntimeError("pending validated attempt must be routed before replay")
         self._append(record)
         index = PHASE_NAMES.index(record.phase)
         if index + 1 >= len(PHASE_NAMES):
@@ -319,8 +327,7 @@ class PhaseMachine:
                 raise ValueError(f"duplicate phase attempt id: {skip.attempt_id}")
             skip_ids.add(skip.attempt_id)
 
-        transition = f"{route.kind}:{route.reason_code}"
-        finalized = replace(pending, transition=transition)
+        finalized = replace(pending, transition=route.kind)
         self._records.append(finalized)
         appended: list[PhaseAttemptRecord] = [finalized]
         for skip in decision.skips:

@@ -219,7 +219,7 @@ def test_repair_signal_reopens_direct_dependency_with_monotonic_attempt():
 
     assert engine.phase_machine.current_phase == "build"
     assert engine.phase_machine.current_attempt_id == "build-1"
-    assert engine.phase_machine.records[0].transition.startswith("repair:")
+    assert engine.phase_machine.records[0].transition == "repair"
     assert engine.run_evidence_state.repair_records[-1].accepted is True
 
 

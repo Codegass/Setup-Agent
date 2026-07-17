@@ -58,7 +58,7 @@ def test_same_repair_signature_without_progress_is_rejected():
     request = _request()
     vector = {"environment": 1, "dependencies": 3, "artifacts": 4}
     state.record_phase_evidence(request.source_attempt_id, request.evidence_refs)
-    state.record_repair(request, state_vector=vector, accepted=True)
+    state.record_repair(request, state_vector=vector)
 
     decision = PhaseTransitionPolicy().request_repair(
         request,
@@ -70,6 +70,27 @@ def test_same_repair_signature_without_progress_is_rejected():
     assert decision.route.kind == "evidence_close"
     assert decision.reason_code == "repair_without_progress"
     assert state.repair_records[-1].accepted is False
+
+
+def test_repair_recurrence_guard_is_replaceable_through_two_argument_protocol():
+    class RejectingGuard:
+        def check(self, request, relevant_state_vector):
+            assert request.failure_signature == "missing_sibling_artifact:module-a"
+            assert "artifacts" in relevant_state_vector
+            return "loop_memory_rejected"
+
+    state = _state()
+    request = _request()
+    state.record_phase_evidence(request.source_attempt_id, request.evidence_refs)
+
+    decision = PhaseTransitionPolicy(repair_guard=RejectingGuard()).request_repair(
+        request,
+        state=state,
+        budgets=RepairBudgets.available(),
+    )
+
+    assert decision.reason_code == "loop_memory_rejected"
+    assert decision.route.kind == "evidence_close"
 
 
 def test_relevant_progress_allows_same_repair_signature_again():

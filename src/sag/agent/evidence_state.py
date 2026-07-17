@@ -420,7 +420,11 @@ class RunEvidenceState(BaseModel):
         if not normalized_attempt:
             raise ValueError("phase evidence event requires an attempt id")
         normalized = tuple(
-            dict.fromkeys(str(ref).strip() for ref in evidence_refs if str(ref).strip())
+            dict.fromkeys(
+                str(ref).strip()
+                for ref in evidence_refs
+                if ref is not None and str(ref).strip()
+            )
         )
         if not normalized:
             raise ValueError("phase evidence event requires at least one evidence ref")
@@ -442,7 +446,7 @@ class RunEvidenceState(BaseModel):
         request: Any,
         *,
         state_vector: Mapping[str, int],
-        accepted: bool,
+        accepted: bool = True,
         decision_reason: str = "",
     ) -> RepairRecord:
         self._require_mutable()
