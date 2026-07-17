@@ -3,7 +3,13 @@ returns evidence + options, never blocks tool use; probe errors fail OPEN."""
 
 from types import SimpleNamespace
 
-from sag.agent.phase_gates import check_phase_done
+from sag.agent.phase_gates import (
+    ClaimDisposition,
+    ValidatorState,
+    check_phase_claim,
+    check_phase_done,
+)
+from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 
 
 class FakeValidator:
@@ -11,10 +17,21 @@ class FakeValidator:
         self._b, self._s, self._t = build_success, build_system, has_test_reports
 
     def validate_build_status(self, project_name=None):
-        return {"success": self._b, "evidence": {"build_system": self._s}, "reason": "scripted"}
+        return {
+            "success": self._b,
+            "build_complete": self._b,
+            "evidence_status": "success" if self._b else "blocked",
+            "evidence": {"build_system": self._s},
+            "reason": "scripted build validation",
+        }
 
     def validate_test_status(self, project_name=None):
-        return {"has_test_reports": self._t, "status": "scripted"}
+        return {
+            "has_test_reports": self._t,
+            "status": "SUCCESS" if self._t else "WARNING",
+            "evidence_status": "success" if self._t else "unknown",
+            "reason": "scripted test validation",
+        }
 
 
 def _orch(java_ok=True, workspace_exists=True):
@@ -47,12 +64,13 @@ def test_build_done_accepted_with_artifacts():
     assert verdict["ok"] is True
 
 
-def test_build_gate_fails_open_for_non_jvm_systems():
+def test_build_gate_uses_physical_validator_for_non_jvm_systems():
     verdict = check_phase_done(
         "build", validator=FakeValidator(build_success=False, build_system="nodejs"),
         orchestrator=_orch(), project_name="demo",
     )
-    assert verdict["ok"] is True, "artifact gate is maven/gradle-scoped (round-3 over-block fix)"
+    assert verdict["ok"] is False
+    assert verdict["validator_state"] == "red"
 
 
 def test_test_done_rejected_without_reports():
@@ -72,7 +90,7 @@ def test_provision_rejected_without_workspace():
     assert verdict["ok"] is False
 
 
-def test_gate_fails_open_on_probe_error():
+def test_gate_probe_error_is_explicitly_unavailable():
     class Exploding:
         def validate_build_status(self, project_name=None):
             raise RuntimeError("docker down")
@@ -80,12 +98,103 @@ def test_gate_fails_open_on_probe_error():
     verdict = check_phase_done(
         "build", validator=Exploding(), orchestrator=_orch(), project_name="demo",
     )
-    assert verdict["ok"] is True, "infrastructure failure must never trap the model"
+    assert verdict["ok"] is False
+    assert verdict["validator_state"] == "unavailable"
 
 
-def test_analyze_always_passes_with_note():
-    # Analysis quality is advisory; an honest 'unknown' must not trap the run.
-    verdict = check_phase_done(
-        "analyze", validator=FakeValidator(), orchestrator=_orch(), project_name="demo",
+def test_analyze_unknown_claim_can_end_when_evidence_is_unavailable():
+    result = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.UNKNOWN),
+        validator=FakeValidator(),
+        orchestrator=_orch(),
+        project_name="demo",
     )
-    assert verdict["ok"] is True
+    assert result.accepted is True
+    assert result.validator_state is ValidatorState.UNAVAILABLE
+    assert result.claim_disposition is ClaimDisposition.CONFIRMED
+    assert result.validated_outcome is PhaseOutcome.UNKNOWN
+
+
+def test_analyze_validator_maps_complete_and_partial_evidence():
+    class Analyzer(FakeValidator):
+        def __init__(self, *, counted):
+            super().__init__()
+            self.counted = counted
+
+        def validate_project_analysis_status(self, project_name=None):
+            return {
+                "analyzed": True,
+                "has_static_test_count": self.counted,
+                "static_test_count": 12 if self.counted else None,
+            }
+
+    green = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=Analyzer(counted=True),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+    partial = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=Analyzer(counted=False),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert green.accepted is True
+    assert green.validator_state is ValidatorState.GREEN
+    assert partial.accepted is True
+    assert partial.validator_state is ValidatorState.PARTIAL
+
+
+def test_all_collection_errors_are_red_even_when_report_exists():
+    class CollectionFailure(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "evidence_status": "success",
+                "total_tests": 328,
+                "error_tests": 328,
+                "test_stats": {"executed": 328, "discovered": 328},
+                "reason": "collection errors",
+                "report_files": ["report://junit"],
+            }
+
+    result = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=CollectionFailure(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is False
+    assert result.validator_state is ValidatorState.RED
+    assert result.validated_outcome is PhaseOutcome.FAILED
+    assert result.code == "test_collection_failed"
+
+
+def test_detected_but_unexecuted_tests_are_red():
+    class NoExecution(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "evidence_status": "success",
+                "test_stats": {"executed": 0, "discovered": 12},
+                "reason": "empty runner",
+            }
+
+    result = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=NoExecution(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is False
+    assert result.validator_state is ValidatorState.RED
+    assert result.code == "tests_not_executed"

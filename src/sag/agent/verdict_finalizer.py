@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
@@ -19,7 +19,7 @@ from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
 from .output_storage import atomic_write_container_text
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
-VERDICT_SCHEMA_VERSION = 1
+VERDICT_SCHEMA_VERSION = 2
 
 
 class EvidenceCloseReason(str, Enum):
@@ -87,6 +87,17 @@ class BuildEvidenceSnapshot(BaseModel):
     refs: tuple[str, ...] = ()
 
 
+class PhaseClaimSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    phase: str
+    claimed_outcome: str
+    signal: str = "done"
+    key_results: str = ""
+    reason: str = ""
+    evidence_refs: tuple[str, ...] = ()
+
+
 class PhaseRecordSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -94,11 +105,28 @@ class PhaseRecordSnapshot(BaseModel):
     attempt_id: str
     termination: str
     outcome: str
-    transition: str = ""
+    transition: str | None = None
     key_results: str = ""
     reason: str = ""
     evidence: tuple[str, ...] = ()
+    evidence_refs: tuple[str, ...] = ()
+    claim: PhaseClaimSnapshot | None = None
+    validated_outcome: str
+    claim_disposition: str | None = None
     legacy_claim: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_v1_phase_record(cls, value: Any) -> Any:
+        """Read additive WS1 records written before claim validation existed."""
+        if not isinstance(value, dict):
+            return value
+        upgraded = dict(value)
+        upgraded.setdefault("validated_outcome", upgraded.get("outcome", "unknown"))
+        upgraded.setdefault("evidence_refs", upgraded.get("evidence", ()))
+        if upgraded.get("transition") == "":
+            upgraded["transition"] = None
+        return upgraded
 
 
 class RunVerdictSnapshot(BaseModel):

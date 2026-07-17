@@ -70,6 +70,25 @@ def test_completed_unknown_is_legal_and_not_a_run_verdict():
     assert not hasattr(PhaseMachine(), "overall_outcome")
 
 
+def test_terminal_failure_has_no_transition_before_policy():
+    record = PhaseAttemptRecord(
+        phase="build",
+        attempt_id="build-1",
+        termination=PhaseTermination.COMPLETED,
+        outcome=PhaseOutcome.FAILED,
+    )
+
+    assert record.is_terminal is True
+    assert record.transition is None
+
+
+def test_model_cannot_emit_skipped_record():
+    machine = PhaseMachine()
+
+    with pytest.raises(PermissionError, match="transition policy"):
+        machine.record_model_skip(phase="test", reason="build failed")
+
+
 def test_phase_records_are_append_only_and_skip_has_its_own_type():
     machine = PhaseMachine()
     machine.mark_done("provisioned", ["overlay:java"])

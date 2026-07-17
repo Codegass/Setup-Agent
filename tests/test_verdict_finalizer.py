@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
@@ -10,9 +10,11 @@ from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
 from sag.agent.evidence_state import (
     StateScope,
 )
-from sag.agent.phase_machine import PhaseMachine
+from sag.agent.phase_gates import ValidatorState, validate_phase_claim
+from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.verdict_finalizer import (
     EvidenceCloseReason,
+    PhaseRecordSnapshot,
     VerdictFinalizer,
     read_verdict_snapshot,
 )
@@ -146,6 +148,7 @@ def test_finalization_is_byte_identical_and_uses_atomic_rename():
     second = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
     assert first.model_dump_json() == second.model_dump_json()
+    assert first.schema_version == 2
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
     assert orchestrator.commands[len(commands_after_first) :] == [
@@ -639,6 +642,45 @@ def test_phase_records_are_preserved_as_detached_audit_history():
     expected_json = json.loads(json.dumps(expected, default=lambda value: value.value))
     assert actual == expected_json
     assert snapshot.verdict == "partial", "phase outcomes are audit-only verdict inputs"
+
+
+def test_phase_claim_and_validated_outcome_are_preserved_for_audit():
+    state = _tvm_state()
+    machine = PhaseMachine()
+    validation = validate_phase_claim(
+        PhaseClaim(phase="provision", claimed_outcome=PhaseOutcome.FAILED),
+        ValidatorState.GREEN,
+    )
+    record = replace(machine.close_attempt(validation), attempt_id="provision-claim-2")
+    state.record_phase_record(record)
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    audited = snapshot.phase_records[-1]
+    assert audited.claim is not None
+    assert audited.claim.claimed_outcome == "failed"
+    assert audited.validated_outcome == "success"
+    assert audited.outcome == "success"
+    assert audited.claim_disposition == "pessimistic"
+
+
+def test_phase_record_snapshot_upgrades_pre_claim_validation_shape():
+    record = PhaseRecordSnapshot.model_validate(
+        {
+            "phase": "build",
+            "attempt_id": "build-1",
+            "termination": "completed",
+            "outcome": "failed",
+            "transition": "",
+            "evidence": ["output_1"],
+        }
+    )
+
+    assert record.validated_outcome == "failed"
+    assert record.evidence_refs == ("output_1",)
+    assert record.transition is None
 
 
 def test_sealed_state_rejects_all_later_evidence_mutation():
