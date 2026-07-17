@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from enum import Enum
-from typing import Any, Iterable
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
@@ -98,37 +100,71 @@ def _canonicalize(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def _snapshot(record: Any) -> Any:
+    """Return a detached copy suitable for the public read surface."""
+    if isinstance(record, BaseModel):
+        return record.model_copy(deep=True)
+    return copy.deepcopy(record)
+
+
 class RunEvidenceState(BaseModel):
     """Mutable run evidence owned and written exclusively by the engine."""
 
-    model_config = ConfigDict(validate_assignment=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     run_id: str
-    state_epochs: dict[StateScope, int] = Field(
+
+    _state_epochs: dict[StateScope, int] = PrivateAttr(
         default_factory=lambda: {scope: 0 for scope in StateScope}
     )
-    facts: list[EvidenceFact] = Field(default_factory=list)
-    blockers: list[BlockerRecord] = Field(default_factory=list)
-    blocker_events: list[BlockerRecord] = Field(default_factory=list)
-    action_attempts: list[ActionAttempt] = Field(default_factory=list)
-    tool_observations: list[ToolObservation] = Field(default_factory=list)
-    validator_findings: list[EvidenceFinding] = Field(default_factory=list)
-    conflicts: list[str] = Field(default_factory=list)
-    finalized_at: str | None = None
-
+    _facts: list[EvidenceFact] = PrivateAttr(default_factory=list)
+    _blockers: list[BlockerRecord] = PrivateAttr(default_factory=list)
+    _blocker_events: list[BlockerRecord] = PrivateAttr(default_factory=list)
+    _action_attempts: list[ActionAttempt] = PrivateAttr(default_factory=list)
+    _tool_observations: list[ToolObservation] = PrivateAttr(default_factory=list)
+    _validator_findings: list[EvidenceFinding] = PrivateAttr(default_factory=list)
+    _conflicts: list[str] = PrivateAttr(default_factory=list)
+    _finalized_at: str | None = PrivateAttr(default=None)
     _canonical_values: set[tuple[StateScope, str, str]] = PrivateAttr(default_factory=set)
 
-    def model_post_init(self, __context: Any) -> None:
-        for scope in StateScope:
-            self.state_epochs.setdefault(scope, 0)
-        self._canonical_values = {
-            (fact.scope, fact.key, fact.canonical_value)
-            for fact in self.facts
-            if fact.status is FactStatus.VERIFIED
-        }
+    @property
+    def state_epochs(self) -> Mapping[StateScope, int]:
+        return MappingProxyType(dict(self._state_epochs))
+
+    @property
+    def facts(self) -> tuple[EvidenceFact, ...]:
+        return tuple(_snapshot(fact) for fact in self._facts)
+
+    @property
+    def blockers(self) -> tuple[BlockerRecord, ...]:
+        return tuple(_snapshot(blocker) for blocker in self._blockers)
+
+    @property
+    def blocker_events(self) -> tuple[BlockerRecord, ...]:
+        return tuple(_snapshot(event) for event in self._blocker_events)
+
+    @property
+    def action_attempts(self) -> tuple[ActionAttempt, ...]:
+        return tuple(_snapshot(attempt) for attempt in self._action_attempts)
+
+    @property
+    def tool_observations(self) -> tuple[ToolObservation, ...]:
+        return tuple(_snapshot(observation) for observation in self._tool_observations)
+
+    @property
+    def validator_findings(self) -> tuple[EvidenceFinding, ...]:
+        return tuple(_snapshot(finding) for finding in self._validator_findings)
+
+    @property
+    def conflicts(self) -> tuple[str, ...]:
+        return tuple(self._conflicts)
+
+    @property
+    def finalized_at(self) -> str | None:
+        return self._finalized_at
 
     def _require_mutable(self) -> None:
-        if self.finalized_at is not None:
+        if self._finalized_at is not None:
             raise RuntimeError("RunEvidenceState is sealed")
 
     def register_fact(
@@ -145,24 +181,24 @@ class RunEvidenceState(BaseModel):
         fact = EvidenceFact(
             scope=scope,
             key=key,
-            value=value,
+            value=copy.deepcopy(value),
             canonical_value=canonical_value,
             status=FactStatus.VERIFIED,
             provenance=provenance,
         )
-        before = self.state_epochs[scope]
+        before = self._state_epochs[scope]
         identity = (scope, key, canonical_value)
         changed = identity not in self._canonical_values
         if changed:
             self._canonical_values.add(identity)
-            self.state_epochs[scope] = before + 1
-        self.facts.append(fact)
+            self._state_epochs[scope] = before + 1
+        self._facts.append(fact)
         return StateEpochDelta(
             scope=scope,
             before=before,
-            after=self.state_epochs[scope],
+            after=self._state_epochs[scope],
             changed=changed,
-            fact=fact,
+            fact=_snapshot(fact),
         )
 
     def register_claim(
@@ -178,19 +214,19 @@ class RunEvidenceState(BaseModel):
         fact = EvidenceFact(
             scope=scope,
             key=key,
-            value=value,
+            value=copy.deepcopy(value),
             canonical_value=_canonicalize(value),
             status=FactStatus.CLAIMED,
             provenance=provenance,
         )
-        before = self.state_epochs[scope]
-        self.facts.append(fact)
+        before = self._state_epochs[scope]
+        self._facts.append(fact)
         return StateEpochDelta(
             scope=scope,
             before=before,
             after=before,
             changed=False,
-            fact=fact,
+            fact=_snapshot(fact),
         )
 
     def record_blocker(
@@ -203,15 +239,15 @@ class RunEvidenceState(BaseModel):
     ) -> BlockerRecord:
         self._require_mutable()
         blocker = BlockerRecord(
-            blocker_id=f"blocker_{len(self.blockers) + 1}",
+            blocker_id=f"blocker_{len(self._blockers) + 1}",
             category=category,
             error_code=error_code,
             failure_signature=failure_signature,
             evidence_refs=list(evidence_refs),
         )
-        self.blockers.append(blocker)
-        self.blocker_events.append(blocker.model_copy(deep=True))
-        return blocker
+        self._blockers.append(blocker)
+        self._blocker_events.append(_snapshot(blocker))
+        return _snapshot(blocker)
 
     def resolve_blocker(
         self,
@@ -220,17 +256,17 @@ class RunEvidenceState(BaseModel):
         resolution: str = "",
     ) -> BlockerRecord:
         self._require_mutable()
-        blocker = next((item for item in self.blockers if item.blocker_id == blocker_id), None)
+        blocker = next((item for item in self._blockers if item.blocker_id == blocker_id), None)
         if blocker is None:
             raise KeyError(f"Unknown blocker: {blocker_id}")
         if blocker.status == "resolved":
             raise ValueError(f"Blocker already resolved: {blocker_id}")
         blocker.status = "resolved"
         blocker.resolution = resolution or None
-        resolution_event = blocker.model_copy(deep=True)
+        resolution_event = _snapshot(blocker)
         resolution_event.event = "resolved"
-        self.blocker_events.append(resolution_event)
-        return resolution_event
+        self._blocker_events.append(resolution_event)
+        return _snapshot(resolution_event)
 
     def record_attempt(
         self,
@@ -243,15 +279,15 @@ class RunEvidenceState(BaseModel):
         self._require_mutable()
         scopes = [StateScope(scope) for scope in relevant_scopes]
         attempt = ActionAttempt(
-            attempt_id=f"attempt_{len(self.action_attempts) + 1}",
+            attempt_id=f"attempt_{len(self._action_attempts) + 1}",
             action=action,
             relevant_scopes=scopes,
             state_vector=self.state_vector(scopes),
             outcome=outcome,
             evidence_refs=list(evidence_refs),
         )
-        self.action_attempts.append(attempt)
-        return attempt
+        self._action_attempts.append(attempt)
+        return _snapshot(attempt)
 
     def ingest_tool_result(
         self,
@@ -268,23 +304,21 @@ class RunEvidenceState(BaseModel):
             or result.output_ref
             or next(
                 iter(result.evidence_refs or result.refs),
-                f"tool:{tool_name}:{len(self.tool_observations) + 1}",
+                f"tool:{tool_name}:{len(self._tool_observations) + 1}",
             )
         )
         observation = ToolObservation(
-            observation_id=f"observation_{len(self.tool_observations) + 1}",
+            observation_id=f"observation_{len(self._tool_observations) + 1}",
             scope=scope,
             tool_name=tool_name,
             result=result.model_copy(deep=True),
             provenance=source,
         )
-        self.tool_observations.append(observation)
-        self.validator_findings.extend(
-            finding.model_copy(deep=True) for finding in result.validator_findings
-        )
-        self.conflicts.extend(result.conflicts)
+        self._tool_observations.append(observation)
+        self._validator_findings.extend(_snapshot(finding) for finding in result.validator_findings)
+        self._conflicts.extend(result.conflicts)
 
-        before = self.state_epochs[scope]
+        before = self._state_epochs[scope]
         latest_fact: EvidenceFact | None = None
         changed = False
         if result.evidence_status is EvidenceStatus.VERIFIED:
@@ -295,7 +329,7 @@ class RunEvidenceState(BaseModel):
         return StateEpochDelta(
             scope=scope,
             before=before,
-            after=self.state_epochs[scope],
+            after=self._state_epochs[scope],
             changed=changed,
             fact=latest_fact,
         )
@@ -303,11 +337,11 @@ class RunEvidenceState(BaseModel):
     def state_vector(self, scopes: Iterable[StateScope]) -> dict[str, int]:
         """Return selected epoch counters in the declaration order of StateScope."""
         selected = {StateScope(scope) for scope in scopes}
-        return {scope.value: self.state_epochs[scope] for scope in StateScope if scope in selected}
+        return {scope.value: self._state_epochs[scope] for scope in StateScope if scope in selected}
 
     def seal(self, *, finalized_at: str) -> None:
         """Close evidence collection permanently at the evidence-close boundary."""
         self._require_mutable()
         if not finalized_at.strip():
             raise ValueError("finalized_at must be nonblank")
-        self.finalized_at = finalized_at
+        self._finalized_at = finalized_at
