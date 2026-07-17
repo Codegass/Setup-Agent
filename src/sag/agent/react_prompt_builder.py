@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -11,6 +11,9 @@ from sag.config.prompt_loader import PromptConfig
 from sag.tools.base import BaseTool
 
 from .react_types import ReactModelMode, ReActStep, StepType
+
+if TYPE_CHECKING:
+    from .phase_handoff import HandoffProjection
 
 
 def _format_attempt_history(todo_list) -> str:
@@ -321,6 +324,18 @@ Current Focus: {context_info.get('focus', 'Not specified')}
             return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
 
         raise ValueError(f"Unsupported React model mode: {mode}")
+
+    @staticmethod
+    def build_phase_intro_guidance(
+        *,
+        phase_contract: str,
+        handoff_projection: "HandoffProjection | None",
+    ) -> str:
+        """Join the engine-owned contract to a typed, explicitly untrusted digest."""
+        contract = str(phase_contract).rstrip()
+        if handoff_projection is None:
+            return contract
+        return f"{contract}\n\n{handoff_projection.to_prompt_text()}"
 
     def invalidate_trunk_cache(self) -> None:
         """Invalidate trunk context cache when we know it has changed."""

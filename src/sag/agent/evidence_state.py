@@ -6,7 +6,7 @@ import copy
 import json
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, field_serializer
 
@@ -45,6 +45,9 @@ class EvidenceFact(BaseModel):
     canonical_value: str
     status: FactStatus
     provenance: str
+    source_phase: str | None = None
+    source_attempt_id: str | None = None
+    evidence_refs: tuple[str, ...] = ()
 
 
 class BlockerRecord(BaseModel):
@@ -60,6 +63,8 @@ class BlockerRecord(BaseModel):
     event: str = "recorded"
     resolution: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
+    source_phase: str | None = None
+    source_attempt_id: str | None = None
 
 
 class ActionAttempt(BaseModel):
@@ -170,6 +175,9 @@ class RunEvidenceState(BaseModel):
     _finalized_at: str | None = PrivateAttr(default=None)
     _close_reason: str | None = PrivateAttr(default=None)
     _canonical_values: set[tuple[StateScope, str, str]] = PrivateAttr(default_factory=set)
+    _change_listeners: list[Callable[["RunEvidenceState", str], None]] = PrivateAttr(
+        default_factory=list
+    )
 
     @computed_field
     @property
@@ -249,16 +257,67 @@ class RunEvidenceState(BaseModel):
         if self._finalized_at is not None:
             raise RuntimeError("RunEvidenceState is sealed")
 
+    def add_change_listener(
+        self,
+        listener: Callable[["RunEvidenceState", str], None],
+    ) -> None:
+        """Subscribe a projection/persistence observer without changing state truth."""
+        if not callable(listener):
+            raise TypeError("state change listener must be callable")
+        if listener not in self._change_listeners:
+            self._change_listeners.append(listener)
+
+    def remove_change_listener(
+        self,
+        listener: Callable[["RunEvidenceState", str], None],
+    ) -> None:
+        if listener in self._change_listeners:
+            self._change_listeners.remove(listener)
+
+    def _notify_change(self, event: str) -> None:
+        for listener in tuple(self._change_listeners):
+            listener(self, event)
+
+    @staticmethod
+    def _source_ref(
+        provenance: str | None,
+        source_ref: str | None,
+        evidence_refs: Iterable[str] = (),
+    ) -> tuple[str, tuple[str, ...]]:
+        refs = tuple(
+            dict.fromkeys(
+                str(ref).strip()
+                for ref in evidence_refs
+                if ref is not None and str(ref).strip()
+            )
+        )
+        if provenance and source_ref and str(provenance) != str(source_ref):
+            raise ValueError("fact provenance and source_ref disagree")
+        resolved = str(source_ref or provenance or (refs[0] if refs else "")).strip()
+        return resolved, refs
+
     def register_fact(
         self,
         scope: StateScope,
         key: str,
         value: Any,
-        provenance: str,
+        provenance: str | None = None,
+        *,
+        source_ref: str | None = None,
+        source_phase: str | None = None,
+        source_attempt_id: str | None = None,
+        evidence_refs: Iterable[str] = (),
     ) -> StateEpochDelta:
         """Append verified evidence and advance only for new canonical content."""
         self._require_mutable()
         scope = StateScope(scope)
+        resolved_ref, normalized_refs = self._source_ref(
+            provenance,
+            source_ref,
+            evidence_refs,
+        )
+        if not resolved_ref:
+            raise ValueError("verified facts require a nonblank evidence ref")
         canonical_value = _canonicalize(value)
         fact = EvidenceFact(
             scope=scope,
@@ -266,7 +325,12 @@ class RunEvidenceState(BaseModel):
             value=copy.deepcopy(value),
             canonical_value=canonical_value,
             status=FactStatus.VERIFIED,
-            provenance=provenance,
+            provenance=resolved_ref,
+            source_phase=str(source_phase).strip() if source_phase else None,
+            source_attempt_id=(
+                str(source_attempt_id).strip() if source_attempt_id else None
+            ),
+            evidence_refs=normalized_refs or (resolved_ref,),
         )
         before = self._state_epochs[scope]
         identity = (scope, key, canonical_value)
@@ -275,41 +339,63 @@ class RunEvidenceState(BaseModel):
             self._canonical_values.add(identity)
             self._state_epochs[scope] = before + 1
         self._facts.append(fact)
-        return StateEpochDelta(
+        delta = StateEpochDelta(
             scope=scope,
             before=before,
             after=self._state_epochs[scope],
             changed=changed,
             fact=_snapshot(fact),
         )
+        self._notify_change("fact_registered")
+        return delta
 
     def register_claim(
         self,
         scope: StateScope,
         key: str,
         value: Any,
-        provenance: str,
+        provenance: str | None = None,
+        *,
+        source_ref: str | None = None,
+        source_phase: str | None = None,
+        source_attempt_id: str | None = None,
+        evidence_refs: Iterable[str] = (),
     ) -> StateEpochDelta:
         """Append an unverified claim without allowing it to create progress."""
         self._require_mutable()
         scope = StateScope(scope)
+        resolved_ref, normalized_refs = self._source_ref(
+            provenance,
+            source_ref,
+            evidence_refs,
+        )
+        if not resolved_ref:
+            phase = str(source_phase or "unknown").strip() or "unknown"
+            resolved_ref = f"claim://{phase}/{len(self._facts) + 1}"
         fact = EvidenceFact(
             scope=scope,
             key=key,
             value=copy.deepcopy(value),
             canonical_value=_canonicalize(value),
             status=FactStatus.CLAIMED,
-            provenance=provenance,
+            provenance=resolved_ref,
+            source_phase=str(source_phase).strip() if source_phase else None,
+            source_attempt_id=(
+                str(source_attempt_id).strip() if source_attempt_id else None
+            ),
+            evidence_refs=normalized_refs,
         )
         before = self._state_epochs[scope]
         self._facts.append(fact)
-        return StateEpochDelta(
+        delta = StateEpochDelta(
             scope=scope,
             before=before,
             after=before,
             changed=False,
             fact=_snapshot(fact),
         )
+        self._notify_change("claim_registered")
+        return delta
 
     def set_fact(
         self,
@@ -318,6 +404,8 @@ class RunEvidenceState(BaseModel):
         *,
         evidence_ref: str,
         scope: StateScope | None = None,
+        source_phase: str | None = None,
+        source_attempt_id: str | None = None,
     ) -> StateEpochDelta:
         """Register an engine/validator fact through a stable dotted-key seam."""
         if not str(evidence_ref).strip():
@@ -334,7 +422,14 @@ class RunEvidenceState(BaseModel):
                 "analysis": StateScope.PROJECT_ANALYSIS,
                 "project": StateScope.PROJECT_ANALYSIS,
             }.get(prefix, StateScope.PROJECT_ANALYSIS)
-        return self.register_fact(StateScope(scope), str(key), value, str(evidence_ref))
+        return self.register_fact(
+            StateScope(scope),
+            str(key),
+            value,
+            str(evidence_ref),
+            source_phase=source_phase,
+            source_attempt_id=source_attempt_id,
+        )
 
     def fact_value(self, key: str, default: Any = None) -> Any:
         """Return the latest verified canonical fact with this key."""
@@ -351,22 +446,43 @@ class RunEvidenceState(BaseModel):
 
     def record_blocker(
         self,
+        signature: str | None = None,
         *,
-        category: str,
-        error_code: str,
-        failure_signature: str,
+        category: str = "runtime",
+        error_code: str = "BLOCKED",
+        failure_signature: str | None = None,
         evidence_refs: Iterable[str] = (),
+        evidence_ref: str | None = None,
+        source_phase: str | None = None,
+        source_attempt_id: str | None = None,
     ) -> BlockerRecord:
         self._require_mutable()
+        if signature and failure_signature and str(signature) != str(failure_signature):
+            raise ValueError("blocker signature aliases disagree")
+        normalized_signature = str(failure_signature or signature or "").strip()
+        if not normalized_signature:
+            raise ValueError("blocker requires a nonblank failure signature")
+        normalized_refs = list(
+            dict.fromkeys(
+                str(ref).strip()
+                for ref in [*evidence_refs, evidence_ref]
+                if ref is not None and str(ref).strip()
+            )
+        )
         blocker = BlockerRecord(
             blocker_id=f"blocker_{len(self._blockers) + 1}",
             category=category,
             error_code=error_code,
-            failure_signature=failure_signature,
-            evidence_refs=list(evidence_refs),
+            failure_signature=normalized_signature,
+            evidence_refs=normalized_refs,
+            source_phase=str(source_phase).strip() if source_phase else None,
+            source_attempt_id=(
+                str(source_attempt_id).strip() if source_attempt_id else None
+            ),
         )
         self._blockers.append(blocker)
         self._blocker_events.append(_snapshot(blocker))
+        self._notify_change("blocker_recorded")
         return _snapshot(blocker)
 
     def resolve_blocker(
@@ -374,18 +490,40 @@ class RunEvidenceState(BaseModel):
         blocker_id: str,
         *,
         resolution: str = "",
+        evidence_ref: str | None = None,
+        evidence_refs: Iterable[str] = (),
     ) -> BlockerRecord:
         self._require_mutable()
-        blocker = next((item for item in self._blockers if item.blocker_id == blocker_id), None)
+        blocker = next(
+            (
+                item
+                for item in self._blockers
+                if item.blocker_id == blocker_id or item.failure_signature == blocker_id
+            ),
+            None,
+        )
         if blocker is None:
             raise KeyError(f"Unknown blocker: {blocker_id}")
         if blocker.status == "resolved":
             raise ValueError(f"Blocker already resolved: {blocker_id}")
         blocker.status = "resolved"
         blocker.resolution = resolution or None
+        blocker.evidence_refs = list(
+            dict.fromkeys(
+                [
+                    *blocker.evidence_refs,
+                    *(
+                        str(ref).strip()
+                        for ref in [*evidence_refs, evidence_ref]
+                        if ref is not None and str(ref).strip()
+                    ),
+                ]
+            )
+        )
         resolution_event = _snapshot(blocker)
         resolution_event.event = "resolved"
         self._blocker_events.append(resolution_event)
+        self._notify_change("blocker_resolved")
         return _snapshot(resolution_event)
 
     def record_attempt(
@@ -407,6 +545,7 @@ class RunEvidenceState(BaseModel):
             evidence_refs=list(evidence_refs),
         )
         self._action_attempts.append(attempt)
+        self._notify_change("action_attempt_recorded")
         return _snapshot(attempt)
 
     def record_phase_evidence(
@@ -436,6 +575,7 @@ class RunEvidenceState(BaseModel):
             evidence_refs=fresh or normalized,
         )
         self._phase_evidence_events.append(event)
+        self._notify_change("phase_evidence_recorded")
         return _snapshot(event)
 
     def evidence_refs_for_attempt(self, attempt_id: str) -> tuple[str, ...]:
@@ -464,6 +604,7 @@ class RunEvidenceState(BaseModel):
             decision_reason=str(decision_reason),
         )
         self._repair_records.append(record)
+        self._notify_change("repair_recorded")
         return _snapshot(record)
 
     def record_conflict(self, conflict: str) -> None:
@@ -474,6 +615,7 @@ class RunEvidenceState(BaseModel):
             raise ValueError("conflict must be nonblank")
         if normalized not in self._conflicts:
             self._conflicts.append(normalized)
+            self._notify_change("conflict_recorded")
 
     def has_execution_id(self, execution_id: str) -> bool:
         return execution_id in self._observation_execution_ids
@@ -488,6 +630,8 @@ class RunEvidenceState(BaseModel):
         roles: Iterable[EvidenceRole] = (),
         execution_id: str | None = None,
         params: Mapping[str, Any] | None = None,
+        source_phase: str | None = None,
+        source_attempt_id: str | None = None,
     ) -> StateEpochDelta:
         """Record a WS0 result and promote only its verified facts into epochs."""
         self._require_mutable()
@@ -547,16 +691,25 @@ class RunEvidenceState(BaseModel):
         changed = False
         if result.evidence_status is EvidenceStatus.VERIFIED:
             for key, value in result.facts.items():
-                delta = self.register_fact(scope, key, value, source)
+                delta = self.register_fact(
+                    scope,
+                    key,
+                    value,
+                    source,
+                    source_phase=source_phase,
+                    source_attempt_id=source_attempt_id,
+                )
                 latest_fact = delta.fact
                 changed = changed or delta.changed
-        return StateEpochDelta(
+        delta = StateEpochDelta(
             scope=scope,
             before=before,
             after=self._state_epochs[scope],
             changed=changed,
             fact=latest_fact,
         )
+        self._notify_change("tool_observation_ingested")
+        return delta
 
     def ingest_unpersisted_result(
         self,
@@ -568,6 +721,8 @@ class RunEvidenceState(BaseModel):
         roles: Iterable[EvidenceRole] = (),
         execution_id: str | None = None,
         params: Mapping[str, Any] | None = None,
+        source_phase: str | None = None,
+        source_attempt_id: str | None = None,
     ) -> StateEpochDelta:
         """Record bounded evidence from a result-construction persistence failure."""
         if not isinstance(result, UnpersistedToolResult):
@@ -580,6 +735,8 @@ class RunEvidenceState(BaseModel):
             roles=roles,
             execution_id=execution_id or result.execution_id,
             params=params,
+            source_phase=source_phase,
+            source_attempt_id=source_attempt_id,
         )
 
     def state_vector(self, scopes: Iterable[StateScope]) -> dict[str, int]:
@@ -602,6 +759,7 @@ class RunEvidenceState(BaseModel):
         detached = _snapshot(record)
         self._phase_records.append(detached)
         self._phase_record_ids.add(detached.attempt_id)
+        self._notify_change("phase_attempt_recorded")
         return _snapshot(detached)
 
     def record_phase_attempt(self, record: PhaseAttemptRecord) -> PhaseAttemptRecord:
@@ -615,3 +773,4 @@ class RunEvidenceState(BaseModel):
             raise ValueError("finalized_at must be nonblank")
         self._finalized_at = finalized_at
         self._close_reason = close_reason
+        self._notify_change("state_sealed")

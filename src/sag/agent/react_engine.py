@@ -29,6 +29,7 @@ from .context_manager import ContextManager, TaskStatus
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_gates import GateResult, ValidatorState, check_phase_claim, validate_phase_claim
+from .phase_handoff import PhaseHandoff
 from .phase_machine import (
     PHASE_NAMES,
     PhaseClaim,
@@ -374,6 +375,7 @@ class ReActEngine(UIEventEmitter):
             else None
         )
         self.output_storage = OutputStorageManager(contexts_dir, orchestrator=orchestrator)
+        self.phase_handoff = None
         if self.phase_machine is not None:
             if self.run_evidence_state is None:
                 run_id = str(
@@ -386,6 +388,10 @@ class ReActEngine(UIEventEmitter):
                     orchestrator,
                     test_pass_threshold=self.config.test_pass_threshold,
                 )
+            self.phase_handoff = PhaseHandoff(
+                self.run_evidence_state,
+                orchestrator=orchestrator,
+            )
 
         # Initialize physical validator for fact-based validation
         self.physical_validator = PhysicalValidator(
@@ -687,6 +693,9 @@ class ReActEngine(UIEventEmitter):
         scope = self._tool_evidence_scope(tool_name, params)
         roles = self._tool_evidence_roles(tool_name, params, result)
         action = self._tool_evidence_action(params)
+        machine = getattr(self, "phase_machine", None)
+        source_phase = getattr(machine, "current_phase", None)
+        source_attempt_id = getattr(machine, "current_attempt_id", None)
         if state.has_execution_id(execution_id):
             state.ingest_tool_result(
                 scope,
@@ -696,6 +705,8 @@ class ReActEngine(UIEventEmitter):
                 roles=roles,
                 execution_id=execution_id,
                 params=params,
+                source_phase=source_phase,
+                source_attempt_id=source_attempt_id,
             )
             return result
         if not attempted_execution:
@@ -742,6 +753,8 @@ class ReActEngine(UIEventEmitter):
                 roles=roles,
                 execution_id=execution_id,
                 params=params,
+                source_phase=source_phase,
+                source_attempt_id=source_attempt_id,
             )
             self._record_current_phase_evidence(
                 state,
@@ -765,6 +778,8 @@ class ReActEngine(UIEventEmitter):
             roles=roles,
             execution_id=execution_id,
             params=params,
+            source_phase=source_phase,
+            source_attempt_id=source_attempt_id,
         )
         self._record_current_phase_evidence(
             state,
@@ -977,9 +992,28 @@ class ReActEngine(UIEventEmitter):
             guidance = self._python_phase_guidance(phase)
             if guidance:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
+        handoff = getattr(self, "phase_handoff", None)
+        projection = None
+        if handoff is not None:
+            char_budget = int(getattr(self.config, "phase_handoff_char_budget", 6000))
+            projection = handoff.project_for(phase, char_budget=char_budget)
+        contract = "\n".join(lines)
+        builder = getattr(self, "prompt_builder", None)
+        render_intro = getattr(builder, "build_phase_intro_guidance", None)
+        if callable(render_intro):
+            content = render_intro(
+                phase_contract=contract,
+                handoff_projection=projection,
+            )
+        else:
+            content = (
+                f"{contract}\n\n{projection.to_prompt_text()}"
+                if projection is not None
+                else contract
+            )
         return ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
-            content="\n".join(lines),
+            content=content,
             timestamp=self._get_timestamp(),
         )
 
@@ -1149,7 +1183,13 @@ class ReActEngine(UIEventEmitter):
             else f"validator:{phase}:{getattr(self.phase_machine, 'current_attempt_id', '')}"
         )
         for key, value in gate.validated_facts.items():
-            state.set_fact(key, value, evidence_ref=provenance)
+            state.set_fact(
+                key,
+                value,
+                evidence_ref=provenance,
+                source_phase=phase,
+                source_attempt_id=self.phase_machine.current_attempt_id,
+            )
         if gate.evidence_refs:
             state.record_phase_evidence(
                 self.phase_machine.current_attempt_id,
