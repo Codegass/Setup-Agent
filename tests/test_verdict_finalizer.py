@@ -3,7 +3,13 @@ from dataclasses import asdict
 
 import pytest
 
-from sag.agent.evidence_state import RunEvidenceState, StateScope
+from sag.agent.evidence_state import (
+    EvidenceRole,
+)
+from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
+from sag.agent.evidence_state import (
+    StateScope,
+)
 from sag.agent.phase_machine import PhaseMachine
 from sag.agent.verdict_finalizer import (
     EvidenceCloseReason,
@@ -15,6 +21,25 @@ from sag.tools.base import ToolResult
 
 VERDICT_PATH = "/workspace/.setup_agent/verdict.json"
 VERDICT_TMP_PATH = f"{VERDICT_PATH}.tmp"
+
+
+class RunEvidenceState(_RunEvidenceState):
+    """Direct finalizer fixtures assign the roles the engine normally owns."""
+
+    def ingest_tool_result(self, scope, tool_name, result, provenance=None, *, roles=()):
+        explicit_roles = list(roles)
+        if not explicit_roles:
+            if scope is StateScope.ARTIFACTS:
+                explicit_roles.append(EvidenceRole.BUILD)
+            if result.test_stats is not None:
+                explicit_roles.append(EvidenceRole.TEST)
+        return super().ingest_tool_result(
+            scope,
+            tool_name,
+            result,
+            provenance,
+            roles=explicit_roles,
+        )
 
 
 class FakeVerdictOrchestrator:

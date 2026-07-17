@@ -13,6 +13,7 @@ from loguru import logger as default_logger
 
 from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
 from sag.tools.base import (
+    ActualToolExecution,
     BaseTool,
     OutputPersistenceError,
     ToolResult,
@@ -83,12 +84,6 @@ class RecoveryDecision:
     replacement_result: Optional[ToolResult] = None
     replacement_params: Optional[Dict[str, Any]] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True, slots=True)
-class ActualToolExecution:
-    params: Dict[str, Any]
-    result: ToolResult
 
 
 @dataclass(slots=True)
@@ -314,6 +309,37 @@ class ToolOrchestrator:
             add_system_guidance=self.add_system_guidance,
             logger=self.logger,
         )
+
+    @classmethod
+    def _flatten_actual_execution(
+        cls,
+        tool_name: str,
+        params: Dict[str, Any],
+        result: ToolResult,
+        *,
+        include_untraced: bool = True,
+    ) -> list[ActualToolExecution]:
+        if not result.execution_trace:
+            if not include_untraced:
+                return []
+            return [
+                ActualToolExecution(
+                    tool_name=tool_name,
+                    params=dict(params),
+                    result=result,
+                )
+            ]
+
+        flattened: list[ActualToolExecution] = []
+        for actual in result.execution_trace:
+            flattened.extend(
+                cls._flatten_actual_execution(
+                    actual.tool_name,
+                    actual.params,
+                    actual.result,
+                )
+            )
+        return flattened
 
     def _recommended_workdir(self, action: str) -> Optional[str]:
         """Analyzer's recommended reactor root for a build/test call, or None.
@@ -612,7 +638,11 @@ class ToolOrchestrator:
             )
             escaped_exception_result = result
 
-        actual_executions = [ActualToolExecution(params=dict(validated_params), result=result)]
+        actual_executions = self._flatten_actual_execution(
+            call.name,
+            validated_params,
+            result,
+        )
         executed_params = validated_params
         recovery_applied = False
         recovery_strategy: Optional[str] = None
@@ -666,10 +696,11 @@ class ToolOrchestrator:
                     if guidance_only:
                         status = "recovery_attempted"
                     else:
-                        actual_executions.append(
-                            ActualToolExecution(
-                                params=dict(recovery_params),
-                                result=result,
+                        actual_executions.extend(
+                            self._flatten_actual_execution(
+                                call.name,
+                                recovery_params,
+                                result,
                             )
                         )
                         status = (
@@ -1115,7 +1146,12 @@ class ToolOrchestrator:
             recovery_applied=True,
             recovery_strategy=recovery_strategy,
             attempted_execution=False,
-            actual_executions=[ActualToolExecution(params=dict(recovery_params), result=result)],
+            actual_executions=self._flatten_actual_execution(
+                call.name,
+                recovery_params,
+                result,
+                include_untraced=False,
+            ),
             parameter_fixes=call.parameter_fixes,
             metadata=metadata,
         )
@@ -1157,7 +1193,15 @@ class ToolOrchestrator:
 
         system_tool = self._system_delegate()
         if system_tool is not None:
-            system_tool.safe_execute(action="verify_java")
+            verify_params = {"action": "verify_java"}
+            verify_result = system_tool.safe_execute(**verify_params)
+            actual_executions = [
+                ActualToolExecution(
+                    tool_name="system",
+                    params=verify_params,
+                    result=verify_result,
+                )
+            ]
 
             current_context = ""
             if self.context_manager and hasattr(self.context_manager, "get_current_context"):
@@ -1170,7 +1214,15 @@ class ToolOrchestrator:
                 self.logger.info(
                     "Detected Java 17 requirement, using system tool for proper installation"
                 )
-                install_result = system_tool.safe_execute(action="install_java", java_version="17")
+                install_params = {"action": "install_java", "java_version": "17"}
+                install_result = system_tool.safe_execute(**install_params)
+                actual_executions.append(
+                    ActualToolExecution(
+                        tool_name="system",
+                        params=install_params,
+                        result=install_result,
+                    )
+                )
 
                 if install_result.succeeded:
                     return ToolResult.completed_success(
@@ -1179,7 +1231,14 @@ class ToolOrchestrator:
                             + install_result.output
                         ),
                         metadata={"auto_fixed": True, "java_version": "17"},
-                    )
+                    ).with_execution_trace(actual_executions)
+
+            return ToolResult.completed_failure(
+                output="Could not auto-fix Java configuration. Skipping to next task.",
+                error="Auto-fix failed",
+                error_code="AUTO_FIX_FAILED",
+                suggestions=["Manual intervention may be required", "Check Java installation logs"],
+            ).with_execution_trace(actual_executions)
 
         return ToolResult.completed_failure(
             output="Could not auto-fix Java configuration. Skipping to next task.",

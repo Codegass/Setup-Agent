@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, field_serializer
 
 from sag.evidence import EvidenceFinding, EvidenceStatus, OperationOutcome
-from sag.tools.base import ToolResult
+from sag.tools.base import ToolResult, UnpersistedToolResult
 
 from .phase_machine import PhaseAttemptRecord
 
@@ -22,6 +22,11 @@ class StateScope(str, Enum):
     ARTIFACTS = "artifacts"
     TEST_RUNTIME = "test_runtime"
     PROJECT_ANALYSIS = "project_analysis"
+
+
+class EvidenceRole(str, Enum):
+    BUILD = "build"
+    TEST = "test"
 
 
 class FactStatus(str, Enum):
@@ -78,7 +83,8 @@ class ToolObservation(BaseModel):
     observation_id: str
     scope: StateScope
     tool_name: str
-    result: ToolResult
+    roles: tuple[EvidenceRole, ...] = ()
+    result: ToolResult | UnpersistedToolResult
     provenance: str
 
 
@@ -335,8 +341,10 @@ class RunEvidenceState(BaseModel):
         self,
         scope: StateScope,
         tool_name: str,
-        result: ToolResult,
+        result: ToolResult | UnpersistedToolResult,
         provenance: str | None = None,
+        *,
+        roles: Iterable[EvidenceRole] = (),
     ) -> StateEpochDelta:
         """Record a WS0 result and promote only its verified facts into epochs."""
         self._require_mutable()
@@ -353,6 +361,7 @@ class RunEvidenceState(BaseModel):
             observation_id=f"observation_{len(self._tool_observations) + 1}",
             scope=scope,
             tool_name=tool_name,
+            roles=tuple(dict.fromkeys(EvidenceRole(role) for role in roles)),
             result=result.model_copy(deep=True),
             provenance=source,
         )
@@ -374,6 +383,26 @@ class RunEvidenceState(BaseModel):
             after=self._state_epochs[scope],
             changed=changed,
             fact=latest_fact,
+        )
+
+    def ingest_unpersisted_result(
+        self,
+        scope: StateScope,
+        tool_name: str,
+        result: UnpersistedToolResult,
+        provenance: str,
+        *,
+        roles: Iterable[EvidenceRole] = (),
+    ) -> StateEpochDelta:
+        """Record bounded evidence from a result-construction persistence failure."""
+        if not isinstance(result, UnpersistedToolResult):
+            raise TypeError("unpersisted evidence requires UnpersistedToolResult")
+        return self.ingest_tool_result(
+            scope,
+            tool_name,
+            result,
+            provenance,
+            roles=roles,
         )
 
     def state_vector(self, scopes: Iterable[StateScope]) -> dict[str, int]:

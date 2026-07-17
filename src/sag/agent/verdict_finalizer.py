@@ -15,7 +15,7 @@ from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
 from sag.verdict import rescue_blocked_build, run_verdict
 
-from .evidence_state import RunEvidenceState, StateScope, ToolObservation
+from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
 from .output_storage import atomic_write_container_text
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
@@ -62,6 +62,7 @@ class SnapshotTestCounts(BaseModel):
 class SnapshotTestStats(SnapshotTestCounts):
     discovered: int | None = None
     raw: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
+    judgment: Literal["success", "failed", "unknown"] = "unknown"
 
     @property
     def pass_rate(self) -> float:
@@ -167,7 +168,7 @@ def _fold_build_evidence(state: RunEvidenceState) -> BuildEvidenceSnapshot:
     observations = [
         observation
         for observation in state.tool_observations
-        if observation.scope is StateScope.ARTIFACTS
+        if EvidenceRole.BUILD in observation.roles
         and observation.result.invocation_status.value != "pending"
     ]
     if not observations:
@@ -243,11 +244,15 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
     return stats, distinct_failures, errors
 
 
-def _fold_test_stats(state: RunEvidenceState) -> tuple[SnapshotTestStats, tuple[str, ...]]:
+def _fold_test_stats(
+    state: RunEvidenceState,
+    *,
+    test_pass_threshold: float,
+) -> tuple[SnapshotTestStats, tuple[str, ...]]:
     observations = [
         observation
         for observation in state.tool_observations
-        if observation.scope is StateScope.TEST_RUNTIME
+        if EvidenceRole.TEST in observation.roles
     ]
     snapshots = [
         item for observation in observations if (item := _coerce_result_stats(observation))
@@ -301,6 +306,13 @@ def _fold_test_stats(state: RunEvidenceState) -> tuple[SnapshotTestStats, tuple[
         skipped=sum(stats.skipped for stats, _, _ in snapshots),
     )
     conflicts = ("test_stats_basis_incomparable",) if len(frontier) > 1 else ()
+    judgment = "unknown"
+    if unique.executed > 0:
+        judgment = evaluate_run_verdict(
+            True,
+            round((unique.passed / unique.executed) * 100.0, 1),
+            test_pass_threshold=test_pass_threshold,
+        )
     return (
         SnapshotTestStats(
             discovered=unique.discovered,
@@ -310,6 +322,7 @@ def _fold_test_stats(state: RunEvidenceState) -> tuple[SnapshotTestStats, tuple[
             errors=unique_errors,
             skipped=unique.skipped,
             raw=raw,
+            judgment=judgment,
         ),
         conflicts,
     )
@@ -319,8 +332,6 @@ def _snapshot_verdict(
     build: BuildEvidenceSnapshot,
     tests: SnapshotTestStats,
     conflicts: tuple[str, ...],
-    *,
-    test_pass_threshold: float,
 ) -> str:
     if not build.observed or build.outcome is OperationOutcome.UNKNOWN:
         return "unknown"
@@ -335,12 +346,10 @@ def _snapshot_verdict(
 
     if not build.green:
         physical_verdict = "failed"
-    elif tests.executed > 0:
-        physical_verdict = evaluate_run_verdict(
-            True,
-            tests.pass_rate,
-            test_pass_threshold=test_pass_threshold,
-        )
+    elif tests.judgment == "success":
+        physical_verdict = "success"
+    elif tests.judgment == "failed":
+        physical_verdict = "failed"
     else:
         physical_verdict = "partial"
     return run_verdict(build_judge, physical_verdict, conflicts)
@@ -394,7 +403,10 @@ class VerdictFinalizer:
             return cached
 
         build = _fold_build_evidence(state)
-        tests, test_conflicts = _fold_test_stats(state)
+        tests, test_conflicts = _fold_test_stats(
+            state,
+            test_pass_threshold=self.test_pass_threshold,
+        )
         conflicts = _dedupe([*state.conflicts, *test_conflicts])
         input_refs = _dedupe(
             [
@@ -414,7 +426,6 @@ class VerdictFinalizer:
                 build,
                 tests,
                 conflicts,
-                test_pass_threshold=self.test_pass_threshold,
             ),
             build_evidence=build,
             test_stats=tests,

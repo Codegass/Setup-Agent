@@ -412,12 +412,8 @@ class ReportTool(BaseTool, UIEventEmitter):
                     snapshot_phases = report_snapshot.get("phases") or {}
                     ui_total_tests = int(snapshot_status.get("tests_total") or 0)
                     ui_passed_tests = int(snapshot_status.get("tests_passed") or 0)
-                    ui_failed_tests = int(snapshot_status.get("tests_failed") or 0)
-                    ui_error_tests = int(snapshot_status.get("tests_errors") or 0)
                     ui_build_success = snapshot_phases.get("build") is True
-                    ui_test_success = bool(
-                        ui_total_tests > 0 and ui_failed_tests == 0 and ui_error_tests == 0
-                    )
+                    ui_test_success = snapshot_status.get("test_judgment") == "success"
                     ui_test_pass_rate = float(snapshot_status.get("pass_pct") or 0)
                 else:
                     test_analysis = actual_accomplishments.get("physical_validation", {}).get(
@@ -1481,7 +1477,11 @@ class ReportTool(BaseTool, UIEventEmitter):
             "modules_expected": None,
             "modules_seen": None,
             "skipped_modules": [],
-            "tests_ok": None,
+            "test_judgment": tests.judgment,
+            "tests_ok": {
+                "success": True,
+                "failed": False,
+            }.get(tests.judgment),
         }
         evidence_refs = list(dict.fromkeys([*snapshot.input_refs, *snapshot.build_evidence.refs]))
         evidence_result = {
@@ -1510,7 +1510,10 @@ class ReportTool(BaseTool, UIEventEmitter):
             "phases": {
                 "clone": completed_successfully("provision", "clone"),
                 "build": snapshot.build_evidence.green,
-                "test": completed_successfully("test"),
+                "test": {
+                    "success": True,
+                    "failed": False,
+                }.get(tests.judgment),
             },
             "report_path": f"/workspace/{report_filename}",
             "physical_evidence": {

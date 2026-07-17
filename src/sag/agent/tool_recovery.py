@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Set
 from loguru import logger as default_logger
 
 from sag.agent.tool_orchestration import RecoveryDecision
-from sag.tools.base import BaseTool, ToolResult
+from sag.tools.base import ActualToolExecution, BaseTool, ToolResult
 from sag.tools.build.backends import GradleBackend, MavenBackend
 
 
@@ -369,17 +369,18 @@ class ToolRecoveryHandler:
             self.logger.warning("System tool not available for Java installation")
             return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
-        verify_result = system_tool.safe_execute(
-            action="verify_java", java_version=required_version
-        )
+        verify_params = {"action": "verify_java", "java_version": required_version}
+        verify_result = system_tool.safe_execute(**verify_params)
+        actual_executions = [ActualToolExecution("system", verify_params, verify_result)]
         if verify_result.succeeded:
             result = maven_tool.safe_execute(**params)
+            actual_executions.append(ActualToolExecution("maven", dict(params), result))
             return self._attempted(
                 strategy="maven_java_version",
                 message=(
                     f"Java {required_version} was already installed, " "retried Maven command"
                 ),
-                result=result,
+                result=result.with_execution_trace(actual_executions),
                 recovery_params=params,
             )
 
@@ -388,20 +389,22 @@ class ToolRecoveryHandler:
             "java_version": required_version,
         }
         install_result = system_tool.safe_execute(**install_params)
+        actual_executions.append(ActualToolExecution("system", install_params, install_result))
 
         if install_result.succeeded:
             result = maven_tool.safe_execute(**params)
+            actual_executions.append(ActualToolExecution("maven", dict(params), result))
             return self._attempted(
                 strategy="maven_java_version",
                 message=(f"Recovered by installing Java {required_version} and retrying"),
-                result=result,
+                result=result.with_execution_trace(actual_executions),
                 recovery_params=params,
             )
 
         return self._attempted(
             strategy="maven_java_version",
             message=f"Attempted to install Java {required_version} but failed",
-            result=install_result,
+            result=install_result.with_execution_trace(actual_executions),
             recovery_params=params,
             metadata={"repair_params": install_params},
         )

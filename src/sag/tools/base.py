@@ -1,5 +1,7 @@
 """Base classes for agent tools."""
 
+from __future__ import annotations
+
 import hashlib
 import inspect
 import re
@@ -8,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Dict, Iterator, List, Optional, Union, get_args, get_origin
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Union, get_args, get_origin
 
 from loguru import logger
 from pydantic import (
@@ -85,6 +87,34 @@ class ToolError(Exception):
 
 class OutputPersistenceError(RuntimeError):
     """Raised when neither primary nor emergency output persistence is durable."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        draft: UnpersistedToolResult | None = None,
+        tool_name: str | None = None,
+        params: Dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.draft = draft
+        self.tool_name = tool_name
+        self.params = dict(params) if params is not None else None
+
+    def attach_draft(self, draft: UnpersistedToolResult) -> OutputPersistenceError:
+        if self.draft is None:
+            self.draft = draft
+        return self
+
+    def attach_invocation(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+    ) -> OutputPersistenceError:
+        if self.tool_name is None:
+            self.tool_name = tool_name
+            self.params = dict(params)
+        return self
 
 
 LEGAL_RESULT_STATES = {
@@ -284,11 +314,116 @@ def _stable_failure_signature_source(source: str) -> str:
     return " ".join(normalized.split())
 
 
+@dataclass(frozen=True, slots=True)
+class ActualToolExecution:
+    """One real tool invocation hidden behind a facade or recovery result."""
+
+    tool_name: str
+    params: Dict[str, Any]
+    result: ToolResult
+
+
+def _bounded_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
+    if depth >= 4:
+        return str(value)[:500]
+    if isinstance(value, str):
+        return value[:1000]
+    if isinstance(value, bytes):
+        return value[:1000].decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {
+            str(key)[:100]: _bounded_diagnostic_value(item, depth=depth + 1)
+            for key, item in list(value.items())[:50]
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_bounded_diagnostic_value(item, depth=depth + 1) for item in list(value)[:50]]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return str(value)[:500]
+
+
+def _bounded_strings(values: Any) -> List[str]:
+    return [str(value)[:500] for value in list(values or [])[:50]]
+
+
+class UnpersistedToolResult(BaseModel):
+    """Bounded evidence from a real execution whose full output was not durable."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    invocation_status: InvocationStatus
+    operation_outcome: OperationOutcome
+    evidence_status: EvidenceStatus
+    poll_ref: Optional[str] = None
+    failure_signature: Optional[str] = None
+    error_tail_preview: Optional[str] = None
+    output_ref: None = None
+    evidence_assessment: EvidenceAssessment = EvidenceAssessment.UNKNOWN
+    error: Optional[str] = None
+    error_code: Optional[str] = None
+    suggestions: List[str] = Field(default_factory=list)
+    documentation_links: List[str] = Field(default_factory=list)
+    raw_data: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: List[str] = Field(default_factory=list)
+    conflicts: List[str] = Field(default_factory=list)
+    validator_findings: List[EvidenceFinding] = Field(default_factory=list)
+    test_stats: Optional[TestStats] = None
+    facts: Dict[str, Any] = Field(default_factory=dict)
+    refs: List[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_failed_construction(
+        cls,
+        *,
+        invocation_status: InvocationStatus,
+        operation_outcome: OperationOutcome,
+        evidence_status: EvidenceStatus | str,
+        payload: Dict[str, Any],
+    ) -> UnpersistedToolResult:
+        return cls(
+            invocation_status=invocation_status,
+            operation_outcome=operation_outcome,
+            evidence_status=EvidenceStatus(evidence_status),
+            poll_ref=payload.get("poll_ref"),
+            failure_signature=payload.get("failure_signature"),
+            error_tail_preview=payload.get("error_tail_preview"),
+            evidence_assessment=payload.get("evidence_assessment", EvidenceAssessment.UNKNOWN),
+            error=str(payload["error"])[:1000] if payload.get("error") is not None else None,
+            error_code=(
+                str(payload["error_code"])[:200] if payload.get("error_code") is not None else None
+            ),
+            suggestions=_bounded_strings(payload.get("suggestions")),
+            documentation_links=_bounded_strings(payload.get("documentation_links")),
+            raw_data=(
+                _bounded_diagnostic_value(payload.get("raw_data"))
+                if payload.get("raw_data") is not None
+                else None
+            ),
+            metadata=_bounded_diagnostic_value(payload.get("metadata") or {}),
+            evidence_refs=_bounded_strings(payload.get("evidence_refs")),
+            conflicts=_bounded_strings(payload.get("conflicts")),
+            validator_findings=list(payload.get("validator_findings") or [])[:50],
+            test_stats=payload.get("test_stats"),
+            facts=_bounded_diagnostic_value(payload.get("facts") or {}),
+            refs=_bounded_strings(payload.get("refs")),
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.invocation_status is not InvocationStatus.PENDING
+
+    @property
+    def succeeded(self) -> bool:
+        return False
+
+
 class ToolResult(BaseModel):
     """Canonical, orthogonal tool execution result."""
 
     model_config = ConfigDict(validate_assignment=True, extra="forbid")
     _output_ref_verified: bool = PrivateAttr(default=False)
+    _execution_trace: tuple[ActualToolExecution, ...] = PrivateAttr(default=())
 
     invocation_status: InvocationStatus
     operation_outcome: OperationOutcome
@@ -417,14 +552,25 @@ class ToolResult(BaseModel):
                     None,
                 )
             if not output_ref:
-                output_ref = _store_bound_output(
-                    source,
-                    metadata={
-                        "operation_outcome": outcome.value,
-                        "error_code": payload.get("error_code"),
-                        "failure_signature": payload.get("failure_signature"),
-                    },
-                )
+                try:
+                    output_ref = _store_bound_output(
+                        source,
+                        metadata={
+                            "operation_outcome": outcome.value,
+                            "error_code": payload.get("error_code"),
+                            "failure_signature": payload.get("failure_signature"),
+                        },
+                    )
+                except OutputPersistenceError as exc:
+                    exc.attach_draft(
+                        UnpersistedToolResult.from_failed_construction(
+                            invocation_status=invocation_status,
+                            operation_outcome=outcome,
+                            evidence_status=evidence_status,
+                            payload=payload,
+                        )
+                    )
+                    raise
             if outcome is OperationOutcome.FAILED and not output_ref:
                 raise ValueError(
                     "canonical failed results require durable output storage before construction"
@@ -499,6 +645,18 @@ class ToolResult(BaseModel):
             self.invocation_status is InvocationStatus.COMPLETED
             and self.operation_outcome is OperationOutcome.SUCCESS
         )
+
+    @property
+    def execution_trace(self) -> tuple[ActualToolExecution, ...]:
+        return self._execution_trace
+
+    def with_execution_trace(
+        self,
+        executions: Iterable[ActualToolExecution],
+    ) -> ToolResult:
+        traced = self.model_copy(deep=True)
+        traced._execution_trace = tuple(executions)
+        return traced
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in READ_ONLY_RESULT_FIELDS:
@@ -874,8 +1032,8 @@ class BaseTool(ABC):
             self._log_execution(kwargs, result)
             return result
 
-        except OutputPersistenceError:
-            raise
+        except OutputPersistenceError as exc:
+            raise exc.attach_invocation(self.name, kwargs)
 
         except ToolError as e:
             # Handle tool errors using to_result() method

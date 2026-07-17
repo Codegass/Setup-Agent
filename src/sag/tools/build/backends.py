@@ -7,7 +7,7 @@ later ecosystems (python/node) add a module here, never a schema change.
 
 from typing import Any, Dict, Optional
 
-from sag.tools.base import ToolResult
+from sag.tools.base import ActualToolExecution, OutputPersistenceError, ToolResult
 
 # Marker files probed (in priority order) to select a backend.
 # python comes AFTER maven/gradle on purpose: a JVM repo with a stray
@@ -15,8 +15,13 @@ from sag.tools.base import ToolResult
 # probe order in BuildTool._detect_system.
 BUILD_MARKERS = {
     "maven": ("pom.xml",),
-    "gradle": ("build.gradle", "build.gradle.kts", "settings.gradle",
-               "settings.gradle.kts", "gradlew"),
+    "gradle": (
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+    ),
     "python": ("pyproject.toml", "setup.py", "requirements.txt", "Pipfile"),
 }
 
@@ -37,8 +42,9 @@ class MavenBackend:
     def __init__(self, maven_tool):
         self.maven_tool = maven_tool
 
-    def run(self, verb: str, args: Optional[str], working_directory: str,
-            timeout: Optional[int]) -> ToolResult:
+    def execute(
+        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+    ) -> ActualToolExecution:
         kwargs: Dict[str, Any] = {
             "command": self.VERBS[verb],
             "working_directory": working_directory,
@@ -59,7 +65,16 @@ class MavenBackend:
             kwargs["extra_args"] = args
         if timeout:
             kwargs["timeout"] = timeout
-        return self.maven_tool.execute(**kwargs)
+        try:
+            result = self.maven_tool.execute(**kwargs)
+        except OutputPersistenceError as exc:
+            raise exc.attach_invocation("maven", kwargs)
+        return ActualToolExecution("maven", kwargs, result)
+
+    def run(
+        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+    ) -> ToolResult:
+        return self.execute(verb, args, working_directory, timeout).result
 
 
 class PythonBackend:
@@ -77,8 +92,9 @@ class PythonBackend:
     def __init__(self, python_tool):
         self.python_tool = python_tool
 
-    def run(self, verb: str, args: Optional[str], working_directory: str,
-            timeout: Optional[int]) -> ToolResult:
+    def execute(
+        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+    ) -> ActualToolExecution:
         kwargs: Dict[str, Any] = {
             "operation": self.VERBS[verb],
             "working_directory": working_directory,
@@ -87,7 +103,16 @@ class PythonBackend:
             kwargs["args"] = args
         if timeout:
             kwargs["timeout"] = timeout
-        return self.python_tool.execute(**kwargs)
+        try:
+            result = self.python_tool.execute(**kwargs)
+        except OutputPersistenceError as exc:
+            raise exc.attach_invocation("python", kwargs)
+        return ActualToolExecution("python", kwargs, result)
+
+    def run(
+        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+    ) -> ToolResult:
+        return self.execute(verb, args, working_directory, timeout).result
 
 
 class GradleBackend:
@@ -131,13 +156,10 @@ class GradleBackend:
                 return "publishToMavenLocal"
         return "assemble"
 
-    def run(self, verb: str, args: Optional[str], working_directory: str,
-            timeout: Optional[int]) -> ToolResult:
-        task = (
-            self._install_task(working_directory)
-            if verb == "install"
-            else self.VERBS[verb]
-        )
+    def execute(
+        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+    ) -> ActualToolExecution:
+        task = self._install_task(working_directory) if verb == "install" else self.VERBS[verb]
         kwargs: Dict[str, Any] = {
             "tasks": task,
             "working_directory": working_directory,
@@ -154,4 +176,13 @@ class GradleBackend:
             kwargs["gradle_args"] = args
         if timeout:
             kwargs["timeout"] = timeout
-        return self.gradle_tool.execute(**kwargs)
+        try:
+            result = self.gradle_tool.execute(**kwargs)
+        except OutputPersistenceError as exc:
+            raise exc.attach_invocation("gradle", kwargs)
+        return ActualToolExecution("gradle", kwargs, result)
+
+    def run(
+        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+    ) -> ToolResult:
+        return self.execute(verb, args, working_directory, timeout).result

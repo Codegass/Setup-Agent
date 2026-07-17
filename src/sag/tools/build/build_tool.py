@@ -149,7 +149,8 @@ class BuildTool(BaseTool):
                     "unresolved; tests outside this module will not run"
                 )
 
-        inner = backend.run(verb, args, working_directory, timeout)
+        actual_executions = [backend.execute(verb, args, working_directory, timeout)]
+        inner = actual_executions[-1].result
 
         # Bounded retry (spec §1c): a version-shaped failure means the JDK in
         # the error text is authoritative (static analysis cannot always see
@@ -168,9 +169,18 @@ class BuildTool(BaseTool):
                         "re-provisioned, retry 1/1"
                     )
                     jdk_retry_meta = {"from": active, "to": needed}
-                    inner = backend.run(verb, args, working_directory, timeout)
+                    actual_executions.append(
+                        backend.execute(verb, args, working_directory, timeout)
+                    )
+                    inner = actual_executions[-1].result
 
-        return self._envelope(inner, system, verb, preamble_lines, jdk_retry_meta)
+        return self._envelope(
+            inner,
+            system,
+            verb,
+            preamble_lines,
+            jdk_retry_meta,
+        ).with_execution_trace(actual_executions)
 
     def _detect_system(self, working_directory: str):
         checked = []

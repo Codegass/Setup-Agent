@@ -4,7 +4,7 @@ from test_verdict_finalizer import FakeVerdictOrchestrator
 
 import sag.agent.react_engine as react_engine_module
 import sag.tools.base as tool_base_module
-from sag.agent.evidence_state import RunEvidenceState
+from sag.agent.evidence_state import EvidenceRole, RunEvidenceState
 from sag.agent.phase_machine import PhaseMachine, PhaseTermination
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import ReActStep, StepType
@@ -194,7 +194,12 @@ def test_construction_persistence_failure_is_audited_before_setup_abort():
     assert attempt.action == "build:compile"
     assert attempt.outcome is OperationOutcome.FAILED
     assert attempt.evidence_refs == []
-    assert engine.run_evidence_state.tool_observations == ()
+    assert len(engine.run_evidence_state.tool_observations) == 1
+    observation = engine.run_evidence_state.tool_observations[0]
+    assert observation.tool_name == "build"
+    assert observation.roles == (EvidenceRole.BUILD,)
+    assert observation.result.operation_outcome is OperationOutcome.FAILED
+    assert observation.result.output_ref is None
     assert engine.run_evidence_state.conflicts == ("output_storage_failed",)
     assert engine.run_evidence_state.sealed is True
     assert engine.run_evidence_state.close_reason == "aborted"

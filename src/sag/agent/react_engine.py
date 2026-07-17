@@ -17,6 +17,7 @@ from sag.tools.base import (
     BaseTool,
     OutputPersistenceError,
     ToolResult,
+    UnpersistedToolResult,
     is_output_storage_ref,
 )
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
@@ -24,7 +25,7 @@ from sag.ui.events import EventType, UIEvent, UIEventEmitter
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
-from .evidence_state import RunEvidenceState, StateScope
+from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_machine import PHASE_NAMES, PhaseMachine
 from .physical_validator import PhysicalValidator
@@ -512,12 +513,13 @@ class ReActEngine(UIEventEmitter):
     # ------------------------------------------------------------------
 
     _NON_EVIDENCE_TOOLS = frozenset({"phase", "manage_context", "report"})
+    _BUILD_EVIDENCE_TOOLS = frozenset({"build", "maven", "gradle", "python"})
 
     @staticmethod
     def _backend_operation_tokens(params: Dict[str, Any]) -> List[str]:
         values = [
             params[key]
-            for key in ("command", "tasks", "task")
+            for key in ("command", "tasks", "task", "operation")
             if params.get(key) not in (None, "", [])
         ]
         if not values:
@@ -564,7 +566,15 @@ class ReActEngine(UIEventEmitter):
             "dependencyinsight",
             "resolve",
             "install_dependencies",
+            "setup_env",
         }
+
+    def _tool_evidence_action(self, params: Dict[str, Any]) -> str:
+        action = str((params or {}).get("action") or "").strip().lower()
+        if action:
+            return action
+        operations = self._backend_operation_tokens(params or {})
+        return " ".join(operations).lower() or "execute"
 
     def _tool_evidence_scope(self, tool_name: str, params: Dict[str, Any]) -> StateScope:
         action = str((params or {}).get("action") or "").strip().lower()
@@ -588,6 +598,33 @@ class ReActEngine(UIEventEmitter):
             "test": StateScope.TEST_RUNTIME,
         }.get(phase, StateScope.PROJECT_ANALYSIS)
 
+    def _tool_evidence_roles(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        result: ToolResult | UnpersistedToolResult,
+    ) -> tuple[EvidenceRole, ...]:
+        roles: list[EvidenceRole] = []
+        if tool_name in self._BUILD_EVIDENCE_TOOLS:
+            operations = [
+                operation
+                for operation in self._backend_operation_tokens(params or {})
+                if not operation.startswith("-")
+            ]
+            test_only = bool(operations) and all(
+                self._is_test_operation(operation)
+                and operation.rsplit(":", 1)[-1].lower() not in {"verify", "check"}
+                for operation in operations
+            )
+            dependency_only = bool(operations) and all(
+                self._is_dependency_operation(operation) for operation in operations
+            )
+            if not test_only and not dependency_only:
+                roles.append(EvidenceRole.BUILD)
+        if result.test_stats is not None:
+            roles.append(EvidenceRole.TEST)
+        return tuple(roles)
+
     def _record_tool_execution(
         self,
         tool_name: str,
@@ -610,7 +647,8 @@ class ReActEngine(UIEventEmitter):
             return result
 
         scope = self._tool_evidence_scope(tool_name, params)
-        action = str((params or {}).get("action") or "execute").strip().lower()
+        roles = self._tool_evidence_roles(tool_name, params, result)
+        action = self._tool_evidence_action(params)
         if not attempted_execution:
             state.record_attempt(
                 action=f"{tool_name}:{action}",
@@ -652,6 +690,7 @@ class ReActEngine(UIEventEmitter):
                 tool_name,
                 result,
                 provenance=f"tool:{tool_name}:{action}:output-persistence-failed",
+                roles=roles,
             )
             state.record_conflict("output_storage_failed")
             raise
@@ -668,6 +707,7 @@ class ReActEngine(UIEventEmitter):
             tool_name,
             durable,
             provenance=durable.output_ref,
+            roles=roles,
         )
         return durable
 
@@ -1787,15 +1827,32 @@ class ReActEngine(UIEventEmitter):
                 and call.name not in self._NON_EVIDENCE_TOOLS
                 and call.name != "report"
             ):
-                params = call.validated_params or call.raw_params
-                scope = self._tool_evidence_scope(call.name, params)
-                action = str((params or {}).get("action") or "execute").strip().lower()
+                tool_name = exc.tool_name or call.name
+                params = exc.params or call.validated_params or call.raw_params
+                scope = self._tool_evidence_scope(tool_name, params)
+                action = self._tool_evidence_action(params)
                 state.record_attempt(
-                    action=f"{call.name}:{action}",
+                    action=f"{tool_name}:{action}",
                     relevant_scopes=[scope],
-                    outcome=OperationOutcome.FAILED,
-                    evidence_refs=[],
+                    outcome=(
+                        exc.draft.operation_outcome
+                        if exc.draft is not None
+                        else OperationOutcome.FAILED
+                    ),
+                    evidence_refs=(
+                        self._dedupe_strings([*exc.draft.evidence_refs, *exc.draft.refs])
+                        if exc.draft is not None
+                        else []
+                    ),
                 )
+                if exc.draft is not None:
+                    state.ingest_unpersisted_result(
+                        scope,
+                        tool_name,
+                        exc.draft,
+                        provenance=(f"tool:{tool_name}:{action}:output-persistence-failed"),
+                        roles=self._tool_evidence_roles(tool_name, params, exc.draft),
+                    )
                 state.record_conflict("output_storage_failed")
             raise
 
@@ -1882,13 +1939,17 @@ class ReActEngine(UIEventEmitter):
                     recorded_executions = []
                     for actual in execution.actual_executions:
                         recorded = self._record_tool_execution(
-                            call.name,
+                            actual.tool_name,
                             actual.params,
                             actual.result,
                             attempted_execution=True,
                         )
                         recorded_executions.append(
-                            ActualToolExecution(params=actual.params, result=recorded)
+                            ActualToolExecution(
+                                tool_name=actual.tool_name,
+                                params=actual.params,
+                                result=recorded,
+                            )
                         )
                         if actual.result is execution.result:
                             result = recorded
