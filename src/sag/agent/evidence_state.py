@@ -84,6 +84,7 @@ class ToolObservation(BaseModel):
     execution_id: str
     scope: StateScope
     tool_name: str
+    params: dict[str, Any] = Field(default_factory=dict)
     roles: tuple[EvidenceRole, ...] = ()
     result: ToolResult | UnpersistedToolResult
     provenance: str
@@ -351,12 +352,14 @@ class RunEvidenceState(BaseModel):
         *,
         roles: Iterable[EvidenceRole] = (),
         execution_id: str | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> StateEpochDelta:
         """Record a WS0 result and promote only its verified facts into epochs."""
         self._require_mutable()
         scope = StateScope(scope)
         execution_id = execution_id or new_execution_id()
         normalized_roles = tuple(dict.fromkeys(EvidenceRole(role) for role in roles))
+        normalized_params = copy.deepcopy(dict(params or {}))
         existing = next(
             (
                 observation
@@ -369,6 +372,7 @@ class RunEvidenceState(BaseModel):
             if (
                 existing.scope is not scope
                 or existing.tool_name != tool_name
+                or existing.params != normalized_params
                 or existing.roles != normalized_roles
                 or existing.result != result
             ):
@@ -393,6 +397,7 @@ class RunEvidenceState(BaseModel):
             execution_id=execution_id,
             scope=scope,
             tool_name=tool_name,
+            params=normalized_params,
             roles=normalized_roles,
             result=result.model_copy(deep=True),
             provenance=source,
@@ -427,6 +432,7 @@ class RunEvidenceState(BaseModel):
         *,
         roles: Iterable[EvidenceRole] = (),
         execution_id: str | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> StateEpochDelta:
         """Record bounded evidence from a result-construction persistence failure."""
         if not isinstance(result, UnpersistedToolResult):
@@ -438,6 +444,7 @@ class RunEvidenceState(BaseModel):
             provenance,
             roles=roles,
             execution_id=execution_id or result.execution_id,
+            params=params,
         )
 
     def state_vector(self, scopes: Iterable[StateScope]) -> dict[str, int]:

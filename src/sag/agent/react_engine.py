@@ -649,12 +649,20 @@ class ReActEngine(UIEventEmitter):
             return result
 
         execution_id = execution_id or new_execution_id()
-        if state.has_execution_id(execution_id):
-            return result
-
         scope = self._tool_evidence_scope(tool_name, params)
         roles = self._tool_evidence_roles(tool_name, params, result)
         action = self._tool_evidence_action(params)
+        if state.has_execution_id(execution_id):
+            state.ingest_tool_result(
+                scope,
+                tool_name,
+                result,
+                provenance=result.output_ref or f"tool:{tool_name}:{action}:replay",
+                roles=roles,
+                execution_id=execution_id,
+                params=params,
+            )
+            return result
         if not attempted_execution:
             state.record_attempt(
                 action=f"{tool_name}:{action}",
@@ -698,6 +706,7 @@ class ReActEngine(UIEventEmitter):
                 provenance=f"tool:{tool_name}:{action}:output-persistence-failed",
                 roles=roles,
                 execution_id=execution_id,
+                params=params,
             )
             state.record_conflict("output_storage_failed")
             raise
@@ -716,6 +725,7 @@ class ReActEngine(UIEventEmitter):
             provenance=durable.output_ref,
             roles=roles,
             execution_id=execution_id,
+            params=params,
         )
         return durable
 
@@ -1868,6 +1878,7 @@ class ReActEngine(UIEventEmitter):
                         provenance=(f"tool:{tool_name}:{action}:output-persistence-failed"),
                         roles=self._tool_evidence_roles(tool_name, params, exc.draft),
                         execution_id=exc.execution_id or exc.draft.execution_id,
+                        params=params,
                     )
                 state.record_conflict("output_storage_failed")
             raise

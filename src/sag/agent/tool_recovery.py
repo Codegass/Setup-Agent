@@ -211,6 +211,8 @@ class ToolRecoveryHandler:
                             result=result,
                             recovery_params=params,
                         )
+            except OutputPersistenceError:
+                raise
             except Exception as exc:
                 self.logger.warning(f"Context recovery failed: {exc}")
 
@@ -229,6 +231,8 @@ class ToolRecoveryHandler:
                             result=result,
                             recovery_params=recovery_params,
                         )
+            except OutputPersistenceError:
+                raise
             except Exception as exc:
                 self.logger.warning(f"Task ID recovery failed: {exc}")
 
@@ -467,6 +471,8 @@ class ToolRecoveryHandler:
                     result=result,
                     recovery_params=recovery_params,
                 )
+        except OutputPersistenceError:
+            raise
         except Exception as exc:
             self.logger.warning(f"Automatic pom.xml discovery failed during Maven recovery: {exc}")
 

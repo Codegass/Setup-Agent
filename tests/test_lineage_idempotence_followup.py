@@ -1,5 +1,6 @@
 import ast
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -32,9 +33,7 @@ from sag.tools.base import (
     canonical_full_output_source,
 )
 
-PYTHON_312 = Path(
-    "/Users/chenhao/.local/share/uv/python/" "cpython-3.12-macos-aarch64-none/bin/python3.12"
-)
+PYTHON_312 = shutil.which("python3.12")
 DRAFT_CAP_BYTES = 32 * 1024
 
 
@@ -417,12 +416,13 @@ def test_tools_base_annotation_contract_compiles_on_uv_python_312(tmp_path):
         if isinstance(node, ast.ImportFrom) and node.module == "__future__"
     ]
     assert any(alias.name == "annotations" for node in future_imports for alias in node.names)
-    assert PYTHON_312.is_file()
+    if PYTHON_312 is None:
+        pytest.skip("python3.12 is not available on PATH")
 
     env = os.environ.copy()
     env["PYTHONPYCACHEPREFIX"] = str(tmp_path / "pycache")
     completed = subprocess.run(
-        [str(PYTHON_312), "-m", "py_compile", str(source_path)],
+        [PYTHON_312, "-m", "py_compile", str(source_path)],
         check=False,
         capture_output=True,
         text=True,

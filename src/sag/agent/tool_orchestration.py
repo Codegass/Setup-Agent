@@ -321,9 +321,9 @@ class ToolOrchestrator:
         *,
         include_untraced: bool = True,
         execution_id: str | None = None,
-        _seen_execution_ids: set[str] | None = None,
+        _seen_executions: dict[str, ActualToolExecution] | None = None,
     ) -> list[ActualToolExecution]:
-        seen = _seen_execution_ids if _seen_execution_ids is not None else set()
+        seen = _seen_executions if _seen_executions is not None else {}
         if not result.execution_trace:
             if not include_untraced:
                 return []
@@ -333,9 +333,12 @@ class ToolOrchestrator:
                 result=result,
                 execution_id=execution_id or new_execution_id(),
             )
-            if actual.execution_id in seen:
+            existing = seen.get(actual.execution_id)
+            if existing is not None:
+                if not existing.is_exact_replay_of(actual):
+                    raise ValueError(f"conflicting execution_id {actual.execution_id}")
                 return []
-            seen.add(actual.execution_id)
+            seen[actual.execution_id] = actual
             return [actual]
 
         flattened: list[ActualToolExecution] = []
@@ -346,7 +349,7 @@ class ToolOrchestrator:
                     actual.params,
                     actual.result,
                     execution_id=actual.execution_id,
-                    _seen_execution_ids=seen,
+                    _seen_executions=seen,
                 )
             )
         return flattened
@@ -714,8 +717,8 @@ class ToolOrchestrator:
                                 decision.replacement_tool_name or call.name,
                                 recovery_params,
                                 result,
-                                _seen_execution_ids={
-                                    actual.execution_id for actual in actual_executions
+                                _seen_executions={
+                                    actual.execution_id: actual for actual in actual_executions
                                 },
                             )
                         )

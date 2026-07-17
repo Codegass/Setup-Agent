@@ -141,6 +141,9 @@ class OutputPersistenceError(RuntimeError):
     ) -> OutputPersistenceError:
         merged = {actual.execution_id: actual for actual in self.actual_executions}
         for actual in executions:
+            existing = merged.get(actual.execution_id)
+            if existing is not None and not existing.is_exact_replay_of(actual):
+                raise ValueError(f"conflicting execution_id {actual.execution_id}")
             merged.setdefault(actual.execution_id, actual)
         self.actual_executions = tuple(merged.values())
         return self
@@ -352,10 +355,19 @@ class ActualToolExecution:
     result: ToolResult
     execution_id: str = field(default_factory=new_execution_id)
 
+    def is_exact_replay_of(self, other: ActualToolExecution) -> bool:
+        return bool(
+            self.execution_id == other.execution_id
+            and self.tool_name == other.tool_name
+            and self.params == other.params
+            and self.result == other.result
+        )
+
 
 UNPERSISTED_DRAFT_MAX_BYTES = 32 * 1024
 _UNPERSISTED_DRAFT_CHAR_BUDGET = 3500
 _UNPERSISTED_DRAFT_NODE_BUDGET = 96
+_UNPERSISTED_DRAFT_MAX_TEST_COUNT = (1 << 63) - 1
 
 
 @dataclass
@@ -490,6 +502,36 @@ class _DraftBudget:
         return bounded
 
 
+def _bounded_draft_test_stats(value: Any, budget: _DraftBudget) -> TestStats | None:
+    if value is None:
+        return None
+    try:
+        stats = value if isinstance(value, TestStats) else TestStats.model_validate(value)
+    except Exception:
+        budget.truncated = True
+        return None
+    counts = (
+        stats.discovered,
+        stats.executed,
+        stats.passed,
+        stats.failed,
+        stats.skipped,
+    )
+    if any(
+        count is not None and abs(count) > _UNPERSISTED_DRAFT_MAX_TEST_COUNT for count in counts
+    ):
+        budget.truncated = True
+        return None
+    return stats.model_copy(deep=True)
+
+
+def _serialized_draft_size(value: Any) -> int:
+    try:
+        return len(value.model_dump_json().encode("utf-8"))
+    except Exception:
+        return UNPERSISTED_DRAFT_MAX_BYTES + 1
+
+
 class UnpersistedToolResult(BaseModel):
     """Bounded evidence from a real execution whose full output was not durable."""
 
@@ -547,6 +589,7 @@ class UnpersistedToolResult(BaseModel):
         )
         suggestions = budget.strings(payload.get("suggestions"))
         documentation_links = budget.strings(payload.get("documentation_links"))
+        test_stats = _bounded_draft_test_stats(payload.get("test_stats"), budget)
         draft = cls(
             execution_id=execution_id,
             invocation_status=invocation_status,
@@ -565,19 +608,19 @@ class UnpersistedToolResult(BaseModel):
             evidence_refs=evidence_refs,
             conflicts=conflicts,
             validator_findings=validator_findings,
-            test_stats=payload.get("test_stats"),
+            test_stats=test_stats,
             facts=facts if isinstance(facts, dict) else {},
             refs=refs,
             truncated=budget.truncated,
         )
-        if len(draft.model_dump_json().encode("utf-8")) <= UNPERSISTED_DRAFT_MAX_BYTES:
+        if _serialized_draft_size(draft) <= UNPERSISTED_DRAFT_MAX_BYTES:
             return draft
 
         minimal_findings = [
             finding.model_copy(update={"refs": finding.refs[:1], "details": {}})
             for finding in draft.validator_findings[:1]
         ]
-        return cls(
+        fallback = cls(
             execution_id=draft.execution_id,
             invocation_status=draft.invocation_status,
             operation_outcome=draft.operation_outcome,
@@ -596,6 +639,20 @@ class UnpersistedToolResult(BaseModel):
             evidence_refs=draft.evidence_refs[:4],
             truncated=True,
         )
+        if _serialized_draft_size(fallback) <= UNPERSISTED_DRAFT_MAX_BYTES:
+            return fallback
+
+        last_resort = cls(
+            invocation_status=draft.invocation_status,
+            operation_outcome=draft.operation_outcome,
+            evidence_status=draft.evidence_status,
+            evidence_assessment=draft.evidence_assessment,
+            metadata={"draft_truncated": True},
+            truncated=True,
+        )
+        if _serialized_draft_size(last_resort) > UNPERSISTED_DRAFT_MAX_BYTES:
+            raise ValueError("minimal unpersisted draft exceeds serialized size limit")
+        return last_resort
 
     @property
     def is_terminal(self) -> bool:
