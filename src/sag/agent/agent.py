@@ -1030,37 +1030,37 @@ START by working toward the current phase objective shown in my context.
             "partial",
         }
 
-    def _close_open_setup_run(self, reason: str, *, cancelled: bool = False) -> None:
-        """Best-effort closure for setup failures outside the ReAct loop."""
-        try:
-            state = getattr(self, "run_evidence_state", None)
-            if state is None or state.sealed:
-                return
-            engine = getattr(self, "react_engine", None)
-            if engine is not None:
-                self.run_termination = (
-                    engine.cancel(reason=reason) if cancelled else engine.abort(reason=reason)
-                )
-                return
+    def _close_open_setup_run(
+        self, reason: str, *, cancelled: bool = False
+    ) -> RunTermination | None:
+        """Create typed closure for failures outside the active ReAct loop."""
+        state = getattr(self, "run_evidence_state", None)
+        if state is None:
+            return None
+        if getattr(self, "run_termination", None) is not None:
+            return self.run_termination
 
-            machine = getattr(self, "phase_machine", None)
-            finalizer = getattr(self, "verdict_finalizer", None)
-            if machine is None or finalizer is None:
-                return
-            record = machine.record_abort(reason, evidence=[])
-            state.record_phase_record(record)
-            finalizer.finalize(
-                state,
-                EvidenceCloseReason.CANCELLED if cancelled else EvidenceCloseReason.ABORTED,
+        engine = getattr(self, "react_engine", None)
+        if engine is not None:
+            self.run_termination = (
+                engine.cancel(reason=reason) if cancelled else engine.abort(reason=reason)
             )
-            self.run_termination = RunTermination(
-                termination=(
-                    RunTerminationStatus.CANCELLED if cancelled else RunTerminationStatus.ABORTED
-                ),
-                report_delivery_status=ReportDeliveryStatus.SKIPPED,
-            )
-        except Exception as exc:
-            logger.warning(f"Failed to close setup evidence after {reason}: {exc}")
+            return self.run_termination
+
+        finalizer = getattr(self, "verdict_finalizer", None)
+        if finalizer is None:
+            raise RuntimeError("pre-engine setup closure requires a verdict finalizer")
+        finalizer.finalize(
+            state,
+            EvidenceCloseReason.CANCELLED if cancelled else EvidenceCloseReason.ABORTED,
+        )
+        self.run_termination = RunTermination(
+            termination=(
+                RunTerminationStatus.CANCELLED if cancelled else RunTerminationStatus.ABORTED
+            ),
+            report_delivery_status=ReportDeliveryStatus.SKIPPED,
+        )
+        return self.run_termination
 
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
         """Combine physical validation and evidence conflicts through the kernel."""

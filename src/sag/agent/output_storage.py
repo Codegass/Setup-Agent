@@ -26,9 +26,13 @@ def attach_durable_output_ref(
     tool_name: str,
 ) -> ToolResult:
     """Return a detached result whose full output has durable provenance."""
-    if result.output_ref:
-        return result
     output = result.raw_output if result.raw_output is not None else result.output
+    if result.output_ref:
+        if storage.retrieve_output(result.output_ref) is not None:
+            return result
+        logger.warning(
+            f"Re-persisting inaccessible output reference {result.output_ref} for {tool_name}"
+        )
     ref = storage.store_output(
         task_id=task_id,
         tool_name=tool_name,
@@ -41,7 +45,9 @@ def attach_durable_output_ref(
     )
     if not is_output_storage_ref(ref):
         raise RuntimeError("failed to persist a durable tool output reference")
-    return ToolResult(**{**result.model_dump(), "output_ref": ref})
+    if storage.retrieve_output(ref) is None:
+        raise RuntimeError("tool output reference is not immediately retrievable")
+    return result.model_copy(deep=True, update={"output_ref": ref})
 
 
 def atomic_write_container_text(orchestrator, path: str, content: str) -> None:
@@ -157,7 +163,7 @@ class OutputStorageManager:
                         return json.load(f)
                 except Exception as e:
                     logger.warning(f"Failed to load output index: {e}")
-        return {}
+        return self._rebuild_index_from_storage()
 
     def _save_index(self):
         """Save the current index to disk."""
@@ -165,19 +171,77 @@ class OutputStorageManager:
             if self.orchestrator:
                 index_json = json.dumps(self.current_index, indent=2)
                 if not self._write_container_text(self.container_index_file, index_json):
-                    logger.error("Failed to save index to container")
+                    raise OSError("failed to save output index to container")
             else:
                 # Local filesystem fallback
                 with open(self.index_file, "w") as f:
                     json.dump(self.current_index, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save output index: {e}")
+        except Exception as exc:
+            raise OSError(f"failed to save output index: {exc}") from exc
 
     def _write_container_text(self, path: str, content: str, *, append: bool = False) -> bool:
         # Delegate to the shared writer: it keeps the fast single-command heredoc
         # for small content and streams large content as base64 chunks, so a big
         # payload never trips the kernel per-arg limit ("argument list too long").
         return write_container_text(self.orchestrator, path, content, append=append)
+
+    @staticmethod
+    def _index_entry(record: Dict[str, Any], line_number: int) -> Dict[str, Any]:
+        output = str(record.get("output") or "")
+        return {
+            "task_id": record.get("task_id"),
+            "tool_name": record.get("tool_name"),
+            "timestamp": record.get("timestamp"),
+            "output_length": record.get("output_length", len(output)),
+            "line_number": line_number,
+            "first_100_chars": output[:100],
+            "last_100_chars": output[-100:] if len(output) > 100 else output,
+            "metadata": record.get("metadata") or {},
+        }
+
+    def _read_storage_line(self, line_number: int) -> Optional[Dict[str, Any]]:
+        try:
+            if self.orchestrator:
+                result = self.orchestrator.execute_command(
+                    f"sed -n '{line_number}p' {self.container_storage_file}"
+                )
+                if result.get("exit_code") != 0 or not result.get("output"):
+                    return None
+                return json.loads(result["output"])
+
+            if not self.storage_file.exists():
+                return None
+            with open(self.storage_file, "r") as storage_file:
+                for current, line in enumerate(storage_file, 1):
+                    if current == line_number:
+                        return json.loads(line)
+        except Exception as exc:
+            logger.warning(f"Failed to read output storage line {line_number}: {exc}")
+        return None
+
+    def _rebuild_index_from_storage(self) -> Dict[str, Dict[str, Any]]:
+        """Recover searchable metadata from the append-only JSONL source of truth."""
+        rebuilt: Dict[str, Dict[str, Any]] = {}
+        for line_number in range(1, self._count_lines_in_file() + 1):
+            record = self._read_storage_line(line_number)
+            if not isinstance(record, dict):
+                continue
+            ref_id = record.get("ref_id")
+            if not is_output_storage_ref(ref_id):
+                continue
+            rebuilt[ref_id] = self._index_entry(record, line_number)
+        return rebuilt
+
+    def _index_may_be_stale(self) -> bool:
+        indexed_line = max(
+            (
+                int(info.get("line_number", 0) or 0)
+                for info in self.current_index.values()
+                if isinstance(info, dict)
+            ),
+            default=0,
+        )
+        return self._count_lines_in_file() > indexed_line
 
     def store_output(
         self,
@@ -267,7 +331,16 @@ class OutputStorageManager:
             "metadata": metadata or {},
         }
 
-        self._save_index()
+        try:
+            self._save_index()
+        except OSError as exc:
+            recovered = self._rebuild_index_from_storage()
+            if ref_id not in recovered:
+                raise OSError(
+                    f"output index persistence failed and JSONL recovery lost {ref_id}"
+                ) from exc
+            self.current_index = recovered
+            logger.warning(f"Output index write failed; using JSONL recovery: {exc}")
         logger.debug(f"Stored full output with ref_id: {ref_id} ({len(output)} chars)")
         return ref_id
 
@@ -315,8 +388,11 @@ class OutputStorageManager:
             self.current_index = self._load_index()
 
         if ref_id not in self.current_index:
-            logger.warning(f"Reference ID not found in index: {ref_id}")
-            return None
+            if self._index_may_be_stale():
+                self.current_index = self._rebuild_index_from_storage()
+            if ref_id not in self.current_index:
+                logger.warning(f"Reference ID not found in index or JSONL: {ref_id}")
+                return None
 
         index_info = self.current_index[ref_id]
         line_number = index_info.get("line_number", 0)
@@ -324,11 +400,8 @@ class OutputStorageManager:
         try:
             if self.orchestrator:
                 # Retrieve from container using container path
-                retrieve_cmd = f"sed -n '{line_number}p' {self.container_storage_file}"
-                retrieve_result = self.orchestrator.execute_command(retrieve_cmd)
-
-                if retrieve_result.get("exit_code") == 0 and retrieve_result.get("output"):
-                    record = json.loads(retrieve_result["output"])
+                record = self._read_storage_line(line_number)
+                if record and record.get("ref_id") == ref_id:
                     return record.get("output", "")
             else:
                 # Local filesystem fallback
@@ -345,6 +418,8 @@ class OutputStorageManager:
     def has_output_ref(self, ref_id: str) -> bool:
         """Check the durable index without loading the stored output body."""
         self.current_index = self._load_index()
+        if ref_id not in self.current_index and self._index_may_be_stale():
+            self.current_index = self._rebuild_index_from_storage()
         return ref_id in self.current_index
 
     def search_outputs(
@@ -373,6 +448,8 @@ class OutputStorageManager:
         # retrieve_output). Without this, search/list miss build outputs written by
         # the build tool's separate manager.
         self.current_index = self._load_index()
+        if self._index_may_be_stale():
+            self.current_index = self._rebuild_index_from_storage()
 
         # First, filter by index criteria
         candidates = []

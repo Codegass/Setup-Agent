@@ -532,13 +532,15 @@ class ReActEngine(UIEventEmitter):
         tool_name: str,
         params: Dict[str, Any],
         result: ToolResult,
+        *,
+        attempted_execution: bool = True,
     ) -> ToolResult:
         """Persist provenance and ingest one evidence-bearing execution once."""
         if tool_name == "report":
             self._report_attempted = True
-            if result.succeeded:
+            if attempted_execution and result.succeeded:
                 self._report_delivered = True
-            elif result.is_terminal:
+            elif result.is_terminal or not attempted_execution:
                 self._report_failed = True
             return result
 
@@ -546,23 +548,87 @@ class ReActEngine(UIEventEmitter):
         if state is None or state.sealed or tool_name in self._NON_EVIDENCE_TOOLS:
             return result
 
+        scope = self._tool_evidence_scope(tool_name, params)
+        action = str((params or {}).get("action") or "execute").strip().lower()
+        if not attempted_execution:
+            state.record_attempt(
+                action=f"{tool_name}:{action}",
+                relevant_scopes=[scope],
+                outcome=result.operation_outcome,
+                evidence_refs=self._dedupe_strings(
+                    [result.output_ref, *result.evidence_refs, *result.refs]
+                ),
+            )
+            return result
+
         task_id = str(
             getattr(self.context_manager, "current_task_id", None)
             or f"{tool_name}_{getattr(self, 'current_iteration', 0)}"
         )
-        durable = attach_durable_output_ref(
-            result,
-            self.output_storage,
-            task_id=task_id,
-            tool_name=tool_name,
+        try:
+            durable = attach_durable_output_ref(
+                result,
+                self.output_storage,
+                task_id=task_id,
+                tool_name=tool_name,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.error(f"Failed to persist full output for {tool_name}: {exc}")
+            durable = result.model_copy(
+                deep=True,
+                update={
+                    "output_ref": None,
+                    "conflicts": self._dedupe_strings([*result.conflicts, "output_storage_failed"]),
+                    "metadata": {
+                        **result.metadata,
+                        "output_storage_error": type(exc).__name__,
+                    },
+                },
+            )
+        state.record_attempt(
+            action=f"{tool_name}:{action}",
+            relevant_scopes=[scope],
+            outcome=durable.operation_outcome,
+            evidence_refs=self._dedupe_strings(
+                [durable.output_ref, *durable.evidence_refs, *durable.refs]
+            ),
         )
         state.ingest_tool_result(
-            self._tool_evidence_scope(tool_name, params),
+            scope,
             tool_name,
             durable,
             provenance=durable.output_ref,
         )
         return durable
+
+    def _report_execution_allowed(self) -> bool:
+        if getattr(self, "phase_machine", None) is None:
+            return True
+        state = getattr(self, "run_evidence_state", None)
+        finalizer = getattr(self, "verdict_finalizer", None)
+        return bool(
+            state is not None
+            and state.sealed
+            and finalizer is not None
+            and finalizer.has_current_snapshot(state)
+        )
+
+    @staticmethod
+    def _refused_report_execution(call: ToolCall) -> ToolExecution:
+        result = ToolResult.completed(
+            output="Report execution refused until evidence-close persistence completes.",
+            operation_outcome=OperationOutcome.SKIPPED,
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="skipped",
+            raw_params=call.raw_params,
+            validated_params=call.validated_params,
+            observation_text=format_tool_result(call.name, result),
+            attempted_execution=False,
+            metadata={"report_refused": "evidence_not_closed"},
+        )
 
     def _record_phase_audit(self, record) -> None:
         state = getattr(self, "run_evidence_state", None)
@@ -1650,11 +1716,15 @@ class ReActEngine(UIEventEmitter):
 
                 branch_task_id = getattr(self.context_manager, "current_task_id", None)
                 call = self._build_tool_call_from_step(step)
-                execution = self._get_tool_orchestrator().execute(call)
+                if call.name == "report" and not self._report_execution_allowed():
+                    execution = self._refused_report_execution(call)
+                else:
+                    execution = self._get_tool_orchestrator().execute(call)
                 result = self._record_tool_execution(
                     call.name,
                     call.validated_params or call.raw_params,
                     execution.result,
+                    attempted_execution=execution.attempted_execution,
                 )
                 if result is not execution.result:
                     execution.result = result

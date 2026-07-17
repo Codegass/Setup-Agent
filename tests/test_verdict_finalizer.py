@@ -53,6 +53,18 @@ class FakeVerdictOrchestrator:
         return {"success": True, "exit_code": 0, "output": ""}
 
 
+class FailingReplacementOrchestrator(FakeVerdictOrchestrator):
+    def __init__(self):
+        super().__init__()
+        self.fail_replacement = False
+
+    def execute_command(self, command):
+        if command.startswith("mv ") and self.fail_replacement:
+            self.commands.append(command)
+            return {"success": False, "exit_code": 1, "output": "replacement failed"}
+        return super().execute_command(command)
+
+
 def _record_machine_history(state: RunEvidenceState, machine: PhaseMachine) -> None:
     for record in machine.records:
         state.record_phase_record(record)
@@ -134,6 +146,24 @@ def test_conflicting_reason_is_rejected_before_read_write_or_state_change():
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
 
 
+def test_sealed_retry_never_accepts_or_caches_an_older_run_snapshot():
+    orchestrator = FailingReplacementOrchestrator()
+    old_state = RunEvidenceState(run_id="older-run")
+    old_snapshot = VerdictFinalizer(orchestrator).finalize(old_state, EvidenceCloseReason.ABORTED)
+    new_state = RunEvidenceState(run_id="current-run")
+    finalizer = VerdictFinalizer(orchestrator)
+    orchestrator.fail_replacement = True
+
+    with pytest.raises(OSError, match="atomically rename"):
+        finalizer.finalize(new_state, EvidenceCloseReason.ABORTED)
+    with pytest.raises(OSError, match="atomically rename"):
+        finalizer.finalize(new_state, EvidenceCloseReason.ABORTED)
+
+    assert new_state.sealed is True
+    assert read_verdict_snapshot(orchestrator).run_id == old_snapshot.run_id
+    assert id(new_state) not in finalizer._snapshots
+
+
 def test_snapshot_uses_unique_test_counts_and_keeps_raw_retries_secondary():
     snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
         _tvm_state(), EvidenceCloseReason.TEST_TERMINATED
@@ -146,6 +176,137 @@ def test_snapshot_uses_unique_test_counts_and_keeps_raw_retries_secondary():
     assert snapshot.test_stats.raw.executed == 984
     assert snapshot.test_stats.pass_rate == 100.0
     assert "pass_rate" not in snapshot.model_dump()["test_stats"]
+
+
+def test_narrow_passing_retry_cannot_replace_failed_full_suite_basis():
+    state = RunEvidenceState(run_id="session-targeted-retry")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="full suite failed",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=100,
+                executed=100,
+                passed=0,
+                failed=100,
+                skipped=0,
+            ),
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="targeted retry passed",
+            test_stats=TestStats(
+                discovered=1,
+                executed=1,
+                passed=1,
+                failed=0,
+                skipped=0,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.discovered == 100
+    assert snapshot.test_stats.executed == 100
+    assert snapshot.test_stats.passed == 0
+    assert snapshot.test_stats.failed == 100
+    assert snapshot.verdict == "failed"
+    assert snapshot.test_stats.raw.executed == 101
+
+
+def test_executed_count_preserves_broader_suite_when_it_exceeds_discovered():
+    state = RunEvidenceState(run_id="session-parameterized-drift")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="parameterized full suite failed",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=80,
+                executed=100,
+                passed=0,
+                failed=100,
+                skipped=0,
+            ),
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="smaller retry passed",
+            test_stats=TestStats(
+                discovered=90,
+                executed=90,
+                passed=90,
+                failed=0,
+                skipped=0,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.discovered == 80
+    assert snapshot.test_stats.executed == 100
+    assert snapshot.test_stats.failed == 100
+    assert snapshot.verdict == "failed"
+
+
+def test_untyped_test_count_facts_do_not_manufacture_primary_stats():
+    state = RunEvidenceState(run_id="session-untyped-counts")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "bash",
+        ToolResult.completed_success(
+            output="untyped parser summary",
+            facts={"executed": 1, "passed": 1, "failed": 0, "skipped": 0},
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.discovered is None
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.test_stats.raw.executed == 0
+    assert snapshot.verdict == "partial"
 
 
 def test_snapshot_separates_maven_failures_from_errors():

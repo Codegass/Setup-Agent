@@ -21,7 +21,7 @@ from sag.agent.verdict_finalizer import (
     read_verdict_snapshot,
 )
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
-from sag.tools.base import ToolResult
+from sag.tools.base import ToolResult, bind_tool_result_output_storage
 
 
 class _FailFirstAtomicWriteOrchestrator(FakeVerdictOrchestrator):
@@ -106,6 +106,26 @@ def _phase_step(signal="done", **metadata):
     )
 
 
+def _prepare_action_execution(engine):
+    engine.config = SimpleNamespace(verbose=False)
+    engine.current_iteration = 1
+    engine.token_tracker = SimpleNamespace(update_last_tool_name=lambda tool_name: None)
+    engine.emit = lambda *args, **kwargs: None
+    engine._add_observation_step = lambda observation: None
+    engine._apply_tool_execution_loop_effects = lambda execution: None
+
+
+def _action_step(tool_name, params, content=None):
+    return SimpleNamespace(
+        step_type=StepType.ACTION,
+        tool_name=tool_name,
+        tool_params=params,
+        tool_result=None,
+        content=content or tool_name,
+        model_used="test-model",
+    )
+
+
 def test_engine_ingests_result_once_with_full_output_ref(tmp_path):
     engine, _ = _engine(tmp_path, phase="build")
     original = ToolResult.completed_success(
@@ -142,36 +162,84 @@ def test_execute_steps_calls_the_single_ingestion_boundary_once(tmp_path):
     )
     orchestrator = SimpleNamespace(execute=lambda call: execution)
     engine._get_tool_orchestrator = lambda: orchestrator
-    engine.config = SimpleNamespace(verbose=False)
-    engine.current_iteration = 1
-    engine.token_tracker = SimpleNamespace(update_last_tool_name=lambda tool_name: None)
-    engine.emit = lambda *args, **kwargs: None
-    engine._add_observation_step = lambda observation: None
-    engine._apply_tool_execution_loop_effects = lambda execution: None
-    step = SimpleNamespace(
-        step_type=StepType.ACTION,
-        tool_name="build",
-        tool_params={"action": "compile"},
-        tool_result=None,
-        content="compile",
-        model_used="test-model",
-    )
+    _prepare_action_execution(engine)
+    step = _action_step("build", {"action": "compile"}, "compile")
 
     engine._execute_steps([step])
 
     assert len(engine.run_evidence_state.tool_observations) == 1
+    assert len(engine.run_evidence_state.action_attempts) == 1
     assert step.tool_result.output_ref.startswith("output_")
+
+
+def test_non_execution_is_audited_without_polluting_build_evidence(tmp_path):
+    engine, _ = _engine(tmp_path, phase="build")
+    _green_build(engine)
+    malformed = ToolResult.completed_failure(
+        output="",
+        error="missing required parameter",
+        error_code="PARAMETER_VALIDATION_FAILED",
+    )
+
+    engine._record_tool_execution(
+        "build",
+        {"action": "compile"},
+        malformed,
+        attempted_execution=False,
+    )
+    snapshot = engine.verdict_finalizer.finalize(
+        engine.run_evidence_state, EvidenceCloseReason.ABORTED
+    )
+
+    assert len(engine.run_evidence_state.action_attempts) == 2
+    assert len(engine.run_evidence_state.tool_observations) == 1
+    assert snapshot.build_evidence.green is True
+    assert snapshot.build_evidence.outcome is OperationOutcome.SUCCESS
+
+
+def test_output_append_failure_records_one_conflicted_execution(tmp_path):
+    class FailedStorage:
+        def store_output(self, **kwargs):
+            return ""
+
+        def retrieve_output(self, ref_id):
+            return None
+
+    engine, _ = _engine(tmp_path, phase="build")
+    engine.output_storage = FailedStorage()
+
+    recorded = engine._record_tool_execution(
+        "build",
+        {"action": "compile"},
+        ToolResult.completed_success(
+            output="compile complete",
+            facts={"build_success": True},
+        ),
+        attempted_execution=True,
+    )
+    snapshot = engine.verdict_finalizer.finalize(
+        engine.run_evidence_state, EvidenceCloseReason.ABORTED
+    )
+
+    assert recorded.output_ref is None
+    assert "output_storage_failed" in recorded.conflicts
+    assert len(engine.run_evidence_state.action_attempts) == 1
+    assert engine.run_evidence_state.action_attempts[0].evidence_refs == []
+    assert len(engine.run_evidence_state.tool_observations) == 1
+    assert snapshot.verdict != "success"
+    assert "output_storage_failed" in snapshot.conflicts
 
 
 def test_failed_result_keeps_ws0_failure_identity_and_is_not_rehashed(tmp_path):
     engine, _ = _engine(tmp_path, phase="build")
-    failed = ToolResult.completed_failure(
-        output="[ERROR] compilation failed",
-        error="compile failed",
-        error_code="MAVEN_BUILD_FAILED",
-        failure_signature="MAVEN_BUILD_FAILED:canonical",
-        error_tail_preview="[ERROR] compilation failed",
-    )
+    with bind_tool_result_output_storage(engine.output_storage, task_id="build", tool_name="build"):
+        failed = ToolResult.completed_failure(
+            output="[ERROR] compilation failed",
+            error="compile failed",
+            error_code="MAVEN_BUILD_FAILED",
+            failure_signature="MAVEN_BUILD_FAILED:canonical",
+            error_tail_preview="[ERROR] compilation failed",
+        )
 
     recorded = engine._record_tool_execution("build", {"action": "compile"}, failed)
 
@@ -252,6 +320,63 @@ def test_floor_driven_test_completion_finalizes_before_report_intro(tmp_path):
     assert engine.phase_machine.current_phase == "report"
     assert report_intro_observations == [True]
     assert engine.run_evidence_state.close_reason == EvidenceCloseReason.TEST_TERMINATED.value
+
+
+def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tmp_path):
+    engine, orchestrator = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    _green_tests(engine)
+    _prepare_action_execution(engine)
+    report_calls = []
+
+    def execute(call):
+        if call.name == "phase":
+            result = ToolResult.completed_success(
+                output="test phase complete",
+                metadata={
+                    "phase_signal": "done",
+                    "key_results": "tests terminal",
+                    "evidence": [],
+                },
+            )
+            return ToolExecution(
+                call=call,
+                result=result,
+                status="success",
+                raw_params=call.raw_params,
+                validated_params=call.raw_params,
+                observation_text=result.output,
+                attempted_execution=True,
+            )
+        report_calls.append(call)
+        result = ToolResult.completed_success(output="report rendered")
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="success",
+            raw_params=call.raw_params,
+            validated_params=call.raw_params,
+            observation_text=result.output,
+            attempted_execution=True,
+        )
+
+    engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=execute)
+    phase_step = _action_step("phase", {"action": "done"})
+    early_report = _action_step("report", {"action": "generate"})
+
+    engine._execute_steps([phase_step, early_report])
+
+    assert report_calls == []
+    assert engine._report_delivered is False
+    engine._handle_phase_signals([phase_step, early_report])
+    assert engine.run_evidence_state.sealed is True
+    assert orchestrator.files[VERDICT_PATH]
+
+    later_report = _action_step("report", {"action": "generate"})
+    engine._execute_steps([later_report])
+
+    assert len(report_calls) == 1
+    assert engine._report_delivered is True
 
 
 def test_abort_mid_build_seals_available_evidence_once(tmp_path):
@@ -548,3 +673,40 @@ def test_setup_agent_injects_one_session_owned_state_and_finalizer(monkeypatch):
 
     assert captured["run_evidence_state"] is agent.run_evidence_state
     assert captured["verdict_finalizer"] is agent.verdict_finalizer
+
+
+def test_pre_engine_exception_seals_without_fabricating_phase_evidence():
+    orchestrator = FakeVerdictOrchestrator()
+    agent = object.__new__(SetupAgent)
+    agent.run_evidence_state = RunEvidenceState(run_id="pre-engine")
+    agent.verdict_finalizer = VerdictFinalizer(orchestrator)
+    agent.phase_machine = PhaseMachine()
+    agent.react_engine = None
+    agent.run_termination = None
+
+    agent._close_open_setup_run("setup exception: RuntimeError")
+
+    assert agent.run_evidence_state.sealed is True
+    assert agent.run_evidence_state.phase_records == ()
+    assert agent.phase_machine.records == ()
+    assert agent.run_termination.termination is RunTerminationStatus.ABORTED
+    assert read_verdict_snapshot(orchestrator).run_id == "pre-engine"
+
+
+def test_pre_engine_closure_failure_is_surfaced_to_caller():
+    class FailingFinalizer:
+        def finalize(self, state, reason):
+            raise OSError("verdict persistence failed")
+
+    agent = object.__new__(SetupAgent)
+    agent.run_evidence_state = RunEvidenceState(run_id="pre-engine-failure")
+    agent.verdict_finalizer = FailingFinalizer()
+    agent.phase_machine = PhaseMachine()
+    agent.react_engine = None
+    agent.run_termination = None
+
+    with pytest.raises(OSError, match="verdict persistence failed"):
+        agent._close_open_setup_run("setup exception: RuntimeError")
+
+    assert agent.run_termination is None
+    assert agent.phase_machine.records == ()

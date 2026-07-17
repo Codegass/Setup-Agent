@@ -2,7 +2,10 @@ import base64
 import re
 from pathlib import Path
 
-from sag.agent.output_storage import OutputStorageManager
+import pytest
+
+from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
+from sag.tools.base import ToolResult
 from sag.utils.container_io import DEFAULT_MAX_CMD_CHARS
 
 INDEX_PATH = "/workspace/.setup_agent/contexts/output_index.json"
@@ -13,6 +16,7 @@ class FakeOutputStorageOrchestrator:
     def __init__(self):
         self.commands = []
         self.files = {}
+        self.failed_write_paths = set()
 
     def execute_command(self, command):
         self.commands.append(command)
@@ -46,6 +50,8 @@ class FakeOutputStorageOrchestrator:
         if command.startswith("cat >> ") or command.startswith("cat > "):
             operator = ">>" if command.startswith("cat >> ") else ">"
             path = command.split()[2]
+            if path in self.failed_write_paths:
+                return {"success": False, "output": "write failed", "exit_code": 1}
             payload = command.split("\n", 1)[1].rsplit("\n", 1)[0]
             if operator == ">>":
                 self.files[path] = self.files.get(path, "") + payload + "\n"
@@ -93,12 +99,14 @@ def test_output_storage_uses_safe_container_writes_for_backticks(tmp_path):
     assert all('echo "' not in command for command in orchestrator.commands)
     assert "/workspace/.setup_agent/contexts/full_outputs.jsonl" in orchestrator.files
     assert "/workspace/.setup_agent/contexts/output_index.json" in orchestrator.files
-    assert "mvn` without arguments" in orchestrator.files[
-        "/workspace/.setup_agent/contexts/full_outputs.jsonl"
-    ]
-    assert "mvn` without arguments" in orchestrator.files[
-        "/workspace/.setup_agent/contexts/output_index.json"
-    ]
+    assert (
+        "mvn` without arguments"
+        in orchestrator.files["/workspace/.setup_agent/contexts/full_outputs.jsonl"]
+    )
+    assert (
+        "mvn` without arguments"
+        in orchestrator.files["/workspace/.setup_agent/contexts/output_index.json"]
+    )
 
 
 def test_retrieve_reloads_index_for_output_stored_by_another_instance():
@@ -153,6 +161,41 @@ def test_has_output_ref_refreshes_index_without_loading_output_body():
     assert reader.has_output_ref(ref_id) is True
     assert reader.has_output_ref("output_missing") is False
     assert not any(command.startswith("sed -n ") for command in orchestrator.commands)
+
+
+def test_index_write_failure_recovers_ref_from_durable_jsonl():
+    orchestrator = FakeOutputStorageOrchestrator()
+    orchestrator.failed_write_paths.add(INDEX_PATH)
+    writer = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+
+    ref_id = writer.store_output(
+        task_id="build",
+        tool_name="build",
+        output="durable compile output",
+    )
+
+    assert ref_id.startswith("output_")
+    assert INDEX_PATH not in orchestrator.files
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    assert reader.retrieve_output(ref_id) == "durable compile output"
+    assert reader.has_output_ref(ref_id) is True
+
+
+def test_attach_rejects_syntactic_ref_that_cannot_be_retrieved():
+    class SyntacticOnlyStorage:
+        def store_output(self, **kwargs):
+            return "output_not_retrievable"
+
+        def retrieve_output(self, ref_id):
+            return None
+
+    with pytest.raises(RuntimeError, match="immediately retrievable"):
+        attach_durable_output_ref(
+            ToolResult.completed_success(output="compile output"),
+            SyntacticOnlyStorage(),
+            task_id="build",
+            tool_name="build",
+        )
 
 
 def test_second_writer_does_not_clobber_first_writers_index_entry():

@@ -205,7 +205,6 @@ def _first_count(sources: tuple[dict[str, Any], ...], *keys: str) -> int | None:
 def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, int] | None:
     result = observation.result
     stats = result.test_stats
-    facts = result.facts or {}
     metadata = result.metadata or {}
     analysis = metadata.get("analysis") if isinstance(metadata.get("analysis"), dict) else {}
     error_analysis = (
@@ -220,15 +219,7 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
         )
         if isinstance(value, dict)
     )
-    sources = (facts, result.raw_data or {}, metadata, *nested_stats)
-    if stats is None and any(key in facts for key in ("executed", "passed", "failed", "skipped")):
-        stats = TestStats(
-            discovered=facts.get("discovered"),
-            executed=int(facts.get("executed", 0) or 0),
-            passed=int(facts.get("passed", 0) or 0),
-            failed=int(facts.get("failed", 0) or 0),
-            skipped=int(facts.get("skipped", 0) or 0),
-        )
+    sources = (result.raw_data or {}, metadata, *nested_stats)
     if stats is None:
         return None
     errors = _first_count(
@@ -252,7 +243,7 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
     return stats, distinct_failures, errors
 
 
-def _fold_test_stats(state: RunEvidenceState) -> SnapshotTestStats:
+def _fold_test_stats(state: RunEvidenceState) -> tuple[SnapshotTestStats, tuple[str, ...]]:
     observations = [
         observation
         for observation in state.tool_observations
@@ -262,9 +253,22 @@ def _fold_test_stats(state: RunEvidenceState) -> SnapshotTestStats:
         item for observation in observations if (item := _coerce_result_stats(observation))
     ]
     if not snapshots:
-        return SnapshotTestStats()
+        return SnapshotTestStats(), ()
 
-    unique, unique_failures, unique_errors = snapshots[-1]
+    basis_kinds = {
+        "discovered" if stats.discovered is not None else "executed" for stats, _, _ in snapshots
+    }
+    primary_index = max(
+        range(len(snapshots)),
+        key=lambda index: (
+            max(
+                snapshots[index][0].discovered or 0,
+                snapshots[index][0].executed,
+            ),
+            index,
+        ),
+    )
+    unique, unique_failures, unique_errors = snapshots[primary_index]
     raw = SnapshotTestCounts(
         executed=sum(stats.executed for stats, _, _ in snapshots),
         passed=sum(stats.passed for stats, _, _ in snapshots),
@@ -272,14 +276,18 @@ def _fold_test_stats(state: RunEvidenceState) -> SnapshotTestStats:
         errors=sum(errors for _, _, errors in snapshots),
         skipped=sum(stats.skipped for stats, _, _ in snapshots),
     )
-    return SnapshotTestStats(
-        discovered=unique.discovered,
-        executed=unique.executed,
-        passed=unique.passed,
-        failed=unique_failures,
-        errors=unique_errors,
-        skipped=unique.skipped,
-        raw=raw,
+    conflicts = ("test_stats_basis_incomparable",) if len(basis_kinds) > 1 else ()
+    return (
+        SnapshotTestStats(
+            discovered=unique.discovered,
+            executed=unique.executed,
+            passed=unique.passed,
+            failed=unique_failures,
+            errors=unique_errors,
+            skipped=unique.skipped,
+            raw=raw,
+        ),
+        conflicts,
     )
 
 
@@ -353,40 +361,17 @@ class VerdictFinalizer:
         self.orchestrator = orchestrator
         self.test_pass_threshold = test_pass_threshold
         self._snapshots: dict[int, RunVerdictSnapshot] = {}
+        self._expected_snapshots: dict[int, RunVerdictSnapshot] = {}
 
-    def finalize(
-        self,
-        state: RunEvidenceState,
-        reason: EvidenceCloseReason,
-    ) -> RunVerdictSnapshot:
-        if not isinstance(reason, EvidenceCloseReason):
-            raise TypeError("finalize requires a typed EvidenceCloseReason")
-
-        if state.close_reason is not None and state.close_reason != reason.value:
-            raise ValueError(
-                "conflicting evidence-close reason: "
-                f"sealed={state.close_reason}, requested={reason.value}"
-            )
-
+    def _snapshot_for_state(self, state: RunEvidenceState) -> RunVerdictSnapshot:
         cache_key = id(state)
-        if cache_key in self._snapshots:
-            return self._snapshots[cache_key]
-
-        if state.sealed:
-            persisted = read_verdict_snapshot(self.orchestrator)
-            if not any(
-                conflict in persisted.conflicts
-                for conflict in ("snapshot_missing", "snapshot_corrupt")
-            ):
-                self._snapshots[cache_key] = persisted
-                return persisted
-        else:
-            finalized_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            state.seal(finalized_at=finalized_at, close_reason=reason.value)
+        cached = self._expected_snapshots.get(cache_key)
+        if cached is not None:
+            return cached
 
         build = _fold_build_evidence(state)
-        tests = _fold_test_stats(state)
-        conflicts = _dedupe(state.conflicts)
+        tests, test_conflicts = _fold_test_stats(state)
+        conflicts = _dedupe([*state.conflicts, *test_conflicts])
         input_refs = _dedupe(
             [
                 *(
@@ -412,6 +397,50 @@ class VerdictFinalizer:
             conflicts=conflicts,
             phase_records=tuple(_phase_record_snapshot(record) for record in state.phase_records),
         )
+        self._expected_snapshots[cache_key] = snapshot
+        return snapshot
+
+    def has_current_snapshot(self, state: RunEvidenceState) -> bool:
+        """Return whether the verdict path contains this run's canonical bytes."""
+        if not state.sealed:
+            return False
+        snapshot = self._snapshot_for_state(state)
+        content = _read_snapshot_text(self.orchestrator)
+        if content != snapshot.model_dump_json():
+            return False
+        try:
+            persisted = RunVerdictSnapshot.model_validate_json(content)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return False
+        return persisted.run_id == state.run_id
+
+    def finalize(
+        self,
+        state: RunEvidenceState,
+        reason: EvidenceCloseReason,
+    ) -> RunVerdictSnapshot:
+        if not isinstance(reason, EvidenceCloseReason):
+            raise TypeError("finalize requires a typed EvidenceCloseReason")
+
+        if state.close_reason is not None and state.close_reason != reason.value:
+            raise ValueError(
+                "conflicting evidence-close reason: "
+                f"sealed={state.close_reason}, requested={reason.value}"
+            )
+
+        cache_key = id(state)
+        if cache_key in self._snapshots:
+            return self._snapshots[cache_key]
+
+        if not state.sealed:
+            finalized_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            state.seal(finalized_at=finalized_at, close_reason=reason.value)
+
+        snapshot = self._snapshot_for_state(state)
+        if self.has_current_snapshot(state):
+            self._snapshots[cache_key] = snapshot
+            return snapshot
+
         mkdir_result = self.orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
         if mkdir_result.get("exit_code") != 0 and not mkdir_result.get("success"):
             raise OSError("failed to create verdict snapshot directory")
@@ -420,5 +449,7 @@ class VerdictFinalizer:
             VERDICT_SNAPSHOT_PATH,
             snapshot.model_dump_json(),
         )
+        if not self.has_current_snapshot(state):
+            raise OSError("persisted verdict snapshot does not match current run")
         self._snapshots[cache_key] = snapshot
         return snapshot
