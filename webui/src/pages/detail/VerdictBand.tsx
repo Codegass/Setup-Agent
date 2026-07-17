@@ -41,9 +41,62 @@ function toneFromOutcome(outcome: string): Tone {
   return "success"
 }
 
+function canonicalTone(verdict?: VerdictSummary["verdict"]): Tone | null {
+  if (verdict === "success") return "success"
+  if (verdict === "failed") return "failed"
+  if (verdict === "partial" || verdict === "unknown") return "attention"
+  return null
+}
+
+function authorityPresentation(
+  detail: ExecutionSessionDetail,
+  verdict: VerdictSummary | null | undefined,
+): { label: string | null; note: string | null; tone: Tone | null } {
+  const canonical = verdict?.verdict ?? detail.canonicalVerdict
+  const legacy = detail.legacy === true || verdict?.source === "legacy"
+  const conflict =
+    detail.snapshotStatus === "corrupt" ||
+    (canonical === "unknown" && detail.evidenceStatus === "conflict")
+
+  if (legacy) {
+    return {
+      label: "LEGACY",
+      note: "Legacy report reconstruction · canonical verdict unknown",
+      tone: null,
+    }
+  }
+  if (conflict) {
+    return {
+      label: "CONFLICT",
+      note: "Snapshot corrupt · canonical verdict unknown",
+      tone: "attention",
+    }
+  }
+  if (canonical === "unknown" || detail.snapshotStatus === "missing") {
+    return {
+      label: "UNKNOWN",
+      note:
+        detail.snapshotStatus === "missing"
+          ? "Snapshot missing · canonical verdict unknown"
+          : "Canonical verdict unknown",
+      tone: "attention",
+    }
+  }
+  if (canonical) {
+    return {
+      label: canonical === "success" ? "PASS" : canonical.toUpperCase(),
+      note: null,
+      tone: canonicalTone(canonical),
+    }
+  }
+  return { label: null, note: null, tone: null }
+}
+
 export function VerdictBand({ detail }: { detail: ExecutionSessionDetail }) {
   const verdict = detail.verdict
-  const tone: Tone = verdict?.tone ?? toneFromOutcome(detail.outcome ?? "")
+  const authority = authorityPresentation(detail, verdict)
+  const tone: Tone = authority.tone ?? verdict?.tone ?? toneFromOutcome(detail.outcome ?? "")
+  const label = authority.label ?? (verdict ? TONE_LABEL[tone] : null)
 
   return (
     <div
@@ -52,7 +105,7 @@ export function VerdictBand({ detail }: { detail: ExecutionSessionDetail }) {
         TONE_BAND[tone],
       )}
     >
-      {verdict ? (
+      {label ? (
         <span
           className={cn(
             "inline-flex h-7 shrink-0 items-center gap-2 rounded-full px-3 text-[12px] font-bold uppercase tracking-[0.04em]",
@@ -60,7 +113,7 @@ export function VerdictBand({ detail }: { detail: ExecutionSessionDetail }) {
           )}
         >
           <span className={cn("h-[7px] w-[7px] shrink-0 rounded-full", TONE_DOT[tone])} />
-          {TONE_LABEL[tone]}
+          {label}
         </span>
       ) : (
         <span
@@ -75,6 +128,11 @@ export function VerdictBand({ detail }: { detail: ExecutionSessionDetail }) {
             {verdict.detail ? (
               <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
                 <b className="font-medium text-muted-foreground">Why —</b> {verdict.detail}
+              </span>
+            ) : null}
+            {authority.note ? (
+              <span className="mt-0.5 block text-[12.5px] text-muted-foreground">
+                {authority.note}
               </span>
             ) : null}
           </>

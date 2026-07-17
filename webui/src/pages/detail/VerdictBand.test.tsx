@@ -62,4 +62,78 @@ describe("VerdictBand", () => {
     render(<VerdictBand detail={{ verdict: null, outcome: "⚠️ PARTIAL" } as any} />)
     expect(screen.getByText(/PARTIAL/)).toBeInTheDocument()
   })
+
+  it("renders a missing canonical snapshot as UNKNOWN rather than PARTIAL", () => {
+    render(
+      <VerdictBand
+        detail={
+          {
+            verdict: {
+              tone: "attention",
+              headline: "Setup verdict unknown — review before promoting",
+              verdict: "unknown",
+              source: "snapshot",
+            },
+            canonicalVerdict: "unknown",
+            snapshotStatus: "missing",
+            legacy: false,
+            outcome: "UNKNOWN",
+          } as any
+        }
+      />,
+    )
+
+    expect(screen.getByText("UNKNOWN")).toBeInTheDocument()
+    expect(screen.getByText(/Snapshot missing/)).toBeInTheDocument()
+    expect(screen.queryByText("PARTIAL")).not.toBeInTheDocument()
+  })
+
+  it("renders a corrupt canonical snapshot as a conflict", () => {
+    render(
+      <VerdictBand
+        detail={
+          {
+            verdict: {
+              tone: "attention",
+              headline: "Setup verdict unknown — review before promoting",
+              verdict: "unknown",
+              source: "snapshot",
+            },
+            canonicalVerdict: "unknown",
+            snapshotStatus: "corrupt",
+            legacy: false,
+            outcome: "UNKNOWN",
+          } as any
+        }
+      />,
+    )
+
+    expect(screen.getByText("CONFLICT")).toBeInTheDocument()
+    expect(screen.getByText(/Snapshot corrupt/)).toBeInTheDocument()
+  })
+
+  it("labels report-derived historical verdicts as legacy", () => {
+    render(
+      <VerdictBand
+        detail={
+          {
+            verdict: {
+              tone: "success",
+              headline: "Build passed. 987 tests passing",
+              verdict: "unknown",
+              source: "legacy",
+            },
+            canonicalVerdict: "unknown",
+            snapshotStatus: "legacy",
+            legacy: true,
+            outcome: "SUCCESS",
+          } as any
+        }
+      />,
+    )
+
+    expect(screen.getByText("LEGACY")).toBeInTheDocument()
+    expect(screen.getByText(/Legacy report reconstruction/)).toBeInTheDocument()
+    expect(screen.getByText(/987 tests passing/)).toBeInTheDocument()
+  })
 })

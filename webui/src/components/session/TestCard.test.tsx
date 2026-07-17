@@ -71,4 +71,29 @@ describe("TestCard", () => {
     const red = bar.querySelector(".bg-status-failed") as HTMLElement
     expect(red.style.width).not.toBe("0%")
   })
+
+  it("labels snapshot unique counts as primary and raw executions as diagnostics", () => {
+    render(
+      <TestCard
+        test={{
+          state: "partial",
+          pass: 320,
+          fail: 8,
+          skip: 0,
+          total: 328,
+          errors: 0,
+          uniqueTotal: 328,
+          uniquePassed: 320,
+          uniqueFailed: 8,
+          uniqueErrors: 0,
+          uniqueSkipped: 0,
+          rawExecutions: 987,
+        }}
+      />,
+    )
+
+    expect(screen.getByText(/320 \/ 328 unique tests passed/)).toBeInTheDocument()
+    expect(screen.getByText(/987 raw executions \(diagnostic\)/)).toBeInTheDocument()
+    expect(screen.queryByText(/328 runner executions/)).not.toBeInTheDocument()
+  })
 })

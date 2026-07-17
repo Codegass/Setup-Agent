@@ -63,7 +63,10 @@ def compose_verdict(
     canonical_verdict: str | None = None,
     verdict_source: str = "derived",
 ) -> dict | None:
-    clauses = [c for c in (_build_clause(build, module_summary), _test_clause(test)) if c]
+    # Module rollups are mutable report diagnostics. A canonical snapshot view
+    # may use its literal build/test evidence, but never module-derived wording.
+    authoritative_modules = None if verdict_source == "snapshot" else module_summary
+    clauses = [c for c in (_build_clause(build, authoritative_modules), _test_clause(test)) if c]
     if not clauses and canonical_verdict is None:
         return None
     if canonical_verdict is not None and verdict_source != "legacy":

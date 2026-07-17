@@ -314,6 +314,37 @@ def test_setup_report_never_calls_legacy_verdict_or_scan_owners(monkeypatch, tvm
     assert result.metadata["report_snapshot"]["status"]["verdict"] == tvm_snapshot.verdict
 
 
+def test_setup_report_overwrites_conflicting_nonzero_caller_evidence(tvm_snapshot):
+    orchestrator = SnapshotOrchestrator({VERDICT_PATH: tvm_snapshot.model_dump_json()})
+    tool = ReportTool(orchestrator, workflow_mode="setup")
+
+    result = tool.execute(
+        summary="Caller claims a different run",
+        status="success",
+        evidence_status="success",
+        test_stats={
+            "discovered": 987,
+            "executed": 987,
+            "passed": 987,
+            "failed": 0,
+            "skipped": 0,
+        },
+        conflicts=["caller_conflict"],
+        evidence_refs=["caller.log"],
+    )
+
+    assert result.test_stats is not None
+    assert result.test_stats.executed == tvm_snapshot.test_stats.executed
+    assert result.test_stats.passed == tvm_snapshot.test_stats.passed
+    assert result.conflicts == list(tvm_snapshot.conflicts)
+    assert result.evidence_refs == ["build.log"]
+    assert result.metadata["status"] == tvm_snapshot.verdict
+    assert result.metadata["final_flow_status"] == tvm_snapshot.verdict
+    assert result.metadata["test_stats"]["executed"] == tvm_snapshot.test_stats.executed
+    assert "987 executed" not in result.output
+    assert "caller_conflict" not in result.output
+
+
 def test_renderers_use_unique_not_raw_retry_total(surface_harness, snapshot_factory):
     snapshot = snapshot_factory(unique_total=328, raw_executions=987)
 
@@ -386,6 +417,37 @@ def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
     assert detail.verdict.verdict == tvm_snapshot.verdict
     assert detail.verdict.source == "snapshot"
     assert detail.report_delivery_status is None
+
+
+def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_factory):
+    snapshot = snapshot_factory(
+        verdict="success",
+        unique_passed=328,
+        unique_errors=0,
+    )
+    files = {
+        VERDICT_PATH: snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+        "/workspace/.setup_agent/module_metrics.json": json.dumps(
+            {
+                "modules": [],
+                "module_summary": {
+                    "modulesTotal": 4,
+                    "modulesBuilt": 0,
+                    "modulesFailed": 4,
+                    "singleModule": False,
+                },
+            }
+        ),
+    }
+
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm")
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.verdict is not None
+    assert detail.verdict.verdict == "success"
+    assert detail.verdict.tone == "success"
+    assert detail.verdict.headline == "Build passed. 328 tests passing"
 
 
 def test_web_exposes_report_delivery_only_from_durable_flow_data(tvm_snapshot):

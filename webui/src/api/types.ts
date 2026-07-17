@@ -1,4 +1,8 @@
 export type Tone = "neutral" | "blue" | "green" | "red" | "amber"
+export type CanonicalVerdict = "success" | "partial" | "failed" | "unknown"
+export type VerdictSource = "snapshot" | "legacy" | "derived"
+export type SnapshotStatus = "valid" | "missing" | "corrupt" | "legacy" | "unavailable"
+export type ReportDeliveryStatus = "delivered" | "failed" | "skipped"
 
 export interface DockerSummary {
   status: string
@@ -30,6 +34,7 @@ export interface TestSummary {
   uniqueFailed?: number | null
   uniqueErrors?: number | null
   uniqueSkipped?: number | null
+  rawExecutions?: number | null
   declaredTotal?: number | null
   methodExecutionRate?: number | null
   failingNames?: string[]
@@ -89,6 +94,10 @@ export interface ExecutionSessionSummary {
   report: string
   files: number
   evidence: number
+  canonicalVerdict?: CanonicalVerdict
+  snapshotStatus?: SnapshotStatus
+  legacy?: boolean
+  reportDeliveryStatus?: ReportDeliveryStatus | null
 }
 
 export interface DashboardResponse {
@@ -161,6 +170,8 @@ export interface VerdictSummary {
   tone: "success" | "attention" | "failed"
   headline: string
   detail?: string | null
+  verdict?: CanonicalVerdict | null
+  source?: VerdictSource
 }
 
 export interface ExecutionSessionDetail {
@@ -177,6 +188,10 @@ export interface ExecutionSessionDetail {
   steps?: number | null
   stepBudget?: number | null
   evidenceStatus?: string | null
+  canonicalVerdict?: CanonicalVerdict
+  snapshotStatus?: SnapshotStatus
+  legacy?: boolean
+  reportDeliveryStatus?: ReportDeliveryStatus | null
   build: BuildSummary
   test: TestSummary
   modules?: ModuleSummary[]

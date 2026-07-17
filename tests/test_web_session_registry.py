@@ -677,7 +677,7 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
     # not reconstruct canonical test counts or verdict from report metrics.
     assert detail.verdict is not None
     assert detail.verdict.tone == "attention"
-    assert detail.verdict.headline == "Build passed on 3 of 4 modules — review before promoting"
+    assert detail.verdict.headline == "Setup verdict unknown — review before promoting"
     assert detail.canonical_verdict == "unknown"
     assert detail.snapshot_status == "missing"
     assert detail.test.total == 0

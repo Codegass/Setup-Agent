@@ -329,46 +329,56 @@ class ReportTool(BaseTool, UIEventEmitter):
                 )
 
                 evidence_result = report_snapshot.get("evidence_result", {})
-                result_evidence_status = self._coerce_report_evidence_status(
-                    evidence_result.get("status"),
-                    evidence_status,
-                    verified_status,
-                    status,
-                )
-                if test_stats is None:
+                if self.workflow_mode == "setup":
+                    # Setup result fields are projections of the sealed snapshot.
+                    # Model/caller evidence may describe presentation, but it
+                    # cannot append a second count, status, conflict, or ref.
+                    result_evidence_status = self._coerce_report_evidence_status(
+                        evidence_result.get("status")
+                    )
                     result_test_stats = self._coerce_report_test_stats(
                         evidence_result.get("test_stats")
                     )
-                if conflicts is None:
                     result_conflicts = list(evidence_result.get("conflicts") or [])
-                if evidence_refs is None:
                     result_evidence_refs = list(evidence_result.get("evidence_refs") or [])
+                    result_status = verified_status
+                else:
+                    result_evidence_status = self._coerce_report_evidence_status(
+                        evidence_result.get("status"),
+                        evidence_status,
+                        verified_status,
+                        status,
+                    )
+                    if test_stats is None:
+                        result_test_stats = self._coerce_report_test_stats(
+                            evidence_result.get("test_stats")
+                        )
+                    if conflicts is None:
+                        result_conflicts = list(evidence_result.get("conflicts") or [])
+                    if evidence_refs is None:
+                        result_evidence_refs = list(evidence_result.get("evidence_refs") or [])
 
-                # Blocked-build evidence-rescue, stats side (bug #11 secondary
-                # incoherence): when the rescue fired, the agent's report call
-                # often carries zeroed test_stats — it believed the run was
-                # blocked — which rendered "Tests: no tests executed" directly
-                # under a banner printing the physically-validated
-                # "1287 detected, 1287 executed" (pyyaml-6/7 probes). The
-                # rescue's principle (physical evidence outranks agent belief)
-                # applies to the stats line too: prefer the snapshot's
-                # validated stats. Runs where the rescue did not fire — and
-                # rescued runs with genuinely no executed tests (libcloud-2)
-                # — keep today's stats exactly.
-                validated_stats = self._snapshot_test_stats(report_snapshot)
-                if (
-                    validated_stats is not None
-                    and validated_stats.executed > 0
-                    and (result_test_stats is None or result_test_stats.executed == 0)
-                ):
-                    result_test_stats = validated_stats
+                    # Legacy blocked-build evidence rescue prefers physically
+                    # validated stats over an absent or zeroed caller summary.
+                    validated_stats = self._snapshot_test_stats(report_snapshot)
+                    if (
+                        validated_stats is not None
+                        and validated_stats.executed > 0
+                        and (result_test_stats is None or result_test_stats.executed == 0)
+                    ):
+                        result_test_stats = validated_stats
+                    result_status = status
+
+                canonical_evidence_status = self._canonical_report_evidence_status(
+                    result_evidence_status
+                )
 
                 # Mark this as a completion signal for the ReAct engine
                 metadata = {
                     "task_completed": True,
                     "completion_signal": True,
-                    "status": status,
-                    "final_flow_status": status,
+                    "status": result_status,
+                    "final_flow_status": result_status,
                     "verified_status": verified_status,  # Include the verified status
                     "evidence_status": result_evidence_status.value,
                     "timestamp": datetime.now().isoformat(),
@@ -428,7 +438,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     raw_data={
                         "full_report": report,
                         "report_snapshot": report_snapshot,
-                        "final_flow_status": status,
+                        "final_flow_status": result_status,
                         "verified_status": verified_status,
                         "evidence_status": metadata["evidence_status"],
                         "test_stats": (
