@@ -29,6 +29,7 @@ class PlanFaultCode(str, Enum):
     UNKNOWN_TOOL = "unknown_tool"
     UNMET_PRECONDITION = "unmet_precondition"
     PLAN_EXHAUSTED = "plan_exhausted"
+    ACTOR_MISMATCH = "actor_mismatch"
 
 
 class PlanFault(ValueError):
