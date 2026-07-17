@@ -1,5 +1,5 @@
 # src/sag/tools/phase_tool.py
-"""phase(action: done | blocked | note, outcome=...) lifecycle surface.
+"""phase(action: done | blocked | note | repair, outcome=...) lifecycle surface.
 
 Terminal actions are model claims.  The tool validates them against physical
 evidence and emits both claim and gate records; it never mutates phase state or
@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from sag.agent.phase_gates import ClaimDisposition, check_phase_claim
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+from sag.agent.phase_transitions import RepairRequest
 
 from .base import BaseTool, ToolResult
 
@@ -21,8 +22,9 @@ class PhaseTool(BaseTool):
                 "Phase lifecycle: action='done' with outcome and evidence claims the current "
                 "phase ended; action='blocked' with outcome, reason, and evidence claims an "
                 "external impediment; both are checked against physical evidence. "
-                "action='note' (text) records a working note. The engine advances phases; "
-                "you never pick or reorder them."
+                "action='repair' proposes one bounded direct-dependency repair with a failure "
+                "signature, hypothesis, and current-attempt evidence. action='note' records a "
+                "working note. The engine alone routes, repairs, or skips phases."
             ),
         )
         self.machine = machine
@@ -39,6 +41,10 @@ class PhaseTool(BaseTool):
         reason: str = "",
         evidence: Optional[List[str]] = None,
         text: str = "",
+        target_phase: str = "",
+        reason_code: str = "",
+        failure_signature: str = "",
+        hypothesis: str = "",
     ) -> ToolResult:
         if self.machine.is_complete:
             return ToolResult.completed_failure(
@@ -66,12 +72,47 @@ class PhaseTool(BaseTool):
                 metadata={"phase_signal": "note", "text": text},
             )
 
+        if verb == "repair":
+            if outcome is not None:
+                return ToolResult.completed_failure(
+                    output="repair proposals do not accept a phase outcome",
+                    error="outcome is forbidden for repair",
+                    error_code="phase_repair_outcome_forbidden",
+                )
+            try:
+                request = RepairRequest(
+                    from_phase=phase,
+                    target_phase=target_phase,
+                    source_attempt_id=str(self.machine.current_attempt_id or ""),
+                    reason_code=reason_code,
+                    failure_signature=failure_signature,
+                    hypothesis=hypothesis,
+                    evidence_refs=tuple(evidence or ()),
+                )
+            except ValueError as exc:
+                return ToolResult.completed_failure(
+                    output=f"Invalid repair proposal: {exc}",
+                    error=str(exc),
+                    error_code="phase_repair_invalid",
+                )
+            return ToolResult.completed_success(
+                output=(
+                    f"Repair proposal {request.from_phase}→{request.target_phase} submitted "
+                    "for engine policy validation."
+                ),
+                facts={"phase": phase},
+                metadata={
+                    "phase_signal": "repair",
+                    "repair_request": request.to_metadata(),
+                },
+            )
+
         if verb not in {"done", "blocked"}:
             return ToolResult.completed_failure(
                 output=f"Unknown phase action: {action!r}",
                 error="invalid action",
                 error_code="phase_action_invalid",
-                suggestions=["Use action= done | blocked | note"],
+                suggestions=["Use action= done | blocked | note | repair"],
             )
 
         if outcome is None or not str(outcome).strip():
@@ -137,6 +178,7 @@ class PhaseTool(BaseTool):
                 evidence_refs=gate.evidence_refs,
                 suggestions=gate.suggestions,
                 code="blocked_contradicted_by_green_evidence",
+                validated_facts=gate.validated_facts,
                 claim=claim,
             )
 
@@ -162,11 +204,6 @@ class PhaseTool(BaseTool):
                 "phase_signal": verb,
                 "phase_claim": claim.to_metadata(),
                 "gate_result": gate.to_metadata(),
-                # Temporary presentation aliases consumed by the WS3 engine
-                # seam until Task 7 installs PhaseTransitionPolicy.
-                "key_results": key_results,
-                "reason": reason,
-                "evidence": list(evidence or []),
             },
         )
 
@@ -174,11 +211,14 @@ class PhaseTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["done", "blocked", "note"]},
+                "action": {
+                    "type": "string",
+                    "enum": ["done", "blocked", "note", "repair"],
+                },
                 "outcome": {
                     "type": "string",
                     "enum": ["unknown", "success", "partial", "failed"],
-                    "description": "Required for done/blocked; forbidden for note",
+                    "description": "Required for done/blocked; forbidden for note/repair",
                 },
                 "key_results": {
                     "type": "string",
@@ -191,6 +231,23 @@ class PhaseTool(BaseTool):
                     "description": "refs supporting the claim (output_*, job:*, file:*)",
                 },
                 "text": {"type": "string", "description": "note: working note"},
+                "target_phase": {
+                    "type": "string",
+                    "enum": ["analyze", "build"],
+                    "description": "repair: direct dependency target",
+                },
+                "reason_code": {
+                    "type": "string",
+                    "description": "repair: typed snake_case reason code",
+                },
+                "failure_signature": {
+                    "type": "string",
+                    "description": "repair: normalized current failure identity",
+                },
+                "hypothesis": {
+                    "type": "string",
+                    "description": "repair: why the target attempt can change evidence",
+                },
             },
             "required": ["action"],
         }

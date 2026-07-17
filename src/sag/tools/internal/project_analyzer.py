@@ -2446,7 +2446,8 @@ PY"""
             if rec.get("is_aggregator_only"):
                 output += (
                     f"🧭 Recommended Build: NONE — {rec['rationale']} "
-                    f"Consider phase(action='blocked') with this evidence rather than forcing a compile.\n"
+                    f"Consider phase(action='blocked', outcome='unknown', ...) with this "
+                    f"evidence rather than forcing a compile.\n"
                 )
             else:
                 output += (

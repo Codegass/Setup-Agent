@@ -28,7 +28,20 @@ from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .output_storage import OutputStorageManager, attach_durable_output_ref
-from .phase_machine import PHASE_NAMES, PhaseMachine
+from .phase_gates import GateResult, ValidatorState, check_phase_claim, validate_phase_claim
+from .phase_machine import (
+    PHASE_NAMES,
+    PhaseClaim,
+    PhaseMachine,
+    PhaseOutcome,
+    PhaseTermination,
+)
+from .phase_transitions import (
+    PhaseTransitionPolicy,
+    RepairBudgets,
+    RepairRequest,
+    TransitionDecision,
+)
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
@@ -59,7 +72,8 @@ PHASE_OBJECTIVES = {
     "provision": (
         "Get the repository cloned and the toolchain installed: "
         "project(action='clone', repo_url=...), then project(action='provision', ...) "
-        "for the JDK the project needs. Claim phase(action='done') with what was installed."
+        "for the JDK the project needs. Claim phase(action='done', outcome='success', ...) "
+        "with what was installed."
     ),
     "analyze": (
         "Understand the project: project(action='analyze'). Record build system, the "
@@ -71,7 +85,8 @@ PHASE_OBJECTIVES = {
         "Recommended Build when it differs from a plain root compile — an aggregator "
         "root over Groovy modules needs build(action='package'/'install'), and a "
         "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
-        "compile target (a packaging/meta-project), phase(action='blocked') with that "
+        "compile target (a packaging/meta-project), phase(action='blocked', "
+        "outcome='unknown', ...) with that "
         "evidence instead of forcing a compile. If compilation fails on missing "
         "dependencies, build(action='deps') can resolve them — but do not run deps "
         "first by default (multi-module reactors can fail dependency resolution while "
@@ -84,9 +99,13 @@ PHASE_OBJECTIVES = {
         "even a different build system — than the build, e.g. Gradle test modules "
         "beside a Maven build); otherwise use the build root. Partial pass above "
         "threshold is a valid outcome — report the numbers honestly in key_results. "
-        "If tests genuinely cannot run, phase(action='blocked') with evidence."
+        "If tests genuinely cannot run, phase(action='blocked', outcome='failed', ...) "
+        "with evidence."
     ),
-    "report": "Generate the final report with the report tool, then phase(action='done').",
+    "report": (
+        "Generate the final report with the report tool, then "
+        "phase(action='done', outcome='success', ...)."
+    ),
 }
 
 # Python overrides for the build/test objectives (live-run 2026-06-24 pyyaml
@@ -101,7 +120,8 @@ PYTHON_PHASE_OBJECTIVES = {
         "Set up the environment and install dependencies: build(action='deps'), "
         "then verify byte-compilation with build(action='compile'). A Python "
         "project has no Java compile target — that is NOT grounds for "
-        "phase(action='blocked'). Block only when the environment or dependency "
+        "phase(action='blocked', outcome='failed', ...). Block only when the "
+        "environment or dependency "
         "install itself genuinely fails, with that evidence. Never run "
         "pip/python via bash — build resolves the registered toolchain. Long "
         "installs detach; poll the job ref with search."
@@ -111,7 +131,7 @@ PYTHON_PHASE_OBJECTIVES = {
         "the analyzer's Recommended Tests target when one is present; otherwise "
         "the project root. Partial pass above threshold is a valid outcome — "
         "report the numbers honestly in key_results. If tests genuinely cannot "
-        "run, phase(action='blocked') with evidence."
+        "run, phase(action='blocked', outcome='failed', ...) with evidence."
     ),
 }
 
@@ -150,7 +170,8 @@ KICKOFF_PHASE_OBJECTIVES = {
 # build phase and under-executing tests (0-2 executions vs 1287 passing).
 PYTHON_BUILD_PHASE_GUIDANCE = (
     "This is a Python project — there is no Java compile target and that is "
-    "NOT grounds for phase(action='blocked'). Do: build(action='deps') to "
+    "NOT grounds for phase(action='blocked', outcome='failed', ...). "
+    "Do: build(action='deps') to "
     "create the venv and install dependencies with the project's own tool, "
     "then build(action='compile') to verify byte-compilation. Never run "
     "pip/pytest via bash — the build tool resolves the project venv."
@@ -267,6 +288,7 @@ class ReActEngine(UIEventEmitter):
         context_journal=None,
         run_evidence_state: Optional[RunEvidenceState] = None,
         verdict_finalizer: Optional[VerdictFinalizer] = None,
+        transition_policy: Optional[PhaseTransitionPolicy] = None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -279,6 +301,9 @@ class ReActEngine(UIEventEmitter):
         self.context_journal = context_journal
         self.run_evidence_state = run_evidence_state
         self.verdict_finalizer = verdict_finalizer
+        self.transition_policy = transition_policy or PhaseTransitionPolicy()
+        self._repair_global_remaining = 2
+        self._repair_phase_remaining = {"test": 1, "build": 1}
         self._report_attempted = False
         self._report_delivered = False
         self._report_failed = False
@@ -391,10 +416,9 @@ class ReActEngine(UIEventEmitter):
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
-        # Stage 2: in machine-driven setup runs the evaluator must never end
-        # the run from the report tool's completion signal — the report PHASE
-        # done does (run_react_loop returns on machine completion with the
-        # machine's honest overall outcome).
+        # In machine-driven setup runs the evaluator never ends the run from
+        # the report tool's completion signal. A validated report-phase claim
+        # closes flow; the sealed snapshot remains the verdict authority.
         self.state_evaluator.phase_machine_active = self.phase_machine is not None
 
         # Initialize token tracker and LLM client for monitoring model usage
@@ -626,6 +650,17 @@ class ReActEngine(UIEventEmitter):
             roles.append(EvidenceRole.TEST)
         return tuple(roles)
 
+    def _record_current_phase_evidence(
+        self,
+        state: RunEvidenceState,
+        evidence_refs: List[str],
+    ) -> None:
+        machine = getattr(self, "phase_machine", None)
+        attempt_id = getattr(machine, "current_attempt_id", None)
+        refs = self._dedupe_strings(evidence_refs)
+        if attempt_id and refs:
+            state.record_phase_evidence(attempt_id, refs)
+
     def _record_tool_execution(
         self,
         tool_name: str,
@@ -708,6 +743,10 @@ class ReActEngine(UIEventEmitter):
                 execution_id=execution_id,
                 params=params,
             )
+            self._record_current_phase_evidence(
+                state,
+                self._dedupe_strings([result.output_ref, *result.evidence_refs, *result.refs]),
+            )
             state.record_conflict("output_storage_failed")
             raise
         state.record_attempt(
@@ -726,6 +765,10 @@ class ReActEngine(UIEventEmitter):
             roles=roles,
             execution_id=execution_id,
             params=params,
+        )
+        self._record_current_phase_evidence(
+            state,
+            self._dedupe_strings([durable.output_ref, *durable.evidence_refs, *durable.refs]),
         )
         return durable
 
@@ -835,20 +878,19 @@ class ReActEngine(UIEventEmitter):
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("sealed setup evidence has no typed close reason") from exc
 
-        if termination is RunTerminationStatus.CANCELLED:
+        if sealed_reason in {
+            EvidenceCloseReason.TEST_TERMINATED,
+            EvidenceCloseReason.DEPENDENTS_SKIPPED,
+        }:
+            # Evidence-close is immutable. A later report-phase abort or
+            # cancellation changes flow/delivery status, never snapshot inputs.
+            reason = sealed_reason
+        elif termination is RunTerminationStatus.CANCELLED:
             reason = EvidenceCloseReason.CANCELLED
         elif termination is RunTerminationStatus.ABORTED:
             reason = EvidenceCloseReason.ABORTED
         else:
-            reason = (
-                sealed_reason
-                if sealed_reason
-                in {
-                    EvidenceCloseReason.TEST_TERMINATED,
-                    EvidenceCloseReason.DEPENDENTS_SKIPPED,
-                }
-                else EvidenceCloseReason.DEPENDENTS_SKIPPED
-            )
+            reason = EvidenceCloseReason.DEPENDENTS_SKIPPED
         # This is a cache hit after a successful evidence-close. If persistence
         # failed after sealing, the same reason safely retries the atomic write.
         self._finalize_evidence(reason)
@@ -916,8 +958,9 @@ class ReActEngine(UIEventEmitter):
             f"Objective: {objective}",
             f"Budget: flexible — up to ~{budget} iterations available (a small reserve is "
             f"kept for later phases). When finished, call phase(action='done', "
-            f"key_results=..., evidence=[refs]). If it cannot be finished, "
-            f"phase(action='blocked', reason=..., evidence=[refs]).",
+            f"outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+            f"For an external impediment, call phase(action='blocked', "
+            f"outcome='failed|partial|unknown', reason=..., evidence=[refs]).",
         ]
         # Surface the analyzer's build recommendation directly in the build/test
         # intro so the target/goal is present even if the model didn't carry it
@@ -1032,7 +1075,8 @@ class ReActEngine(UIEventEmitter):
         if rec.get("is_aggregator_only"):
             return (
                 f"Recommended Build: NONE — {rec.get('rationale', '')} "
-                "Use phase(action='blocked') with this evidence rather than forcing a compile."
+                "Use phase(action='blocked', outcome='unknown', ...) with this evidence "
+                "rather than forcing a compile."
             )
         return (
             f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
@@ -1077,12 +1121,140 @@ class ReActEngine(UIEventEmitter):
             f"islands — run tests in EACH test island: {items}."
         )
 
-    def _handle_phase_signals(self, executed_steps) -> Optional[str]:
-        """Advance the machine when the phase tool signalled done/blocked.
+    def _repair_budgets(self) -> RepairBudgets:
+        return RepairBudgets(
+            global_remaining=getattr(self, "_repair_global_remaining", 2),
+            phase_remaining=dict(
+                getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1})
+            ),
+        )
 
-        The ENGINE is the single owner of phase state: the tool only emits
-        `metadata.phase_signal`; this method mutates the machine, persists the
-        phase record to the trunk, and performs the window reset."""
+    def _consume_repair_budget(self, phase: str) -> None:
+        self._repair_global_remaining = max(
+            0, getattr(self, "_repair_global_remaining", 2) - 1
+        )
+        phase_remaining = dict(
+            getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1})
+        )
+        phase_remaining[phase] = max(0, phase_remaining.get(phase, 0) - 1)
+        self._repair_phase_remaining = phase_remaining
+
+    def _record_gate_facts(self, phase: str, gate: GateResult) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return
+        provenance = (
+            gate.evidence_refs[0]
+            if gate.evidence_refs
+            else f"validator:{phase}:{getattr(self.phase_machine, 'current_attempt_id', '')}"
+        )
+        for key, value in gate.validated_facts.items():
+            state.set_fact(key, value, evidence_ref=provenance)
+        if gate.evidence_refs:
+            state.record_phase_evidence(
+                self.phase_machine.current_attempt_id,
+                gate.evidence_refs,
+            )
+
+    @staticmethod
+    def _phase_record_status(record) -> str:
+        if (
+            record.termination in {PhaseTermination.BLOCKED, PhaseTermination.SKIPPED}
+            or record.outcome is PhaseOutcome.FAILED
+        ):
+            return "failed"
+        return "completed"
+
+    def _apply_phase_decision(
+        self,
+        record,
+        decision: TransitionDecision,
+    ) -> None:
+        machine = self.phase_machine
+        appended = machine.apply(decision)
+        for applied in appended:
+            self._record_phase_audit(applied)
+            text = applied.key_results or applied.reason or applied.outcome.value
+            self._persist_phase_record(
+                applied.phase,
+                self._phase_record_status(applied),
+                f"[{applied.outcome.value}] {text}",
+            )
+
+        if decision.route.kind == "evidence_close":
+            reason = (
+                EvidenceCloseReason.DEPENDENTS_SKIPPED
+                if decision.skips or record.phase != "test"
+                else EvidenceCloseReason.TEST_TERMINATED
+            )
+            self._finalize_evidence(reason)
+
+        self._phase_iterations = 0
+        self.steps_since_context_switch = 0
+        if not machine.is_complete:
+            self._archive_window_steps()
+            self.steps = [self._phase_intro_step()]
+            self._journal_intro_dirty = True
+            self._journal_last_ledger = None
+            self._start_phase_branch()
+
+    def _project_name_for_gate(self) -> str | None:
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            return getattr(trunk, "project_name", None)
+        except Exception:
+            return getattr(self.context_manager, "project_name", None)
+
+    def _handle_repair_signal(self, metadata: Dict[str, Any]) -> str | None:
+        machine = self.phase_machine
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return None
+        try:
+            request = RepairRequest.from_metadata(metadata.get("repair_request") or {})
+        except (TypeError, ValueError) as exc:
+            self.agent_logger.warning(f"Rejected malformed repair proposal: {exc}")
+            return None
+        if (
+            request.from_phase != machine.current_phase
+            or request.source_attempt_id != machine.current_attempt_id
+        ):
+            self.agent_logger.warning("Rejected repair proposal for a stale phase attempt")
+            return None
+
+        claim = PhaseClaim(
+            phase=request.from_phase,
+            signal="done",
+            claimed_outcome=PhaseOutcome.FAILED,
+            reason=request.hypothesis,
+            evidence_refs=request.evidence_refs,
+        )
+        gate = check_phase_claim(
+            request.from_phase,
+            claim,
+            getattr(self, "physical_validator", None),
+            getattr(getattr(self, "physical_validator", None), "docker_orchestrator", None),
+            self._project_name_for_gate(),
+        )
+        if not gate.accepted:
+            self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
+            return None
+        self._record_gate_facts(request.from_phase, gate)
+        record = machine.close_attempt(gate)
+        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+        decision = policy.request_repair(
+            request,
+            state=state,
+            budgets=self._repair_budgets(),
+            source_record=record,
+        )
+        if decision.route.kind == "repair":
+            self._consume_repair_budget(request.from_phase)
+        self._apply_phase_decision(record, decision)
+        return "repair"
+
+    def _handle_phase_signals(self, executed_steps) -> Optional[str]:
+        """Validate terminal claims, then route them through exactly one policy call."""
         if getattr(self, "phase_machine", None) is None:
             return None
         for step in executed_steps:
@@ -1092,30 +1264,44 @@ class ReActEngine(UIEventEmitter):
             if not signal:
                 continue
             machine = self.phase_machine
-            finished = machine.current_phase
             if signal == "note":
-                self._persist_phase_note(finished, metadata.get("text", ""))
+                self._persist_phase_note(machine.current_phase, metadata.get("text", ""))
                 return signal
-            if signal == "done":
-                machine.mark_done(metadata.get("key_results", ""), metadata.get("evidence", []))
-                self._persist_phase_record(finished, "completed", metadata.get("key_results", ""))
-            else:
-                machine.mark_blocked(metadata.get("reason", ""), metadata.get("evidence", []))
-                self._persist_phase_record(finished, "failed", metadata.get("reason", ""))
-            self._record_phase_audit(machine.records[-1])
-            if finished == "test":
-                # Evidence-close precedes even construction of the report window.
-                self._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
-            self._phase_iterations = 0
-            # Phase transitions are the context switches of phase mode (no
-            # manage_context actions exist to reset the legacy counter).
-            self.steps_since_context_switch = 0
-            if not machine.is_complete:
-                self._archive_window_steps()
-                self.steps = [self._phase_intro_step()]
-                self._journal_intro_dirty = True
-                self._journal_last_ledger = None
-                self._start_phase_branch()
+            if signal == "repair":
+                return self._handle_repair_signal(metadata)
+            if signal not in {"done", "blocked"}:
+                self.agent_logger.warning(f"Ignoring unknown phase signal: {signal}")
+                return None
+
+            claim_data = metadata.get("phase_claim")
+            gate_data = metadata.get("gate_result")
+            if not isinstance(claim_data, dict) or not isinstance(gate_data, dict):
+                self.agent_logger.warning("Ignoring unvalidated legacy terminal phase signal")
+                return None
+            try:
+                claim = PhaseClaim.from_metadata(claim_data)
+                gate = GateResult.from_metadata(gate_data, claim=claim)
+            except (TypeError, ValueError, PermissionError) as exc:
+                self.agent_logger.warning(f"Ignoring malformed phase validation metadata: {exc}")
+                return None
+            if claim.phase != machine.current_phase or claim.signal != signal:
+                self.agent_logger.warning("Ignoring a stale or mismatched phase claim")
+                return None
+            if not gate.accepted:
+                self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
+                return None
+            self._record_gate_facts(claim.phase, gate)
+            record = machine.close_attempt(gate)
+            state = getattr(self, "run_evidence_state", None)
+            if state is None:
+                raise RuntimeError("phase routing requires RunEvidenceState")
+            policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+            decision = policy.decide(
+                record,
+                state=state,
+                budgets=self._repair_budgets(),
+            )
+            self._apply_phase_decision(record, decision)
             return signal
         return None
 
@@ -1207,7 +1393,15 @@ class ReActEngine(UIEventEmitter):
         evidence, never on inability to check."""
         validator = getattr(self, "physical_validator", None)
         if validator is None:
-            return {"ok": False, "reason": "no validator available", "suggestions": []}
+            return {
+                "ok": False,
+                "reason": "no validator available",
+                "suggestions": [],
+                "validator_state": ValidatorState.UNAVAILABLE.value,
+                "evidence_refs": [],
+                "validated_facts": {},
+                "code": "validator_unavailable",
+            }
         from .phase_gates import check_phase_done
 
         project_name = None
@@ -1244,7 +1438,8 @@ class ReActEngine(UIEventEmitter):
                 content=(
                     f"EVIDENCE CHECK: the completion gate for phase '{machine.current_phase}' "
                     f"already passes on physical evidence. If you agree the objective is met, "
-                    f"claim phase(action='done', key_results=..., evidence=[refs]) now and move on. "
+                    f"claim phase(action='done', outcome='success', key_results=..., "
+                    f"evidence=[refs]) now. The engine will route from prerequisites. "
                     f"If you are pursuing something beyond this phase's objective, consider "
                     f"whether it belongs to a later phase or a note."
                 ),
@@ -1254,11 +1449,7 @@ class ReActEngine(UIEventEmitter):
         return True
 
     def _enforce_phase_floors(self) -> bool:
-        """Force-finish the current phase ONLY when continuing would starve the
-        minimum floors of later phases (no per-phase quotas: build may consume
-        everything the easy phases saved). Round-5 vfs lesson: consult the
-        evidence gate first — green evidence auto-completes the phase as done;
-        only a failing gate records blocked."""
+        """Close a starved attempt honestly, then let transition policy route it."""
         machine = getattr(self, "phase_machine", None)
         if machine is None or machine.is_complete:
             return False
@@ -1267,36 +1458,42 @@ class ReActEngine(UIEventEmitter):
         if remaining > reserved:
             return False
 
-        gate = self._phase_gate_check(phase)
-        if gate.get("ok"):
-            machine.mark_done(
-                f"auto-completed at floor exhaustion (remaining {remaining} iterations "
-                f"reserved for later phases); evidence gate passed",
-                [],
-            )
-            self._persist_phase_record(
-                phase, "completed", "auto-completed at floor exhaustion; evidence gate passed"
-            )
-        else:
-            machine.mark_blocked(
-                f"remaining {remaining} iterations are reserved for later phases "
-                f"({reserved} needed)",
-                [],
-            )
-            self._persist_phase_record(
-                phase, "failed", "remaining iterations reserved for later phases"
-            )
-        self._record_phase_audit(machine.records[-1])
-        if phase == "test":
-            self._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
-        self._phase_iterations = 0
-        self.steps_since_context_switch = 0
-        if not machine.is_complete:
-            self._archive_window_steps()
-            self.steps = [self._phase_intro_step()]
-            self._journal_intro_dirty = True
-            self._journal_last_ledger = None
-            self._start_phase_branch()
+        probe = self._phase_gate_check(phase)
+        validator_state = ValidatorState(
+            probe.get("validator_state", ValidatorState.UNAVAILABLE.value)
+        )
+        claimed_outcome = {
+            ValidatorState.GREEN: PhaseOutcome.SUCCESS,
+            ValidatorState.PARTIAL: PhaseOutcome.PARTIAL,
+            ValidatorState.RED: PhaseOutcome.FAILED,
+            ValidatorState.UNAVAILABLE: PhaseOutcome.UNKNOWN,
+        }[validator_state]
+        claim = PhaseClaim(
+            phase=phase,
+            claimed_outcome=claimed_outcome,
+            key_results=(
+                f"attempt closed at floor exhaustion; {remaining} iterations remain and "
+                f"{reserved} are reserved for downstream work"
+            ),
+            evidence_refs=tuple(probe.get("evidence_refs") or ()),
+        )
+        gate = validate_phase_claim(
+            claim,
+            validator_state,
+            reason=str(probe.get("reason") or "phase budget exhausted"),
+            evidence_refs=tuple(probe.get("evidence_refs") or ()),
+            suggestions=tuple(probe.get("suggestions") or ()),
+            code=str(probe.get("code") or "phase_floor_exhausted"),
+            validated_facts=dict(probe.get("validated_facts") or {}),
+        )
+        self._record_gate_facts(phase, gate)
+        record = machine.close_attempt(gate)
+        state = getattr(self, "run_evidence_state", None)
+        if state is None:
+            raise RuntimeError("phase routing requires RunEvidenceState")
+        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+        decision = policy.decide(record, state=state, budgets=self._repair_budgets())
+        self._apply_phase_decision(record, decision)
         return True
 
     def _persist_phase_record(self, phase_name: str, status: str, text: str) -> None:
@@ -1563,10 +1760,10 @@ class ReActEngine(UIEventEmitter):
                 # Execute the steps
                 self._execute_steps(parsed_steps)
 
-                # PHASE SIGNALS (phase mode): a phase tool done/blocked advances
-                # the machine, persists the record, and resets the window. When
-                # the report phase ends, the machine — not the evaluator — ends
-                # the run with its honest overall outcome.
+                # PHASE SIGNALS (phase mode): the engine validates the claim,
+                # applies one policy route, persists its audit records, and
+                # resets the window. Report termination closes control flow;
+                # the already sealed snapshot remains the only run verdict.
                 if phase_mode:
                     self._handle_phase_signals(parsed_steps)
                     if self.phase_machine.is_complete:
@@ -2094,6 +2291,15 @@ class ReActEngine(UIEventEmitter):
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log action to branch history: {e}")
+
+                phase_signal = (result.metadata or {}).get("phase_signal")
+                if phase_signal in {"done", "blocked", "repair"}:
+                    # The engine must apply the accepted proposal before any
+                    # later action can run under a new or closed prerequisite.
+                    logger.debug(
+                        f"Stopping the action batch at phase signal {phase_signal!r}"
+                    )
+                    break
 
         return True
 

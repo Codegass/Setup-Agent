@@ -16,7 +16,8 @@ import sag.agent.react_engine as react_engine_module
 from sag.agent.agent import SetupAgent
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.output_storage import OutputStorageManager
-from sag.agent.phase_machine import PhaseMachine
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import (
@@ -116,7 +117,10 @@ def _engine(tmp_path, *, phase="provision"):
     )
     engine.prompt_builder = SimpleNamespace(invalidate_trunk_cache=lambda: None)
     engine.context_journal = None
-    engine.agent_logger = SimpleNamespace(info=lambda *args, **kwargs: None)
+    engine.agent_logger = SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+    )
     engine._persist_phase_record = lambda *args, **kwargs: None
     engine._archive_window_steps = lambda: None
     engine._start_phase_branch = lambda: None
@@ -152,10 +156,67 @@ def _green_tests(engine):
     )
 
 
-def _phase_step(signal="done", **metadata):
+def _phase_metadata(
+    phase,
+    *,
+    signal="done",
+    outcome=PhaseOutcome.SUCCESS,
+    key_results="",
+    reason="",
+):
+    outcome = PhaseOutcome(outcome)
+    state = {
+        PhaseOutcome.SUCCESS: ValidatorState.GREEN,
+        PhaseOutcome.PARTIAL: ValidatorState.PARTIAL,
+        PhaseOutcome.FAILED: ValidatorState.RED,
+        PhaseOutcome.UNKNOWN: ValidatorState.UNAVAILABLE,
+    }[outcome]
+    facts = {}
+    if phase == "provision":
+        facts["provision.workspace_ready"] = outcome is PhaseOutcome.SUCCESS
+    elif phase == "analyze":
+        facts["analysis.build_entry_ready"] = outcome in {
+            PhaseOutcome.SUCCESS,
+            PhaseOutcome.PARTIAL,
+        }
+    elif phase == "build":
+        facts["build.test_entry_ready"] = outcome in {
+            PhaseOutcome.SUCCESS,
+            PhaseOutcome.PARTIAL,
+        }
+    claim = PhaseClaim(
+        phase=phase,
+        signal=signal,
+        claimed_outcome=outcome,
+        key_results=key_results,
+        reason=reason,
+    )
+    gate = GateResult(
+        accepted=True,
+        validated_outcome=outcome,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=state,
+        reason=reason or "scripted gate",
+        validated_facts=facts,
+        claim=claim,
+    )
+    return {
+        "phase_signal": signal,
+        "phase_claim": claim.to_metadata(),
+        "gate_result": gate.to_metadata(),
+    }
+
+
+def _phase_step(engine, signal="done", **metadata):
     return SimpleNamespace(
         tool_name="phase",
-        tool_result=SimpleNamespace(metadata={"phase_signal": signal, "evidence": [], **metadata}),
+        tool_result=SimpleNamespace(
+            metadata=_phase_metadata(
+                engine.phase_machine.current_phase,
+                signal=signal,
+                **metadata,
+            )
+        ),
     )
 
 
@@ -181,6 +242,7 @@ def _action_step(tool_name, params, content=None):
 
 def test_engine_ingests_result_once_with_full_output_ref(tmp_path):
     engine, _ = _engine(tmp_path, phase="build")
+    records_before = engine.phase_machine.records
     original = ToolResult.completed_success(
         output="full compile output",
         facts={"build_success": True},
@@ -196,6 +258,11 @@ def test_engine_ingests_result_once_with_full_output_ref(tmp_path):
     observation = engine.run_evidence_state.tool_observations[0]
     assert observation.result.output_ref == recorded.output_ref
     assert observation.provenance == recorded.output_ref
+    assert engine.phase_machine.current_phase == "build"
+    assert engine.phase_machine.current_attempt_id == "build-1"
+    assert engine.phase_machine.records == records_before
+    assert engine.phase_machine.current_record.termination.value == "running"
+    assert engine.phase_machine.current_record.outcome.value == "unknown"
 
 
 def test_execute_steps_calls_the_single_ingestion_boundary_once(tmp_path):
@@ -640,6 +707,7 @@ def test_non_execution_is_audited_without_polluting_build_evidence(tmp_path):
 
 def test_failed_result_primary_repersistence_failure_uses_emergency_ref(tmp_path, monkeypatch):
     engine, _ = _engine(tmp_path, phase="build")
+    records_before = engine.phase_machine.records
     origin_storage = OutputStorageManager(Path(tmp_path) / "origin")
     raw_failure = "[ERROR] complete compiler diagnostics"
     with bind_tool_result_output_storage(origin_storage, task_id="origin-build", tool_name="build"):
@@ -670,6 +738,11 @@ def test_failed_result_primary_repersistence_failure_uses_emergency_ref(tmp_path
     observation = engine.run_evidence_state.tool_observations[0]
     assert observation.result.output_ref == recorded.output_ref
     assert observation.provenance == recorded.output_ref
+    assert engine.phase_machine.current_phase == "build"
+    assert engine.phase_machine.current_attempt_id == "build-1"
+    assert engine.phase_machine.records == records_before
+    assert engine.phase_machine.current_record.termination.value == "running"
+    assert engine.phase_machine.current_record.outcome.value == "unknown"
 
 
 def test_total_output_persistence_failure_keeps_actual_failure_with_fallback_provenance(
@@ -857,7 +930,7 @@ def test_snapshot_exists_before_report_phase_intro_is_built(tmp_path):
 
     engine._phase_intro_step = report_intro
 
-    engine._handle_phase_signals([_phase_step(key_results="tests terminal")])
+    engine._handle_phase_signals([_phase_step(engine, key_results="tests terminal")])
 
     assert report_intro_observations == [True]
     assert VERDICT_PATH in orchestrator.files
@@ -900,11 +973,7 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
         if call.name == "phase":
             result = ToolResult.completed_success(
                 output="test phase complete",
-                metadata={
-                    "phase_signal": "done",
-                    "key_results": "tests terminal",
-                    "evidence": [],
-                },
+                metadata=_phase_metadata("test", key_results="tests terminal"),
             )
             return ToolExecution(
                 call=call,
@@ -928,7 +997,7 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
         )
 
     engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=execute)
-    phase_step = _action_step("phase", {"action": "done"})
+    phase_step = _action_step("phase", {"action": "done", "outcome": "success"})
     early_report = _action_step("report", {"action": "generate"})
 
     engine._execute_steps([phase_step, early_report])
@@ -944,6 +1013,41 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
 
     assert len(report_calls) == 1
     assert engine._report_delivered is True
+
+
+def test_terminal_phase_signal_stops_later_actions_until_policy_routes(tmp_path):
+    engine, _ = _engine(tmp_path, phase="test")
+    _prepare_action_execution(engine)
+    calls = []
+
+    def execute(call):
+        calls.append(call.name)
+        result = ToolResult.completed_success(
+            output="test phase complete" if call.name == "phase" else "stale action ran",
+            metadata=(
+                _phase_metadata("test", key_results="tests terminal")
+                if call.name == "phase"
+                else {}
+            ),
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="success",
+            raw_params=call.raw_params,
+            validated_params=call.raw_params,
+            observation_text=result.output,
+            attempted_execution=True,
+        )
+
+    engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=execute)
+    phase_step = _action_step("phase", {"action": "done", "outcome": "success"})
+    stale_action = _action_step("build", {"action": "test"})
+
+    engine._execute_steps([phase_step, stale_action])
+
+    assert calls == ["phase"]
+    assert stale_action.tool_result is None
 
 
 def test_sealed_run_refuses_evidence_tool_before_execution(tmp_path):
@@ -1055,7 +1159,7 @@ def test_report_failure_changes_delivery_only_and_cannot_mutate_sealed_evidence(
     engine, orchestrator = _engine(tmp_path, phase="test")
     _green_build(engine)
     _green_tests(engine)
-    engine._handle_phase_signals([_phase_step(key_results="tests green")])
+    engine._handle_phase_signals([_phase_step(engine, key_results="tests green")])
     before = read_verdict_snapshot(orchestrator)
     observations_before_report = len(engine.run_evidence_state.tool_observations)
 
@@ -1073,6 +1177,23 @@ def test_report_failure_changes_delivery_only_and_cannot_mutate_sealed_evidence(
     assert termination.report_delivery_status is ReportDeliveryStatus.FAILED
     assert before.model_dump_json() == after.model_dump_json()
     assert len(engine.run_evidence_state.tool_observations) == observations_before_report
+
+
+def test_report_phase_abort_keeps_the_existing_evidence_close_snapshot(tmp_path):
+    engine, orchestrator = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    _green_tests(engine)
+    engine._handle_phase_signals([_phase_step(engine, key_results="tests green")])
+    snapshot_before = orchestrator.files[VERDICT_PATH]
+    engine._report_attempted = True
+    engine._report_failed = True
+
+    termination = engine.abort(reason="report renderer crashed")
+
+    assert termination.termination is RunTerminationStatus.ABORTED
+    assert termination.report_delivery_status is ReportDeliveryStatus.FAILED
+    assert engine.run_evidence_state.close_reason == EvidenceCloseReason.TEST_TERMINATED.value
+    assert orchestrator.files[VERDICT_PATH] == snapshot_before
 
 
 class _PersistenceFailingReportTool(BaseTool):
@@ -1098,11 +1219,10 @@ class _ReportCompletionTool(BaseTool):
         self.calls += 1
         return ToolResult.completed_success(
             output="report phase closed",
-            metadata={
-                "phase_signal": "done",
-                "key_results": "report delivery failed",
-                "evidence": [],
-            },
+            metadata=_phase_metadata(
+                "report",
+                key_results="report delivery failed",
+            ),
         )
 
 
@@ -1112,7 +1232,7 @@ def test_report_construction_persistence_failure_completes_without_mutating_verd
     engine, verdict_orchestrator = _engine(tmp_path, phase="test")
     _green_build(engine)
     _green_tests(engine)
-    engine._handle_phase_signals([_phase_step(key_results="tests green")])
+    engine._handle_phase_signals([_phase_step(engine, key_results="tests green")])
     snapshot_before = read_verdict_snapshot(verdict_orchestrator)
     snapshot_bytes_before = verdict_orchestrator.files[VERDICT_PATH]
     evidence_state_before = engine.run_evidence_state.model_dump_json()
@@ -1209,7 +1329,7 @@ def test_successful_report_marks_delivery_without_changing_verdict(tmp_path):
     engine, orchestrator = _engine(tmp_path, phase="test")
     _green_build(engine)
     _green_tests(engine)
-    engine._handle_phase_signals([_phase_step(key_results="tests green")])
+    engine._handle_phase_signals([_phase_step(engine, key_results="tests green")])
     before = read_verdict_snapshot(orchestrator)
 
     engine._record_tool_execution(
@@ -1227,14 +1347,14 @@ def test_normal_report_phase_flow_close_returns_completed_termination(tmp_path):
     engine, orchestrator = _engine(tmp_path, phase="test")
     _green_build(engine)
     _green_tests(engine)
-    engine._handle_phase_signals([_phase_step(key_results="tests green")])
+    engine._handle_phase_signals([_phase_step(engine, key_results="tests green")])
     engine._record_tool_execution(
         "report",
         {"action": "generate"},
         ToolResult.completed_success(output="report written"),
     )
 
-    engine._handle_phase_signals([_phase_step(key_results="report delivered")])
+    engine._handle_phase_signals([_phase_step(engine, key_results="report delivered")])
     termination = engine._close_flow(RunTerminationStatus.COMPLETED)
 
     assert engine.phase_machine.is_complete is True

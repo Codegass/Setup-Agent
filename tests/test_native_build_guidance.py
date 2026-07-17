@@ -305,7 +305,7 @@ def test_native_build_intro_prepends_native_first_block():
     )
 
 
-def test_plain_python_intro_has_no_native_text_and_is_byte_identical():
+def test_plain_python_intro_has_no_native_text_and_matches_phase_contract():
     """A plain-python repo must carry ZERO native text and its build intro must
     be byte-identical to the same repo analyzed with the native path never
     firing (snapshot below, captured from the plain-repo chain)."""
@@ -316,25 +316,25 @@ def test_plain_python_intro_has_no_native_text_and_is_byte_identical():
     assert intro == _PLAIN_BUILD_INTRO_SNAPSHOT
 
 
-# Captured VERBATIM from the plain-python chain (no native path). If this
-# fails, the plain-python intro changed — out of scope for T5 and must be an
-# intentional, separate change.
+# Contract snapshot from the plain-python chain (no native path).
 _PLAIN_BUILD_INTRO_SNAPSHOT = (
     "=== PHASE: BUILD ===\n"
     "Run picture so far:\n"
-    "✓ provision: repo cloned; toolchain installed\n"
-    "✓ analyze: python project analyzed\n"
+    "• provision [unknown]: repo cloned; toolchain installed\n"
+    "• analyze [unknown]: python project analyzed\n"
     "→ current: build\n"
     "\n"
     "Objective: Set up the environment and install dependencies: "
     "build(action='deps'), then verify byte-compilation with "
     "build(action='compile'). A Python project has no Java compile target — "
-    "that is NOT grounds for phase(action='blocked'). Block only when the "
+    "that is NOT grounds for phase(action='blocked', outcome='failed', ...). "
+    "Block only when the "
     "environment or dependency install itself genuinely fails, with that "
     "evidence. Never run pip/python via bash — build resolves the registered "
     "toolchain. Long installs detach; poll the job ref with search.\n"
     "This is a Python project — there is no Java compile target and that is "
-    "NOT grounds for phase(action='blocked'). Do: build(action='deps') to "
+    "NOT grounds for phase(action='blocked', outcome='failed', ...). Do: "
+    "build(action='deps') to "
     "create the venv and install dependencies with the project's own tool, "
     "then build(action='compile') to verify byte-compilation. Never run "
     "pip/pytest via bash — the build tool resolves the project venv.\n"
@@ -343,8 +343,9 @@ _PLAIN_BUILD_INTRO_SNAPSHOT = (
     "build(action='compile'), test with build(action='test').\n"
     "Budget: flexible — up to ~132 iterations available (a small reserve is "
     "kept for later phases). When finished, call phase(action='done', "
-    "key_results=..., evidence=[refs]). If it cannot be finished, "
-    "phase(action='blocked', reason=..., evidence=[refs])."
+    "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+    "For an external impediment, call phase(action='blocked', "
+    "outcome='failed|partial|unknown', reason=..., evidence=[refs])."
 )
 
 

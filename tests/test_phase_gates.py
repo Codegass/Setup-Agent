@@ -57,11 +57,22 @@ def test_build_done_rejected_without_artifacts():
 
 
 def test_build_done_accepted_with_artifacts():
+    validator = FakeValidator(build_success=True)
     verdict = check_phase_done(
         "build", validator=FakeValidator(build_success=True),
         orchestrator=_orch(), project_name="demo",
     )
     assert verdict["ok"] is True
+
+    result = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=validator,
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+    assert result.validated_facts["build.test_entry_ready"] is True
+    assert result.to_metadata()["validated_facts"]["build.test_entry_ready"] is True
 
 
 def test_build_gate_uses_physical_validator_for_non_jvm_systems():
@@ -88,6 +99,18 @@ def test_provision_rejected_without_workspace():
         orchestrator=_orch(workspace_exists=False), project_name="demo",
     )
     assert verdict["ok"] is False
+
+
+def test_phase_gate_emits_only_validator_derived_entry_facts():
+    provision = check_phase_claim(
+        "provision",
+        PhaseClaim(phase="provision", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=FakeValidator(),
+        orchestrator=_orch(workspace_exists=True),
+        project_name="demo",
+    )
+
+    assert provision.validated_facts == {"provision.workspace_ready": True}
 
 
 def test_gate_probe_error_is_explicitly_unavailable():

@@ -7,9 +7,9 @@ selects the next phase; routing belongs to ``PhaseTransitionPolicy``.
 from __future__ import annotations
 
 import shlex
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from loguru import logger
 
@@ -55,14 +55,25 @@ class GateResult:
     evidence_refs: tuple[str, ...] = ()
     suggestions: tuple[str, ...] = ()
     code: str = ""
+    validated_facts: Mapping[str, Any] = field(default_factory=dict)
     claim: PhaseClaim | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.accepted, bool):
+            raise TypeError("gate accepted flag must be boolean")
         object.__setattr__(self, "validated_outcome", PhaseOutcome(self.validated_outcome))
         object.__setattr__(self, "claim_disposition", ClaimDisposition(self.claim_disposition))
         object.__setattr__(self, "validator_state", ValidatorState(self.validator_state))
+        if self.validated_outcome is not _VALIDATED_OUTCOMES[self.validator_state]:
+            raise ValueError("validated outcome must match the validator state")
+        expected_accepted = self.claim_disposition is not ClaimDisposition.CONTRADICTED
+        if self.accepted is not expected_accepted:
+            raise ValueError("gate acceptance conflicts with the claim disposition")
         object.__setattr__(self, "evidence_refs", tuple(dict.fromkeys(self.evidence_refs)))
         object.__setattr__(self, "suggestions", tuple(self.suggestions))
+        if not isinstance(self.validated_facts, Mapping):
+            raise TypeError("validated facts must be a mapping")
+        object.__setattr__(self, "validated_facts", dict(self.validated_facts))
 
     @property
     def disposition(self) -> ClaimDisposition:
@@ -83,6 +94,7 @@ class GateResult:
             "evidence_refs": list(self.evidence_refs),
             "suggestions": list(self.suggestions),
             "code": self.code,
+            "validated_facts": dict(self.validated_facts),
         }
 
     @classmethod
@@ -92,8 +104,16 @@ class GateResult:
         *,
         claim: PhaseClaim | None = None,
     ) -> "GateResult":
+        if not isinstance(value, Mapping):
+            raise TypeError("gate metadata must be a mapping")
+        accepted = value.get("accepted")
+        if not isinstance(accepted, bool):
+            raise TypeError("gate metadata accepted flag must be boolean")
+        facts = value.get("validated_facts") or {}
+        if not isinstance(facts, Mapping):
+            raise TypeError("gate metadata validated facts must be a mapping")
         return cls(
-            accepted=bool(value.get("accepted")),
+            accepted=accepted,
             validated_outcome=value.get("validated_outcome", PhaseOutcome.UNKNOWN),
             claim_disposition=value.get(
                 "claim_disposition", ClaimDisposition.UNVERIFIABLE
@@ -103,6 +123,7 @@ class GateResult:
             evidence_refs=tuple(value.get("evidence_refs") or ()),
             suggestions=tuple(value.get("suggestions") or ()),
             code=str(value.get("code") or ""),
+            validated_facts=dict(facts),
             claim=claim,
         )
 
@@ -114,6 +135,7 @@ class _ValidatorObservation:
     evidence_refs: tuple[str, ...] = ()
     suggestions: tuple[str, ...] = ()
     code: str = ""
+    validated_facts: Mapping[str, Any] = field(default_factory=dict)
 
 
 def validate_phase_claim(
@@ -124,6 +146,7 @@ def validate_phase_claim(
     evidence_refs: Iterable[str] = (),
     suggestions: Iterable[str] = (),
     code: str = "",
+    validated_facts: Mapping[str, Any] | None = None,
 ) -> GateResult:
     """Compare a claim with validator evidence without routing or mutation."""
     state = ValidatorState(validator_state)
@@ -167,6 +190,7 @@ def validate_phase_claim(
         evidence_refs=tuple(evidence_refs),
         suggestions=tuple(suggestions),
         code=code,
+        validated_facts=dict(validated_facts or {}),
         claim=phase_claim,
     )
 
@@ -189,6 +213,7 @@ def check_phase_claim(
         evidence_refs=observation.evidence_refs,
         suggestions=observation.suggestions,
         code=observation.code,
+        validated_facts=observation.validated_facts,
     )
 
 
@@ -211,6 +236,7 @@ def check_phase_done(
         "validator_state": observation.state.value,
         "evidence_refs": list(observation.evidence_refs),
         "code": observation.code,
+        "validated_facts": dict(observation.validated_facts),
     }
 
 
@@ -254,6 +280,7 @@ def _inspect_provision(orchestrator, project_name) -> _ValidatorObservation:
             ValidatorState.RED,
             reason=f"workspace {workdir} does not exist — repository not cloned",
             evidence_refs=(workdir,),
+            validated_facts={"provision.workspace_ready": False},
             suggestions=(
                 "Clone first: project(action='clone', repo_url=...)",
                 "If the repo cloned elsewhere, verify with bash ls /workspace",
@@ -265,6 +292,7 @@ def _inspect_provision(orchestrator, project_name) -> _ValidatorObservation:
         reason=f"workspace {workdir} exists",
         evidence_refs=(workdir,),
         code="workspace_present",
+        validated_facts={"provision.workspace_ready": True},
     )
 
 
@@ -318,6 +346,10 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
         ),
         evidence_refs=_status_refs(status),
         code=f"analysis_{state.value}",
+        validated_facts={
+            "analysis.build_entry_ready": state
+            in {ValidatorState.GREEN, ValidatorState.PARTIAL}
+        },
     )
 
 
@@ -340,12 +372,30 @@ def _inspect_build(validator, project_name) -> _ValidatorObservation:
             "Run build(action='compile') and validate the resulting artifacts",
             "If an external impediment prevents progress, claim blocked with its evidence refs",
         )
+    explicit_ready = status.get("test_entry_ready")
+    evidence = status.get("evidence") or {}
+    if not isinstance(explicit_ready, bool) and isinstance(evidence, dict):
+        explicit_ready = evidence.get("test_entry_ready")
+    if isinstance(explicit_ready, bool):
+        test_entry_ready = explicit_ready
+    elif state is ValidatorState.GREEN:
+        test_entry_ready = True
+    elif state is ValidatorState.PARTIAL and isinstance(evidence, dict):
+        test_entry_ready = bool(
+            evidence.get("has_artifacts")
+            or evidence.get("has_build_fingerprints")
+            or evidence.get("test_classpath")
+            or evidence.get("test_discovery")
+        )
+    else:
+        test_entry_ready = False
     return _ValidatorObservation(
         state,
         reason=reason,
         evidence_refs=_status_refs(status),
         suggestions=suggestions,
         code=f"build_{state.value}",
+        validated_facts={"build.test_entry_ready": test_entry_ready},
     )
 
 

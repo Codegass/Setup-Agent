@@ -75,6 +75,33 @@ class ActionAttempt(BaseModel):
     evidence_refs: list[str] = Field(default_factory=list)
 
 
+class PhaseEvidenceEvent(BaseModel):
+    """Evidence refs observed while one concrete phase attempt was open."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attempt_id: str
+    evidence_refs: tuple[str, ...] = ()
+
+
+class RepairRecord(BaseModel):
+    """Append-only repair proposal and the state vector used to decide it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repair_id: str
+    from_phase: str
+    target_phase: str
+    source_attempt_id: str
+    reason_code: str
+    failure_signature: str
+    hypothesis: str
+    evidence_refs: tuple[str, ...] = ()
+    state_vector: dict[str, int] = Field(default_factory=dict)
+    accepted: bool
+    decision_reason: str = ""
+
+
 class ToolObservation(BaseModel):
     """A preserved WS0 result observed by the engine."""
 
@@ -131,6 +158,9 @@ class RunEvidenceState(BaseModel):
     _blockers: list[BlockerRecord] = PrivateAttr(default_factory=list)
     _blocker_events: list[BlockerRecord] = PrivateAttr(default_factory=list)
     _action_attempts: list[ActionAttempt] = PrivateAttr(default_factory=list)
+    _phase_evidence_events: list[PhaseEvidenceEvent] = PrivateAttr(default_factory=list)
+    _phase_evidence_refs: dict[str, set[str]] = PrivateAttr(default_factory=dict)
+    _repair_records: list[RepairRecord] = PrivateAttr(default_factory=list)
     _tool_observations: list[ToolObservation] = PrivateAttr(default_factory=list)
     _observation_execution_ids: set[str] = PrivateAttr(default_factory=set)
     _validator_findings: list[EvidenceFinding] = PrivateAttr(default_factory=list)
@@ -169,6 +199,16 @@ class RunEvidenceState(BaseModel):
     @property
     def action_attempts(self) -> tuple[ActionAttempt, ...]:
         return tuple(_snapshot(attempt) for attempt in self._action_attempts)
+
+    @computed_field
+    @property
+    def phase_evidence_events(self) -> tuple[PhaseEvidenceEvent, ...]:
+        return tuple(_snapshot(event) for event in self._phase_evidence_events)
+
+    @computed_field
+    @property
+    def repair_records(self) -> tuple[RepairRecord, ...]:
+        return tuple(_snapshot(record) for record in self._repair_records)
 
     @computed_field
     @property
@@ -271,6 +311,44 @@ class RunEvidenceState(BaseModel):
             fact=_snapshot(fact),
         )
 
+    def set_fact(
+        self,
+        key: str,
+        value: Any,
+        *,
+        evidence_ref: str,
+        scope: StateScope | None = None,
+    ) -> StateEpochDelta:
+        """Register an engine/validator fact through a stable dotted-key seam."""
+        if not str(evidence_ref).strip():
+            raise ValueError("validated facts require a nonblank evidence ref")
+        if scope is None:
+            prefix = str(key).partition(".")[0]
+            scope = {
+                "provision": StateScope.ENVIRONMENT,
+                "environment": StateScope.ENVIRONMENT,
+                "dependencies": StateScope.DEPENDENCIES,
+                "build": StateScope.ARTIFACTS,
+                "artifacts": StateScope.ARTIFACTS,
+                "test": StateScope.TEST_RUNTIME,
+                "analysis": StateScope.PROJECT_ANALYSIS,
+                "project": StateScope.PROJECT_ANALYSIS,
+            }.get(prefix, StateScope.PROJECT_ANALYSIS)
+        return self.register_fact(StateScope(scope), str(key), value, str(evidence_ref))
+
+    def fact_value(self, key: str, default: Any = None) -> Any:
+        """Return the latest verified canonical fact with this key."""
+        for fact in reversed(self._facts):
+            if fact.key == key and fact.status is FactStatus.VERIFIED:
+                return copy.deepcopy(fact.value)
+        return copy.deepcopy(default)
+
+    def fact_provenance(self, key: str) -> str | None:
+        for fact in reversed(self._facts):
+            if fact.key == key and fact.status is FactStatus.VERIFIED:
+                return fact.provenance
+        return None
+
     def record_blocker(
         self,
         *,
@@ -330,6 +408,59 @@ class RunEvidenceState(BaseModel):
         )
         self._action_attempts.append(attempt)
         return _snapshot(attempt)
+
+    def record_phase_evidence(
+        self,
+        attempt_id: str,
+        evidence_refs: Iterable[str],
+    ) -> PhaseEvidenceEvent:
+        """Append refs produced while an attempt is open; never reassign old refs."""
+        self._require_mutable()
+        normalized_attempt = str(attempt_id).strip()
+        if not normalized_attempt:
+            raise ValueError("phase evidence event requires an attempt id")
+        normalized = tuple(
+            dict.fromkeys(str(ref).strip() for ref in evidence_refs if str(ref).strip())
+        )
+        if not normalized:
+            raise ValueError("phase evidence event requires at least one evidence ref")
+        known = self._phase_evidence_refs.setdefault(normalized_attempt, set())
+        fresh = tuple(ref for ref in normalized if ref not in known)
+        known.update(normalized)
+        event = PhaseEvidenceEvent(
+            attempt_id=normalized_attempt,
+            evidence_refs=fresh or normalized,
+        )
+        self._phase_evidence_events.append(event)
+        return _snapshot(event)
+
+    def evidence_refs_for_attempt(self, attempt_id: str) -> tuple[str, ...]:
+        return tuple(sorted(self._phase_evidence_refs.get(str(attempt_id), set())))
+
+    def record_repair(
+        self,
+        request: Any,
+        *,
+        state_vector: Mapping[str, int],
+        accepted: bool,
+        decision_reason: str = "",
+    ) -> RepairRecord:
+        self._require_mutable()
+        record = RepairRecord(
+            repair_id=f"repair_{len(self._repair_records) + 1}",
+            from_phase=str(request.from_phase),
+            target_phase=str(request.target_phase),
+            source_attempt_id=str(request.source_attempt_id),
+            reason_code=str(request.reason_code),
+            failure_signature=str(request.failure_signature),
+            hypothesis=str(request.hypothesis),
+            evidence_refs=tuple(request.evidence_refs),
+            state_vector={str(key): int(value) for key, value in state_vector.items()},
+            accepted=bool(accepted),
+            decision_reason=str(decision_reason),
+        )
+        self._repair_records.append(record)
+        return _snapshot(record)
 
     def record_conflict(self, conflict: str) -> None:
         """Record an engine-observed conflict without fabricating tool evidence."""
@@ -468,6 +599,10 @@ class RunEvidenceState(BaseModel):
         self._phase_records.append(detached)
         self._phase_record_ids.add(detached.attempt_id)
         return _snapshot(detached)
+
+    def record_phase_attempt(self, record: PhaseAttemptRecord) -> PhaseAttemptRecord:
+        """Named WS3 seam; phase attempts and skips share append-only storage."""
+        return self.record_phase_record(record)
 
     def seal(self, *, finalized_at: str, close_reason: str | None = None) -> None:
         """Close evidence collection permanently at the evidence-close boundary."""

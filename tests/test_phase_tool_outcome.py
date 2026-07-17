@@ -6,7 +6,11 @@ from sag.tools.phase_tool import PhaseTool
 
 
 def _tool(gate_result):
-    machine = SimpleNamespace(current_phase="build", is_complete=False)
+    machine = SimpleNamespace(
+        current_phase="build",
+        current_attempt_id="build-1",
+        is_complete=False,
+    )
     return PhaseTool(
         machine=machine,
         validator=None,
@@ -81,3 +85,48 @@ def test_phase_schema_requires_outcome_for_terminal_claims_semantically():
         "failed",
     ]
     assert "skipped" not in schema["properties"]["outcome"]["enum"]
+
+
+def test_repair_emits_typed_proposal_without_gate_or_state_mutation():
+    result = _tool(_gate()).execute(
+        action="repair",
+        target_phase="analyze",
+        reason_code="manifest_incomplete",
+        failure_signature="missing-root-manifest",
+        hypothesis="re-analysis will discover the actual reactor root",
+        evidence=["output_9"],
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["phase_signal"] == "repair"
+    assert result.metadata["repair_request"] == {
+        "from_phase": "build",
+        "target_phase": "analyze",
+        "source_attempt_id": "build-1",
+        "reason_code": "manifest_incomplete",
+        "failure_signature": "missing-root-manifest",
+        "hypothesis": "re-analysis will discover the actual reactor root",
+        "evidence_refs": ["output_9"],
+    }
+
+
+def test_repair_requires_current_attempt_evidence_and_forbids_outcome():
+    no_evidence = _tool(_gate()).execute(
+        action="repair",
+        target_phase="analyze",
+        reason_code="manifest_incomplete",
+        failure_signature="missing-root-manifest",
+        hypothesis="inspect manifests again",
+    )
+    with_outcome = _tool(_gate()).execute(
+        action="repair",
+        outcome="failed",
+        target_phase="analyze",
+        reason_code="manifest_incomplete",
+        failure_signature="missing-root-manifest",
+        hypothesis="inspect manifests again",
+        evidence=["output_9"],
+    )
+
+    assert no_evidence.error_code == "phase_repair_invalid"
+    assert with_outcome.error_code == "phase_repair_outcome_forbidden"

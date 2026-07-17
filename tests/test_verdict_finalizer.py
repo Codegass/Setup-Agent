@@ -640,6 +640,8 @@ def test_phase_records_are_preserved_as_detached_audit_history():
 
     actual = snapshot.model_dump(mode="json")["phase_records"]
     expected_json = json.loads(json.dumps(expected, default=lambda value: value.value))
+    for record in expected_json:
+        record["prerequisite_ref"] = ""
     assert actual == expected_json
     assert snapshot.verdict == "partial", "phase outcomes are audit-only verdict inputs"
 

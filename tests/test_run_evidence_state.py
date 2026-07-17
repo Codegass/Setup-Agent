@@ -3,6 +3,7 @@ import json
 import pytest
 
 from sag.agent.evidence_state import FactStatus, RunEvidenceState, StateScope
+from sag.agent.phase_transitions import RepairRequest
 from sag.evidence import EvidenceFinding, EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
 
@@ -71,6 +72,8 @@ def test_model_dump_contains_complete_deterministic_evidence_snapshot():
         "blockers",
         "blocker_events",
         "action_attempts",
+        "phase_evidence_events",
+        "repair_records",
         "tool_observations",
         "validator_findings",
         "conflicts",
@@ -215,6 +218,64 @@ def test_record_attempt_appends_a_state_vector_snapshot():
 
     assert state.action_attempts == (attempt,)
     assert attempt.state_vector == {"environment": 1, "test_runtime": 0}
+
+
+def test_phase_evidence_refs_are_scoped_to_the_attempt_that_created_them():
+    state = RunEvidenceState(run_id="r1")
+
+    state.record_phase_evidence("test-1", ["output_1", "output_2"])
+    state.record_phase_evidence("test-2", ["output_3"])
+
+    assert state.evidence_refs_for_attempt("test-1") == ("output_1", "output_2")
+    assert state.evidence_refs_for_attempt("test-2") == ("output_3",)
+    assert len(state.phase_evidence_events) == 2
+
+
+def test_validator_fact_latest_value_and_provenance_drive_prerequisites():
+    state = RunEvidenceState(run_id="r1")
+
+    state.set_fact(
+        "build.test_entry_ready",
+        False,
+        evidence_ref="artifact://missing",
+    )
+    state.set_fact(
+        "build.test_entry_ready",
+        True,
+        evidence_ref="artifact://classpath",
+    )
+
+    assert state.fact_value("build.test_entry_ready") is True
+    assert state.fact_provenance("build.test_entry_ready") == "artifact://classpath"
+    assert state.state_vector([StateScope.ARTIFACTS]) == {"artifacts": 2}
+
+
+def test_repair_decisions_are_append_only():
+    state = RunEvidenceState(run_id="r1")
+    request = RepairRequest(
+        from_phase="test",
+        target_phase="build",
+        source_attempt_id="test-1",
+        reason_code="missing_artifact",
+        failure_signature="missing:module-a",
+        hypothesis="install will publish module-a",
+        evidence_refs=("output_1",),
+    )
+
+    accepted = state.record_repair(
+        request,
+        state_vector={"artifacts": 1},
+        accepted=True,
+    )
+    rejected = state.record_repair(
+        request,
+        state_vector={"artifacts": 1},
+        accepted=False,
+        decision_reason="repair_without_progress",
+    )
+
+    assert state.repair_records == (accepted, rejected)
+    assert rejected.decision_reason == "repair_without_progress"
 
 
 def test_ingest_tool_result_preserves_the_observation_and_only_registers_verified_facts():

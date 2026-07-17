@@ -114,6 +114,7 @@ class PhaseRecordSnapshot(BaseModel):
     validated_outcome: str
     claim_disposition: str | None = None
     legacy_claim: bool = False
+    prerequisite_ref: str = ""
 
     @model_validator(mode="before")
     @classmethod

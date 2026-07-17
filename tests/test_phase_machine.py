@@ -3,13 +3,16 @@ advancement, always-available escape valve, honest records."""
 
 import pytest
 
+from sag.agent.phase_gates import ValidatorState, validate_phase_claim
 from sag.agent.phase_machine import (
     PHASE_NAMES,
     PhaseAttemptRecord,
+    PhaseClaim,
     PhaseMachine,
     PhaseOutcome,
     PhaseTermination,
 )
+from sag.agent.phase_transitions import PhaseRoute, TransitionDecision
 
 
 def test_phase_order_is_fixed():
@@ -96,3 +99,42 @@ def test_digest_lines_for_prompt():
     lines = m.digest_lines()
     assert any("provision" in l and "JDK 17" in l for l in lines)
     assert any("analyze" in l and ("current" in l.lower() or "→" in l) for l in lines)
+
+
+def test_invalid_transition_leaves_pending_attempt_and_history_unchanged():
+    machine = PhaseMachine(start_phase="build")
+    gate = validate_phase_claim(
+        PhaseClaim(
+            phase="build",
+            claimed_outcome=PhaseOutcome.SUCCESS,
+        ),
+        ValidatorState.GREEN,
+    )
+    record = machine.close_attempt(gate)
+    invalid = TransitionDecision(
+        route=PhaseRoute(
+            kind="advance",
+            source_attempt_id=record.attempt_id,
+            target="not-a-phase",
+            reason_code="invalid_target",
+        )
+    )
+
+    with pytest.raises(ValueError, match="target is not a phase"):
+        machine.apply(invalid)
+
+    assert machine.records == ()
+    assert machine.current_phase == "build"
+    assert machine.current_record == record
+
+    valid = TransitionDecision(
+        route=PhaseRoute(
+            kind="advance",
+            source_attempt_id=record.attempt_id,
+            target="test",
+            reason_code="test_entry_ready",
+        )
+    )
+    machine.apply(valid)
+    assert machine.current_phase == "test"
+    assert [item.attempt_id for item in machine.records] == ["build-1"]

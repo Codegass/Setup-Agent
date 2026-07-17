@@ -252,7 +252,8 @@ _JAVA_BUILD_OBJECTIVE_SNAPSHOT = (
     "Recommended Build when it differs from a plain root compile — an aggregator "
     "root over Groovy modules needs build(action='package'/'install'), and a "
     "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
-    "compile target (a packaging/meta-project), phase(action='blocked') with that "
+    "compile target (a packaging/meta-project), phase(action='blocked', "
+    "outcome='unknown', ...) with that "
     "evidence instead of forcing a compile. If compilation fails on missing "
     "dependencies, build(action='deps') can resolve them — but do not run deps "
     "first by default (multi-module reactors can fail dependency resolution while "
@@ -266,7 +267,7 @@ def test_python_build_objective_forbids_blocking_on_missing_java_target():
     assert "build(action='deps')" in obj
     assert "build(action='compile')" in obj
     assert "no Java compile target" in obj
-    assert "NOT grounds for phase(action='blocked')" in obj
+    assert "NOT grounds for phase(action='blocked', outcome='failed'" in obj
     assert obj != PHASE_OBJECTIVES["build"]
 
 
@@ -320,7 +321,7 @@ def test_build_intro_uses_python_objective_for_python_project():
         }
     )
     intro = engine._phase_intro_step().content
-    assert "NOT grounds for phase(action='blocked')" in intro
+    assert "NOT grounds for phase(action='blocked', outcome='failed'" in intro
     assert "Make the project compile" not in intro
 
 

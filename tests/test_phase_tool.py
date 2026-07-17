@@ -1,5 +1,5 @@
 # tests/test_phase_tool.py
-"""phase(action: done|blocked|note) - the model's entire lifecycle surface."""
+"""phase(action: done|blocked|note|repair) lifecycle surface."""
 
 from types import SimpleNamespace
 
@@ -59,7 +59,7 @@ def test_done_passes_gate_and_signals_engine():
 
     assert result.succeeded is True
     assert result.metadata["phase_signal"] == "done"
-    assert result.metadata["key_results"] == "compiled 115 classes"
+    assert result.metadata["phase_claim"]["key_results"] == "compiled 115 classes"
     assert gate.calls == ["build"]
 
 
@@ -94,7 +94,7 @@ def test_external_blocked_claim_is_accepted_when_evidence_is_unavailable():
 
     assert result.succeeded is True
     assert result.metadata["phase_signal"] == "blocked"
-    assert result.metadata["reason"] == "develocity plugin unresolvable"
+    assert result.metadata["phase_claim"]["reason"] == "develocity plugin unresolvable"
     assert result.metadata["gate_result"]["validated_outcome"] == "unknown"
     assert gate.calls == ["build"]
 

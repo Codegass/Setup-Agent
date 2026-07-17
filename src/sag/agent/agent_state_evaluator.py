@@ -486,11 +486,13 @@ class AgentStateEvaluator:
                     f"If the current phase's objective is met, record it now:\n\n"
                     f"phase(\n"
                     f"    action='done',\n"
+                    f"    outcome='success|partial|failed|unknown',\n"
                     f"    key_results='[numbers/paths the next phase needs]',\n"
                     f"    evidence=[output refs]\n"
                     f")\n\n"
-                    f"If the objective cannot be finished, phase(action='blocked', "
-                    f"reason=..., evidence=[refs]) — an honest blocked outcome "
+                    f"For an external impediment, phase(action='blocked', "
+                    f"outcome='failed|partial|unknown', reason=..., evidence=[refs]) — "
+                    f"an honest blocked outcome "
                     f"beats drifting into unrecorded work."
                 )
                 return AgentStateAnalysis(

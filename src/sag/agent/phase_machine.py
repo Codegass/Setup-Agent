@@ -1,11 +1,12 @@
 """Engine-owned phase lifecycle records for ``sag project``."""
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Mapping, Optional
 
 if TYPE_CHECKING:
     from .phase_gates import GateResult
+    from .phase_transitions import TransitionDecision
 
 PHASE_NAMES = ["provision", "analyze", "build", "test", "report"]
 
@@ -85,14 +86,19 @@ class PhaseClaim:
         }
 
     @classmethod
-    def from_metadata(cls, value: dict[str, Any]) -> "PhaseClaim":
+    def from_metadata(cls, value: Mapping[str, Any]) -> "PhaseClaim":
+        if not isinstance(value, Mapping):
+            raise TypeError("phase claim metadata must be a mapping")
+        evidence_refs = value.get("evidence_refs") or ()
+        if isinstance(evidence_refs, str) or not isinstance(evidence_refs, (list, tuple)):
+            raise TypeError("phase claim evidence refs must be a list")
         return cls(
             phase=str(value.get("phase") or ""),
             signal=str(value.get("signal") or "done"),
             claimed_outcome=value.get("claimed_outcome", PhaseOutcome.UNKNOWN),
             key_results=str(value.get("key_results") or ""),
             reason=str(value.get("reason") or ""),
-            evidence_refs=tuple(value.get("evidence_refs") or ()),
+            evidence_refs=tuple(evidence_refs),
         )
 
 
@@ -147,12 +153,48 @@ class PhaseAttemptRecord:
 class PhaseSkipRecord(PhaseAttemptRecord):
     termination: PhaseTermination | str = field(default=PhaseTermination.SKIPPED, init=False)
     outcome: PhaseOutcome | str = field(default=PhaseOutcome.SKIPPED, init=False)
+    prerequisite_ref: str = ""
+    _policy_token: InitVar[object | None] = None
+
+    def __post_init__(self, _policy_token: object | None) -> None:
+        if _policy_token is not _PHASE_POLICY_TOKEN:
+            raise PermissionError("only the transition policy may construct skipped phase records")
+        super().__post_init__()
+
+
+_PHASE_POLICY_TOKEN = object()
+
+
+def _policy_skip_record(
+    *,
+    phase: str,
+    attempt_id: str,
+    reason: str,
+    evidence_refs: tuple[str, ...] = (),
+    prerequisite_ref: str = "",
+) -> PhaseSkipRecord:
+    """Restricted construction seam used only by ``PhaseTransitionPolicy``."""
+    return PhaseSkipRecord(
+        phase=phase,
+        attempt_id=attempt_id,
+        transition="policy",
+        reason=reason,
+        evidence_refs=evidence_refs,
+        prerequisite_ref=prerequisite_ref,
+        _policy_token=_PHASE_POLICY_TOKEN,
+    )
 
 
 class PhaseMachine:
-    def __init__(self):
-        self._index = 0
+    def __init__(self, *, start_phase: str = "provision"):
+        if start_phase not in PHASE_NAMES:
+            raise ValueError(f"unknown start phase: {start_phase}")
+        self._current_phase: Optional[str] = start_phase
+        self._flow_closed = False
         self._records: List[PhaseAttemptRecord] = []
+        self._attempt_counts = {phase: 0 for phase in PHASE_NAMES}
+        self._current_attempt_id = self._open_attempt(start_phase)
+        self._pending_record: Optional[PhaseAttemptRecord] = None
 
     @property
     def records(self) -> tuple[PhaseAttemptRecord, ...]:
@@ -160,15 +202,45 @@ class PhaseMachine:
 
     @property
     def current_phase(self) -> Optional[str]:
-        return PHASE_NAMES[self._index] if self._index < len(PHASE_NAMES) else None
+        return self._current_phase
+
+    @property
+    def current_attempt_id(self) -> Optional[str]:
+        return self._current_attempt_id
+
+    @property
+    def current_record(self) -> Optional[PhaseAttemptRecord]:
+        if self._pending_record is not None:
+            return self._pending_record
+        if self._current_phase is None or self._current_attempt_id is None:
+            return None
+        return PhaseAttemptRecord(
+            phase=self._current_phase,
+            attempt_id=self._current_attempt_id,
+            termination=PhaseTermination.RUNNING,
+            outcome=PhaseOutcome.UNKNOWN,
+        )
 
     @property
     def is_complete(self) -> bool:
-        return self._index >= len(PHASE_NAMES)
+        return self._flow_closed
+
+    def _open_attempt(self, phase: str) -> str:
+        self._attempt_counts[phase] += 1
+        return f"{phase}-{self._attempt_counts[phase]}"
 
     def _advance(self, record: PhaseAttemptRecord) -> None:
+        """Replay-only adapter for pre-WS3 transcripts and fixtures."""
         self._append(record)
-        self._index += 1
+        index = PHASE_NAMES.index(record.phase)
+        if index + 1 >= len(PHASE_NAMES):
+            self._current_phase = None
+            self._current_attempt_id = None
+            self._flow_closed = True
+            return
+        target = PHASE_NAMES[index + 1]
+        self._current_phase = target
+        self._current_attempt_id = self._open_attempt(target)
 
     def _append(self, record: PhaseAttemptRecord) -> None:
         if self.is_complete:
@@ -180,7 +252,9 @@ class PhaseMachine:
         self._records.append(record)
 
     def _attempt_id(self) -> str:
-        return f"{self.current_phase}-{len(self._records) + 1}"
+        if self._current_attempt_id is None:
+            raise RuntimeError("phase machine has no open attempt")
+        return self._current_attempt_id
 
     def close_attempt(
         self,
@@ -188,7 +262,11 @@ class PhaseMachine:
         *,
         termination: PhaseTermination | str | None = None,
     ) -> PhaseAttemptRecord:
-        """Append a validated terminal record without selecting a transition."""
+        """Close the open attempt pending a separate transition-policy decision."""
+        if self.is_complete or self.current_phase is None:
+            raise RuntimeError("phase machine already complete")
+        if self._pending_record is not None:
+            raise RuntimeError("phase attempt already awaits a transition decision")
         if not validation.accepted:
             raise ValueError("a rejected phase claim cannot close an attempt")
         claim = validation.claim
@@ -217,8 +295,55 @@ class PhaseMachine:
             validated_outcome=validation.validated_outcome,
             claim_disposition=validation.claim_disposition.value,
         )
-        self._append(record)
+        self._pending_record = record
         return record
+
+    def apply(self, decision: "TransitionDecision") -> tuple[PhaseAttemptRecord, ...]:
+        """Atomically append the pending attempt, skips, and open the decided route."""
+        if self._pending_record is None:
+            raise RuntimeError("no validated phase attempt awaits routing")
+        route = decision.route
+        pending = self._pending_record
+        if route.source_attempt_id != pending.attempt_id:
+            raise ValueError("transition source does not match the pending phase attempt")
+        if route.kind in {"advance", "repair", "report"} and route.target not in PHASE_NAMES:
+            raise ValueError(f"transition target is not a phase: {route.target!r}")
+        skip_ids: set[str] = set()
+        existing_ids = {record.attempt_id for record in self._records}
+        for skip in decision.skips:
+            if not isinstance(skip, PhaseSkipRecord):
+                raise TypeError("transition skips must be PhaseSkipRecord instances")
+            if skip.phase not in PHASE_NAMES:
+                raise ValueError(f"transition skip is not a phase: {skip.phase!r}")
+            if skip.attempt_id in existing_ids or skip.attempt_id in skip_ids:
+                raise ValueError(f"duplicate phase attempt id: {skip.attempt_id}")
+            skip_ids.add(skip.attempt_id)
+
+        transition = f"{route.kind}:{route.reason_code}"
+        finalized = replace(pending, transition=transition)
+        self._records.append(finalized)
+        appended: list[PhaseAttemptRecord] = [finalized]
+        for skip in decision.skips:
+            self._records.append(skip)
+            appended.append(skip)
+
+        if route.kind in {"advance", "repair"}:
+            self._current_phase = route.target
+            self._current_attempt_id = self._open_attempt(route.target)
+        elif route.kind == "evidence_close":
+            self._current_phase = "report"
+            self._current_attempt_id = self._open_attempt("report")
+        elif route.kind == "report":
+            self._current_phase = "report"
+            self._current_attempt_id = self._open_attempt("report")
+        elif route.kind == "flow_close":
+            self._current_phase = None
+            self._current_attempt_id = None
+            self._flow_closed = True
+        else:
+            raise ValueError(f"unsupported phase route kind: {route.kind!r}")
+        self._pending_record = None
+        return tuple(appended)
 
     def record_model_skip(self, *, phase: str, reason: str) -> None:
         del phase, reason
@@ -267,6 +392,7 @@ class PhaseMachine:
             reason=reason or "setup phase aborted",
             evidence=list(evidence or []),
         )
+        self._pending_record = None
         self._append(record)
         return record
 
@@ -293,6 +419,8 @@ class PhaseMachine:
                     f"⛔ {record.phase} BLOCKED [{record.outcome.value}]: "
                     f"{record.reason[:200]}"
                 )
+            elif record.termination is PhaseTermination.SKIPPED:
+                lines.append(f"↷ {record.phase} SKIPPED: {record.reason[:200]}")
             else:
                 lines.append(f"⛔ {record.phase} ABORTED: {record.reason[:200]}")
         if not self.is_complete:

@@ -16,13 +16,12 @@ analyzer has run) via _recommended_build_line. Under test here:
 A. With a python build_recommendation on the trunk, the build-phase intro
    carries the explicit no-blocked python guidance and the test-phase intro
    carries the pytest guidance.
-B. With a maven recommendation, the build/test intros are BYTE-IDENTICAL to
-   the pre-change strings (full-intro snapshots below).
+B. With a maven recommendation, the build/test intros match the explicit-outcome
+   control-layer contract (full-intro snapshots below).
 C. The analyzer stores build_system='python' on the recommendation payload
    for a Python project, so the runtime signal is canonical.
 D. The kickoff plan template no longer unconditionally instructs blocking on
-   a missing Java compile target (conditional sentence), while the runtime
-   PHASE_OBJECTIVES stay byte-identical.
+   a missing Java compile target (conditional sentence).
 """
 
 import inspect
@@ -107,7 +106,7 @@ _MAVEN_ENV = {
 def test_build_intro_carries_no_blocked_python_guidance():
     intro = _engine_at(2, _python_env())._phase_intro_step().content
     assert PYTHON_BUILD_PHASE_GUIDANCE in intro
-    assert "NOT grounds for phase(action='blocked')" in intro
+    assert "NOT grounds for phase(action='blocked', outcome='failed'" in intro
     assert "build(action='deps') to create the venv" in intro
     assert "Never run pip/pytest via bash" in intro
 
@@ -137,24 +136,23 @@ def test_guidance_absent_without_python_signal():
 
 
 # ---------------------------------------------------------------------------
-# B. maven intros stay byte-identical (full pre-change snapshots)
+# B. maven intros preserve their domain guidance under the new phase contract
 # ---------------------------------------------------------------------------
 
-# Captured VERBATIM from _phase_intro_step on the pre-change code with the
-# _MAVEN_ENV fixture above. If these fail, the Java intro changed — out of
-# scope for the python fix and must be an intentional, separate change.
+# Contract snapshots from _phase_intro_step with the _MAVEN_ENV fixture above.
 _MAVEN_BUILD_INTRO_SNAPSHOT = (
     "=== PHASE: BUILD ===\n"
     "Run picture so far:\n"
-    "✓ provision: repo cloned; JDK 17 installed\n"
-    "✓ analyze: maven project analyzed\n"
+    "• provision [unknown]: repo cloned; JDK 17 installed\n"
+    "• analyze [unknown]: maven project analyzed\n"
     "→ current: build\n"
     "\n"
     "Objective: Make the project compile: build(action='compile'). Follow the "
     "analyzer's Recommended Build when it differs from a plain root compile — "
     "an aggregator root over Groovy modules needs build(action='package'/'install'), "
     "and a Gradle-primary project needs the Gradle build. If the analyzer reports "
-    "NO Java compile target (a packaging/meta-project), phase(action='blocked') "
+    "NO Java compile target (a packaging/meta-project), phase(action='blocked', "
+    "outcome='unknown', ...) "
     "with that evidence instead of forcing a compile. If compilation fails on "
     "missing dependencies, build(action='deps') can resolve them — but do not run "
     "deps first by default (multi-module reactors can fail dependency resolution "
@@ -163,17 +161,18 @@ _MAVEN_BUILD_INTRO_SNAPSHOT = (
     "Recommended Build: maven 'install' in /workspace/demo — Root Maven module "
     "has main sources.\n"
     "Budget: flexible — up to ~132 iterations available (a small reserve is kept "
-    "for later phases). When finished, call phase(action='done', key_results=..., "
-    "evidence=[refs]). If it cannot be finished, phase(action='blocked', "
-    "reason=..., evidence=[refs])."
+    "for later phases). When finished, call phase(action='done', "
+    "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+    "For an external impediment, call phase(action='blocked', "
+    "outcome='failed|partial|unknown', reason=..., evidence=[refs])."
 )
 
 _MAVEN_TEST_INTRO_SNAPSHOT = (
     "=== PHASE: TEST ===\n"
     "Run picture so far:\n"
-    "✓ provision: repo cloned; JDK 17 installed\n"
-    "✓ analyze: maven project analyzed\n"
-    "✓ build: compiled 120 classes\n"
+    "• provision [unknown]: repo cloned; JDK 17 installed\n"
+    "• analyze [unknown]: maven project analyzed\n"
+    "• build [unknown]: compiled 120 classes\n"
     "→ current: test\n"
     "\n"
     "Objective: Run the test suite: build(action='test'). Run it in the "
@@ -181,21 +180,22 @@ _MAVEN_TEST_INTRO_SNAPSHOT = (
     "module — and even a different build system — than the build, e.g. Gradle "
     "test modules beside a Maven build); otherwise use the build root. Partial "
     "pass above threshold is a valid outcome — report the numbers honestly in "
-    "key_results. If tests genuinely cannot run, phase(action='blocked') with "
-    "evidence.\n"
+    "key_results. If tests genuinely cannot run, phase(action='blocked', "
+    "outcome='failed', ...) with evidence.\n"
     "Budget: flexible — up to ~136 iterations available (a small reserve is kept "
-    "for later phases). When finished, call phase(action='done', key_results=..., "
-    "evidence=[refs]). If it cannot be finished, phase(action='blocked', "
-    "reason=..., evidence=[refs])."
+    "for later phases). When finished, call phase(action='done', "
+    "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+    "For an external impediment, call phase(action='blocked', "
+    "outcome='failed|partial|unknown', reason=..., evidence=[refs])."
 )
 
 
-def test_maven_build_intro_byte_identical_to_pre_change():
+def test_maven_build_intro_matches_control_layer_contract():
     intro = _engine_at(2, _MAVEN_ENV)._phase_intro_step().content
     assert intro == _MAVEN_BUILD_INTRO_SNAPSHOT
 
 
-def test_maven_test_intro_byte_identical_to_pre_change():
+def test_maven_test_intro_matches_control_layer_contract():
     intro = _engine_at(3, _MAVEN_ENV)._phase_intro_step().content
     assert intro == _MAVEN_TEST_INTRO_SNAPSHOT
 
@@ -251,7 +251,7 @@ def test_kickoff_build_objective_softens_blocking_to_conditional():
         "AND the project is not a Python/other-ecosystem project" in kickoff
     )
     # The Java meta-project escape hatch itself is kept, just made conditional.
-    assert "phase(action='blocked')" in kickoff
+    assert "phase(action='blocked', outcome='unknown'" in kickoff
 
 
 def test_kickoff_other_phases_identical_to_runtime_objectives():
@@ -431,9 +431,7 @@ def test_recommendation_fires_on_python_config_signal_alone():
     assert "Python project (poetry)" in rec["rationale"]
 
 
-# Captured VERBATIM from the pre-change code running the SAME scripted maven
-# repo through the SAME live chain. If these fail, Maven behavior changed —
-# out of scope for the python fix and must be an intentional, separate change.
+# Contract snapshots from the same scripted Maven repo and live chain.
 _MAVEN_LIVE_REC_SNAPSHOT = {
     "build_system": "maven",
     "build_root": _MAVEN_REPO_ROOT,
@@ -450,15 +448,16 @@ _MAVEN_LIVE_REC_SNAPSHOT = {
 _MAVEN_LIVE_BUILD_INTRO_SNAPSHOT = (
     "=== PHASE: BUILD ===\n"
     "Run picture so far:\n"
-    "✓ provision: repo cloned; JDK 17 installed\n"
-    "✓ analyze: maven project analyzed\n"
+    "• provision [unknown]: repo cloned; JDK 17 installed\n"
+    "• analyze [unknown]: maven project analyzed\n"
     "→ current: build\n"
     "\n"
     "Objective: Make the project compile: build(action='compile'). Follow the "
     "analyzer's Recommended Build when it differs from a plain root compile — "
     "an aggregator root over Groovy modules needs build(action='package'/'install'), "
     "and a Gradle-primary project needs the Gradle build. If the analyzer reports "
-    "NO Java compile target (a packaging/meta-project), phase(action='blocked') "
+    "NO Java compile target (a packaging/meta-project), phase(action='blocked', "
+    "outcome='unknown', ...) "
     "with that evidence instead of forcing a compile. If compilation fails on "
     "missing dependencies, build(action='deps') can resolve them — but do not run "
     "deps first by default (multi-module reactors can fail dependency resolution "
@@ -467,17 +466,18 @@ _MAVEN_LIVE_BUILD_INTRO_SNAPSHOT = (
     "Recommended Build: maven 'compile' in /workspace/demo — Root Maven module "
     "has main sources; compile at the root.\n"
     "Budget: flexible — up to ~132 iterations available (a small reserve is kept "
-    "for later phases). When finished, call phase(action='done', key_results=..., "
-    "evidence=[refs]). If it cannot be finished, phase(action='blocked', "
-    "reason=..., evidence=[refs])."
+    "for later phases). When finished, call phase(action='done', "
+    "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+    "For an external impediment, call phase(action='blocked', "
+    "outcome='failed|partial|unknown', reason=..., evidence=[refs])."
 )
 
 _MAVEN_LIVE_TEST_INTRO_SNAPSHOT = (
     "=== PHASE: TEST ===\n"
     "Run picture so far:\n"
-    "✓ provision: repo cloned; JDK 17 installed\n"
-    "✓ analyze: maven project analyzed\n"
-    "✓ build: compiled 120 classes\n"
+    "• provision [unknown]: repo cloned; JDK 17 installed\n"
+    "• analyze [unknown]: maven project analyzed\n"
+    "• build [unknown]: compiled 120 classes\n"
     "→ current: test\n"
     "\n"
     "Objective: Run the test suite: build(action='test'). Run it in the "
@@ -485,12 +485,13 @@ _MAVEN_LIVE_TEST_INTRO_SNAPSHOT = (
     "module — and even a different build system — than the build, e.g. Gradle "
     "test modules beside a Maven build); otherwise use the build root. Partial "
     "pass above threshold is a valid outcome — report the numbers honestly in "
-    "key_results. If tests genuinely cannot run, phase(action='blocked') with "
-    "evidence.\n"
+    "key_results. If tests genuinely cannot run, phase(action='blocked', "
+    "outcome='failed', ...) with evidence.\n"
     "Budget: flexible — up to ~136 iterations available (a small reserve is kept "
-    "for later phases). When finished, call phase(action='done', key_results=..., "
-    "evidence=[refs]). If it cannot be finished, phase(action='blocked', "
-    "reason=..., evidence=[refs])."
+    "for later phases). When finished, call phase(action='done', "
+    "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+    "For an external impediment, call phase(action='blocked', "
+    "outcome='failed|partial|unknown', reason=..., evidence=[refs])."
 )
 
 
@@ -499,7 +500,7 @@ def test_live_maven_recommendation_byte_identical_to_pre_change():
     assert env["build_recommendation"] == _MAVEN_LIVE_REC_SNAPSHOT
 
 
-def test_live_maven_intros_byte_identical_to_pre_change():
+def test_live_maven_intros_match_control_layer_contract():
     _, env = _analyzed_env(_MAVEN_REPO_ROOT, _MAVEN_REPO_FILES)
     build_intro = _engine_at(2, env)._phase_intro_step().content
     test_intro = _engine_at(3, env)._phase_intro_step().content

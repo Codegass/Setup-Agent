@@ -1,7 +1,12 @@
 import pytest
 
-from sag.agent.phase_gates import ClaimDisposition, ValidatorState, validate_phase_claim
-from sag.agent.phase_machine import PhaseOutcome
+from sag.agent.phase_gates import (
+    ClaimDisposition,
+    GateResult,
+    ValidatorState,
+    validate_phase_claim,
+)
+from sag.agent.phase_machine import PhaseMachine, PhaseOutcome
 
 
 @pytest.mark.parametrize(
@@ -68,9 +73,7 @@ def test_unknown_claim_is_refined_by_available_evidence():
 
 
 def test_record_outcome_always_comes_from_gate_not_claim():
-    machine = __import__(
-        "sag.agent.phase_machine", fromlist=["PhaseMachine"]
-    ).PhaseMachine()
+    machine = PhaseMachine()
     validation = validate_phase_claim(PhaseOutcome.FAILED, ValidatorState.GREEN)
 
     record = machine.close_attempt(validation)
@@ -78,3 +81,20 @@ def test_record_outcome_always_comes_from_gate_not_claim():
     assert record.claim.claimed_outcome is PhaseOutcome.FAILED
     assert record.validated_outcome is PhaseOutcome.SUCCESS
     assert record.outcome is PhaseOutcome.SUCCESS
+
+
+def test_gate_metadata_rejects_string_booleans_and_incoherent_outcomes():
+    metadata = validate_phase_claim(
+        PhaseOutcome.FAILED,
+        ValidatorState.RED,
+    ).to_metadata()
+    metadata["accepted"] = "false"
+
+    with pytest.raises(TypeError, match="boolean"):
+        GateResult.from_metadata(metadata)
+
+    metadata["accepted"] = True
+    metadata["claim_disposition"] = "confirmed"
+    metadata["validated_outcome"] = "success"
+    with pytest.raises(ValueError, match="validator state"):
+        GateResult.from_metadata(metadata)

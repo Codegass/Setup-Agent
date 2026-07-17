@@ -103,10 +103,8 @@ def test_phase_records_are_append_only_and_skip_has_its_own_type():
     assert machine.records[1].legacy_claim is True
     assert machine.records[1].termination is PhaseTermination.BLOCKED
     assert machine.records[1].outcome is PhaseOutcome.UNKNOWN
-    assert isinstance(
-        PhaseSkipRecord(phase="test", attempt_id="test-skip-1", transition="policy"),
-        PhaseSkipRecord,
-    )
+    with pytest.raises(PermissionError, match="transition policy"):
+        PhaseSkipRecord(phase="test", attempt_id="test-skip-1", transition="policy")
 
 
 def test_phase_record_evidence_and_history_reject_external_mutation():
