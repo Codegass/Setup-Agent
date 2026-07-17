@@ -10,7 +10,18 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Union, get_args, get_origin
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Union,
+    get_args,
+    get_origin,
+)
 from uuid import uuid4
 
 from loguru import logger
@@ -559,6 +570,23 @@ class UnpersistedToolResult(BaseModel):
     facts: Dict[str, Any] = Field(default_factory=dict)
     refs: List[str] = Field(default_factory=list)
     truncated: bool = False
+
+    @model_validator(mode="after")
+    def _enforce_serialized_size_limit(self) -> UnpersistedToolResult:
+        if _serialized_draft_size(self) > UNPERSISTED_DRAFT_MAX_BYTES:
+            raise ValueError("unpersisted draft exceeds serialized size limit")
+        return self
+
+    def model_copy(
+        self,
+        *,
+        update: Mapping[str, Any] | None = None,
+        deep: bool = False,
+    ) -> UnpersistedToolResult:
+        copied = super().model_copy(update=update, deep=deep)
+        if _serialized_draft_size(copied) > UNPERSISTED_DRAFT_MAX_BYTES:
+            raise ValueError("unpersisted draft exceeds serialized size limit")
+        return copied
 
     @classmethod
     def from_failed_construction(

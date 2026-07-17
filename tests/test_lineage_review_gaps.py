@@ -285,6 +285,33 @@ def test_unpersisted_draft_hard_cap_handles_300k_digit_test_count():
     assert draft.truncated is True
 
 
+def test_unpersisted_draft_direct_construction_enforces_hard_cap():
+    huge_count = 10**299_999
+
+    with pytest.raises(ValueError, match="serialized size limit"):
+        UnpersistedToolResult(
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            evidence_status=EvidenceStatus.CONFLICT,
+            test_stats=TestStats(
+                discovered=huge_count,
+                executed=huge_count,
+                passed=huge_count,
+            ),
+        )
+
+
+def test_unpersisted_draft_copy_cannot_bypass_hard_cap():
+    draft = UnpersistedToolResult(
+        invocation_status=InvocationStatus.COMPLETED,
+        operation_outcome=OperationOutcome.FAILED,
+        evidence_status=EvidenceStatus.CONFLICT,
+    )
+
+    with pytest.raises(ValueError, match="serialized size limit"):
+        draft.model_copy(update={"metadata": {"payload": "x" * 40_000}})
+
+
 def test_python_compatibility_smoke_has_no_user_specific_interpreter_path():
     source_path = ROOT / "tests" / "test_lineage_idempotence_followup.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
