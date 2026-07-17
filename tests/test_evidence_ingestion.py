@@ -49,6 +49,28 @@ class _ContainerJUnitOrchestrator(PythonOrchestrator):
         self.extraction_outputs = []
 
     def execute_command(self, cmd, workdir=None, timeout=None):
+        if "SAG_ATTEMPT_TAGGED" in cmd:
+            self.commands.append(cmd)
+            if self.junit_xml is None:
+                self.report_path.unlink(missing_ok=True)
+            else:
+                self.report_path.write_text(self.junit_xml, encoding="utf-8")
+            argv = shlex.split(cmd)
+            argv[0] = sys.executable
+            argv[-2] = str(self.report_path)
+            completed = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0:
+                self.junit_xml = self.report_path.read_text(encoding="utf-8")
+            return {
+                "success": completed.returncode == 0,
+                "exit_code": completed.returncode,
+                "output": completed.stdout or completed.stderr,
+            }
         if "xml.etree.ElementTree" in cmd:
             self.commands.append(cmd)
             if self.junit_xml is None:

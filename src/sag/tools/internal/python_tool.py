@@ -14,7 +14,6 @@ required for a green verdict.
 import json
 import re
 import shlex
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -94,6 +93,7 @@ _PYTEST_USAGE_HINT = (
 
 _OPERATIONS = ("setup_env", "test", "build", "compile")
 _PYTEST_JUNIT_CONFLICT = "pytest_junit_unavailable"
+_PYTEST_ATTEMPT_ID_CONFLICT = "pytest_attempt_id_unpersisted"
 _PYTEST_JUNIT_MAX_COUNT = (1 << 63) - 1
 _PYTEST_JUNIT_SUMMARY_MAX_BYTES = 512
 _PYTEST_JUNIT_ERROR_REASONS = frozenset(
@@ -154,6 +154,58 @@ if (
     unavailable("invalid_counts")
 
 emit({"ok": True, **counts})
+"""
+
+_PYTEST_ATTEMPT_TAG_SCRIPT = """\
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+attempt_id = int(sys.argv[2])
+if attempt_id < 1:
+    raise ValueError("attempt_id must be positive")
+
+tree = ET.parse(path)
+root = tree.getroot()
+
+def local_name(element):
+    return element.tag.rsplit("}", 1)[-1]
+
+def child_tag(parent, name):
+    if parent.tag.startswith("{"):
+        namespace = parent.tag.split("}", 1)[0] + "}"
+        return namespace + name
+    return name
+
+suite = root if local_name(root) == "testsuite" else next(
+    element for element in root.iter() if local_name(element) == "testsuite"
+)
+properties = next(
+    (child for child in suite if local_name(child) == "properties"),
+    None,
+)
+if properties is None:
+    properties = ET.Element(child_tag(suite, "properties"))
+    suite.insert(0, properties)
+property_element = next(
+    (
+        child
+        for child in properties
+        if local_name(child) == "property"
+        and child.attrib.get("name") == "sag.attempt_id"
+    ),
+    None,
+)
+if property_element is None:
+    property_element = ET.SubElement(properties, child_tag(properties, "property"))
+property_element.set("name", "sag.attempt_id")
+property_element.set("value", str(attempt_id))
+
+temporary = path + ".attempt.tmp"
+tree.write(temporary, encoding="utf-8", xml_declaration=True)
+os.replace(temporary, path)
+print("SAG_ATTEMPT_TAGGED")
 """
 
 
@@ -295,6 +347,7 @@ class PythonTool(BaseTool):
         )
         self.orchestrator = orchestrator
         self.command_tracker = command_tracker
+        self._test_attempt_counter = 0
 
     def execute(
         self,
@@ -568,7 +621,9 @@ class PythonTool(BaseTool):
         collected = self._parse_collected(collect.get("output") or "")
         self._write_collected(collected)
 
-        report = f"{PYTEST_REPORT_DIR}/pytest-{int(time.time())}.xml"
+        self._test_attempt_counter += 1
+        attempt_id = self._test_attempt_counter
+        report = f"{PYTEST_REPORT_DIR}/pytest-attempt-{attempt_id:06d}.xml"
         self.orchestrator.execute_command(f"mkdir -p {PYTEST_REPORT_DIR}")
         command = f"{python} -m pytest"
         if pytest_args:
@@ -580,6 +635,14 @@ class PythonTool(BaseTool):
         result = self._run(command, working_directory, timeout)
         exit_code = result.get("exit_code")
         output = result.get("output") or ""
+        attempt_tag_command = (
+            f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_ATTEMPT_TAG_SCRIPT)} "
+            f"{shlex.quote(report)} {attempt_id}"
+        )
+        attempt_tag_result = self.orchestrator.execute_command(attempt_tag_command)
+        attempt_tagged = attempt_tag_result.get("success")
+        if attempt_tagged is None:
+            attempt_tagged = attempt_tag_result.get("exit_code") == 0
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
         success, error, error_code = _classify_pytest_result(exit_code, output)
@@ -612,6 +675,7 @@ class PythonTool(BaseTool):
             "command": command,
             "exit_code": exit_code,
             "report": report,
+            "attempt_id": attempt_id,
             "collected": collected,
             "collected_json": COLLECTED_JSON,
             **junit_counts,
@@ -626,11 +690,20 @@ class PythonTool(BaseTool):
                 "status": "available",
                 "transport": "container_elementtree_json",
             }
+        metadata["junit_attempt_id"] = {
+            "status": "available" if attempt_tagged else "unavailable",
+            "value": attempt_id,
+        }
         raw_data = {
             **junit_counts,
             "junit_status": junit_error or "available",
         }
         result_conflicts = [_PYTEST_JUNIT_CONFLICT] if junit_error else []
+        # A wholly unavailable JUnit report already carries the stronger
+        # pytest_junit_unavailable conflict. Report attempt persistence as a
+        # separate conflict only when the XML was otherwise usable.
+        if not attempt_tagged and not junit_error:
+            result_conflicts.append(_PYTEST_ATTEMPT_ID_CONFLICT)
         tail = self._tail(output)
         if success:
             return self._finish(

@@ -17,10 +17,14 @@ command recorded. Contract under test:
 """
 
 import json
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 
 import sag.tools.internal.build_preflight as bp
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.python_tool import (
+    _PYTEST_ATTEMPT_TAG_SCRIPT,
     COLLECTED_JSON,
     PYTEST_REPORT_DIR,
     PythonTool,
@@ -247,6 +251,47 @@ def test_test_writes_collected_denominator_and_junitxml_report():
     collect = next(i for i, c in enumerate(orch.commands) if "--collect-only" in c)
     run = next(i for i, c in enumerate(orch.commands) if "--junitxml" in c)
     assert collect < run
+
+
+def test_test_assigns_monotonic_attempt_ids_and_persists_them_in_junit():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("--collect-only", ok("1 test collected in 0.01s"))],
+    )
+    tool = PythonTool(orch)
+
+    first = tool.execute("test", working_directory="/workspace/proj")
+    second = tool.execute("test", working_directory="/workspace/proj")
+
+    assert first.metadata["attempt_id"] == 1
+    assert second.metadata["attempt_id"] == 2
+    assert first.metadata["report"].endswith("pytest-attempt-000001.xml")
+    assert second.metadata["report"].endswith("pytest-attempt-000002.xml")
+    tag_commands = [command for command in orch.commands if "SAG_ATTEMPT_TAGGED" in command]
+    assert len(tag_commands) == 2
+    assert " 1" in tag_commands[0]
+    assert " 2" in tag_commands[1]
+
+
+def test_attempt_tag_script_writes_suite_property_atomically(tmp_path):
+    report = tmp_path / "report.xml"
+    report.write_text(
+        '<testsuites><testsuite tests="1"><testcase '
+        'classname="tests.test_api" name="test_ok"/></testsuite></testsuites>'
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _PYTEST_ATTEMPT_TAG_SCRIPT, str(report), "7"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    root = ET.parse(report).getroot()
+    properties = {element.get("name"): element.get("value") for element in root.iter("property")}
+    assert completed.stdout.strip() == "SAG_ATTEMPT_TAGGED"
+    assert properties["sag.attempt_id"] == "7"
+    assert not (tmp_path / "report.xml.attempt.tmp").exists()
 
 
 def test_pytest_failures_are_honest_and_never_rerun():
