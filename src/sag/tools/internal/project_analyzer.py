@@ -17,6 +17,7 @@ from ..base import BaseTool, ToolResult
 # Enforcer version accepts range syntax ([1.8,), [11,17)); capture the lower
 # bound including a legacy "1.x" form (the old \d+ captured "1" from "1.8").
 ENFORCER_JAVA_PATTERN = r"<requireJavaVersion>.*?<version>\s*\[?\s*(\d+(?:\.\d+)?)"
+PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 
 
 def _normalize_java_version(raw) -> Optional[str]:
@@ -260,6 +261,7 @@ class ProjectAnalyzerTool(BaseTool):
     def _perform_comprehensive_analysis(self, project_path: str) -> Dict[str, Any]:
         """Perform comprehensive project analysis."""
         analysis = {
+            "analyzer_version": PROJECT_ANALYZER_VERSION,
             "project_path": project_path,
             "project_type": "unknown",
             "build_system": "unknown",
@@ -337,6 +339,15 @@ class ProjectAnalyzerTool(BaseTool):
         # Step 5: 生成智能执行计划
         execution_plan = self._generate_execution_plan(analysis)
         analysis["execution_plan"] = execution_plan
+
+        # One deterministic role-typed composition pass owns all build/test
+        # planner guidance. Persistence failure is evidence, not a reason to
+        # discard an otherwise valid project analysis.
+        try:
+            self._compose_project_brief(project_path, analysis)
+        except Exception as exc:
+            analysis["project_brief_error"] = type(exc).__name__
+            logger.warning(f"Project brief composition failed: {exc}")
 
         return analysis
 
@@ -457,6 +468,7 @@ class ProjectAnalyzerTool(BaseTool):
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
         """分析项目文档，提取关键信息"""
         documentation = {
+            "source_path": None,
             "readme_content": "",
             "setup_instructions": [],
             "build_commands": [],
@@ -476,6 +488,7 @@ class ProjectAnalyzerTool(BaseTool):
             result = self.docker_orchestrator.execute_command(f"cat {project_path}/{readme_file}")
             if result.get("success"):
                 readme_content = result.get("output", "")
+                documentation["source_path"] = readme_file
                 logger.info(f"Successfully read {readme_file}")
                 break
 
@@ -1889,6 +1902,26 @@ PY"""
 
         write_build_requirements(self.docker_orchestrator, data)
 
+    def _compose_project_brief(
+        self,
+        project_path: str,
+        analysis: Dict[str, Any],
+    ):
+        """Compose and atomically publish the complete role-typed brief."""
+        from sag.agent.project_brief import ProjectBriefAdapter
+
+        artifact = ProjectBriefAdapter(
+            self.docker_orchestrator,
+            analyzer_version=str(
+                analysis.get("analyzer_version") or PROJECT_ANALYZER_VERSION
+            ),
+        ).compose(analysis, project_path=project_path)
+        analysis["project_brief"] = artifact.brief.model_dump(mode="json")
+        analysis["project_brief_ref"] = artifact.artifact_ref
+        analysis["project_brief_projection"] = artifact.planner_projection
+        analysis["project_brief_cache_hit"] = artifact.cache_hit
+        return artifact
+
     def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """
         Generate intelligent execution plan based on THREE CORE STEPS:
@@ -2364,6 +2397,18 @@ PY"""
                 f"at {build_recommendation.get('build_root')}"
             )
 
+        project_brief = analysis.get("project_brief") or {}
+        project_brief_projection = analysis.get("project_brief_projection")
+        project_brief_ref = analysis.get("project_brief_ref")
+        if project_brief and project_brief_projection and project_brief_ref:
+            trunk_context.environment_summary["project_brief_fingerprint"] = project_brief.get(
+                "input_fingerprint"
+            )
+            trunk_context.environment_summary["project_brief_projection"] = (
+                project_brief_projection
+            )
+            trunk_context.environment_summary["project_brief_ref"] = project_brief_ref
+
         static_test_count = analysis.get("static_test_count")
         if static_test_count is not None:
             trunk_context.environment_summary["static_test_count"] = static_test_count
@@ -2438,6 +2483,14 @@ PY"""
         build_system = analysis.get("build_system", "Unknown")
         output += f"📂 Project Type: {project_type}\n"
         output += f"🔧 Build System: {build_system}\n"
+        if analysis.get("project_brief_ref"):
+            fingerprint = (analysis.get("project_brief") or {}).get(
+                "input_fingerprint", "unknown"
+            )
+            output += (
+                f"🧾 Project Brief: {analysis['project_brief_ref']} "
+                f"(fingerprint {str(fingerprint)[:16]})\n"
+            )
 
         # Recommended build target — steer the build phase away from compiling an
         # empty aggregator root (e.g. Bigtop's packaging=pom over Groovy/Gradle).

@@ -50,6 +50,7 @@ from .phase_transitions import (
     RepairRequest,
     TransitionDecision,
 )
+from .project_brief import PROJECT_BRIEF_PATH, PROJECT_BRIEF_PROJECTION_CHARS
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
@@ -995,16 +996,21 @@ class ReActEngine(UIEventEmitter):
         # forward in analyze key_results (Bigtop: compile the right reactor/module,
         # or block honestly on a meta-project — don't compile an empty root).
         if phase in ("build", "test"):
-            rec_line = self._recommended_build_line(phase)
-            if rec_line:
-                lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
-            # Python guidance is injected HERE, at runtime, because this is
-            # the first text the model sees after the analyzer has recorded
-            # the project type — the kickoff plan (authored at t=0) still
-            # carries the generic text and cannot be trusted to correct it.
-            guidance = self._python_phase_guidance(phase)
-            if guidance:
-                lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
+            brief_projection = self._project_brief_projection()
+            if brief_projection:
+                lines.insert(
+                    lines.index(f"Objective: {objective}") + 1,
+                    brief_projection,
+                )
+            else:
+                rec_line = self._recommended_build_line(phase)
+                if rec_line:
+                    lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
+                # Backward-compatible fallback for analyzer state created
+                # before the role-typed brief existed.
+                guidance = self._python_phase_guidance(phase)
+                if guidance:
+                    lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
         handoff = getattr(self, "phase_handoff", None)
         projection = None
         if handoff is not None:
@@ -1051,6 +1057,21 @@ class ReActEngine(UIEventEmitter):
         except Exception:
             return {}
         return env.get("build_recommendation") or {}
+
+    def _project_brief_projection(self) -> Optional[str]:
+        """Return the analyzer's single bounded projection, never raw sections."""
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            env = getattr(trunk, "environment_summary", None) or {}
+        except Exception:
+            return None
+        projection = str(env.get("project_brief_projection") or "").strip()
+        if not projection:
+            return None
+        if len(projection) <= PROJECT_BRIEF_PROJECTION_CHARS:
+            return projection
+        ref = str(env.get("project_brief_ref") or PROJECT_BRIEF_PATH)
+        return f"PROJECT BRIEF projection exceeded its budget; read the complete brief: {ref}"
 
     def _python_phase_guidance(self, phase: str) -> Optional[str]:
         """Explicit python guidance block for the build/test intros, keyed off

@@ -36,10 +36,7 @@ from types import SimpleNamespace
 
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.phase_machine import PhaseMachine
-from sag.agent.react_engine import (
-    PYTHON_BUILD_PHASE_GUIDANCE,
-    ReActEngine,
-)
+from sag.agent.react_engine import ReActEngine
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
@@ -285,9 +282,9 @@ def _engine_at(phase_done_count, environment_summary):
 _NATIVE_FIRST_MARKERS = (
     "NATIVE core",
     "CMakeLists.txt at the repo root",
-    "build the native library FIRST",
+    "Build the native library FIRST",
     "will not import without it",
-    f"{_TVM_ROOT}/python",  # the detected python root, named in the guidance
+    "install the package from python",  # portable, project-relative package root
     "Long native builds detach; poll with search",
 )
 
@@ -297,56 +294,26 @@ def test_native_build_intro_prepends_native_first_block():
     intro = _engine_at(2, env)._phase_intro_step().content
     for marker in _NATIVE_FIRST_MARKERS:
         assert marker in intro, f"missing native-first marker: {marker!r}"
-    # The native-first block PRECEDES the ordinary python build guidance (it is
-    # a prepend, not a replacement — the deps/compile advice still follows).
-    assert PYTHON_BUILD_PHASE_GUIDANCE in intro
-    assert intro.index("build the native library FIRST") < intro.index(
-        PYTHON_BUILD_PHASE_GUIDANCE
+    # The native-first requirement PRECEDES the ordinary python deps/compile
+    # instruction in the single composed project brief.
+    assert "build(action='deps')" in intro
+    assert "build(action='compile')" in intro
+    assert intro.index("Build the native library FIRST") < intro.index(
+        "Python project: use build(action='deps')"
     )
 
 
-def test_plain_python_intro_has_no_native_text_and_matches_phase_contract():
-    """A plain-python repo must carry ZERO native text and its build intro must
-    be byte-identical to the same repo analyzed with the native path never
-    firing (snapshot below, captured from the plain-repo chain)."""
+def test_plain_python_intro_has_no_native_text_and_keeps_phase_contract_markers():
+    """Plain Python keeps its semantics without the native-only requirement."""
     env = _env_from(_analyzed(_PLAIN_ROOT, _PLAIN_FILES)[0])
     intro = _engine_at(2, env)._phase_intro_step().content
     assert "NATIVE core" not in intro
     assert "native library FIRST" not in intro
-    assert intro == _PLAIN_BUILD_INTRO_SNAPSHOT
-
-
-# Contract snapshot from the plain-python chain (no native path).
-_PLAIN_BUILD_INTRO_SNAPSHOT = (
-    "=== PHASE: BUILD ===\n"
-    "Run picture so far:\n"
-    "• provision [unknown]: repo cloned; toolchain installed\n"
-    "• analyze [unknown]: python project analyzed\n"
-    "→ current: build\n"
-    "\n"
-    "Objective: Set up the environment and install dependencies: "
-    "build(action='deps'), then verify byte-compilation with "
-    "build(action='compile'). A Python project has no Java compile target — "
-    "that is NOT grounds for phase(action='blocked', outcome='failed', ...). "
-    "Block only when the "
-    "environment or dependency install itself genuinely fails, with that "
-    "evidence. Never run pip/python via bash — build resolves the registered "
-    "toolchain. Long installs detach; poll the job ref with search.\n"
-    "This is a Python project — there is no Java compile target and that is "
-    "NOT grounds for phase(action='blocked', outcome='failed', ...). Do: "
-    "build(action='deps') to "
-    "create the venv and install dependencies with the project's own tool, "
-    "then build(action='compile') to verify byte-compilation. Never run "
-    "pip/pytest via bash — the build tool resolves the project venv.\n"
-    "Recommended Build: python 'deps' in /workspace/pyproj — Python project "
-    "(pip): create the venv and install with build(action='deps'), verify with "
-    "build(action='compile'), test with build(action='test').\n"
-    "Budget: flexible — up to ~132 iterations available (a small reserve is "
-    "kept for later phases). When finished, call phase(action='done', "
-    "outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
-    "For an external impediment, call phase(action='blocked', "
-    "outcome='failed|partial|unknown', reason=..., evidence=[refs])."
-)
+    assert intro.count("=== PROJECT BRIEF v1 ===") == 1
+    assert "build(action='deps')" in intro
+    assert "build(action='compile')" in intro
+    assert "root=. system=python goal=deps" in intro
+    assert "/workspace/.setup_agent/project_brief.json" in intro
 
 
 # ---------------------------------------------------------------------------
