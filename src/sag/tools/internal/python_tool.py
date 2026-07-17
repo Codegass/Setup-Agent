@@ -15,7 +15,6 @@ import json
 import re
 import shlex
 import time
-import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -94,42 +93,118 @@ _PYTEST_USAGE_HINT = (
 )
 
 _OPERATIONS = ("setup_env", "test", "build", "compile")
+_PYTEST_JUNIT_CONFLICT = "pytest_junit_unavailable"
+_PYTEST_JUNIT_MAX_COUNT = (1 << 63) - 1
+_PYTEST_JUNIT_SUMMARY_MAX_BYTES = 512
+_PYTEST_JUNIT_ERROR_REASONS = frozenset(
+    {
+        "missing",
+        "malformed",
+        "unreadable",
+        "unsupported",
+        "invalid_counts",
+        "extract_failed",
+    }
+)
+_PYTEST_JUNIT_EXTRACT_SCRIPT = """\
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+def unavailable(reason):
+    emit({"error": reason, "ok": False})
+    raise SystemExit(0)
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except FileNotFoundError:
+    unavailable("missing")
+except ET.ParseError:
+    unavailable("malformed")
+except OSError:
+    unavailable("unreadable")
+
+name = root.tag.rsplit("}", 1)[-1]
+if name == "testsuite":
+    suites = [root]
+elif name == "testsuites":
+    suites = [root] if "tests" in root.attrib else [
+        child for child in root if child.tag.rsplit("}", 1)[-1] == "testsuite"
+    ]
+else:
+    unavailable("unsupported")
+
+try:
+    counts = {
+        key: sum(int(suite.attrib.get(key, 0) or 0) for suite in suites)
+        for key in ("tests", "failures", "errors", "skipped")
+    }
+except (TypeError, ValueError, OverflowError):
+    unavailable("invalid_counts")
+
+if (
+    counts["tests"] <= 0
+    or any(value < 0 for value in counts.values())
+    or any(value > 9223372036854775807 for value in counts.values())
+    or counts["failures"] + counts["errors"] + counts["skipped"] > counts["tests"]
+):
+    unavailable("invalid_counts")
+
+emit({"ok": True, **counts})
+"""
 
 
-def _parse_pytest_junit(xml_text: str, discovered: Optional[int]) -> tuple[TestStats, dict]:
-    root = ET.fromstring(xml_text)
-    root_name = root.tag.rsplit("}", 1)[-1]
-    if root_name == "testsuite":
-        suites = [root]
-    elif root_name == "testsuites":
-        suites = (
-            [root]
-            if "tests" in root.attrib
-            else [child for child in root if child.tag.rsplit("}", 1)[-1] == "testsuite"]
-        )
-    else:
-        raise ValueError(f"unsupported JUnit root element: {root_name}")
+def _parse_pytest_junit_summary(
+    output: str,
+    discovered: Optional[int],
+) -> tuple[Optional[TestStats], Dict[str, int], Optional[str]]:
+    encoded = (output or "").strip().encode("utf-8", errors="replace")
+    if not encoded or len(encoded) > _PYTEST_JUNIT_SUMMARY_MAX_BYTES:
+        return None, {}, "extract_failed"
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, {}, "extract_failed"
+    if not isinstance(payload, dict):
+        return None, {}, "extract_failed"
+    if payload.get("ok") is not True:
+        reason = payload.get("error")
+        if reason not in _PYTEST_JUNIT_ERROR_REASONS:
+            reason = "extract_failed"
+        return None, {}, reason
 
-    def total(attribute: str) -> int:
-        return sum(int(suite.attrib.get(attribute, 0) or 0) for suite in suites)
+    keys = ("tests", "failures", "errors", "skipped")
+    if any(type(payload.get(key)) is not int for key in keys):
+        return None, {}, "invalid_counts"
+    executed, failures, errors, skipped = (payload[key] for key in keys)
+    if (
+        executed <= 0
+        or min(executed, failures, errors, skipped) < 0
+        or max(executed, failures, errors, skipped) > _PYTEST_JUNIT_MAX_COUNT
+        or failures + errors + skipped > executed
+    ):
+        return None, {}, "invalid_counts"
 
-    executed = total("tests")
-    failures = total("failures")
-    errors = total("errors")
-    skipped = total("skipped")
-    stats = TestStats(
-        discovered=discovered,
-        executed=executed,
-        passed=max(executed - failures - errors - skipped, 0),
-        failed=failures + errors,
-        skipped=skipped,
-    )
-    return stats, {
+    counts = {
         "tests": executed,
         "failed_tests": failures,
         "error_tests": errors,
         "skipped_tests": skipped,
     }
+    return (
+        TestStats(
+            discovered=discovered,
+            executed=executed,
+            passed=executed - failures - errors - skipped,
+            failed=failures + errors,
+            skipped=skipped,
+        ),
+        counts,
+        None,
+    )
 
 
 def _classify_pytest_result(
@@ -508,20 +583,18 @@ class PythonTool(BaseTool):
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
         success, error, error_code = _classify_pytest_result(exit_code, output)
-        report_result = self.orchestrator.execute_command(f"cat {shlex.quote(report)}")
-        test_stats = None
-        junit_counts: Dict[str, int] = {}
-        junit_parse_error = None
+        extraction_command = (
+            f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_JUNIT_EXTRACT_SCRIPT)} "
+            f"{shlex.quote(report)}"
+        )
+        report_result = self.orchestrator.execute_command(extraction_command)
         if report_result.get("success"):
-            try:
-                test_stats, junit_counts = _parse_pytest_junit(
-                    report_result.get("output") or "",
-                    collected,
-                )
-            except (ET.ParseError, TypeError, ValueError) as exc:
-                junit_parse_error = str(exc)
+            test_stats, junit_counts, junit_error = _parse_pytest_junit_summary(
+                report_result.get("output") or "",
+                collected,
+            )
         else:
-            junit_parse_error = "generated JUnit report could not be read"
+            test_stats, junit_counts, junit_error = None, {}, "extract_failed"
         if self.command_tracker:
             try:
                 self.command_tracker.track_test_command(
@@ -543,9 +616,21 @@ class PythonTool(BaseTool):
             "collected_json": COLLECTED_JSON,
             **junit_counts,
         }
-        if junit_parse_error:
-            metadata["junit_parse_error"] = junit_parse_error
-        raw_data = dict(junit_counts) if junit_counts else None
+        if junit_error:
+            metadata["junit_extraction"] = {
+                "status": "unavailable",
+                "reason": junit_error,
+            }
+        else:
+            metadata["junit_extraction"] = {
+                "status": "available",
+                "transport": "container_elementtree_json",
+            }
+        raw_data = {
+            **junit_counts,
+            "junit_status": junit_error or "available",
+        }
+        result_conflicts = [_PYTEST_JUNIT_CONFLICT] if junit_error else []
         tail = self._tail(output)
         if success:
             return self._finish(
@@ -556,6 +641,7 @@ class PythonTool(BaseTool):
                     metadata=metadata,
                     test_stats=test_stats,
                     evidence_refs=[report],
+                    conflicts=result_conflicts,
                 ),
                 preamble,
             )
@@ -569,6 +655,7 @@ class PythonTool(BaseTool):
                 metadata=metadata,
                 test_stats=test_stats,
                 evidence_refs=[report],
+                conflicts=result_conflicts,
             ),
             preamble,
         )

@@ -232,6 +232,7 @@ class BuildTool(BaseTool):
             "metadata": metadata,
             "test_stats": inner.test_stats,
             "evidence_refs": inner.evidence_refs,
+            "conflicts": inner.conflicts,
             "raw_output": raw_output,
             "raw_data": inner.raw_data,
         }

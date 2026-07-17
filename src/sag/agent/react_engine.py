@@ -2,6 +2,7 @@
 
 import json
 import re
+import shlex
 import time
 from typing import Any, Dict, List, Optional
 
@@ -512,6 +513,59 @@ class ReActEngine(UIEventEmitter):
 
     _NON_EVIDENCE_TOOLS = frozenset({"phase", "manage_context", "report"})
 
+    @staticmethod
+    def _backend_operation_tokens(params: Dict[str, Any]) -> List[str]:
+        values = [
+            params[key]
+            for key in ("command", "tasks", "task")
+            if params.get(key) not in (None, "", [])
+        ]
+        if not values:
+            values = [params.get("action")]
+
+        tokens: List[str] = []
+        pending = list(values)
+        while pending:
+            value = pending.pop(0)
+            if isinstance(value, (list, tuple, set)):
+                pending[0:0] = list(value)
+                continue
+            text = str(value or "").strip()
+            if not text:
+                continue
+            try:
+                tokens.extend(shlex.split(text))
+            except ValueError:
+                tokens.extend(text.split())
+        return tokens
+
+    @staticmethod
+    def _is_test_operation(token: str) -> bool:
+        if token.startswith("-"):
+            return False
+        leaf = token.rsplit(":", 1)[-1]
+        normalized = leaf.lower()
+        if normalized in {"test", "tests", "verify", "verify_tests", "check"}:
+            return True
+        if re.search(r"(?:^|[-_])tests?(?:$|[-_])", normalized):
+            return True
+        return bool(re.search(r"^test(?=$|[A-Z])", leaf) or re.search(r"Test(?=$|[A-Z])", leaf))
+
+    @staticmethod
+    def _is_dependency_operation(token: str) -> bool:
+        if token.startswith("-"):
+            return False
+        normalized = token.lower()
+        leaf = normalized.rsplit(":", 1)[-1]
+        return normalized.startswith("dependency:") or leaf in {
+            "deps",
+            "dependencies",
+            "dependency",
+            "dependencyinsight",
+            "resolve",
+            "install_dependencies",
+        }
+
     def _tool_evidence_scope(self, tool_name: str, params: Dict[str, Any]) -> StateScope:
         action = str((params or {}).get("action") or "").strip().lower()
         if tool_name in {"project", "project_analyzer"} and action == "analyze":
@@ -519,10 +573,11 @@ class ReActEngine(UIEventEmitter):
         if tool_name in {"project", "project_setup", "system", "env"}:
             return StateScope.ENVIRONMENT
         if tool_name in {"build", "maven", "gradle", "python"}:
-            if action in {"deps", "dependencies", "resolve", "install_dependencies"}:
-                return StateScope.DEPENDENCIES
-            if action in {"test", "tests", "verify_tests"}:
+            operations = self._backend_operation_tokens(params or {})
+            if any(self._is_test_operation(operation) for operation in operations):
                 return StateScope.TEST_RUNTIME
+            if any(self._is_dependency_operation(operation) for operation in operations):
+                return StateScope.DEPENDENCIES
             return StateScope.ARTIFACTS
 
         phase = getattr(getattr(self, "phase_machine", None), "current_phase", None)

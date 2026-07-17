@@ -1,9 +1,13 @@
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from test_python_tool import MANIFEST as PYTHON_MANIFEST
 from test_python_tool import Orch as PythonOrchestrator
+from test_python_tool import fail as command_fail
 from test_python_tool import ok as command_ok
 from test_verdict_finalizer import VERDICT_PATH, FakeVerdictOrchestrator
 
@@ -31,7 +35,46 @@ from sag.agent.verdict_finalizer import (
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
 from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_output_storage
 from sag.tools.build.build_tool import BuildTool
-from sag.tools.internal.python_tool import PythonTool
+from sag.tools.internal.python_tool import PYTEST_REPORT_DIR, PythonTool
+
+
+class _ContainerJUnitOrchestrator(PythonOrchestrator):
+    """Run the production in-container extractor against a local report file."""
+
+    def __init__(self, report_path, junit_xml, **kwargs):
+        super().__init__(**kwargs)
+        self.report_path = Path(report_path)
+        self.junit_xml = junit_xml
+        self.extraction_outputs = []
+
+    def execute_command(self, cmd, workdir=None, timeout=None):
+        if "xml.etree.ElementTree" in cmd:
+            self.commands.append(cmd)
+            if self.junit_xml is None:
+                self.report_path.unlink(missing_ok=True)
+            else:
+                self.report_path.write_text(self.junit_xml, encoding="utf-8")
+            argv = shlex.split(cmd)
+            argv[0] = sys.executable
+            argv[-1] = str(self.report_path)
+            completed = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.extraction_outputs.append(completed.stdout)
+            return {
+                "success": completed.returncode == 0,
+                "exit_code": completed.returncode,
+                "output": completed.stdout or completed.stderr,
+            }
+        if cmd.startswith("cat ") and PYTEST_REPORT_DIR in cmd:
+            self.commands.append(cmd)
+            if self.junit_xml is None:
+                return {"success": False, "exit_code": 1, "output": "missing"}
+            return command_ok(self.junit_xml[:30_000])
+        return super().execute_command(cmd, workdir=workdir)
 
 
 class _FailFirstAtomicWriteOrchestrator(FakeVerdictOrchestrator):
@@ -256,6 +299,111 @@ def test_recovery_ingests_original_and_replacement_under_their_actual_scopes(tmp
     assert snapshot.verdict == "failed"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "operation_params", "error_code"),
+    [
+        ("maven", {"command": "test"}, "BUILD_FAILED"),
+        ("gradle", {"tasks": ["clean", ":app:test"]}, "BUILD_FILE_NOT_FOUND"),
+    ],
+)
+def test_backend_test_recovery_keeps_both_attempts_in_test_scope(
+    tmp_path, tool_name, operation_params, error_code
+):
+    class RecoveringBackendTool(BaseTool):
+        def __init__(self):
+            super().__init__(tool_name, "backend recovery evidence")
+            self._parameter_schema = {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "task": {"type": "string"},
+                    "tasks": {"type": ["string", "array"], "items": {"type": "string"}},
+                    "working_directory": {"type": "string"},
+                },
+                "required": [],
+            }
+            self.calls = []
+            self.results = [
+                ToolResult.completed_failure(
+                    output="tests failed because the working directory was not found",
+                    error="working directory not found",
+                    error_code=error_code,
+                    test_stats=TestStats(
+                        discovered=5,
+                        executed=5,
+                        passed=3,
+                        failed=2,
+                        skipped=0,
+                    ),
+                ),
+                ToolResult.completed_success(
+                    output="all tests passed from the recovered working directory",
+                    test_stats=TestStats(
+                        discovered=5,
+                        executed=5,
+                        passed=5,
+                        failed=0,
+                        skipped=0,
+                    ),
+                ),
+            ]
+
+        def execute(self, **params) -> ToolResult:
+            self.calls.append(dict(params))
+            return self.results.pop(0)
+
+    engine, _ = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    tool = RecoveringBackendTool()
+    orchestrator = ToolOrchestrator(
+        tools={tool_name: tool},
+        context_manager=engine.context_manager,
+        recent_tool_executions=[],
+        successful_states={"working_directory": "/workspace/app"},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=engine.output_storage,
+    )
+    engine._get_tool_orchestrator = lambda: orchestrator
+    _prepare_action_execution(engine)
+    step = _action_step(tool_name, operation_params)
+
+    engine._execute_steps([step])
+
+    assert len(tool.calls) == 2
+    for field, value in operation_params.items():
+        assert [call[field] for call in tool.calls] == [value, value]
+    assert tool.calls[-1]["working_directory"] == "/workspace/app"
+    assert step.tool_result.succeeded is True
+    observations = [
+        observation
+        for observation in engine.run_evidence_state.tool_observations
+        if observation.tool_name == tool_name
+    ]
+    assert len(observations) == 2
+    assert [observation.scope for observation in observations] == [
+        StateScope.TEST_RUNTIME,
+        StateScope.TEST_RUNTIME,
+    ]
+    assert [observation.result.test_stats.failed for observation in observations] == [2, 0]
+
+    snapshot = engine.verdict_finalizer.finalize(
+        engine.run_evidence_state,
+        EvidenceCloseReason.TEST_TERMINATED,
+    )
+
+    assert snapshot.verdict == "success"
+    assert snapshot.test_stats.executed == 5
+    assert snapshot.test_stats.passed == 5
+    assert snapshot.test_stats.failed == 0
+    assert snapshot.test_stats.raw.executed == 10
+    assert snapshot.test_stats.raw.passed == 8
+    assert snapshot.test_stats.raw.failed == 2
+
+
 def test_guidance_only_recovery_does_not_fabricate_an_execution(tmp_path, monkeypatch):
     class FailingBuildTool(BaseTool):
         def __init__(self):
@@ -310,10 +458,106 @@ def test_guidance_only_recovery_does_not_fabricate_an_execution(tmp_path, monkey
     assert observations[0].result.error_code == "ORIGINAL_COMPILE_FAILED"
 
 
+def test_large_pytest_junit_is_reduced_to_bounded_counts_inside_container(tmp_path):
+    testcases = "\n".join(
+        f'    <testcase classname="tests.generated_{index:03d}" '
+        f'name="test_case_{index:03d}" time="0.001" />'
+        for index in range(474)
+    )
+    junit = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<testsuites tests="474" failures="2" errors="1" skipped="4">\n'
+        '  <testsuite name="pytest" tests="474" failures="2" errors="1" skipped="4">\n'
+        f"{testcases}\n"
+        "  </testsuite>\n"
+        "</testsuites>"
+    )
+    assert len(junit.encode("utf-8")) > 31_794
+    assert len(junit.splitlines()) > 474
+    orchestrator = _ContainerJUnitOrchestrator(
+        tmp_path / "large-pytest.xml",
+        junit,
+        manifest=dict(PYTHON_MANIFEST),
+        rules=[
+            ("--collect-only", command_ok("474 tests collected in 0.20s")),
+            (
+                "--junitxml",
+                command_fail("2 failed, 1 error, 4 skipped, 467 passed", exit_code=1),
+            ),
+        ],
+    )
+
+    result = PythonTool(orchestrator).execute("test", working_directory="/workspace/proj")
+
+    assert result.test_stats == TestStats(
+        discovered=474,
+        executed=474,
+        passed=467,
+        failed=3,
+        skipped=4,
+    )
+    assert result.metadata["failed_tests"] == 2
+    assert result.metadata["error_tests"] == 1
+    assert result.raw_data["failed_tests"] == 2
+    assert result.raw_data["error_tests"] == 1
+    assert not any(
+        command.startswith("cat ") and PYTEST_REPORT_DIR in command
+        for command in orchestrator.commands
+    )
+    assert orchestrator.extraction_outputs
+    assert max(len(output.encode("utf-8")) for output in orchestrator.extraction_outputs) < 256
+    assert all(junit not in command for command in orchestrator.commands)
+
+
+@pytest.mark.parametrize(
+    ("junit_xml", "reason"),
+    [
+        (None, "missing"),
+        ("<testsuites><testsuite>", "malformed"),
+        (
+            '<testsuite tests="9223372036854775808" failures="0" ' 'errors="0" skipped="0" />',
+            "invalid_counts",
+        ),
+    ],
+)
+def test_unavailable_pytest_junit_conflict_reaches_sealed_snapshot(tmp_path, junit_xml, reason):
+    python_orchestrator = _ContainerJUnitOrchestrator(
+        tmp_path / f"{reason}-pytest.xml",
+        junit_xml,
+        manifest=dict(PYTHON_MANIFEST),
+        rules=[
+            ("pyproject.toml", command_ok("exists")),
+            ("--collect-only", command_ok("5 tests collected in 0.02s")),
+            ("--junitxml", command_ok("5 passed in 0.03s")),
+        ],
+    )
+    build = BuildTool(
+        python_orchestrator,
+        python_tool=PythonTool(python_orchestrator),
+    )
+
+    result = build.execute("test", working_directory="/workspace/proj")
+    engine, _ = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    engine._record_tool_execution("build", {"action": "test"}, result)
+    snapshot = engine.verdict_finalizer.finalize(
+        engine.run_evidence_state,
+        EvidenceCloseReason.TEST_TERMINATED,
+    )
+
+    assert result.test_stats is None
+    assert result.conflicts == ["pytest_junit_unavailable"]
+    assert result.metadata["junit_extraction"] == {
+        "status": "unavailable",
+        "reason": reason,
+    }
+    assert result.raw_data["junit_status"] == reason
+    assert "pytest_junit_unavailable" in snapshot.conflicts
+    assert snapshot.test_stats.executed == 0
+    assert snapshot.verdict != "success"
+
+
 def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path):
-    class BuildPythonOrchestrator(PythonOrchestrator):
-        def execute_command(self, cmd, workdir=None, timeout=None):
-            return super().execute_command(cmd, workdir=workdir)
 
     junit = """<?xml version="1.0" encoding="utf-8"?>
 <testsuites name="pytest tests" tests="5" failures="0" errors="0" skipped="0">
@@ -325,12 +569,14 @@ def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path
     <testcase classname="tests.test_app" name="test_five" />
   </testsuite>
 </testsuites>"""
-    python_orchestrator = BuildPythonOrchestrator(
+    python_orchestrator = _ContainerJUnitOrchestrator(
+        tmp_path / "five-passing.xml",
+        junit,
         manifest=dict(PYTHON_MANIFEST),
         rules=[
             ("pyproject.toml", command_ok("exists")),
             ("--collect-only", command_ok("5 tests collected in 0.02s")),
-            ("cat /workspace/.setup_agent/pytest-reports/pytest-", command_ok(junit)),
+            ("--junitxml", command_ok("5 passed in 0.03s")),
         ],
     )
     build = BuildTool(
@@ -569,6 +815,17 @@ def test_failed_result_keeps_ws0_failure_identity_and_is_not_rehashed(tmp_path):
         ("build", "build", {"action": "deps"}, StateScope.DEPENDENCIES),
         ("build", "build", {"action": "package"}, StateScope.ARTIFACTS),
         ("test", "build", {"action": "test"}, StateScope.TEST_RUNTIME),
+        ("test", "maven", {"command": "test"}, StateScope.TEST_RUNTIME),
+        (
+            "test",
+            "gradle",
+            {"tasks": ["clean", ":app:test"]},
+            StateScope.TEST_RUNTIME,
+        ),
+        ("build", "maven", {"command": "dependency:resolve"}, StateScope.DEPENDENCIES),
+        ("build", "gradle", {"tasks": "dependencies"}, StateScope.DEPENDENCIES),
+        ("build", "maven", {"command": "package"}, StateScope.ARTIFACTS),
+        ("build", "gradle", {"tasks": "assemble"}, StateScope.ARTIFACTS),
         ("test", "bash", {"command": "pytest"}, StateScope.TEST_RUNTIME),
     ],
 )
