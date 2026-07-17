@@ -66,6 +66,7 @@ class TestStats(BaseModel):
     passed: int = 0
     failed: int = 0
     skipped: int = 0
+    flaky_count: int = 0
 
     @property
     def pass_rate(self) -> float:
@@ -94,8 +95,9 @@ class TestStats(BaseModel):
             if self.discovered and self.discovered > 0:
                 return f"0 of {self.discovered} detected tests executed (no tests ran)"
             return "no tests executed"
+        flaky = f" ({self.flaky_count} flaky)" if self.flaky_count else ""
         return (
-            f"{self.passed} / {self.executed} passed, "
+            f"{self.passed} / {self.executed} passed{flaky}, "
             f"{self.pass_rate:.1f}% pass rate, "
             f"{self.failed} failed, {self.skipped} skipped"
         )

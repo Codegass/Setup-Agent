@@ -14,6 +14,7 @@ canned results per command shape, every command recorded.
 import json
 
 from sag.agent.physical_validator import PhysicalValidator
+from sag.reporting.utils import render_condensed_summary
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.python_tool import COLLECTED_JSON, PYTEST_REPORT_DIR
 
@@ -35,15 +36,27 @@ def _manifest(**overrides):
 class LadderOrch:
     """Scriptable python evidence-ladder container: flat-layout package foo."""
 
-    def __init__(self, *, venv=True, pip_clean=True, pip_output=None,
-                 import_ok=True, py_count=10, pyc_count=10, so_present=False,
-                 manifest=None, active="3.12"):
+    def __init__(
+        self,
+        *,
+        venv=True,
+        pip_clean=True,
+        pip_output=None,
+        import_ok=True,
+        py_count=10,
+        pyc_count=10,
+        so_present=False,
+        foreign_pyc_count=0,
+        manifest=None,
+        active="3.12",
+    ):
         self.venv = venv
         self.pip_clean = pip_clean
         self.pip_output = pip_output  # forces a FAILED pip check with this output
         self.import_ok = import_ok
         self.py_count = py_count
         self.pyc_count = pyc_count
+        self.foreign_pyc_count = foreign_pyc_count
         self.so_present = so_present
         self.manifest = manifest if manifest is not None else _manifest()
         self.active = active
@@ -79,13 +92,45 @@ class LadderOrch:
                 return res(False, self.pip_output)
             return res(
                 self.pip_clean,
-                "No broken requirements found." if self.pip_clean
-                else "foo 1.0 requires bar, which is not installed.",
+                (
+                    "No broken requirements found."
+                    if self.pip_clean
+                    else "foo 1.0 requires bar, which is not installed."
+                ),
             )
         if "import foo" in c:
             return res(
                 self.import_ok,
                 "" if self.import_ok else "ModuleNotFoundError: No module named 'foo'",
+            )
+        if "importlib.util" in c:
+            invalid = self.foreign_pyc_count > 0
+            return res(
+                True,
+                json.dumps(
+                    {
+                        "status": (
+                            "invalid" if invalid else ("valid" if self.py_count else "unavailable")
+                        ),
+                        "source_count": self.py_count,
+                        "compiled_source_count": self.pyc_count,
+                        "missing_source_count": max(self.py_count - self.pyc_count, 0),
+                        "foreign_pyc_count": self.foreign_pyc_count,
+                        "coverage": (
+                            self.pyc_count / self.py_count
+                            if self.py_count and not invalid
+                            else None
+                        ),
+                        "cache_tag": "cpython-312",
+                        "conflicts": ["metrics_conflict"] if invalid else [],
+                        "missing_sources": [],
+                        "foreign_pycs": (
+                            ["/workspace/proj/foo/__pycache__/old.cpython-311.pyc"]
+                            if invalid
+                            else []
+                        ),
+                    }
+                ),
             )
         if "compileall" in c:
             return res(True)
@@ -148,9 +193,7 @@ def test_missing_pip_module_is_unverifiable_not_breakage():
     breakage. The rung must go UNVERIFIABLE (pip_check_clean None) with a
     visible skip warning and the honest PARTIAL reason 'pip check unverified'
     — never the phantom 'pip check reported dependency breakage'."""
-    orch = LadderOrch(
-        pip_output="/workspace/proj/.venv/bin/python: No module named pip"
-    )
+    orch = LadderOrch(pip_output="/workspace/proj/.venv/bin/python: No module named pip")
     result = _validate(orch)
     details = result["evidence"]["fingerprint_details"]
     assert details["pip_check_clean"] is None  # UNVERIFIABLE, not False
@@ -170,9 +213,7 @@ def test_missing_python_binary_is_unverifiable_not_breakage():
     does not, so the shell reports 'No such file or directory' — also a
     missing tool, never dependency breakage."""
     orch = LadderOrch(
-        pip_output=(
-            "bash: /workspace/proj/.venv/bin/python: No such file or directory"
-        )
+        pip_output=("bash: /workspace/proj/.venv/bin/python: No such file or directory")
     )
     result = _validate(orch)
     assert result["evidence"]["fingerprint_details"]["pip_check_clean"] is None
@@ -189,10 +230,7 @@ def test_verifier_runs_pip_check_in_module_form():
     '{venv}/bin/pip' binary (which plain uv venvs do not ship)."""
     orch = LadderOrch()
     _validate(orch)
-    assert any(
-        c.strip() == "/workspace/proj/.venv/bin/python -m pip check"
-        for c in orch.commands
-    )
+    assert any(c.strip() == "/workspace/proj/.venv/bin/python -m pip check" for c in orch.commands)
     assert not any("/bin/pip " in c for c in orch.commands)
 
 
@@ -204,6 +242,36 @@ def test_low_compileall_coverage_is_partial():
     assert result["evidence_status"] == "partial"
     assert "compileall coverage" in result["reason"]
     assert result["evidence"]["fingerprint_details"]["compileall_coverage"] == 0.5
+
+
+def test_foreign_pyc_makes_compileall_metric_invalid_and_conflicted():
+    orch = LadderOrch(py_count=10, pyc_count=10, foreign_pyc_count=1)
+
+    result = _validate(orch)
+
+    details = result["evidence"]["fingerprint_details"]
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert details["compileall_metric_status"] == "invalid"
+    assert details["compileall_coverage"] is None
+    assert details["compileall_foreign_pyc_count"] == 1
+    assert "metrics_conflict" in result["conflicts"]
+    assert "source/PYC basis mismatch" in result["reason"]
+
+    rendered = render_condensed_summary(
+        {
+            "status": {"verdict": "partial"},
+            "project": {"build_system": "python"},
+            "phases": {"build": True},
+            "physical_evidence": result["evidence"],
+        }
+    )
+    build_line = next(
+        line for line in rendered.splitlines() if line.startswith("🧾 Build evidence:")
+    )
+    assert "compileall invalid" in build_line
+    assert "compileall 100%" not in build_line
 
 
 def test_missing_declared_c_extension_is_partial():
@@ -364,8 +432,11 @@ class EnvOrch:
             return {"success": True, "exit_code": 0, "output": f"Python {self.python}.10"}
         if "java -version" in cmd:
             if self.java:
-                return {"success": True, "exit_code": 0,
-                        "output": f'openjdk version "{self.java}.0.1"'}
+                return {
+                    "success": True,
+                    "exit_code": 0,
+                    "output": f'openjdk version "{self.java}.0.1"',
+                }
             return {"success": False, "exit_code": 127, "output": "java: command not found"}
         if cmd == f"cat {REQUIREMENTS_PATH}":
             if self.manifest:
@@ -394,14 +465,14 @@ def test_no_python_conflict_when_constraint_satisfied():
     # Active 3.12 satisfies >=3.9 even though the resolved newest is 3.13 —
     # same honesty rule as PythonPreflight: the requirement is the constraint,
     # not the newest interpreter.
-    orch = EnvOrch(python="3.12",
-                   manifest={"python_version": "3.13", "python_constraint": ">=3.9"})
+    orch = EnvOrch(python="3.12", manifest={"python_version": "3.13", "python_constraint": ">=3.9"})
     assert _conflicts(orch) == []
 
 
 def test_jdk_and_python_mismatches_are_both_collected():
-    orch = EnvOrch(python="3.8", java="11",
-                   manifest={"java_version": "17", "python_version": "3.11"})
+    orch = EnvOrch(
+        python="3.8", java="11", manifest={"java_version": "17", "python_version": "3.11"}
+    )
     assert _conflicts(orch) == ["jdk_mismatch", "python_version_mismatch"]
 
 
@@ -427,8 +498,7 @@ class CollectedOrch:
                 return {"exit_code": 1, "output": ""}
             return {"exit_code": 0, "output": "/workspace/.setup_agent/contexts/trunk_1.json"}
         if c.startswith("cat ") and "trunk_" in c:
-            return {"exit_code": 0,
-                    "output": json.dumps({"environment_summary": self.trunk_env})}
+            return {"exit_code": 0, "output": json.dumps({"environment_summary": self.trunk_env})}
         if c.startswith("test -f "):
             return {"exit_code": 0 if c.endswith(self.build_marker) else 1, "output": ""}
         if c == f"cat {COLLECTED_JSON}":

@@ -1420,12 +1420,13 @@ START by working toward the current phase objective shown in my context.
         }
         text_style, border_style = verdict_style[snapshot.verdict]
         tests = snapshot.test_stats
+        flaky = f" ({tests.flaky_count} flaky)" if tests.flaky_count else ""
         summary_lines = [
             f"[{text_style}]{snapshot.verdict.upper()}[/{text_style}]",
             "",
             "[bold]Canonical Result:[/bold]",
             f"• Verdict: {snapshot.verdict}",
-            f"• {tests.passed} / {tests.executed} unique tests passed",
+            f"• {tests.passed} / {tests.executed} unique tests passed{flaky}",
             f"• Failures: {tests.failed}; errors: {tests.errors}; skipped: {tests.skipped}",
         ]
         if tests.raw.executed != tests.executed:

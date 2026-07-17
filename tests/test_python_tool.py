@@ -90,6 +90,36 @@ MANIFEST = {
 }
 
 
+def compile_metrics(
+    source_count,
+    compiled_source_count,
+    *,
+    status="valid",
+    foreign_pyc_count=0,
+):
+    coverage = compiled_source_count / source_count if status == "valid" and source_count else None
+    return ok(
+        json.dumps(
+            {
+                "status": status,
+                "source_count": source_count,
+                "compiled_source_count": compiled_source_count,
+                "missing_source_count": max(source_count - compiled_source_count, 0),
+                "foreign_pyc_count": foreign_pyc_count,
+                "coverage": coverage,
+                "cache_tag": "cpython-312",
+                "conflicts": ["metrics_conflict"] if status == "invalid" else [],
+                "missing_sources": [],
+                "foreign_pycs": (
+                    ["/workspace/proj/src/proj/__pycache__/old.cpython-311.pyc"]
+                    if foreign_pyc_count
+                    else []
+                ),
+            }
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # setup_env
 # ---------------------------------------------------------------------------
@@ -368,8 +398,7 @@ def test_compile_runs_compileall_over_package_dirs_and_reports_counts():
         manifest=dict(MANIFEST),
         rules=[
             ("test -d /workspace/proj/src/proj", ok("EXISTS")),
-            ("__pycache__", ok("8")),
-            ("-name '*.py'", ok("10")),
+            ("importlib.util", compile_metrics(10, 8)),
         ],
     )
     result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
@@ -380,6 +409,34 @@ def test_compile_runs_compileall_over_package_dirs_and_reports_counts():
     assert result.metadata.get("py_count") == 10
     assert result.metadata.get("pyc_count") == 8
     assert result.metadata.get("failed") == 2
+    assert result.metadata.get("compileall_metric_status") == "valid"
+
+
+def test_compile_foreign_pyc_is_invalid_and_never_clamped_to_full_coverage():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -d /workspace/proj/src/proj", ok("EXISTS")),
+            (
+                "importlib.util",
+                compile_metrics(
+                    10,
+                    10,
+                    status="invalid",
+                    foreign_pyc_count=1,
+                ),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    assert "invalid" in result.output
+    assert result.metadata["coverage"] is None
+    assert result.metadata["compileall_metric_status"] == "invalid"
+    assert result.metadata["foreign_pyc_count"] == 1
+    assert "metrics_conflict" in result.conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -782,8 +839,14 @@ def test_compile_zero_sources_is_vacuous_and_says_so():
         manifest=dict(MANIFEST),
         rules=[
             ("test -d /workspace/proj/src/proj", ok("EXISTS")),
-            ("__pycache__", ok("0")),
-            ("-name '*.py'", ok("0")),
+            (
+                "importlib.util",
+                compile_metrics(
+                    0,
+                    0,
+                    status="unavailable",
+                ),
+            ),
         ],
     )
     result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")

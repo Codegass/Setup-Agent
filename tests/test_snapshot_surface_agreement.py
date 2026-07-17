@@ -89,6 +89,7 @@ def snapshot_factory():
         unique_errors=328,
         unique_skipped=0,
         raw_executions=987,
+        flaky_count=0,
     ):
         return RunVerdictSnapshot(
             run_id="tvm-run",
@@ -117,6 +118,7 @@ def snapshot_factory():
                     errors=max(raw_executions - unique_passed - unique_failed, 0),
                     skipped=unique_skipped,
                 ),
+                flaky_count=flaky_count,
             ),
             conflicts=("test_retry_evidence",),
         )
@@ -395,6 +397,29 @@ def test_renderers_use_unique_not_raw_retry_total(surface_harness, snapshot_fact
         rendered.web,
     ):
         assert surface.primary_test_total != 987
+    for surface in (rendered.markdown, rendered.condensed, rendered.cli):
+        primary_test_lines = [line for line in surface.text.splitlines() if "Tests" in line]
+        assert primary_test_lines
+        assert all("987" not in line for line in primary_test_lines)
+
+
+def test_all_surfaces_preserve_visible_flaky_count(surface_harness, snapshot_factory):
+    snapshot = snapshot_factory(
+        verdict="success",
+        unique_total=5,
+        unique_passed=5,
+        unique_failed=0,
+        unique_errors=0,
+        raw_executions=7,
+        flaky_count=3,
+    )
+
+    rendered = surface_harness.render_all(snapshot)
+
+    assert "3 flaky" in rendered.markdown.text
+    assert "3 flaky" in rendered.condensed.text
+    assert "3 flaky" in rendered.cli.text
+    assert "flaky_count=3" in rendered.web.text
 
 
 @pytest.mark.parametrize(

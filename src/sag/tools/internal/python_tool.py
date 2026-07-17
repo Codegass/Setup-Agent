@@ -19,6 +19,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from loguru import logger
 
 from sag.evidence import TestStats
+from sag.testcases.compileall_metrics import (
+    COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
+    compileall_metrics_command,
+    parse_compileall_metrics,
+)
 
 from ..base import BaseTool, ToolResult
 from .build_preflight import (
@@ -828,21 +833,44 @@ class PythonTool(BaseTool):
         venv: str,
     ) -> ToolResult:
         dirs = self._package_dirs(working_directory, requirements)
-        target = " ".join(dirs)
+        target = " ".join(shlex.quote(directory) for directory in dirs)
         result = self._run(
             f"{venv}/bin/python -m compileall -q {target}", working_directory, timeout
         )
-        py_count = self._count(
-            f"find {target} -name '*.py' -not -path '*/.*' | wc -l", working_directory
+        metric_result = self._run(
+            compileall_metrics_command(f"{venv}/bin/python", dirs),
+            working_directory,
+            timeout,
         )
-        pyc_count = self._count(
-            f"find {target} -path '*/__pycache__/*.pyc' | wc -l", working_directory
-        )
-        failed = (
-            max(py_count - pyc_count, 0) if py_count is not None and pyc_count is not None else None
-        )
-        coverage = (pyc_count / py_count) if py_count else None
-        if py_count == 0:
+        metric = None
+        metric_error = None
+        try:
+            if not metric_result.get("success"):
+                raise ValueError("scanner command failed")
+            metric = parse_compileall_metrics(metric_result.get("output") or "")
+        except (TypeError, ValueError) as exc:
+            metric_error = str(exc)
+
+        if metric is not None:
+            py_count = metric.source_count
+            pyc_count = metric.compiled_source_count
+            failed = metric.missing_source_count
+            coverage = metric.coverage
+            metric_status = metric.status
+            metric_conflicts = list(metric.conflicts)
+            foreign_pyc_count = metric.foreign_pyc_count
+            cache_tag = metric.cache_tag
+        else:
+            py_count = None
+            pyc_count = None
+            failed = None
+            coverage = None
+            metric_status = "unavailable"
+            metric_conflicts = [COMPILEALL_METRICS_UNAVAILABLE_CONFLICT]
+            foreign_pyc_count = None
+            cache_tag = None
+
+        if metric_status == "unavailable" and py_count == 0:
             # Bug #13 defect 8: 0/0 compiled is VACUOUS evidence — say so
             # instead of a misleading green ('0/0 sources compiled').
             return ToolResult.completed_success(
@@ -855,17 +883,26 @@ class PythonTool(BaseTool):
                     "pyc_count": pyc_count,
                     "failed": None,
                     "coverage": None,
+                    "compileall_metric_status": metric_status,
+                    "metrics_conflicts": metric_conflicts,
+                    "foreign_pyc_count": foreign_pyc_count,
+                    "cache_tag": cache_tag,
                     "exit_code": result.get("exit_code"),
                     "vacuous": True,
                 },
+                conflicts=metric_conflicts,
             )
         summary = f"compileall over {target}: "
-        if py_count is not None and pyc_count is not None:
+        if metric_status == "invalid":
+            summary += (
+                "invalid (source/PYC basis mismatch; " f"{foreign_pyc_count or 0} foreign pyc)"
+            )
+        elif py_count is not None and pyc_count is not None:
             summary += f"{pyc_count}/{py_count} sources compiled, {failed} failed"
             if coverage is not None:
                 summary += f" (coverage {coverage:.2f})"
         else:
-            summary += "source/bytecode counts unavailable"
+            summary += f"source/bytecode counts unavailable ({metric_error or 'unknown reason'})"
         success = bool(result.get("success"))
         errors = self._tail(result.get("output") or "", lines=20)
         return ToolResult.completed(
@@ -881,8 +918,13 @@ class PythonTool(BaseTool):
                 "pyc_count": pyc_count,
                 "failed": failed,
                 "coverage": coverage,
+                "compileall_metric_status": metric_status,
+                "metrics_conflicts": metric_conflicts,
+                "foreign_pyc_count": foreign_pyc_count,
+                "cache_tag": cache_tag,
                 "exit_code": result.get("exit_code"),
             },
+            conflicts=metric_conflicts,
         )
 
     # ------------------------------------------------------------------
@@ -923,13 +965,6 @@ class PythonTool(BaseTool):
                     dirs.append(candidate)
                     break
         return dirs or [root]
-
-    def _count(self, command: str, workdir: str) -> Optional[int]:
-        result = self.orchestrator.execute_command(command, workdir=workdir)
-        try:
-            return int((result.get("output") or "").strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return None
 
     def _parse_collected(self, output: str) -> Optional[int]:
         """Trailing `N tests collected` from pytest --collect-only -q; a `no

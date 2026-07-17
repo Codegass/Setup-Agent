@@ -148,7 +148,7 @@ def test_finalization_is_byte_identical_and_uses_atomic_rename():
     second = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
 
     assert first.model_dump_json() == second.model_dump_json()
-    assert first.schema_version == 2
+    assert first.schema_version == 3
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
     assert orchestrator.commands[len(commands_after_first) :] == [
@@ -239,7 +239,105 @@ def test_snapshot_uses_unique_test_counts_and_keeps_raw_retries_secondary():
     assert snapshot.test_stats.passed == 328
     assert snapshot.test_stats.raw.executed == 984
     assert snapshot.test_stats.pass_rate == 100.0
-    assert "pass_rate" not in snapshot.model_dump()["test_stats"]
+    serialized = snapshot.model_dump()["test_stats"]
+    assert serialized["unique"] == {
+        "executed": 328,
+        "passed": 328,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+    assert serialized["raw"]["executed"] == 984
+    assert "executed" not in serialized
+    assert "pass_rate" not in serialized
+
+
+def test_v2_flat_test_stats_upgrade_to_explicit_unique_basis():
+    from sag.agent.verdict_finalizer import SnapshotTestStats
+
+    stats = SnapshotTestStats.model_validate(
+        {
+            "discovered": 10,
+            "executed": 10,
+            "passed": 9,
+            "failed": 1,
+            "errors": 0,
+            "skipped": 0,
+            "raw": {"executed": 12, "passed": 10, "failed": 2},
+            "flaky_count": 2,
+        }
+    )
+
+    assert stats.executed == 10
+    assert stats.unique.passed == 9
+    assert stats.raw.executed == 12
+    assert stats.flaky_count == 2
+    assert "executed" not in stats.model_dump()
+
+
+def test_compileall_basis_mismatch_is_a_snapshot_metrics_conflict():
+    state = RunEvidenceState(run_id="session-compileall-conflict")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="compileall invalid",
+            facts={"build_success": True},
+            conflicts=["metrics_conflict"],
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="tests green",
+            test_stats=TestStats(
+                discovered=10,
+                executed=10,
+                passed=10,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert "metrics_conflict" in snapshot.conflicts
+    assert snapshot.verdict == "partial"
+
+
+def test_flaky_count_flows_into_unique_snapshot_basis():
+    state = RunEvidenceState(run_id="session-flaky")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="tests green with retries",
+            test_stats=TestStats(
+                discovered=5,
+                executed=5,
+                passed=5,
+                flaky_count=2,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.unique.passed == 5
+    assert snapshot.test_stats.flaky_count == 2
+    assert snapshot.model_dump()["test_stats"]["flaky_count"] == 2
 
 
 def test_narrow_passing_retry_cannot_replace_failed_full_suite_basis():

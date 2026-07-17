@@ -86,13 +86,16 @@ def build_stored_test_analysis(test_analysis: Dict[str, Any]) -> Dict[str, Any]:
         "raw_failed_tests": test_analysis.get("raw_failed_tests"),
         "raw_error_tests": test_analysis.get("raw_error_tests"),
         "raw_skipped_tests": test_analysis.get("raw_skipped_tests"),
-        # Unique normalized methods (parameterized/dynamic folded) -- these feed
-        # status.tests_unique / tests_*_unique that the metrics contract reads.
+        # Canonical unique/latest identities -- the sole reporting basis.
         "unique_tests": test_analysis.get("unique_tests"),
         "unique_passed_tests": test_analysis.get("unique_passed_tests"),
         "unique_failed_tests": test_analysis.get("unique_failed_tests"),
         "unique_error_tests": test_analysis.get("unique_error_tests"),
         "unique_skipped_tests": test_analysis.get("unique_skipped_tests"),
+        "flaky_count": test_analysis.get("flaky_count", 0),
+        "retried_count": test_analysis.get("retried_count", 0),
+        "test_histories": test_analysis.get("test_histories", []),
+        "metrics_conflicts": test_analysis.get("metrics_conflicts", []),
         # Legacy plural alias (markdown consumers) + the singular key the
         # report_metrics contract actually reads.
         "report_files_count": len(report_files),
@@ -412,6 +415,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     snapshot_phases = report_snapshot.get("phases") or {}
                     ui_total_tests = int(snapshot_status.get("tests_total") or 0)
                     ui_passed_tests = int(snapshot_status.get("tests_passed") or 0)
+                    ui_flaky_tests = int(snapshot_status.get("tests_flaky") or 0)
                     ui_build_success = snapshot_phases.get("build") is True
                     ui_test_success = snapshot_status.get("test_judgment") == "success"
                     ui_test_pass_rate = float(snapshot_status.get("pass_pct") or 0)
@@ -424,6 +428,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     ui_test_pass_rate = test_analysis.get("pass_rate", 0)
                     ui_total_tests = test_analysis.get("total_tests", 0)
                     ui_passed_tests = test_analysis.get("passed_tests", 0)
+                    ui_flaky_tests = test_analysis.get("flaky_count", 0)
 
                 # Emit UI event for report generation
                 self.emit(
@@ -436,6 +441,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                     test_pass_rate=ui_test_pass_rate,
                     total_tests=ui_total_tests,
                     passed_tests=ui_passed_tests,
+                    flaky_count=ui_flaky_tests,
                 )
 
                 return ToolResult.completed_success(
@@ -514,6 +520,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             passed=passed,
             failed=failed,
             skipped=skipped,
+            flaky_count=as_int("flaky_count", "flaky", default=0) or 0,
         )
 
     def _serialize_report_test_stats(self, test_stats: TestStats) -> Dict[str, Any]:
@@ -661,6 +668,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "failed": (test_analysis.get("failed_tests") or 0)
                 + (test_analysis.get("error_tests") or 0),
                 "skipped": test_analysis.get("skipped_tests"),
+                "flaky_count": test_analysis.get("flaky_count", 0),
             }
 
         return None
@@ -785,7 +793,12 @@ class ReportTool(BaseTool, UIEventEmitter):
             if discovered:
                 try:
                     return TestStats(
-                        discovered=int(discovered), executed=0, passed=0, failed=0, skipped=0
+                        discovered=int(discovered),
+                        executed=0,
+                        passed=0,
+                        failed=0,
+                        skipped=0,
+                        flaky_count=int(status.get("tests_flaky", 0) or 0),
                     )
                 except (TypeError, ValueError):
                     return None
@@ -800,6 +813,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 failed=int(status.get("tests_failed", 0) or 0)
                 + int(status.get("tests_errors", 0) or 0),
                 skipped=int(status.get("tests_skipped", 0) or 0),
+                flaky_count=int(status.get("tests_flaky", 0) or 0),
             )
         except (TypeError, ValueError):
             return None
@@ -1468,6 +1482,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             "tests_failed_unique": tests.failed,
             "tests_errors_unique": tests.errors,
             "tests_skipped_unique": tests.skipped,
+            "tests_flaky": tests.flaky_count,
             "pass_pct": tests.pass_rate if tests.executed > 0 else None,
             "static_test_count": tests.discovered,
             "method_count": None,
@@ -1492,6 +1507,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "passed": tests.passed,
                 "failed": tests.failed + tests.errors,
                 "skipped": tests.skipped,
+                "flaky_count": tests.flaky_count,
             },
             "conflicts": list(snapshot.conflicts),
             "evidence_refs": evidence_refs,
@@ -1701,6 +1717,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         tests_error = test_analysis.get("error_tests")
         tests_skipped = test_analysis.get("skipped_tests")
         tests_passed = test_analysis.get("passed_tests")
+        tests_flaky = test_analysis.get("flaky_count", 0)
         pass_pct = (
             test_analysis.get("pass_rate")
             or test_analysis.get("pass_pct")
@@ -1717,6 +1734,28 @@ class ReportTool(BaseTool, UIEventEmitter):
         unique_failed_tests = test_analysis.get("unique_failed_tests")
         unique_error_tests = test_analysis.get("unique_error_tests")
         unique_skipped_tests = test_analysis.get("unique_skipped_tests")
+
+        # WS7 has exactly one reporting basis: canonical unique/latest. Older
+        # parsers exposed raw runner totals at the top level, so preserve those
+        # as diagnostics before replacing every primary field with unique_*.
+        unique_basis_available = unique_total_tests is not None
+        if unique_basis_available:
+            if raw_total_tests is None and tests_total != unique_total_tests:
+                raw_total_tests = tests_total
+            if raw_passed_tests is None and tests_passed != unique_passed_tests:
+                raw_passed_tests = tests_passed
+            if raw_failed_tests is None and tests_failed != unique_failed_tests:
+                raw_failed_tests = tests_failed
+            if raw_error_tests is None and tests_error != unique_error_tests:
+                raw_error_tests = tests_error
+            if raw_skipped_tests is None and tests_skipped != unique_skipped_tests:
+                raw_skipped_tests = tests_skipped
+            tests_total = unique_total_tests
+            tests_passed = unique_passed_tests
+            tests_failed = unique_failed_tests
+            tests_error = unique_error_tests
+            tests_skipped = unique_skipped_tests
+            pass_pct = None
 
         if tests_total is None:
             tests_total = aggregate_total
@@ -1748,7 +1787,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             if raw_skipped_tests is None and aggregate_skipped is not None:
                 raw_skipped_tests = aggregate_skipped
 
-        if pass_pct is None:
+        if pass_pct is None and not unique_basis_available:
             pass_pct = aggregate_pass_pct
 
         if pass_pct is None and tests_total and tests_passed is not None:
@@ -1857,6 +1896,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             "tests_failed_unique": to_int(unique_failed_tests),
             "tests_errors_unique": to_int(unique_error_tests),
             "tests_skipped_unique": to_int(unique_skipped_tests),
+            "tests_flaky": to_int(tests_flaky) or 0,
             "pass_pct": pass_pct,
             "static_test_count": static_test_count,
             "method_count": method_count,  # Original method annotations
@@ -4115,6 +4155,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         executed = status.get("tests_total", 0)
         raw_executed = status.get("tests_total_raw", 0)
         passed = status.get("tests_passed", 0)
+        flaky_count = status.get("tests_flaky", 0) or 0
         exec_rate = status.get("execution_rate")
         expansion_factor = status.get("expansion_factor")
         pass_rate = status.get("pass_pct")
@@ -4154,7 +4195,11 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         if pass_rate is not None:
             pass_icon = "✅" if pass_rate >= 95 else "⚠️" if pass_rate >= 80 else "❌"
-            pass_msg = f"{pass_icon} {format_percentage(pass_rate)} ({passed}/{executed} passed)"
+            flaky_note = f", {flaky_count} flaky" if flaky_count else ""
+            pass_msg = (
+                f"{pass_icon} {format_percentage(pass_rate)} "
+                f"({passed}/{executed} passed{flaky_note})"
+            )
             lines.append(f"│ Pass Rate       │ {pass_msg:<32} │")
 
         if modules_detected:
@@ -4203,6 +4248,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         raw_executed = status.get("tests_total_raw", 0)
         unique_executed = status.get("tests_unique", 0)
         passed = status.get("tests_passed", 0)
+        flaky_count = status.get("tests_flaky", 0) or 0
         exec_rate = status.get("execution_rate")
         pass_rate = status.get("pass_pct")
         expansion_factor = status.get("expansion_factor")
@@ -4234,7 +4280,8 @@ class ReportTool(BaseTool, UIEventEmitter):
                 f"| **Parameterized Expansion** | ~{expansion_factor:.1f}x | {raw_executed} runner executions / {unique_executed} methods | 🔄 |"
             )
 
-        lines.append(f"| **Tests Passed** | {passed} | Successful runner count | ✅ |")
+        passed_value = f"{passed} ({flaky_count} flaky)" if flaky_count else str(passed)
+        lines.append(f"| **Tests Passed** | {passed_value} | Canonical latest status | ✅ |")
 
         # Execution rate now measures coverage of declared test methods
         if exec_rate is not None and static_count:

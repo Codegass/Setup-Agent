@@ -123,6 +123,11 @@ class TestSummary(WebModel):
         validation_alias=AliasChoices("unique_skipped", "uniqueSkipped"),
         serialization_alias="uniqueSkipped",
     )
+    flaky_count: int = Field(
+        default=0,
+        validation_alias=AliasChoices("flaky_count", "flakyCount"),
+        serialization_alias="flakyCount",
+    )
     raw_executions: int | None = Field(
         default=None,
         validation_alias=AliasChoices("raw_executions", "rawExecutions"),

@@ -27,6 +27,7 @@ Example Usage:
 import json
 import os
 import re
+import shlex
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -45,6 +46,11 @@ from sag.testcases.catalog import (
     TestCaseDescriptor,
     build_java_test_catalog,
     normalize_testcase_identifier,
+)
+from sag.testcases.compileall_metrics import (
+    COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
+    compileall_metrics_command,
+    parse_compileall_metrics,
 )
 from sag.testcases.results import (
     CanonicalTestIdentity,
@@ -2305,6 +2311,10 @@ class PhysicalValidator:
                     "imports_ok",
                     "import_failures",
                     "compileall_coverage",
+                    "compileall_metric_status",
+                    "compileall_source_count",
+                    "compileall_compiled_source_count",
+                    "compileall_foreign_pyc_count",
                     "ext_modules_ok",
                     "native_artifact_ok",
                 )
@@ -2472,6 +2482,8 @@ class PhysicalValidator:
             conflicts = []
 
         conflicts.extend(self._collect_env_conflicts())
+        if python_build is not None:
+            conflicts.extend(python_build.get("metrics_conflicts") or [])
 
         result = {
             "success": success,
@@ -2598,6 +2610,11 @@ class PhysicalValidator:
             "imports_ok": None,
             "import_failures": [],
             "compileall_coverage": None,
+            "compileall_metric_status": "unavailable",
+            "compileall_source_count": 0,
+            "compileall_compiled_source_count": 0,
+            "compileall_foreign_pyc_count": 0,
+            "metrics_conflicts": [],
             "ext_modules_ok": None,
             # Native core (root CMakeLists.txt, live TVM): whether a build native
             # artifact (.so/.dylib) is present. None until probed / not
@@ -2700,24 +2717,36 @@ class PhysicalValidator:
                 return result
 
         package_dirs = self._python_package_dirs(project_dir, packages)
-        target = " ".join(package_dirs)
         self._execute_command_with_logging(
-            f"{venv}/bin/python -m compileall -q {target}", "compileall"
+            f"{venv}/bin/python -m compileall -q "
+            + " ".join(shlex.quote(path) for path in package_dirs),
+            "compileall",
         )
-        # Source-weighted coverage: .pyc under __pycache__ / .py sources, with
-        # tests/docs/examples and dot-dirs (.venv) excluded on BOTH counts.
-        py_count = self._int_from_count(
-            f"find {target} -name '*.py' -type f -not -path '*/.*' "
-            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
-            f"2>/dev/null | wc -l"
+        metric_result = self._execute_command_with_logging(
+            compileall_metrics_command(f"{venv}/bin/python", package_dirs),
+            "compileall metrics",
         )
-        pyc_count = self._int_from_count(
-            f"find {target} -path '*/__pycache__/*.pyc' -type f -not -path '*/.*' "
-            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
-            f"2>/dev/null | wc -l"
-        )
-        if py_count and pyc_count is not None:
-            result["compileall_coverage"] = min(pyc_count / py_count, 1.0)
+        try:
+            if not metric_result["success"]:
+                raise ValueError("scanner command failed")
+            compile_metric = parse_compileall_metrics(metric_result.get("output") or "")
+        except (TypeError, ValueError) as exc:
+            compile_metric = None
+            result["metrics_conflicts"].append(COMPILEALL_METRICS_UNAVAILABLE_CONFLICT)
+            result["warnings"].append(f"compileall metrics unavailable: {exc}")
+
+        if compile_metric is not None:
+            result["compileall_metric_status"] = compile_metric.status
+            result["compileall_source_count"] = compile_metric.source_count
+            result["compileall_compiled_source_count"] = compile_metric.compiled_source_count
+            result["compileall_foreign_pyc_count"] = compile_metric.foreign_pyc_count
+            result["compileall_coverage"] = compile_metric.coverage
+            result["metrics_conflicts"].extend(compile_metric.conflicts)
+            if compile_metric.status == "invalid":
+                result["warnings"].append(
+                    "compileall metric invalid: "
+                    f"{compile_metric.foreign_pyc_count} foreign pyc file(s)"
+                )
 
         so_missing = False
         if manifest.get("has_c_extensions"):
@@ -2773,8 +2802,13 @@ class PhysicalValidator:
             # silent SUCCESS on a project whose install was never verified.
             partial_reasons.append("imports unverified: no importable package detected")
         coverage = result["compileall_coverage"]
+        metric_status = result["compileall_metric_status"]
         threshold = self.build_coverage_threshold
-        if coverage is not None and coverage < threshold:
+        if metric_status == "invalid":
+            partial_reasons.append("compileall metric invalid: source/PYC basis mismatch")
+        elif COMPILEALL_METRICS_UNAVAILABLE_CONFLICT in result["metrics_conflicts"]:
+            partial_reasons.append("compileall metrics unavailable")
+        elif coverage is not None and coverage < threshold:
             partial_reasons.append(
                 f"compileall coverage {coverage * 100:.0f}% below the "
                 f"{threshold * 100:.0f}% threshold"
@@ -2892,14 +2926,6 @@ class PhysicalValidator:
                     dirs.append(candidate)
                     break
         return dirs or [root]
-
-    def _int_from_count(self, command: str) -> Optional[int]:
-        """Last line of a `... | wc -l` pipeline as an int, or None."""
-        result = self._execute_command_with_logging(command, "counting files")
-        try:
-            return int((result.get("output") or "").strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return None
 
     def _build_status_evidence_refs(
         self, project_dir: str, artifacts_result: Dict[str, any]
@@ -3028,6 +3054,7 @@ class PhysicalValidator:
                 "passed": test_metrics.get("passed_tests", 0),
                 "failed": failed_count,
                 "skipped": test_metrics.get("skipped_tests", 0),
+                "flaky_count": test_metrics.get("flaky_count", 0),
                 "pass_rate": round(pass_rate, 1),
             }
         report_files = test_metrics.get("report_files", [])
@@ -3038,6 +3065,8 @@ class PhysicalValidator:
             conflicts.append("test_errors_detected")
         if test_metrics.get("parsing_errors", []):
             conflicts.append("test_report_parse_error")
+        if test_metrics.get("metrics_conflicts", []):
+            conflicts.append("metrics_conflict")
 
         if not test_metrics.get("valid", False):
             evidence_status = "unknown"
@@ -3075,6 +3104,10 @@ class PhysicalValidator:
             "unique_failed_tests": test_metrics.get("unique_failed_tests"),
             "unique_error_tests": test_metrics.get("unique_error_tests"),
             "unique_skipped_tests": test_metrics.get("unique_skipped_tests"),
+            "flaky_count": test_metrics.get("flaky_count", 0),
+            "retried_count": test_metrics.get("retried_count", 0),
+            "test_histories": test_metrics.get("test_histories", []),
+            "metrics_conflicts": test_metrics.get("metrics_conflicts", []),
             "parsing_errors": test_metrics.get("parsing_errors", []),
             "evidence_status": evidence_status,
             "test_stats": test_stats,

@@ -19,7 +19,7 @@ from .evidence_state import EvidenceRole, RunEvidenceState, ToolObservation
 from .output_storage import atomic_write_container_text
 
 VERDICT_SNAPSHOT_PATH = "/workspace/.setup_agent/verdict.json"
-VERDICT_SCHEMA_VERSION = 2
+VERDICT_SCHEMA_VERSION = 3
 
 
 class EvidenceCloseReason(str, Enum):
@@ -59,10 +59,47 @@ class SnapshotTestCounts(BaseModel):
     skipped: int = 0
 
 
-class SnapshotTestStats(SnapshotTestCounts):
+class SnapshotTestStats(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
     discovered: int | None = None
+    unique: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     raw: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
+    flaky_count: int = 0
     judgment: Literal["success", "failed", "unknown"] = "unknown"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_flat_unique_counts(cls, value: Any) -> Any:
+        """Read v2 flat snapshots while serializing one explicit unique basis."""
+        if not isinstance(value, dict):
+            return value
+        upgraded = dict(value)
+        count_fields = ("executed", "passed", "failed", "errors", "skipped")
+        flat_counts = {field: upgraded.pop(field) for field in count_fields if field in upgraded}
+        if "unique" not in upgraded and flat_counts:
+            upgraded["unique"] = flat_counts
+        return upgraded
+
+    @property
+    def executed(self) -> int:
+        return self.unique.executed
+
+    @property
+    def passed(self) -> int:
+        return self.unique.passed
+
+    @property
+    def failed(self) -> int:
+        return self.unique.failed
+
+    @property
+    def errors(self) -> int:
+        return self.unique.errors
+
+    @property
+    def skipped(self) -> int:
+        return self.unique.skipped
 
     @property
     def pass_rate(self) -> float:
@@ -270,6 +307,9 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
         # WS0 TestStats historically combines failures and errors. Preserve
         # the minimal snapshot's distinct fields when an error count exists.
         distinct_failures = max(stats.failed - errors, 0)
+    flaky_count = _first_count(sources, "flaky_count")
+    if flaky_count is not None and flaky_count != stats.flaky_count:
+        stats = stats.model_copy(update={"flaky_count": flaky_count})
     return stats, distinct_failures, errors
 
 
@@ -345,12 +385,15 @@ def _fold_test_stats(
     return (
         SnapshotTestStats(
             discovered=unique.discovered,
-            executed=unique.executed,
-            passed=unique.passed,
-            failed=unique_failures,
-            errors=unique_errors,
-            skipped=unique.skipped,
+            unique=SnapshotTestCounts(
+                executed=unique.executed,
+                passed=unique.passed,
+                failed=unique_failures,
+                errors=unique_errors,
+                skipped=unique.skipped,
+            ),
             raw=raw,
+            flaky_count=unique.flaky_count,
             judgment=judgment,
         ),
         conflicts,

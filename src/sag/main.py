@@ -54,12 +54,13 @@ def _render_setup_cli_result(
 ) -> tuple[str, int]:
     """Render the setup result and translate only the sealed verdict to an exit code."""
     tests = snapshot.test_stats
+    flaky = f" ({tests.flaky_count} flaky)" if tests.flaky_count else ""
     lines = [
         f"Project: {project_name}",
         f"Verdict: {snapshot.verdict.upper()}",
         (
             f"Tests: {tests.executed} unique "
-            f"({tests.passed} passed, {tests.failed} failed, "
+            f"({tests.passed} passed{flaky}, {tests.failed} failed, "
             f"{tests.errors} errors, {tests.skipped} skipped)"
         ),
     ]

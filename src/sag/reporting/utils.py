@@ -83,7 +83,10 @@ def _python_evidence_rungs(fingerprints: Dict[str, Any]) -> List[str]:
     if fingerprints.get("imports_ok") is not None:
         parts.append(f"imports {tick(fingerprints['imports_ok'])}")
     coverage = fingerprints.get("compileall_coverage")
-    if coverage is not None:
+    metric_status = fingerprints.get("compileall_metric_status")
+    if metric_status == "invalid":
+        parts.append("compileall invalid")
+    elif coverage is not None:
         try:
             parts.append(f"compileall {float(coverage) * 100:.0f}%")
         except (TypeError, ValueError):
@@ -132,9 +135,9 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
         # C-extensions, see PhysicalValidator._verify_python_build) IS the
         # build evidence there; unknown rungs (None) are skipped, never
         # invented. Java/Maven/Gradle keep the artifacts line unchanged.
-        build_system = str(
-            evidence.get("build_system") or project.get("build_system") or ""
-        ).strip().lower()
+        build_system = (
+            str(evidence.get("build_system") or project.get("build_system") or "").strip().lower()
+        )
         if build_system in ("python", "pip/poetry"):
             rungs = _python_evidence_rungs(evidence.get("fingerprint_details") or {})
             if rungs:
@@ -173,6 +176,9 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
             quals.append(f"pass rate {format_percentage(pass_pct)}")
         if execution_rate is not None:
             quals.append(f"execution rate {format_percentage(execution_rate)}")
+        flaky_count = status.get("tests_flaky", 0) or 0
+        if flaky_count:
+            quals.append(f"{flaky_count} flaky")
         if quals:
             test_line += f" ({', '.join(quals)})"
         lines.append(test_line)

@@ -58,6 +58,19 @@ class FailureTool(BaseTool):
         )
 
 
+class WheelFailureTool(BaseTool):
+    def __init__(self):
+        super().__init__("wheel", "Wheel build test tool")
+
+    def execute(self, command: str) -> ToolResult:
+        return ToolResult.completed_failure(
+            output="CMake configuration failed",
+            error="wheel build failed",
+            error_code="WHEEL_BUILD_FAILED",
+            metadata={"operation": "build", "evidence_only": True},
+        )
+
+
 class PartialTool(BaseTool):
     def __init__(self):
         super().__init__("partial", "Partial tool")
@@ -83,10 +96,12 @@ class ExplodingSafeExecuteTool(BaseTool):
 class FakeDurableOutputStorage:
     def __init__(self):
         self.outputs = {}
+        self.records = {}
 
     def store_output(self, **kwargs):
         ref = f"output_failure_{len(self.outputs) + 1}"
         self.outputs[ref] = kwargs["output"]
+        self.records[ref] = kwargs
         return ref
 
     def retrieve_output(self, ref):
@@ -213,6 +228,33 @@ def test_orchestrator_persists_failure_before_emitting_canonical_result():
 
     assert execution.result.output_ref.startswith("output_")
     assert storage.retrieve_output(execution.result.output_ref) == "durable failure details"
+
+
+def test_stored_wheel_failure_metadata_matches_typed_outcome():
+    storage = FakeDurableOutputStorage()
+    events = []
+    orchestrator = ToolOrchestrator(
+        tools={"wheel": WheelFailureTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=storage,
+        event_sink=events.append,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="wheel", raw_params={"command": "build"}))
+
+    stored = storage.records[execution.result.output_ref]
+    typed_outcome = execution.result.operation_outcome.value
+    assert typed_outcome == "failed"
+    assert stored["metadata"]["operation_outcome"] == typed_outcome
+    assert events[-1].metadata["operation_outcome"] == typed_outcome
+    assert execution.result.succeeded is False
 
 
 def test_orchestrator_uses_emergency_during_failed_result_construction(tmp_path, monkeypatch):

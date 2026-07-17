@@ -10,6 +10,13 @@ from .catalog import (
     normalize_method_name,
     normalize_testcase_identifier,
 )
+from .compileall_metrics import (
+    COMPILEALL_METRICS_CONFLICT,
+    COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
+    CompileallMetrics,
+    compileall_metrics_command,
+    parse_compileall_metrics,
+)
 from .results import (
     AggregatedTestResults,
     CanonicalTestIdentity,
@@ -34,4 +41,9 @@ __all__ = [
     "TestResultObservation",
     "aggregate_test_results",
     "canonical_test_identity",
+    "COMPILEALL_METRICS_CONFLICT",
+    "COMPILEALL_METRICS_UNAVAILABLE_CONFLICT",
+    "CompileallMetrics",
+    "compileall_metrics_command",
+    "parse_compileall_metrics",
 ]

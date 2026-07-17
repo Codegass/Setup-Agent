@@ -1245,8 +1245,10 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
         {},
     )
 
-    # Runner executions and unique methods are distinct facts in the snapshot.
-    assert snapshot["status"]["tests_total"] == 18839
+    # Canonical unique/latest is the one primary basis. Raw runner executions
+    # stay explicitly diagnostic and are never rendered as Tests: N.
+    assert snapshot["status"]["tests_total"] == 9497
+    assert snapshot["status"]["tests_total_raw"] == 18839
     assert snapshot["status"]["tests_unique"] == 9497
 
     metrics = assemble_report_metrics(
@@ -1258,7 +1260,8 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
         generated_at="2026-06-15 00:00:00",
     )
 
-    assert metrics["test"]["total"] == 18839, "runner executions"
+    assert metrics["test"]["total"] == 9497, "canonical latest"
+    assert metrics["test"]["raw_executions"] == 18839, "diagnostic runner rows"
     assert metrics["test"]["unique_total"] == 9497, "unique normalized methods"
     assert metrics["test"]["unique_passed"] == 9470
     assert metrics["test"]["unique_failed"] == 5
