@@ -26,6 +26,7 @@ from sag.ui.events import EventType, UIEvent, UIEventEmitter
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
+from .current_plan import PlanFault, PlanFaultCode
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
@@ -56,6 +57,12 @@ from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_response_parser import ReActResponseParser
 from .react_types import ReactModelMode, ReActStep, StepType
+from .reasoning_scheduler import (
+    ReasoningScheduler,
+    ReasoningTrigger,
+    SchedulerMode,
+    SchedulerTurn,
+)
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
     ActualToolExecution,
@@ -303,6 +310,12 @@ class ReActEngine(UIEventEmitter):
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
+        self.reasoning_scheduler = ReasoningScheduler(
+            available_tools=self.tools,
+            heartbeat_actions=getattr(self.config, "reasoning_heartbeat_actions", 5),
+        )
+        self._scheduler_active = False
+        self._scheduled_turn: SchedulerTurn | None = None
 
         # Engine-owned phase machine for setup runs (spec §3.1). None keeps the
         # legacy free-form behavior (`sag run --task` passes neither).
@@ -1192,18 +1205,12 @@ class ReActEngine(UIEventEmitter):
     def _repair_budgets(self) -> RepairBudgets:
         return RepairBudgets(
             global_remaining=getattr(self, "_repair_global_remaining", 2),
-            phase_remaining=dict(
-                getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1})
-            ),
+            phase_remaining=dict(getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1})),
         )
 
     def _consume_repair_budget(self, phase: str) -> None:
-        self._repair_global_remaining = max(
-            0, getattr(self, "_repair_global_remaining", 2) - 1
-        )
-        phase_remaining = dict(
-            getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1})
-        )
+        self._repair_global_remaining = max(0, getattr(self, "_repair_global_remaining", 2) - 1)
+        phase_remaining = dict(getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1}))
         phase_remaining[phase] = max(0, phase_remaining.get(phase, 0) - 1)
         self._repair_phase_remaining = phase_remaining
 
@@ -1246,6 +1253,7 @@ class ReActEngine(UIEventEmitter):
     ) -> None:
         machine = self.phase_machine
         appended = machine.apply(decision)
+        self._request_scheduler_reasoning(ReasoningTrigger.PHASE_CHANGE)
         for applied in appended:
             self._record_phase_audit(applied)
             text = applied.key_results or applied.reason or applied.outcome.value
@@ -1312,6 +1320,7 @@ class ReActEngine(UIEventEmitter):
         )
         if not gate.accepted:
             self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
+            self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
             return None
         self._record_gate_facts(request.from_phase, gate)
         record = machine.close_attempt(gate)
@@ -1363,6 +1372,7 @@ class ReActEngine(UIEventEmitter):
                 return None
             if not gate.accepted:
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
+                self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
                 return None
             self._record_gate_facts(claim.phase, gate)
             record = machine.close_attempt(gate)
@@ -1737,6 +1747,16 @@ class ReActEngine(UIEventEmitter):
         # Setup-mode phase machine: the engine drives provision→…→report and the
         # model signals with the phase tool. None (run-task mode) = legacy path.
         phase_mode = completion_mode == "setup" and self.phase_machine is not None
+        configured_scheduler = getattr(self, "reasoning_scheduler", None)
+        if phase_mode and configured_scheduler is not None:
+            self.reasoning_scheduler = ReasoningScheduler(
+                available_tools=self.tools,
+                heartbeat_actions=getattr(configured_scheduler, "heartbeat_actions", 5),
+            )
+            self._scheduler_active = True
+        else:
+            self._scheduler_active = False
+        self._scheduled_turn = None
 
         # Initialize with the initial prompt. In phase mode the window opens on
         # the phase intro digest instead of empty.
@@ -1806,7 +1826,21 @@ class ReActEngine(UIEventEmitter):
 
                 # Get LLM response
                 wrapped_prompt = self.prompt_builder.build_mode_prompt(
-                    current_prompt, mode, workflow_mode=completion_mode
+                    current_prompt,
+                    mode,
+                    workflow_mode=completion_mode,
+                    planned_step=(
+                        self._scheduled_turn.step if self._scheduled_turn is not None else None
+                    ),
+                    reasoning_reasons=(
+                        self._scheduled_turn.reasons if self._scheduled_turn is not None else ()
+                    ),
+                    scheduler_fault=(
+                        str(self._scheduled_turn.fault)
+                        if self._scheduled_turn is not None
+                        and self._scheduled_turn.fault is not None
+                        else None
+                    ),
                 )
                 response = self.llm_client.get_response(wrapped_prompt, mode)
 
@@ -1826,10 +1860,19 @@ class ReActEngine(UIEventEmitter):
                     was_thinking_model=is_thinking_step,
                 )
 
+                scheduler = self._active_reasoning_scheduler()
+                if scheduler is not None and self._scheduled_turn is not None:
+                    parsed_steps = self._prepare_scheduler_steps(
+                        response,
+                        parsed_steps,
+                        self._scheduled_turn,
+                    )
+
                 if not parsed_steps:
                     logger.warning("No valid steps parsed from LLM response")
                     logger.warning(f"Raw response was: {repr(response)}")
-                    continue
+                    if scheduler is None:
+                        continue
 
                 # Execute the steps
                 self._execute_steps(parsed_steps)
@@ -1981,6 +2024,8 @@ class ReActEngine(UIEventEmitter):
                 return self.abort(reason=f"engine exception: {type(e).__name__}")
             return False
         finally:
+            self._scheduler_active = False
+            self._scheduled_turn = None
             self.state_evaluator.completion_mode = previous_completion_mode
 
     def _record_setup_abort(self, phase_mode: bool, reason: str) -> None:
@@ -1988,8 +2033,79 @@ class ReActEngine(UIEventEmitter):
             record = self.phase_machine.record_abort(reason, evidence=[])
             self._record_phase_audit(record)
 
+    def _active_reasoning_scheduler(self) -> ReasoningScheduler | None:
+        if not getattr(self, "_scheduler_active", False):
+            return None
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        return scheduler if isinstance(scheduler, ReasoningScheduler) else None
+
+    def _request_scheduler_reasoning(
+        self,
+        trigger: ReasoningTrigger | str,
+    ) -> bool:
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is None:
+            return False
+        scheduler.request_reasoning(trigger)
+        return True
+
+    def _prepare_scheduler_steps(
+        self,
+        response: str,
+        parsed_steps: List[ReActStep],
+        turn: SchedulerTurn,
+    ) -> List[ReActStep]:
+        """Validate a model response against the scheduler before execution."""
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is None:
+            return parsed_steps
+
+        action_steps = [step for step in parsed_steps if step.step_type is StepType.ACTION]
+        thought_steps = [step for step in parsed_steps if step.step_type is StepType.THOUGHT]
+
+        if turn.mode is SchedulerMode.THINK:
+            if action_steps:
+                scheduler.reject_plan(
+                    PlanFault(
+                        code=PlanFaultCode.MALFORMED_PLAN,
+                        message="thinking response included an ACTION; no tool was executed",
+                    )
+                )
+            else:
+                scheduler.accept_thinking_response(response)
+            return thought_steps
+
+        if len(action_steps) == 1:
+            candidate = action_steps[0]
+            if scheduler.validate_actor_action(candidate.tool_name, candidate.tool_params):
+                return [candidate]
+        else:
+            scheduler.validate_actor_action(None, None)
+
+        self._add_system_guidance(
+            "SCHEDULER FAULT: the actor response did not exactly match the resolved "
+            "CurrentPlan step. No tool was executed; reason again with exact parameters.",
+            priority=9,
+        )
+        return []
+
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is not None:
+            self._scheduled_turn = scheduler.next_turn()
+            if self._scheduled_turn.mode is SchedulerMode.THINK:
+                logger.info(
+                    "Using thinking model for scheduler triggers: "
+                    + ", ".join(reason.value for reason in self._scheduled_turn.reasons)
+                )
+                return True
+            logger.info(
+                f"Using action model for planned step {self._scheduled_turn.step.plan_index + 1}"
+            )
+            return False
+
+        self._scheduled_turn = None
         # CRITICAL: Check if thinking model was requested after successful tool execution
         if self._force_thinking_after_success:
             self._force_thinking_after_success = False  # Reset the flag
@@ -2174,11 +2290,7 @@ class ReActEngine(UIEventEmitter):
             "",
         )
         evidence_ref = next(
-            (
-                str(ref)
-                for ref in [result.output_ref, *result.evidence_refs, *result.refs]
-                if ref
-            ),
+            (str(ref) for ref in [result.output_ref, *result.evidence_refs, *result.refs] if ref),
             "",
         )
         return LoopEvent(
@@ -2253,7 +2365,8 @@ class ReActEngine(UIEventEmitter):
         metadata = execution.metadata or {}
 
         if metadata.get("force_thinking_next"):
-            self._force_thinking_next = True
+            if not self._request_scheduler_reasoning(ReasoningTrigger.LOOP_BREAKER):
+                self._force_thinking_next = True
 
         if metadata.get("invalidate_trunk_cache"):
             self.prompt_builder.invalidate_trunk_cache()
@@ -2272,7 +2385,8 @@ class ReActEngine(UIEventEmitter):
         if decision.decision == "force_break":
             self._record_loop_blocker(decision)
         if decision.request_thinking:
-            self._force_thinking_next = True
+            if not self._request_scheduler_reasoning(ReasoningTrigger.LOOP_BREAKER):
+                self._force_thinking_next = True
         return decision
 
     def _close_phase_for_loop(
@@ -2426,29 +2540,34 @@ class ReActEngine(UIEventEmitter):
                 # Add observation step with improved formatting
                 self._add_observation_step(execution.observation_text)
 
-                # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
-                evidence_assessment = result.evidence_assessment
-                should_force_thinking = (
-                    result.invocation_status is InvocationStatus.PENDING
-                    or result.succeeded
-                    or evidence_assessment
-                    in {
-                        EvidenceAssessment.PARTIAL,
-                        EvidenceAssessment.CONFLICT,
-                        EvidenceAssessment.UNKNOWN,
-                    }
-                )
-                if should_force_thinking:
-                    self._force_thinking_after_success = True
-                    logger.debug(
-                        f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
+                scheduler = self._active_reasoning_scheduler()
+                if scheduler is not None:
+                    scheduler.observe_result(result)
+                else:
+                    # Legacy run-task cadence: setup phase mode is owned by the
+                    # executable-plan scheduler above.
+                    evidence_assessment = result.evidence_assessment
+                    should_force_thinking = (
+                        result.invocation_status is InvocationStatus.PENDING
+                        or result.succeeded
+                        or evidence_assessment
+                        in {
+                            EvidenceAssessment.PARTIAL,
+                            EvidenceAssessment.CONFLICT,
+                            EvidenceAssessment.UNKNOWN,
+                        }
                     )
-                if loop_decision is not None and loop_decision.request_thinking:
-                    # LoopMemory owns this reasoning trigger.  Collapse the
-                    # generic success trigger so one decision yields exactly
-                    # one thinking step, never two consecutive forced turns.
-                    self._force_thinking_after_success = False
-                    self._force_thinking_next = True
+                    if should_force_thinking:
+                        self._force_thinking_after_success = True
+                        logger.debug(
+                            f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
+                        )
+                    if loop_decision is not None and loop_decision.request_thinking:
+                        # LoopMemory owns this reasoning trigger.  Collapse the
+                        # generic success trigger so one decision yields exactly
+                        # one thinking step, never two consecutive forced turns.
+                        self._force_thinking_after_success = False
+                        self._force_thinking_next = True
 
                 # Log to branch context if we're in one
                 if branch_task_id:
@@ -2536,9 +2655,7 @@ class ReActEngine(UIEventEmitter):
                 if phase_signal in {"done", "blocked", "repair"}:
                     # The engine must apply the accepted proposal before any
                     # later action can run under a new or closed prerequisite.
-                    logger.debug(
-                        f"Stopping the action batch at phase signal {phase_signal!r}"
-                    )
+                    logger.debug(f"Stopping the action batch at phase signal {phase_signal!r}")
                     break
 
         return True

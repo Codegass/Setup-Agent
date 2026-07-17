@@ -7,11 +7,13 @@ state — not the full LLM loop."""
 from types import SimpleNamespace
 
 from sag.agent.evidence_state import RunEvidenceState
+from sag.agent.current_plan import CurrentPlan, PlanStep
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.phase_transitions import PhaseTransitionPolicy, RepairRequest
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
+from sag.agent.reasoning_scheduler import ReasoningScheduler, ReasoningTrigger, SchedulerMode
 from sag.agent.verdict_finalizer import EvidenceCloseReason
 from sag.evidence import OperationOutcome
 
@@ -117,6 +119,82 @@ def test_phase_done_signal_advances_and_resets_window():
     assert "analyze" in intro.lower()
     assert "cloned + JDK" in intro, "prior key results carried into the digest"
     assert engine._phase_iterations == 0
+
+
+def test_phase_transition_invalidates_current_plan_and_requests_one_fresh_think():
+    engine = _engine_with_machine()
+    scheduler = ReasoningScheduler(available_tools={"phase"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                PlanStep(
+                    tool="phase",
+                    exact_params={"action": "done", "outcome": "success"},
+                    expected_evidence=("accepted phase gate",),
+                    success_criteria=("phase advances",),
+                ),
+            )
+        )
+    )
+    engine.reasoning_scheduler = scheduler
+    engine._scheduler_active = True
+
+    engine._handle_phase_signals([_terminal_step(engine, key_results="cloned")])
+
+    turn = scheduler.next_turn()
+    assert turn.mode is SchedulerMode.THINK
+    assert turn.reasons == (ReasoningTrigger.PHASE_CHANGE,)
+
+
+def test_rejected_phase_gate_requests_reasoning_without_advancing():
+    engine = _engine_with_machine()
+    scheduler = ReasoningScheduler(available_tools={"phase"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                PlanStep(
+                    tool="phase",
+                    exact_params={"action": "done", "outcome": "success"},
+                    expected_evidence=("accepted phase gate",),
+                    success_criteria=("phase advances",),
+                ),
+            )
+        )
+    )
+    engine.reasoning_scheduler = scheduler
+    engine._scheduler_active = True
+    claim = PhaseClaim(
+        phase="provision",
+        signal="done",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="workspace ready",
+    )
+    rejected = GateResult(
+        accepted=False,
+        validated_outcome=PhaseOutcome.UNKNOWN,
+        claim_disposition=ClaimDisposition.CONTRADICTED,
+        validator_state=ValidatorState.UNAVAILABLE,
+        reason="workspace evidence unavailable",
+        claim=claim,
+    )
+    step = SimpleNamespace(
+        tool_result=SimpleNamespace(
+            metadata={
+                "phase_signal": "done",
+                "phase_claim": claim.to_metadata(),
+                "gate_result": rejected.to_metadata(),
+            }
+        )
+    )
+
+    engine._handle_phase_signals([step])
+
+    assert engine.phase_machine.current_phase == "provision"
+    turn = scheduler.next_turn()
+    assert turn.mode is SchedulerMode.THINK
+    assert turn.reasons == (ReasoningTrigger.GATE_REJECTION,)
 
 
 def test_phase_blocked_signal_routes_from_prerequisites_not_linear_order():

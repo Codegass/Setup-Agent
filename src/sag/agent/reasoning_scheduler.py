@@ -291,7 +291,7 @@ class ReasoningScheduler:
             self.request_reasoning(ReasoningTrigger.OBSERVATION_CONFLICT)
         elif outcome in {"unknown", "skipped"} or assessment == "unknown":
             self.request_reasoning(ReasoningTrigger.OBSERVATION_UNKNOWN)
-        elif self.next_step_index >= len(self.current_plan.steps):
+        elif self.current_plan is None or self.next_step_index >= len(self.current_plan.steps):
             self.request_reasoning(ReasoningTrigger.PLAN_EXHAUSTED)
         elif (
             self.heartbeat_actions is not None

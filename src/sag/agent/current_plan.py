@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import re
 from enum import Enum
-from typing import Any, Mapping, Sequence
+from collections.abc import Collection
+from typing import Any, Mapping, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
@@ -188,7 +189,7 @@ class CurrentPlan(BaseModel):
             )
 
         try:
-            return cls.model_validate(decoded)
+            return cast(CurrentPlan, cls.model_validate(decoded))
         except ValidationError as exc:
             raise PlanFault(
                 PlanFaultCode.MALFORMED_PLAN,
@@ -203,8 +204,8 @@ class CurrentPlan(BaseModel):
         self,
         step_index: int,
         *,
-        prior_results: Mapping[str | int, Any],
-        available_tools: Sequence[str] | set[str] | Mapping[str, Any],
+        prior_results: Mapping[Any, Any],
+        available_tools: Collection[str] | Mapping[str, Any],
     ) -> ExecutablePlanStep:
         """Resolve one zero-based step or raise a scheduler fault before acting."""
         if step_index < 0 or step_index >= len(self.steps):
@@ -266,7 +267,7 @@ class CurrentPlan(BaseModel):
         value: Any,
         *,
         step_index: int,
-        prior_results: Mapping[str | int, Any],
+        prior_results: Mapping[Any, Any],
     ) -> Any:
         if isinstance(value, dict):
             resolved: dict[str, Any] = {}
@@ -347,7 +348,7 @@ class CurrentPlan(BaseModel):
     @staticmethod
     def _result_for_ordinal(
         ordinal: int,
-        prior_results: Mapping[str | int, Any],
+        prior_results: Mapping[Any, Any],
     ) -> Any:
         for key in (f"step_{ordinal}", ordinal, ordinal - 1):
             if key in prior_results:
@@ -359,7 +360,7 @@ class CurrentPlan(BaseModel):
         match: re.Match[str],
         *,
         step_index: int,
-        prior_results: Mapping[str | int, Any],
+        prior_results: Mapping[Any, Any],
     ) -> Any:
         ordinal = int(match.group("ordinal"))
         if ordinal > step_index:

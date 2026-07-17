@@ -81,6 +81,10 @@ class Config(BaseModel):
     # Agent configuration
     max_iterations: int = Field(default=50)
     context_switch_threshold: int = Field(default=20)
+    # Experimental scheduler heartbeat: require a fresh reasoning turn after
+    # this many actor calls without one.  This is a tunable guard, not part of
+    # the executable-plan architecture.
+    reasoning_heartbeat_actions: int = Field(default=5, ge=1)
     # Global wall-clock cap for a whole run (seconds); the ReAct loop ends with
     # a clear "global time cap" status once exceeded. <=0 disables the cap.
     max_wall_clock_seconds: int = Field(default=7200)
@@ -155,6 +159,7 @@ class Config(BaseModel):
             workspace_path=os.getenv("SAG_WORKSPACE_PATH", "/workspace"),
             max_iterations=int(os.getenv("SAG_MAX_ITERATIONS", "50")),
             context_switch_threshold=int(os.getenv("SAG_CONTEXT_SWITCH_THRESHOLD", "20")),
+            reasoning_heartbeat_actions=int(os.getenv("SAG_REASONING_HEARTBEAT_ACTIONS", "5")),
             max_wall_clock_seconds=int(os.getenv("SAG_MAX_WALL_CLOCK_SECONDS", "7200")),
             dispatch_soft_timeout_seconds=int(
                 os.getenv("SAG_DISPATCH_SOFT_TIMEOUT_SECONDS", "900")
