@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Set
 from loguru import logger as default_logger
 
 from sag.agent.tool_orchestration import RecoveryDecision
-from sag.tools.base import ActualToolExecution, BaseTool, ToolResult
+from sag.tools.base import ActualToolExecution, BaseTool, OutputPersistenceError, ToolResult
 from sag.tools.build.backends import GradleBackend, MavenBackend
 
 
@@ -44,31 +44,39 @@ class ToolRecoveryHandler:
             self.logger.info(f"Attempting tool recovery for {tool_name}: {error_msg[:100]}")
 
             if tool_name == "manage_context":
-                return self._recover_context_management_error(params, failed_result)
-            if tool_name == "project_setup":
-                return self._recover_project_setup_error(params, failed_result)
-            if tool_name == "project":
+                decision = self._recover_context_management_error(params, failed_result)
+            elif tool_name == "project_setup":
+                decision = self._recover_project_setup_error(params, failed_result)
+            elif tool_name == "project":
                 # Stage-1 surface: only the clone verb has a recovery strategy.
                 if str(params.get("action", "")).lower() == "clone":
-                    return self._recover_project_setup_error(
+                    decision = self._recover_project_setup_error(
                         self._project_clone_params(params), failed_result
                     )
-                return self._recover_generic_error(tool_name, params, failed_result)
-            if tool_name == "maven":
-                return self._recover_maven_error(params, failed_result)
-            if tool_name == "gradle":
-                return self._recover_gradle_error(params, failed_result)
-            if tool_name == "build":
-                return self._recover_build_error(params, failed_result)
-            if tool_name == "bash":
-                return self._recover_bash_error(params, failed_result)
-            if tool_name == "file_io":
-                return self._recover_file_io_error(params, failed_result)
-            return self._recover_generic_error(tool_name, params, failed_result)
+                else:
+                    decision = self._recover_generic_error(tool_name, params, failed_result)
+            elif tool_name == "maven":
+                decision = self._recover_maven_error(params, failed_result)
+            elif tool_name == "gradle":
+                decision = self._recover_gradle_error(params, failed_result)
+            elif tool_name == "build":
+                decision = self._recover_build_error(params, failed_result)
+            elif tool_name == "bash":
+                decision = self._recover_bash_error(params, failed_result)
+            elif tool_name == "file_io":
+                decision = self._recover_file_io_error(params, failed_result)
+            else:
+                decision = self._recover_generic_error(tool_name, params, failed_result)
+        except OutputPersistenceError:
+            raise
         except Exception as exc:
             message = f"Recovery mechanism failed: {exc}"
             self.logger.error(f"Tool recovery itself failed for {tool_name}: {exc}")
             return self._no_strategy("generic_no_strategy", message)
+
+        if decision.replacement_result is not None and decision.replacement_tool_name is None:
+            decision.replacement_tool_name = tool_name
+        return decision
 
     def _delegate_tool(self, name: str) -> Optional[BaseTool]:
         """Resolve a backend/delegate tool by its legacy name.
@@ -110,9 +118,17 @@ class ToolRecoveryHandler:
         """Route consolidated build failures to the backend-specific strategies."""
         system = (getattr(failed_result, "facts", None) or {}).get("system")
         if system == "maven":
-            return self._recover_maven_error(self._maven_params_from_build(params), failed_result)
+            decision = self._recover_maven_error(
+                self._maven_params_from_build(params), failed_result
+            )
+            decision.replacement_tool_name = "maven"
+            return decision
         if system == "gradle":
-            return self._recover_gradle_error(self._gradle_params_from_build(params), failed_result)
+            decision = self._recover_gradle_error(
+                self._gradle_params_from_build(params), failed_result
+            )
+            decision.replacement_tool_name = "gradle"
+            return decision
         return self._no_strategy("build_no_strategy", "No build recovery strategy applicable")
 
     def _maven_params_from_build(self, params: Dict[str, Any]) -> Dict[str, Any]:

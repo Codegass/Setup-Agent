@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, field_serializer
 
 from sag.evidence import EvidenceFinding, EvidenceStatus, OperationOutcome
-from sag.tools.base import ToolResult, UnpersistedToolResult
+from sag.tools.base import ToolResult, UnpersistedToolResult, new_execution_id
 
 from .phase_machine import PhaseAttemptRecord
 
@@ -81,6 +81,7 @@ class ToolObservation(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     observation_id: str
+    execution_id: str
     scope: StateScope
     tool_name: str
     roles: tuple[EvidenceRole, ...] = ()
@@ -130,6 +131,7 @@ class RunEvidenceState(BaseModel):
     _blocker_events: list[BlockerRecord] = PrivateAttr(default_factory=list)
     _action_attempts: list[ActionAttempt] = PrivateAttr(default_factory=list)
     _tool_observations: list[ToolObservation] = PrivateAttr(default_factory=list)
+    _observation_execution_ids: set[str] = PrivateAttr(default_factory=set)
     _validator_findings: list[EvidenceFinding] = PrivateAttr(default_factory=list)
     _conflicts: list[str] = PrivateAttr(default_factory=list)
     _phase_records: list[PhaseAttemptRecord] = PrivateAttr(default_factory=list)
@@ -337,6 +339,9 @@ class RunEvidenceState(BaseModel):
         if normalized not in self._conflicts:
             self._conflicts.append(normalized)
 
+    def has_execution_id(self, execution_id: str) -> bool:
+        return execution_id in self._observation_execution_ids
+
     def ingest_tool_result(
         self,
         scope: StateScope,
@@ -345,10 +350,36 @@ class RunEvidenceState(BaseModel):
         provenance: str | None = None,
         *,
         roles: Iterable[EvidenceRole] = (),
+        execution_id: str | None = None,
     ) -> StateEpochDelta:
         """Record a WS0 result and promote only its verified facts into epochs."""
         self._require_mutable()
         scope = StateScope(scope)
+        execution_id = execution_id or new_execution_id()
+        normalized_roles = tuple(dict.fromkeys(EvidenceRole(role) for role in roles))
+        existing = next(
+            (
+                observation
+                for observation in self._tool_observations
+                if observation.execution_id == execution_id
+            ),
+            None,
+        )
+        if existing is not None:
+            if (
+                existing.scope is not scope
+                or existing.tool_name != tool_name
+                or existing.roles != normalized_roles
+                or existing.result != result
+            ):
+                raise ValueError(f"conflicting observation for execution_id {execution_id}")
+            before = self._state_epochs[scope]
+            return StateEpochDelta(
+                scope=scope,
+                before=before,
+                after=before,
+                changed=False,
+            )
         source = (
             provenance
             or result.output_ref
@@ -359,13 +390,15 @@ class RunEvidenceState(BaseModel):
         )
         observation = ToolObservation(
             observation_id=f"observation_{len(self._tool_observations) + 1}",
+            execution_id=execution_id,
             scope=scope,
             tool_name=tool_name,
-            roles=tuple(dict.fromkeys(EvidenceRole(role) for role in roles)),
+            roles=normalized_roles,
             result=result.model_copy(deep=True),
             provenance=source,
         )
         self._tool_observations.append(observation)
+        self._observation_execution_ids.add(execution_id)
         self._validator_findings.extend(_snapshot(finding) for finding in result.validator_findings)
         self._conflicts.extend(result.conflicts)
 
@@ -393,6 +426,7 @@ class RunEvidenceState(BaseModel):
         provenance: str,
         *,
         roles: Iterable[EvidenceRole] = (),
+        execution_id: str | None = None,
     ) -> StateEpochDelta:
         """Record bounded evidence from a result-construction persistence failure."""
         if not isinstance(result, UnpersistedToolResult):
@@ -403,6 +437,7 @@ class RunEvidenceState(BaseModel):
             result,
             provenance,
             roles=roles,
+            execution_id=execution_id or result.execution_id,
         )
 
     def state_vector(self, scopes: Iterable[StateScope]) -> dict[str, int]:

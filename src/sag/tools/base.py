@@ -8,9 +8,10 @@ import re
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Union, get_args, get_origin
+from uuid import uuid4
 
 from loguru import logger
 from pydantic import (
@@ -29,6 +30,10 @@ from sag.evidence import (
     OperationOutcome,
     TestStats,
 )
+
+
+def new_execution_id() -> str:
+    return f"execution_{uuid4().hex}"
 
 
 class ToolError(Exception):
@@ -95,25 +100,49 @@ class OutputPersistenceError(RuntimeError):
         draft: UnpersistedToolResult | None = None,
         tool_name: str | None = None,
         params: Dict[str, Any] | None = None,
+        execution_id: str | None = None,
+        actual_executions: Iterable[ActualToolExecution] = (),
     ) -> None:
         super().__init__(message)
         self.draft = draft
         self.tool_name = tool_name
         self.params = dict(params) if params is not None else None
+        self.execution_id = execution_id
+        self.actual_executions = tuple(actual_executions)
 
     def attach_draft(self, draft: UnpersistedToolResult) -> OutputPersistenceError:
         if self.draft is None:
-            self.draft = draft
+            self.draft = (
+                draft.model_copy(update={"execution_id": self.execution_id})
+                if self.execution_id is not None
+                else draft
+            )
         return self
 
     def attach_invocation(
         self,
         tool_name: str,
         params: Dict[str, Any],
+        *,
+        execution_id: str | None = None,
     ) -> OutputPersistenceError:
         if self.tool_name is None:
             self.tool_name = tool_name
             self.params = dict(params)
+        if self.execution_id is None:
+            self.execution_id = execution_id or new_execution_id()
+        if self.draft is not None and self.draft.execution_id != self.execution_id:
+            self.draft = self.draft.model_copy(update={"execution_id": self.execution_id})
+        return self
+
+    def attach_actual_executions(
+        self,
+        executions: Iterable[ActualToolExecution],
+    ) -> OutputPersistenceError:
+        merged = {actual.execution_id: actual for actual in self.actual_executions}
+        for actual in executions:
+            merged.setdefault(actual.execution_id, actual)
+        self.actual_executions = tuple(merged.values())
         return self
 
 
@@ -321,29 +350,144 @@ class ActualToolExecution:
     tool_name: str
     params: Dict[str, Any]
     result: ToolResult
+    execution_id: str = field(default_factory=new_execution_id)
 
 
-def _bounded_diagnostic_value(value: Any, *, depth: int = 0) -> Any:
-    if depth >= 4:
-        return str(value)[:500]
-    if isinstance(value, str):
-        return value[:1000]
-    if isinstance(value, bytes):
-        return value[:1000].decode("utf-8", errors="replace")
-    if isinstance(value, dict):
-        return {
-            str(key)[:100]: _bounded_diagnostic_value(item, depth=depth + 1)
-            for key, item in list(value.items())[:50]
-        }
-    if isinstance(value, (list, tuple, set)):
-        return [_bounded_diagnostic_value(item, depth=depth + 1) for item in list(value)[:50]]
-    if value is None or isinstance(value, (bool, int, float)):
-        return value
-    return str(value)[:500]
+UNPERSISTED_DRAFT_MAX_BYTES = 32 * 1024
+_UNPERSISTED_DRAFT_CHAR_BUDGET = 3500
+_UNPERSISTED_DRAFT_NODE_BUDGET = 96
 
 
-def _bounded_strings(values: Any) -> List[str]:
-    return [str(value)[:500] for value in list(values or [])[:50]]
+@dataclass
+class _DraftBudget:
+    """One shared budget for all bounded construction-failure diagnostics."""
+
+    remaining_chars: int = _UNPERSISTED_DRAFT_CHAR_BUDGET
+    remaining_nodes: int = _UNPERSISTED_DRAFT_NODE_BUDGET
+    truncated: bool = False
+
+    def _claim_node(self) -> bool:
+        if self.remaining_nodes <= 0:
+            self.truncated = True
+            return False
+        self.remaining_nodes -= 1
+        return True
+
+    def _clip_text(self, value: Any, max_chars: int, *, keep_tail: bool = False) -> str:
+        raw = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else str(value)
+        available = min(max_chars, self.remaining_chars)
+        if available <= 0:
+            if raw:
+                self.truncated = True
+            return ""
+        clipped = raw[-available:] if keep_tail else raw[:available]
+        self.remaining_chars -= len(clipped)
+        if len(clipped) != len(raw):
+            self.truncated = True
+        return clipped
+
+    def text(
+        self,
+        value: Any,
+        max_chars: int,
+        *,
+        keep_tail: bool = False,
+    ) -> str | None:
+        if value is None:
+            return None
+        if not self._claim_node():
+            return ""
+        return self._clip_text(value, max_chars, keep_tail=keep_tail)
+
+    def strings(
+        self,
+        values: Any,
+        *,
+        max_items: int = 16,
+        max_chars: int = 500,
+    ) -> List[str]:
+        if values is None:
+            return []
+        iterable = [values] if isinstance(values, (str, bytes)) else values
+        bounded: List[str] = []
+        for index, value in enumerate(iterable):
+            if index >= max_items:
+                self.truncated = True
+                break
+            item = self.text(value, max_chars)
+            if item is None:
+                continue
+            if not item and str(value):
+                break
+            bounded.append(item)
+        return bounded
+
+    def diagnostic(self, value: Any, *, depth: int = 0) -> Any:
+        if not self._claim_node():
+            return None
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, (str, bytes)):
+            return self._clip_text(value, 500)
+        if depth >= 4:
+            self.truncated = True
+            return "<truncated>"
+        if isinstance(value, dict):
+            bounded: Dict[str, Any] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= 16:
+                    self.truncated = True
+                    break
+                bounded_key = self.text(key, 80)
+                if not bounded_key:
+                    break
+                bounded[bounded_key] = self.diagnostic(item, depth=depth + 1)
+            return bounded
+        if isinstance(value, (list, tuple, set)):
+            bounded_list: List[Any] = []
+            for index, item in enumerate(value):
+                if index >= 16:
+                    self.truncated = True
+                    break
+                if self.remaining_nodes <= 0 or self.remaining_chars <= 0:
+                    self.truncated = True
+                    break
+                bounded_list.append(self.diagnostic(item, depth=depth + 1))
+            return bounded_list
+        return self._clip_text(value, 500)
+
+    def findings(self, values: Any) -> List[EvidenceFinding]:
+        bounded: List[EvidenceFinding] = []
+        for index, value in enumerate(values or []):
+            if index >= 8:
+                self.truncated = True
+                break
+            try:
+                finding = (
+                    value
+                    if isinstance(value, EvidenceFinding)
+                    else EvidenceFinding.model_validate(value)
+                )
+            except (TypeError, ValueError):
+                self.truncated = True
+                continue
+            finding_type = self.text(finding.type, 256)
+            reason = self.text(finding.reason, 512)
+            if not finding_type or not reason:
+                self.truncated = True
+                break
+            refs = self.strings(finding.refs, max_items=8, max_chars=500)
+            details = self.diagnostic(finding.details)
+            bounded.append(
+                EvidenceFinding(
+                    type=finding_type,
+                    reason=reason,
+                    status=finding.status,
+                    refs=refs,
+                    details=details if isinstance(details, dict) else {},
+                )
+            )
+        return bounded
 
 
 class UnpersistedToolResult(BaseModel):
@@ -351,6 +495,7 @@ class UnpersistedToolResult(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    execution_id: Optional[str] = None
     invocation_status: InvocationStatus
     operation_outcome: OperationOutcome
     evidence_status: EvidenceStatus
@@ -371,6 +516,7 @@ class UnpersistedToolResult(BaseModel):
     test_stats: Optional[TestStats] = None
     facts: Dict[str, Any] = Field(default_factory=dict)
     refs: List[str] = Field(default_factory=list)
+    truncated: bool = False
 
     @classmethod
     def from_failed_construction(
@@ -381,32 +527,74 @@ class UnpersistedToolResult(BaseModel):
         evidence_status: EvidenceStatus | str,
         payload: Dict[str, Any],
     ) -> UnpersistedToolResult:
-        return cls(
+        budget = _DraftBudget()
+        execution_id = budget.text(payload.get("execution_id"), 128)
+        poll_ref = budget.text(payload.get("poll_ref"), 256)
+        failure_signature = budget.text(payload.get("failure_signature"), 256)
+        error_tail_preview = budget.text(payload.get("error_tail_preview"), 400, keep_tail=True)
+        error = budget.text(payload.get("error"), 1000)
+        error_code = budget.text(payload.get("error_code"), 200)
+        validator_findings = budget.findings(payload.get("validator_findings"))
+        conflicts = budget.strings(payload.get("conflicts"))
+        evidence_refs = budget.strings(payload.get("evidence_refs"))
+        refs = budget.strings(payload.get("refs"))
+        facts = budget.diagnostic(payload.get("facts") or {})
+        metadata = budget.diagnostic(payload.get("metadata") or {})
+        raw_data = (
+            budget.diagnostic(payload.get("raw_data"))
+            if payload.get("raw_data") is not None
+            else None
+        )
+        suggestions = budget.strings(payload.get("suggestions"))
+        documentation_links = budget.strings(payload.get("documentation_links"))
+        draft = cls(
+            execution_id=execution_id,
             invocation_status=invocation_status,
             operation_outcome=operation_outcome,
             evidence_status=EvidenceStatus(evidence_status),
-            poll_ref=payload.get("poll_ref"),
-            failure_signature=payload.get("failure_signature"),
-            error_tail_preview=payload.get("error_tail_preview"),
+            poll_ref=poll_ref,
+            failure_signature=failure_signature,
+            error_tail_preview=error_tail_preview,
             evidence_assessment=payload.get("evidence_assessment", EvidenceAssessment.UNKNOWN),
-            error=str(payload["error"])[:1000] if payload.get("error") is not None else None,
-            error_code=(
-                str(payload["error_code"])[:200] if payload.get("error_code") is not None else None
-            ),
-            suggestions=_bounded_strings(payload.get("suggestions")),
-            documentation_links=_bounded_strings(payload.get("documentation_links")),
-            raw_data=(
-                _bounded_diagnostic_value(payload.get("raw_data"))
-                if payload.get("raw_data") is not None
-                else None
-            ),
-            metadata=_bounded_diagnostic_value(payload.get("metadata") or {}),
-            evidence_refs=_bounded_strings(payload.get("evidence_refs")),
-            conflicts=_bounded_strings(payload.get("conflicts")),
-            validator_findings=list(payload.get("validator_findings") or [])[:50],
+            error=error,
+            error_code=error_code,
+            suggestions=suggestions,
+            documentation_links=documentation_links,
+            raw_data=raw_data if isinstance(raw_data, dict) else None,
+            metadata=metadata if isinstance(metadata, dict) else {},
+            evidence_refs=evidence_refs,
+            conflicts=conflicts,
+            validator_findings=validator_findings,
             test_stats=payload.get("test_stats"),
-            facts=_bounded_diagnostic_value(payload.get("facts") or {}),
-            refs=_bounded_strings(payload.get("refs")),
+            facts=facts if isinstance(facts, dict) else {},
+            refs=refs,
+            truncated=budget.truncated,
+        )
+        if len(draft.model_dump_json().encode("utf-8")) <= UNPERSISTED_DRAFT_MAX_BYTES:
+            return draft
+
+        minimal_findings = [
+            finding.model_copy(update={"refs": finding.refs[:1], "details": {}})
+            for finding in draft.validator_findings[:1]
+        ]
+        return cls(
+            execution_id=draft.execution_id,
+            invocation_status=draft.invocation_status,
+            operation_outcome=draft.operation_outcome,
+            evidence_status=draft.evidence_status,
+            poll_ref=draft.poll_ref,
+            failure_signature=draft.failure_signature,
+            error_tail_preview=draft.error_tail_preview,
+            evidence_assessment=draft.evidence_assessment,
+            error=draft.error,
+            error_code=draft.error_code,
+            metadata={"draft_truncated": True},
+            conflicts=draft.conflicts[:4],
+            validator_findings=minimal_findings,
+            test_stats=draft.test_stats,
+            refs=draft.refs[:4],
+            evidence_refs=draft.evidence_refs[:4],
+            truncated=True,
         )
 
     @property

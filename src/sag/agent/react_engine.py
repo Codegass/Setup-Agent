@@ -19,6 +19,7 @@ from sag.tools.base import (
     ToolResult,
     UnpersistedToolResult,
     is_output_storage_ref,
+    new_execution_id,
 )
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
@@ -632,6 +633,7 @@ class ReActEngine(UIEventEmitter):
         result: ToolResult,
         *,
         attempted_execution: bool = True,
+        execution_id: str | None = None,
     ) -> ToolResult:
         """Persist provenance and ingest one evidence-bearing execution once."""
         if tool_name == "report":
@@ -644,6 +646,10 @@ class ReActEngine(UIEventEmitter):
 
         state = getattr(self, "run_evidence_state", None)
         if state is None or state.sealed or tool_name in self._NON_EVIDENCE_TOOLS:
+            return result
+
+        execution_id = execution_id or new_execution_id()
+        if state.has_execution_id(execution_id):
             return result
 
         scope = self._tool_evidence_scope(tool_name, params)
@@ -691,6 +697,7 @@ class ReActEngine(UIEventEmitter):
                 result,
                 provenance=f"tool:{tool_name}:{action}:output-persistence-failed",
                 roles=roles,
+                execution_id=execution_id,
             )
             state.record_conflict("output_storage_failed")
             raise
@@ -708,6 +715,7 @@ class ReActEngine(UIEventEmitter):
             durable,
             provenance=durable.output_ref,
             roles=roles,
+            execution_id=execution_id,
         )
         return durable
 
@@ -1827,6 +1835,13 @@ class ReActEngine(UIEventEmitter):
                 and call.name not in self._NON_EVIDENCE_TOOLS
                 and call.name != "report"
             ):
+                for actual in exc.actual_executions:
+                    self._record_tool_execution(
+                        actual.tool_name,
+                        actual.params,
+                        actual.result,
+                        execution_id=actual.execution_id,
+                    )
                 tool_name = exc.tool_name or call.name
                 params = exc.params or call.validated_params or call.raw_params
                 scope = self._tool_evidence_scope(tool_name, params)
@@ -1852,6 +1867,7 @@ class ReActEngine(UIEventEmitter):
                         exc.draft,
                         provenance=(f"tool:{tool_name}:{action}:output-persistence-failed"),
                         roles=self._tool_evidence_roles(tool_name, params, exc.draft),
+                        execution_id=exc.execution_id or exc.draft.execution_id,
                     )
                 state.record_conflict("output_storage_failed")
             raise
@@ -1943,12 +1959,14 @@ class ReActEngine(UIEventEmitter):
                             actual.params,
                             actual.result,
                             attempted_execution=True,
+                            execution_id=actual.execution_id,
                         )
                         recorded_executions.append(
                             ActualToolExecution(
                                 tool_name=actual.tool_name,
                                 params=actual.params,
                                 result=recorded,
+                                execution_id=actual.execution_id,
                             )
                         )
                         if actual.result is execution.result:

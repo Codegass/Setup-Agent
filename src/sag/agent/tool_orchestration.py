@@ -18,6 +18,7 @@ from sag.tools.base import (
     OutputPersistenceError,
     ToolResult,
     bind_tool_result_output_storage,
+    new_execution_id,
 )
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
@@ -83,6 +84,7 @@ class RecoveryDecision:
     guidance: Optional[str] = None
     replacement_result: Optional[ToolResult] = None
     replacement_params: Optional[Dict[str, Any]] = None
+    replacement_tool_name: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -318,17 +320,23 @@ class ToolOrchestrator:
         result: ToolResult,
         *,
         include_untraced: bool = True,
+        execution_id: str | None = None,
+        _seen_execution_ids: set[str] | None = None,
     ) -> list[ActualToolExecution]:
+        seen = _seen_execution_ids if _seen_execution_ids is not None else set()
         if not result.execution_trace:
             if not include_untraced:
                 return []
-            return [
-                ActualToolExecution(
-                    tool_name=tool_name,
-                    params=dict(params),
-                    result=result,
-                )
-            ]
+            actual = ActualToolExecution(
+                tool_name=tool_name,
+                params=dict(params),
+                result=result,
+                execution_id=execution_id or new_execution_id(),
+            )
+            if actual.execution_id in seen:
+                return []
+            seen.add(actual.execution_id)
+            return [actual]
 
         flattened: list[ActualToolExecution] = []
         for actual in result.execution_trace:
@@ -337,6 +345,8 @@ class ToolOrchestrator:
                     actual.tool_name,
                     actual.params,
                     actual.result,
+                    execution_id=actual.execution_id,
+                    _seen_execution_ids=seen,
                 )
             )
         return flattened
@@ -654,7 +664,10 @@ class ToolOrchestrator:
         )
 
         if result.is_terminal and result.operation_outcome is OperationOutcome.FAILED:
-            decision = self.recovery_handler.recover(call.name, validated_params, result)
+            try:
+                decision = self.recovery_handler.recover(call.name, validated_params, result)
+            except OutputPersistenceError as exc:
+                raise exc.attach_actual_executions(actual_executions)
             recovery_metadata = dict(decision.metadata)
             recovery_metadata.setdefault("attempted", decision.should_recover)
             recovery_metadata.setdefault("success", False)
@@ -698,9 +711,12 @@ class ToolOrchestrator:
                     else:
                         actual_executions.extend(
                             self._flatten_actual_execution(
-                                call.name,
+                                decision.replacement_tool_name or call.name,
                                 recovery_params,
                                 result,
+                                _seen_execution_ids={
+                                    actual.execution_id for actual in actual_executions
+                                },
                             )
                         )
                         status = (
