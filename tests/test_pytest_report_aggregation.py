@@ -490,7 +490,7 @@ def test_execution_coverage_gate_consumes_collected_fallback(workspace):
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="partial",
         report_filename="setup-report-test.md",
         project_info={"build_system": "pip/poetry"},
@@ -530,7 +530,7 @@ def test_full_green_parameterized_run_keeps_coverage_gate_quiet(workspace):
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="success",
         report_filename="setup-report-test.md",
         project_info={"build_system": "pip/poetry"},
@@ -565,7 +565,7 @@ def test_java_method_denominator_keeps_unique_numerator():
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="success",
         report_filename="setup-report-test.md",
         project_info={"build_system": "Maven"},

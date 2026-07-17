@@ -120,7 +120,7 @@ def test_snapshot_builder_sources_fingerprint_details_from_validator():
         "compileall_coverage": 1.0,
         "ext_modules_ok": None,
     }
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         "success",
         "setup-report.md",
         {"type": "Python Project", "build_system": "pip/poetry", "directory": "/workspace/pyyaml"},
