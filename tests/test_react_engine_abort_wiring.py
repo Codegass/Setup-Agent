@@ -1,8 +1,12 @@
 from types import SimpleNamespace
 
+from test_verdict_finalizer import FakeVerdictOrchestrator
+
 import sag.agent.react_engine as react_engine_module
+from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_machine import PhaseMachine, PhaseTermination
 from sag.agent.react_engine import ReActEngine
+from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
 
 
 class _PromptBuilder:
@@ -39,6 +43,11 @@ def _engine(*, response="unparseable response", error=None, wall_clock_cap=0):
     engine = ReActEngine.__new__(ReActEngine)
     engine.max_iterations = 3
     engine.phase_machine = PhaseMachine()
+    engine.run_evidence_state = RunEvidenceState(run_id="abort-wiring")
+    engine.verdict_finalizer = VerdictFinalizer(FakeVerdictOrchestrator())
+    engine._report_attempted = False
+    engine._report_delivered = False
+    engine._report_failed = False
     engine.config = SimpleNamespace(max_wall_clock_seconds=wall_clock_cap)
     engine.agent_logger = SimpleNamespace(info=lambda *args, **kwargs: None)
     engine.prompt_builder = _PromptBuilder()
@@ -71,27 +80,27 @@ def test_setup_wall_clock_exhaustion_records_abort_without_advancing(monkeypatch
     clock = iter([100.0, 102.0, 102.0])
     monkeypatch.setattr(react_engine_module.time, "time", lambda: next(clock))
 
-    succeeded = engine.run_react_loop("set up project", max_iterations=3)
+    termination = engine.run_setup_loop("set up project", max_iterations=3)
 
-    assert succeeded is False
+    assert termination.termination is RunTerminationStatus.ABORTED
     _assert_setup_abort(engine, "wall clock cap exceeded")
 
 
 def test_setup_empty_llm_response_records_abort_without_advancing():
     engine = _engine(response="")
 
-    succeeded = engine.run_react_loop("set up project", max_iterations=3)
+    termination = engine.run_setup_loop("set up project", max_iterations=3)
 
-    assert succeeded is False
+    assert termination.termination is RunTerminationStatus.ABORTED
     _assert_setup_abort(engine, "LLM response unavailable")
 
 
 def test_setup_iteration_exhaustion_records_abort_without_advancing():
     engine = _engine(response="unparseable response")
 
-    succeeded = engine.run_react_loop("set up project", max_iterations=2)
+    termination = engine.run_setup_loop("set up project", max_iterations=2)
 
-    assert succeeded is False
+    assert termination.termination is RunTerminationStatus.ABORTED
     assert engine.current_iteration == 2
     _assert_setup_abort(engine, "iteration budget exhausted")
 
@@ -99,15 +108,15 @@ def test_setup_iteration_exhaustion_records_abort_without_advancing():
 def test_setup_engine_exception_records_abort_without_advancing():
     engine = _engine(error=RuntimeError("LLM transport failed"))
 
-    succeeded = engine.run_react_loop("set up project", max_iterations=3)
+    termination = engine.run_setup_loop("set up project", max_iterations=3)
 
-    assert succeeded is False
+    assert termination.termination is RunTerminationStatus.ABORTED
     _assert_setup_abort(engine, "engine exception: RuntimeError")
 
 
 def test_setup_duplicate_cleanup_keeps_first_abort_record():
     engine = _engine(response="")
-    engine.run_react_loop("set up project", max_iterations=3)
+    engine.run_setup_loop("set up project", max_iterations=3)
     first_record = engine.phase_machine.records[0]
 
     engine._record_setup_abort(True, "duplicate cleanup")

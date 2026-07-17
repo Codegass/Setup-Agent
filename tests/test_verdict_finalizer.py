@@ -1,0 +1,309 @@
+import json
+from dataclasses import asdict
+
+import pytest
+
+from sag.agent.evidence_state import RunEvidenceState, StateScope
+from sag.agent.phase_machine import PhaseMachine
+from sag.agent.verdict_finalizer import (
+    EvidenceCloseReason,
+    VerdictFinalizer,
+    read_verdict_snapshot,
+)
+from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
+from sag.tools.base import ToolResult
+
+VERDICT_PATH = "/workspace/.setup_agent/verdict.json"
+VERDICT_TMP_PATH = f"{VERDICT_PATH}.tmp"
+
+
+class FakeVerdictOrchestrator:
+    def __init__(self):
+        self.commands = []
+        self.files = {}
+
+    def execute_command(self, command):
+        self.commands.append(command)
+
+        if command.startswith("mkdir -p "):
+            return {"success": True, "exit_code": 0, "output": ""}
+
+        if command.startswith("test -f ") and " && cat " in command:
+            path = command.split()[2]
+            if path not in self.files:
+                return {"success": False, "exit_code": 1, "output": ""}
+            return {"success": True, "exit_code": 0, "output": self.files[path]}
+
+        if command.startswith("cat > "):
+            path = command.split()[2]
+            payload = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            self.files[path] = payload + "\n"
+            return {"success": True, "exit_code": 0, "output": ""}
+
+        if command.startswith("truncate -s -1 "):
+            path = command.split()[-1]
+            self.files[path] = self.files[path][:-1]
+            return {"success": True, "exit_code": 0, "output": ""}
+
+        if command.startswith("mv "):
+            _, source, target = command.split()
+            self.files[target] = self.files.pop(source)
+            return {"success": True, "exit_code": 0, "output": ""}
+
+        return {"success": True, "exit_code": 0, "output": ""}
+
+
+def _record_machine_history(state: RunEvidenceState, machine: PhaseMachine) -> None:
+    for record in machine.records:
+        state.record_phase_record(record)
+
+
+def _tvm_state() -> RunEvidenceState:
+    state = RunEvidenceState(run_id="session-tvm")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed(
+            output="native and Python artifacts built",
+            operation_outcome=OperationOutcome.PARTIAL,
+            evidence_status=EvidenceStatus.VERIFIED,
+            facts={"build_success": True, "build_complete": False},
+            refs=["output_build"],
+        ),
+        provenance="output_build",
+    )
+    for attempt in range(3):
+        state.ingest_tool_result(
+            StateScope.TEST_RUNTIME,
+            "build",
+            ToolResult.completed_success(
+                output=f"pytest retry {attempt + 1}",
+                test_stats=TestStats(
+                    discovered=328,
+                    executed=328,
+                    passed=328,
+                    failed=0,
+                    skipped=0,
+                ),
+                refs=[f"output_test_{attempt + 1}"],
+            ),
+            provenance=f"output_test_{attempt + 1}",
+        )
+
+    machine = PhaseMachine()
+    machine.mark_done("cloned", ["output_clone"])
+    machine.mark_done("analyzed", ["output_analysis"])
+    machine.mark_done("native core partial; imports verified", ["output_build"])
+    machine.mark_done("328 tests green", ["output_test_3"])
+    _record_machine_history(state, machine)
+    return state
+
+
+def test_finalization_is_byte_identical_and_uses_atomic_rename():
+    orchestrator = FakeVerdictOrchestrator()
+    state = _tvm_state()
+    finalizer = VerdictFinalizer(orchestrator)
+
+    first = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    commands_after_first = list(orchestrator.commands)
+    second = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    assert first.model_dump_json() == second.model_dump_json()
+    assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
+    assert VERDICT_TMP_PATH not in orchestrator.files
+    assert orchestrator.commands == commands_after_first
+    temp_write_index = next(
+        index for index, command in enumerate(orchestrator.commands) if VERDICT_TMP_PATH in command
+    )
+    rename_index = orchestrator.commands.index(f"mv {VERDICT_TMP_PATH} {VERDICT_PATH}")
+    assert temp_write_index < rename_index
+
+
+def test_conflicting_reason_is_rejected_before_read_write_or_state_change():
+    orchestrator = FakeVerdictOrchestrator()
+    state = _tvm_state()
+    finalizer = VerdictFinalizer(orchestrator)
+    first = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    commands_after_first = list(orchestrator.commands)
+
+    with pytest.raises(ValueError, match="conflicting evidence-close reason"):
+        finalizer.finalize(state, EvidenceCloseReason.ABORTED)
+
+    assert state.close_reason == EvidenceCloseReason.TEST_TERMINATED.value
+    assert orchestrator.commands == commands_after_first
+    assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
+
+
+def test_snapshot_uses_unique_test_counts_and_keeps_raw_retries_secondary():
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        _tvm_state(), EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.verdict == "partial"
+    assert snapshot.test_stats.discovered == 328
+    assert snapshot.test_stats.executed == 328
+    assert snapshot.test_stats.passed == 328
+    assert snapshot.test_stats.raw.executed == 984
+    assert snapshot.test_stats.pass_rate == 100.0
+    assert "pass_rate" not in snapshot.model_dump()["test_stats"]
+
+
+def test_snapshot_separates_maven_failures_from_errors():
+    state = RunEvidenceState(run_id="session-errors")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="tests terminal",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=12,
+                executed=12,
+                passed=6,
+                failed=5,
+                skipped=1,
+            ),
+            metadata={
+                "analysis": {
+                    "tests_run": {
+                        "total": 12,
+                        "failures": 2,
+                        "errors": 3,
+                        "skipped": 1,
+                    }
+                }
+            },
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.failed == 2
+    assert snapshot.test_stats.errors == 3
+    assert snapshot.test_stats.raw.failed == 2
+    assert snapshot.test_stats.raw.errors == 3
+
+
+def test_conflict_caps_a_green_physical_verdict_at_partial():
+    state = RunEvidenceState(run_id="session-conflict")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="tests complete",
+            test_stats=TestStats(executed=10, passed=10, failed=0, skipped=0),
+            conflicts=["test_report_parse_ambiguous"],
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.verdict == "partial"
+    assert snapshot.conflicts == ("test_report_parse_ambiguous",)
+
+
+def test_verified_build_evidence_rescues_failed_build_judge_to_partial():
+    state = RunEvidenceState(run_id="session-rescue")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_failure(
+            output="tool reported failure after artifacts were verified",
+            error="build tool failed",
+            error_code="BUILD_TOOL_FAILED",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="tests complete",
+            test_stats=TestStats(executed=10, passed=10, failed=0, skipped=0),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.build_evidence.green is True
+    assert snapshot.verdict == "partial"
+
+
+def test_phase_records_are_preserved_as_detached_audit_history():
+    state = _tvm_state()
+    expected = [asdict(record) for record in state.phase_records]
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    actual = snapshot.model_dump(mode="json")["phase_records"]
+    expected_json = json.loads(json.dumps(expected, default=lambda value: value.value))
+    assert actual == expected_json
+    assert snapshot.verdict == "partial", "phase outcomes are audit-only verdict inputs"
+
+
+def test_sealed_state_rejects_all_later_evidence_mutation():
+    state = _tvm_state()
+    VerdictFinalizer(FakeVerdictOrchestrator()).finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    with pytest.raises(RuntimeError, match="sealed"):
+        state.ingest_tool_result(
+            StateScope.TEST_RUNTIME,
+            "build",
+            ToolResult.completed_success(output="late report-side evidence"),
+        )
+
+
+def test_read_missing_snapshot_returns_unknown_without_recomputation():
+    snapshot = read_verdict_snapshot(FakeVerdictOrchestrator())
+
+    assert snapshot.verdict == "unknown"
+    assert snapshot.conflicts == ("snapshot_missing",)
+    assert snapshot.input_refs == ()
+
+
+def test_read_corrupt_snapshot_returns_unknown_without_recomputation():
+    orchestrator = FakeVerdictOrchestrator()
+    orchestrator.files[VERDICT_PATH] = "{definitely not JSON"
+
+    snapshot = read_verdict_snapshot(orchestrator)
+
+    assert snapshot.verdict == "unknown"
+    assert snapshot.conflicts == ("snapshot_corrupt",)
+    assert snapshot.input_refs == ()
+
+
+def test_read_round_trips_the_persisted_immutable_snapshot():
+    orchestrator = FakeVerdictOrchestrator()
+    written = VerdictFinalizer(orchestrator).finalize(
+        _tvm_state(), EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    read_back = read_verdict_snapshot(orchestrator)
+
+    assert read_back.model_dump_json() == written.model_dump_json()
+    with pytest.raises(Exception):
+        read_back.verdict = "failed"

@@ -16,7 +16,16 @@ from sag.docker_orch.orch import DockerOrchestrator
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
 
 from .context_manager import ContextManager
+from .evidence_state import RunEvidenceState
 from .react_engine import ReActEngine
+from .verdict_finalizer import (
+    EvidenceCloseReason,
+    ReportDeliveryStatus,
+    RunTermination,
+    RunTerminationStatus,
+    VerdictFinalizer,
+    read_verdict_snapshot,
+)
 
 
 class SetupAgent:
@@ -49,6 +58,9 @@ class SetupAgent:
         # None keeps the legacy free-form path (`sag run --task`, continue).
         self.phase_machine = None
         self.context_journal = None
+        self.run_evidence_state = None
+        self.verdict_finalizer = None
+        self.run_termination = None
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
@@ -120,6 +132,8 @@ class SetupAgent:
             tools=self.tools,
             phase_machine=self.phase_machine,
             context_journal=self.context_journal,
+            run_evidence_state=self.run_evidence_state,
+            verdict_finalizer=self.verdict_finalizer,
         )
 
         # Pass UIManager to ReActEngine if in UI mode
@@ -147,22 +161,22 @@ class SetupAgent:
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.build import BuildTool
-        from sag.tools.internal.command_tracker import CommandTracker
         from sag.tools.context_tool import ContextTool
-        from sag.tools.internal.env_tool import EnvTool
         from sag.tools.file_io import FileIOTool
+        from sag.tools.internal.command_tracker import CommandTracker
+        from sag.tools.internal.env_tool import EnvTool
         from sag.tools.internal.gradle_tool import GradleTool
         from sag.tools.internal.maven_tool import MavenTool
         from sag.tools.internal.output_search_tool import OutputSearchTool
         from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
         from sag.tools.internal.project_setup_tool import ProjectSetupTool
         from sag.tools.internal.python_tool import PythonTool
+        from sag.tools.internal.system_tool import SystemTool
+        from sag.tools.internal.web_search import WebSearchTool
         from sag.tools.phase_tool import PhaseTool
         from sag.tools.project_tool import ProjectTool
         from sag.tools.report_tool import ReportTool
         from sag.tools.search_tool import SearchTool
-        from sag.tools.internal.system_tool import SystemTool
-        from sag.tools.internal.web_search import WebSearchTool
 
         # Configure bash tool with enhanced features
         bash_config = BashToolConfig(
@@ -407,6 +421,11 @@ class SetupAgent:
             from sag.agent.phase_machine import PhaseMachine
 
             self.phase_machine = PhaseMachine()
+            self.run_evidence_state = RunEvidenceState(run_id=str(cmd_logger_id))
+            self.verdict_finalizer = VerdictFinalizer(
+                self.orchestrator,
+                test_pass_threshold=self.config.test_pass_threshold,
+            )
             self.context_journal = ContextJournal(self.orchestrator)
             # Actual repo directory name (from URL); the phase gates probe
             # /workspace/<project_name> with it.
@@ -480,6 +499,7 @@ class SetupAgent:
             except Exception as e:
                 self.agent_logger.error(f"❌ Failed to create trunk context: {e}")
                 logger.error(f"Trunk context creation failed: {e}")
+                self._close_open_setup_run(f"setup exception: {type(e).__name__}")
                 # Always show critical errors
                 self.console.print(f"[bold red]❌ Failed to create project context: {e}[/bold red]")
                 return False
@@ -523,7 +543,14 @@ class SetupAgent:
             cmd_logger.info(f"Project setup completed: success={success}, verdict={final_verdict}")
             return success
 
+        except KeyboardInterrupt:
+            self._close_open_setup_run("keyboard interrupt", cancelled=True)
+            cmd_logger.error("Setup cancelled by keyboard interrupt")
+            self.console.print("[bold yellow]Setup cancelled.[/bold yellow]")
+            return False
+
         except Exception as e:
+            self._close_open_setup_run(f"setup exception: {type(e).__name__}")
             cmd_logger.error(f"Setup failed: {e}", exc_info=True)
             # Always show critical errors
             self.console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
@@ -946,11 +973,11 @@ START by working toward the current phase objective shown in my context.
         if self.config.ui_mode:
             self._emit(EventType.PHASE_START, "Running project setup", phase=PhaseType.BUILD)
 
-            success = self.react_engine.run_react_loop(
+            termination = self.react_engine.run_setup_loop(
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
 
-            verified_success = self._get_verified_final_status(success)
+            verified_success = self._apply_run_termination(termination)
 
             if verified_success:
                 self._emit(
@@ -979,12 +1006,11 @@ START by working toward the current phase objective shown in my context.
             ) as progress:
                 task = progress.add_task("Running setup process...", total=None)
 
-                success = self.react_engine.run_react_loop(
+                termination = self.react_engine.run_setup_loop(
                     initial_prompt=setup_prompt, max_iterations=self.max_iterations
                 )
 
-                # Check if a report was generated and get the verified status
-                verified_success = self._get_verified_final_status(success)
+                verified_success = self._apply_run_termination(termination)
 
                 if verified_success:
                     progress.update(task, description="✅ Setup process completed")
@@ -992,6 +1018,49 @@ START by working toward the current phase objective shown in my context.
                     progress.update(task, description="❌ Setup process incomplete")
 
             return verified_success
+
+    def _apply_run_termination(self, termination: RunTermination) -> bool:
+        """Mirror the immutable setup snapshot into the legacy boolean boundary."""
+        self.run_termination = termination
+        snapshot = read_verdict_snapshot(self.orchestrator)
+        self.final_verdict = snapshot.verdict
+        self.final_verdict_reason = ""
+        return termination.termination is RunTerminationStatus.COMPLETED and snapshot.verdict in {
+            "success",
+            "partial",
+        }
+
+    def _close_open_setup_run(self, reason: str, *, cancelled: bool = False) -> None:
+        """Best-effort closure for setup failures outside the ReAct loop."""
+        try:
+            state = getattr(self, "run_evidence_state", None)
+            if state is None or state.sealed:
+                return
+            engine = getattr(self, "react_engine", None)
+            if engine is not None:
+                self.run_termination = (
+                    engine.cancel(reason=reason) if cancelled else engine.abort(reason=reason)
+                )
+                return
+
+            machine = getattr(self, "phase_machine", None)
+            finalizer = getattr(self, "verdict_finalizer", None)
+            if machine is None or finalizer is None:
+                return
+            record = machine.record_abort(reason, evidence=[])
+            state.record_phase_record(record)
+            finalizer.finalize(
+                state,
+                EvidenceCloseReason.CANCELLED if cancelled else EvidenceCloseReason.ABORTED,
+            )
+            self.run_termination = RunTermination(
+                termination=(
+                    RunTerminationStatus.CANCELLED if cancelled else RunTerminationStatus.ABORTED
+                ),
+                report_delivery_status=ReportDeliveryStatus.SKIPPED,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to close setup evidence after {reason}: {exc}")
 
     def _get_verified_final_status(self, react_engine_success: bool) -> bool:
         """Combine physical validation and evidence conflicts through the kernel."""

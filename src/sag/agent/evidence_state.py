@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, 
 from sag.evidence import EvidenceFinding, EvidenceStatus, OperationOutcome
 from sag.tools.base import ToolResult
 
+from .phase_machine import PhaseAttemptRecord
+
 
 class StateScope(str, Enum):
     ENVIRONMENT = "environment"
@@ -124,7 +126,10 @@ class RunEvidenceState(BaseModel):
     _tool_observations: list[ToolObservation] = PrivateAttr(default_factory=list)
     _validator_findings: list[EvidenceFinding] = PrivateAttr(default_factory=list)
     _conflicts: list[str] = PrivateAttr(default_factory=list)
+    _phase_records: list[PhaseAttemptRecord] = PrivateAttr(default_factory=list)
+    _phase_record_ids: set[str] = PrivateAttr(default_factory=set)
     _finalized_at: str | None = PrivateAttr(default=None)
+    _close_reason: str | None = PrivateAttr(default=None)
     _canonical_values: set[tuple[StateScope, str, str]] = PrivateAttr(default_factory=set)
 
     @computed_field
@@ -173,6 +178,11 @@ class RunEvidenceState(BaseModel):
 
     @computed_field
     @property
+    def phase_records(self) -> tuple[PhaseAttemptRecord, ...]:
+        return tuple(_snapshot(record) for record in self._phase_records)
+
+    @computed_field
+    @property
     def sealed(self) -> bool:
         return self._finalized_at is not None
 
@@ -180,6 +190,11 @@ class RunEvidenceState(BaseModel):
     @property
     def finalized_at(self) -> str | None:
         return self._finalized_at
+
+    @property
+    def close_reason(self) -> str | None:
+        """Evidence-close metadata; deliberately absent from snapshot serialization."""
+        return self._close_reason
 
     def _require_mutable(self) -> None:
         if self._finalized_at is not None:
@@ -357,9 +372,27 @@ class RunEvidenceState(BaseModel):
         selected = {StateScope(scope) for scope in scopes}
         return {scope.value: self._state_epochs[scope] for scope in StateScope if scope in selected}
 
-    def seal(self, *, finalized_at: str) -> None:
+    def record_phase_record(self, record: PhaseAttemptRecord) -> PhaseAttemptRecord:
+        """Append one detached phase record without using it as verdict evidence."""
+        self._require_mutable()
+        if not isinstance(record, PhaseAttemptRecord):
+            raise TypeError("phase records must be PhaseAttemptRecord instances")
+        if record.attempt_id in self._phase_record_ids:
+            existing = next(
+                item for item in self._phase_records if item.attempt_id == record.attempt_id
+            )
+            if existing != record:
+                raise ValueError(f"conflicting phase record for {record.attempt_id}")
+            return _snapshot(existing)
+        detached = _snapshot(record)
+        self._phase_records.append(detached)
+        self._phase_record_ids.add(detached.attempt_id)
+        return _snapshot(detached)
+
+    def seal(self, *, finalized_at: str, close_reason: str | None = None) -> None:
         """Close evidence collection permanently at the evidence-close boundary."""
         self._require_mutable()
         if not finalized_at.strip():
             raise ValueError("finalized_at must be nonblank")
         self._finalized_at = finalized_at
+        self._close_reason = close_reason

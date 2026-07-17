@@ -18,7 +18,8 @@ from sag.ui.events import EventType, UIEvent, UIEventEmitter
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
-from .output_storage import OutputStorageManager
+from .evidence_state import RunEvidenceState, StateScope
+from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_machine import PHASE_NAMES, PhaseMachine
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
@@ -32,6 +33,14 @@ from .tool_orchestration import (
     ToolExecutionRecord,
     ToolLifecycleEvent,
     ToolOrchestrator,
+    format_tool_result,
+)
+from .verdict_finalizer import (
+    EvidenceCloseReason,
+    ReportDeliveryStatus,
+    RunTermination,
+    RunTerminationStatus,
+    VerdictFinalizer,
 )
 
 # Per-phase objectives for the setup phase machine (spec §3.1). These
@@ -247,6 +256,8 @@ class ReActEngine(UIEventEmitter):
         repository_ref: str = None,
         phase_machine: Optional[PhaseMachine] = None,
         context_journal=None,
+        run_evidence_state: Optional[RunEvidenceState] = None,
+        verdict_finalizer: Optional[VerdictFinalizer] = None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -257,6 +268,11 @@ class ReActEngine(UIEventEmitter):
         # legacy free-form behavior (`sag run --task` passes neither).
         self.phase_machine = phase_machine
         self.context_journal = context_journal
+        self.run_evidence_state = run_evidence_state
+        self.verdict_finalizer = verdict_finalizer
+        self._report_attempted = False
+        self._report_delivered = False
+        self._report_failed = False
         self._phase_iterations = 0
         # Window-reset marker: the first journal record after a reset carries
         # the new phase intro text (spec §7 reconstruction).
@@ -324,6 +340,18 @@ class ReActEngine(UIEventEmitter):
             else None
         )
         self.output_storage = OutputStorageManager(contexts_dir, orchestrator=orchestrator)
+        if self.phase_machine is not None:
+            if self.run_evidence_state is None:
+                run_id = str(
+                    getattr(self.context_manager, "session_id", None)
+                    or f"react-{self._get_timestamp()}"
+                )
+                self.run_evidence_state = RunEvidenceState(run_id=run_id)
+            if self.verdict_finalizer is None and orchestrator is not None:
+                self.verdict_finalizer = VerdictFinalizer(
+                    orchestrator,
+                    test_pass_threshold=self.config.test_pass_threshold,
+                )
 
         # Initialize physical validator for fact-based validation
         self.physical_validator = PhysicalValidator(
@@ -471,6 +499,140 @@ class ReActEngine(UIEventEmitter):
                 "Stopping: multiple tasks completed with no new build artifacts (no physical progress)."
             )
         return tripped
+
+    # ------------------------------------------------------------------
+    # Evidence ownership and run closure (setup mode only)
+    # ------------------------------------------------------------------
+
+    _NON_EVIDENCE_TOOLS = frozenset({"phase", "manage_context", "report"})
+
+    def _tool_evidence_scope(self, tool_name: str, params: Dict[str, Any]) -> StateScope:
+        action = str((params or {}).get("action") or "").strip().lower()
+        if tool_name in {"project", "project_analyzer"} and action == "analyze":
+            return StateScope.PROJECT_ANALYSIS
+        if tool_name in {"project", "project_setup", "system", "env"}:
+            return StateScope.ENVIRONMENT
+        if tool_name in {"build", "maven", "gradle", "python"}:
+            if action in {"deps", "dependencies", "resolve", "install_dependencies"}:
+                return StateScope.DEPENDENCIES
+            if action in {"test", "tests", "verify_tests"}:
+                return StateScope.TEST_RUNTIME
+            return StateScope.ARTIFACTS
+
+        phase = getattr(getattr(self, "phase_machine", None), "current_phase", None)
+        return {
+            "provision": StateScope.ENVIRONMENT,
+            "analyze": StateScope.PROJECT_ANALYSIS,
+            "build": StateScope.ARTIFACTS,
+            "test": StateScope.TEST_RUNTIME,
+        }.get(phase, StateScope.PROJECT_ANALYSIS)
+
+    def _record_tool_execution(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        result: ToolResult,
+    ) -> ToolResult:
+        """Persist provenance and ingest one evidence-bearing execution once."""
+        if tool_name == "report":
+            self._report_attempted = True
+            if result.succeeded:
+                self._report_delivered = True
+            elif result.is_terminal:
+                self._report_failed = True
+            return result
+
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed or tool_name in self._NON_EVIDENCE_TOOLS:
+            return result
+
+        task_id = str(
+            getattr(self.context_manager, "current_task_id", None)
+            or f"{tool_name}_{getattr(self, 'current_iteration', 0)}"
+        )
+        durable = attach_durable_output_ref(
+            result,
+            self.output_storage,
+            task_id=task_id,
+            tool_name=tool_name,
+        )
+        state.ingest_tool_result(
+            self._tool_evidence_scope(tool_name, params),
+            tool_name,
+            durable,
+            provenance=durable.output_ref,
+        )
+        return durable
+
+    def _record_phase_audit(self, record) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            state.record_phase_record(record)
+
+    def _finalize_evidence(self, reason: EvidenceCloseReason):
+        state = getattr(self, "run_evidence_state", None)
+        finalizer = getattr(self, "verdict_finalizer", None)
+        if state is None or finalizer is None:
+            raise RuntimeError("setup evidence finalization is not configured")
+        return finalizer.finalize(state, reason)
+
+    def _report_delivery_status(self) -> ReportDeliveryStatus:
+        if getattr(self, "_report_delivered", False):
+            return ReportDeliveryStatus.DELIVERED
+        if getattr(self, "_report_attempted", False) or getattr(self, "_report_failed", False):
+            return ReportDeliveryStatus.FAILED
+        return ReportDeliveryStatus.SKIPPED
+
+    def _close_flow(self, termination: RunTerminationStatus) -> RunTermination:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None:
+            raise RuntimeError("setup flow closure requires run evidence state")
+        if state.sealed:
+            try:
+                reason = EvidenceCloseReason(state.close_reason)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("sealed setup evidence has no typed close reason") from exc
+        else:
+            reason = (
+                EvidenceCloseReason.CANCELLED
+                if termination is RunTerminationStatus.CANCELLED
+                else (
+                    EvidenceCloseReason.DEPENDENTS_SKIPPED
+                    if termination is RunTerminationStatus.COMPLETED
+                    else EvidenceCloseReason.ABORTED
+                )
+            )
+        # This is a cache hit after a successful evidence-close. If persistence
+        # failed after sealing, the same reason safely retries the atomic write.
+        self._finalize_evidence(reason)
+        return RunTermination(
+            termination=termination,
+            report_delivery_status=self._report_delivery_status(),
+        )
+
+    def abort(self, *, reason: str) -> RunTermination:
+        machine = getattr(self, "phase_machine", None)
+        if machine is None:
+            raise RuntimeError("abort termination is available only for setup runs")
+        if not machine.is_complete:
+            record = machine.record_abort(reason, evidence=[])
+            self._record_phase_audit(record)
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            self._finalize_evidence(EvidenceCloseReason.ABORTED)
+        return self._close_flow(RunTerminationStatus.ABORTED)
+
+    def cancel(self, *, reason: str = "explicit cancellation") -> RunTermination:
+        machine = getattr(self, "phase_machine", None)
+        if machine is None:
+            raise RuntimeError("cancel termination is available only for setup runs")
+        if not machine.is_complete:
+            record = machine.record_abort(reason, evidence=[])
+            self._record_phase_audit(record)
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            self._finalize_evidence(EvidenceCloseReason.CANCELLED)
+        return self._close_flow(RunTerminationStatus.CANCELLED)
 
     # ------------------------------------------------------------------
     # Phase-machine wiring (setup mode only; spec §3.1/§3.2/§7)
@@ -693,6 +855,10 @@ class ReActEngine(UIEventEmitter):
             else:
                 machine.mark_blocked(metadata.get("reason", ""), metadata.get("evidence", []))
                 self._persist_phase_record(finished, "failed", metadata.get("reason", ""))
+            self._record_phase_audit(machine.records[-1])
+            if finished == "test":
+                # Evidence-close precedes even construction of the report window.
+                self._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
             self._phase_iterations = 0
             # Phase transitions are the context switches of phase mode (no
             # manage_context actions exist to reset the legacy counter).
@@ -873,6 +1039,9 @@ class ReActEngine(UIEventEmitter):
             self._persist_phase_record(
                 phase, "failed", "remaining iterations reserved for later phases"
             )
+        self._record_phase_audit(machine.records[-1])
+        if phase == "test":
+            self._finalize_evidence(EvidenceCloseReason.TEST_TERMINATED)
         self._phase_iterations = 0
         self.steps_since_context_switch = 0
         if not machine.is_complete:
@@ -1000,12 +1169,47 @@ class ReActEngine(UIEventEmitter):
         except Exception as exc:
             logger.warning(f"Could not start phase branch context for {task_id}: {exc}")
 
+    def run_setup_loop(
+        self,
+        initial_prompt: str,
+        max_iterations: Optional[int] = None,
+    ) -> RunTermination:
+        """Run setup mode with a typed flow-close result."""
+        if self.phase_machine is None:
+            raise RuntimeError("run_setup_loop requires a phase machine")
+        result = self._run_react_loop(
+            initial_prompt,
+            max_iterations=max_iterations,
+            completion_mode="setup",
+        )
+        if not isinstance(result, RunTermination):
+            raise RuntimeError("setup loop exited without typed termination")
+        return result
+
     def run_react_loop(
         self,
         initial_prompt: str,
         max_iterations: Optional[int] = None,
         completion_mode: str = "setup",
     ) -> bool:
+        """Preserve the legacy free-form boolean contract."""
+        if completion_mode == "setup" and self.phase_machine is not None:
+            raise RuntimeError("setup callers must use run_setup_loop")
+        result = self._run_react_loop(
+            initial_prompt,
+            max_iterations=max_iterations,
+            completion_mode=completion_mode,
+        )
+        if isinstance(result, RunTermination):
+            raise RuntimeError("legacy loop exited with setup termination")
+        return bool(result)
+
+    def _run_react_loop(
+        self,
+        initial_prompt: str,
+        max_iterations: Optional[int] = None,
+        completion_mode: str = "setup",
+    ):
         """Run the main ReAct loop."""
         max_iter = max_iterations or self.max_iterations
         self._run_max_iterations = max_iter
@@ -1059,8 +1263,9 @@ class ReActEngine(UIEventEmitter):
                         f"ReAct loop stopped: global wall-clock cap of {wall_clock_cap}s "
                         f"reached after {elapsed:.0f}s / {self.current_iteration} iterations"
                     )
-                    self._record_setup_abort(phase_mode, "wall clock cap exceeded")
                     self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="wall clock cap exceeded")
                     return False
 
                 # FLOOR RESERVATIONS (phase mode): force-block the current
@@ -1068,7 +1273,7 @@ class ReActEngine(UIEventEmitter):
                 # guaranteeing the run always reaches report and ends honestly.
                 if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
                     self._export_token_usage_csv()
-                    return self.phase_machine.termination_state() == "completed"
+                    return self._close_flow(RunTerminationStatus.COMPLETED)
 
                 self.current_iteration += 1
                 self._phase_iterations += 1
@@ -1090,8 +1295,9 @@ class ReActEngine(UIEventEmitter):
                 if not response:
                     logger.error("Failed to get LLM response")
                     # Export token usage before early return due to failed LLM response
-                    self._record_setup_abort(phase_mode, "LLM response unavailable")
                     self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="LLM response unavailable")
                     return False
 
                 # Parse the response
@@ -1122,7 +1328,7 @@ class ReActEngine(UIEventEmitter):
                             f"All phases complete; flow termination: {termination}"
                         )
                         self._export_token_usage_csv()
-                        return termination == "completed"
+                        return self._close_flow(RunTerminationStatus.COMPLETED)
                     # Mid-phase evidence nudge: when the gate already passes,
                     # tell the model — break rabbit holes with evidence.
                     self._maybe_nudge_phase_done()
@@ -1143,6 +1349,11 @@ class ReActEngine(UIEventEmitter):
 
                 # Check for task completion
                 if state_analysis.is_task_complete:
+                    if phase_mode:
+                        self.agent_logger.info(
+                            "Ignoring direct evaluator completion until setup flow-close"
+                        )
+                        continue
                     self.agent_logger.info("Task completed successfully")
                     # Export token usage before successful completion
                     self._export_token_usage_csv()
@@ -1166,6 +1377,8 @@ class ReActEngine(UIEventEmitter):
                     )
                     # Export token usage before no-progress completion
                     self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="no physical progress")
                     return False
 
                 # DEPRECATED: Legacy checks now handled by state_evaluator
@@ -1231,22 +1444,31 @@ class ReActEngine(UIEventEmitter):
 
             logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
             # Export token usage before max iterations completion
-            self._record_setup_abort(phase_mode, "iteration budget exhausted")
             self._export_token_usage_csv()
+            if phase_mode:
+                return self.abort(reason="iteration budget exhausted")
             return False
 
+        except KeyboardInterrupt:
+            logger.warning("ReAct loop cancelled by keyboard interrupt")
+            self._export_token_usage_csv()
+            if phase_mode:
+                return self.cancel(reason="keyboard interrupt")
+            return False
         except Exception as e:
             logger.error(f"ReAct loop failed: {e}", exc_info=True)
             # Export token usage before exception completion
-            self._record_setup_abort(phase_mode, f"engine exception: {type(e).__name__}")
             self._export_token_usage_csv()
+            if phase_mode:
+                return self.abort(reason=f"engine exception: {type(e).__name__}")
             return False
         finally:
             self.state_evaluator.completion_mode = previous_completion_mode
 
     def _record_setup_abort(self, phase_mode: bool, reason: str) -> None:
         if phase_mode and not self.phase_machine.is_complete:
-            self.phase_machine.record_abort(reason, evidence=[])
+            record = self.phase_machine.record_abort(reason, evidence=[])
+            self._record_phase_audit(record)
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""
@@ -1429,7 +1651,14 @@ class ReActEngine(UIEventEmitter):
                 branch_task_id = getattr(self.context_manager, "current_task_id", None)
                 call = self._build_tool_call_from_step(step)
                 execution = self._get_tool_orchestrator().execute(call)
-                result = execution.result
+                result = self._record_tool_execution(
+                    call.name,
+                    call.validated_params or call.raw_params,
+                    execution.result,
+                )
+                if result is not execution.result:
+                    execution.result = result
+                    execution.observation_text = format_tool_result(call.name, result)
                 step.tool_result = result
                 self._apply_tool_execution_loop_effects(execution)
 
@@ -1469,7 +1698,11 @@ class ReActEngine(UIEventEmitter):
 
                         # Store full output and get reference if output is large
                         stored_output_refs = []
-                        if len(output_to_store) > 800 and self.output_storage is not None:
+                        if (
+                            len(output_to_store) > 800
+                            and self.output_storage is not None
+                            and not result.output_ref
+                        ):
                             # Store the full output
                             ref_id = self.output_storage.store_output(
                                 task_id=self.context_manager.current_task_id,

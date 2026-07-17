@@ -14,7 +14,50 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.tools.base import ToolResult, is_output_storage_ref
 from sag.utils.container_io import write_container_text
+
+
+def attach_durable_output_ref(
+    result: ToolResult,
+    storage: "OutputStorageManager",
+    *,
+    task_id: str,
+    tool_name: str,
+) -> ToolResult:
+    """Return a detached result whose full output has durable provenance."""
+    if result.output_ref:
+        return result
+    output = result.raw_output if result.raw_output is not None else result.output
+    ref = storage.store_output(
+        task_id=task_id,
+        tool_name=tool_name,
+        output=output or "",
+        metadata={
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
+        },
+    )
+    if not is_output_storage_ref(ref):
+        raise RuntimeError("failed to persist a durable tool output reference")
+    return ToolResult(**{**result.model_dump(), "output_ref": ref})
+
+
+def atomic_write_container_text(orchestrator, path: str, content: str) -> None:
+    """Persist exact text with a temp write followed by an atomic rename."""
+    tmp_path = f"{path}.tmp"
+    if not write_container_text(orchestrator, tmp_path, content):
+        raise OSError(f"failed to write temporary file {tmp_path}")
+
+    # write_container_text appends one newline for JSONL callers. Remove only
+    # that helper-owned byte so canonical JSON bytes and returned JSON match.
+    trim_result = orchestrator.execute_command(f"truncate -s -1 {tmp_path}")
+    if not (trim_result.get("exit_code") == 0 or trim_result.get("success")):
+        raise OSError(f"failed to finalize temporary file {tmp_path}")
+    rename_result = orchestrator.execute_command(f"mv {tmp_path} {path}")
+    if not (rename_result.get("exit_code") == 0 or rename_result.get("success")):
+        raise OSError(f"failed to atomically rename {tmp_path} to {path}")
 
 
 class OutputStorageManager:

@@ -74,6 +74,7 @@ def test_model_dump_contains_complete_deterministic_evidence_snapshot():
         "tool_observations",
         "validator_findings",
         "conflicts",
+        "phase_records",
         "sealed",
         "finalized_at",
     ]
