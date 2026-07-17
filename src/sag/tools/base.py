@@ -83,6 +83,10 @@ class ToolError(Exception):
         )
 
 
+class OutputPersistenceError(RuntimeError):
+    """Raised when neither primary nor emergency output persistence is durable."""
+
+
 LEGAL_RESULT_STATES = {
     InvocationStatus.PENDING: {OperationOutcome.UNKNOWN},
     InvocationStatus.COMPLETED: {
@@ -130,6 +134,19 @@ def is_output_storage_ref(value: Any) -> bool:
     return isinstance(value, str) and bool(re.fullmatch(r"output_[A-Za-z0-9_-]+", value))
 
 
+def canonical_full_output_source(
+    *,
+    raw_output: Any = None,
+    output: Any = None,
+    error: Any = None,
+) -> str:
+    """Normalize the canonical full-output source without discarding error-only text."""
+    source = raw_output or output or error or ""
+    if isinstance(source, bytes):
+        return source.decode("utf-8", errors="replace")
+    return source if isinstance(source, str) else str(source)
+
+
 @contextmanager
 def bind_tool_result_output_storage(
     storage: Any,
@@ -154,15 +171,42 @@ def _store_bound_output(output: str, *, metadata: Dict[str, Any]) -> Optional[st
     binding = _DURABLE_OUTPUT_BINDING.get()
     if binding is None:
         return None
-    ref = binding.storage.store_output(
-        task_id=binding.task_id,
-        tool_name=binding.tool_name,
-        output=output,
-        metadata=metadata,
+
+    failures: list[str] = []
+    persistence_methods = (
+        ("primary", getattr(binding.storage, "store_output", None)),
+        ("emergency", getattr(binding.storage, "store_emergency_output", None)),
     )
-    if not is_output_storage_ref(ref):
-        raise ValueError("OutputStorage failed to return a resolvable output_* reference")
-    return ref
+    for label, persist in persistence_methods:
+        if not callable(persist):
+            failures.append(f"{label} persistence is unavailable")
+            continue
+        try:
+            ref = persist(
+                task_id=binding.task_id,
+                tool_name=binding.tool_name,
+                output=output,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            failures.append(f"{label} persistence raised {type(exc).__name__}")
+            continue
+        if not is_output_storage_ref(ref):
+            failures.append(f"{label} persistence returned no durable reference")
+            continue
+        try:
+            retrieved = binding.storage.retrieve_output(ref)
+        except Exception as exc:
+            failures.append(f"{label} retrieval raised {type(exc).__name__}")
+            continue
+        if retrieved != output:
+            failures.append(f"{label} output did not round-trip")
+            continue
+        return ref
+
+    raise OutputPersistenceError(
+        "primary and emergency output persistence failed: " + "; ".join(failures)
+    )
 
 
 def require_persisted_output_storage_ref(ref: str, *, storage: Any = None) -> None:
@@ -202,9 +246,7 @@ def _normalize_temporary_path(match: re.Match[str]) -> str:
                 flags=re.IGNORECASE,
             )
             and any(
-                len(token) >= 6
-                and re.search(r"[A-Za-z]", token)
-                and re.search(r"\d", token)
+                len(token) >= 6 and re.search(r"[A-Za-z]", token) and re.search(r"\d", token)
                 for token in re.split(r"[-_.]", stem)
             )
         )
@@ -326,7 +368,23 @@ class ToolResult(BaseModel):
         output_ref_storage: Any,
         **payload: Any,
     ) -> "ToolResult":
+        if output_ref_storage is not None:
+            with bind_tool_result_output_storage(output_ref_storage):
+                return cls._terminal(
+                    invocation_status=invocation_status,
+                    output=output,
+                    operation_outcome=operation_outcome,
+                    evidence_status=evidence_status,
+                    output_ref_storage=None,
+                    **payload,
+                )
+
         outcome = OperationOutcome(operation_outcome)
+        source = canonical_full_output_source(
+            raw_output=payload.get("raw_output"),
+            output=output,
+            error=payload.get("error"),
+        )
         payload.setdefault(
             "evidence_assessment",
             {
@@ -336,11 +394,10 @@ class ToolResult(BaseModel):
             }.get(outcome, EvidenceAssessment.UNKNOWN),
         )
         if outcome is OperationOutcome.FAILED:
-            source = str(payload.get("raw_output") or output or payload.get("error") or "")
             signature_source = _stable_failure_signature_source(source)
-            digest = hashlib.sha256(
-                signature_source.encode("utf-8", errors="replace")
-            ).hexdigest()[:16]
+            digest = hashlib.sha256(signature_source.encode("utf-8", errors="replace")).hexdigest()[
+                :16
+            ]
             error_code = str(payload.get("error_code") or "TOOL_OPERATION_FAILED")
             payload["error_code"] = error_code
             if not payload.get("failure_signature"):
@@ -348,6 +405,7 @@ class ToolResult(BaseModel):
             if not payload.get("error_tail_preview"):
                 payload["error_tail_preview"] = source[-400:] or error_code
 
+        if outcome in {OperationOutcome.FAILED, OperationOutcome.PARTIAL}:
             output_ref = payload.get("output_ref")
             if not output_ref:
                 output_ref = next(
@@ -362,15 +420,17 @@ class ToolResult(BaseModel):
                 output_ref = _store_bound_output(
                     source,
                     metadata={
-                        "error_code": error_code,
-                        "failure_signature": payload["failure_signature"],
+                        "operation_outcome": outcome.value,
+                        "error_code": payload.get("error_code"),
+                        "failure_signature": payload.get("failure_signature"),
                     },
                 )
-            if not output_ref:
+            if outcome is OperationOutcome.FAILED and not output_ref:
                 raise ValueError(
                     "canonical failed results require durable output storage before construction"
                 )
-            payload["output_ref"] = output_ref
+            if output_ref:
+                payload["output_ref"] = output_ref
         result_values = {
             "invocation_status": invocation_status,
             "operation_outcome": outcome,
@@ -378,9 +438,6 @@ class ToolResult(BaseModel):
             "output": output,
             **payload,
         }
-        if outcome is OperationOutcome.FAILED and output_ref_storage is not None:
-            with bind_tool_result_output_storage(output_ref_storage):
-                return cls(**result_values)
         return cls(**result_values)
 
     @classmethod
@@ -816,6 +873,9 @@ class BaseTool(ABC):
 
             self._log_execution(kwargs, result)
             return result
+
+        except OutputPersistenceError:
+            raise
 
         except ToolError as e:
             # Handle tool errors using to_result() method

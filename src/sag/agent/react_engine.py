@@ -12,18 +12,19 @@ from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
 from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
 from sag.reporting import render_condensed_summary
-from sag.tools.base import BaseTool, ToolResult, is_output_storage_ref
+from sag.tools.base import (
+    BaseTool,
+    OutputPersistenceError,
+    ToolResult,
+    is_output_storage_ref,
+)
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
 from .evidence_state import RunEvidenceState, StateScope
-from .output_storage import (
-    OutputDurabilityError,
-    OutputStorageManager,
-    attach_durable_output_ref,
-)
+from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_machine import PHASE_NAMES, PhaseMachine
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
@@ -576,7 +577,7 @@ class ReActEngine(UIEventEmitter):
                 task_id=task_id,
                 tool_name=tool_name,
             )
-        except OutputDurabilityError as exc:
+        except OutputPersistenceError as exc:
             logger.error(f"Failed to persist full output for {tool_name}: {exc}")
             state.record_attempt(
                 action=f"{tool_name}:{action}",
@@ -1651,6 +1652,31 @@ class ReActEngine(UIEventEmitter):
             model_used=step.model_used,
         )
 
+    def _execute_tool_call(self, call: ToolCall) -> ToolExecution:
+        """Execute one call and audit construction-time persistence failure."""
+        try:
+            return self._get_tool_orchestrator().execute(call)
+        except OutputPersistenceError as exc:
+            logger.error(f"Failed to construct durable result for {call.name}: {exc}")
+            state = getattr(self, "run_evidence_state", None)
+            if (
+                state is not None
+                and not state.sealed
+                and call.name not in self._NON_EVIDENCE_TOOLS
+                and call.name != "report"
+            ):
+                params = call.validated_params or call.raw_params
+                scope = self._tool_evidence_scope(call.name, params)
+                action = str((params or {}).get("action") or "execute").strip().lower()
+                state.record_attempt(
+                    action=f"{call.name}:{action}",
+                    relevant_scopes=[scope],
+                    outcome=OperationOutcome.FAILED,
+                    evidence_refs=[],
+                )
+                state.record_conflict("output_storage_failed")
+            raise
+
     def _apply_tool_execution_loop_effects(self, execution: ToolExecution) -> None:
         """Apply loop-level side effects requested by orchestration metadata."""
         metadata = execution.metadata or {}
@@ -1726,7 +1752,7 @@ class ReActEngine(UIEventEmitter):
                 if call.name == "report" and not self._report_execution_allowed():
                     execution = self._refused_report_execution(call)
                 else:
-                    execution = self._get_tool_orchestrator().execute(call)
+                    execution = self._execute_tool_call(call)
                 result = self._record_tool_execution(
                     call.name,
                     call.validated_params or call.raw_params,

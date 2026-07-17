@@ -12,7 +12,12 @@ from sag.agent.output_storage import OutputStorageManager
 from sag.agent.phase_machine import PhaseMachine
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
-from sag.agent.tool_orchestration import ToolCall, ToolExecution
+from sag.agent.tool_orchestration import (
+    RecoveryDecision,
+    ToolCall,
+    ToolExecution,
+    ToolOrchestrator,
+)
 from sag.agent.verdict_finalizer import (
     EvidenceCloseReason,
     ReportDeliveryStatus,
@@ -21,7 +26,7 @@ from sag.agent.verdict_finalizer import (
     read_verdict_snapshot,
 )
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
-from sag.tools.base import ToolResult, bind_tool_result_output_storage
+from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_output_storage
 
 
 class _FailFirstAtomicWriteOrchestrator(FakeVerdictOrchestrator):
@@ -273,6 +278,69 @@ def test_total_output_persistence_failure_records_attempt_and_stops_admission(tm
     assert len(engine.run_evidence_state.tool_observations) == 2
     assert snapshot.verdict == "partial"
     assert "output_storage_failed" in snapshot.conflicts
+
+
+def test_error_only_failure_uses_one_source_through_construction_and_ingestion(
+    tmp_path, monkeypatch
+):
+    class ErrorOnlyBuildTool(BaseTool):
+        def __init__(self):
+            super().__init__("build", "Error-only build tool")
+
+        def execute(self, action: str) -> ToolResult:
+            raise ToolError(
+                "compiler emitted no stdout",
+                error_code="COMPILER_EMPTY_OUTPUT",
+            )
+
+    engine, _ = _engine(tmp_path, phase="build")
+    primary_calls = []
+    monkeypatch.setattr(
+        engine.output_storage,
+        "store_output",
+        lambda **kwargs: primary_calls.append(kwargs) or "",
+    )
+    constructed_results = []
+    orchestrator = ToolOrchestrator(
+        tools={"build": ErrorOnlyBuildTool()},
+        context_manager=engine.context_manager,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda signature, result: constructed_results.append(result),
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=engine.output_storage,
+    )
+    monkeypatch.setattr(
+        orchestrator.recovery_handler,
+        "recover",
+        lambda *args: RecoveryDecision(should_recover=False),
+    )
+    engine._get_tool_orchestrator = lambda: orchestrator
+    _prepare_action_execution(engine)
+    step = _action_step("build", {"action": "compile"})
+
+    engine._execute_steps([step])
+
+    constructed = constructed_results[0]
+    recorded = step.tool_result
+    assert len(primary_calls) == 1
+    assert recorded.output == ""
+    assert recorded.error == "compiler emitted no stdout"
+    assert recorded.output_ref == constructed.output_ref
+    assert recorded.output_ref.startswith("output_emergency_")
+    assert (
+        engine.output_storage.retrieve_output(recorded.output_ref) == "compiler emitted no stdout"
+    )
+    assert recorded.error_code == constructed.error_code == "COMPILER_EMPTY_OUTPUT"
+    assert recorded.failure_signature == constructed.failure_signature
+    assert recorded.error_tail_preview == constructed.error_tail_preview
+    assert recorded.error_tail_preview == "compiler emitted no stdout"
+    observation = engine.run_evidence_state.tool_observations[-1]
+    assert observation.result.output_ref == recorded.output_ref
+    assert observation.provenance == recorded.output_ref
 
 
 def test_failed_result_keeps_ws0_failure_identity_and_is_not_rehashed(tmp_path):

@@ -1,5 +1,6 @@
 import pytest
 
+from sag.agent.output_storage import OutputStorageManager
 from sag.agent.tool_orchestration import (
     RecoveryDecision,
     ToolCall,
@@ -54,6 +55,17 @@ class FailureTool(BaseTool):
             output="durable failure details",
             error="failed",
             error_code="FAILURE_TOOL_FAILED",
+        )
+
+
+class PartialTool(BaseTool):
+    def __init__(self):
+        super().__init__("partial", "Partial tool")
+
+    def execute(self, command: str) -> ToolResult:
+        return ToolResult.completed(
+            output="partial execution details",
+            operation_outcome=OperationOutcome.PARTIAL,
         )
 
 
@@ -201,6 +213,57 @@ def test_orchestrator_persists_failure_before_emitting_canonical_result():
 
     assert execution.result.output_ref.startswith("output_")
     assert storage.retrieve_output(execution.result.output_ref) == "durable failure details"
+
+
+def test_orchestrator_uses_emergency_during_failed_result_construction(tmp_path, monkeypatch):
+    storage = OutputStorageManager(tmp_path)
+    primary_calls = []
+    monkeypatch.setattr(
+        storage,
+        "store_output",
+        lambda **kwargs: primary_calls.append(kwargs) or "",
+    )
+    orchestrator = ToolOrchestrator(
+        tools={"failure": FailureTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=storage,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="failure", raw_params={"command": "run"}))
+
+    assert len(primary_calls) == 1
+    assert execution.result.output_ref.startswith("output_emergency_")
+    assert storage.retrieve_output(execution.result.output_ref) == "durable failure details"
+
+
+def test_orchestrator_uses_emergency_during_partial_result_construction(tmp_path, monkeypatch):
+    storage = OutputStorageManager(tmp_path)
+    monkeypatch.setattr(storage, "store_output", lambda **kwargs: "")
+    orchestrator = ToolOrchestrator(
+        tools={"partial": PartialTool()},
+        context_manager=None,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=storage,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="partial", raw_params={"command": "run"}))
+
+    assert execution.status == "partial"
+    assert execution.result.output_ref.startswith("output_emergency_")
+    assert storage.retrieve_output(execution.result.output_ref) == "partial execution details"
 
 
 def test_orchestrator_refuses_failure_without_output_storage_boundary():

@@ -12,7 +12,12 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 from loguru import logger as default_logger
 
 from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
-from sag.tools.base import BaseTool, ToolResult, bind_tool_result_output_storage
+from sag.tools.base import (
+    BaseTool,
+    OutputPersistenceError,
+    ToolResult,
+    bind_tool_result_output_storage,
+)
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
 ToolExecutionStatus = Literal[
@@ -585,6 +590,8 @@ class ToolOrchestrator:
         escaped_exception_result: Optional[ToolResult] = None
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
+        except OutputPersistenceError:
+            raise
         except Exception as exc:
             result = ToolResult.terminal_failure(
                 invocation_status=InvocationStatus.CRASHED,

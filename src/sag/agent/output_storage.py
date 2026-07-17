@@ -15,14 +15,16 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.tools.base import (
+    OutputPersistenceError,
     ToolResult,
     bind_tool_result_output_storage,
+    canonical_full_output_source,
     is_output_storage_ref,
 )
 from sag.utils.container_io import write_container_text
 
 
-class OutputDurabilityError(RuntimeError):
+class OutputDurabilityError(OutputPersistenceError):
     """Raised when no validated durable home can be established for output."""
 
 
@@ -62,7 +64,11 @@ def attach_durable_output_ref(
     tool_name: str,
 ) -> ToolResult:
     """Return a detached result whose full output has durable provenance."""
-    output = (result.raw_output if result.raw_output is not None else result.output) or ""
+    output = canonical_full_output_source(
+        raw_output=result.raw_output,
+        output=result.output,
+        error=result.error,
+    )
     if result.output_ref:
         if _output_round_trips(storage, result.output_ref, output):
             return result

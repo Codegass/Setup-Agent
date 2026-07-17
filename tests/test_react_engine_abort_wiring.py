@@ -3,10 +3,15 @@ from types import SimpleNamespace
 from test_verdict_finalizer import FakeVerdictOrchestrator
 
 import sag.agent.react_engine as react_engine_module
+import sag.tools.base as tool_base_module
 from sag.agent.evidence_state import RunEvidenceState
 from sag.agent.phase_machine import PhaseMachine, PhaseTermination
 from sag.agent.react_engine import ReActEngine
+from sag.agent.react_types import ReActStep, StepType
+from sag.agent.tool_orchestration import ToolOrchestrator
 from sag.agent.verdict_finalizer import RunTerminationStatus, VerdictFinalizer
+from sag.evidence import OperationOutcome
+from sag.tools.base import BaseTool, ToolResult
 
 
 class _PromptBuilder:
@@ -112,6 +117,88 @@ def test_setup_engine_exception_records_abort_without_advancing():
 
     assert termination.termination is RunTerminationStatus.ABORTED
     _assert_setup_abort(engine, "engine exception: RuntimeError")
+
+
+def test_construction_persistence_failure_is_audited_before_setup_abort():
+    class FailedConstructionTool(BaseTool):
+        def __init__(self):
+            super().__init__("build", "Failed construction tool")
+
+        def execute(self, action: str) -> ToolResult:
+            return ToolResult.completed_failure(
+                output="compile failed before result return",
+                error="compile failed",
+                error_code="CONSTRUCTION_FAILED",
+            )
+
+    class TotalFailureStorage:
+        def __init__(self):
+            self.primary_calls = 0
+            self.emergency_calls = 0
+
+        def store_output(self, **kwargs):
+            self.primary_calls += 1
+            return ""
+
+        def store_emergency_output(self, **kwargs):
+            self.emergency_calls += 1
+            return ""
+
+        def retrieve_output(self, ref_id):
+            return None
+
+    storage = TotalFailureStorage()
+    engine = _engine(response="build action")
+    engine.config = SimpleNamespace(max_wall_clock_seconds=0, verbose=False)
+    engine.context_manager = SimpleNamespace(current_task_id=None)
+    engine.emit = lambda *args, **kwargs: None
+    engine.token_tracker = SimpleNamespace(
+        set_iteration=lambda iteration: None,
+        update_last_tool_name=lambda tool_name: None,
+    )
+    engine._should_use_thinking_model = lambda: False
+    engine.response_parser = SimpleNamespace(
+        parse=lambda *args, **kwargs: [
+            ReActStep(
+                step_type=StepType.ACTION,
+                content="compile",
+                tool_name="build",
+                tool_params={"action": "compile"},
+                timestamp="ts",
+                model_used="test-model",
+            )
+        ]
+    )
+    orchestrator = ToolOrchestrator(
+        tools={"build": FailedConstructionTool()},
+        context_manager=engine.context_manager,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=storage,
+    )
+    engine._get_tool_orchestrator = lambda: orchestrator
+
+    termination = engine.run_setup_loop("set up project", max_iterations=1)
+
+    assert issubclass(tool_base_module.OutputPersistenceError, RuntimeError)
+    assert termination.termination is RunTerminationStatus.ABORTED
+    assert storage.primary_calls == 1
+    assert storage.emergency_calls == 1
+    assert len(engine.run_evidence_state.action_attempts) == 1
+    attempt = engine.run_evidence_state.action_attempts[0]
+    assert attempt.action == "build:compile"
+    assert attempt.outcome is OperationOutcome.FAILED
+    assert attempt.evidence_refs == []
+    assert engine.run_evidence_state.tool_observations == ()
+    assert engine.run_evidence_state.conflicts == ("output_storage_failed",)
+    assert engine.run_evidence_state.sealed is True
+    assert engine.run_evidence_state.close_reason == "aborted"
+    _assert_setup_abort(engine, "engine exception: OutputPersistenceError")
 
 
 def test_setup_duplicate_cleanup_keeps_first_abort_record():
