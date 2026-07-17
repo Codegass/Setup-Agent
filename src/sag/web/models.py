@@ -123,6 +123,11 @@ class TestSummary(WebModel):
         validation_alias=AliasChoices("unique_skipped", "uniqueSkipped"),
         serialization_alias="uniqueSkipped",
     )
+    raw_executions: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("raw_executions", "rawExecutions"),
+        serialization_alias="rawExecutions",
+    )
     declared_total: int | None = Field(
         default=None,
         validation_alias=AliasChoices("declared_total", "declaredTotal"),
@@ -298,6 +303,14 @@ class ExecutionSessionSummary(WebModel):
     report: str
     files: int
     evidence: int
+    canonical_verdict: str = Field(default="unknown", serialization_alias="canonicalVerdict")
+    snapshot_status: str = Field(default="unavailable", serialization_alias="snapshotStatus")
+    legacy: bool = False
+    report_delivery_status: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("report_delivery_status", "reportDeliveryStatus"),
+        serialization_alias="reportDeliveryStatus",
+    )
 
 
 class WorkspaceSummary(WebModel):
@@ -470,9 +483,7 @@ class ModuleRollup(WebModel):
     )
     modules_with_test_failures: int = Field(
         default=0,
-        validation_alias=AliasChoices(
-            "modules_with_test_failures", "modulesWithTestFailures"
-        ),
+        validation_alias=AliasChoices("modules_with_test_failures", "modulesWithTestFailures"),
         serialization_alias="modulesWithTestFailures",
     )
     build_systems: list[str] = Field(
@@ -526,6 +537,8 @@ class VerdictSummary(WebModel):
     tone: str  # "success" | "attention" | "failed"
     headline: str
     detail: str | None = None
+    verdict: str | None = None
+    source: str = "derived"
 
 
 class ExecutionSessionDetail(WebModel):
@@ -565,6 +578,14 @@ class ExecutionSessionDetail(WebModel):
         default=None,
         validation_alias=AliasChoices("step_budget", "stepBudget"),
         serialization_alias="stepBudget",
+    )
+    canonical_verdict: str = Field(default="unknown", serialization_alias="canonicalVerdict")
+    snapshot_status: str = Field(default="unavailable", serialization_alias="snapshotStatus")
+    legacy: bool = False
+    report_delivery_status: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("report_delivery_status", "reportDeliveryStatus"),
+        serialization_alias="reportDeliveryStatus",
     )
 
 

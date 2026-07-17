@@ -1,7 +1,7 @@
 import json
 
-from sag.evidence import EvidenceAssessment, EvidenceStatus, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
+from sag.evidence import EvidenceAssessment, EvidenceStatus, TestStats
 from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool, build_stored_test_analysis
 
@@ -812,7 +812,7 @@ def test_detailed_test_analysis_distinguishes_runner_and_unique_counts():
     lines = tool._render_detailed_test_analysis(snapshot)
     body = "\n".join(lines)
 
-    assert "| **Tests Executed** | 18839 | Runner XML count |" in body
+    assert "| **Unique Tests Executed** | 18839 | Snapshot-local unique count |" in body
     assert "| **Unique Test Methods** | 9497 | Normalized runtime method count |" in body
     assert "Deduplicated runtime count" not in body
 
@@ -900,7 +900,7 @@ def _all_green_kernel_snapshot():
 def test_report_result_header_ignores_phase_termination_for_verdict():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"test"}))
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
+    assert tool._legacy_snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
     lines = tool._render_enhanced_header(
         "2026-06-12 12:00:00",
@@ -915,7 +915,7 @@ def test_report_result_header_ignores_phase_termination_for_verdict():
 def test_report_result_header_blocked_build_phase_does_not_imply_failure():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
+    assert tool._legacy_snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
 
 def test_report_kernel_verdict_abstains_without_phase_tasks():
@@ -923,7 +923,7 @@ def test_report_kernel_verdict_abstains_without_phase_tasks():
     the machine input abstains and physical evidence still rules."""
     tool = ReportTool(context_manager=FakeReportContextManager())
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
+    assert tool._legacy_snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
 
 def test_condensed_log_output_matches_kernel_verdict():
@@ -1031,7 +1031,7 @@ def test_build_green_no_tests_maps_to_partial_not_failed():
             "evidence_refs": [],
         },
     }
-    verdict = tool._snapshot_kernel_verdict(snapshot)
+    verdict = tool._legacy_snapshot_kernel_verdict(snapshot)
     assert verdict == "partial", verdict
 
 
@@ -1047,7 +1047,7 @@ def test_build_failed_still_maps_to_failed():
             "evidence_refs": [],
         },
     }
-    assert tool._snapshot_kernel_verdict(snapshot) == "failed"
+    assert tool._legacy_snapshot_kernel_verdict(snapshot) == "failed"
 
 
 def test_console_result_line_uses_kernel_verdict():
@@ -1228,7 +1228,7 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
 
     stored_analysis = build_stored_test_analysis(parser_analysis)
     tool = ReportTool()
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         "success",
         "setup-report-test.md",
         {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},

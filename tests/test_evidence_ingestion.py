@@ -867,6 +867,8 @@ def test_setup_evaluator_success_cannot_bypass_phase_lifecycle(tmp_path):
 
 def test_legacy_run_task_keeps_boolean_contract_without_evidence_finalization(tmp_path):
     engine, orchestrator = _loop_engine(tmp_path, response="")
+    stale_snapshot = '{"run_id":"old-setup","verdict":"success"}'
+    orchestrator.files[VERDICT_PATH] = stale_snapshot
 
     succeeded = engine.run_react_loop(
         "perform one task",
@@ -876,7 +878,7 @@ def test_legacy_run_task_keeps_boolean_contract_without_evidence_finalization(tm
 
     assert succeeded is False
     assert engine.phase_machine.records == ()
-    assert VERDICT_PATH not in orchestrator.files
+    assert orchestrator.files[VERDICT_PATH] == stale_snapshot
 
 
 def test_setup_agent_injects_one_session_owned_state_and_finalizer(monkeypatch):

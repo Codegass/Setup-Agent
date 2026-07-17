@@ -59,6 +59,7 @@ class FakePhysicalValidator:
 
 def _agent_with_validator(validator):
     agent = object.__new__(SetupAgent)
+    agent.workflow_mode = "continue"
     agent.orchestrator = SimpleNamespace(project_name="pyyaml")
     agent.project_name = "pyyaml"
     agent.context_manager = SimpleNamespace(project_name="pyyaml")
@@ -126,7 +127,7 @@ def test_python_partial_physical_evidence_drives_partial_verdict():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert agent.final_verdict == "partial"
     assert result is True, "flow-control follows the physical evidence"
@@ -141,7 +142,7 @@ def test_python_phase_termination_does_not_leak_into_verdict_reason():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    agent._get_verified_final_status(react_engine_success=True)
+    agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert agent.final_verdict == "partial"
     reason = agent.final_verdict_reason
@@ -172,7 +173,7 @@ def test_blocked_build_with_no_physical_evidence_stays_failed():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert result is False
     assert agent.final_verdict == "failed"
@@ -203,7 +204,7 @@ def test_java_green_evidence_is_not_capped_by_phase_termination():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert agent.final_verdict == "success"
     assert result is True
@@ -233,7 +234,7 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert result is False
     assert agent.final_verdict == "failed"

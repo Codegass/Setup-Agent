@@ -23,6 +23,7 @@ from .verdict_finalizer import (
     ReportDeliveryStatus,
     RunTermination,
     RunTerminationStatus,
+    RunVerdictSnapshot,
     VerdictFinalizer,
     read_verdict_snapshot,
 )
@@ -48,9 +49,6 @@ class SetupAgent:
         self.context_manager = None
         self.tools = None
         self.react_engine = None
-        # Surfaced run verdict ("success" | "partial" | "failed"); refined by
-        # _get_verified_final_status. "partial" = build verified, tests not.
-        self.final_verdict = "failed"
         # PhysicalValidator is set during _initialize_tools() once orchestrator
         # is available; declared here so attribute access is always safe.
         self.physical_validator = None
@@ -61,6 +59,7 @@ class SetupAgent:
         self.run_evidence_state = None
         self.verdict_finalizer = None
         self.run_termination = None
+        self.workflow_mode = "idle"
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
@@ -98,8 +97,8 @@ class SetupAgent:
         """Initialize context manager, tools, and react engine after Docker is ready.
 
         ``workflow_mode`` selects the model-facing tool surface: setup runs get
-        the engine-owned phase machine + `phase` tool; "run_task" keeps the
-        legacy free-form surface with `manage_context` (spec §8.2).
+        the engine-owned phase machine + `phase` tool; legacy continuation and
+        "run_task" keep the free-form surface with `manage_context` (spec §8.2).
         """
         if self.context_manager is not None:
             return  # Already initialized
@@ -262,6 +261,7 @@ class SetupAgent:
                 execution_history_callback=self._get_execution_history,
                 context_manager=self.context_manager,
                 physical_validator=self.physical_validator,
+                workflow_mode=workflow_mode,
             ),
         ]
 
@@ -360,7 +360,7 @@ class SetupAgent:
         interactive: bool = False,
         docker_label: Optional[str] = None,
         project_ref: Optional[str] = None,
-    ) -> bool:
+    ) -> RunTermination:
         """Setup a project from scratch.
 
         Args:
@@ -375,6 +375,8 @@ class SetupAgent:
         # Default docker_label to project_name if not provided
         if docker_label is None:
             docker_label = project_name
+        self.run_termination = None
+        self.workflow_mode = "setup"
 
         # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("project", project_name)
@@ -401,7 +403,7 @@ class SetupAgent:
             self._emit(EventType.PHASE_START, "Setting up environment", phase=PhaseType.SETUP)
 
             if not self._setup_docker_environment(project_name):
-                return False
+                return self._close_open_setup_run("docker environment setup failed")
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
             self._emit(
@@ -502,7 +504,7 @@ class SetupAgent:
                 self._close_open_setup_run(f"setup exception: {type(e).__name__}")
                 # Always show critical errors
                 self.console.print(f"[bold red]❌ Failed to create project context: {e}[/bold red]")
-                return False
+                return self.run_termination
 
             # Step 2.5: Complete setup phase
             self._emit(
@@ -513,7 +515,7 @@ class SetupAgent:
             )
 
             # Step 3: Run the unified setup process
-            success = self._run_unified_setup(
+            termination = self._run_unified_setup(
                 project_url,
                 project_name,
                 goal,
@@ -521,40 +523,53 @@ class SetupAgent:
                 project_ref=project_ref,
             )
 
-            # Step 5: Handle final status
-            final_verdict = getattr(self, "final_verdict", "success" if success else "failed")
+            # Step 5: Render the immutable setup result. Delivery remains a
+            # separate flow fact and never changes the verdict.
+            snapshot = read_verdict_snapshot(self.orchestrator)
             if self.config.ui_mode:
-                if success and final_verdict == "partial":
+                if snapshot.verdict == "success":
                     self._emit(
                         EventType.SUCCESS,
-                        "Project setup partially completed (build verified, tests not verified)",
-                        level="warning",
+                        "Project setup completed successfully",
+                        level="success",
                     )
-                elif success:
+                elif snapshot.verdict == "partial":
                     self._emit(
-                        EventType.SUCCESS, "Project setup completed successfully", level="success"
+                        EventType.SUCCESS,
+                        "Project setup partially completed",
+                        level="warning",
                     )
                 else:
                     self._emit(EventType.FAILURE, "Project setup incomplete", level="error")
+                if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
+                    self._emit(
+                        EventType.ERROR,
+                        "Setup report delivery failed; verdict is unchanged",
+                        level="warning",
+                    )
                 self.ui_manager.display_final_summary()
             else:
-                self._provide_setup_summary(success)
+                self._provide_setup_summary(termination, snapshot)
 
-            cmd_logger.info(f"Project setup completed: success={success}, verdict={final_verdict}")
-            return success
+            cmd_logger.info(
+                "Project setup completed: "
+                f"verdict={snapshot.verdict}, "
+                f"report_delivery={termination.report_delivery_status.value}"
+            )
+            return termination
 
         except KeyboardInterrupt:
-            self._close_open_setup_run("keyboard interrupt", cancelled=True)
+            termination = self._close_open_setup_run("keyboard interrupt", cancelled=True)
             cmd_logger.error("Setup cancelled by keyboard interrupt")
             self.console.print("[bold yellow]Setup cancelled.[/bold yellow]")
-            return False
+            return termination
 
         except Exception as e:
-            self._close_open_setup_run(f"setup exception: {type(e).__name__}")
+            termination = self._close_open_setup_run(f"setup exception: {type(e).__name__}")
             cmd_logger.error(f"Setup failed: {e}", exc_info=True)
             # Always show critical errors
             self.console.print(f"[bold red]❌ Setup failed: {e}[/bold red]")
-            return False
+            return termination
 
         finally:
             # Tear down the live UI on every exit path. display_final_summary
@@ -581,6 +596,7 @@ class SetupAgent:
 
     def continue_project(self, project_name: str, additional_request: Optional[str] = None) -> bool:
         """Continue working on an existing project."""
+        self.workflow_mode = "continue"
 
         self.console.print(
             Panel.fit(
@@ -596,7 +612,7 @@ class SetupAgent:
                 return False
 
             # Step 1.5: Initialize context manager and tools now that Docker is ready
-            self._initialize_context_and_tools()
+            self._initialize_context_and_tools(workflow_mode="legacy")
 
             # Step 2: Load existing trunk context
             logger.info(f"Loading or creating trunk context for project: {project_name}")
@@ -634,7 +650,7 @@ class SetupAgent:
             success = self._run_setup_loop(interactive=True)
 
             # Step 5: Provide summary
-            self._provide_setup_summary(success)
+            self._provide_legacy_setup_summary(success)
 
             return success
 
@@ -646,6 +662,7 @@ class SetupAgent:
 
     def run_task(self, project_name: str, task_description: str) -> bool:
         """Run a specific task on an existing project."""
+        self.workflow_mode = "run_task"
 
         # Create command-specific logger
         cmd_logger, cmd_logger_id = create_command_logger("run", project_name)
@@ -928,7 +945,7 @@ Do not generate a final setup report unless the TASK explicitly asks for one.
         goal: str,
         interactive: bool = False,
         project_ref: Optional[str] = None,
-    ) -> bool:
+    ) -> RunTermination:
         """Run the unified project setup process."""
 
         # Create comprehensive setup prompt with intelligent planning approach
@@ -976,25 +993,14 @@ START by working toward the current phase objective shown in my context.
             termination = self.react_engine.run_setup_loop(
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
-
-            verified_success = self._apply_run_termination(termination)
-
-            if verified_success:
-                self._emit(
-                    EventType.PHASE_COMPLETE,
-                    "Build and test completed",
-                    phase=PhaseType.BUILD,
-                    level="success",
-                )
-            else:
-                self._emit(
-                    EventType.PHASE_ERROR,
-                    "Build or test failed",
-                    phase=PhaseType.BUILD,
-                    level="error",
-                )
-
-            return verified_success
+            self.run_termination = termination
+            self._emit(
+                EventType.PHASE_COMPLETE,
+                "Setup flow completed",
+                phase=PhaseType.BUILD,
+                level="success",
+            )
+            return termination
         else:
             # Normal Mode: use Rich Progress
             self.console.print("[dim]🚀 Starting intelligent project setup process...[/dim]")
@@ -1009,34 +1015,22 @@ START by working toward the current phase objective shown in my context.
                 termination = self.react_engine.run_setup_loop(
                     initial_prompt=setup_prompt, max_iterations=self.max_iterations
                 )
+                self.run_termination = termination
+                progress.update(task, description="Setup flow completed")
 
-                verified_success = self._apply_run_termination(termination)
+            return termination
 
-                if verified_success:
-                    progress.update(task, description="✅ Setup process completed")
-                else:
-                    progress.update(task, description="❌ Setup process incomplete")
-
-            return verified_success
-
-    def _apply_run_termination(self, termination: RunTermination) -> bool:
-        """Mirror the immutable setup snapshot into the legacy boolean boundary."""
-        self.run_termination = termination
-        snapshot = read_verdict_snapshot(self.orchestrator)
-        self.final_verdict = snapshot.verdict
-        self.final_verdict_reason = ""
-        return termination.termination is RunTerminationStatus.COMPLETED and snapshot.verdict in {
-            "success",
-            "partial",
-        }
-
-    def _close_open_setup_run(
-        self, reason: str, *, cancelled: bool = False
-    ) -> RunTermination | None:
+    def _close_open_setup_run(self, reason: str, *, cancelled: bool = False) -> RunTermination:
         """Create typed closure for failures outside the active ReAct loop."""
         state = getattr(self, "run_evidence_state", None)
         if state is None:
-            return None
+            self.run_termination = RunTermination(
+                termination=(
+                    RunTerminationStatus.CANCELLED if cancelled else RunTerminationStatus.ABORTED
+                ),
+                report_delivery_status=ReportDeliveryStatus.SKIPPED,
+            )
+            return self.run_termination
         if getattr(self, "run_termination", None) is not None:
             return self.run_termination
 
@@ -1062,11 +1056,16 @@ START by working toward the current phase objective shown in my context.
         )
         return self.run_termination
 
-    def _get_verified_final_status(self, react_engine_success: bool) -> bool:
-        """Combine physical validation and evidence conflicts through the kernel."""
+    def _require_legacy_verdict_mode(self) -> None:
+        if getattr(self, "workflow_mode", None) not in {"continue", "run_task"}:
+            raise RuntimeError("legacy verdict mapper is unavailable in setup mode")
+
+    def _legacy_get_verified_final_status(self, react_engine_success: bool) -> bool:
+        """Legacy-only physical finalization retained outside setup mode."""
+        self._require_legacy_verdict_mode()
         from sag.verdict import run_verdict
 
-        physical_ok = self._get_physical_final_status(react_engine_success)
+        physical_ok = self._legacy_get_physical_final_status(react_engine_success)
         physical_verdict = self.final_verdict
         test_status = getattr(self, "_last_test_status", None)
 
@@ -1089,7 +1088,7 @@ START by working toward the current phase objective shown in my context.
         # evidence-backed blocked-build cap, which must not be re-demoted. It
         # never promotes (failed stays failed), and no-report runs (snapshot
         # absent) keep today's behavior exactly.
-        snapshot_verdict, snapshot_conflicts = self._report_snapshot_verdict()
+        snapshot_verdict, snapshot_conflicts = self._legacy_report_snapshot_verdict()
         snapshot_capped = (
             snapshot_verdict in ("partial", "failed") and self.final_verdict == "success"
         )
@@ -1123,7 +1122,7 @@ START by working toward the current phase objective shown in my context.
 
         return physical_ok
 
-    def _report_snapshot_verdict(self) -> tuple:
+    def _legacy_report_snapshot_verdict(self) -> tuple:
         """The kernel verdict the LAST generated report stored, plus its
         evidence conflicts: ``(verdict | None, conflicts)``.
 
@@ -1136,6 +1135,7 @@ START by working toward the current phase objective shown in my context.
         legacy, direct unit-test invocations) — return (None, []) so the
         finalization keeps its no-report behavior untouched.
         """
+        self._require_legacy_verdict_mode()
         states = getattr(getattr(self, "react_engine", None), "successful_states", None)
         snapshot = states.get("report_snapshot") if isinstance(states, dict) else None
         if not isinstance(snapshot, dict):
@@ -1144,7 +1144,7 @@ START by working toward the current phase objective shown in my context.
         conflicts = (snapshot.get("evidence_result") or {}).get("conflicts") or []
         return verdict, list(conflicts)
 
-    def _get_physical_final_status(self, react_engine_success: bool) -> bool:
+    def _legacy_get_physical_final_status(self, react_engine_success: bool) -> bool:
         """Verify the final run status against physical evidence.
 
         Returns the boolean used for flow control, and records the surfaced
@@ -1157,6 +1157,8 @@ START by working toward the current phase objective shown in my context.
         verdict policy shared with the report verdict) so the run/test success
         path can never diverge from the report.
         """
+        self._require_legacy_verdict_mode()
+
         from sag.agent.physical_validator import evaluate_run_verdict
         from sag.config.settings import (
             DEFAULT_TEST_EXECUTION_THRESHOLD,
@@ -1400,8 +1402,74 @@ START by working toward the current phase objective shown in my context.
 
         return None
 
-    def _provide_setup_summary(self, success: bool):
-        """Provide a summary of the setup process."""
+    def _provide_setup_summary(
+        self, termination: RunTermination, snapshot: RunVerdictSnapshot
+    ) -> None:
+        """Render setup completion from one sealed snapshot and flow termination."""
+        exec_summary = self.react_engine.get_execution_summary()
+        context_info = self.context_manager.get_current_context_info()
+        verdict_style = {
+            "success": ("bold green", "green"),
+            "partial": ("bold yellow", "yellow"),
+            "failed": ("bold red", "red"),
+            "unknown": ("bold yellow", "yellow"),
+        }
+        text_style, border_style = verdict_style[snapshot.verdict]
+        tests = snapshot.test_stats
+        summary_lines = [
+            f"[{text_style}]{snapshot.verdict.upper()}[/{text_style}]",
+            "",
+            "[bold]Canonical Result:[/bold]",
+            f"• Verdict: {snapshot.verdict}",
+            f"• {tests.passed} / {tests.executed} unique tests passed",
+            f"• Failures: {tests.failed}; errors: {tests.errors}; skipped: {tests.skipped}",
+        ]
+        if tests.raw.executed != tests.executed:
+            summary_lines.append(f"• Raw executions (diagnostic): {tests.raw.executed}")
+        summary_lines.extend(
+            [
+                f"• Report delivery: {termination.report_delivery_status.value}",
+                "",
+                "[bold]Execution Statistics:[/bold]",
+                f"• Total Steps: {exec_summary['total_steps']}",
+                f"• Iterations: {exec_summary['iterations']}",
+                f"• Thoughts: {exec_summary['thoughts']}",
+                f"• Actions: {exec_summary['actions']}",
+                f"• Successful Actions: {exec_summary['successful_actions']}",
+                f"• Failed Actions: {exec_summary['failed_actions']}",
+                "",
+                "[bold]Final Context:[/bold]",
+                f"• Context Type: {context_info.get('context_type', 'Unknown')}",
+                f"• Context ID: {context_info.get('context_id', 'Unknown')}",
+            ]
+        )
+        self.console.print(
+            Panel(
+                "\n".join(summary_lines),
+                title="[bold]Setup Summary[/bold]",
+                border_style=border_style,
+            )
+        )
+
+        if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
+            self.console.print(
+                "[bold yellow]WARNING: setup report delivery failed; "
+                "the sealed setup verdict is unchanged.[/bold yellow]"
+            )
+
+        project_name = context_info.get("project_name", "project")
+        if snapshot.verdict == "success":
+            self.console.print("[bold green]Project setup completed successfully.[/bold green]")
+            self.console.print(f"[dim]Connect with:[/dim] setup-agent connect {project_name}")
+        else:
+            self.console.print(
+                f"[bold yellow]Project setup verdict: {snapshot.verdict.upper()}.[/bold yellow]"
+            )
+            self.console.print(f"[dim]Continue with:[/dim] setup-agent continue {project_name}")
+
+    def _provide_legacy_setup_summary(self, success: bool):
+        """Provide the pre-snapshot summary for non-setup compatibility paths."""
+        self._require_legacy_verdict_mode()
 
         # Get execution summary
         exec_summary = self.react_engine.get_execution_summary()

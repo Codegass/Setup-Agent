@@ -1,8 +1,10 @@
 """Report tool for generating task summaries and marking completion."""
 
+from __future__ import annotations
+
 import json
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 
@@ -28,6 +30,9 @@ from sag.ui.events import EventType, UIEventEmitter
 from sag.verdict import rescue_blocked_build, run_verdict
 
 from .base import BaseTool, ToolResult
+
+if TYPE_CHECKING:
+    from sag.agent.verdict_finalizer import RunVerdictSnapshot
 
 MAX_RUNTIME_ENV_OVERLAY_BLOCKED_ROWS = 5
 MAX_RUNTIME_ENV_OVERLAY_REASON_CHARS = 160
@@ -144,6 +149,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         execution_history_callback=None,
         context_manager=None,
         physical_validator=None,
+        workflow_mode: str = "legacy",
     ):
         BaseTool.__init__(
             self,
@@ -157,6 +163,9 @@ class ReportTool(BaseTool, UIEventEmitter):
         self.execution_history_callback = execution_history_callback
         self.context_manager = context_manager
         self.physical_validator = physical_validator
+        if workflow_mode not in {"setup", "legacy", "run_task"}:
+            raise ValueError(f"Unsupported report workflow mode: {workflow_mode}")
+        self.workflow_mode = "legacy" if workflow_mode == "run_task" else workflow_mode
 
     def execute(
         self,
@@ -189,7 +198,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # IDEMPOTENCY CHECK: Prevent multiple report generation
         # Check if a report was already generated recently (within last 5 minutes)
-        if action == "generate" and self.docker_orchestrator:
+        if action == "generate" and self.docker_orchestrator and self.workflow_mode != "setup":
             try:
                 # Check for ANY existing reports (broader check to prevent duplicates)
                 check_cmd = "find /workspace -maxdepth 1 -name '*report*.md' -type f 2>/dev/null | grep -E '(setup.*report|final.*report|report.*md)' | head -1"
@@ -287,7 +296,11 @@ class ReportTool(BaseTool, UIEventEmitter):
         try:
             if action == "generate":
                 # CRITICAL: Verify all prerequisite tasks are completed before generating report
-                context_validation = self._validate_context_prerequisites()
+                context_validation = (
+                    {"valid": True}
+                    if self.workflow_mode == "setup"
+                    else self._validate_context_prerequisites()
+                )
                 if not context_validation["valid"]:
                     return ToolResult.completed_failure(
                         output="",
@@ -696,7 +709,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Console Result reads the same kernel verdict as the header — round 6
         # beam printed "Result: SUCCESS" beside a FAILED header.
-        lines = [f"Result: {self._snapshot_kernel_verdict(snapshot).upper()}"]
+        lines = [f"Result: {self._report_verdict(snapshot).upper()}"]
         test_stats = self._snapshot_test_stats(snapshot) or self._coerce_report_test_stats(
             evidence.get("test_stats")
         )
@@ -769,8 +782,18 @@ class ReportTool(BaseTool, UIEventEmitter):
         except (TypeError, ValueError):
             return None
 
-    def _snapshot_kernel_verdict(self, snapshot: Optional[Dict[str, Any]]) -> str:
-        """The run verdict for this report, via the verdict kernel (spec §6).
+    def _report_verdict(self, snapshot: Optional[Dict[str, Any]]) -> str:
+        """Return the adapter-owned verdict without setup-mode recomputation."""
+        status = (snapshot or {}).get("status") or {}
+        verdict = status.get("verdict") if isinstance(status, dict) else None
+        if verdict in {"success", "partial", "failed", "unknown"}:
+            return verdict
+        if self.workflow_mode == "setup":
+            return "unknown"
+        return self._legacy_snapshot_kernel_verdict(snapshot)
+
+    def _legacy_snapshot_kernel_verdict(self, snapshot: Optional[Dict[str, Any]]) -> str:
+        """Legacy report verdict synthesis, isolated from setup mode.
 
         Combines physically verified status, evidence assessment, and conflict
         caps. Phase termination records are deliberately absent from verdict
@@ -896,7 +919,106 @@ class ReportTool(BaseTool, UIEventEmitter):
         conflicts: Optional[List[str]] = None,
         evidence_refs: Optional[List[str]] = None,
     ) -> Tuple[str, str, str, dict, dict]:
-        """Generate a comprehensive project setup report."""
+        """Generate a report through the explicit setup or legacy adapter."""
+        if self.workflow_mode == "setup":
+            from sag.agent.verdict_finalizer import read_verdict_snapshot
+
+            snapshot = read_verdict_snapshot(self.docker_orchestrator)
+            return self._generate_snapshot_report(
+                snapshot,
+                summary=summary,
+                details=details,
+            )
+        return self._generate_legacy_comprehensive_report(
+            summary,
+            status,
+            details,
+            evidence_status=evidence_status,
+            test_stats=test_stats,
+            conflicts=conflicts,
+            evidence_refs=evidence_refs,
+        )
+
+    def _generate_snapshot_report(
+        self,
+        snapshot: RunVerdictSnapshot,
+        *,
+        summary: str,
+        details: str,
+    ) -> Tuple[str, str, str, dict, dict]:
+        """Render a sealed setup snapshot without validating or rescanning it."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        report_filename = f"setup-report-{datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
+        project_info = self._get_project_info()
+        execution_metrics = self._collect_execution_metrics()
+        report_snapshot = self._build_report_snapshot(
+            snapshot,
+            report_filename=report_filename,
+            project_info=project_info or {},
+        )
+        actual_accomplishments: dict[str, Any] = {}
+
+        console_report = self._generate_console_report(
+            summary,
+            snapshot.verdict,
+            details,
+            timestamp,
+            project_info,
+            actual_accomplishments,
+            execution_metrics,
+            report_snapshot,
+        )
+        markdown_report = self._generate_markdown_report(
+            summary,
+            snapshot.verdict,
+            details,
+            timestamp,
+            project_info,
+            actual_accomplishments,
+            execution_metrics,
+            report_snapshot,
+        )
+
+        if not self._save_markdown_report(markdown_report, timestamp, report_filename):
+            raise OSError(f"failed to persist setup report: /workspace/{report_filename}")
+
+        try:
+            from sag.tools.report_metrics import assemble_report_metrics
+
+            evidence_result = report_snapshot.get("evidence_result") or {}
+            self._persist_report_metrics(
+                assemble_report_metrics(
+                    snapshot=report_snapshot,
+                    build_evidence={},
+                    test_analysis={},
+                    conflicts=list(evidence_result.get("conflicts") or []),
+                    evidence_refs=list(evidence_result.get("evidence_refs") or []),
+                    generated_at=timestamp,
+                    execution_metrics=execution_metrics,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive diagnostics
+            logger.warning(f"Skipped report metrics artifact: {exc}")
+
+        return (
+            console_report,
+            snapshot.verdict,
+            report_filename,
+            actual_accomplishments,
+            report_snapshot,
+        )
+
+    def _generate_legacy_comprehensive_report(
+        self,
+        summary: str,
+        status: str,
+        details: str,
+        evidence_status: Optional[str] = None,
+        test_stats: Optional[Dict[str, Any] | TestStats] = None,
+        conflicts: Optional[List[str]] = None,
+        evidence_refs: Optional[List[str]] = None,
+    ) -> Tuple[str, str, str, dict, dict]:
+        """Generate a legacy report from mutable validators and report history."""
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # Generate consistent report filename for both display and saving
@@ -923,7 +1045,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         # Ensure the report action itself is reflected as a successful execution
         self._finalize_report_metrics(execution_metrics, verified_status)
 
-        report_snapshot = self._build_report_snapshot(
+        report_snapshot = self._build_legacy_report_snapshot(
             verified_status,
             report_filename,
             project_info or {},
@@ -1283,6 +1405,113 @@ class ReportTool(BaseTool, UIEventEmitter):
         return history
 
     def _build_report_snapshot(
+        self,
+        snapshot: RunVerdictSnapshot,
+        *,
+        report_filename: str,
+        project_info: dict,
+    ) -> Dict[str, Any]:
+        """Adapt the sealed setup snapshot into the existing render model."""
+        tests = snapshot.test_stats
+        raw = tests.raw
+        expansion_factor = None
+        if tests.executed > 0 and raw.executed > tests.executed:
+            expansion_factor = raw.executed / tests.executed
+
+        latest_outcomes: dict[str, str] = {}
+        for record in snapshot.phase_records:
+            latest_outcomes[record.phase] = record.outcome
+
+        def completed_successfully(*phase_names: str) -> bool | None:
+            outcomes = [latest_outcomes[name] for name in phase_names if name in latest_outcomes]
+            if not outcomes:
+                return None
+            return outcomes[-1] == "success"
+
+        status = {
+            "overall": snapshot.verdict,
+            "verdict": snapshot.verdict,
+            "tests_total": tests.executed,
+            "tests_total_raw": raw.executed,
+            "tests_passed": tests.passed,
+            "tests_passed_raw": raw.passed,
+            "tests_failed": tests.failed,
+            "tests_failed_raw": raw.failed,
+            "tests_errors": tests.errors,
+            "tests_errors_raw": raw.errors,
+            "tests_skipped": tests.skipped,
+            "tests_skipped_raw": raw.skipped,
+            "tests_unique": tests.executed,
+            "tests_passed_unique": tests.passed,
+            "tests_failed_unique": tests.failed,
+            "tests_errors_unique": tests.errors,
+            "tests_skipped_unique": tests.skipped,
+            "pass_pct": tests.pass_rate if tests.executed > 0 else None,
+            "static_test_count": tests.discovered,
+            "method_count": None,
+            "execution_rate": tests.execution_rate,
+            "expansion_factor": expansion_factor,
+            "parameterized_info": {},
+            "modules_expected": None,
+            "modules_seen": None,
+            "skipped_modules": [],
+            "tests_ok": None,
+        }
+        evidence_refs = list(dict.fromkeys([*snapshot.input_refs, *snapshot.build_evidence.refs]))
+        evidence_result = {
+            "status": snapshot.verdict,
+            "test_stats": {
+                "discovered": tests.discovered,
+                "executed": tests.executed,
+                "passed": tests.passed,
+                "failed": tests.failed + tests.errors,
+                "skipped": tests.skipped,
+            },
+            "conflicts": list(snapshot.conflicts),
+            "evidence_refs": evidence_refs,
+        }
+        attention_items = [
+            {"severity": "INFO", "icon": "INFO", "message": conflict}
+            for conflict in snapshot.conflicts
+        ]
+        return {
+            "mode": "setup",
+            "status": status,
+            "project": {
+                "type": project_info.get("type", "Unknown"),
+                "build_system": project_info.get("build_system", "Unknown"),
+            },
+            "phases": {
+                "clone": completed_successfully("provision", "clone"),
+                "build": snapshot.build_evidence.green,
+                "test": completed_successfully("test"),
+            },
+            "report_path": f"/workspace/{report_filename}",
+            "physical_evidence": {
+                "class_files": None,
+                "jar_files": None,
+                "tests_total": tests.executed,
+                "tests_pass_pct": tests.pass_rate if tests.executed > 0 else None,
+                "build_system": project_info.get("build_system"),
+                "fingerprint_details": {},
+                "refs": list(snapshot.build_evidence.refs),
+            },
+            "test_history": {},
+            "per_module": {},
+            "flags": {},
+            "last_command": {},
+            "failed_tests": [],
+            "evidence_result": evidence_result,
+            "attention": {
+                "items": [f"INFO {item['message']}" for item in attention_items],
+                "raw": attention_items,
+                "ignored_lines": 0,
+            },
+            "raw_diagnostics": raw.model_dump(mode="json"),
+            "canonical_snapshot": snapshot.model_dump(mode="json"),
+        }
+
+    def _build_legacy_report_snapshot(
         self,
         verified_status: str,
         report_filename: str,
@@ -1750,7 +1979,7 @@ class ReportTool(BaseTool, UIEventEmitter):
 
         # Stored verdict comes from the SAME kernel inputs as the header's
         # Result line (spec §6): header-vs-stored divergence is impossible.
-        status["verdict"] = self._snapshot_kernel_verdict(snapshot)
+        status["verdict"] = self._legacy_snapshot_kernel_verdict(snapshot)
 
         attention = self._evaluate_attention_flags(snapshot)
         snapshot["attention"] = {
@@ -1858,7 +2087,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         snapshot["report_path"] = snapshot.get("report_path") or f"/workspace/{report_filename}"
 
         status = dict(snapshot.get("status") or {})
-        kernel_verdict = status.get("verdict") or self._snapshot_kernel_verdict(snapshot)
+        kernel_verdict = status.get("verdict") or self._report_verdict(snapshot)
         status["verdict"] = kernel_verdict
         snapshot["status"] = status
 
@@ -2257,9 +2486,10 @@ class ReportTool(BaseTool, UIEventEmitter):
             except Exception as e:
                 logger.warning(f"Failed to collect execution metrics: {e}")
 
-        test_history = self._load_test_history()
-        if test_history:
-            metrics["test_history"] = test_history
+        if self.workflow_mode != "setup":
+            test_history = self._load_test_history()
+            if test_history:
+                metrics["test_history"] = test_history
 
         return metrics
 
@@ -2639,15 +2869,24 @@ class ReportTool(BaseTool, UIEventEmitter):
         # Fallback when no TODO list is available: render the three core phases
         # from the physically-validated accomplishments.
         if not todo_list_used:
-            logger.info("Using physical accomplishments as fallback for task status")
-
-            accomplishments = actual_accomplishments or {}
-            for label, key in (
-                ("Project repository cloning", "repository_cloned"),
-                ("Project compilation", "build_success"),
-                ("Test execution", "test_success"),
-            ):
-                icon = "✅" if accomplishments.get(key) else "❌"
+            setup_snapshot = (report_snapshot or {}).get("mode") == "setup"
+            if setup_snapshot:
+                phase_values = (report_snapshot or {}).get("phases") or {}
+                phase_rows = (
+                    ("Project repository cloning", phase_values.get("clone")),
+                    ("Project compilation", phase_values.get("build")),
+                    ("Test execution", phase_values.get("test")),
+                )
+            else:
+                logger.info("Using physical accomplishments as fallback for task status")
+                accomplishments = actual_accomplishments or {}
+                phase_rows = (
+                    ("Project repository cloning", accomplishments.get("repository_cloned")),
+                    ("Project compilation", accomplishments.get("build_success")),
+                    ("Test execution", accomplishments.get("test_success")),
+                )
+            for label, phase_value in phase_rows:
+                icon = "✅" if phase_value is True else "❌" if phase_value is False else "❔"
                 report_lines.append(f"   • {icon} {label}")
 
         # Add comprehensive execution metrics
@@ -2938,6 +3177,7 @@ class ReportTool(BaseTool, UIEventEmitter):
         )
 
         if report_snapshot:
+            setup_snapshot = report_snapshot.get("mode") == "setup"
             # Add summary dashboard with all key metrics
             dashboard_section = self._render_summary_dashboard(report_snapshot)
             if dashboard_section:
@@ -2949,14 +3189,15 @@ class ReportTool(BaseTool, UIEventEmitter):
                 report_lines.extend(test_analysis_section)
 
             # Add per-submodule build/test breakdown (multi-module projects only)
-            try:
-                mm = self._build_module_metrics(
-                    self._load_test_history() or {},
-                    generated_at=timestamp,
-                )
-                report_lines.extend(self._render_submodule_breakdown(mm or {}))
-            except Exception as exc:
-                logger.debug(f"submodule breakdown skipped: {exc}")
+            if not setup_snapshot:
+                try:
+                    mm = self._build_module_metrics(
+                        self._load_test_history() or {},
+                        generated_at=timestamp,
+                    )
+                    report_lines.extend(self._render_submodule_breakdown(mm or {}))
+                except Exception as exc:
+                    logger.debug(f"submodule breakdown skipped: {exc}")
 
             # Add issues and recommendations
             issues_section = self._render_issues_recommendations(report_snapshot)
@@ -2964,9 +3205,11 @@ class ReportTool(BaseTool, UIEventEmitter):
                 report_lines.extend(issues_section)
 
         # Task progress section with improved format
-        task_progress_section = self._render_task_progress(actual_accomplishments)
-        if task_progress_section:
-            report_lines.extend(task_progress_section)
+        setup_snapshot = (report_snapshot or {}).get("mode") == "setup"
+        if not setup_snapshot:
+            task_progress_section = self._render_task_progress(actual_accomplishments)
+            if task_progress_section:
+                report_lines.extend(task_progress_section)
 
         # Execution details section (simplified)
         exec_details_section = self._render_execution_details_simplified(
@@ -2976,14 +3219,16 @@ class ReportTool(BaseTool, UIEventEmitter):
             report_lines.extend(exec_details_section)
 
         # Runtime overlay evidence is reported separately from project metadata.
-        env_overlay_section = self._render_runtime_env_overlay_evidence()
-        if env_overlay_section:
-            report_lines.extend(env_overlay_section)
+        if not setup_snapshot:
+            env_overlay_section = self._render_runtime_env_overlay_evidence()
+            if env_overlay_section:
+                report_lines.extend(env_overlay_section)
 
         # Add error analysis section
-        error_section = self._generate_error_reporting_section(actual_accomplishments)
-        if error_section:
-            report_lines.extend(error_section)
+        if not setup_snapshot:
+            error_section = self._generate_error_reporting_section(actual_accomplishments)
+            if error_section:
+                report_lines.extend(error_section)
 
         # Generate next steps based on actual status and context
         next_steps_section = self._generate_next_steps_section(status, actual_accomplishments)
@@ -3647,7 +3892,9 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
         return lines
 
-    def _save_markdown_report(self, markdown_content: str, timestamp: str, report_filename: str):
+    def _save_markdown_report(
+        self, markdown_content: str, timestamp: str, report_filename: str
+    ) -> bool:
         """Save markdown report to workspace using here-doc for safe handling."""
 
         try:
@@ -3675,27 +3922,30 @@ class ReportTool(BaseTool, UIEventEmitter):
                 # Check result using exit_code as primary indicator
                 if result.get("exit_code") == 0:
                     logger.info(f"✅ Markdown report saved to: {filepath}")
+                    return True
                 else:
                     # Fallback to old method if here-doc fails
                     logger.warning(f"⚠️ Here-doc failed, trying fallback method")
-                    self._save_markdown_report_fallback(markdown_content, filepath)
+                    return self._save_markdown_report_fallback(markdown_content, filepath)
             else:
                 logger.warning(
                     "⚠️ Docker orchestrator not available, skipping markdown file creation"
                 )
+                return False
 
         except Exception as e:
             logger.error(f"❌ Error saving markdown report: {e}")
             # Try fallback method on any exception
             if self.docker_orchestrator:
                 try:
-                    self._save_markdown_report_fallback(
+                    return self._save_markdown_report_fallback(
                         markdown_content, f"/workspace/{report_filename}"
                     )
                 except Exception as fallback_error:
                     logger.error(f"❌ Fallback method also failed: {fallback_error}")
+            return False
 
-    def _save_markdown_report_fallback(self, markdown_content: str, filepath: str):
+    def _save_markdown_report_fallback(self, markdown_content: str, filepath: str) -> bool:
         """
         Fallback method for saving markdown report using base64 encoding.
         This method is more reliable for content with special characters.
@@ -3712,11 +3962,14 @@ class ReportTool(BaseTool, UIEventEmitter):
 
             if result.get("exit_code") == 0:
                 logger.info(f"✅ Markdown report saved via fallback to: {filepath}")
+                return True
             else:
                 logger.error(f"❌ Fallback method failed: {result.get('output', 'Unknown error')}")
+                return False
 
         except Exception as e:
             logger.error(f"❌ Base64 fallback failed: {e}")
+            return False
 
     # ==================== NEW IMPROVED REPORT RENDERING METHODS ====================
 
@@ -3771,7 +4024,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             # same inputs as the agent's final status — never the raw
             # evidence status alone (round-5 iceberg: report PARTIAL while
             # the CLI announced success).
-            verdict = self._snapshot_kernel_verdict(snapshot).upper()
+            verdict = self._report_verdict(snapshot).upper()
             icon = {
                 "SUCCESS": "✅",
                 "PARTIAL": "⚠️",
@@ -3848,8 +4101,12 @@ class ReportTool(BaseTool, UIEventEmitter):
         lines.append(f"│ Build           │ {build_msg:<32} │")
 
         if static_count:
-            test_count_msg = f"📊 {static_count} test methods"
-            lines.append(f"│ Total Tests     │ {test_count_msg:<32} │")
+            test_count_msg = f"📊 {static_count} tests detected"
+            lines.append(f"│ Detected Tests  │ {test_count_msg:<32} │")
+
+        if executed:
+            unique_msg = f"🧪 {executed} snapshot-local unique"
+            lines.append(f"│ Unique Tests    │ {unique_msg:<32} │")
 
         if raw_executed and raw_executed > executed and expansion_factor:
             raw_msg = f"🔄 {raw_executed} raw runs (~{expansion_factor:.1f}x)"
@@ -3928,7 +4185,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
 
         lines.append(
-            f"| **Tests Executed** | {executed} | Runner XML count | {'✅' if pass_rate and pass_rate >= 95 else '⚠️' if pass_rate and pass_rate >= 80 else '❌' if pass_rate is not None else '📊'} |"
+            f"| **Unique Tests Executed** | {executed} | Snapshot-local unique count | {'✅' if pass_rate and pass_rate >= 95 else '⚠️' if pass_rate and pass_rate >= 80 else '❌' if pass_rate is not None else '📊'} |"
         )
 
         # Highlight method-level deduplication when parameterized/dynamic tests expand at runtime.

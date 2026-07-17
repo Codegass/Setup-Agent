@@ -32,7 +32,9 @@ def test_setup_logs_matches_latest_run_by_mtime_ignoring_dir_name_timezone(tmp_p
     # pick the most recent run regardless of the dir-name timezone.
     logs = tmp_path / "logs"
     _make_session_dir(logs, "session_20260101_000000_111", "commons-cli", "OLD run", 1_000_000)
-    newer = _make_session_dir(logs, "session_20260616_134219_222", "commons-cli", "NEW run", 2_000_000)
+    newer = _make_session_dir(
+        logs, "session_20260616_134219_222", "commons-cli", "NEW run", 2_000_000
+    )
 
     assert _matching_log_session_dir(logs, "commons-cli") == newer
     assert _setup_logs(logs, "commons-cli") == ["NEW run"]
@@ -370,6 +372,7 @@ def test_container_session_registry_falls_back_to_setup_artifacts_without_index_
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
             {
                 "context_id": "trunk_20260606_213241",
+                "legacy": True,
                 "created_at": "2026-06-06 21:32:41.079329",
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Setup and configure the commons-cli project to be runnable",
@@ -433,6 +436,7 @@ def test_container_session_registry_merges_web_sessions_with_setup_artifacts():
         "/workspace/.setup_agent/contexts/trunk_20260606_213241.json": json.dumps(
             {
                 "context_id": "trunk_20260606_213241",
+                "legacy": True,
                 "created_at": "2026-06-06 21:32:41.079329",
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Setup and configure the commons-cli project to be runnable",
@@ -462,6 +466,7 @@ def test_container_session_registry_parses_setup_report_breakdown_table():
                 "created_at": "2026-06-06 21:32:41.079329",
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Set up commons-cli",
+                "legacy": True,
                 "todo_list": [],
             }
         ),
@@ -494,6 +499,7 @@ def test_setup_artifact_build_state_reads_checkmark_marker():
                 "created_at": "2026-06-06 21:32:41.079329",
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Set up commons-cli",
+                "legacy": True,
                 "todo_list": [
                     {"id": "task_1", "description": "Compile", "status": "completed"},
                 ],
@@ -524,6 +530,7 @@ def test_setup_artifact_build_state_reads_failure_marker():
                 "created_at": "2026-06-06 21:32:41.079329",
                 "last_updated": "2026-06-06 21:35:09.305137",
                 "goal": "Set up commons-cli",
+                "legacy": True,
                 "todo_list": [
                     {"id": "task_1", "description": "Compile", "status": "failed"},
                 ],
@@ -590,9 +597,11 @@ def test_container_session_registry_returns_setup_artifact_detail():
         "meta",
         "status",
     ]
-    assert detail.build.state == "success"
-    assert detail.build.tool == "Maven"
-    assert detail.build.note == "115 classes, 0 JARs"
+    assert detail.build.state == "unknown"
+    assert detail.canonical_verdict == "unknown"
+    assert detail.snapshot_status == "missing"
+    assert detail.build.tool == "—"
+    assert detail.build.note == ""
     assert detail.context is not None
     assert detail.context.trunk.progress == {"done": 1, "total": 1}
     assert detail.context.phases[0].id == "phase_provision"
@@ -625,7 +634,10 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
                 "build": {"state": "partial", "system": "maven", "tool": "Maven"},
                 "test": {
                     "state": "partial",
-                    "total": 1205, "passed": 1186, "failed": 7, "skipped": 12,
+                    "total": 1205,
+                    "passed": 1186,
+                    "failed": 7,
+                    "skipped": 12,
                 },
             }
         ),
@@ -633,7 +645,9 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
             {
                 "modules": [],
                 "module_summary": {
-                    "modulesTotal": 4, "modulesBuilt": 3, "modulesFailed": 1,
+                    "modulesTotal": 4,
+                    "modulesBuilt": 3,
+                    "modulesFailed": 1,
                     "singleModule": False,
                 },
             }
@@ -659,13 +673,14 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
     assert detail.model == "claude-sonnet-4.5"
     assert detail.steps == 6
     assert detail.step_budget == 40
-    # finding 6: the verdict is composed from the serialized (by_alias) model
-    # dicts; assert the real keys feed compose_verdict end-to-end.
+    # A new phase session without verdict.json keeps runtime metadata but does
+    # not reconstruct canonical test counts or verdict from report metrics.
     assert detail.verdict is not None
     assert detail.verdict.tone == "attention"
-    assert detail.verdict.headline == (
-        "Build passed on 3 of 4 modules. 7 of 1,205 tests failing — review before promoting"
-    )
+    assert detail.verdict.headline == "Build passed on 3 of 4 modules — review before promoting"
+    assert detail.canonical_verdict == "unknown"
+    assert detail.snapshot_status == "missing"
+    assert detail.test.total == 0
 
 
 def test_setup_artifact_detail_uses_trunk_report_phase_without_backfill():
@@ -843,13 +858,20 @@ def test_same_second_setup_sessions_resolve_to_their_own_workspace():
 
 
 def test_build_payload_surfaces_time_note_artifact():
-    payload = _build_payload_from_metrics({
-        "build": {
-            "state": "success", "system": "maven", "tool": "Maven 3.9.6",
-            "class_count": 115, "jar_count": 1,
-            "time": "47.2s", "note": "clean package", "artifact": "target/x.jar",
+    payload = _build_payload_from_metrics(
+        {
+            "build": {
+                "state": "success",
+                "system": "maven",
+                "tool": "Maven 3.9.6",
+                "class_count": 115,
+                "jar_count": 1,
+                "time": "47.2s",
+                "note": "clean package",
+                "artifact": "target/x.jar",
+            }
         }
-    })
+    )
     assert payload is not None
     assert payload["time"] == "47.2s"
     assert payload["note"] == "clean package"

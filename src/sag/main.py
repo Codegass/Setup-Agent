@@ -20,6 +20,12 @@ from sag.agent.agent import SetupAgent
 from sag.agent.context_journal import JOURNAL_DIR
 from sag.agent.history_state import HistoryActionState, decode_history_action_state
 from sag.agent.phase_machine import PHASE_NAMES
+from sag.agent.verdict_finalizer import (
+    ReportDeliveryStatus,
+    RunTermination,
+    RunVerdictSnapshot,
+    read_verdict_snapshot,
+)
 from sag.config import (
     Config,
     LogLevel,
@@ -39,6 +45,30 @@ console = Console()
 # Note: You may see "Exception ignored while finalizing... ValueError: I/O operation on closed file"
 # at the end of execution. This is a harmless cleanup issue from urllib3/docker-py during
 # garbage collection and does not affect functionality. Python already handles it gracefully.
+
+
+def _render_setup_cli_result(
+    snapshot: RunVerdictSnapshot,
+    termination: RunTermination,
+    project_name: str,
+) -> tuple[str, int]:
+    """Render the setup result and translate only the sealed verdict to an exit code."""
+    tests = snapshot.test_stats
+    lines = [
+        f"Project: {project_name}",
+        f"Verdict: {snapshot.verdict.upper()}",
+        (
+            f"Tests: {tests.executed} unique "
+            f"({tests.passed} passed, {tests.failed} failed, "
+            f"{tests.errors} errors, {tests.skipped} skipped)"
+        ),
+    ]
+    if tests.raw.executed != tests.executed:
+        lines.append(f"Raw executions (diagnostic): {tests.raw.executed}")
+    lines.append(f"Report delivery: {termination.report_delivery_status.value}")
+    if termination.report_delivery_status is ReportDeliveryStatus.FAILED:
+        lines.append("WARNING: setup report delivery failed; sealed verdict is unchanged")
+    return "\n".join(lines), 0 if snapshot.verdict == "success" else 1
 
 
 def _start_agent_session_logging(config: Config) -> None:
@@ -377,7 +407,9 @@ def list():
     "--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs"
 )
 @click.option(
-    "--coverage", is_flag=True, help="Run an isolated JaCoCo coverage pass after setup (best-effort)"
+    "--coverage",
+    is_flag=True,
+    help="Run an isolated JaCoCo coverage pass after setup (best-effort)",
 )
 @click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.option(
@@ -454,12 +486,18 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
         agent = SetupAgent(config=config, orchestrator=orchestrator)
 
         # Run the setup - pass project_name (from URL) and docker_label for metadata
-        success = agent.setup_project(
+        termination = agent.setup_project(
             project_url=repo_url,
             project_name=project_name,
             goal=goal,
             docker_label=docker_label,
             project_ref=project_ref,
+        )
+        snapshot = read_verdict_snapshot(orchestrator)
+        cli_result, exit_code = _render_setup_cli_result(
+            snapshot,
+            termination,
+            project_name,
         )
 
         # Save artifacts if recording is enabled
@@ -471,7 +509,8 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
 
         # Only show completion messages in non-UI mode (UI manager handles this)
         if not config.ui_mode:
-            if success:
+            console.print(cli_result)
+            if snapshot.verdict == "success":
                 console.print(
                     f"[bold green]✅ Project '{project_name}' setup completed![/bold green]"
                 )
@@ -480,12 +519,14 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
                 console.print(f'  uv run sag run {docker_name} --task "add tests"')
                 console.print(f"  uv run sag shell {docker_name}")
             else:
-                console.print(f"[bold red]❌ Project setup failed![/bold red]")
+                console.print(
+                    f"[bold red]❌ Project setup verdict: {snapshot.verdict.upper()}[/bold red]"
+                )
                 console.print(f"[dim]Check logs for details. You can retry with:[/dim]")
                 console.print(f'  sag run {docker_name} --task "continue setup"')
 
-        if not success:
-            sys.exit(1)
+        if exit_code:
+            sys.exit(exit_code)
 
     except Exception as e:
         logger.error(f"Project setup failed: {e}")
@@ -502,7 +543,9 @@ def project(ctx, repo_url, name, goal, record, coverage, ui, project_ref):
     "--record", is_flag=True, help="Save setup artifacts (contexts, reports) to local session logs"
 )
 @click.option(
-    "--coverage", is_flag=True, help="Run an isolated JaCoCo coverage pass after setup (best-effort)"
+    "--coverage",
+    is_flag=True,
+    help="Run an isolated JaCoCo coverage pass after setup (best-effort)",
 )
 @click.option("--ui", is_flag=True, help="Enable enhanced UI mode with live progress display")
 @click.pass_context
