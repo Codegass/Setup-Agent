@@ -11,7 +11,7 @@ from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.output_storage import OutputStorageManager
 from sag.agent.phase_machine import PhaseMachine
 from sag.agent.react_engine import ReActEngine
-from sag.agent.react_types import StepType
+from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import (
     RecoveryDecision,
     ToolCall,
@@ -559,6 +559,136 @@ def test_report_failure_changes_delivery_only_and_cannot_mutate_sealed_evidence(
     assert termination.report_delivery_status is ReportDeliveryStatus.FAILED
     assert before.model_dump_json() == after.model_dump_json()
     assert len(engine.run_evidence_state.tool_observations) == observations_before_report
+
+
+class _PersistenceFailingReportTool(BaseTool):
+    def __init__(self):
+        self.renderer_calls = 0
+        super().__init__("report", "render the final report")
+
+    def execute(self, action: str) -> ToolResult:
+        self.renderer_calls += 1
+        return ToolResult.completed_failure(
+            output="report renderer failed",
+            error="report renderer failed",
+            error_code="REPORT_RENDER_FAILED",
+        )
+
+
+class _ReportCompletionTool(BaseTool):
+    def __init__(self):
+        self.calls = 0
+        super().__init__("phase", "complete the report phase")
+
+    def execute(self, action: str) -> ToolResult:
+        self.calls += 1
+        return ToolResult.completed_success(
+            output="report phase closed",
+            metadata={
+                "phase_signal": "done",
+                "key_results": "report delivery failed",
+                "evidence": [],
+            },
+        )
+
+
+def test_report_construction_persistence_failure_completes_without_mutating_verdict(
+    tmp_path, monkeypatch
+):
+    engine, verdict_orchestrator = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    _green_tests(engine)
+    engine._handle_phase_signals([_phase_step(key_results="tests green")])
+    snapshot_before = read_verdict_snapshot(verdict_orchestrator)
+    snapshot_bytes_before = verdict_orchestrator.files[VERDICT_PATH]
+    evidence_state_before = engine.run_evidence_state.model_dump_json()
+    observations_before = tuple(engine.run_evidence_state.tool_observations)
+
+    persistence_attempts = {"primary": 0, "emergency": 0}
+
+    def fail_primary(**kwargs):
+        persistence_attempts["primary"] += 1
+        return ""
+
+    def fail_emergency(**kwargs):
+        persistence_attempts["emergency"] += 1
+        return ""
+
+    monkeypatch.setattr(engine.output_storage, "store_output", fail_primary)
+    monkeypatch.setattr(engine.output_storage, "store_emergency_output", fail_emergency)
+
+    report_tool = _PersistenceFailingReportTool()
+    phase_tool = _ReportCompletionTool()
+    tool_orchestrator = ToolOrchestrator(
+        tools={"report": report_tool, "phase": phase_tool},
+        context_manager=engine.context_manager,
+        recent_tool_executions=engine.recent_tool_executions,
+        successful_states={},
+        repository_url="https://example.test/repo.git",
+        track_tool_execution=lambda *args, **kwargs: None,
+        update_successful_states=lambda *args, **kwargs: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "2026-07-17T00:00:00Z",
+        output_storage=engine.output_storage,
+    )
+    report_step = ReActStep(
+        step_type=StepType.ACTION,
+        content="render report",
+        tool_name="report",
+        tool_params={"action": "generate"},
+        timestamp="2026-07-17T00:00:00Z",
+        model_used="test-model",
+    )
+    close_step = ReActStep(
+        step_type=StepType.ACTION,
+        content="close report phase",
+        tool_name="phase",
+        tool_params={"action": "done"},
+        timestamp="2026-07-17T00:00:01Z",
+        model_used="test-model",
+    )
+    engine.max_iterations = 1
+    engine.config = SimpleNamespace(max_wall_clock_seconds=0, verbose=False)
+    engine.prompt_builder = _PromptBuilder()
+    engine.repository_url = "https://example.test/repo.git"
+    engine.repository_ref = None
+    engine.llm_client = _LLMClient(response="render and close report")
+    engine.state_evaluator = SimpleNamespace(completion_mode="previous")
+    engine.token_tracker = SimpleNamespace(
+        set_iteration=lambda iteration: None,
+        update_last_tool_name=lambda tool_name: None,
+    )
+    engine.response_parser = SimpleNamespace(
+        parse=lambda response, **kwargs: [report_step, close_step]
+    )
+    engine._get_tool_orchestrator = lambda: tool_orchestrator
+    engine._phase_intro_step = lambda: SimpleNamespace(content="report phase")
+    engine._enforce_phase_floors = lambda: False
+    engine._should_use_thinking_model = lambda: False
+    engine._export_token_usage_csv = lambda: None
+    engine._add_observation_step = lambda observation: None
+    engine.emit = lambda *args, **kwargs: None
+
+    termination = engine.run_setup_loop("deliver report", max_iterations=1)
+
+    assert report_tool.renderer_calls == 1
+    assert phase_tool.calls == 1
+    assert persistence_attempts == {"primary": 1, "emergency": 1}
+    assert engine._report_attempted is True
+    assert engine._report_failed is True
+    assert engine._report_delivered is False
+    assert termination.termination is RunTerminationStatus.COMPLETED
+    assert termination.report_delivery_status is ReportDeliveryStatus.FAILED
+    assert termination.snapshot_ref == VERDICT_PATH
+    assert engine.phase_machine.is_complete is True
+    assert engine.run_evidence_state.model_dump_json() == evidence_state_before
+    assert tuple(engine.run_evidence_state.tool_observations) == observations_before
+    assert verdict_orchestrator.files[VERDICT_PATH] == snapshot_bytes_before
+    snapshot_after = read_verdict_snapshot(verdict_orchestrator)
+    assert snapshot_after.model_dump_json() == snapshot_before.model_dump_json()
+    assert report_step.tool_result is not None
+    assert report_step.tool_result.operation_outcome is OperationOutcome.SKIPPED
+    assert report_step.tool_result.metadata["report_delivery_failure"] == "output_persistence"
 
 
 def test_successful_report_marks_delivery_without_changing_verdict(tmp_path):

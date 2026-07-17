@@ -638,6 +638,29 @@ class ReActEngine(UIEventEmitter):
             metadata={"report_refused": "evidence_not_closed"},
         )
 
+    @staticmethod
+    def _failed_report_persistence_execution(
+        call: ToolCall, exc: OutputPersistenceError
+    ) -> ToolExecution:
+        result = ToolResult.completed(
+            output="Report delivery failed because output persistence was unavailable.",
+            operation_outcome=OperationOutcome.SKIPPED,
+            metadata={
+                "report_delivery_failure": "output_persistence",
+                "persistence_error": type(exc).__name__,
+            },
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="failure",
+            raw_params=call.raw_params,
+            validated_params=call.validated_params,
+            observation_text=format_tool_result(call.name, result),
+            attempted_execution=True,
+            metadata={"report_delivery_failure": "output_persistence"},
+        )
+
     def _record_phase_audit(self, record) -> None:
         state = getattr(self, "run_evidence_state", None)
         if state is not None and not state.sealed:
@@ -1659,6 +1682,13 @@ class ReActEngine(UIEventEmitter):
         except OutputPersistenceError as exc:
             logger.error(f"Failed to construct durable result for {call.name}: {exc}")
             state = getattr(self, "run_evidence_state", None)
+            if (
+                call.name == "report"
+                and state is not None
+                and state.sealed
+                and self._report_execution_allowed()
+            ):
+                return self._failed_report_persistence_execution(call, exc)
             if (
                 state is not None
                 and not state.sealed
