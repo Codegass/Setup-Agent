@@ -8,7 +8,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, field_serializer
 
 from sag.evidence import EvidenceFinding, EvidenceStatus, OperationOutcome
 from sag.tools.base import ToolResult
@@ -127,38 +127,56 @@ class RunEvidenceState(BaseModel):
     _finalized_at: str | None = PrivateAttr(default=None)
     _canonical_values: set[tuple[StateScope, str, str]] = PrivateAttr(default_factory=set)
 
+    @computed_field
     @property
     def state_epochs(self) -> Mapping[StateScope, int]:
         return MappingProxyType(dict(self._state_epochs))
 
+    @field_serializer("state_epochs")
+    def _serialize_state_epochs(self, epochs: Mapping[StateScope, int]) -> dict[str, int]:
+        return {scope.value: epochs[scope] for scope in StateScope}
+
+    @computed_field
     @property
     def facts(self) -> tuple[EvidenceFact, ...]:
         return tuple(_snapshot(fact) for fact in self._facts)
 
+    @computed_field
     @property
     def blockers(self) -> tuple[BlockerRecord, ...]:
         return tuple(_snapshot(blocker) for blocker in self._blockers)
 
+    @computed_field
     @property
     def blocker_events(self) -> tuple[BlockerRecord, ...]:
         return tuple(_snapshot(event) for event in self._blocker_events)
 
+    @computed_field
     @property
     def action_attempts(self) -> tuple[ActionAttempt, ...]:
         return tuple(_snapshot(attempt) for attempt in self._action_attempts)
 
+    @computed_field
     @property
     def tool_observations(self) -> tuple[ToolObservation, ...]:
         return tuple(_snapshot(observation) for observation in self._tool_observations)
 
+    @computed_field
     @property
     def validator_findings(self) -> tuple[EvidenceFinding, ...]:
         return tuple(_snapshot(finding) for finding in self._validator_findings)
 
+    @computed_field
     @property
     def conflicts(self) -> tuple[str, ...]:
         return tuple(self._conflicts)
 
+    @computed_field
+    @property
+    def sealed(self) -> bool:
+        return self._finalized_at is not None
+
+    @computed_field
     @property
     def finalized_at(self) -> str | None:
         return self._finalized_at

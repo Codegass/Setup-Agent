@@ -1,8 +1,131 @@
+import json
+
 import pytest
 
 from sag.agent.evidence_state import FactStatus, RunEvidenceState, StateScope
 from sag.evidence import EvidenceFinding, EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
+
+
+def _populated_sealed_state() -> RunEvidenceState:
+    state = RunEvidenceState(run_id="r-serialization")
+    state.register_fact(
+        StateScope.ENVIRONMENT,
+        "java.versions",
+        {"installed": ["17"]},
+        "output_environment",
+    )
+    state.register_claim(
+        StateScope.ARTIFACTS,
+        "wheel.path",
+        "dist/project.whl",
+        "model_step_1",
+    )
+    blocker = state.record_blocker(
+        category="build",
+        error_code="MISSING_JDK",
+        failure_signature="java:missing-jdk",
+        evidence_refs=["output_environment"],
+    )
+    state.resolve_blocker(blocker.blocker_id, resolution="installed JDK 17")
+    state.record_attempt(
+        action="mvn test",
+        relevant_scopes=[StateScope.ENVIRONMENT, StateScope.TEST_RUNTIME],
+        evidence_refs=["output_attempt"],
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "maven",
+        ToolResult.completed_failure(
+            output="[ERROR] test failure",
+            error="maven tests failed",
+            error_code="MAVEN_TEST_FAILED",
+            failure_signature="maven:test:failed",
+            error_tail_preview="[ERROR] test failure",
+            facts={"tests": {"failed": 1}},
+            conflicts=["test-report-conflict"],
+            validator_findings=[
+                EvidenceFinding(
+                    type="test_report",
+                    reason="one test failed",
+                    refs=["surefire-report"],
+                    details={"failed": 1},
+                )
+            ],
+        ),
+        provenance="output_maven",
+    )
+    state.seal(finalized_at="2026-07-17T12:00:00Z")
+    return state
+
+
+def test_model_dump_contains_complete_deterministic_evidence_snapshot():
+    state = _populated_sealed_state()
+
+    dumped = state.model_dump()
+
+    assert list(dumped) == [
+        "run_id",
+        "state_epochs",
+        "facts",
+        "blockers",
+        "blocker_events",
+        "action_attempts",
+        "tool_observations",
+        "validator_findings",
+        "conflicts",
+        "sealed",
+        "finalized_at",
+    ]
+    assert dumped["run_id"] == "r-serialization"
+    assert dumped["state_epochs"] == {
+        "environment": 1,
+        "dependencies": 0,
+        "artifacts": 0,
+        "test_runtime": 1,
+        "project_analysis": 0,
+    }
+    assert [fact["provenance"] for fact in dumped["facts"]] == [
+        "output_environment",
+        "model_step_1",
+        "output_maven",
+    ]
+    assert dumped["blockers"][0]["resolution"] == "installed JDK 17"
+    assert [event["event"] for event in dumped["blocker_events"]] == [
+        "recorded",
+        "resolved",
+    ]
+    assert dumped["action_attempts"][0]["evidence_refs"] == ["output_attempt"]
+    observation = dumped["tool_observations"][0]
+    assert observation["provenance"] == "output_maven"
+    assert observation["result"]["error_code"] == "MAVEN_TEST_FAILED"
+    assert observation["result"]["failure_signature"] == "maven:test:failed"
+    assert observation["result"]["error_tail_preview"] == "[ERROR] test failure"
+    assert observation["result"]["output_ref"].startswith("output_")
+    assert dumped["validator_findings"][0]["details"] == {"failed": 1}
+    assert dumped["conflicts"] == ("test-report-conflict",)
+    assert dumped["sealed"] is True
+    assert dumped["finalized_at"] == "2026-07-17T12:00:00Z"
+
+
+def test_model_dump_json_preserves_full_state_without_mutable_aliasing():
+    state = _populated_sealed_state()
+
+    dumped = state.model_dump()
+    dumped_json = state.model_dump_json()
+
+    assert dumped_json == state.model_dump_json()
+    assert json.loads(dumped_json) == state.model_dump(mode="json")
+    dumped["facts"][0]["value"]["installed"].append("21")
+    dumped["blockers"][0]["status"] = "tampered"
+    dumped["tool_observations"][0]["result"]["facts"]["tests"]["failed"] = 0
+    dumped["validator_findings"][0]["details"]["failed"] = 0
+
+    fresh = state.model_dump()
+    assert fresh["facts"][0]["value"] == {"installed": ["17"]}
+    assert fresh["blockers"][0]["status"] == "resolved"
+    assert fresh["tool_observations"][0]["result"]["facts"] == {"tests": {"failed": 1}}
+    assert fresh["validator_findings"][0]["details"] == {"failed": 1}
 
 
 def test_duplicate_fact_does_not_advance_epoch():
