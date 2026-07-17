@@ -2,6 +2,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from test_python_tool import MANIFEST as PYTHON_MANIFEST
+from test_python_tool import Orch as PythonOrchestrator
+from test_python_tool import ok as command_ok
 from test_verdict_finalizer import VERDICT_PATH, FakeVerdictOrchestrator
 
 import sag.agent.agent as agent_module
@@ -27,6 +30,8 @@ from sag.agent.verdict_finalizer import (
 )
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome, TestStats
 from sag.tools.base import BaseTool, ToolError, ToolResult, bind_tool_result_output_storage
+from sag.tools.build.build_tool import BuildTool
+from sag.tools.internal.python_tool import PythonTool
 
 
 class _FailFirstAtomicWriteOrchestrator(FakeVerdictOrchestrator):
@@ -177,6 +182,191 @@ def test_execute_steps_calls_the_single_ingestion_boundary_once(tmp_path):
     assert step.tool_result.output_ref.startswith("output_")
 
 
+def test_recovery_ingests_original_and_replacement_under_their_actual_scopes(tmp_path, monkeypatch):
+    class RecoveringBuildTool(BaseTool):
+        def __init__(self):
+            super().__init__("build", "test recovery evidence")
+            self.actions = []
+
+        def execute(self, action: str) -> ToolResult:
+            self.actions.append(action)
+            if action == "test":
+                return ToolResult.completed_failure(
+                    output="one test failed",
+                    error="one test failed",
+                    error_code="TEST_FAILED",
+                    test_stats=TestStats(
+                        discovered=1,
+                        executed=1,
+                        passed=0,
+                        failed=1,
+                        skipped=0,
+                    ),
+                )
+            return ToolResult.completed_success(
+                output="compile recovered",
+                facts={"build_success": True},
+            )
+
+    engine, _ = _engine(tmp_path, phase="test")
+    tool = RecoveringBuildTool()
+    orchestrator = ToolOrchestrator(
+        tools={"build": tool},
+        context_manager=engine.context_manager,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=engine.output_storage,
+    )
+
+    def recover(tool_name, params, failed_result):
+        replacement = tool.safe_execute(action="compile")
+        return RecoveryDecision(
+            should_recover=True,
+            strategy="compile_after_test_failure",
+            replacement_result=replacement,
+            replacement_params={"action": "compile"},
+        )
+
+    monkeypatch.setattr(orchestrator.recovery_handler, "recover", recover)
+    engine._get_tool_orchestrator = lambda: orchestrator
+    _prepare_action_execution(engine)
+    step = _action_step("build", {"action": "test"})
+
+    engine._execute_steps([step])
+
+    assert tool.actions == ["test", "compile"]
+    assert step.tool_result.succeeded is True
+    observations = engine.run_evidence_state.tool_observations
+    assert [observation.scope for observation in observations] == [
+        StateScope.TEST_RUNTIME,
+        StateScope.ARTIFACTS,
+    ]
+    assert observations[0].result.test_stats.failed == 1
+    assert observations[1].result.facts["build_success"] is True
+    snapshot = engine.verdict_finalizer.finalize(
+        engine.run_evidence_state,
+        EvidenceCloseReason.ABORTED,
+    )
+    assert snapshot.test_stats.failed == 1
+    assert snapshot.verdict == "failed"
+
+
+def test_guidance_only_recovery_does_not_fabricate_an_execution(tmp_path, monkeypatch):
+    class FailingBuildTool(BaseTool):
+        def __init__(self):
+            super().__init__("build", "guidance-only recovery evidence")
+
+        def execute(self, action: str) -> ToolResult:
+            return ToolResult.completed_failure(
+                output="compile actually failed",
+                error="compile actually failed",
+                error_code="ORIGINAL_COMPILE_FAILED",
+            )
+
+    engine, _ = _engine(tmp_path, phase="build")
+    tool = FailingBuildTool()
+    orchestrator = ToolOrchestrator(
+        tools={"build": tool},
+        context_manager=engine.context_manager,
+        recent_tool_executions=[],
+        successful_states={},
+        repository_url=None,
+        track_tool_execution=lambda *args: None,
+        update_successful_states=lambda *args: None,
+        add_system_guidance=lambda *args, **kwargs: None,
+        get_timestamp=lambda: "ts",
+        output_storage=engine.output_storage,
+    )
+
+    def recover(tool_name, params, failed_result):
+        guidance = ToolResult.completed_failure(
+            output="try a different compiler next",
+            error="recovery guidance only",
+            error_code="GUIDANCE_ONLY",
+        )
+        return RecoveryDecision(
+            should_recover=True,
+            strategy="compile_guidance",
+            replacement_result=guidance,
+            replacement_params={"action": "compile"},
+            metadata={"guidance_only": True},
+        )
+
+    monkeypatch.setattr(orchestrator.recovery_handler, "recover", recover)
+    engine._get_tool_orchestrator = lambda: orchestrator
+    _prepare_action_execution(engine)
+    step = _action_step("build", {"action": "compile"})
+
+    engine._execute_steps([step])
+
+    assert step.tool_result.error_code == "GUIDANCE_ONLY"
+    observations = engine.run_evidence_state.tool_observations
+    assert len(observations) == 1
+    assert observations[0].result.error_code == "ORIGINAL_COMPILE_FAILED"
+
+
+def test_python_pytest_junit_stats_flow_through_build_to_sealed_verdict(tmp_path):
+    class BuildPythonOrchestrator(PythonOrchestrator):
+        def execute_command(self, cmd, workdir=None, timeout=None):
+            return super().execute_command(cmd, workdir=workdir)
+
+    junit = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="pytest tests" tests="5" failures="0" errors="0" skipped="0">
+  <testsuite name="pytest" tests="5" failures="0" errors="0" skipped="0">
+    <testcase classname="tests.test_app" name="test_one" />
+    <testcase classname="tests.test_app" name="test_two" />
+    <testcase classname="tests.test_app" name="test_three" />
+    <testcase classname="tests.test_app" name="test_four" />
+    <testcase classname="tests.test_app" name="test_five" />
+  </testsuite>
+</testsuites>"""
+    python_orchestrator = BuildPythonOrchestrator(
+        manifest=dict(PYTHON_MANIFEST),
+        rules=[
+            ("pyproject.toml", command_ok("exists")),
+            ("--collect-only", command_ok("5 tests collected in 0.02s")),
+            ("cat /workspace/.setup_agent/pytest-reports/pytest-", command_ok(junit)),
+        ],
+    )
+    build = BuildTool(
+        python_orchestrator,
+        python_tool=PythonTool(python_orchestrator),
+    )
+
+    result = build.execute("test", working_directory="/workspace/proj")
+    engine, _ = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    engine._record_tool_execution("build", {"action": "test"}, result)
+    snapshot = engine.verdict_finalizer.finalize(
+        engine.run_evidence_state,
+        EvidenceCloseReason.TEST_TERMINATED,
+    )
+
+    assert result.test_stats == TestStats(
+        discovered=5,
+        executed=5,
+        passed=5,
+        failed=0,
+        skipped=0,
+    )
+    assert len(result.evidence_refs) == 1
+    assert result.evidence_refs[0].startswith("/workspace/.setup_agent/pytest-reports/pytest-")
+    assert snapshot.test_stats.discovered == 5
+    assert snapshot.test_stats.executed == 5
+    assert snapshot.test_stats.passed == 5
+    assert snapshot.test_stats.failed == 0
+    assert snapshot.test_stats.errors == 0
+    assert snapshot.test_stats.skipped == 0
+    assert result.metadata["failed_tests"] == 0
+    assert result.metadata["error_tests"] == 0
+    assert snapshot.verdict == "success"
+
+
 def test_non_execution_is_audited_without_polluting_build_evidence(tmp_path):
     engine, _ = _engine(tmp_path, phase="build")
     _green_build(engine)
@@ -236,7 +426,9 @@ def test_failed_result_primary_repersistence_failure_uses_emergency_ref(tmp_path
     assert observation.provenance == recorded.output_ref
 
 
-def test_total_output_persistence_failure_records_attempt_and_stops_admission(tmp_path):
+def test_total_output_persistence_failure_keeps_actual_failure_with_fallback_provenance(
+    tmp_path,
+):
     class FailedStorage:
         def store_output(self, **kwargs):
             return ""
@@ -275,8 +467,13 @@ def test_total_output_persistence_failure_records_attempt_and_stops_admission(tm
     assert failed_attempt.action == "build:compile"
     assert failed_attempt.outcome is OperationOutcome.FAILED
     assert failed_attempt.evidence_refs == []
-    assert len(engine.run_evidence_state.tool_observations) == 2
-    assert snapshot.verdict == "partial"
+    assert len(engine.run_evidence_state.tool_observations) == 3
+    failed_observation = engine.run_evidence_state.tool_observations[-1]
+    assert failed_observation.scope is StateScope.ARTIFACTS
+    assert failed_observation.result.operation_outcome is OperationOutcome.FAILED
+    assert failed_observation.provenance == ("tool:build:compile:output-persistence-failed")
+    assert snapshot.build_evidence.outcome is OperationOutcome.FAILED
+    assert snapshot.verdict == "failed"
     assert "output_storage_failed" in snapshot.conflicts
 
 
@@ -492,6 +689,48 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
     assert engine._report_delivered is True
 
 
+def test_sealed_run_refuses_evidence_tool_before_execution(tmp_path):
+    engine, orchestrator = _engine(tmp_path, phase="test")
+    _green_build(engine)
+    _green_tests(engine)
+    engine.verdict_finalizer.finalize(
+        engine.run_evidence_state,
+        EvidenceCloseReason.TEST_TERMINATED,
+    )
+    snapshot_before = orchestrator.files[VERDICT_PATH]
+    observations_before = tuple(engine.run_evidence_state.tool_observations)
+    calls = []
+
+    def execute(call):
+        calls.append(call)
+        result = ToolResult.completed_failure(
+            output="post-close pytest failed",
+            error="one test failed",
+            error_code="PYTEST_FAILED",
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="failure",
+            raw_params=call.raw_params,
+            validated_params=call.raw_params,
+            observation_text=result.output,
+            attempted_execution=True,
+        )
+
+    engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=execute)
+    _prepare_action_execution(engine)
+    step = _action_step("build", {"action": "test"})
+
+    engine._execute_steps([step])
+
+    assert calls == []
+    assert step.tool_result.operation_outcome is OperationOutcome.SKIPPED
+    assert step.tool_result.metadata["execution_refused"] == "evidence_closed"
+    assert tuple(engine.run_evidence_state.tool_observations) == observations_before
+    assert orchestrator.files[VERDICT_PATH] == snapshot_before
+
+
 def test_abort_mid_build_seals_available_evidence_once(tmp_path):
     engine, orchestrator = _engine(tmp_path, phase="build")
     _green_build(engine)
@@ -503,9 +742,27 @@ def test_abort_mid_build_seals_available_evidence_once(tmp_path):
     assert first.termination is RunTerminationStatus.ABORTED
     assert first.snapshot_ref.endswith("verdict.json")
     assert first.model_dump_json() == second.model_dump_json()
-    assert orchestrator.commands == commands_after_first
+    assert orchestrator.commands[len(commands_after_first) :] == [
+        f"test -f {VERDICT_PATH} && cat {VERDICT_PATH}"
+    ]
     assert read_verdict_snapshot(orchestrator).verdict in {"unknown", "partial", "failed"}
     assert len(engine.run_evidence_state.phase_records) == 3
+
+
+def test_conflicting_close_termination_is_rejected_after_seal(tmp_path):
+    engine, orchestrator = _engine(tmp_path, phase="build")
+    _green_build(engine)
+    first = engine.abort(reason="operator aborted")
+    snapshot_bytes = orchestrator.files[VERDICT_PATH]
+
+    same_reason = engine._close_flow(RunTerminationStatus.ABORTED)
+    with pytest.raises(ValueError, match="conflicting evidence-close reason"):
+        engine.cancel(reason="operator then requested cancellation")
+
+    assert first.termination is RunTerminationStatus.ABORTED
+    assert same_reason.model_dump_json() == first.model_dump_json()
+    assert engine.run_evidence_state.close_reason == EvidenceCloseReason.ABORTED.value
+    assert orchestrator.files[VERDICT_PATH] == snapshot_bytes
 
 
 def test_flow_close_retries_persistence_for_an_already_sealed_state(tmp_path):

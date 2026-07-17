@@ -454,6 +454,8 @@ class VerdictFinalizer:
 
         cache_key = id(state)
         if cache_key in self._snapshots:
+            if not self.has_current_snapshot(state):
+                raise RuntimeError("cached verdict snapshot is not current on disk")
             return self._snapshots[cache_key]
 
         if not state.sealed:

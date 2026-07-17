@@ -33,6 +33,7 @@ from .react_response_parser import ReActResponseParser
 from .react_types import ReactModelMode, ReActStep, StepType
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
+    ActualToolExecution,
     ToolCall,
     ToolExecution,
     ToolExecutionRecord,
@@ -591,6 +592,12 @@ class ReActEngine(UIEventEmitter):
                     ]
                 ),
             )
+            state.ingest_tool_result(
+                scope,
+                tool_name,
+                result,
+                provenance=f"tool:{tool_name}:{action}:output-persistence-failed",
+            )
             state.record_conflict("output_storage_failed")
             raise
         state.record_attempt(
@@ -619,6 +626,30 @@ class ReActEngine(UIEventEmitter):
             and state.sealed
             and finalizer is not None
             and finalizer.has_current_snapshot(state)
+        )
+
+    def _evidence_execution_closed(self, call: ToolCall) -> bool:
+        state = getattr(self, "run_evidence_state", None)
+        return bool(
+            state is not None and state.sealed and call.name not in self._NON_EVIDENCE_TOOLS
+        )
+
+    @staticmethod
+    def _refused_closed_evidence_execution(call: ToolCall) -> ToolExecution:
+        result = ToolResult.completed(
+            output="Tool execution refused because setup evidence is already sealed.",
+            operation_outcome=OperationOutcome.SKIPPED,
+            metadata={"execution_refused": "evidence_closed"},
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="skipped",
+            raw_params=call.raw_params,
+            validated_params=call.validated_params,
+            observation_text=format_tool_result(call.name, result),
+            attempted_execution=False,
+            metadata={"execution_refused": "evidence_closed"},
         )
 
     @staticmethod
@@ -684,20 +715,26 @@ class ReActEngine(UIEventEmitter):
         state = getattr(self, "run_evidence_state", None)
         if state is None:
             raise RuntimeError("setup flow closure requires run evidence state")
+        sealed_reason = None
         if state.sealed:
             try:
-                reason = EvidenceCloseReason(state.close_reason)
+                sealed_reason = EvidenceCloseReason(state.close_reason)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("sealed setup evidence has no typed close reason") from exc
+
+        if termination is RunTerminationStatus.CANCELLED:
+            reason = EvidenceCloseReason.CANCELLED
+        elif termination is RunTerminationStatus.ABORTED:
+            reason = EvidenceCloseReason.ABORTED
         else:
             reason = (
-                EvidenceCloseReason.CANCELLED
-                if termination is RunTerminationStatus.CANCELLED
-                else (
-                    EvidenceCloseReason.DEPENDENTS_SKIPPED
-                    if termination is RunTerminationStatus.COMPLETED
-                    else EvidenceCloseReason.ABORTED
-                )
+                sealed_reason
+                if sealed_reason
+                in {
+                    EvidenceCloseReason.TEST_TERMINATED,
+                    EvidenceCloseReason.DEPENDENTS_SKIPPED,
+                }
+                else EvidenceCloseReason.DEPENDENTS_SKIPPED
             )
         # This is a cache hit after a successful evidence-close. If persistence
         # failed after sealing, the same reason safely retries the atomic write.
@@ -1779,16 +1816,35 @@ class ReActEngine(UIEventEmitter):
 
                 branch_task_id = getattr(self.context_manager, "current_task_id", None)
                 call = self._build_tool_call_from_step(step)
-                if call.name == "report" and not self._report_execution_allowed():
+                if self._evidence_execution_closed(call):
+                    execution = self._refused_closed_evidence_execution(call)
+                elif call.name == "report" and not self._report_execution_allowed():
                     execution = self._refused_report_execution(call)
                 else:
                     execution = self._execute_tool_call(call)
-                result = self._record_tool_execution(
-                    call.name,
-                    call.validated_params or call.raw_params,
-                    execution.result,
-                    attempted_execution=execution.attempted_execution,
-                )
+                if execution.actual_executions:
+                    result = execution.result
+                    recorded_executions = []
+                    for actual in execution.actual_executions:
+                        recorded = self._record_tool_execution(
+                            call.name,
+                            actual.params,
+                            actual.result,
+                            attempted_execution=True,
+                        )
+                        recorded_executions.append(
+                            ActualToolExecution(params=actual.params, result=recorded)
+                        )
+                        if actual.result is execution.result:
+                            result = recorded
+                    execution.actual_executions = recorded_executions
+                else:
+                    result = self._record_tool_execution(
+                        call.name,
+                        call.validated_params or call.raw_params,
+                        execution.result,
+                        attempted_execution=execution.attempted_execution,
+                    )
                 if result is not execution.result:
                     execution.result = result
                     execution.observation_text = format_tool_result(call.name, result)

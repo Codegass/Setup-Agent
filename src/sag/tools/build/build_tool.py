@@ -140,13 +140,9 @@ class BuildTool(BaseTool):
                 and build_root
                 and (working_directory or "").rstrip("/").startswith(build_root + "/")
             )
-            pl_scoped = system == "maven" and bool(
-                re.search(r"(^|\s)-pl(\s|=)", args or "")
-            )
+            pl_scoped = system == "maven" and bool(re.search(r"(^|\s)-pl(\s|=)", args or ""))
             if scoped_deeper or pl_scoped:
-                narrowed = (
-                    working_directory if scoped_deeper else f"-pl selection ({args})"
-                )
+                narrowed = working_directory if scoped_deeper else f"-pl selection ({args})"
                 preamble_lines.append(
                     f"[scope] {narrowed} is narrower than the recommended "
                     f"reactor root ({build_root or 'root'}) — sibling deps may be "
@@ -237,6 +233,7 @@ class BuildTool(BaseTool):
             "test_stats": inner.test_stats,
             "evidence_refs": inner.evidence_refs,
             "raw_output": raw_output,
+            "raw_data": inner.raw_data,
         }
         for field_name in ("failure_signature", "error_tail_preview", "output_ref"):
             value = getattr(inner, field_name)

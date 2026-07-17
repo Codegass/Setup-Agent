@@ -123,12 +123,48 @@ def test_finalization_is_byte_identical_and_uses_atomic_rename():
     assert first.model_dump_json() == second.model_dump_json()
     assert orchestrator.files[VERDICT_PATH] == first.model_dump_json()
     assert VERDICT_TMP_PATH not in orchestrator.files
-    assert orchestrator.commands == commands_after_first
+    assert orchestrator.commands[len(commands_after_first) :] == [
+        f"test -f {VERDICT_PATH} && cat {VERDICT_PATH}"
+    ]
     temp_write_index = next(
         index for index, command in enumerate(orchestrator.commands) if VERDICT_TMP_PATH in command
     )
     rename_index = orchestrator.commands.index(f"mv {VERDICT_TMP_PATH} {VERDICT_PATH}")
     assert temp_write_index < rename_index
+
+
+@pytest.mark.parametrize("disk_state", ["missing", "corrupt", "other_run", "stale"])
+def test_cached_finalization_rejects_noncurrent_persisted_snapshot(disk_state):
+    orchestrator = FakeVerdictOrchestrator()
+    state = _tvm_state()
+    finalizer = VerdictFinalizer(orchestrator)
+    snapshot = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    persisted = json.loads(snapshot.model_dump_json())
+
+    if disk_state == "missing":
+        del orchestrator.files[VERDICT_PATH]
+    elif disk_state == "corrupt":
+        orchestrator.files[VERDICT_PATH] = "{not-json"
+    elif disk_state == "other_run":
+        persisted["run_id"] = "another-run"
+        orchestrator.files[VERDICT_PATH] = json.dumps(
+            persisted,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    else:
+        persisted["verdict"] = "unknown"
+        orchestrator.files[VERDICT_PATH] = json.dumps(
+            persisted,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    disk_bytes = orchestrator.files.get(VERDICT_PATH)
+
+    with pytest.raises(RuntimeError, match="cached verdict snapshot is not current"):
+        finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+
+    assert orchestrator.files.get(VERDICT_PATH) == disk_bytes
 
 
 def test_conflicting_reason_is_rejected_before_read_write_or_state_change():

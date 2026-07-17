@@ -85,6 +85,12 @@ class RecoveryDecision:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class ActualToolExecution:
+    params: Dict[str, Any]
+    result: ToolResult
+
+
 @dataclass(slots=True)
 class ToolExecution:
     call: ToolCall
@@ -98,6 +104,7 @@ class ToolExecution:
     recovery_applied: bool = False
     recovery_strategy: Optional[str] = None
     attempted_execution: bool = False
+    actual_executions: list[ActualToolExecution] = field(default_factory=list)
     parameter_fixes: list[ParameterFix] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -605,6 +612,7 @@ class ToolOrchestrator:
             )
             escaped_exception_result = result
 
+        actual_executions = [ActualToolExecution(params=dict(validated_params), result=result)]
         executed_params = validated_params
         recovery_applied = False
         recovery_strategy: Optional[str] = None
@@ -654,9 +662,16 @@ class ToolOrchestrator:
                 if decision.replacement_result is not None:
                     result = decision.replacement_result
                     executed_params = recovery_params
-                    if recovery_metadata.get("guidance_only"):
+                    guidance_only = bool(recovery_metadata.get("guidance_only"))
+                    if guidance_only:
                         status = "recovery_attempted"
                     else:
+                        actual_executions.append(
+                            ActualToolExecution(
+                                params=dict(recovery_params),
+                                result=result,
+                            )
+                        )
                         status = (
                             "recovered"
                             if result.operation_outcome is OperationOutcome.SUCCESS
@@ -703,6 +718,7 @@ class ToolOrchestrator:
             recovery_applied=recovery_applied,
             recovery_strategy=recovery_strategy,
             attempted_execution=True,
+            actual_executions=actual_executions,
             parameter_fixes=call.parameter_fixes,
             metadata=execution_metadata,
         )
@@ -1099,6 +1115,7 @@ class ToolOrchestrator:
             recovery_applied=True,
             recovery_strategy=recovery_strategy,
             attempted_execution=False,
+            actual_executions=[ActualToolExecution(params=dict(recovery_params), result=result)],
             parameter_fixes=call.parameter_fixes,
             metadata=metadata,
         )

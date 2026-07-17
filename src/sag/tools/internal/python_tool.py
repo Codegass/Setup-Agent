@@ -15,9 +15,12 @@ import json
 import re
 import shlex
 import time
+import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
+
+from sag.evidence import TestStats
 
 from ..base import BaseTool, ToolResult
 from .build_preflight import (
@@ -91,6 +94,42 @@ _PYTEST_USAGE_HINT = (
 )
 
 _OPERATIONS = ("setup_env", "test", "build", "compile")
+
+
+def _parse_pytest_junit(xml_text: str, discovered: Optional[int]) -> tuple[TestStats, dict]:
+    root = ET.fromstring(xml_text)
+    root_name = root.tag.rsplit("}", 1)[-1]
+    if root_name == "testsuite":
+        suites = [root]
+    elif root_name == "testsuites":
+        suites = (
+            [root]
+            if "tests" in root.attrib
+            else [child for child in root if child.tag.rsplit("}", 1)[-1] == "testsuite"]
+        )
+    else:
+        raise ValueError(f"unsupported JUnit root element: {root_name}")
+
+    def total(attribute: str) -> int:
+        return sum(int(suite.attrib.get(attribute, 0) or 0) for suite in suites)
+
+    executed = total("tests")
+    failures = total("failures")
+    errors = total("errors")
+    skipped = total("skipped")
+    stats = TestStats(
+        discovered=discovered,
+        executed=executed,
+        passed=max(executed - failures - errors - skipped, 0),
+        failed=failures + errors,
+        skipped=skipped,
+    )
+    return stats, {
+        "tests": executed,
+        "failed_tests": failures,
+        "error_tests": errors,
+        "skipped_tests": skipped,
+    }
 
 
 def _classify_pytest_result(
@@ -469,6 +508,20 @@ class PythonTool(BaseTool):
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
         success, error, error_code = _classify_pytest_result(exit_code, output)
+        report_result = self.orchestrator.execute_command(f"cat {shlex.quote(report)}")
+        test_stats = None
+        junit_counts: Dict[str, int] = {}
+        junit_parse_error = None
+        if report_result.get("success"):
+            try:
+                test_stats, junit_counts = _parse_pytest_junit(
+                    report_result.get("output") or "",
+                    collected,
+                )
+            except (ET.ParseError, TypeError, ValueError) as exc:
+                junit_parse_error = str(exc)
+        else:
+            junit_parse_error = "generated JUnit report could not be read"
         if self.command_tracker:
             try:
                 self.command_tracker.track_test_command(
@@ -488,14 +541,21 @@ class PythonTool(BaseTool):
             "report": report,
             "collected": collected,
             "collected_json": COLLECTED_JSON,
+            **junit_counts,
         }
+        if junit_parse_error:
+            metadata["junit_parse_error"] = junit_parse_error
+        raw_data = dict(junit_counts) if junit_counts else None
         tail = self._tail(output)
         if success:
             return self._finish(
                 ToolResult.completed_success(
                     output=tail,
                     raw_output=output,
+                    raw_data=raw_data,
                     metadata=metadata,
+                    test_stats=test_stats,
+                    evidence_refs=[report],
                 ),
                 preamble,
             )
@@ -505,7 +565,10 @@ class PythonTool(BaseTool):
                 raw_output=output,
                 error=error,
                 error_code=error_code,
+                raw_data=raw_data,
                 metadata=metadata,
+                test_stats=test_stats,
+                evidence_refs=[report],
             ),
             preamble,
         )
