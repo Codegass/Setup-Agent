@@ -12,14 +12,18 @@ from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
 from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
 from sag.reporting import render_condensed_summary
-from sag.tools.base import BaseTool, ToolResult
+from sag.tools.base import BaseTool, ToolResult, is_output_storage_ref
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
 from .evidence_state import RunEvidenceState, StateScope
-from .output_storage import OutputStorageManager, attach_durable_output_ref
+from .output_storage import (
+    OutputDurabilityError,
+    OutputStorageManager,
+    attach_durable_output_ref,
+)
 from .phase_machine import PHASE_NAMES, PhaseMachine
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
@@ -572,19 +576,22 @@ class ReActEngine(UIEventEmitter):
                 task_id=task_id,
                 tool_name=tool_name,
             )
-        except (OSError, RuntimeError, ValueError) as exc:
+        except OutputDurabilityError as exc:
             logger.error(f"Failed to persist full output for {tool_name}: {exc}")
-            durable = result.model_copy(
-                deep=True,
-                update={
-                    "output_ref": None,
-                    "conflicts": self._dedupe_strings([*result.conflicts, "output_storage_failed"]),
-                    "metadata": {
-                        **result.metadata,
-                        "output_storage_error": type(exc).__name__,
-                    },
-                },
+            state.record_attempt(
+                action=f"{tool_name}:{action}",
+                relevant_scopes=[scope],
+                outcome=result.operation_outcome,
+                evidence_refs=self._dedupe_strings(
+                    [
+                        ref
+                        for ref in [*result.evidence_refs, *result.refs]
+                        if not is_output_storage_ref(ref)
+                    ]
+                ),
             )
+            state.record_conflict("output_storage_failed")
+            raise
         state.record_attempt(
             action=f"{tool_name}:{action}",
             relevant_scopes=[scope],

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
+from sag.evidence import OperationOutcome
 from sag.tools.base import ToolResult
 from sag.utils.container_io import DEFAULT_MAX_CMD_CHARS
 
@@ -24,10 +25,11 @@ class FakeOutputStorageOrchestrator:
         if command.startswith("mkdir -p "):
             return {"success": True, "output": "", "exit_code": 0}
 
-        # `test -f <index> && cat <index>` — return current contents so a manager
-        # can (re)load the durable index that another instance wrote.
-        if command.startswith("test -f ") and "output_index.json" in command:
-            contents = self.files.get(INDEX_PATH)
+        # `test -f <path> && cat <path>` supports both the primary index and
+        # content-addressed emergency records.
+        if command.startswith("test -f ") and " && cat " in command:
+            path = command.split()[2]
+            contents = self.files.get(path)
             if contents:
                 return {"success": True, "output": contents, "exit_code": 0}
             return {"success": False, "output": "", "exit_code": 1}
@@ -57,6 +59,20 @@ class FakeOutputStorageOrchestrator:
                 self.files[path] = self.files.get(path, "") + payload + "\n"
             else:
                 self.files[path] = payload + "\n"
+            return {"success": True, "output": "", "exit_code": 0}
+
+        if command.startswith("truncate -s -1 "):
+            path = command.split()[-1]
+            if path not in self.files:
+                return {"success": False, "output": "missing", "exit_code": 1}
+            self.files[path] = self.files[path][:-1]
+            return {"success": True, "output": "", "exit_code": 0}
+
+        if command.startswith("mv "):
+            _, source, target = command.split()
+            if source not in self.files:
+                return {"success": False, "output": "missing", "exit_code": 1}
+            self.files[target] = self.files.pop(source)
             return {"success": True, "output": "", "exit_code": 0}
 
         # --- chunked (base64) write path ---
@@ -179,6 +195,52 @@ def test_index_write_failure_recovers_ref_from_durable_jsonl():
     reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
     assert reader.retrieve_output(ref_id) == "durable compile output"
     assert reader.has_output_ref(ref_id) is True
+
+
+def test_emergency_output_file_is_deterministic_and_survives_new_manager(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    payload = "failed compile output\nwith complete diagnostics"
+    metadata = {"operation_outcome": "failed", "error_code": "COMPILE_FAILED"}
+
+    first_ref = storage.store_emergency_output(
+        task_id="build",
+        tool_name="build",
+        output=payload,
+        metadata=metadata,
+    )
+    second_ref = storage.store_emergency_output(
+        task_id="build",
+        tool_name="build",
+        output=payload,
+        metadata=metadata,
+    )
+
+    assert first_ref == second_ref
+    assert first_ref.startswith("output_emergency_")
+    reader = OutputStorageManager(tmp_path)
+    assert reader.retrieve_output(first_ref) == payload
+    assert reader.has_output_ref(first_ref) is True
+
+
+def test_primary_jsonl_failure_gives_partial_result_retrievable_emergency_ref():
+    orchestrator = FakeOutputStorageOrchestrator()
+    orchestrator.failed_write_paths.add(STORAGE_PATH)
+    storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    partial = ToolResult.completed(
+        output="partial compile diagnostics",
+        operation_outcome=OperationOutcome.PARTIAL,
+    )
+
+    attached = attach_durable_output_ref(
+        partial,
+        storage,
+        task_id="build",
+        tool_name="build",
+    )
+
+    assert attached.output_ref.startswith("output_emergency_")
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    assert reader.retrieve_output(attached.output_ref) == partial.output
 
 
 def test_attach_rejects_syntactic_ref_that_cannot_be_retrieved():

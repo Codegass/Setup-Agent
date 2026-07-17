@@ -280,6 +280,160 @@ def test_executed_count_preserves_broader_suite_when_it_exceeds_discovered():
     assert snapshot.verdict == "failed"
 
 
+def test_pareto_incomparable_retry_keeps_broader_failed_execution_basis():
+    state = RunEvidenceState(run_id="session-pareto-incomparable")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="full suite failed",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=100,
+                executed=100,
+                passed=0,
+                failed=100,
+                skipped=0,
+            ),
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="narrow discovery retry passed",
+            test_stats=TestStats(
+                discovered=101,
+                executed=1,
+                passed=1,
+                failed=0,
+                skipped=0,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.discovered == 100
+    assert snapshot.test_stats.executed == 100
+    assert snapshot.test_stats.failed == 100
+    assert "test_stats_basis_incomparable" in snapshot.conflicts
+    assert snapshot.verdict == "failed"
+
+
+def test_dominant_complete_basis_supersedes_missing_discovered_without_conflict():
+    state = RunEvidenceState(run_id="session-complete-dominates-incomplete")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="incomplete basis failed",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=None,
+                executed=50,
+                passed=0,
+                failed=50,
+                skipped=0,
+            ),
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="complete dominant suite passed",
+            test_stats=TestStats(
+                discovered=100,
+                executed=100,
+                passed=100,
+                failed=0,
+                skipped=0,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.discovered == 100
+    assert snapshot.test_stats.executed == 100
+    assert snapshot.test_stats.passed == 100
+    assert "test_stats_basis_incomparable" not in snapshot.conflicts
+    assert snapshot.verdict == "success"
+
+
+def test_equal_complete_basis_uses_latest_typed_status():
+    state = RunEvidenceState(run_id="session-equal-basis-latest")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="build complete",
+            facts={"build_success": True},
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed(
+            output="first full suite failed",
+            operation_outcome=OperationOutcome.FAILED,
+            test_stats=TestStats(
+                discovered=100,
+                executed=100,
+                passed=0,
+                failed=100,
+                skipped=0,
+            ),
+        ),
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME,
+        "build",
+        ToolResult.completed_success(
+            output="latest equal suite passed",
+            test_stats=TestStats(
+                discovered=100,
+                executed=100,
+                passed=100,
+                failed=0,
+                skipped=0,
+            ),
+        ),
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.test_stats.discovered == 100
+    assert snapshot.test_stats.executed == 100
+    assert snapshot.test_stats.passed == 100
+    assert snapshot.test_stats.failed == 0
+    assert snapshot.conflicts == ()
+    assert snapshot.verdict == "success"
+
+
 def test_untyped_test_count_facts_do_not_manufacture_primary_stats():
     state = RunEvidenceState(run_id="session-untyped-counts")
     state.ingest_tool_result(

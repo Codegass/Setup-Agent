@@ -197,36 +197,81 @@ def test_non_execution_is_audited_without_polluting_build_evidence(tmp_path):
     assert snapshot.build_evidence.outcome is OperationOutcome.SUCCESS
 
 
-def test_output_append_failure_records_one_conflicted_execution(tmp_path):
+def test_failed_result_primary_repersistence_failure_uses_emergency_ref(tmp_path, monkeypatch):
+    engine, _ = _engine(tmp_path, phase="build")
+    origin_storage = OutputStorageManager(Path(tmp_path) / "origin")
+    raw_failure = "[ERROR] complete compiler diagnostics"
+    with bind_tool_result_output_storage(origin_storage, task_id="origin-build", tool_name="build"):
+        failed = ToolResult.completed_failure(
+            output="compile failed",
+            raw_output=raw_failure,
+            error="compile failed",
+            error_code="MAVEN_BUILD_FAILED",
+            failure_signature="MAVEN_BUILD_FAILED:canonical",
+            error_tail_preview=raw_failure,
+        )
+
+    assert engine.output_storage.retrieve_output(failed.output_ref) is None
+    monkeypatch.setattr(engine.output_storage, "store_output", lambda **kwargs: "")
+
+    recorded = engine._record_tool_execution("build", {"action": "compile"}, failed)
+
+    assert recorded.output_ref
+    assert recorded.output_ref != failed.output_ref
+    assert recorded.output_ref.startswith("output_emergency_")
+    assert recorded.invocation_status is InvocationStatus.COMPLETED
+    assert recorded.operation_outcome is OperationOutcome.FAILED
+    assert recorded.error_code == failed.error_code
+    assert recorded.failure_signature == failed.failure_signature
+    assert recorded.error_tail_preview == failed.error_tail_preview
+    reader = OutputStorageManager(engine.output_storage.storage_dir)
+    assert reader.retrieve_output(recorded.output_ref) == raw_failure
+    observation = engine.run_evidence_state.tool_observations[0]
+    assert observation.result.output_ref == recorded.output_ref
+    assert observation.provenance == recorded.output_ref
+
+
+def test_total_output_persistence_failure_records_attempt_and_stops_admission(tmp_path):
     class FailedStorage:
         def store_output(self, **kwargs):
+            return ""
+
+        def store_emergency_output(self, **kwargs):
             return ""
 
         def retrieve_output(self, ref_id):
             return None
 
     engine, _ = _engine(tmp_path, phase="build")
+    _green_build(engine)
+    _green_tests(engine)
+    origin_storage = OutputStorageManager(Path(tmp_path) / "origin")
+    with bind_tool_result_output_storage(origin_storage, task_id="origin-build", tool_name="build"):
+        failed = ToolResult.completed_failure(
+            output="compile failed",
+            error="compile failed",
+            error_code="MAVEN_BUILD_FAILED",
+        )
     engine.output_storage = FailedStorage()
 
-    recorded = engine._record_tool_execution(
-        "build",
-        {"action": "compile"},
-        ToolResult.completed_success(
-            output="compile complete",
-            facts={"build_success": True},
-        ),
-        attempted_execution=True,
-    )
+    with pytest.raises(RuntimeError, match="primary and emergency"):
+        engine._record_tool_execution(
+            "build",
+            {"action": "compile"},
+            failed,
+            attempted_execution=True,
+        )
     snapshot = engine.verdict_finalizer.finalize(
         engine.run_evidence_state, EvidenceCloseReason.ABORTED
     )
 
-    assert recorded.output_ref is None
-    assert "output_storage_failed" in recorded.conflicts
-    assert len(engine.run_evidence_state.action_attempts) == 1
-    assert engine.run_evidence_state.action_attempts[0].evidence_refs == []
-    assert len(engine.run_evidence_state.tool_observations) == 1
-    assert snapshot.verdict != "success"
+    assert len(engine.run_evidence_state.action_attempts) == 3
+    failed_attempt = engine.run_evidence_state.action_attempts[-1]
+    assert failed_attempt.action == "build:compile"
+    assert failed_attempt.outcome is OperationOutcome.FAILED
+    assert failed_attempt.evidence_refs == []
+    assert len(engine.run_evidence_state.tool_observations) == 2
+    assert snapshot.verdict == "partial"
     assert "output_storage_failed" in snapshot.conflicts
 
 

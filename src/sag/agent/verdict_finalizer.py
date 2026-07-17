@@ -255,20 +255,44 @@ def _fold_test_stats(state: RunEvidenceState) -> tuple[SnapshotTestStats, tuple[
     if not snapshots:
         return SnapshotTestStats(), ()
 
-    basis_kinds = {
-        "discovered" if stats.discovered is not None else "executed" for stats, _, _ in snapshots
-    }
-    primary_index = max(
-        range(len(snapshots)),
-        key=lambda index: (
-            max(
-                snapshots[index][0].discovered or 0,
-                snapshots[index][0].executed,
-            ),
-            index,
+    latest_by_basis: dict[tuple[int | None, int], tuple[int, tuple[TestStats, int, int]]] = {}
+    for index, snapshot in enumerate(snapshots):
+        stats, _, _ = snapshot
+        latest_by_basis[(stats.discovered, stats.executed)] = (index, snapshot)
+
+    candidates = tuple(sorted(latest_by_basis.values(), key=lambda item: item[0]))
+
+    def dominates(left: TestStats, right: TestStats) -> bool:
+        if left.discovered is None:
+            return right.discovered is None and left.executed > right.executed
+        if right.discovered is None:
+            return left.executed >= right.executed
+        return (
+            left.discovered >= right.discovered
+            and left.executed >= right.executed
+            and (left.discovered > right.discovered or left.executed > right.executed)
+        )
+
+    frontier = tuple(
+        candidate
+        for candidate in candidates
+        if not any(
+            dominates(other[1][0], candidate[1][0])
+            for other in candidates
+            if other is not candidate
+        )
+    )
+    _, primary = max(
+        frontier,
+        key=lambda item: (
+            item[1][0].executed,
+            item[1][1] + item[1][2],
+            item[1][2],
+            -item[1][0].passed,
+            item[0],
         ),
     )
-    unique, unique_failures, unique_errors = snapshots[primary_index]
+    unique, unique_failures, unique_errors = primary
     raw = SnapshotTestCounts(
         executed=sum(stats.executed for stats, _, _ in snapshots),
         passed=sum(stats.passed for stats, _, _ in snapshots),
@@ -276,7 +300,7 @@ def _fold_test_stats(state: RunEvidenceState) -> tuple[SnapshotTestStats, tuple[
         errors=sum(errors for _, _, errors in snapshots),
         skipped=sum(stats.skipped for stats, _, _ in snapshots),
     )
-    conflicts = ("test_stats_basis_incomparable",) if len(basis_kinds) > 1 else ()
+    conflicts = ("test_stats_basis_incomparable",) if len(frontier) > 1 else ()
     return (
         SnapshotTestStats(
             discovered=unique.discovered,

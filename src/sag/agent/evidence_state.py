@@ -322,6 +322,15 @@ class RunEvidenceState(BaseModel):
         self._action_attempts.append(attempt)
         return _snapshot(attempt)
 
+    def record_conflict(self, conflict: str) -> None:
+        """Record an engine-observed conflict without fabricating tool evidence."""
+        self._require_mutable()
+        normalized = str(conflict).strip()
+        if not normalized:
+            raise ValueError("conflict must be nonblank")
+        if normalized not in self._conflicts:
+            self._conflicts.append(normalized)
+
     def ingest_tool_result(
         self,
         scope: StateScope,
