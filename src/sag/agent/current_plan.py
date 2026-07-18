@@ -305,9 +305,11 @@ class CurrentPlan(BaseModel):
             )
 
         matches = list(_PLACEHOLDER.finditer(value))
-        if "{{" in value or "}}" in value:
-            # Every brace pair must match the strict reference grammar.  This
-            # catches misspellings, unclosed braces, and unsupported expressions.
+        if "{{" in value:
+            # Every placeholder opening must match the strict reference
+            # grammar. Literal strings may legitimately contain adjacent
+            # closing braces (for example canonical nested JSON), so ``}}``
+            # alone is not evidence of a malformed placeholder.
             if not matches or any(
                 _FULL_PLACEHOLDER.fullmatch(match.group(0)) is None for match in matches
             ):
@@ -317,7 +319,7 @@ class CurrentPlan(BaseModel):
                     step_index=step_index,
                 )
             residue = _PLACEHOLDER.sub("", value)
-            if "{{" in residue or "}}" in residue:
+            if "{{" in residue:
                 raise PlanFault(
                     PlanFaultCode.MALFORMED_PLACEHOLDER,
                     f"malformed placeholder in exact_params: {value!r}",

@@ -123,6 +123,32 @@ def test_placeholder_resolution_feeds_prior_output_ref_without_actor_reanalysis(
     assert "{{" not in resolved.model_dump_json()
 
 
+def test_literal_nested_json_string_is_not_treated_as_a_placeholder():
+    key_results = '{"build_system":"unknown","recommended":{"goal":"unknown"}}'
+    plan = CurrentPlan(
+        steps=(
+            PlanStep.model_validate(
+                _step(
+                    "phase",
+                    {
+                        "action": "done",
+                        "outcome": "unknown",
+                        "key_results": key_results,
+                    },
+                )
+            ),
+        )
+    )
+
+    resolved = plan.resolve_step(
+        0,
+        prior_results={},
+        available_tools={"phase"},
+    )
+
+    assert resolved.exact_params["key_results"] == key_results
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [
