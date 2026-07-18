@@ -3217,7 +3217,15 @@ class PhysicalValidator:
                         )
 
                     # Check for other analysis markers
-                    if env_summary.get("project_type") or env_summary.get("build_system"):
+                    if any(
+                        (
+                            env_summary.get("project_type"),
+                            env_summary.get("build_system"),
+                            env_summary.get("build_recommendation"),
+                            env_summary.get("project_brief_ref"),
+                            env_summary.get("project_brief_fingerprint"),
+                        )
+                    ):
                         result["analyzed"] = True  # At least partial analysis was done
 
                 except json.JSONDecodeError as e:

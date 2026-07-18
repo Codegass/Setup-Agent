@@ -111,6 +111,38 @@ def test_parameter_alias_default_and_state_injection_are_recorded():
     assert len(state_updates) == 1
 
 
+def test_normalized_action_envelope_is_emitted_before_tool_execution():
+    trace = []
+
+    class TracedBashTool(BashLikeTool):
+        def execute(self, command: str, timeout: int, working_directory: str = "") -> ToolResult:
+            trace.append(("tool", {"command": command, "timeout": timeout}))
+            return super().execute(command, timeout, working_directory)
+
+    def before_tool_execute(call, params):
+        trace.append(("envelope", call.name, dict(params)))
+        return "envelope-1"
+
+    orchestrator, _, _, _ = _orchestrator(
+        tools={"bash": TracedBashTool()},
+        before_tool_execute=before_tool_execute,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="bash", raw_params={"cmd": "echo hi"}))
+
+    assert trace[0] == (
+        "envelope",
+        "bash",
+        {
+            "command": "echo hi",
+            "timeout": 60,
+            "working_directory": "/workspace/project",
+        },
+    )
+    assert trace[1][0] == "tool"
+    assert execution.metadata["control_envelope_id"] == "envelope-1"
+
+
 def test_parameter_normalizer_owns_alias_default_and_state_injection():
     fixes = []
     normalizer = ToolParameterNormalizer(

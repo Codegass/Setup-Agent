@@ -514,6 +514,27 @@ def test_collected_json_fallback_feeds_static_test_count():
     assert result["static_test_count"] == 42
 
 
+def test_project_brief_marks_analysis_ready_before_python_test_collection():
+    orch = CollectedOrch(
+        collected=None,
+        trunk_env={
+            "build_recommendation": {
+                "build_system": "python",
+                "build_root": "/workspace/proj",
+                "goal": "deps",
+            },
+            "project_brief_ref": "/workspace/.setup_agent/project_brief.json",
+            "project_brief_fingerprint": "a" * 64,
+        },
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    result = validator.validate_project_analysis_status("proj")
+
+    assert result["analyzed"] is True
+    assert result["has_static_test_count"] is False
+
+
 def test_collect_only_denominator_wins_over_env_summary_on_python():
     """Bug #7 (click live probe): on python the pytest --collect-only count is
     ground truth and outranks the env-summary static heuristic (which the venv

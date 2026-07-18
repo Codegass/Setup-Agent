@@ -282,9 +282,12 @@ def test_all_surfaces_render_the_same_snapshot(tvm_snapshot, surface_harness):
     assert rendered.condensed.verdict == tvm_snapshot.verdict
     assert rendered.cli.verdict == tvm_snapshot.verdict
     assert rendered.web.verdict == tvm_snapshot.verdict
-    assert {rendered.markdown.tests, rendered.condensed.tests, rendered.web.tests} == {
-        tvm_snapshot.test_stats.executed
-    }
+    assert {
+        rendered.markdown.tests,
+        rendered.condensed.tests,
+        rendered.cli.tests,
+        rendered.web.tests,
+    } == {tvm_snapshot.test_stats.executed}
 
 
 def test_report_failure_does_not_mutate_setup_verdict(tvm_snapshot, surface_harness):

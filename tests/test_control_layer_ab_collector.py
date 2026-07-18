@@ -1,0 +1,439 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from sag.agent.control_events import action_envelope_sha256
+from scripts.collect_control_layer_ab import (
+    ABCollector,
+    CampaignStore,
+    CollectionError,
+    _validate_current_run_pin,
+    build_legacy_run_pin,
+    build_parser,
+)
+
+PIN = {
+    "target_repo_sha": "a" * 40,
+    "container_image_digest": "sha256:" + "b" * 64,
+    "sag_git_sha": "c" * 40,
+    "thinking_model": "thinking-model",
+    "action_model": "action-model",
+    "sanitized_config": {"max_iterations": 80},
+    "prompt_bundle_sha256": "d" * 64,
+    "feature_flags": {"control_scheduler": True},
+    "random_seed_or_null": 17,
+    "dependency_cache_state": "warm",
+    "host_arch": "arm64",
+}
+
+
+def _session(tmp_path: Path, *, excluding: str | None = None) -> Path:
+    session = tmp_path / "session_one"
+    setup = session / ".setup_agent"
+    setup.mkdir(parents=True)
+    pin = {key: value for key, value in PIN.items() if key != excluding}
+    (setup / "run-pin.json").write_text(json.dumps(pin), encoding="utf-8")
+    (setup / "verdict.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "run_id": "run-1",
+                "finalized_at": "2026-07-17T12:00:00Z",
+                "verdict": "success",
+                "build_evidence": {
+                    "observed": True,
+                    "green": True,
+                    "outcome": "success",
+                    "evidence_status": "verified",
+                    "refs": [],
+                },
+                "test_stats": {
+                    "discovered": 541,
+                    "unique": {
+                        "executed": 541,
+                        "passed": 541,
+                        "failed": 0,
+                        "errors": 0,
+                        "skipped": 0,
+                    },
+                    "raw": {
+                        "executed": 544,
+                        "passed": 541,
+                        "failed": 3,
+                        "errors": 0,
+                        "skipped": 0,
+                    },
+                    "flaky_count": 3,
+                    "judgment": "success",
+                },
+                "conflicts": [],
+                "phase_records": [],
+                "input_refs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (setup / "control_events.jsonl").write_text(
+        '{"sequence":1,"kind":"evidence_close","payload":{"reason":"test_terminated"}}\n',
+        encoding="utf-8",
+    )
+    (session / "token_usage.csv").write_text(
+        "model_type,total_tokens\nthinking,100\naction,50\nthinking,80\n",
+        encoding="utf-8",
+    )
+    return session
+
+
+def test_collector_ignores_numbers_in_markdown(tmp_path):
+    session = _session(tmp_path)
+    (session / "setup-report.md").write_text("999999 tests passed", encoding="utf-8")
+
+    record = ABCollector().collect(session)
+
+    assert record.metrics.unique_passed == 541
+    assert record.metrics.flaky_count == 3
+    assert record.metrics.thought_calls == 2
+
+
+def test_collector_rejects_incomplete_pin(tmp_path):
+    session = _session(tmp_path, excluding="container_image_digest")
+
+    with pytest.raises(CollectionError, match="container_image_digest"):
+        ABCollector().collect(session)
+
+
+def test_collector_uses_legacy_structured_adapter_without_markdown(tmp_path):
+    session = tmp_path / "legacy"
+    contexts = session / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    (session / ".setup_agent" / "run-pin.json").write_text(json.dumps(PIN), encoding="utf-8")
+    (contexts / "phase_report.json").write_text(
+        json.dumps(
+            {
+                "raw_data": {
+                    "report_snapshot": {
+                        "verdict": "partial",
+                        "test_stats": {
+                            "executed": 328,
+                            "passed": 0,
+                            "failed": 328,
+                            "skipped": 0,
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (session / "setup-report.md").write_text("777777 passed", encoding="utf-8")
+
+    record = ABCollector().collect(session)
+
+    assert record.source_schema == "legacy_structured"
+    assert record.metrics.unique_total == 328
+    assert record.metrics.unique_passed == 0
+
+
+def test_legacy_adapter_reads_the_recorded_report_action_when_snapshot_is_absent(tmp_path):
+    session = tmp_path / "legacy-action"
+    contexts = session / ".setup_agent" / "contexts"
+    contexts.mkdir(parents=True)
+    (session / ".setup_agent" / "run-pin.json").write_text(json.dumps(PIN), encoding="utf-8")
+    (contexts / "phase_report.json").write_text(
+        json.dumps(
+            {
+                "history": [
+                    {
+                        "type": "action",
+                        "tool_name": "report",
+                        "success": True,
+                        "parameters": {
+                            "status": "success",
+                            "test_stats": {
+                                "discovered": 559,
+                                "executed": 559,
+                                "passed": 541,
+                                "failed": 0,
+                                "skipped": 18,
+                            },
+                        },
+                        "output": "Tests: 999999 / 999999 passed",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = ABCollector().collect(session)
+
+    assert record.source_schema == "legacy_structured"
+    assert record.metrics.verdict == "success"
+    assert record.metrics.unique_total == 559
+    assert record.metrics.unique_passed == 541
+    assert record.metrics.unique_skipped == 18
+
+
+def test_collector_counts_the_live_token_csv_type_column(tmp_path):
+    session = _session(tmp_path)
+    (session / "token_usage.csv").write_text(
+        "iteration,type,tool_name,model,total_tokens\n"
+        "1,action,project,action-model,100\n"
+        "2,thought,Think,thinking-model,200\n"
+        "3,action,build,action-model,100\n",
+        encoding="utf-8",
+    )
+
+    record = ABCollector().collect(session)
+
+    assert record.metrics.thought_calls == 1
+    assert record.metrics.action_calls == 2
+
+
+def test_collector_flags_an_action_envelope_without_a_tool_result(tmp_path):
+    session = _session(tmp_path)
+    params = {"action": "compile"}
+    envelope = {
+        "sequence": 1,
+        "kind": "action_envelope",
+        "payload": {
+            "envelope_id": "envelope-1",
+            "plan_index": 0,
+            "tool": "build",
+            "exact_params": params,
+            "envelope_sha256": action_envelope_sha256(
+                plan_index=0,
+                tool="build",
+                exact_params=params,
+            ),
+        },
+    }
+    (session / ".setup_agent" / "control_events.jsonl").write_text(
+        json.dumps(envelope) + "\n",
+        encoding="utf-8",
+    )
+
+    record = ABCollector().collect(session)
+
+    assert record.metrics.envelope_count == 1
+    assert record.metrics.tool_result_count == 0
+    assert record.metrics.unmatched_envelope_count == 1
+
+
+def test_legacy_external_run_pin_is_complete_and_sanitized():
+    pin = build_legacy_run_pin(
+        target_repo_sha="a" * 40,
+        container_image_digest="sha256:" + "b" * 64,
+        sag_git_sha="c" * 40,
+        runtime_config={
+            "thinking_model": "thinking-model",
+            "action_model": "action-model",
+            "max_iterations": 50,
+            "openai_api_key": "must-not-survive",
+            "openai_base_url": "https://user:password@example.invalid/v1",
+        },
+        prompt_bundle_sha256="d" * 64,
+        random_seed=17,
+        dependency_cache_state="warm",
+        host_arch="arm64",
+    )
+
+    assert pin.thinking_model == "thinking-model"
+    assert pin.action_model == "action-model"
+    assert pin.feature_flags == {
+        "control_events": False,
+        "reasoning_scheduler": False,
+        "phase_machine": False,
+    }
+    assert pin.sanitized_config == {"max_iterations": 50}
+
+
+def test_probe_runner_accepts_an_explicit_shared_env_file():
+    args = build_parser().parse_args(
+        [
+            "run-probe",
+            "--campaign",
+            "campaign",
+            "--probe",
+            "paramiko",
+            "--stage",
+            "baseline",
+            "--repeat",
+            "1",
+            "--sag-root",
+            "baseline-worktree",
+            "--dependency-cache",
+            "warm",
+            "--seed",
+            "17",
+            "--env-file",
+            "/private/config/setup-agent.env",
+        ]
+    )
+
+    assert args.env_file == "/private/config/setup-agent.env"
+
+
+def test_summary_reports_median_and_range(tmp_path):
+    campaign = CampaignStore(tmp_path / "campaign")
+    campaign.add_metric_runs("paramiko", "ws4", "thought_calls", [8, 6, 7])
+
+    metric = campaign.summarize().metric("paramiko", "thought_calls")
+
+    assert metric.median == 7
+    assert metric.minimum == 6
+    assert metric.maximum == 8
+    assert metric.render() == "7 [6-8]"
+
+
+def test_campaign_rejects_duplicate_run_ids_and_pin_drift(tmp_path):
+    session = _session(tmp_path)
+    record = ABCollector().collect(session)
+    campaign = CampaignStore(tmp_path / "campaign")
+    campaign.append("paramiko", "ws7", record)
+
+    with pytest.raises(CollectionError, match="duplicate run id"):
+        campaign.append("paramiko", "ws7", record)
+
+    changed = record.model_copy(
+        update={"run_id": "run-2", "pin": record.pin.model_copy(update={"random_seed_or_null": 99})}
+    )
+    with pytest.raises(CollectionError, match="pin mismatch"):
+        campaign.append("paramiko", "ws7", changed)
+
+
+def _populate_valid_six_bar_campaign(tmp_path):
+    record = ABCollector().collect(_session(tmp_path))
+    campaign = CampaignStore(tmp_path / "campaign")
+    for probe in ("tvm", "bigtop", "paramiko", "cassandra-java-driver"):
+        for repeat in range(1, 4):
+            baseline_metrics = record.metrics.model_copy(
+                update={
+                    "verdict": "success",
+                    "thought_calls": 10 if probe == "paramiko" else 4,
+                    "action_calls": 6,
+                    "envelope_count": 6,
+                    "compiled_classes": 8916 if probe == "cassandra-java-driver" else None,
+                    "unique_total": 4900 if probe == "cassandra-java-driver" else 541,
+                    "raw_executions": 4900 if probe == "cassandra-java-driver" else 544,
+                }
+            )
+            campaign.append(
+                probe,
+                "baseline",
+                record.model_copy(
+                    update={
+                        "run_id": f"{probe}-baseline-{repeat}",
+                        "metrics": baseline_metrics,
+                    }
+                ),
+            )
+            current_metrics = baseline_metrics.model_copy(
+                update={"thought_calls": 4 if probe == "paramiko" else 4}
+            )
+            campaign.append(
+                probe,
+                "ws7",
+                record.model_copy(
+                    update={
+                        "run_id": f"{probe}-ws7-{repeat}",
+                        "metrics": current_metrics,
+                        "surface_ok": True,
+                    }
+                ),
+            )
+    return campaign
+
+
+def test_campaign_evaluates_all_six_bars(tmp_path):
+    campaign = _populate_valid_six_bar_campaign(tmp_path)
+
+    summary = campaign.evaluate("ws7", min_repeats=3)
+
+    assert summary.failures == ()
+    assert summary.metric("paramiko", "thought_calls", stage="ws7").render() == "4 [4-4]"
+
+
+def test_campaign_gate_rejects_cassandra_metric_drift(tmp_path):
+    campaign = _populate_valid_six_bar_campaign(tmp_path)
+    path = campaign.path / "cassandra-java-driver-ws7.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][0]["metrics"]["compiled_classes"] = 8915
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = campaign.evaluate("ws7", min_repeats=3)
+
+    assert any("8,916 compiled classes" in failure for failure in summary.failures)
+
+
+def test_campaign_does_not_equate_rejected_actor_calls_with_tool_envelopes(tmp_path):
+    campaign = _populate_valid_six_bar_campaign(tmp_path)
+    path = campaign.path / "paramiko-ws7.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][0]["metrics"]["action_calls"] = 99
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = campaign.evaluate("ws7", min_repeats=3)
+
+    assert not any("action/envelope count drift" in failure for failure in summary.failures)
+
+
+def test_failed_phase_gate_limit_is_not_the_whole_run_gate_total(tmp_path):
+    campaign = _populate_valid_six_bar_campaign(tmp_path)
+    path = campaign.path / "tvm-ws7.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][0]["metrics"].update(
+        {
+            "verdict": "failed",
+            "gate_interactions": 5,
+            "max_failure_gate_interactions": 2,
+        }
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = campaign.evaluate("ws7", min_repeats=3)
+
+    assert not any("determined failure closed too late" in failure for failure in summary.failures)
+
+
+def test_campaign_rejects_a_missed_second_failure_recurrence(tmp_path):
+    campaign = _populate_valid_six_bar_campaign(tmp_path)
+    path = campaign.path / "tvm-ws7.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][0]["metrics"]["second_occurrence_miss_count"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = campaign.evaluate("ws7", min_repeats=3)
+
+    assert any("second identical failure was not intercepted" in item for item in summary.failures)
+
+
+def test_current_run_pin_requires_exact_host_container_mirrors(tmp_path):
+    session = tmp_path / "session"
+    setup = session / ".setup_agent"
+    setup.mkdir(parents=True)
+    canonical = json.dumps(PIN, sort_keys=True, separators=(",", ":"))
+    (session / "run-pin.json").write_text(canonical, encoding="utf-8")
+    (setup / "run-pin.json").write_text(canonical, encoding="utf-8")
+
+    pin = _validate_current_run_pin(
+        session,
+        target_repo_sha=PIN["target_repo_sha"],
+        sag_git_sha=PIN["sag_git_sha"],
+        random_seed=PIN["random_seed_or_null"],
+        dependency_cache_state=PIN["dependency_cache_state"],
+        host_arch=PIN["host_arch"],
+    )
+
+    assert pin.model_dump(mode="json") == PIN
+    (setup / "run-pin.json").write_text(canonical + "\n", encoding="utf-8")
+    with pytest.raises(CollectionError, match="host/container run-pin mirrors differ"):
+        _validate_current_run_pin(
+            session,
+            target_repo_sha=PIN["target_repo_sha"],
+            sag_git_sha=PIN["sag_git_sha"],
+            random_seed=PIN["random_seed_or_null"],
+            dependency_cache_state=PIN["dependency_cache_state"],
+            host_arch=PIN["host_arch"],
+        )

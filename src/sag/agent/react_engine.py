@@ -1,9 +1,11 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
+import hashlib
 import json
 import re
 import shlex
 import time
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -26,10 +28,16 @@ from sag.ui.events import EventType, UIEvent, UIEventEmitter
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
-from .current_plan import PlanFault, PlanFaultCode
+from .control_events import (
+    ControlEventSink,
+    action_envelope_sha256,
+    canonical_sha256,
+    compact_control_value,
+)
+from .current_plan import CurrentPlan, PlanFault, PlanFaultCode
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
-from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
+from .output_storage import OutputStorageManager, attach_durable_output_ref
 from .phase_gates import (
     ClaimDisposition,
     GateResult,
@@ -51,8 +59,8 @@ from .phase_transitions import (
     RepairRequest,
     TransitionDecision,
 )
-from .project_brief import PROJECT_BRIEF_PATH, PROJECT_BRIEF_PROJECTION_CHARS
 from .physical_validator import PhysicalValidator
+from .project_brief import PROJECT_BRIEF_PATH, PROJECT_BRIEF_PROJECTION_CHARS
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_response_parser import ReActResponseParser
@@ -305,6 +313,8 @@ class ReActEngine(UIEventEmitter):
         run_evidence_state: Optional[RunEvidenceState] = None,
         verdict_finalizer: Optional[VerdictFinalizer] = None,
         transition_policy: Optional[PhaseTransitionPolicy] = None,
+        control_event_sink: Optional[ControlEventSink] = None,
+        target_repo_sha_callback=None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -316,6 +326,9 @@ class ReActEngine(UIEventEmitter):
         )
         self._scheduler_active = False
         self._scheduled_turn: SchedulerTurn | None = None
+        self.control_event_sink = control_event_sink
+        self._target_repo_sha_callback = target_repo_sha_callback
+        self._active_control_envelope_id: str | None = None
 
         # Engine-owned phase machine for setup runs (spec §3.1). None keeps the
         # legacy free-form behavior (`sag run --task` passes neither).
@@ -900,7 +913,11 @@ class ReActEngine(UIEventEmitter):
         finalizer = getattr(self, "verdict_finalizer", None)
         if state is None or finalizer is None:
             raise RuntimeError("setup evidence finalization is not configured")
-        return finalizer.finalize(state, reason)
+        was_sealed = state.sealed
+        snapshot = finalizer.finalize(state, reason)
+        if not was_sealed:
+            self._emit_control_event("evidence_close", {"reason": reason.value})
+        return snapshot
 
     def _report_delivery_status(self) -> ReportDeliveryStatus:
         if getattr(self, "_report_delivered", False):
@@ -1250,8 +1267,11 @@ class ReActEngine(UIEventEmitter):
         self,
         record,
         decision: TransitionDecision,
+        *,
+        repair_request: RepairRequest | None = None,
     ) -> None:
         machine = self.phase_machine
+        self._emit_control_phase_transition(decision, repair_request=repair_request)
         appended = machine.apply(decision)
         self._request_scheduler_reasoning(ReasoningTrigger.PHASE_CHANGE)
         for applied in appended:
@@ -1318,6 +1338,7 @@ class ReActEngine(UIEventEmitter):
             getattr(getattr(self, "physical_validator", None), "docker_orchestrator", None),
             self._project_name_for_gate(),
         )
+        self._emit_control_gate(claim, gate)
         if not gate.accepted:
             self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
             self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
@@ -1333,7 +1354,7 @@ class ReActEngine(UIEventEmitter):
         )
         if decision.route.kind == "repair":
             self._consume_repair_budget(request.from_phase)
-        self._apply_phase_decision(record, decision)
+        self._apply_phase_decision(record, decision, repair_request=request)
         return "repair"
 
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:
@@ -1370,6 +1391,7 @@ class ReActEngine(UIEventEmitter):
             if claim.phase != machine.current_phase or claim.signal != signal:
                 self.agent_logger.warning("Ignoring a stale or mismatched phase claim")
                 return None
+            self._emit_control_gate(claim, gate)
             if not gate.accepted:
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
                 self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
@@ -1570,6 +1592,7 @@ class ReActEngine(UIEventEmitter):
             code=str(probe.get("code") or "phase_floor_exhausted"),
             validated_facts=dict(probe.get("validated_facts") or {}),
         )
+        self._emit_control_gate(claim, gate)
         self._record_gate_facts(phase, gate)
         record = machine.close_attempt(gate)
         state = getattr(self, "run_evidence_state", None)
@@ -2033,6 +2056,234 @@ class ReActEngine(UIEventEmitter):
             record = self.phase_machine.record_abort(reason, evidence=[])
             self._record_phase_audit(record)
 
+    def _emit_control_event(self, kind: str, payload: Dict[str, Any]):
+        sink = getattr(self, "control_event_sink", None)
+        if sink is None:
+            return None
+        try:
+            return sink.emit(kind, compact_control_value(payload))
+        except Exception as exc:
+            logger.warning(f"Control-event emission failed for {kind}: {exc}")
+            return None
+
+    def _emit_control_scheduler_decision(self, turn: SchedulerTurn) -> None:
+        self._emit_control_event(
+            "scheduler_decision",
+            {
+                "mode": turn.mode.value,
+                "reasons": [reason.value for reason in turn.reasons],
+                "plan_index": turn.step.plan_index if turn.step is not None else None,
+            },
+        )
+
+    def _emit_control_planner_response(self, plan: CurrentPlan) -> None:
+        plan_payload = compact_control_value(plan.model_dump(mode="json"))
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        ordinal = getattr(scheduler, "thinking_turns", 0)
+        self._emit_control_event(
+            "planner_response",
+            {
+                "plan_id": f"plan-{ordinal:04d}",
+                "plan": plan_payload,
+                "response_sha256": canonical_sha256(plan_payload),
+            },
+        )
+
+    def _emit_control_planner_rejection(self, response: str, code: str) -> None:
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        ordinal = getattr(scheduler, "thinking_turns", 0)
+        self._emit_control_event(
+            "planner_response",
+            {
+                "plan_id": f"rejected-{code}-{ordinal:04d}",
+                "plan": {"rejected": True, "code": code},
+                "response_sha256": canonical_sha256(str(response)),
+            },
+        )
+
+    def _emit_control_action_envelope(
+        self,
+        tool: str,
+        params: Dict[str, Any],
+    ) -> str | None:
+        sink = getattr(self, "control_event_sink", None)
+        if sink is None or self._active_reasoning_scheduler() is None:
+            return None
+        turn = getattr(self, "_scheduled_turn", None)
+        step = turn.step if turn is not None else None
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        if step is None and scheduler is not None:
+            step = getattr(scheduler, "active_step", None)
+        if step is None:
+            logger.warning("Control envelope omitted because no scheduler action is active")
+            return None
+        safe_params = compact_control_value(params)
+        envelope_id = f"envelope-{sink.sequence + 1:06d}"
+        emitted = self._emit_control_event(
+            "action_envelope",
+            {
+                "envelope_id": envelope_id,
+                "plan_index": step.plan_index,
+                "tool": tool,
+                "exact_params": safe_params,
+                "envelope_sha256": action_envelope_sha256(
+                    plan_index=step.plan_index,
+                    tool=tool,
+                    exact_params=safe_params,
+                ),
+            },
+        )
+        if emitted is None:
+            return None
+        self._active_control_envelope_id = envelope_id
+        return envelope_id
+
+    @staticmethod
+    def _control_result_projection(result: ToolResult) -> Dict[str, Any]:
+        output_ref = result.output_ref or next(
+            (str(ref) for ref in [*result.evidence_refs, *result.refs] if ref),
+            None,
+        )
+        projection: Dict[str, Any] = {
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
+            "output": (
+                f"stored as {output_ref}"
+                if output_ref
+                else "output body omitted; verify output_sha256"
+            ),
+            "evidence_assessment": result.evidence_assessment.value,
+            "metadata": compact_control_value(result.metadata),
+            "evidence_refs": list(result.evidence_refs),
+            "conflicts": list(result.conflicts),
+            "validator_findings": [
+                finding.model_dump(mode="json") for finding in result.validator_findings
+            ],
+            "facts": compact_control_value(result.facts),
+            "refs": list(result.refs),
+        }
+        for name in (
+            "poll_ref",
+            "failure_signature",
+            "error_tail_preview",
+            "output_ref",
+            "error",
+            "error_code",
+        ):
+            value = getattr(result, name)
+            if value is not None:
+                projection[name] = compact_control_value(value)
+        if result.test_stats is not None:
+            projection["test_stats"] = result.test_stats.model_dump(mode="json")
+        return projection
+
+    def _emit_control_tool_result(
+        self,
+        *,
+        envelope_id: str | None,
+        execution_id: str,
+        tool: str,
+        params: Dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        if not envelope_id:
+            return
+        machine = getattr(self, "phase_machine", None)
+        safe_params = compact_control_value(params)
+        output_source = result.raw_output if result.raw_output is not None else result.output
+        self._emit_control_event(
+            "tool_result",
+            {
+                "envelope_id": envelope_id,
+                "execution_id": execution_id,
+                "tool": tool,
+                "params": safe_params,
+                "scope": self._tool_evidence_scope(tool, params).value,
+                "roles": [role.value for role in self._tool_evidence_roles(tool, params, result)],
+                "result": self._control_result_projection(result),
+                "source_phase": getattr(machine, "current_phase", "") or "",
+                "source_attempt_id": getattr(machine, "current_attempt_id", "") or "",
+                "output_sha256": hashlib.sha256(
+                    str(output_source or "").encode("utf-8", errors="replace")
+                ).hexdigest(),
+            },
+        )
+        self._active_control_envelope_id = None
+        resolved_commit = (result.metadata or {}).get("resolved_commit")
+        callback = getattr(self, "_target_repo_sha_callback", None)
+        if resolved_commit and callable(callback):
+            try:
+                callback(str(resolved_commit))
+            except Exception as exc:
+                logger.warning(f"Could not update target repository run pin: {exc}")
+
+    def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult) -> None:
+        validated_facts = compact_control_value(dict(gate.validated_facts))
+        self._emit_control_event(
+            "validator_observation",
+            {
+                "phase": claim.phase,
+                "validator_state": gate.validator_state.value,
+                "reason": gate.reason,
+                "evidence_refs": list(gate.evidence_refs),
+                "validated_facts": validated_facts,
+            },
+        )
+        self._emit_control_event(
+            "gate_decision",
+            {
+                "phase": claim.phase,
+                "signal": claim.signal,
+                "claimed_outcome": claim.claimed_outcome.value,
+                "validator_state": gate.validator_state.value,
+                "expected_accepted": gate.accepted,
+                "expected_outcome": gate.validated_outcome.value,
+                "reason": gate.reason,
+                "key_results": claim.key_results,
+                "evidence_refs": list(gate.evidence_refs),
+                "validated_facts": validated_facts,
+            },
+        )
+
+    def _emit_control_phase_transition(
+        self,
+        decision: TransitionDecision,
+        *,
+        repair_request: RepairRequest | None = None,
+    ) -> None:
+        self._emit_control_event(
+            "phase_transition",
+            {
+                "expected_kind": decision.route.kind,
+                "expected_target": decision.route.target,
+                "expected_reason_code": decision.reason_code,
+                "repair_request": (
+                    repair_request.to_metadata() if repair_request is not None else None
+                ),
+            },
+        )
+
+    def _emit_control_loop_decision(
+        self,
+        event: LoopEvent,
+        decision: LoopDecision,
+    ) -> None:
+        event_payload = asdict(event)
+        event_payload["relevant_state"] = {
+            getattr(scope, "value", str(scope)): value
+            for scope, value in event.relevant_state.items()
+        }
+        event_payload["recurrence_count"] = decision.recurrence_count
+        self._emit_control_event(
+            "loop_decision",
+            {
+                "event": event_payload,
+                "expected_decision": decision.decision,
+                "expected_reason_code": decision.reason_code,
+            },
+        )
+
     def _active_reasoning_scheduler(self) -> ReasoningScheduler | None:
         if not getattr(self, "_scheduler_active", False):
             return None
@@ -2071,8 +2322,13 @@ class ReActEngine(UIEventEmitter):
                         message="thinking response included an ACTION; no tool was executed",
                     )
                 )
+                self._emit_control_planner_rejection(response, "thinking_included_action")
             else:
-                scheduler.accept_thinking_response(response)
+                accepted = scheduler.accept_thinking_response(response)
+                if accepted and scheduler.current_plan is not None:
+                    self._emit_control_planner_response(scheduler.current_plan)
+                else:
+                    self._emit_control_planner_rejection(response, "malformed_plan")
             return thought_steps
 
         if len(action_steps) == 1:
@@ -2094,6 +2350,7 @@ class ReActEngine(UIEventEmitter):
         scheduler = self._active_reasoning_scheduler()
         if scheduler is not None:
             self._scheduled_turn = scheduler.next_turn()
+            self._emit_control_scheduler_decision(self._scheduled_turn)
             if self._scheduled_turn.mode is SchedulerMode.THINK:
                 logger.info(
                     "Using thinking model for scheduler triggers: "
@@ -2171,6 +2428,10 @@ class ReActEngine(UIEventEmitter):
             add_system_guidance=self._add_system_guidance,
             get_timestamp=self._get_timestamp,
             event_sink=self._handle_tool_lifecycle_event,
+            before_tool_execute=lambda call, params: self._emit_control_action_envelope(
+                call.name,
+                params,
+            ),
             output_storage=self.output_storage,
             logger=logger,
         )
@@ -2374,7 +2635,9 @@ class ReActEngine(UIEventEmitter):
         memory = getattr(self, "loop_memory", None)
         if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
             return None
-        decision = memory.observe(self._loop_event_for_execution(execution))
+        loop_event = self._loop_event_for_execution(execution)
+        decision = memory.observe(loop_event)
+        self._emit_control_loop_decision(loop_event, decision)
         execution.metadata["loop_decision"] = decision.to_metadata()
         self._resolve_progressed_loop_blockers(decision)
         if decision.decision in {"guide", "force_break", "diversity_advisory"}:
@@ -2424,6 +2687,7 @@ class ReActEngine(UIEventEmitter):
             evidence_refs=refs,
             claim=claim,
         )
+        self._emit_control_gate(claim, gate)
         record = machine.close_attempt(gate)
         route = self.transition_policy.decide(
             record,
@@ -2498,6 +2762,7 @@ class ReActEngine(UIEventEmitter):
                     execution = self._refused_report_execution(call)
                 else:
                     execution = self._execute_tool_call(call)
+                control_execution_id: str | None = None
                 if execution.actual_executions:
                     result = execution.result
                     recorded_executions = []
@@ -2519,18 +2784,42 @@ class ReActEngine(UIEventEmitter):
                         )
                         if actual.result is execution.result:
                             result = recorded
+                            control_execution_id = actual.execution_id
                     execution.actual_executions = recorded_executions
                 else:
+                    control_execution_id = new_execution_id()
                     result = self._record_tool_execution(
                         call.name,
                         call.validated_params or call.raw_params,
                         execution.result,
                         attempted_execution=execution.attempted_execution,
+                        execution_id=control_execution_id,
                     )
                 if result is not execution.result:
                     execution.result = result
                     execution.observation_text = format_tool_result(call.name, result)
                 step.tool_result = result
+                control_envelope_id = (
+                    str(execution.metadata.get("control_envelope_id") or "") or None
+                )
+                if execution.validated_params is not None:
+                    control_params = execution.validated_params
+                elif call.validated_params is not None:
+                    control_params = call.validated_params
+                else:
+                    control_params = call.raw_params
+                if control_envelope_id is None:
+                    control_envelope_id = self._emit_control_action_envelope(
+                        call.name,
+                        control_params,
+                    )
+                self._emit_control_tool_result(
+                    envelope_id=control_envelope_id,
+                    execution_id=control_execution_id or new_execution_id(),
+                    tool=call.name,
+                    params=control_params,
+                    result=result,
+                )
                 loop_decision = self._apply_tool_execution_loop_effects(execution)
 
                 # Log tool result in verbose mode

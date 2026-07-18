@@ -274,6 +274,7 @@ class ToolOrchestrator:
         add_system_guidance: Callable[[str, GuidancePriority], None],
         get_timestamp: Callable[[], str],
         event_sink: Optional[Callable[[ToolLifecycleEvent], None]] = None,
+        before_tool_execute: Optional[Callable[[ToolCall, Dict[str, Any]], Any]] = None,
         output_storage: Any = None,
         logger: Any = None,
     ):
@@ -291,6 +292,7 @@ class ToolOrchestrator:
         self.add_system_guidance = add_system_guidance
         self.get_timestamp = get_timestamp
         self.event_sink = event_sink
+        self.before_tool_execute = before_tool_execute
         self.output_storage = output_storage
         self.logger = logger or default_logger
         self.parameter_normalizer = ToolParameterNormalizer(
@@ -539,6 +541,13 @@ class ToolOrchestrator:
                 },
             )
 
+        control_envelope_id = None
+        if self.before_tool_execute is not None:
+            try:
+                control_envelope_id = self.before_tool_execute(call, validated_params)
+            except Exception as exc:
+                self.logger.warning(f"Before-execute hook failed for {call.name}: {exc}")
+
         escaped_exception_result: Optional[ToolResult] = None
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
@@ -644,7 +653,9 @@ class ToolOrchestrator:
 
         duration_ms = self._duration_since(started_at)
         observation_text = format_tool_result(call.name, result)
-        execution_metadata = {"execution_signature": signature}
+        execution_metadata: Dict[str, Any] = {"execution_signature": signature}
+        if control_envelope_id is not None:
+            execution_metadata["control_envelope_id"] = control_envelope_id
         if recovery_metadata is not None:
             execution_metadata["recovery"] = recovery_metadata
         if recovery_strategy:

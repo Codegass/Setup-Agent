@@ -1,8 +1,12 @@
 """Main Setup Agent that orchestrates project setup."""
 
 import json
+import os
+import platform
 import re
+import subprocess
 from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlparse
 
@@ -16,6 +20,12 @@ from sag.docker_orch.orch import DockerOrchestrator
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
 
 from .context_manager import ContextManager
+from .control_events import (
+    ControlEventSink,
+    RunPin,
+    canonical_sha256,
+    sanitize_config,
+)
 from .evidence_state import RunEvidenceState
 from .react_engine import ReActEngine
 from .verdict_finalizer import (
@@ -27,6 +37,15 @@ from .verdict_finalizer import (
     VerdictFinalizer,
     read_verdict_snapshot,
 )
+
+
+def _active_setup_run_id(command_logger_id: object) -> str:
+    session_logger = get_session_logger()
+    session_id = str(getattr(session_logger, "session_id", "") or "").strip()
+    if session_id:
+        return session_id
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"setup-{timestamp}-{os.getpid()}-{command_logger_id or 'no-command-log'}"
 
 
 class SetupAgent:
@@ -60,6 +79,10 @@ class SetupAgent:
         self.verdict_finalizer = None
         self.run_termination = None
         self.workflow_mode = "idle"
+        self.control_event_sink = None
+        self._run_pin_template = None
+        self._run_pin_host_path = None
+        self._run_pin_mirror = None
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
@@ -123,6 +146,10 @@ class SetupAgent:
         # Initialize tools
         self.tools = self._initialize_tools(workflow_mode=workflow_mode)
 
+        # One host-owned stream is mirrored into the container so normal
+        # --record artifact copying captures exactly the same canonical rows.
+        self._initialize_control_recording()
+
         # Initialize ReAct engine (repository URL will be set later). The phase
         # machine and in-container context journal are None outside setup runs,
         # which keeps the legacy loop behavior.
@@ -133,7 +160,10 @@ class SetupAgent:
             context_journal=self.context_journal,
             run_evidence_state=self.run_evidence_state,
             verdict_finalizer=self.verdict_finalizer,
+            control_event_sink=self.control_event_sink,
+            target_repo_sha_callback=self._record_target_repo_sha,
         )
+        self._initialize_run_pin_template()
 
         # Pass UIManager to ReActEngine if in UI mode
         if self.config.ui_mode and self.ui_manager:
@@ -148,6 +178,113 @@ class SetupAgent:
                     logger.debug(f"Set UI manager for tool: {tool.name}")
 
         self.agent_logger.info("Context manager, tools, and ReAct engine initialized")
+
+    def _initialize_control_recording(self) -> None:
+        session_logger = get_session_logger()
+        if session_logger is None:
+            return
+        from sag.utils.container_io import write_container_text
+
+        container_dir = "/workspace/.setup_agent"
+        self.orchestrator.execute_command(f"mkdir -p {container_dir}")
+
+        def mirror_event(line: str) -> None:
+            if not write_container_text(
+                self.orchestrator,
+                f"{container_dir}/control_events.jsonl",
+                line.rstrip("\n"),
+                append=True,
+            ):
+                raise RuntimeError("container control-event mirror rejected the append")
+
+        def mirror_pin(payload: str) -> None:
+            if not write_container_text(
+                self.orchestrator,
+                f"{container_dir}/run-pin.json",
+                payload,
+            ):
+                raise RuntimeError("container run-pin mirror rejected the write")
+
+        self.control_event_sink = session_logger.get_control_event_sink(mirror=mirror_event)
+        self._run_pin_host_path = session_logger.run_pin_path
+        self._run_pin_mirror = mirror_pin
+
+    @staticmethod
+    def _resolve_sag_git_sha() -> str | None:
+        configured = str(os.getenv("SAG_GIT_SHA") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", configured):
+            return configured
+        repository_root = Path(__file__).resolve().parents[3]
+        process = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository_root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        resolved = process.stdout.strip().lower()
+        return (
+            resolved
+            if process.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", resolved)
+            else None
+        )
+
+    def _resolve_container_image_digest(self) -> str | None:
+        try:
+            container = self.orchestrator.client.containers.get(self.orchestrator.container_name)
+            digest = str(container.image.id).strip().lower()
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+                return digest
+        except Exception as exc:
+            self.agent_logger.warning(f"Could not resolve container image digest: {exc}")
+        return None
+
+    def _initialize_run_pin_template(self) -> None:
+        if self._run_pin_host_path is None or self.react_engine is None:
+            return
+        sag_git_sha = self._resolve_sag_git_sha()
+        image_digest = self._resolve_container_image_digest()
+        if sag_git_sha is None or image_digest is None:
+            self.agent_logger.warning(
+                "Run pin is waiting for complete SAG/image provenance; collection will reject it"
+            )
+            return
+        seed_text = str(os.getenv("SAG_RANDOM_SEED") or "").strip()
+        random_seed = int(seed_text) if re.fullmatch(r"-?[0-9]+", seed_text) else None
+        self._run_pin_template = {
+            "container_image_digest": image_digest,
+            "sag_git_sha": sag_git_sha,
+            "thinking_model": self.config.thinking_model,
+            "action_model": self.config.action_model,
+            "sanitized_config": sanitize_config(self.config),
+            # Hash the complete prompt bundle. Event projections are bounded,
+            # but a reproducibility pin must notice suffix-only prompt edits.
+            "prompt_bundle_sha256": canonical_sha256(self.react_engine.prompts),
+            "feature_flags": {
+                "control_events": True,
+                "reasoning_scheduler": True,
+                "phase_machine": self.phase_machine is not None,
+            },
+            "random_seed_or_null": random_seed,
+            "dependency_cache_state": str(os.getenv("SAG_DEPENDENCY_CACHE_STATE") or "unspecified"),
+            "host_arch": platform.machine() or "unknown",
+        }
+
+    def _record_target_repo_sha(self, target_repo_sha: str) -> None:
+        template = getattr(self, "_run_pin_template", None)
+        host_path = getattr(self, "_run_pin_host_path", None)
+        if template is None or host_path is None:
+            self.agent_logger.warning("Target SHA observed before run-pin provenance was ready")
+            return
+        try:
+            pin = RunPin(target_repo_sha=target_repo_sha, **template)
+            ControlEventSink.write_run_pin(
+                host_path,
+                pin,
+                mirror=getattr(self, "_run_pin_mirror", None),
+            )
+        except Exception as exc:
+            self.agent_logger.warning(f"Could not persist complete run pin: {exc}")
 
     def _initialize_tools(self, workflow_mode: str = "setup") -> List:
         """Initialize all available tools for the given workflow mode.
@@ -423,7 +560,7 @@ class SetupAgent:
             from sag.agent.phase_machine import PhaseMachine
 
             self.phase_machine = PhaseMachine()
-            self.run_evidence_state = RunEvidenceState(run_id=str(cmd_logger_id))
+            self.run_evidence_state = RunEvidenceState(run_id=_active_setup_run_id(cmd_logger_id))
             self.verdict_finalizer = VerdictFinalizer(
                 self.orchestrator,
                 test_pass_threshold=self.config.test_pass_threshold,

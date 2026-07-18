@@ -5,7 +5,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Optional
+from typing import Callable, Optional
 
 from loguru import logger
 
@@ -28,6 +28,7 @@ class SessionLogger:
         self.session_id = self._generate_session_id()
         self.base_log_dir = Path("logs")
         self.session_log_dir = self.base_log_dir / f"session_{self.session_id}"
+        self._control_event_sink = None
 
         # Create log directories
         self.base_log_dir.mkdir(exist_ok=True)
@@ -181,6 +182,29 @@ class SessionLogger:
             logger.remove(logger_id)
         except Exception as e:
             logger.warning(f"Failed to cleanup command logger: {e}")
+
+    def get_control_event_sink(
+        self,
+        *,
+        mirror: Optional[Callable[[str], None]] = None,
+        clock: Optional[Callable[[], str]] = None,
+        id_factory: Optional[Callable[[int], str]] = None,
+    ):
+        """Return the one append-only control stream owned by this session."""
+        from sag.agent.control_events import ControlEventSink
+
+        if self._control_event_sink is None:
+            self._control_event_sink = ControlEventSink(
+                self.session_log_dir / "control_events.jsonl",
+                mirror=mirror,
+                clock=clock,
+                id_factory=id_factory,
+            )
+        return self._control_event_sink
+
+    @property
+    def run_pin_path(self) -> Path:
+        return Path(self.session_log_dir) / "run-pin.json"
 
     def get_session_summary(self) -> dict:
         """Get a summary of the current logging session."""
