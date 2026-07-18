@@ -1,4 +1,5 @@
 import compileall
+import importlib.util
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +36,26 @@ def test_same_tag_pyc_is_deduped_by_source_path(tmp_path):
     assert metric.status == "valid"
     assert metric.source_count == 2
     assert metric.compiled_source_count == 2
+    assert metric.coverage == pytest.approx(1.0)
+    assert metric.foreign_pyc_count == 0
+    assert metric.conflicts == ()
+
+
+def test_same_tag_pytest_pyc_is_auxiliary_not_foreign(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    source = package / "alpha.py"
+    source.write_text("VALUE = 1\n")
+    assert compileall.compile_file(source, quiet=1)
+    canonical_pyc = Path(importlib.util.cache_from_source(str(source)))
+    pytest_pyc = canonical_pyc.with_name(f"{canonical_pyc.stem}-pytest-9.1.1{canonical_pyc.suffix}")
+    pytest_pyc.write_bytes(canonical_pyc.read_bytes())
+
+    metric = _scan(package)
+
+    assert metric.status == "valid"
+    assert metric.source_count == 1
+    assert metric.compiled_source_count == 1
     assert metric.coverage == pytest.approx(1.0)
     assert metric.foreign_pyc_count == 0
     assert metric.conflicts == ()

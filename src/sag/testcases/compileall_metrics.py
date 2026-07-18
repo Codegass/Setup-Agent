@@ -71,10 +71,31 @@ expected = {
     Path(importlib.util.cache_from_source(str(source))).resolve(): source
     for source in sources
 }
+cache_tag = sys.implementation.cache_tag or ""
+
+def source_for_same_tag_pyc(path):
+    if not cache_tag or path.parent.name != "__pycache__":
+        return None
+    marker = f".{cache_tag}"
+    marker_index = path.name.rfind(marker)
+    if marker_index <= 0 or not path.name.endswith(".pyc"):
+        return None
+    candidate = (path.parent.parent / f"{path.name[:marker_index]}.py").resolve()
+    return candidate if candidate in sources else None
+
+mapped_pycs = {}
+for pyc in pycs:
+    source = expected.get(pyc)
+    if source is None:
+        source = source_for_same_tag_pyc(pyc)
+    if source is not None:
+        mapped_pycs[pyc] = source
+
 compiled_sources = {
     source for expected_pyc, source in expected.items() if expected_pyc.is_file()
 }
-foreign_pycs = sorted(pycs - set(expected))
+compiled_sources.update(mapped_pycs.values())
+foreign_pycs = sorted(pycs - set(mapped_pycs))
 missing_sources = sorted(sources - compiled_sources)
 source_count = len(sources)
 compiled_source_count = len(compiled_sources)
@@ -99,7 +120,7 @@ payload = {
     "missing_source_count": len(missing_sources),
     "foreign_pyc_count": len(foreign_pycs),
     "coverage": coverage,
-    "cache_tag": sys.implementation.cache_tag or "",
+    "cache_tag": cache_tag,
     "conflicts": conflicts,
     "missing_sources": [str(path) for path in missing_sources[:20]],
     "foreign_pycs": [str(path) for path in foreign_pycs[:20]],
