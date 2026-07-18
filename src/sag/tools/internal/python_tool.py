@@ -80,6 +80,10 @@ _COLLECTION_ERROR_RE = re.compile(
     r"^_*\s*ERROR collecting\b" r"|!!+\s*Interrupted: \d+ errors? during collection",
     re.MULTILINE,
 )
+_CONFTEST_IMPORT_ERROR_RE = re.compile(
+    r"^(?:STDERR:\s*)?ImportError while loading conftest\b",
+    re.MULTILINE,
+)
 _USAGE_ERROR_RE = re.compile(r"^ERROR: usage:", re.MULTILINE)
 
 # Bug #13 defect 7: pytest-plausible flags (simple allowlist heuristic).
@@ -290,7 +294,11 @@ def _classify_pytest_result(
         detail = _snippet(_USAGE_ERROR_RE) or f"pytest exited {exit_code}"
         return False, f"pytest usage error — {detail}", "PYTEST_USAGE_ERROR"
     if exit_code == 2:
-        detail = _snippet(_COLLECTION_ERROR_RE) or f"pytest exited {exit_code}"
+        detail = (
+            _snippet(_COLLECTION_ERROR_RE)
+            or _snippet(_CONFTEST_IMPORT_ERROR_RE)
+            or f"pytest exited {exit_code}"
+        )
         return False, f"pytest collection error — {detail}", "PYTEST_COLLECTION_ERROR"
     if exit_code == 5:
         return (
@@ -314,10 +322,11 @@ def _classify_pytest_result(
                 f"pytest usage error — {_snippet(_USAGE_ERROR_RE)}",
                 "PYTEST_USAGE_ERROR",
             )
-        if _COLLECTION_ERROR_RE.search(text):
+        if _COLLECTION_ERROR_RE.search(text) or _CONFTEST_IMPORT_ERROR_RE.search(text):
             return (
                 False,
-                f"pytest collection error — {_snippet(_COLLECTION_ERROR_RE)}",
+                "pytest collection error — "
+                f"{_snippet(_COLLECTION_ERROR_RE) or _snippet(_CONFTEST_IMPORT_ERROR_RE)}",
                 "PYTEST_COLLECTION_ERROR",
             )
         if _NO_TESTS_RE.search(text):

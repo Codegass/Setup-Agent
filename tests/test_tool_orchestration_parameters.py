@@ -38,6 +38,19 @@ class ProjectSetupLikeTool(BaseTool):
         return ToolResult.completed_success(output=str(params))
 
 
+class SchemaLikeTool(BaseTool):
+    def __init__(self, name, properties, required=None):
+        super().__init__(name, f"{name} schema test tool")
+        self._parameter_schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+        }
+
+    def execute(self, **params) -> ToolResult:
+        return ToolResult.completed_success(output=str(params))
+
+
 def _orchestrator(**overrides):
     events = overrides.pop("events", [])
     tracking_calls = overrides.pop("tracking_calls", [])
@@ -300,6 +313,95 @@ def test_project_setup_parameter_normalizer_maps_version_handle_aliases_to_ref(a
     assert params["ref"] == "rel/commons-cli-1.11.0"
     assert alias not in params
     assert params["version"] == "1.11.0"
+
+
+def test_project_parameter_normalizer_maps_path_to_project_path():
+    fixes = []
+    project = SchemaLikeTool(
+        "project",
+        {
+            "action": {"type": "string"},
+            "project_path": {"type": "string"},
+        },
+        required=["action"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"project": project},
+        successful_states={"working_directory": "/workspace/paramiko"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "project", {"action": "analyze", "path": "/workspace/paramiko"}, fixes
+    )
+
+    assert params == {"action": "analyze", "project_path": "/workspace/paramiko"}
+    assert ("schema_alias", "project_path", None, "/workspace/paramiko") in {
+        (fix.source, fix.field, fix.before, fix.after) for fix in fixes
+    }
+
+
+def test_project_path_alias_is_limited_to_analyze_action():
+    project = SchemaLikeTool(
+        "project",
+        {
+            "action": {"type": "string"},
+            "project_path": {"type": "string"},
+        },
+        required=["action"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"project": project},
+        successful_states={"working_directory": "/workspace"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "project", {"action": "clone", "path": "/workspace/paramiko"}
+    )
+
+    assert params == {"action": "clone", "path": "/workspace/paramiko"}
+
+
+def test_report_parameter_normalizer_repairs_live_model_aliases_and_action():
+    fixes = []
+    report = SchemaLikeTool(
+        "report",
+        {
+            "action": {"type": "string", "enum": ["generate"]},
+            "summary": {"type": "string"},
+            "status": {"type": "string"},
+            "details": {"type": "string"},
+            "evidence_refs": {"type": "array"},
+        },
+        required=["action"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"report": report},
+        successful_states={"working_directory": "/workspace/paramiko"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "report",
+        {
+            "action": "report",
+            "summary": "Paramiko is ready",
+            "status": "success",
+            "key_results": ["dependencies installed", "tests passed"],
+            "evidence": "/workspace/paramiko/.setup_agent/report.json",
+        },
+        fixes,
+    )
+
+    assert params == {
+        "action": "generate",
+        "summary": "Paramiko is ready",
+        "status": "success",
+        "details": "dependencies installed tests passed",
+        "evidence_refs": ["/workspace/paramiko/.setup_agent/report.json"],
+    }
+    assert {fix.source for fix in fixes} >= {"schema_alias", "safety_fix"}
 
 
 def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():

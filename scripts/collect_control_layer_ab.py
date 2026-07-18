@@ -180,12 +180,13 @@ def _validate_current_run_pin(
     container_path = session / ".setup_agent" / "run-pin.json"
     if not host_path.is_file() or not container_path.is_file():
         raise CollectionError("current run requires both host and container run-pin mirrors")
-    if host_path.read_bytes() != container_path.read_bytes():
-        raise CollectionError("host/container run-pin mirrors differ")
     try:
         pin = RunPin.model_validate(_load_json(host_path))
+        container_pin = RunPin.model_validate(_load_json(container_path))
     except ValidationError as exc:
         raise CollectionError(f"current run pin is invalid: {exc}") from exc
+    if pin.model_dump(mode="json") != container_pin.model_dump(mode="json"):
+        raise CollectionError("host/container run-pin mirrors differ")
     expected = {
         "target_repo_sha": target_repo_sha,
         "sag_git_sha": sag_git_sha,

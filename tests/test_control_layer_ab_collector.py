@@ -428,6 +428,22 @@ def test_current_run_pin_requires_exact_host_container_mirrors(tmp_path):
 
     assert pin.model_dump(mode="json") == PIN
     (setup / "run-pin.json").write_text(canonical + "\n", encoding="utf-8")
+    assert (
+        _validate_current_run_pin(
+            session,
+            target_repo_sha=PIN["target_repo_sha"],
+            sag_git_sha=PIN["sag_git_sha"],
+            random_seed=PIN["random_seed_or_null"],
+            dependency_cache_state=PIN["dependency_cache_state"],
+            host_arch=PIN["host_arch"],
+        ).model_dump(mode="json")
+        == PIN
+    )
+    drifted = {**PIN, "random_seed_or_null": 99}
+    (setup / "run-pin.json").write_text(
+        json.dumps(drifted, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
     with pytest.raises(CollectionError, match="host/container run-pin mirrors differ"):
         _validate_current_run_pin(
             session,

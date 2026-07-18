@@ -596,6 +596,29 @@ def test_setup_env_empty_manifest_detects_installer_ladder_inline():
     )
 
 
+def test_setup_env_empty_manifest_executes_pep735_dev_dependencies_inline():
+    pyproject = """\
+[project]
+name = "paramiko"
+[dependency-groups]
+dev = ["pytest-relaxed>=2", "icecream>=2.1"]
+"""
+    orch = Orch(
+        manifest=None,
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("ls -A1 /workspace/proj", ok("pyproject.toml\nparamiko")),
+            ("cat /workspace/proj/pyproject.toml", ok(pyproject)),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    assert any("pip install 'pytest-relaxed>=2' 'icecream>=2.1'" in c for c in orch.commands)
+    assert "no test extras declared" not in result.output
+
+
 def test_setup_env_empty_manifest_and_no_markers_fails_with_analyze_guidance():
     orch = Orch(
         manifest=None,
@@ -664,6 +687,41 @@ def test_collection_errors_are_never_green_even_with_exit_zero():
     assert result.succeeded is False
     assert result.error_code == "PYTEST_COLLECTION_ERROR"
     assert "ERROR collecting tests/test_x.py" in (result.error or "")
+
+
+def test_conftest_import_error_is_never_green_when_stream_exit_is_unknown():
+    # Exact live Paramiko shape: Docker streaming lost the exit status and
+    # reported 0, while pytest aborted before it could emit its usual
+    # "ERROR collecting" header or write JUnit XML.
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            (
+                "--collect-only",
+                ok(
+                    "STDERR: ImportError while loading conftest "
+                    "'/workspace/paramiko/tests/conftest.py'.\n"
+                    "E   ModuleNotFoundError: No module named 'icecream'"
+                ),
+            ),
+            (
+                "--junitxml",
+                ok(
+                    "STDERR: ImportError while loading conftest "
+                    "'/workspace/paramiko/tests/conftest.py'.\n"
+                    "STDERR: tests/conftest.py:8: in <module>\n"
+                    "    from icecream import ic\n"
+                    "E   ModuleNotFoundError: No module named 'icecream'"
+                ),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_COLLECTION_ERROR"
+    assert "ImportError while loading conftest" in (result.error or "")
 
 
 def test_usage_errors_are_never_green():

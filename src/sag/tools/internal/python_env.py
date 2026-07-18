@@ -3,13 +3,19 @@ installer-ladder detection. Used by the analyzer, python_tool, and the setup
 tool so the ladder exists exactly once (spec Components 1-3)."""
 
 import re
+import shlex
 from typing import Any, Dict, List, Optional
+
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
+    import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 SUPPORTED_PYTHONS = ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
 
 _PYPROJECT_RP = re.compile(r'requires-python\s*=\s*["\']([^"\']+)["\']')
 _SETUP_PY_RP = re.compile(r'python_requires\s*=\s*["\']([^"\']+)["\']')
-_SETUP_CFG_RP = re.compile(r'^\s*python_requires\s*=\s*(.+)$', re.MULTILINE)
+_SETUP_CFG_RP = re.compile(r"^\s*python_requires\s*=\s*(.+)$", re.MULTILINE)
 
 
 def requires_python_from_pyproject(content: str) -> Optional[str]:
@@ -94,9 +100,79 @@ _PYPROJECT_OPTDEPS_TABLE = re.compile(
 )
 # Extras keys are `name = [` assignments; requiring the `[` keeps dependency
 # pins inside multi-line arrays ("pytest==7.4") from reading as keys.
-_EXTRA_KEY_RE = re.compile(
-    r"""^\s*["']?([A-Za-z0-9][A-Za-z0-9._-]*)["']?\s*=\s*\[""", re.MULTILINE
-)
+_EXTRA_KEY_RE = re.compile(r"""^\s*["']?([A-Za-z0-9][A-Za-z0-9._-]*)["']?\s*=\s*\[""", re.MULTILINE)
+
+
+def _normalized_group_name(name: str) -> str:
+    """PEP 735 group-name comparison normalization."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _dependency_groups(pyproject_content: str) -> Dict[str, List[Any]]:
+    """Return well-shaped PEP 735 dependency groups, or an honest empty map.
+
+    A malformed project file must not crash installer detection. The later
+    editable install remains authoritative and will surface its own parse
+    error with the project's original text.
+    """
+    try:
+        document = tomllib.loads(pyproject_content or "")
+    except (TypeError, tomllib.TOMLDecodeError):
+        return {}
+    raw_groups = document.get("dependency-groups", {})
+    if not isinstance(raw_groups, dict):
+        return {}
+    return {
+        str(name): entries
+        for name, entries in raw_groups.items()
+        if isinstance(name, str) and isinstance(entries, list)
+    }
+
+
+def preferred_test_dependency_groups(pyproject_content: str) -> List[str]:
+    """Declared PEP 735 test-shaped groups in stable preference order."""
+    declared = _dependency_groups(pyproject_content)
+    by_normalized_name = {_normalized_group_name(name): name for name in reversed(list(declared))}
+    return [
+        by_normalized_name[name] for name in _TEST_EXTRA_PREFERENCE if name in by_normalized_name
+    ]
+
+
+def dependency_group_requirements(pyproject_content: str, selected_groups: List[str]) -> List[str]:
+    """Flatten selected PEP 735 groups without shell interpolation.
+
+    ``include-group`` entries are expanded recursively. Cycles and repeated
+    requirements are ignored after their first declaration, preserving the
+    selected groups' order for deterministic manifests and run pins.
+    """
+    groups = _dependency_groups(pyproject_content)
+    by_normalized_name = {_normalized_group_name(name): name for name in reversed(list(groups))}
+    requirements: List[str] = []
+    seen_requirements = set()
+
+    def expand(group_name: str, stack: set[str]) -> None:
+        normalized_name = _normalized_group_name(group_name)
+        if normalized_name in stack:
+            return
+        actual_name = by_normalized_name.get(normalized_name)
+        if actual_name is None:
+            return
+        next_stack = {*stack, normalized_name}
+        for entry in groups[actual_name]:
+            if isinstance(entry, str):
+                if entry not in seen_requirements:
+                    requirements.append(entry)
+                    seen_requirements.add(entry)
+                continue
+            if not isinstance(entry, dict):
+                continue
+            included = entry.get("include-group")
+            if isinstance(included, str):
+                expand(included, next_stack)
+
+    for selected_group in selected_groups:
+        expand(selected_group, set())
+    return requirements
 
 
 def declared_extras(pyproject_content: str = "", setup_cfg_content: str = "") -> List[str]:
@@ -124,22 +200,37 @@ def preferred_test_extras(extras) -> List[str]:
 
 
 def _editable_pip_rung(contents: Optional[Dict[str, str]]) -> Dict[str, Any]:
-    """Editable-install rung with REAL extras only. Multiple test-shaped
-    extras combine; none -> plain ``-e .`` plus NO_TEST_EXTRAS_NOTE so the
+    """Editable-install rung with REAL test dependency declarations only.
+
+    Optional-dependency extras remain the first choice. When they do not
+    exist, flatten a declared PEP 735 test/dev group into a second pip command
+    because pip 24 (used by the locked Paramiko image) has no ``--group``.
+    With neither surface, use plain ``-e .`` plus NO_TEST_EXTRAS_NOTE so the
     caller narrates the hole instead of silently skipping test deps.
     Module form ('{venv}/bin/python -m pip') everywhere (bug #12): a plain
     `uv venv` ships no {venv}/bin/pip binary."""
     contents = contents or {}
+    pyproject_content = contents.get("pyproject.toml", "")
     extras = preferred_test_extras(
-        declared_extras(
-            contents.get("pyproject.toml", ""), contents.get("setup.cfg", "")
-        )
+        declared_extras(pyproject_content, contents.get("setup.cfg", ""))
     )
     if extras:
         joined = ",".join(extras)
         return {
             "commands": [f"{{venv}}/bin/python -m pip install -e '.[{joined}]'"],
             "test_extras": extras,
+            "note": None,
+        }
+    dependency_groups = preferred_test_dependency_groups(pyproject_content)
+    group_requirements = dependency_group_requirements(pyproject_content, dependency_groups)
+    if group_requirements:
+        return {
+            "commands": [
+                "{venv}/bin/python -m pip install -e .",
+                "{venv}/bin/python -m pip install " + shlex.join(group_requirements),
+            ],
+            "test_extras": [],
+            "test_dependency_groups": dependency_groups,
             "note": None,
         }
     return {
@@ -161,17 +252,17 @@ def detect_installer(files_present, contents: Optional[Dict[str, str]] = None) -
     defect 3); without it no extra is ever invented."""
     files = set(files_present or ())
     if "poetry.lock" in files:
-        return {"installer": "poetry", "commands": ["poetry install"],
-                "source": "poetry.lock"}
+        return {"installer": "poetry", "commands": ["poetry install"], "source": "poetry.lock"}
     if "Pipfile.lock" in files:
-        return {"installer": "pipenv", "commands": ["pipenv install --dev"],
-                "source": "Pipfile.lock"}
+        return {
+            "installer": "pipenv",
+            "commands": ["pipenv install --dev"],
+            "source": "Pipfile.lock",
+        }
     if "pyproject.toml" in files:
-        return {"installer": "pip", "source": "pyproject.toml",
-                **_editable_pip_rung(contents)}
+        return {"installer": "pip", "source": "pyproject.toml", **_editable_pip_rung(contents)}
     requirements = sorted(
-        name for name in files
-        if name.startswith("requirements") and name.endswith(".txt")
+        name for name in files if name.startswith("requirements") and name.endswith(".txt")
     )
     if "requirements.txt" in requirements:  # the plain file installs first
         requirements.remove("requirements.txt")
@@ -179,15 +270,11 @@ def detect_installer(files_present, contents: Optional[Dict[str, str]] = None) -
     if requirements:
         return {
             "installer": "pip",
-            "commands": [
-                f"{{venv}}/bin/python -m pip install -r {name}"
-                for name in requirements
-            ],
+            "commands": [f"{{venv}}/bin/python -m pip install -r {name}" for name in requirements],
             "source": requirements[0],
         }
     if "setup.py" in files:
-        return {"installer": "pip", "source": "setup.py",
-                **_editable_pip_rung(contents)}
+        return {"installer": "pip", "source": "setup.py", **_editable_pip_rung(contents)}
     # Nothing declared: honest empty ladder (callers narrate, never invent).
     return {"installer": "pip", "commands": [], "source": None}
 
@@ -212,7 +299,9 @@ def _active_python_minor(orchestrator) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def ensure_venv_pip(orchestrator, venv: str, python_version: Optional[str] = None) -> Dict[str, Any]:
+def ensure_venv_pip(
+    orchestrator, venv: str, python_version: Optional[str] = None
+) -> Dict[str, Any]:
     """Guarantee ``{venv}/bin/python -m pip`` works before anything installs.
 
     Straight-line repair ladder, ONE attempt per rung, re-probing pip between
@@ -285,9 +374,7 @@ def ensure_venv_pip(orchestrator, venv: str, python_version: Optional[str] = Non
     ladder.append("install uv then uv venv --seed")
     orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; {_UV_INSTALL}")
     python_arg = f" --python {python_version}" if python_version else ""
-    orchestrator.execute_command(
-        f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}"
-    )
+    orchestrator.execute_command(f"{_LOCAL_BIN_PATH}; uv venv --seed{python_arg} {venv}")
     if pip_ok():
         return {"ok": True, "action": "uv", "ladder": ladder}
 
@@ -327,18 +414,12 @@ def venv_repair_note(repair: Dict[str, Any], venv: str) -> Optional[str]:
 # package_dir root mapping ({'': '<dir>'}): the project's own declaration of
 # where its import packages live (pyyaml's lib/ layout). Only the '' root key
 # relocates the probe base; named per-package mappings are ignored.
-_SETUP_PY_PKG_DIR = re.compile(
-    r"package_dir\s*=\s*\{[^}]*?(['\"])\1\s*:\s*['\"]([^'\"]+)['\"]"
-)
+_SETUP_PY_PKG_DIR = re.compile(r"package_dir\s*=\s*\{[^}]*?(['\"])\1\s*:\s*['\"]([^'\"]+)['\"]")
 _PYPROJECT_PKG_DIR_INLINE = re.compile(
     r"package-dir\s*=\s*\{[^}]*?(['\"])\1\s*=\s*['\"]([^'\"]+)['\"]"
 )
-_PYPROJECT_PKG_DIR_TABLE = re.compile(
-    r"\[tool\.setuptools\.package-dir\]([^\[]*)"
-)
-_PYPROJECT_PKG_DIR_ROOT_KEY = re.compile(
-    r"^\s*(['\"])\1\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE
-)
+_PYPROJECT_PKG_DIR_TABLE = re.compile(r"\[tool\.setuptools\.package-dir\]([^\[]*)")
+_PYPROJECT_PKG_DIR_ROOT_KEY = re.compile(r"^\s*(['\"])\1\s*=\s*['\"]([^'\"]+)['\"]", re.MULTILINE)
 
 
 def package_dir_from_setup_py(content: str) -> Optional[str]:
@@ -347,9 +428,7 @@ def package_dir_from_setup_py(content: str) -> Optional[str]:
     read as the live declaration (docstring mentions remain a heuristic
     limitation)."""
     live = "\n".join(
-        line
-        for line in (content or "").splitlines()
-        if not line.lstrip().startswith("#")
+        line for line in (content or "").splitlines() if not line.lstrip().startswith("#")
     )
     m = _SETUP_PY_PKG_DIR.search(live)
     return m.group(2).strip() or None if m else None
@@ -410,9 +489,7 @@ def project_name_from_setup_py(content: str) -> Optional[str]:
     comments are dropped first (same limitation notes as
     package_dir_from_setup_py)."""
     live = "\n".join(
-        line
-        for line in (content or "").splitlines()
-        if not line.lstrip().startswith("#")
+        line for line in (content or "").splitlines() if not line.lstrip().startswith("#")
     )
     m = _SETUP_PY_NAME.search(live)
     return m.group(1).strip() or None if m else None
@@ -501,10 +578,7 @@ def discover_packages(orchestrator, project_dir: str) -> List[str]:
                 declared = _declared_project_name(orchestrator, root)
                 if declared:
                     wanted = _import_normalized(declared)
-                    matches = [
-                        name for name in packages
-                        if _import_normalized(name) == wanted
-                    ]
+                    matches = [name for name in packages if _import_normalized(name) == wanted]
                     if matches:
                         packages = matches
             return sorted(packages)
@@ -551,7 +625,7 @@ def tox_test_hints(content: str) -> Dict[str, Any]:
     pytest_args: Optional[str] = None
     for command in section.get("commands", []):
         if command == "pytest" or command.startswith("pytest "):
-            raw = re.sub(r"\{[^}]*\}", "", command[len("pytest"):])
+            raw = re.sub(r"\{[^}]*\}", "", command[len("pytest") :])
             pytest_args = " ".join(raw.split()) or None
             break
     return {"pytest_args": pytest_args, "test_deps": deps}
