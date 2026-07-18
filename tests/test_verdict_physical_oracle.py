@@ -290,3 +290,111 @@ def test_oracle_divergence_with_gate_record_is_a_visible_conflict():
     assert snapshot.build_evidence.judgment == "failed"
     assert "build_oracle_divergence" in snapshot.conflicts
     assert snapshot.verdict == "failed"
+
+
+class ModuleAwareValidator(FakePhysicalValidator):
+    """Physical oracle + the module-coverage machinery the finalizer folds.
+
+    Bigtop live regression #2 (2026-07-18, post-oracle-fix): validate_build_status
+    for a pathological aggregator root is trivially 'complete', so the run
+    sealed SUCCESS while half the islands never built and only a subset of
+    test-bearing modules ran tests. The July kernel capped this at PARTIAL via
+    build_modules_incomplete / reactor_scope_narrowed — those conflicts must
+    survive into the sealed snapshot.
+    """
+
+    def __init__(self, status, *, systems, modules_by_system, tests_by_path):
+        super().__init__(status)
+        self.project_path = "/workspace"
+        self._systems = systems
+        self._modules_by_system = modules_by_system
+        self._tests_by_path = tests_by_path
+
+    def _detect_build_system(self, project_dir):
+        return self._systems[0]
+
+    def scan_modules(self, project_dir, build_system):
+        return [dict(m) for m in self._modules_by_system.get(build_system, [])]
+
+    def parse_module_test_reports(self, module_dir, report_dirs):
+        return dict(self._tests_by_path.get(module_dir.rsplit("/", 1)[-1], {}))
+
+
+def _bigtop_module_validator():
+    return ModuleAwareValidator(
+        {
+            "success": True,
+            "build_complete": True,  # trivially true for the aggregator root
+            "reason": "Build fingerprints found for maven project",
+            "conflicts": [],
+            "evidence_status": "success",
+            "evidence": {"class_count": 115},
+        },
+        systems=["maven", "gradle"],
+        modules_by_system={
+            "maven": [
+                {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+                 "report_dirs": [], "has_test_sources": False},
+                {"path": "bigtop-test-framework", "name": "bigtop-test-framework",
+                 "class_count": 0, "jar_count": 0, "report_dirs": [],
+                 "has_test_sources": True},
+            ],
+            "gradle": [
+                {"path": "bigtop-data-generators/bigtop-samplers",
+                 "name": "bigtop-samplers", "class_count": 39, "jar_count": 1,
+                 "report_dirs": ["/workspace/bigtop/x/build/test-results/test"],
+                 "has_test_sources": True},
+                {"path": "bigtop-bigpetstore/bigpetstore-transaction-queue",
+                 "name": "tq", "class_count": 0, "jar_count": 0,
+                 "report_dirs": [], "has_test_sources": True},
+            ],
+        },
+        tests_by_path={"bigtop-samplers": {"tests_total": 50, "tests_passed": 50,
+                                           "failing_count": 0}},
+    )
+
+
+def test_module_coverage_conflicts_cap_pathological_aggregator_at_partial():
+    validator = _bigtop_module_validator()
+    state = RunEvidenceState(run_id="session-bigtop-islands")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(output="islands built", refs=["output_build"]),
+        provenance="output_build",
+    )
+    _green_tests(state)
+    snapshot = _finalize(state, validator)
+
+    assert snapshot.build_evidence.judgment == "success"  # physical top-level
+    assert "build_modules_incomplete" in snapshot.conflicts
+    assert "reactor_scope_narrowed" in snapshot.conflicts
+    # coverage shortfall caps the run: never SUCCESS with unbuilt islands
+    assert snapshot.verdict == "partial"
+
+
+def test_python_projects_keep_module_conflict_suppression():
+    validator = ModuleAwareValidator(
+        {
+            "success": True,
+            "build_complete": True,
+            "reason": "Python build verified",
+            "conflicts": [],
+            "evidence_status": "success",
+            "evidence": {},
+        },
+        systems=["python"],
+        modules_by_system={},
+        tests_by_path={},
+    )
+    state = RunEvidenceState(run_id="session-python")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(output="venv ok", refs=["output_build"]),
+        provenance="output_build",
+    )
+    _green_tests(state)
+    snapshot = _finalize(state, validator)
+    assert snapshot.conflicts == ()
+    assert snapshot.verdict == "success"
