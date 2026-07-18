@@ -290,6 +290,16 @@ def test_all_surfaces_render_the_same_snapshot(tvm_snapshot, surface_harness):
     } == {tvm_snapshot.test_stats.executed}
 
 
+def test_all_surfaces_keep_failures_and_errors_distinct(tvm_snapshot, surface_harness):
+    rendered = surface_harness.render_all(tvm_snapshot)
+
+    for surface in (rendered.markdown, rendered.condensed, rendered.cli):
+        assert "0 failed" in surface.text
+        assert "328 errors" in surface.text
+    assert "fail_count=0" in rendered.web.text
+    assert "errors=328" in rendered.web.text
+
+
 def test_report_failure_does_not_mutate_setup_verdict(tvm_snapshot, surface_harness):
     termination = surface_harness.fail_report_after_snapshot(tvm_snapshot)
 

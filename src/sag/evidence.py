@@ -65,6 +65,7 @@ class TestStats(BaseModel):
     executed: int = 0
     passed: int = 0
     failed: int = 0
+    errors: int = 0
     skipped: int = 0
     flaky_count: int = 0
 
@@ -96,10 +97,11 @@ class TestStats(BaseModel):
                 return f"0 of {self.discovered} detected tests executed (no tests ran)"
             return "no tests executed"
         flaky = f" ({self.flaky_count} flaky)" if self.flaky_count else ""
+        errors = f", {self.errors} errors" if self.errors else ""
         return (
             f"{self.passed} / {self.executed} passed{flaky}, "
             f"{self.pass_rate:.1f}% pass rate, "
-            f"{self.failed} failed, {self.skipped} skipped"
+            f"{self.failed} failed{errors}, {self.skipped} skipped"
         )
 
 

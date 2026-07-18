@@ -140,6 +140,23 @@ def test_surface_checker_parses_the_production_cli_shape(tmp_path):
     assert result.ok is True
 
 
+def test_surface_checker_prefers_canonical_cli_summary_over_embedded_report_text(tmp_path):
+    artifacts = _artifacts(tmp_path)
+    (artifacts / "cli-output.log").write_text(
+        "Project: paramiko\n"
+        "Verdict: PARTIAL\n"
+        "Tests: 541 unique (541 passed (3 flaky), 0 failed, 0 errors, 0 skipped)\n"
+        "Raw executions (diagnostic): 544\n"
+        "Later embedded report output:\n"
+        "Tests: 0 / 541 passed, 0.0% pass rate, 541 failed, 0 skipped\n",
+        encoding="utf-8",
+    )
+
+    result = check_surfaces(artifacts)
+
+    assert result.ok is True
+
+
 def test_prepare_surface_artifacts_uses_recorded_outputs_and_web_projection(tmp_path):
     session = tmp_path / "session"
     session.mkdir()

@@ -507,18 +507,19 @@ class ReportTool(BaseTool, UIEventEmitter):
             return default
 
         failed = as_int("failed", "failed_tests", default=0) or 0
-        failed += as_int("error", "errors", "error_tests", default=0) or 0
+        errors = as_int("error", "errors", "error_tests", default=0) or 0
         skipped = as_int("skipped", "skipped_tests", default=0) or 0
         passed = as_int("passed", "passed_tests", default=0) or 0
         executed = as_int("executed", "total", "total_tests", default=None)
         if executed is None:
-            executed = passed + failed + skipped
+            executed = passed + failed + errors + skipped
 
         return TestStats(
             discovered=as_int("discovered", "static_test_count", default=None),
             executed=executed,
             passed=passed,
             failed=failed,
+            errors=errors,
             skipped=skipped,
             flaky_count=as_int("flaky_count", "flaky", default=0) or 0,
         )
@@ -709,7 +710,7 @@ class ReportTool(BaseTool, UIEventEmitter):
     ) -> Optional[str]:
         if not test_stats:
             return "partial" if conflicts else None
-        if test_stats.failed > 0:
+        if test_stats.failed > 0 or test_stats.errors > 0:
             return "partial" if test_stats.passed > 0 else "blocked"
         if test_stats.executed > 0:
             return "success"
@@ -797,6 +798,7 @@ class ReportTool(BaseTool, UIEventEmitter):
                         executed=0,
                         passed=0,
                         failed=0,
+                        errors=0,
                         skipped=0,
                         flaky_count=int(status.get("tests_flaky", 0) or 0),
                     )
@@ -810,8 +812,8 @@ class ReportTool(BaseTool, UIEventEmitter):
                 discovered=discovered,
                 executed=int(executed),
                 passed=int(passed),
-                failed=int(status.get("tests_failed", 0) or 0)
-                + int(status.get("tests_errors", 0) or 0),
+                failed=int(status.get("tests_failed", 0) or 0),
+                errors=int(status.get("tests_errors", 0) or 0),
                 skipped=int(status.get("tests_skipped", 0) or 0),
                 flaky_count=int(status.get("tests_flaky", 0) or 0),
             )

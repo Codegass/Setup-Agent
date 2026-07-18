@@ -175,6 +175,68 @@ def test_legacy_adapter_reads_the_recorded_report_action_when_snapshot_is_absent
     assert record.metrics.unique_skipped == 18
 
 
+def test_legacy_adapter_prefers_structured_physical_report_metrics(tmp_path):
+    session = tmp_path / "legacy-physical"
+    setup = session / ".setup_agent"
+    contexts = setup / "contexts"
+    contexts.mkdir(parents=True)
+    (setup / "run-pin.json").write_text(json.dumps(PIN), encoding="utf-8")
+    (contexts / "phase_report.json").write_text(
+        json.dumps(
+            {
+                "history": [
+                    {
+                        "type": "action",
+                        "tool_name": "report",
+                        "success": True,
+                        "parameters": {
+                            "status": "success",
+                            "test_stats": {
+                                "executed": 0,
+                                "passed": 0,
+                                "failed": 0,
+                                "skipped": 0,
+                            },
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (setup / "report_metrics.json").write_text(
+        json.dumps(
+            {
+                "build": {"class_count": 8916},
+                "test": {
+                    "total": 4928,
+                    "passed": 4598,
+                    "failed": 0,
+                    "errors": 156,
+                    "skipped": 174,
+                    "unique_total": 2896,
+                    "unique_passed": 2745,
+                    "unique_failed": 0,
+                    "unique_errors": 89,
+                    "unique_skipped": 62,
+                    "conflicts": ["test_errors_detected"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record = ABCollector().collect(session)
+
+    assert record.metrics.compiled_classes == 8916
+    assert record.metrics.unique_total == 2896
+    assert record.metrics.unique_passed == 2745
+    assert record.metrics.unique_errors == 89
+    assert record.metrics.raw_executions == 4928
+    assert record.metrics.conflicts == ("test_errors_detected",)
+    assert str(setup / "report_metrics.json") in record.structured_inputs
+
+
 def test_collector_counts_the_live_token_csv_type_column(tmp_path):
     session = _session(tmp_path)
     (session / "token_usage.csv").write_text(
@@ -303,7 +365,7 @@ def test_campaign_rejects_duplicate_run_ids_and_pin_drift(tmp_path):
         campaign.append("paramiko", "ws7", changed)
 
 
-def _populate_valid_six_bar_campaign(tmp_path):
+def _populate_valid_six_bar_campaign(tmp_path, *, current_stage="ws7"):
     record = ABCollector().collect(_session(tmp_path))
     campaign = CampaignStore(tmp_path / "campaign")
     for probe in ("tvm", "bigtop", "paramiko", "cassandra-java-driver"):
@@ -334,10 +396,10 @@ def _populate_valid_six_bar_campaign(tmp_path):
             )
             campaign.append(
                 probe,
-                "ws7",
+                current_stage,
                 record.model_copy(
                     update={
-                        "run_id": f"{probe}-ws7-{repeat}",
+                        "run_id": f"{probe}-{current_stage}-{repeat}",
                         "metrics": current_metrics,
                         "surface_ok": True,
                     }
@@ -353,6 +415,21 @@ def test_campaign_evaluates_all_six_bars(tmp_path):
 
     assert summary.failures == ()
     assert summary.metric("paramiko", "thought_calls", stage="ws7").render() == "4 [4-4]"
+
+
+def test_campaign_enforces_numbered_bars_for_suffixed_stage_names(tmp_path):
+    stage = "ws7-final3"
+    campaign = _populate_valid_six_bar_campaign(tmp_path, current_stage=stage)
+    path = campaign.path / f"tvm-{stage}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][0]["surface_ok"] = False
+    payload["runs"][0]["metrics"]["evidence_contract_violations"] = 1
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = campaign.evaluate(stage, min_repeats=3)
+
+    assert any("bar1 surface agreement failed" in failure for failure in summary.failures)
+    assert any("bar4 missing post-step evidence" in failure for failure in summary.failures)
 
 
 def test_campaign_gate_rejects_cassandra_metric_drift(tmp_path):

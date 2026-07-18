@@ -36,6 +36,14 @@ def test_test_stats_preserve_counts_and_percentages():
     assert stats.as_summary() == "206 / 214 passed, 96.3% pass rate, 3 failed, 5 skipped"
 
 
+def test_test_stats_keep_failures_and_errors_distinct():
+    stats = TestStats(executed=357, passed=0, failed=0, errors=356, skipped=1)
+
+    assert stats.failed == 0
+    assert stats.errors == 356
+    assert stats.as_summary() == ("0 / 357 passed, 0.0% pass rate, 0 failed, 356 errors, 1 skipped")
+
+
 def test_test_stats_render_flaky_count_next_to_passed_count():
     stats = TestStats(
         discovered=541,

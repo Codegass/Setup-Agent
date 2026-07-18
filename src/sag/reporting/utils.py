@@ -181,6 +181,12 @@ def render_condensed_summary(snapshot: Dict[str, Any]) -> str:
             quals.append(f"{flaky_count} flaky")
         if quals:
             test_line += f" ({', '.join(quals)})"
+        count_keys = ("tests_passed", "tests_failed", "tests_errors", "tests_skipped")
+        if all(status.get(key) is not None for key in count_keys):
+            test_line += (
+                f" · {status['tests_passed']} passed, {status['tests_failed']} failed, "
+                f"{status['tests_errors']} errors, {status['tests_skipped']} skipped"
+            )
         lines.append(test_line)
 
     # Module build completeness: how many ACTIVE modules built vs were detected

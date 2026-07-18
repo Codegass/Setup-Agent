@@ -511,11 +511,54 @@ def _legacy_metrics(
     test = snapshot.get("test_stats") or snapshot.get("test") or {}
     if not isinstance(test, Mapping):
         raise CollectionError("legacy structured test_stats is invalid")
-    executed = int(test.get("unique_executed", test.get("executed", test.get("total", 0))) or 0)
-    passed = int(test.get("unique_passed", test.get("passed", 0)) or 0)
-    failed = int(test.get("unique_failed", test.get("failed", 0)) or 0)
-    errors = int(test.get("unique_errors", test.get("errors", 0)) or 0)
-    skipped = int(test.get("unique_skipped", test.get("skipped", 0)) or 0)
+
+    def count(source: Mapping[str, Any], *keys: str, default: int | None = 0) -> int | None:
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return default
+
+    # Pre-snapshot releases persisted the validator-owned physical rollup in
+    # report_metrics.json even when the model supplied zero-valued report
+    # parameters. Prefer that structured artifact over the actor claim; never
+    # reconstruct benchmark metrics from rendered Markdown or console text.
+    report_metrics_path = session / ".setup_agent" / "report_metrics.json"
+    physical_test: Mapping[str, Any] = {}
+    physical_build: Mapping[str, Any] = {}
+    if report_metrics_path.is_file():
+        report_metrics = _load_json(report_metrics_path)
+        candidate_test = report_metrics.get("test")
+        candidate_build = report_metrics.get("build")
+        if isinstance(candidate_test, Mapping):
+            physical_test = candidate_test
+        if isinstance(candidate_build, Mapping):
+            physical_build = candidate_build
+    metric_test = physical_test or test
+    executed = count(metric_test, "unique_total", "unique_executed", "executed", "total") or 0
+    passed = count(metric_test, "unique_passed", "passed") or 0
+    failed = count(metric_test, "unique_failed", "failed") or 0
+    errors = count(metric_test, "unique_errors", "errors") or 0
+    skipped = count(metric_test, "unique_skipped", "skipped") or 0
+    raw_executions = count(physical_test, "total", default=executed) if physical_test else None
+    if raw_executions is None:
+        raw_executions = count(test, "raw_executions", default=executed) or executed
+    compiled_classes = count(physical_build, "class_count", default=None)
+    metric_kwargs = dict(event_metrics)
+    if compiled_classes is not None:
+        metric_kwargs["compiled_classes"] = compiled_classes
+    conflicts = tuple(
+        dict.fromkeys(
+            [
+                *tuple(snapshot.get("conflicts") or ()),
+                *tuple(physical_test.get("conflicts") or ()),
+            ]
+        )
+    )
     metrics = RunMetrics(
         verdict=str(snapshot.get("verdict") or snapshot.get("status") or "unknown").lower(),
         unique_total=executed,
@@ -523,12 +566,12 @@ def _legacy_metrics(
         unique_failed=failed,
         unique_errors=errors,
         unique_skipped=skipped,
-        raw_executions=int(test.get("raw_executions", executed) or executed),
-        flaky_count=int(test.get("flaky_count", 0) or 0),
+        raw_executions=raw_executions,
+        flaky_count=int(metric_test.get("flaky_count", 0) or 0),
         thought_calls=thought_calls,
         action_calls=action_calls,
-        conflicts=tuple(snapshot.get("conflicts") or ()),
-        **event_metrics,
+        conflicts=conflicts,
+        **metric_kwargs,
     )
     return str(snapshot.get("run_id") or session.name), metrics, phase_report
 
@@ -576,6 +619,9 @@ class ABCollector:
             )
             source_schema = "legacy_structured"
             structured.append(str(phase_report))
+            report_metrics = session / ".setup_agent" / "report_metrics.json"
+            if report_metrics.is_file():
+                structured.append(str(report_metrics))
         return CollectedRun(
             run_id=run_id,
             session_path=str(session),
@@ -614,7 +660,10 @@ def _text_surface(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="replace")
     normalized = text.replace("**", "")
     verdict = _TEXT_VERDICT.search(normalized)
-    tests = _TEXT_TESTS_RATIO.search(normalized) or _TEXT_TESTS_CLI.search(normalized)
+    # Captured CLI logs may embed report-tool output after the canonical final
+    # summary. Prefer the uniquely-shaped sealed CLI projection whenever it is
+    # present so an older ratio-shaped line cannot shadow it.
+    tests = _TEXT_TESTS_CLI.search(normalized) or _TEXT_TESTS_RATIO.search(normalized)
     no_tests = _TEXT_NO_TESTS.search(normalized)
     anchor = tests or no_tests
     if anchor is not None:
@@ -912,7 +961,7 @@ class CampaignStore:
         )
         current = self._records(stage)
         failures: list[str] = []
-        match = re.fullmatch(r"ws(?P<number>[0-9]+)", stage.lower())
+        match = re.fullmatch(r"ws(?P<number>[0-9]+)(?:-[a-z0-9-]+)?", stage.lower())
         stage_number = int(match.group("number")) if match else 0
 
         for probe in required_probes:
