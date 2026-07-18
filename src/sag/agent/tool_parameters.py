@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from typing import Any, Dict, Optional
@@ -484,6 +485,17 @@ class ToolParameterNormalizer:
         """Convert parameter to expected type."""
         try:
             if expected_type == "string":
+                # Structured planner values must have one stable string form.
+                # ``str(dict)`` depends on insertion order and uses Python
+                # quoting, which made an actor's semantically identical JSON
+                # string fail the scheduler's exact comparison.
+                if isinstance(value, dict):
+                    return json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
                 # Handle list to string conversion properly
                 if isinstance(value, list):
                     # If list has one element, return just that element
@@ -522,8 +534,6 @@ class ToolParameterNormalizer:
                 if isinstance(value, str):
                     # Try to parse as JSON array or split by common delimiters
                     try:
-                        import json
-
                         return json.loads(value)
                     except:
                         # Split by common delimiters
@@ -534,8 +544,6 @@ class ToolParameterNormalizer:
             elif expected_type == "object":
                 if isinstance(value, str):
                     try:
-                        import json
-
                         return json.loads(value)
                     except:
                         # CRITICAL FIX: Don't lose the original string value!

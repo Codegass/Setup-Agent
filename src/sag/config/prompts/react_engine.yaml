@@ -395,7 +395,7 @@ mode_prompts:
     PLAN RULES:
     1. Every step must be executable as-is; exact_params is not a sketch.
     2. Use only registered tools and their real parameters.
-    3. Later parameters and preconditions may use explicit prior-step placeholders such as {{step_1.output_ref}} or {{step_1.poll_ref}}. Never reference the current or a future step.
+    3. Later parameters and preconditions may use explicit prior-step placeholders such as {{step_1.output_ref}} or {{step_1.poll_ref}}. For a project clone workspace, prefer {{step_1.metadata.clone_path}}; output_ref is normally a durable evidence id, not a filesystem path. Never reference the current or a future step.
     4. Preconditions must be complete prior-step placeholders whose resolved value must be truthy.
     5. Include enough straight-line steps to avoid reasoning after every successful action. A detached pending result should flow to a planned poll step.
     6. Do not emit ACTION, PARAMETERS, function calls, a second plan, prose after the plan JSON, or guessed values.

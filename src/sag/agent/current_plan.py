@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import re
-from enum import Enum
 from collections.abc import Collection
+from enum import Enum
 from typing import Any, Mapping, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -379,6 +379,17 @@ class CurrentPlan(BaseModel):
             ) from exc
 
         path = match.group("path")
+        # Project clone results expose both a durable log ``output_ref`` and
+        # the filesystem path that downstream project actions need.  Live
+        # planners naturally use ``step_N.output_ref`` for the clone output;
+        # resolve that placeholder to the clone workspace when the result
+        # carries the authoritative path instead of handing an opaque storage
+        # id to project(action="analyze").  The durable id remains available
+        # in the recorded result snapshot for evidence and replay.
+        if path == "output_ref" and isinstance(current, Mapping):
+            metadata = current.get("metadata")
+            if isinstance(metadata, Mapping) and metadata.get("clone_path"):
+                return metadata["clone_path"]
         for component in path.split("."):
             if isinstance(current, Mapping):
                 if component not in current:

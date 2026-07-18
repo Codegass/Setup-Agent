@@ -2324,7 +2324,13 @@ class ReActEngine(UIEventEmitter):
                 )
                 self._emit_control_planner_rejection(response, "thinking_included_action")
             else:
-                accepted = scheduler.accept_thinking_response(response)
+                try:
+                    plan = CurrentPlan.from_thinking_response(response)
+                    scheduler.accept_plan(self._canonicalize_scheduler_plan(plan))
+                    accepted = True
+                except PlanFault as fault:
+                    scheduler.reject_plan(fault)
+                    accepted = False
                 if accepted and scheduler.current_plan is not None:
                     self._emit_control_planner_response(scheduler.current_plan)
                 else:
@@ -2344,6 +2350,40 @@ class ReActEngine(UIEventEmitter):
             priority=9,
         )
         return []
+
+    def _canonicalize_scheduler_plan(self, plan: CurrentPlan) -> CurrentPlan:
+        """Normalize planner parameters before they become the exact contract.
+
+        Function-calling schemas canonicalize actor parameters (for example
+        ``path`` to ``project_path`` and structured values to strings).  Doing
+        the same deterministic normalization when accepting the plan keeps the
+        authoritative prompt, strict comparison, emitted envelope, and actual
+        tool invocation on one representation.
+        """
+        tools = getattr(self, "tools", None)
+        if not isinstance(tools, dict) or not tools:
+            return plan
+
+        from .tool_parameters import ToolParameterNormalizer
+
+        normalizer = ToolParameterNormalizer(
+            tools=tools,
+            successful_states=getattr(self, "successful_states", {}),
+            repository_url=getattr(self, "repository_url", None),
+            repository_ref=getattr(self, "repository_ref", None),
+            logger=logger,
+        )
+        normalized_steps = []
+        for step in plan.steps:
+            tool_name, raw_params = normalizer.resolve_legacy_alias(
+                step.tool,
+                dict(step.exact_params),
+            )
+            normalized_params = normalizer.validate_and_fix(tool_name, raw_params)
+            normalized_steps.append(
+                step.model_copy(update={"tool": tool_name, "exact_params": normalized_params})
+            )
+        return plan.model_copy(update={"steps": tuple(normalized_steps)})
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""

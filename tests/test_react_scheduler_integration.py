@@ -12,7 +12,20 @@ from sag.agent.reasoning_scheduler import (
 )
 from sag.agent.tool_orchestration import ToolCall, ToolExecution
 from sag.config.prompt_loader import load_react_engine_prompts
-from sag.tools.base import ToolResult
+from sag.tools.base import BaseTool, ToolResult
+
+
+class _SchemaTool(BaseTool):
+    def __init__(self, name, properties):
+        super().__init__(name, f"{name} scheduler schema tool")
+        self._parameter_schema = {
+            "type": "object",
+            "properties": properties,
+            "required": ["action"],
+        }
+
+    def execute(self, **params):
+        return ToolResult.completed_success(output=str(params))
 
 
 def _plan_step(command="pwd"):
@@ -45,7 +58,14 @@ CURRENT_PLAN:
 
 def _scheduled_engine(*, tools=("bash",)):
     engine = ReActEngine.__new__(ReActEngine)
-    engine.reasoning_scheduler = ReasoningScheduler(available_tools=set(tools))
+    available_tools = set(tools)
+    if isinstance(tools, dict):
+        available_tools = set(tools)
+        engine.tools = tools
+        engine.successful_states = {"working_directory": "/workspace/paramiko"}
+        engine.repository_url = None
+        engine.repository_ref = None
+    engine.reasoning_scheduler = ReasoningScheduler(available_tools=available_tools)
     engine._scheduler_active = True
     engine._scheduled_turn = None
     engine.guidance = []
@@ -109,6 +129,86 @@ def test_thinking_response_installs_plan_before_any_actor_turn():
     actor_turn = engine.reasoning_scheduler.next_turn()
     assert actor_turn.mode is SchedulerMode.ACTION
     assert actor_turn.step.exact_params == {"command": "pwd"}
+
+
+def test_thinking_plan_is_schema_canonical_before_actor_comparison():
+    tools = {
+        "project": _SchemaTool(
+            "project",
+            {
+                "action": {"type": "string"},
+                "project_path": {"type": "string"},
+            },
+        ),
+        "phase": _SchemaTool(
+            "phase",
+            {
+                "action": {"type": "string"},
+                "outcome": {"type": "string"},
+                "key_results": {"type": "string"},
+            },
+        ),
+    }
+    engine = _scheduled_engine(tools=tools)
+    parser = ReActResponseParser(lambda: "ts")
+    response = """THOUGHT: Execute the schema-valid actions exactly.
+
+CURRENT_PLAN:
+{
+  "steps": [
+    {
+      "tool": "project",
+      "exact_params": {"action": "analyze", "path": "/workspace/paramiko"},
+      "preconditions": [],
+      "expected_evidence": ["analysis"],
+      "success_criteria": ["analysis completes"]
+    },
+    {
+      "tool": "phase",
+      "exact_params": {
+        "action": "done",
+        "outcome": "partial",
+        "key_results": {"passed": 541, "executed": 559}
+      },
+      "preconditions": [],
+      "expected_evidence": ["phase close"],
+      "success_criteria": ["phase accepted"]
+    }
+  ]
+}"""
+    thinking_turn = engine.reasoning_scheduler.next_turn()
+
+    safe_steps = engine._prepare_scheduler_steps(
+        response,
+        parser.parse(response, model_used="thinker", was_thinking_model=True),
+        thinking_turn,
+    )
+
+    assert [step.step_type for step in safe_steps] == [StepType.THOUGHT]
+    plan = engine.reasoning_scheduler.current_plan
+    assert plan is not None
+    assert plan.steps[0].exact_params == {
+        "action": "analyze",
+        "project_path": "/workspace/paramiko",
+    }
+    assert plan.steps[1].exact_params["key_results"] == '{"executed":559,"passed":541}'
+
+    actor_turn = engine.reasoning_scheduler.next_turn()
+    actor_response = (
+        "ACTION: project\nPARAMETERS: "
+        '{"action": "analyze", "project_path": "/workspace/paramiko"}'
+    )
+    safe_actions = engine._prepare_scheduler_steps(
+        actor_response,
+        parser.parse(actor_response, model_used="actor", was_thinking_model=False),
+        actor_turn,
+    )
+
+    assert len(safe_actions) == 1
+    assert safe_actions[0].tool_params == {
+        "action": "analyze",
+        "project_path": "/workspace/paramiko",
+    }
 
 
 def test_malformed_plan_and_actor_mismatch_execute_no_tool_step():

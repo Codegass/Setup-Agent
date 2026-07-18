@@ -151,6 +151,48 @@ def test_pending_unknown_dispatch_continues_to_planned_poll_without_thinking():
     assert scheduler.thinking_turns == 1
 
 
+def test_clone_output_ref_placeholder_resolves_to_workspace_path():
+    scheduler = ReasoningScheduler(available_tools={"project"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                _step(
+                    1,
+                    tool="project",
+                    params={"action": "clone", "repo_url": "https://example/repo.git"},
+                ),
+                _step(
+                    2,
+                    tool="project",
+                    params={
+                        "action": "analyze",
+                        "project_path": "{{step_1.output_ref}}",
+                    },
+                    preconditions=("{{step_1.output_ref}}",),
+                ),
+            )
+        )
+    )
+
+    clone = _take_action(scheduler)
+    assert clone.tool == "project"
+    scheduler.observe_result(
+        _success(
+            output_ref="output_clone_log",
+            metadata={"clone_path": "/workspace/repo"},
+        )
+    )
+
+    analyze = scheduler.next_turn()
+    assert analyze.mode is SchedulerMode.ACTION
+    assert analyze.step is not None
+    assert analyze.step.exact_params == {
+        "action": "analyze",
+        "project_path": "/workspace/repo",
+    }
+
+
 def test_terminal_poll_success_or_failure_requests_reasoning():
     for terminal in (_success(poll_ref="job:one"), _failure(poll_ref="job:one")):
         scheduler = ReasoningScheduler(available_tools={"search"})
