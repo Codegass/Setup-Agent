@@ -398,3 +398,45 @@ def test_python_projects_keep_module_conflict_suppression():
     snapshot = _finalize(state, validator)
     assert snapshot.conflicts == ()
     assert snapshot.verdict == "success"
+
+
+def test_pr9_phantom_green_gate_reaches_the_sealed_verdict():
+    """PR #9's bigtop fix, end-to-end through the finalizer.
+
+    The phantom-green gate (a JVM build with 0 compiled .class files and only
+    vendored JARs is NOT green) lives inside validate_build_status. During the
+    ws7 implementation window the finalizer never consulted it (last-
+    observation-wins), so an agent observation claiming success could have
+    resealed the exact false-green PR #9 killed. This locks the chain: the
+    physical gate's verdict reaches the sealed snapshot even when the build
+    observation says success.
+    """
+    state = RunEvidenceState(run_id="session-phantom")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="BUILD SUCCESS (vendored jars satisfied the tool)",
+            refs=["output_vendored"],
+        ),
+        provenance="output_vendored",
+    )
+    validator = FakePhysicalValidator(
+        {
+            "success": False,
+            "build_complete": False,
+            "reason": (
+                "No compiled .class files found for maven build (3 non-class "
+                "artifact(s) such as vendored JARs are not evidence the project compiled)"
+            ),
+            "conflicts": [],
+            "evidence_status": "blocked",
+            "evidence": {"class_count": 0, "artifact_count": 3},
+        }
+    )
+    snapshot = _finalize(state, validator)
+
+    assert snapshot.build_evidence.judgment == "failed"
+    assert snapshot.build_evidence.source == "physical"
+    assert snapshot.build_evidence.compiled_classes == 0
+    assert snapshot.verdict == "failed"
