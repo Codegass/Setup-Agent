@@ -19,6 +19,7 @@ from sag.agent.react_engine import ReActEngine
 from sag.agent.reasoning_scheduler import ReasoningScheduler
 from sag.agent.replay import ControlReplayRunner, ReplayValidationError
 from sag.config.logger import SessionLogger
+from sag.config.prompt_loader import PromptConfig
 from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
 
@@ -359,7 +360,7 @@ def test_run_pin_hashes_the_complete_prompt_bundle(tmp_path):
     agent = object.__new__(SetupAgent)
     agent._run_pin_host_path = tmp_path / "run-pin.json"
     agent.config = PinConfig()
-    agent.react_engine = SimpleNamespace(prompts={"system": "x" * 600 + "a"})
+    agent.react_engine = SimpleNamespace(prompts=PromptConfig({"system": "x" * 600 + "a"}))
     agent.phase_machine = object()
     agent.agent_logger = SimpleNamespace(warning=lambda *_args, **_kwargs: None)
     agent._resolve_sag_git_sha = lambda: "a" * 40
@@ -367,7 +368,7 @@ def test_run_pin_hashes_the_complete_prompt_bundle(tmp_path):
 
     agent._initialize_run_pin_template()
     first = agent._run_pin_template["prompt_bundle_sha256"]
-    agent.react_engine.prompts = {"system": "x" * 600 + "b"}
+    agent.react_engine.prompts = PromptConfig({"system": "x" * 600 + "b"})
     agent._initialize_run_pin_template()
 
     assert agent._run_pin_template["prompt_bundle_sha256"] != first

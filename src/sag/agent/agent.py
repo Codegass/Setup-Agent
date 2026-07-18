@@ -251,6 +251,11 @@ class SetupAgent:
             return
         seed_text = str(os.getenv("SAG_RANDOM_SEED") or "").strip()
         random_seed = int(seed_text) if re.fullmatch(r"-?[0-9]+", seed_text) else None
+        prompt_bundle = getattr(
+            self.react_engine.prompts,
+            "canonical_payload",
+            self.react_engine.prompts,
+        )
         self._run_pin_template = {
             "container_image_digest": image_digest,
             "sag_git_sha": sag_git_sha,
@@ -259,7 +264,7 @@ class SetupAgent:
             "sanitized_config": sanitize_config(self.config),
             # Hash the complete prompt bundle. Event projections are bounded,
             # but a reproducibility pin must notice suffix-only prompt edits.
-            "prompt_bundle_sha256": canonical_sha256(self.react_engine.prompts),
+            "prompt_bundle_sha256": canonical_sha256(prompt_bundle),
             "feature_flags": {
                 "control_events": True,
                 "reasoning_scheduler": True,
