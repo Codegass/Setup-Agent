@@ -388,9 +388,9 @@ def _populate_valid_six_bar_campaign(tmp_path, *, current_stage="ws7"):
                     "thought_calls": 10 if probe == "paramiko" else 4,
                     "action_calls": 6,
                     "envelope_count": 6,
-                    "compiled_classes": 8916 if probe == "cassandra-java-driver" else None,
-                    "unique_total": 4900 if probe == "cassandra-java-driver" else 541,
-                    "raw_executions": 4900 if probe == "cassandra-java-driver" else 544,
+                    "compiled_classes": 8914 if probe == "cassandra-java-driver" else None,
+                    "unique_total": 4590 if probe == "cassandra-java-driver" else 541,
+                    "raw_executions": 4810 if probe == "cassandra-java-driver" else 544,
                 }
             )
             campaign.append(
@@ -448,12 +448,26 @@ def test_campaign_gate_rejects_cassandra_metric_drift(tmp_path):
     campaign = _populate_valid_six_bar_campaign(tmp_path)
     path = campaign.path / "cassandra-java-driver-ws7.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["runs"][0]["metrics"]["compiled_classes"] = 8915
+    payload["runs"][0]["metrics"]["compiled_classes"] = 8913
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     summary = campaign.evaluate("ws7", min_repeats=3)
 
-    assert any("8,916 compiled classes" in failure for failure in summary.failures)
+    assert any("8,914..8,916 compiled classes" in failure for failure in summary.failures)
+
+
+def test_campaign_gate_rejects_cassandra_unique_or_raw_volume_drift(tmp_path):
+    campaign = _populate_valid_six_bar_campaign(tmp_path)
+    path = campaign.path / "cassandra-java-driver-ws7.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["runs"][0]["metrics"]["unique_total"] = 4900
+    payload["runs"][1]["metrics"]["raw_executions"] = 4799
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    summary = campaign.evaluate("ws7", min_repeats=3)
+
+    assert any("unique tests are outside 4,500..4,700" in item for item in summary.failures)
+    assert any("raw executions are outside 4,800..5,100" in item for item in summary.failures)
 
 
 def test_campaign_does_not_equate_rejected_actor_calls_with_tool_envelopes(tmp_path):

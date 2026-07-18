@@ -28,6 +28,15 @@ from sag.agent.control_events import (
 )
 from sag.agent.verdict_finalizer import RunVerdictSnapshot
 
+# Bar 6 spans the WS7 basis migration. The historical 4,928 figure was runner
+# executions, not canonical identities; the explicit (module, class, name,
+# param_id) basis is ~4.6k while the raw execution guard remains ~4.9k. Clean
+# Maven lifecycle output has 8,914 classes; two unshaded Guava substitution
+# classes can remain after a non-clean failed build, accounting for 8,916.
+CASSANDRA_CLASS_RANGE = (8914, 8916)
+CASSANDRA_UNIQUE_TEST_RANGE = (4500, 4700)
+CASSANDRA_RAW_EXECUTION_RANGE = (4800, 5100)
+
 
 class CollectionError(RuntimeError):
     pass
@@ -1013,13 +1022,30 @@ class CampaignStore:
                 if probe == "cassandra-java-driver":
                     if metrics.verdict != "success":
                         failures.append(f"bar6 Cassandra verdict is not success for {prefix}")
-                    if metrics.compiled_classes != 8916:
+                    if not (
+                        CASSANDRA_CLASS_RANGE[0]
+                        <= (metrics.compiled_classes or 0)
+                        <= CASSANDRA_CLASS_RANGE[1]
+                    ):
                         failures.append(
-                            f"bar6 Cassandra must report exactly 8,916 compiled classes for {prefix}"
+                            "bar6 Cassandra must report 8,914..8,916 compiled classes "
+                            f"for {prefix}"
                         )
-                    if not 4800 <= metrics.unique_total <= 5100:
+                    if not (
+                        CASSANDRA_UNIQUE_TEST_RANGE[0]
+                        <= metrics.unique_total
+                        <= CASSANDRA_UNIQUE_TEST_RANGE[1]
+                    ):
                         failures.append(
-                            f"bar6 Cassandra unique tests are outside 4,800..5,100 for {prefix}"
+                            f"bar6 Cassandra unique tests are outside 4,500..4,700 for {prefix}"
+                        )
+                    if not (
+                        CASSANDRA_RAW_EXECUTION_RANGE[0]
+                        <= metrics.raw_executions
+                        <= CASSANDRA_RAW_EXECUTION_RANGE[1]
+                    ):
+                        failures.append(
+                            f"bar6 Cassandra raw executions are outside 4,800..5,100 for {prefix}"
                         )
 
         if stage_number >= 4:
