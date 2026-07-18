@@ -352,6 +352,19 @@ class SetupAgent:
         # timed build duration + command in its evidence dict.
         self.physical_validator.command_tracker = self.command_tracker
 
+        # Late-bind the finalizer's build oracle: the finalizer is constructed
+        # before the validator exists, and the physical validator MUST be the
+        # single build oracle at evidence-close (ws7-final7 regression: the
+        # observation-only fold sealed bigtop as failed while the gates read
+        # the physical tri-state — split-brain between the two new components).
+        finalizer = getattr(self, "verdict_finalizer", None)
+        if finalizer is not None and getattr(finalizer, "validator", None) is None:
+            finalizer.validator = self.physical_validator
+            if getattr(finalizer, "project_name", None) is None:
+                finalizer.project_name = getattr(self, "project_name", None) or getattr(
+                    self.orchestrator, "project_name", None
+                )
+
         # Stage-1 surface: the legacy tools below are no longer model-facing;
         # they live on as backends/delegates of the build/project/search facades.
         maven_tool = MavenTool(self.orchestrator, command_tracker=self.command_tracker)

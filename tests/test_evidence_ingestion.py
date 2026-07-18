@@ -813,8 +813,11 @@ def test_total_output_persistence_failure_keeps_actual_failure_with_fallback_pro
     assert failed_observation.scope is StateScope.ARTIFACTS
     assert failed_observation.result.operation_outcome is OperationOutcome.FAILED
     assert failed_observation.provenance == ("tool:build:compile:output-persistence-failed")
-    assert snapshot.build_evidence.outcome is OperationOutcome.FAILED
-    assert snapshot.verdict == "failed"
+    # Physical-oracle fold (2026-07-18): a later failed compile no longer
+    # ERASES the green build that physically happened — mixed evidence in one
+    # action group renders partial, and output_storage_failed keeps the cap.
+    assert snapshot.build_evidence.outcome is OperationOutcome.PARTIAL
+    assert snapshot.verdict == "partial"
     assert "output_storage_failed" in snapshot.conflicts
 
 

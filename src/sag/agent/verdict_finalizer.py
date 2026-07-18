@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Literal, cast
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from sag.agent.physical_validator import evaluate_run_verdict
@@ -119,6 +120,14 @@ class BuildEvidenceSnapshot(BaseModel):
 
     observed: bool = False
     green: bool = False
+    # Tri-state build judgment. The PHYSICAL validator is the primary oracle
+    # (live ws7-final7 regression: last-observation-wins sealed bigtop as
+    # failed while 121 compiled classes and 50/50 green tests sat on disk —
+    # the July-13 kernel honestly called that PARTIAL). ``source`` records
+    # which oracle produced the judgment so gate/finalizer divergence is
+    # diagnosable, never silent.
+    judgment: Literal["success", "partial", "failed", "unknown"] = "unknown"
+    source: Literal["physical", "observations", "none"] = "none"
     outcome: OperationOutcome = OperationOutcome.UNKNOWN
     evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
     refs: tuple[str, ...] = ()
@@ -231,30 +240,193 @@ def _explicit_build_green(observation: ToolObservation) -> bool | None:
     return None
 
 
-def _fold_build_evidence(state: RunEvidenceState) -> BuildEvidenceSnapshot:
+_JUDGMENT_OUTCOME = {
+    "success": OperationOutcome.SUCCESS,
+    "partial": OperationOutcome.PARTIAL,
+    "failed": OperationOutcome.FAILED,
+    "unknown": OperationOutcome.UNKNOWN,
+}
+
+_EVIDENCE_STATUS_MAP = {
+    "success": EvidenceStatus.VERIFIED,
+    "green": EvidenceStatus.VERIFIED,
+    "verified": EvidenceStatus.VERIFIED,
+    "partial": EvidenceStatus.VERIFIED,
+    "blocked": EvidenceStatus.VERIFIED,
+    "conflict": EvidenceStatus.CONFLICT,
+}
+
+
+def _physical_build_status(validator, project_name) -> dict[str, Any] | None:
+    """One authoritative physical scan at evidence-close; never raises."""
+    if validator is None:
+        return None
+    try:
+        status = validator.validate_build_status(project_name)
+    except Exception as exc:  # container gone, replay harness, etc.
+        logger.warning(f"physical build oracle unavailable at finalize: {exc}")
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def _physical_judgment(status: dict[str, Any]) -> str | None:
+    success = status.get("success")
+    if success is True:
+        return "success" if status.get("build_complete", True) else "partial"
+    if success is False:
+        return "failed"
+    return None
+
+
+_ACTION_PARAM_KEYS = ("action", "command", "task", "tasks", "goal", "operation")
+
+
+def _observation_action_group(observation) -> tuple[str, str]:
+    params = observation.params if isinstance(observation.params, dict) else {}
+    for key in _ACTION_PARAM_KEYS:
+        value = params.get(key)
+        if value:
+            return (observation.tool_name, str(value))
+    return (observation.tool_name, "")
+
+
+def _aggregate_observation_judgment(observations) -> str:
+    """Fallback (no container, e.g. replay): AGGREGATE, never bare last-wins.
+
+    Rule (mirrors the WS7 attempt-history philosophy): within one action group
+    (tool + action verb), a LATER success supersedes earlier failures — retry
+    semantics, someone fixed it. A later failure never erases an earlier
+    success — it may be a different target (live bigtop: the failed maven
+    island erased the built gradle islands under bare last-wins). Mixed
+    evidence renders partial; only the physical oracle can adjudicate further.
+    """
+    groups: dict[tuple[str, str], list[OperationOutcome]] = {}
+    for observation in observations:
+        groups.setdefault(_observation_action_group(observation), []).append(
+            observation.result.operation_outcome
+        )
+
+    group_judgments: list[str] = []
+    for outcomes in groups.values():
+        informative = [
+            outcome
+            for outcome in outcomes
+            if outcome
+            in (OperationOutcome.SUCCESS, OperationOutcome.PARTIAL, OperationOutcome.FAILED)
+        ]
+        if not informative:
+            continue
+        last_success = max(
+            (i for i, o in enumerate(informative) if o is OperationOutcome.SUCCESS),
+            default=-1,
+        )
+        last_failure = max(
+            (i for i, o in enumerate(informative) if o is OperationOutcome.FAILED),
+            default=-1,
+        )
+        if OperationOutcome.PARTIAL in informative:
+            group_judgments.append("partial")
+        elif last_success >= 0 and last_failure < 0:
+            group_judgments.append("success")
+        elif last_failure >= 0 and last_success < 0:
+            group_judgments.append("failed")
+        elif last_success > last_failure:
+            group_judgments.append("success")  # retry recovered the action
+        else:
+            group_judgments.append("partial")  # success then failure: mixed truth
+
+    if not group_judgments:
+        return "unknown"
+    if all(judgment == "success" for judgment in group_judgments):
+        return "success"
+    if all(judgment == "failed" for judgment in group_judgments):
+        return "failed"
+    return "partial"
+
+
+def _fold_build_evidence(
+    state: RunEvidenceState,
+    validator=None,
+    project_name=None,
+) -> tuple[BuildEvidenceSnapshot, tuple[str, ...]]:
+    """Fold build evidence: PHYSICAL validator first, observations as fallback.
+
+    Returns the snapshot plus any conflicts the physical oracle emitted (e.g.
+    ``build_modules_incomplete``) so the module-coverage honesty of the old
+    kernel survives into the sealed run state.
+    """
     observations = [
         observation
         for observation in state.tool_observations
         if EvidenceRole.BUILD in observation.roles
         and observation.result.invocation_status.value != "pending"
     ]
-    if not observations:
-        return BuildEvidenceSnapshot()
+    observation_refs = _dedupe(
+        ref for observation in observations for ref in _result_refs(observation)
+    )
 
+    physical = _physical_build_status(validator, project_name)
+    judgment = _physical_judgment(physical) if physical is not None else None
+    if judgment is not None:
+        evidence = physical.get("evidence") if isinstance(physical.get("evidence"), dict) else {}
+        compiled = _nonnegative_int(
+            evidence.get("class_count") if isinstance(evidence, dict) else None
+        )
+        if compiled is None:
+            compiled = _nonnegative_int(state.fact_value("build.compiled_classes"))
+        physical_refs = tuple(
+            str(ref) for ref in (physical.get("evidence_refs") or ()) if str(ref).strip()
+        )
+        conflicts = tuple(
+            str(conflict)
+            for conflict in (physical.get("conflicts") or ())
+            if str(conflict).strip()
+        )
+        evidence_status = _EVIDENCE_STATUS_MAP.get(
+            str(physical.get("evidence_status") or "").strip().lower(),
+            EvidenceStatus.VERIFIED,
+        )
+        return (
+            BuildEvidenceSnapshot(
+                observed=True,
+                green=judgment == "success",
+                judgment=judgment,
+                source="physical",
+                outcome=_JUDGMENT_OUTCOME[judgment],
+                evidence_status=evidence_status,
+                refs=_dedupe([*physical_refs, *observation_refs]),
+                compiled_classes=compiled,
+            ),
+            conflicts,
+        )
+
+    if not observations:
+        return BuildEvidenceSnapshot(), ()
+
+    judgment = _aggregate_observation_judgment(observations)
     latest = observations[-1]
     explicit_green = _explicit_build_green(latest)
-    green = (
-        explicit_green
-        if explicit_green is not None
-        else latest.result.operation_outcome is OperationOutcome.SUCCESS
-    )
-    return BuildEvidenceSnapshot(
-        observed=True,
-        green=green,
-        outcome=latest.result.operation_outcome,
-        evidence_status=latest.result.evidence_status,
-        refs=_dedupe(ref for observation in observations for ref in _result_refs(observation)),
-        compiled_classes=_nonnegative_int(state.fact_value("build.compiled_classes")),
+    # Explicit evidence facts on the result (WS0) outrank the outcome
+    # aggregate — the verified-artifact rescue: a tool that failed AFTER
+    # verifying real build evidence is a partial, not a dead build. The
+    # inverse holds too (explicitly-negated evidence caps success).
+    if explicit_green is True and judgment == "failed":
+        judgment = "partial"
+    elif explicit_green is False and judgment == "success":
+        judgment = "partial"
+    green = explicit_green if explicit_green is not None else judgment == "success"
+    return (
+        BuildEvidenceSnapshot(
+            observed=True,
+            green=green,
+            judgment=judgment,
+            source="observations",
+            outcome=_JUDGMENT_OUTCOME[judgment],
+            evidence_status=latest.result.evidence_status,
+            refs=observation_refs,
+            compiled_classes=_nonnegative_int(state.fact_value("build.compiled_classes")),
+        ),
+        (),
     )
 
 
@@ -473,29 +645,68 @@ def _snapshot_verdict(
     tests: SnapshotTestStats,
     conflicts: tuple[str, ...],
 ) -> Literal["success", "partial", "failed", "unknown"]:
-    if not build.observed or build.outcome is OperationOutcome.UNKNOWN:
-        return "unknown"
-
-    build_judge = {
-        OperationOutcome.SUCCESS: "success",
-        OperationOutcome.PARTIAL: "partial",
-        OperationOutcome.FAILED: "failed",
-        OperationOutcome.SKIPPED: "unknown",
-    }.get(build.outcome)
-    build_judge = rescue_blocked_build(build_judge, build.green)
-
-    if not build.green:
+    # Tri-state fold (restores the July-13 kernel's PARTIAL middle; live
+    # ws7-final7 regression: `not green -> failed` erased it and bigtop's
+    # partial-build + 50/50 green tests rendered FAILED):
+    #   build success -> tests decide (green=success, red=failed, none=partial)
+    #   build partial -> capped at partial (tests red still fail)
+    #   build failed  -> failed
+    #   build unknown -> strong test evidence grounds the verdict; only a run
+    #                    with NOTHING observed anywhere stays unknown.
+    if build.judgment == "failed":
         physical_verdict = "failed"
-    elif tests.judgment == "success":
-        physical_verdict = "success"
-    elif tests.judgment == "failed":
-        physical_verdict = "failed"
-    else:
-        physical_verdict = "partial"
+    elif build.judgment == "success":
+        if tests.judgment == "success":
+            physical_verdict = "success"
+        elif tests.judgment == "failed":
+            physical_verdict = "failed"
+        else:
+            physical_verdict = "partial"
+    elif build.judgment == "partial":
+        physical_verdict = "failed" if tests.judgment == "failed" else "partial"
+    else:  # unknown build
+        if tests.judgment == "failed":
+            physical_verdict = "failed"
+        elif tests.judgment == "success":
+            physical_verdict = "partial"
+        else:
+            return "unknown"
+
+    # No separate blocked-build rescue here: the physical oracle IS the rescue
+    # (agent beliefs never reach this fold; judgment already reflects the real
+    # build). rescue_blocked_build stays exported for the legacy surfaces.
+    build_judge = build.judgment if build.judgment != "unknown" else None
     return cast(
         Literal["success", "partial", "failed", "unknown"],
         run_verdict(build_judge, physical_verdict, conflicts),
     )
+
+
+_OUTCOME_RANK = {"failed": 0, "partial": 1, "success": 2}
+
+
+def _oracle_divergence_conflicts(state: RunEvidenceState, build) -> tuple[str, ...]:
+    """Gate-vs-finalizer divergence is a VISIBLE conflict, never silent.
+
+    Live ws7-final7: one sealed snapshot carried the build phase gate-validated
+    as SUCCESS next to build evidence FAILED. With both sides now reading the
+    physical oracle this should not recur; if physical state genuinely changed
+    between the mid-run gate and evidence-close (rank gap >= 2), the snapshot
+    says so instead of shipping a quiet contradiction.
+    """
+    build_rank = _OUTCOME_RANK.get(build.judgment)
+    if build_rank is None:
+        return ()
+    for record in state.phase_records:
+        phase = str(getattr(record, "phase", "") or "")
+        if phase != "build":
+            continue
+        validated = getattr(record, "validated_outcome", None)
+        validated_value = getattr(validated, "value", validated)
+        validated_rank = _OUTCOME_RANK.get(str(validated_value or ""))
+        if validated_rank is not None and abs(validated_rank - build_rank) >= 2:
+            return ("build_oracle_divergence",)
+    return ()
 
 
 def _phase_record_snapshot(record) -> PhaseRecordSnapshot:
@@ -533,9 +744,21 @@ def read_verdict_snapshot(orchestrator) -> RunVerdictSnapshot:
 
 
 class VerdictFinalizer:
-    def __init__(self, orchestrator, *, test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD):
+    def __init__(
+        self,
+        orchestrator,
+        *,
+        test_pass_threshold: float = DEFAULT_TEST_PASS_THRESHOLD,
+        validator=None,
+        project_name: str | None = None,
+    ):
         self.orchestrator = orchestrator
         self.test_pass_threshold = test_pass_threshold
+        # The physical validator is the build oracle at evidence-close (same
+        # oracle the gates consult). None (e.g. replay) degrades the fold to
+        # the observation aggregate.
+        self.validator = validator
+        self.project_name = project_name
         self._snapshots: dict[int, RunVerdictSnapshot] = {}
         self._expected_snapshots: dict[int, RunVerdictSnapshot] = {}
 
@@ -545,12 +768,23 @@ class VerdictFinalizer:
         if cached is not None:
             return cached
 
-        build = _fold_build_evidence(state)
+        build, build_conflicts = _fold_build_evidence(
+            state,
+            validator=self.validator,
+            project_name=self.project_name,
+        )
         tests, test_conflicts = _fold_test_stats(
             state,
             test_pass_threshold=self.test_pass_threshold,
         )
-        conflicts = _dedupe([*state.conflicts, *test_conflicts])
+        conflicts = _dedupe(
+            [
+                *state.conflicts,
+                *build_conflicts,
+                *test_conflicts,
+                *_oracle_divergence_conflicts(state, build),
+            ]
+        )
         input_refs = _dedupe(
             [
                 *(

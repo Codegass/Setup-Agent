@@ -447,6 +447,16 @@ class ReActEngine(UIEventEmitter):
         if getattr(self.context_manager, "physical_validator", None) is None:
             self.context_manager.physical_validator = self.physical_validator
 
+        # Late-bind the finalizer's build oracle (same contract as
+        # SetupAgent._initialize_tools): gates and finalizer must read the SAME
+        # physical validator, or the sealed snapshot can carry a gate-validated
+        # SUCCESS next to observation-derived FAILED (live ws7-final7 bigtop).
+        finalizer = getattr(self, "verdict_finalizer", None)
+        if finalizer is not None and getattr(finalizer, "validator", None) is None:
+            finalizer.validator = self.physical_validator
+            if getattr(finalizer, "project_name", None) is None:
+                finalizer.project_name = self._project_name_for_gate()
+
         # No-physical-progress guard: halt a run that completes tasks without
         # ever producing build artifacts (anti-thrash). Only armed for
         # artifact-bearing builds (Java/Maven/Gradle); see _expects_build_artifacts.
