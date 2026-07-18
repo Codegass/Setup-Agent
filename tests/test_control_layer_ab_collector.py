@@ -5,6 +5,9 @@ import pytest
 
 from sag.agent.control_events import action_envelope_sha256
 from scripts.collect_control_layer_ab import (
+    CASSANDRA_CLASS_RANGE,
+    CASSANDRA_RAW_EXECUTION_RANGE,
+    CASSANDRA_UNIQUE_TEST_RANGE,
     ABCollector,
     CampaignStore,
     CollectionError,
@@ -26,6 +29,26 @@ PIN = {
     "dependency_cache_state": "warm",
     "host_arch": "arm64",
 }
+
+
+def test_panel_records_cassandra_canonical_and_raw_bases():
+    panel_path = Path(__file__).parents[1] / "scripts" / "control_layer_panel.json"
+    acceptance = json.loads(panel_path.read_text(encoding="utf-8"))["probes"][
+        "cassandra-java-driver"
+    ]["acceptance"]
+
+    assert (
+        acceptance["compiled_classes_min"],
+        acceptance["compiled_classes_max"],
+    ) == CASSANDRA_CLASS_RANGE
+    assert (
+        acceptance["unique_tests_min"],
+        acceptance["unique_tests_max"],
+    ) == CASSANDRA_UNIQUE_TEST_RANGE
+    assert (
+        acceptance["raw_executions_min"],
+        acceptance["raw_executions_max"],
+    ) == CASSANDRA_RAW_EXECUTION_RANGE
 
 
 def _session(tmp_path: Path, *, excluding: str | None = None) -> Path:

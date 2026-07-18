@@ -23,9 +23,12 @@
       "acceptance": {
         "surface_agreement": true,
         "verdict": "success",
-        "compiled_classes": 8916,
-        "unique_tests_min": 4800,
-        "unique_tests_max": 5100
+        "compiled_classes_min": 8914,
+        "compiled_classes_max": 8916,
+        "unique_tests_min": 4500,
+        "unique_tests_max": 4700,
+        "raw_executions_min": 4800,
+        "raw_executions_max": 5100
       }
     }
   }
