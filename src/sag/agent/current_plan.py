@@ -116,6 +116,7 @@ _PLACEHOLDER = re.compile(r"\{\{([^{}]+)\}\}")
 _FULL_PLACEHOLDER = re.compile(
     r"^\{\{step_(?P<ordinal>[1-9][0-9]*)\.(?P<path>[A-Za-z_][A-Za-z0-9_.]*)\}\}$"
 )
+_FULL_OUTPUT_REF_MARKER = re.compile(r"\[Full output ref:\s*(?P<ref>output_[A-Za-z0-9_-]+)\]")
 
 
 class CurrentPlan(BaseModel):
@@ -392,6 +393,32 @@ class CurrentPlan(BaseModel):
             metadata = current.get("metadata")
             if isinstance(metadata, Mapping) and metadata.get("clone_path"):
                 return metadata["clone_path"]
+            explicit_ref = current.get("output_ref")
+            if explicit_ref:
+                return explicit_ref
+            for refs_key in ("evidence_refs", "refs"):
+                refs = current.get(refs_key)
+                if isinstance(refs, (list, tuple)):
+                    durable_ref = next(
+                        (ref for ref in refs if isinstance(ref, str) and ref.strip()),
+                        None,
+                    )
+                    if durable_ref:
+                        return durable_ref
+            if isinstance(metadata, Mapping):
+                metadata_ref = metadata.get("output_ref") or metadata.get("output_ref_id")
+                if metadata_ref:
+                    return metadata_ref
+            output = current.get("output")
+            if isinstance(output, str) and output.strip():
+                marker = _FULL_OUTPUT_REF_MARKER.search(output)
+                if marker is not None:
+                    return marker.group("ref")
+                # Successful short outputs are already literal evidence.  A
+                # tool is not required to persist every green result, so use
+                # that observed body when a planner requested output_ref.
+                if current.get("succeeded"):
+                    return output.strip()
         for component in path.split("."):
             if isinstance(current, Mapping):
                 if component not in current:

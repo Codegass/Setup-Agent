@@ -6,7 +6,7 @@ import re
 import shlex
 import time
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 from loguru import logger
 
@@ -2339,8 +2339,17 @@ class ReActEngine(UIEventEmitter):
 
         if len(action_steps) == 1:
             candidate = action_steps[0]
-            if scheduler.validate_actor_action(candidate.tool_name, candidate.tool_params):
-                return [candidate]
+            if candidate.tool_name is not None:
+                tool_name, tool_params = self._canonicalize_scheduler_action(
+                    candidate.tool_name,
+                    candidate.tool_params,
+                )
+                candidate.tool_name = tool_name
+                candidate.tool_params = tool_params
+                if scheduler.validate_actor_action(tool_name, tool_params):
+                    return [candidate]
+            else:
+                scheduler.validate_actor_action(None, candidate.tool_params)
         else:
             scheduler.validate_actor_action(None, None)
 
@@ -2360,9 +2369,27 @@ class ReActEngine(UIEventEmitter):
         authoritative prompt, strict comparison, emitted envelope, and actual
         tool invocation on one representation.
         """
+        normalized_steps = []
+        for step in plan.steps:
+            tool_name, normalized_params = self._canonicalize_scheduler_action(
+                step.tool,
+                dict(step.exact_params),
+            )
+            normalized_steps.append(
+                step.model_copy(update={"tool": tool_name, "exact_params": normalized_params})
+            )
+        return plan.model_copy(update={"steps": tuple(normalized_steps)})
+
+    def _canonicalize_scheduler_action(
+        self,
+        tool_name: str,
+        params: Mapping[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Put planner and actor actions on the same schema representation."""
+        raw_params = dict(params or {})
         tools = getattr(self, "tools", None)
         if not isinstance(tools, dict) or not tools:
-            return plan
+            return tool_name, raw_params
 
         from .tool_parameters import ToolParameterNormalizer
 
@@ -2373,17 +2400,11 @@ class ReActEngine(UIEventEmitter):
             repository_ref=getattr(self, "repository_ref", None),
             logger=logger,
         )
-        normalized_steps = []
-        for step in plan.steps:
-            tool_name, raw_params = normalizer.resolve_legacy_alias(
-                step.tool,
-                dict(step.exact_params),
-            )
-            normalized_params = normalizer.validate_and_fix(tool_name, raw_params)
-            normalized_steps.append(
-                step.model_copy(update={"tool": tool_name, "exact_params": normalized_params})
-            )
-        return plan.model_copy(update={"steps": tuple(normalized_steps)})
+        normalized_tool, aliased_params = normalizer.resolve_legacy_alias(
+            tool_name,
+            raw_params,
+        )
+        return normalized_tool, normalizer.validate_and_fix(normalized_tool, aliased_params)
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""

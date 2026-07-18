@@ -490,21 +490,29 @@ class ToolParameterNormalizer:
                 # quoting, which made an actor's semantically identical JSON
                 # string fail the scheduler's exact comparison.
                 if isinstance(value, dict):
-                    return json.dumps(
+                    converted = json.dumps(
                         value,
                         ensure_ascii=False,
                         separators=(",", ":"),
                         sort_keys=True,
                     )
                 # Handle list to string conversion properly
-                if isinstance(value, list):
+                elif isinstance(value, list):
                     # If list has one element, return just that element
                     if len(value) == 1:
-                        return str(value[0])
+                        converted = str(value[0])
                     # If multiple elements, join with spaces (common for command-line args)
                     else:
-                        return " ".join(str(v) for v in value)
-                return str(value)
+                        converted = " ".join(str(v) for v in value)
+                else:
+                    converted = str(value)
+                if param_name == "key_results":
+                    # Function-calling actors sometimes render an equivalent
+                    # list as newline-separated text.  The phase contract is a
+                    # narrative scalar, so canonicalize insignificant spacing
+                    # before the scheduler's strict equality check.
+                    return " ".join(converted.split())
+                return converted
             elif expected_type == "integer":
                 if isinstance(value, str):
                     # Try to extract number from string

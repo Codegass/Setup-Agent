@@ -193,6 +193,68 @@ def test_clone_output_ref_placeholder_resolves_to_workspace_path():
     }
 
 
+def test_success_output_without_storage_ref_satisfies_output_ref_dependency():
+    scheduler = ReasoningScheduler(available_tools={"build", "phase"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                _step(1, tool="build", params={"action": "compile"}),
+                _step(
+                    2,
+                    tool="phase",
+                    params={
+                        "action": "done",
+                        "outcome": "success",
+                        "evidence": ["{{step_1.output_ref}}"],
+                    },
+                    preconditions=("{{step_1.output_ref}}",),
+                ),
+            )
+        )
+    )
+
+    _take_action(scheduler)
+    scheduler.observe_result(_success(output="compileall: 41/41 sources compiled", output_ref=None))
+
+    close_phase = scheduler.next_turn()
+    assert close_phase.mode is SchedulerMode.ACTION
+    assert close_phase.step is not None
+    assert close_phase.step.exact_params["evidence"] == ["compileall: 41/41 sources compiled"]
+    assert scheduler.thinking_turns == 1
+
+
+def test_embedded_durable_output_ref_is_preferred_over_truncated_output_body():
+    scheduler = ReasoningScheduler(available_tools={"build", "phase"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                _step(1, tool="build", params={"action": "deps"}),
+                _step(
+                    2,
+                    tool="phase",
+                    params={"action": "done", "evidence": ["{{step_1.output_ref}}"]},
+                    preconditions=("{{step_1.output_ref}}",),
+                ),
+            )
+        )
+    )
+
+    _take_action(scheduler)
+    scheduler.observe_result(
+        _success(
+            output="install output ... [Full output ref: output_deps_123] ...",
+            output_ref=None,
+        )
+    )
+
+    close_phase = scheduler.next_turn()
+    assert close_phase.mode is SchedulerMode.ACTION
+    assert close_phase.step is not None
+    assert close_phase.step.exact_params["evidence"] == ["output_deps_123"]
+
+
 def test_terminal_poll_success_or_failure_requests_reasoning():
     for terminal in (_success(poll_ref="job:one"), _failure(poll_ref="job:one")):
         scheduler = ReasoningScheduler(available_tools={"search"})

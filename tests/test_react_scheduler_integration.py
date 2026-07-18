@@ -211,6 +211,65 @@ CURRENT_PLAN:
     }
 
 
+def test_actor_params_are_schema_canonical_before_exact_comparison():
+    tools = {
+        "phase": _SchemaTool(
+            "phase",
+            {
+                "action": {"type": "string"},
+                "outcome": {"type": "string"},
+                "key_results": {"type": "string"},
+            },
+        )
+    }
+    engine = _scheduled_engine(tools=tools)
+    parser = ReActResponseParser(lambda: "ts")
+    response = """THOUGHT: Close the completed phase.
+
+CURRENT_PLAN:
+{
+  "steps": [
+    {
+      "tool": "phase",
+      "exact_params": {
+        "action": "done",
+        "outcome": "success",
+        "key_results": ["dependencies installed", "byte-compilation verified"]
+      },
+      "preconditions": [],
+      "expected_evidence": ["phase close"],
+      "success_criteria": ["phase accepted"]
+    }
+  ]
+}"""
+    thinking_turn = engine.reasoning_scheduler.next_turn()
+    engine._prepare_scheduler_steps(
+        response,
+        parser.parse(response, model_used="thinker", was_thinking_model=True),
+        thinking_turn,
+    )
+    action_turn = engine.reasoning_scheduler.next_turn()
+    actor_response = (
+        "ACTION: phase\nPARAMETERS: "
+        '{"action":"done","outcome":"success",'
+        '"key_results":"dependencies installed\\nbyte-compilation verified"}'
+    )
+
+    safe_actions = engine._prepare_scheduler_steps(
+        actor_response,
+        parser.parse(actor_response, model_used="actor", was_thinking_model=False),
+        action_turn,
+    )
+
+    assert len(safe_actions) == 1
+    assert safe_actions[0].tool_params == {
+        "action": "done",
+        "outcome": "success",
+        "key_results": "dependencies installed byte-compilation verified",
+    }
+    assert engine.reasoning_scheduler.active_step is not None
+
+
 def test_malformed_plan_and_actor_mismatch_execute_no_tool_step():
     parser = ReActResponseParser(lambda: "ts")
     malformed = _scheduled_engine()
