@@ -362,6 +362,19 @@ def test_setup_report_overwrites_conflicting_nonzero_caller_evidence(tvm_snapsho
     assert "caller_conflict" not in result.output
 
 
+def test_setup_report_evidence_summary_keeps_failures_and_errors_distinct(tvm_snapshot):
+    orchestrator = SnapshotOrchestrator({VERDICT_PATH: tvm_snapshot.model_dump_json()})
+    tool = ReportTool(orchestrator, workflow_mode="setup")
+
+    result = tool.execute(summary="TVM collection errors", status="failed")
+
+    assert result.test_stats is not None
+    assert result.test_stats.failed == 0
+    assert result.test_stats.errors == 328
+    assert "0 failed, 328 errors" in result.output
+    assert "328 failed" not in result.output
+
+
 def test_setup_report_terminal_ui_uses_sealed_build_and_unique_test_stats(
     snapshot_factory,
 ):
