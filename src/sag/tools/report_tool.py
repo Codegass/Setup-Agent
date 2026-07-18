@@ -1536,7 +1536,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             },
             "report_path": f"/workspace/{report_filename}",
             "physical_evidence": {
-                "class_files": None,
+                "class_files": snapshot.build_evidence.compiled_classes,
                 "jar_files": None,
                 "tests_total": tests.executed,
                 "tests_pass_pct": tests.pass_rate if tests.executed > 0 else None,

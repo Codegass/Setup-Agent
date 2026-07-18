@@ -133,6 +133,16 @@ def test_test_stats_surface_in_facts():
     assert result.operation_outcome.value == "partial"
 
 
+def test_maven_test_runs_the_full_verify_lifecycle():
+    maven = FakeBackendTool()
+    tool = _tool({"pom.xml"}, maven=maven)
+
+    tool.execute(action="test", working_directory="/w")
+
+    assert maven.calls[0]["command"] == "verify"
+    assert maven.calls[0]["fail_at_end"] is True
+
+
 def test_args_passthrough():
     maven = FakeBackendTool()
     tool = _tool({"pom.xml"}, maven=maven)

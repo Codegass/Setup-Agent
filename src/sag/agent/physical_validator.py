@@ -2266,6 +2266,12 @@ class PhysicalValidator:
         artifacts_result = self._check_build_artifacts_complete(project_dir)
         evidence["has_artifacts"] = artifacts_result["exist"]
         evidence["artifact_count"] = artifacts_result["count"]
+        # Keep the validator-owned physical count in the structured evidence.
+        # Phase gates persist this scalar into RunEvidenceState before
+        # evidence-close; without it the canonical verdict snapshot can prove a
+        # build happened but cannot reproduce reactor benchmark class counts.
+        evidence["class_count"] = artifacts_result["class_count"]
+        evidence["jar_count"] = artifacts_result["jar_count"]
         evidence["artifact_samples"] = self._collect_artifact_samples(project_dir, artifacts_result)
         if evidence["has_artifacts"]:
             logger.info(

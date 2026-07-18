@@ -96,6 +96,18 @@ def test_collector_ignores_numbers_in_markdown(tmp_path):
     assert record.metrics.thought_calls == 2
 
 
+def test_v3_collector_reads_compiled_classes_from_the_snapshot(tmp_path):
+    session = _session(tmp_path)
+    verdict_path = session / ".setup_agent" / "verdict.json"
+    payload = json.loads(verdict_path.read_text(encoding="utf-8"))
+    payload["build_evidence"]["compiled_classes"] = 8916
+    verdict_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    record = ABCollector().collect(session)
+
+    assert record.metrics.compiled_classes == 8916
+
+
 def test_collector_rejects_incomplete_pin(tmp_path):
     session = _session(tmp_path, excluding="container_image_digest")
 

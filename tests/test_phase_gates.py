@@ -43,13 +43,16 @@ def _orch(java_ok=True, workspace_exists=True):
         if "setup-report-" in command:
             return {"exit_code": 0, "output": "/workspace/setup-report-x.md"}
         return {"exit_code": 0, "output": ""}
+
     return SimpleNamespace(execute_command=execute_command)
 
 
 def test_build_done_rejected_without_artifacts():
     verdict = check_phase_done(
-        "build", validator=FakeValidator(build_success=False),
-        orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=FakeValidator(build_success=False),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is False
     assert "artifact" in verdict["reason"].lower() or "build" in verdict["reason"].lower()
@@ -59,8 +62,10 @@ def test_build_done_rejected_without_artifacts():
 def test_build_done_accepted_with_artifacts():
     validator = FakeValidator(build_success=True)
     verdict = check_phase_done(
-        "build", validator=FakeValidator(build_success=True),
-        orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=FakeValidator(build_success=True),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is True
 
@@ -75,10 +80,94 @@ def test_build_done_accepted_with_artifacts():
     assert result.to_metadata()["validated_facts"]["build.test_entry_ready"] is True
 
 
+def test_phase_gates_preserve_validator_owned_physical_rollups():
+    class PhysicalRollups(FakeValidator):
+        def validate_build_status(self, project_name=None):
+            return {
+                "success": True,
+                "build_complete": True,
+                "evidence_status": "success",
+                "evidence": {
+                    "build_system": "maven",
+                    "class_count": 8916,
+                },
+                "reason": "Found 8916 compiled classes",
+                "evidence_refs": ["artifact://classes"],
+            }
+
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "evidence_status": "partial",
+                "reason": "4598/4928 tests passed",
+                "report_files": ["report://surefire"],
+                "test_stats": {
+                    "discovered": 4928,
+                    "executed": 4928,
+                    "passed": 4598,
+                    "failed": 156,
+                    "skipped": 174,
+                    "flaky_count": 3,
+                },
+                "raw_total_tests": 5000,
+                "raw_passed_tests": 4660,
+                "raw_failed_tests": 0,
+                "raw_error_tests": 160,
+                "raw_skipped_tests": 180,
+                "unique_tests": 4928,
+                "unique_passed_tests": 4598,
+                "unique_failed_tests": 0,
+                "unique_error_tests": 156,
+                "unique_skipped_tests": 174,
+                "flaky_count": 3,
+                "metrics_conflicts": [],
+            }
+
+    validator = PhysicalRollups()
+    build = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=validator,
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+    test = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=validator,
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert build.validated_facts["build.compiled_classes"] == 8916
+    assert test.validated_facts["test.stats"] == {
+        "discovered": 4928,
+        "unique": {
+            "executed": 4928,
+            "passed": 4598,
+            "failed": 0,
+            "errors": 156,
+            "skipped": 174,
+        },
+        "raw": {
+            "executed": 5000,
+            "passed": 4660,
+            "failed": 0,
+            "errors": 160,
+            "skipped": 180,
+        },
+        "flaky_count": 3,
+        "conflicts": ["test_errors_detected"],
+    }
+
+
 def test_build_gate_uses_physical_validator_for_non_jvm_systems():
     verdict = check_phase_done(
-        "build", validator=FakeValidator(build_success=False, build_system="nodejs"),
-        orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=FakeValidator(build_success=False, build_system="nodejs"),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is False
     assert verdict["validator_state"] == "red"
@@ -86,8 +175,10 @@ def test_build_gate_uses_physical_validator_for_non_jvm_systems():
 
 def test_test_done_rejected_without_reports():
     verdict = check_phase_done(
-        "test", validator=FakeValidator(has_test_reports=False),
-        orchestrator=_orch(), project_name="demo",
+        "test",
+        validator=FakeValidator(has_test_reports=False),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is False
     assert "report" in verdict["reason"].lower()
@@ -95,8 +186,10 @@ def test_test_done_rejected_without_reports():
 
 def test_provision_rejected_without_workspace():
     verdict = check_phase_done(
-        "provision", validator=FakeValidator(),
-        orchestrator=_orch(workspace_exists=False), project_name="demo",
+        "provision",
+        validator=FakeValidator(),
+        orchestrator=_orch(workspace_exists=False),
+        project_name="demo",
     )
     assert verdict["ok"] is False
 
@@ -119,7 +212,10 @@ def test_gate_probe_error_is_explicitly_unavailable():
             raise RuntimeError("docker down")
 
     verdict = check_phase_done(
-        "build", validator=Exploding(), orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=Exploding(),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is False
     assert verdict["validator_state"] == "unavailable"

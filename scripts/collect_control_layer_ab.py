@@ -429,6 +429,9 @@ def _new_snapshot_metrics(
     except ValidationError as exc:
         raise CollectionError(f"invalid verdict.json: {exc}") from exc
     tests = snapshot.test_stats
+    metric_kwargs = dict(event_metrics)
+    if snapshot.build_evidence.compiled_classes is not None:
+        metric_kwargs["compiled_classes"] = snapshot.build_evidence.compiled_classes
     metrics = RunMetrics(
         verdict=snapshot.verdict,
         unique_total=tests.unique.executed,
@@ -441,7 +444,7 @@ def _new_snapshot_metrics(
         thought_calls=thought_calls,
         action_calls=action_calls,
         conflicts=tuple(snapshot.conflicts),
-        **event_metrics,
+        **metric_kwargs,
     )
     return snapshot.run_id, metrics
 

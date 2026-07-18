@@ -625,6 +625,61 @@ def test_untyped_test_count_facts_do_not_manufacture_primary_stats():
     assert snapshot.verdict == "partial"
 
 
+def test_validator_rollup_facts_are_the_canonical_snapshot_basis():
+    state = RunEvidenceState(run_id="session-cassandra-rollup")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS,
+        "build",
+        ToolResult.completed_success(
+            output="reactor compiled",
+            facts={"build_success": True},
+        ),
+    )
+    state.set_fact(
+        "build.compiled_classes",
+        8916,
+        evidence_ref="artifact://classes",
+        source_phase="build",
+    )
+    state.set_fact(
+        "test.stats",
+        {
+            "discovered": 4928,
+            "unique": {
+                "executed": 4928,
+                "passed": 4598,
+                "failed": 0,
+                "errors": 156,
+                "skipped": 174,
+            },
+            "raw": {
+                "executed": 5000,
+                "passed": 4660,
+                "failed": 0,
+                "errors": 160,
+                "skipped": 180,
+            },
+            "flaky_count": 3,
+            "conflicts": ["test_errors_detected"],
+        },
+        evidence_ref="report://surefire",
+        source_phase="test",
+    )
+
+    snapshot = VerdictFinalizer(FakeVerdictOrchestrator()).finalize(
+        state, EvidenceCloseReason.TEST_TERMINATED
+    )
+
+    assert snapshot.build_evidence.compiled_classes == 8916
+    assert snapshot.test_stats.unique.executed == 4928
+    assert snapshot.test_stats.unique.passed == 4598
+    assert snapshot.test_stats.unique.errors == 156
+    assert snapshot.test_stats.raw.executed == 5000
+    assert snapshot.test_stats.flaky_count == 3
+    assert snapshot.conflicts == ("test_errors_detected",)
+    assert snapshot.verdict == "success"
+
+
 def test_snapshot_separates_maven_failures_from_errors():
     state = RunEvidenceState(run_id="session-errors")
     state.ingest_tool_result(

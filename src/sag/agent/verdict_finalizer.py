@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -122,6 +122,7 @@ class BuildEvidenceSnapshot(BaseModel):
     outcome: OperationOutcome = OperationOutcome.UNKNOWN
     evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
     refs: tuple[str, ...] = ()
+    compiled_classes: int | None = None
 
 
 class PhaseClaimSnapshot(BaseModel):
@@ -253,7 +254,16 @@ def _fold_build_evidence(state: RunEvidenceState) -> BuildEvidenceSnapshot:
         outcome=latest.result.operation_outcome,
         evidence_status=latest.result.evidence_status,
         refs=_dedupe(ref for observation in observations for ref in _result_refs(observation)),
+        compiled_classes=_nonnegative_int(state.fact_value("build.compiled_classes")),
     )
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _first_count(sources: tuple[dict[str, Any], ...], *keys: str) -> int | None:
@@ -273,10 +283,10 @@ def _coerce_result_stats(observation: ToolObservation) -> tuple[TestStats, int, 
     result = observation.result
     stats = result.test_stats
     metadata = result.metadata or {}
-    analysis = metadata.get("analysis") if isinstance(metadata.get("analysis"), dict) else {}
-    error_analysis = (
-        metadata.get("error_analysis") if isinstance(metadata.get("error_analysis"), dict) else {}
-    )
+    analysis_value = metadata.get("analysis")
+    analysis = analysis_value if isinstance(analysis_value, dict) else {}
+    error_analysis_value = metadata.get("error_analysis")
+    error_analysis = error_analysis_value if isinstance(error_analysis_value, dict) else {}
     nested_stats = tuple(
         value
         for value in (
@@ -318,6 +328,61 @@ def _fold_test_stats(
     *,
     test_pass_threshold: float,
 ) -> tuple[SnapshotTestStats, tuple[str, ...]]:
+    validated_rollup = state.fact_value("test.stats")
+    if isinstance(validated_rollup, dict):
+        conflicts = _dedupe(validated_rollup.get("conflicts") or ())
+        unique_value = validated_rollup.get("unique")
+        raw_value = validated_rollup.get("raw")
+
+        def counts(value: Any) -> SnapshotTestCounts | None:
+            if not isinstance(value, dict):
+                return None
+            parsed = {
+                name: _nonnegative_int(value.get(name))
+                for name in ("executed", "passed", "failed", "errors", "skipped")
+            }
+            if any(item is None for item in parsed.values()):
+                return None
+            result = SnapshotTestCounts(
+                executed=cast(int, parsed["executed"]),
+                passed=cast(int, parsed["passed"]),
+                failed=cast(int, parsed["failed"]),
+                errors=cast(int, parsed["errors"]),
+                skipped=cast(int, parsed["skipped"]),
+            )
+            if result.passed + result.failed + result.errors + result.skipped != result.executed:
+                return None
+            return result
+
+        validated_unique = counts(unique_value)
+        validated_raw = counts(raw_value)
+        if (
+            validated_unique is None
+            or validated_raw is None
+            or validated_raw.executed < validated_unique.executed
+        ):
+            return SnapshotTestStats(), _dedupe([*conflicts, "validated_test_stats_invalid"])
+        validated_judgment: Literal["success", "failed", "unknown"] = "unknown"
+        if validated_unique.executed > 0:
+            validated_judgment = cast(
+                Literal["success", "failed", "unknown"],
+                evaluate_run_verdict(
+                    True,
+                    round((validated_unique.passed / validated_unique.executed) * 100.0, 1),
+                    test_pass_threshold=test_pass_threshold,
+                ),
+            )
+        return (
+            SnapshotTestStats(
+                discovered=_nonnegative_int(validated_rollup.get("discovered")),
+                unique=validated_unique,
+                raw=validated_raw,
+                flaky_count=_nonnegative_int(validated_rollup.get("flaky_count")) or 0,
+                judgment=validated_judgment,
+            ),
+            conflicts,
+        )
+
     observations = [
         observation
         for observation in state.tool_observations
@@ -375,12 +440,15 @@ def _fold_test_stats(
         skipped=sum(stats.skipped for stats, _, _ in snapshots),
     )
     conflicts = ("test_stats_basis_incomparable",) if len(frontier) > 1 else ()
-    judgment = "unknown"
+    judgment: Literal["success", "failed", "unknown"] = "unknown"
     if unique.executed > 0:
-        judgment = evaluate_run_verdict(
-            True,
-            round((unique.passed / unique.executed) * 100.0, 1),
-            test_pass_threshold=test_pass_threshold,
+        judgment = cast(
+            Literal["success", "failed", "unknown"],
+            evaluate_run_verdict(
+                True,
+                round((unique.passed / unique.executed) * 100.0, 1),
+                test_pass_threshold=test_pass_threshold,
+            ),
         )
     return (
         SnapshotTestStats(
@@ -404,7 +472,7 @@ def _snapshot_verdict(
     build: BuildEvidenceSnapshot,
     tests: SnapshotTestStats,
     conflicts: tuple[str, ...],
-) -> str:
+) -> Literal["success", "partial", "failed", "unknown"]:
     if not build.observed or build.outcome is OperationOutcome.UNKNOWN:
         return "unknown"
 
@@ -424,7 +492,10 @@ def _snapshot_verdict(
         physical_verdict = "failed"
     else:
         physical_verdict = "partial"
-    return run_verdict(build_judge, physical_verdict, conflicts)
+    return cast(
+        Literal["success", "partial", "failed", "unknown"],
+        run_verdict(build_judge, physical_verdict, conflicts),
+    )
 
 
 def _phase_record_snapshot(record) -> PhaseRecordSnapshot:
@@ -487,6 +558,7 @@ class VerdictFinalizer:
                     for observation in state.tool_observations
                     for ref in _result_refs(observation)
                 ),
+                *(fact.provenance for fact in state.facts),
                 *(ref for record in state.phase_records for ref in record.evidence),
             ]
         )

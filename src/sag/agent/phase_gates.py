@@ -61,12 +61,15 @@ class GateResult:
     def __post_init__(self) -> None:
         if not isinstance(self.accepted, bool):
             raise TypeError("gate accepted flag must be boolean")
-        object.__setattr__(self, "validated_outcome", PhaseOutcome(self.validated_outcome))
-        object.__setattr__(self, "claim_disposition", ClaimDisposition(self.claim_disposition))
-        object.__setattr__(self, "validator_state", ValidatorState(self.validator_state))
-        if self.validated_outcome is not _VALIDATED_OUTCOMES[self.validator_state]:
+        validated_outcome = PhaseOutcome(self.validated_outcome)
+        claim_disposition = ClaimDisposition(self.claim_disposition)
+        validator_state = ValidatorState(self.validator_state)
+        object.__setattr__(self, "validated_outcome", validated_outcome)
+        object.__setattr__(self, "claim_disposition", claim_disposition)
+        object.__setattr__(self, "validator_state", validator_state)
+        if validated_outcome is not _VALIDATED_OUTCOMES[validator_state]:
             raise ValueError("validated outcome must match the validator state")
-        expected_accepted = self.claim_disposition is not ClaimDisposition.CONTRADICTED
+        expected_accepted = claim_disposition is not ClaimDisposition.CONTRADICTED
         if self.accepted is not expected_accepted:
             raise ValueError("gate acceptance conflicts with the claim disposition")
         object.__setattr__(self, "evidence_refs", tuple(dict.fromkeys(self.evidence_refs)))
@@ -77,7 +80,7 @@ class GateResult:
 
     @property
     def disposition(self) -> ClaimDisposition:
-        return self.claim_disposition
+        return ClaimDisposition(self.claim_disposition)
 
     def with_claim(self, claim: PhaseClaim) -> "GateResult":
         if self.claim is not None and self.claim != claim:
@@ -87,9 +90,9 @@ class GateResult:
     def to_metadata(self) -> dict[str, Any]:
         return {
             "accepted": self.accepted,
-            "validated_outcome": self.validated_outcome.value,
-            "claim_disposition": self.claim_disposition.value,
-            "validator_state": self.validator_state.value,
+            "validated_outcome": PhaseOutcome(self.validated_outcome).value,
+            "claim_disposition": ClaimDisposition(self.claim_disposition).value,
+            "validator_state": ValidatorState(self.validator_state).value,
             "reason": self.reason,
             "evidence_refs": list(self.evidence_refs),
             "suggestions": list(self.suggestions),
@@ -115,9 +118,7 @@ class GateResult:
         return cls(
             accepted=accepted,
             validated_outcome=value.get("validated_outcome", PhaseOutcome.UNKNOWN),
-            claim_disposition=value.get(
-                "claim_disposition", ClaimDisposition.UNVERIFIABLE
-            ),
+            claim_disposition=value.get("claim_disposition", ClaimDisposition.UNVERIFIABLE),
             validator_state=value.get("validator_state", ValidatorState.UNAVAILABLE),
             reason=str(value.get("reason") or ""),
             evidence_refs=tuple(value.get("evidence_refs") or ()),
@@ -154,7 +155,7 @@ def validate_phase_claim(
         phase_claim = claim
     else:
         phase_claim = PhaseClaim(phase="", claimed_outcome=PhaseOutcome(claim))
-    claimed = phase_claim.claimed_outcome
+    claimed = PhaseOutcome(phase_claim.claimed_outcome)
     validated = _VALIDATED_OUTCOMES[state]
 
     if claimed is PhaseOutcome.UNKNOWN:
@@ -316,6 +317,94 @@ def _status_refs(status: dict[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(ref) for ref in (*explicit, *samples) if ref))
 
 
+def _first_nonnegative_int(*values: Any) -> int | None:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed >= 0:
+            return parsed
+    return None
+
+
+def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Project a physical-validator result onto the sealed snapshot basis.
+
+    The gate is the last read-only physical scan before evidence-close.  Its
+    identity-aware raw/unique rollup is therefore authoritative over an actor
+    summary or a backend result that could not parse Maven's console totals.
+    """
+    supplied = status.get("test_stats")
+    test_stats = supplied if isinstance(supplied, Mapping) else {}
+    unique_errors = _first_nonnegative_int(
+        status.get("unique_error_tests"),
+        status.get("error_tests"),
+        0,
+    )
+    unique_failed = _first_nonnegative_int(
+        status.get("unique_failed_tests"),
+        status.get("failed_tests"),
+    )
+    if unique_failed is None:
+        combined = _first_nonnegative_int(test_stats.get("failed"), 0) or 0
+        unique_failed = max(combined - (unique_errors or 0), 0)
+    unique = {
+        "executed": _first_nonnegative_int(
+            status.get("unique_tests"),
+            test_stats.get("executed"),
+            status.get("total_tests"),
+            0,
+        )
+        or 0,
+        "passed": _first_nonnegative_int(
+            status.get("unique_passed_tests"),
+            test_stats.get("passed"),
+            status.get("passed_tests"),
+            0,
+        )
+        or 0,
+        "failed": unique_failed,
+        "errors": unique_errors or 0,
+        "skipped": _first_nonnegative_int(
+            status.get("unique_skipped_tests"),
+            test_stats.get("skipped"),
+            status.get("skipped_tests"),
+            0,
+        )
+        or 0,
+    }
+    if not status.get("has_test_reports") and unique["executed"] == 0:
+        return None
+
+    raw = {
+        "executed": _first_nonnegative_int(status.get("raw_total_tests"), unique["executed"]) or 0,
+        "passed": _first_nonnegative_int(status.get("raw_passed_tests"), unique["passed"]) or 0,
+        "failed": _first_nonnegative_int(status.get("raw_failed_tests"), unique["failed"]) or 0,
+        "errors": _first_nonnegative_int(status.get("raw_error_tests"), unique["errors"]) or 0,
+        "skipped": _first_nonnegative_int(status.get("raw_skipped_tests"), unique["skipped"]) or 0,
+    }
+    conflicts = list(status.get("conflicts") or ())
+    conflicts.extend(status.get("metrics_conflicts") or ())
+    if unique["failed"]:
+        conflicts.append("test_failures_detected")
+    if unique["errors"]:
+        conflicts.append("test_errors_detected")
+    if status.get("parsing_errors"):
+        conflicts.append("test_report_parse_error")
+    return {
+        "discovered": _first_nonnegative_int(
+            test_stats.get("discovered"), status.get("static_test_count")
+        ),
+        "unique": unique,
+        "raw": raw,
+        "flaky_count": _first_nonnegative_int(status.get("flaky_count"), 0) or 0,
+        "conflicts": list(dict.fromkeys(str(item) for item in conflicts if item)),
+    }
+
+
 def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
     method = getattr(validator, "validate_project_analysis_status", None)
     if method is None:
@@ -325,9 +414,7 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
             code="analysis_unavailable",
         )
     status = method(project_name)
-    state = _state_from_evidence_status(
-        status.get("evidence_status") or status.get("status")
-    )
+    state = _state_from_evidence_status(status.get("evidence_status") or status.get("status"))
     if state is ValidatorState.UNAVAILABLE:
         if status.get("analyzed") and status.get("has_static_test_count"):
             state = ValidatorState.GREEN
@@ -347,8 +434,7 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
         evidence_refs=_status_refs(status),
         code=f"analysis_{state.value}",
         validated_facts={
-            "analysis.build_entry_ready": state
-            in {ValidatorState.GREEN, ValidatorState.PARTIAL}
+            "analysis.build_entry_ready": state in {ValidatorState.GREEN, ValidatorState.PARTIAL}
         },
     )
 
@@ -366,7 +452,7 @@ def _inspect_build(validator, project_name) -> _ValidatorObservation:
         elif status.get("success") is False:
             state = ValidatorState.RED
     reason = status.get("reason") or "build validator returned no conclusion"
-    suggestions = ()
+    suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
             "Run build(action='compile') and validate the resulting artifacts",
@@ -389,13 +475,20 @@ def _inspect_build(validator, project_name) -> _ValidatorObservation:
         )
     else:
         test_entry_ready = False
+    validated_facts: dict[str, Any] = {"build.test_entry_ready": test_entry_ready}
+    compiled_classes = _first_nonnegative_int(
+        evidence.get("class_count") if isinstance(evidence, Mapping) else None,
+        status.get("compiled_classes"),
+    )
+    if compiled_classes is not None:
+        validated_facts["build.compiled_classes"] = compiled_classes
     return _ValidatorObservation(
         state,
         reason=reason,
         evidence_refs=_status_refs(status),
         suggestions=suggestions,
         code=f"build_{state.value}",
-        validated_facts={"build.test_entry_ready": test_entry_ready},
+        validated_facts=validated_facts,
     )
 
 
@@ -417,9 +510,7 @@ def _inspect_test(validator, project_name) -> _ValidatorObservation:
         state = ValidatorState.RED
         code = "tests_not_executed"
     else:
-        state = _state_from_evidence_status(
-            status.get("evidence_status") or status.get("status")
-        )
+        state = _state_from_evidence_status(status.get("evidence_status") or status.get("status"))
         code = f"test_{state.value}"
 
     if state is ValidatorState.UNAVAILABLE and not status.get("has_test_reports"):
@@ -429,18 +520,20 @@ def _inspect_test(validator, project_name) -> _ValidatorObservation:
             reason = f"{reason}: {detail}"
     else:
         reason = status.get("reason") or "test validator returned no conclusion"
-    suggestions = ()
+    suggestions: tuple[str, ...] = ()
     if state is not ValidatorState.GREEN:
         suggestions = (
             "Run build(action='test') and preserve the generated test reports",
             "If an external impediment prevents tests, claim blocked with evidence refs",
         )
+    rollup = _validated_test_rollup(status)
     return _ValidatorObservation(
         state,
         reason=reason,
         evidence_refs=_status_refs(status),
         suggestions=suggestions,
         code=code,
+        validated_facts={"test.stats": rollup} if rollup is not None else {},
     )
 
 
