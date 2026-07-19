@@ -211,6 +211,21 @@ is unchanged.
   regression drives rename-at-depth-5 end-to-end (manifest carries
   `beta_pkg`, old name gone).
 
+**Fifth-round review outcome (2026-07-19, fixed).**
+- P1 probe-failure vs empty-layout: the shared scan echoes a trailing
+  sentinel per base probe — a MISSING base (find fails, sentinel echoes)
+  is a legitimately empty listing; NO sentinel means the probe never ran,
+  `package_layout_listing` returns None, and the whole fingerprint is
+  CANNOT COMPARE. Without this, a transient find failure over a real
+  layout digested as L0: spurious re-survey, and the re-survey could write
+  `python_packages=[]` over good facts. Discovery keeps its historical
+  both-are-empty behavior (the sentinel is filtered before parsing).
+- P2 order-sensitivity: the listing is SORTED before the crc32 (find
+  order is unspecified); a reversed-order probe no longer flips the
+  digest. `SURVEY_FACTS_VERSION` 6→7. Regressions: broken probe →
+  `present`, no rewrite, recovery stays `present`; reversed order →
+  `present`, no rewrite.
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -224,7 +239,7 @@ the validator's substrate with zero call-site behavior change (full suite at
 zero new failures after every slice); surveyor emits no `goal`/
 preferred-module fields (slice 5); manifest gains the source fingerprint
 completing the staleness contract (slice 6 + two review rounds;
-`tests/test_framework_survey.py` 21 tests — config edit re-surveys,
+`tests/test_framework_survey.py` 23 tests — config edit re-surveys,
 unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
 via both-ends fingerprint agreement, config-edit-plus-dropped-rewrite is
 `failed` not `created`, probe command covers everything the survey reads).

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION, ProjectAnalyzerTool
+from sag.tools.internal.python_env import LAYOUT_SCAN_SENTINEL
 
 
 class SurveyOrch:
@@ -31,6 +32,8 @@ class SurveyOrch:
         # package_layout, so a rename exercises the actual machinery.
         self.config_seed = "pyproject-v1"
         self.package_layout = ("alpha_pkg",)
+        self.layout_probe_broken = False  # no sentinel: probe never executed
+        self.reverse_layout = False  # find order is unspecified — flip it
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
@@ -40,9 +43,17 @@ class SurveyOrch:
             digest = sum(map(ord, self.config_seed))
             return {"success": True, "exit_code": 0, "output": f"{digest} {len(self.config_seed)}"}
         if "-name __init__.py" in command:
+            if self.layout_probe_broken:
+                return {"success": False, "exit_code": 1, "output": ""}
             base = command.split("find ", 1)[1].split(" ", 1)[0]
             paths = [f"{base}/{pkg}/__init__.py" for pkg in self.package_layout]
-            return {"success": True, "exit_code": 0, "output": "\n".join(paths)}
+            if self.reverse_layout:
+                paths.reverse()
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "\n".join(paths + [LAYOUT_SCAN_SENTINEL]),
+            }
         if "<<" in command and REQUIREMENTS_PATH in command:
             self.manifest_writes += 1
             if not self.drop_manifest_writes:
@@ -345,6 +356,39 @@ def test_package_rename_with_unchanged_config_resurveys():
         assert "-prune" not in probe
 
 
+def test_layout_probe_failure_is_cannot_compare_not_empty_layout():
+    """Category-2 review P1 (shared-scanner round): a transient find failure
+    over a REAL package layout must not masquerade as an empty layout — that
+    digest (L0) would spuriously re-survey, and the re-survey could write
+    python_packages=[] over good facts. No sentinel -> the whole fingerprint
+    is CANNOT COMPARE -> the surveyed facts keep serving."""
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+    assert '"alpha_pkg"' in orch.files[REQUIREMENTS_PATH]
+
+    orch.layout_probe_broken = True  # the layout is unknowable, not empty
+    assert tool.ensure_facts("/workspace/proj") == "present"  # no thrash
+    assert orch.manifest_writes == 1  # and no []-overwrite of good facts
+
+    orch.layout_probe_broken = False  # probe recovers, layout unchanged
+    assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_layout_path_order_does_not_change_the_fingerprint():
+    """Category-2 review P2: find output order is unspecified and crc32 is
+    order-sensitive — the same set of paths in reverse order flipped the
+    digest and re-surveyed. The listing is sorted before digesting."""
+    orch = SurveyOrch()
+    orch.package_layout = ("alpha_pkg", "zeta_pkg")
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.reverse_layout = True  # same paths, reversed find order
+    assert tool.ensure_facts("/workspace/proj") == "present"  # NOT a re-survey
+    assert orch.manifest_writes == 1
+
+
 def test_deep_declared_package_dir_rename_resurveys():
     """Final Category-2 review P1 (isomorph): discover_packages accepts an
     ARBITRARY-depth declared package_dir — package-dir {'': 'lib/generated/
@@ -370,9 +414,9 @@ def test_deep_declared_package_dir_rename_resurveys():
                     return {
                         "success": True,
                         "exit_code": 0,
-                        "output": f"{base}/{self.deep_pkg}/__init__.py",
+                        "output": f"{base}/{self.deep_pkg}/__init__.py\n{LAYOUT_SCAN_SENTINEL}",
                     }
-                return {"success": True, "exit_code": 0, "output": ""}
+                return {"success": True, "exit_code": 0, "output": LAYOUT_SCAN_SENTINEL}
             if command.startswith("cat /workspace/proj/pyproject.toml"):
                 self.commands.append(command)
                 return {"success": True, "exit_code": 0, "output": deep_pyproject}

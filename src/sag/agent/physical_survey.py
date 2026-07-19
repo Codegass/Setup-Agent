@@ -1383,6 +1383,12 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
         from sag.tools.internal.python_env import package_layout_listing
 
         layout = package_layout_listing(orch, _surveyed_python_root(orch, project_path))
+        if layout is None:
+            # A layout probe failed to EXECUTE (distinct from an absent
+            # base): the layout is unknowable, so the whole fingerprint is
+            # CANNOT COMPARE — an empty-layout digest here would spuriously
+            # re-survey and could write python_packages=[] over good facts.
+            return None
         layout_digest = zlib.crc32("\n".join(layout).encode("utf-8", "replace"))
         return f"{container} L{layout_digest}"
     except Exception as exc:

@@ -51,7 +51,10 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # v6: the layout section shares discover_packages' OWN scan machinery
 # (arbitrary-depth declared package_dir, symlinks, no pruning) instead of a
 # hand-mirrored fixed-depth find that drifted from it.
-SURVEY_FACTS_VERSION = 6
+# v7: the layout listing is SORTED before digesting (find order is
+# unspecified) and a probe that fails to execute makes the fingerprint
+# CANNOT COMPARE instead of masquerading as an empty layout.
+SURVEY_FACTS_VERSION = 7
 
 
 class ProjectAnalyzerTool(BaseTool):

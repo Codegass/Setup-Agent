@@ -533,8 +533,14 @@ def _declared_package_dir(orchestrator, root: str) -> Optional[str]:
     return None
 
 
+# Echoed after each layout find: its presence in the output proves the
+# probe EXECUTED (a missing base still echoes it; a container failure does
+# not). Distinguishing the two is load-bearing — see package_layout_listing.
+LAYOUT_SCAN_SENTINEL = "__SAG_LAYOUT_SCAN_DONE__"
+
+
 def _package_layout_scan(orchestrator, root: str):
-    """The ordered ``(base, raw find lines)`` scan that BOTH package
+    """The ordered ``(base, find lines, executed)`` scan that BOTH package
     discovery and the survey fingerprint consume — ONE set of bases
     (declared package_dir first, then src-layout, then flat) and ONE find
     predicate (maxdepth 2 from each base, hidden dirs excluded, symlinks
@@ -542,6 +548,11 @@ def _package_layout_scan(orchestrator, root: str):
     find in the fingerprint drifted from discovery on declared-package_dir
     depth, symlinks, and pruning — sharing the machinery makes the fact and
     its staleness domain inseparable.
+
+    ``executed`` is True iff the trailing sentinel came back: a MISSING base
+    (find fails, sentinel echoes) is a legitimately empty listing, while a
+    probe that never ran (no sentinel) is unknowable. Discovery treats both
+    as empty (its historical behavior); the fingerprint must not.
 
     Lazy: ``discover_packages`` stops at the first base with packages,
     preserving its historical command sequence; the fingerprint drains it.
@@ -556,26 +567,36 @@ def _package_layout_scan(orchestrator, root: str):
     for base in bases:
         result = orchestrator.execute_command(
             f"find {base} -maxdepth 2 -name __init__.py -not -path '*/.*' 2>/dev/null"
+            f"; echo {LAYOUT_SCAN_SENTINEL}"
         )
-        lines = [
-            line.strip() for line in (result.get("output") or "").splitlines() if line.strip()
-        ]
-        yield base, lines
+        raw = [line.strip() for line in (result.get("output") or "").splitlines() if line.strip()]
+        executed = LAYOUT_SCAN_SENTINEL in raw
+        lines = [line for line in raw if line != LAYOUT_SCAN_SENTINEL]
+        yield base, lines, executed
 
 
-def package_layout_listing(orchestrator, project_dir: str) -> List[str]:
+def package_layout_listing(orchestrator, project_dir: str) -> Optional[List[str]]:
     """Every ``__init__.py`` path the package-discovery fact can derive
-    from, across ALL bases, each tagged with its base. Discovery stops at
-    the first productive base, but WHICH base is productive can change — so
-    the staleness domain is the union of every base's listing."""
+    from, across ALL bases, each tagged with its base and SORTED (find
+    order is unspecified; the fingerprint's digest is order-sensitive).
+    Discovery stops at the first productive base, but WHICH base is
+    productive can change — so the staleness domain is the union.
+
+    Returns None when any base probe failed to EXECUTE (no sentinel) —
+    callers must treat that as CANNOT COMPARE, never as an empty layout
+    (Category-2 review: a transient find failure over a real package
+    layout produced an empty-layout digest, spuriously re-surveyed, and
+    the re-survey could write python_packages=[] over good facts)."""
     root = project_dir.rstrip("/")
     listing: List[str] = []
-    for base, lines in _package_layout_scan(orchestrator, root):
+    for base, lines, executed in _package_layout_scan(orchestrator, root):
+        if not executed:
+            return None
         for line in lines:
             entry = f"{base}::{line}"
             if entry not in listing:
                 listing.append(entry)
-    return listing
+    return sorted(listing)
 
 
 def discover_packages(orchestrator, project_dir: str) -> List[str]:
@@ -597,7 +618,7 @@ def discover_packages(orchestrator, project_dir: str) -> List[str]:
     import-probed, and a junk dir kept here still cannot block. src-layout
     and package_dir bases are never ranked."""
     root = project_dir.rstrip("/")
-    for base, lines in _package_layout_scan(orchestrator, root):
+    for base, lines, _executed in _package_layout_scan(orchestrator, root):
         packages = []
         for line in lines:
             if not line.endswith("/__init__.py"):
