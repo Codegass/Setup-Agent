@@ -145,6 +145,36 @@ class ProjectAnalyzerTool(BaseTool):
         self.context_manager = context_manager
         self._java_annotation_cache: Dict[str, Dict[str, int]] = {}
 
+    def ensure_facts(self, project_path: str = "/workspace") -> bool:
+        """Framework-owned survey guarantee: compute + persist the machine
+        facts (manifest, trunk env metrics) WITHOUT the agent-facing output.
+
+        Eight mechanical readers (preflight, build tools, gates, finalizer)
+        depend on the manifest, but it was written only when the agent chose
+        to call ``project(action='analyze')`` — live 2026-07-13 pyyaml: the
+        agent skipped analyze and the install chain starved. The engine calls
+        this at build/test entry; zero LLM tokens (container commands only).
+        Idempotent: an existing manifest means the survey already ran (agent
+        or framework) → no-op. Never raises.
+
+        Returns True when the survey actually ran here.
+        """
+        try:
+            from .build_preflight import read_build_requirements
+
+            if read_build_requirements(self.orchestrator):
+                return False
+            validated = self._validate_and_discover_project_path(project_path)
+            if not validated:
+                return False
+            analysis = self._perform_comprehensive_analysis(validated)
+            if self.context_manager and self._is_analysis_valid(analysis):
+                self._update_trunk_context_with_plan(analysis)
+            return True
+        except Exception as exc:
+            logger.warning(f"framework survey skipped: {exc}")
+            return False
+
     def execute(
         self,
         action: str = "analyze",

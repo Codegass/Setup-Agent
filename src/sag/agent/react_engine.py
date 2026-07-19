@@ -1047,6 +1047,15 @@ class ReActEngine(UIEventEmitter):
         # forward in analyze key_results (Bigtop: compile the right reactor/module,
         # or block honestly on a meta-project — don't compile an empty root).
         if phase in ("build", "test"):
+            # Framework survey guarantee (analyzer diet, Category 1): the
+            # mechanical manifest readers must not depend on the agent having
+            # called project(analyze). Idempotent and token-free; when it
+            # actually ran here, say so in the trace.
+            if self._ensure_project_facts():
+                lines.append(
+                    "(framework survey ran — project facts were computed and "
+                    "persisted; the agent had not called project analyze)"
+                )
             brief_projection = self._project_brief_projection()
             if brief_projection:
                 lines.insert(
@@ -2665,6 +2674,22 @@ class ReActEngine(UIEventEmitter):
             job_id=str(result.poll_ref or metadata.get("job_id") or ""),
             output_cursor=output_cursor,
         )
+
+    def _ensure_project_facts(self) -> bool:
+        """Run the framework survey guarantee; True when it actually ran."""
+        orchestrator = getattr(
+            getattr(self, "physical_validator", None), "docker_orchestrator", None
+        )
+        if orchestrator is None:
+            return False
+        try:
+            from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+            analyzer = ProjectAnalyzerTool(orchestrator, self.context_manager)
+            return analyzer.ensure_facts("/workspace")
+        except Exception as exc:
+            logger.debug(f"framework survey unavailable: {exc}")
+            return False
 
     def _native_smoke_guidance(self, phase: str) -> Optional[str]:
         """The native-not-built smoke steer for the test phase, or None.
