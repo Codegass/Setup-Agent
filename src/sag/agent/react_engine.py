@@ -205,6 +205,17 @@ PYTHON_TEST_PHASE_GUIDANCE = (
     "report; a partial pass above threshold is a valid, honest outcome."
 )
 
+# Rendered before the test guidance when the build phase did NOT get the native
+# core built (live TVM 2026-07-18: the agent swept the full suite without
+# libtvm — 356 identical collection errors, pure waste of the phase budget).
+NATIVE_NOT_BUILT_TEST_GUIDANCE = (
+    "The NATIVE core was not built in the build phase. Do NOT sweep the full "
+    "suite — without the native library it only repeats hundreds of identical "
+    "collection errors. Run a small targeted smoke first (one or two fast test "
+    "files) to confirm what actually works, report the result honestly, and "
+    "only expand if the smoke passes."
+)
+
 # Native-first block, PREPENDED to the python build guidance when the analyzer
 # flagged has_native_build (live TVM: root CMakeLists.txt native core, real
 # python package in python/). Licenses the cmake dance instead of railroading a
@@ -1130,7 +1141,11 @@ class ReActEngine(UIEventEmitter):
         if not is_python_build_system(self._detected_build_system()):
             return None
         if phase == "test":
-            return PYTHON_TEST_PHASE_GUIDANCE
+            guidance = PYTHON_TEST_PHASE_GUIDANCE
+            rec = self._build_recommendation()
+            if rec.get("has_native_build") and self._build_phase_lacked_success():
+                guidance = f"{NATIVE_NOT_BUILT_TEST_GUIDANCE}\n{guidance}"
+            return guidance
         guidance = PYTHON_BUILD_PHASE_GUIDANCE
         rec = self._build_recommendation()
         if rec.get("has_native_build"):
@@ -2641,9 +2656,65 @@ class ReActEngine(UIEventEmitter):
             output_cursor=output_cursor,
         )
 
+    def _build_phase_lacked_success(self) -> bool:
+        """True when the build phase's recorded outcome is anything but success.
+
+        Read from the phase machine's records (validated outcome first, the
+        legacy outcome as fallback). No build record yet -> False.
+        """
+        machine = getattr(self, "phase_machine", None)
+        for record in getattr(machine, "records", ()) or ():
+            if str(getattr(record, "phase", "")) != "build":
+                continue
+            validated = getattr(record, "validated_outcome", None)
+            outcome = getattr(validated, "value", validated) or getattr(
+                getattr(record, "outcome", None), "value", getattr(record, "outcome", None)
+            )
+            return str(outcome or "unknown") != "success"
+        return False
+
+    def _untried_island_targets(self, *, limit: int = 4) -> str:
+        """Recommended build islands with NO observed work yet, as one line.
+
+        A seven-step window means 'change approach' lands on an agent that may
+        no longer remember the alternatives (live bigtop 2026-07-18: it
+        hammered the one broken island for 7 calls while three healthy islands
+        sat untouched). The redirect must carry a destination.
+        """
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            rec = (getattr(trunk, "environment_summary", None) or {}).get(
+                "build_recommendation"
+            ) or {}
+            islands = rec.get("build_islands") or []
+            if len(islands) < 2:
+                return ""
+            observed = [
+                str((getattr(obs, "params", None) or {}).get("working_directory") or "")
+                for obs in getattr(
+                    getattr(self, "run_evidence_state", None), "tool_observations", ()
+                )
+            ]
+            untried = [
+                isl
+                for isl in islands
+                if isl.get("root")
+                and not any(wd.startswith(str(isl["root"])) for wd in observed if wd)
+            ]
+            if not untried:
+                return ""
+            items = "; ".join(
+                f"{isl.get('system') or 'build'} '{isl.get('goal') or 'build'}' in {isl['root']}"
+                for isl in untried[:limit]
+            )
+            return f" Untried recommended islands: {items}."
+        except Exception:
+            return ""
+
     def _loop_guidance(self, decision: LoopDecision) -> str:
         attempts = ", ".join(decision.prior_attempt_ids) or "current run"
         scopes = ", ".join(decision.missing_progress_scopes) or "declared scopes"
+        untried = self._untried_island_targets()
         if decision.decision == "diversity_advisory":
             return (
                 "ACTION DIVERSITY ADVISORY: many distinct actions have been tried in this "
@@ -2654,12 +2725,12 @@ class ReActEngine(UIEventEmitter):
                 "LOOP FORCE-BREAK ARMED: the identical action/outcome recurred four times "
                 f"with no progress in {scopes}. Prior attempts: {attempts}. Reason once, "
                 "then choose a materially different action; an immediate identical repeat "
-                "will close this phase as failed."
+                f"will close this phase as failed.{untried}"
             )
         return (
             "RECURRENCE WITHOUT PROGRESS: the same action and outcome recurred while "
             f"{scopes} stayed unchanged. Prior attempts: {attempts}. Use the failure "
-            "reference and choose a different hypothesis before retrying."
+            f"reference and choose a different hypothesis before retrying.{untried}"
         )
 
     def _record_loop_blocker(self, decision: LoopDecision) -> None:

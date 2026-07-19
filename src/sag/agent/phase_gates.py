@@ -458,6 +458,26 @@ def _inspect_build(validator, project_name) -> _ValidatorObservation:
             "Run build(action='compile') and validate the resulting artifacts",
             "If an external impediment prevents progress, claim blocked with its evidence refs",
         )
+
+    # Agent-facing coverage checklist (live 2026-07-18: one bigtop run gave up
+    # with islands unattempted because the gate only said "evidence is green";
+    # another fixated on a broken island while three healthy ones sat
+    # untouched). The gate response NAMES what built and what has no output —
+    # on acceptance too, not only on rejection. Same computation the finalizer
+    # folds at evidence-close (sag.agent.module_coverage): one algorithm, so
+    # mid-run guidance can never disagree with the sealed verdict.
+    from sag.agent.module_coverage import coverage_checklist_line, module_coverage
+
+    checklist = coverage_checklist_line(module_coverage(validator, project_name))
+    if checklist:
+        reason = f"{reason} · {checklist}"
+        if "no output yet" in checklist:
+            suggestions = (
+                *suggestions,
+                "Modules without build output remain (see the coverage line) — build "
+                "each remaining island, or end the phase honestly with "
+                "outcome='partial' naming what was left and why",
+            )
     explicit_ready = status.get("test_entry_ready")
     evidence = status.get("evidence") or {}
     if not isinstance(explicit_ready, bool) and isinstance(evidence, dict):

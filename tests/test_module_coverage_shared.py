@@ -1,0 +1,270 @@
+"""One island-coverage computation, two consumers (gate mid-run, finalizer at close).
+
+Live evidence driving this module (2026-07-18 probes):
+- ws7-final7 bigtop r1: agent built the gradle islands, tried to claim blocked,
+  was rejected with "evidence is green" (true at top level, useless as
+  guidance), gave up — nothing ever told it which islands remained.
+- bigtop5: the agent fixated on the one broken maven island for 7 build calls;
+  nothing told it three healthy islands were untouched.
+
+The coverage rollup existed — but only at evidence-close, for the verdict.
+This module makes the SAME computation available mid-run so gate responses can
+carry the checklist. Same algorithm both places, or the in-run guidance and
+the sealed verdict would disagree (the exact split this campaign just fixed).
+"""
+
+from sag.agent.module_coverage import (
+    coverage_checklist_line,
+    coverage_conflicts,
+    module_coverage,
+)
+
+
+class FakeValidator:
+    project_path = "/workspace"
+
+    def __init__(self, *, primary="maven", by_system=None, tests_by_path=None):
+        self._primary = primary
+        self._by_system = by_system or {}
+        self._tests = tests_by_path or {}
+
+    def _detect_build_system(self, project_dir):
+        return self._primary
+
+    def scan_modules(self, project_dir, build_system):
+        return [dict(m) for m in self._by_system.get(build_system, [])]
+
+    def parse_module_test_reports(self, module_dir, report_dirs):
+        return dict(self._tests.get(module_dir.rsplit("/", 1)[-1], {}))
+
+
+def _bigtop_validator():
+    return FakeValidator(
+        primary="maven",
+        by_system={
+            "maven": [
+                {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+                 "report_dirs": [], "has_test_sources": False},
+                {"path": "bigtop-test-framework", "name": "bigtop-test-framework",
+                 "class_count": 0, "jar_count": 0, "report_dirs": [],
+                 "has_test_sources": True},
+            ],
+            "gradle": [
+                {"path": "bigtop-data-generators/bigtop-samplers",
+                 "name": "bigtop-samplers", "class_count": 39, "jar_count": 1,
+                 "report_dirs": ["/x/build/test-results/test"],
+                 "has_test_sources": True},
+                {"path": "bigtop-bigpetstore/bigpetstore-spark", "name": "spark",
+                 "class_count": 0, "jar_count": 0, "report_dirs": [],
+                 "has_test_sources": True},
+            ],
+        },
+        tests_by_path={
+            "bigtop-samplers": {"tests_total": 50, "tests_passed": 50, "failing_count": 0}
+        },
+    )
+
+
+def test_coverage_merges_both_jvm_systems_and_rolls_up():
+    coverage = module_coverage(_bigtop_validator(), "bigtop")
+    assert coverage is not None
+    summary = coverage["summary"]
+    assert summary["modules_total"] == 4
+    assert summary["modules_built"] == 1  # only bigtop-samplers has classes
+    built = [m["path"] for m in coverage["modules"] if m["build_status"] == "success"]
+    assert built == ["bigtop-data-generators/bigtop-samplers"]
+
+
+def test_coverage_conflicts_match_the_finalizer_contract():
+    coverage = module_coverage(_bigtop_validator(), "bigtop")
+    conflicts = coverage_conflicts(coverage)
+    assert "build_modules_incomplete" in conflicts
+    assert "reactor_scope_narrowed" in conflicts
+
+
+def test_python_projects_are_exempt():
+    assert module_coverage(FakeValidator(primary="python"), "proj") is None
+    assert coverage_conflicts(None) == ()
+    assert coverage_checklist_line(None) is None
+
+
+def test_checklist_line_names_built_and_unbuilt_modules():
+    line = coverage_checklist_line(module_coverage(_bigtop_validator(), "bigtop"))
+    assert line is not None
+    # the agent must SEE what remains, not just a ratio
+    assert "1/4 built" in line
+    assert "bigtop-samplers" in line
+    assert "bigtop-test-framework" in line or "no output" in line
+
+
+def test_validator_failure_degrades_to_none_never_raises():
+    class Exploding(FakeValidator):
+        def scan_modules(self, project_dir, build_system):
+            raise RuntimeError("container gone")
+
+    coverage = module_coverage(Exploding(), "proj")
+    assert coverage is None or coverage["summary"]["modules_total"] == 0
+
+
+# ---- Gate responses carry the checklist (mid-run consumer) ----
+
+from sag.agent.phase_gates import check_phase_claim
+from sag.agent.phase_machine import PhaseClaim
+
+
+class GateFakeValidator(FakeValidator):
+    """Coverage fixture + the build-status oracle the gate consults."""
+
+    def __init__(self, build_status, **kwargs):
+        super().__init__(**kwargs)
+        self._build_status = build_status
+
+    def validate_build_status(self, project_name):
+        return dict(self._build_status)
+
+
+def _gate_validator():
+    inner = _bigtop_validator()
+    validator = GateFakeValidator(
+        {
+            "success": True,
+            "build_complete": True,
+            "reason": "Build fingerprints found for maven project",
+            "conflicts": [],
+            "evidence_status": "success",
+            "evidence": {"class_count": 39},
+        },
+        primary="maven",
+        by_system=inner._by_system,
+        tests_by_path=inner._tests,
+    )
+    return validator
+
+
+def test_build_gate_response_names_unbuilt_modules():
+    """ws7-final7 r1: 'evidence is green' with zero mention of the unattempted
+    islands taught the agent to give up. The gate's reason must carry the
+    checklist — on ACCEPTANCE too, not only on rejection."""
+    claim = PhaseClaim(
+        phase="build", signal="done", claimed_outcome="partial",
+        key_results="built the samplers island",
+    )
+    gate = check_phase_claim("build", claim, _gate_validator(), None, "bigtop")
+    assert gate.accepted
+    text = " ".join([gate.reason or "", *(gate.suggestions or ())])
+    assert "1/4 built" in text
+    assert "no output yet" in text
+
+
+def test_blocked_rejection_is_informative_not_gaslighting():
+    """The rejection must explain WHY blocked does not fit AND what remains —
+    never a bare 'evidence is green' to an agent that just watched a failure."""
+    claim = PhaseClaim(
+        phase="build", signal="blocked", claimed_outcome="failed",
+        reason="maven island will not compile",
+    )
+    gate = check_phase_claim("build", claim, _gate_validator(), None, "bigtop")
+    # blocked against green top-level evidence: still not accepted as blocked…
+    text = " ".join([gate.reason or "", *(gate.suggestions or ())])
+    # …but the response tells the agent what the evidence actually shows and
+    # what it can do next (continue unbuilt modules / claim done honestly).
+    assert "1/4 built" in text or "no output yet" in text
+
+
+# ---- Loop guidance names the untried recommended targets (fix 3) ----
+
+from types import SimpleNamespace
+
+from sag.agent.react_engine import ReActEngine
+
+
+def _loop_engine(islands, observed_workdirs):
+    engine = ReActEngine.__new__(ReActEngine)
+
+    class FakeCM:
+        def load_trunk_context(self):
+            return SimpleNamespace(
+                environment_summary={"build_recommendation": {"build_islands": islands}}
+            )
+
+    engine.context_manager = FakeCM()
+    engine.run_evidence_state = SimpleNamespace(
+        tool_observations=tuple(
+            SimpleNamespace(params={"working_directory": wd}) for wd in observed_workdirs
+        )
+    )
+    return engine
+
+
+BIGTOP_ISLANDS = [
+    {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven", "goal": "install"},
+    {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle",
+     "goal": "publishToMavenLocal"},
+    {"root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark", "system": "gradle",
+     "goal": "build"},
+]
+
+
+def _guide_decision():
+    return SimpleNamespace(
+        decision="guide",
+        prior_attempt_ids=("build-1",),
+        missing_progress_scopes=("artifacts",),
+    )
+
+
+def test_loop_guidance_names_untried_islands():
+    """bigtop5: 'change approach' with no destination left the agent hammering
+    the one broken island. The guidance must name what it has NOT tried."""
+    engine = _loop_engine(
+        BIGTOP_ISLANDS, observed_workdirs=["/workspace/bigtop/bigtop-test-framework"]
+    )
+    text = engine._loop_guidance(_guide_decision())
+    assert "bigtop-data-generators" in text
+    assert "bigpetstore-spark" in text
+    assert "bigtop-test-framework" not in text.split("Untried")[-1]
+
+
+def test_loop_guidance_stays_clean_when_all_islands_tried_or_no_islands():
+    engine = _loop_engine(BIGTOP_ISLANDS, observed_workdirs=[i["root"] for i in BIGTOP_ISLANDS])
+    assert "Untried" not in engine._loop_guidance(_guide_decision())
+    engine2 = _loop_engine([], observed_workdirs=[])
+    assert "Untried" not in engine2._loop_guidance(_guide_decision())
+
+
+# ---- Test phase reads the native-core state before sweeping (fix 4) ----
+
+from test_python_phase_guidance import _engine_at, _python_env
+
+
+def _native_env():
+    env = _python_env()
+    env["build_recommendation"]["has_native_build"] = True
+    env["build_recommendation"]["build_root"] = "/workspace/tvm/python"
+    return env
+
+
+def test_test_phase_suggests_smoke_when_native_core_not_built():
+    """Live TVM: the agent swept the full suite without libtvm — 356 identical
+    collection errors, pure waste. The test-phase guidance must read the build
+    outcome and steer to a targeted smoke first."""
+    engine = _engine_at(3, _native_env())  # mark_done -> legacy outcome unknown
+    guidance = engine._python_phase_guidance("test")
+    assert "smoke" in guidance.lower()
+    assert "collection errors" in guidance
+    # the standard pytest guidance still follows
+    assert "build(action='test')" in guidance
+
+
+def test_test_phase_stays_clean_when_native_built_or_not_native(monkeypatch):
+    # native repo but build phase succeeded -> no smoke detour
+    engine = _engine_at(3, _native_env())
+    for record in engine.phase_machine.records:
+        if record.phase == "build":
+            object.__setattr__(record, "validated_outcome", "success")
+    assert "smoke" not in engine._python_phase_guidance("test").lower()
+    # plain python repo -> byte-identical guidance to before
+    engine2 = _engine_at(3, _python_env())
+    from sag.agent.react_engine import PYTHON_TEST_PHASE_GUIDANCE
+
+    assert engine2._python_phase_guidance("test") == PYTHON_TEST_PHASE_GUIDANCE

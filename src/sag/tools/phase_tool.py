@@ -174,7 +174,12 @@ class PhaseTool(BaseTool):
                 validated_outcome=gate.validated_outcome,
                 claim_disposition=ClaimDisposition.CONTRADICTED,
                 validator_state=gate.validator_state,
-                reason="phase evidence is green; an external blocked termination is not valid",
+                reason=(
+                    "blocked is reserved for external impediments, but the phase "
+                    f"evidence shows a real green build ({gate.reason}). Continue the "
+                    "remaining modules, or end the phase with phase(action='done', "
+                    "outcome='partial'|'failed') citing the failing modules' evidence"
+                ),
                 evidence_refs=gate.evidence_refs,
                 suggestions=gate.suggestions,
                 code="blocked_contradicted_by_green_evidence",

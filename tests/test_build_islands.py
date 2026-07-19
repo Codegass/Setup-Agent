@@ -741,3 +741,54 @@ def test_single_module_build_intro_still_byte_identical_after_r2():
         "Root Maven module has main sources; compile at the root."
     )
     assert "local maven repo" not in line
+
+
+def test_analyzer_output_does_not_render_competing_single_target_line_with_islands():
+    """bigtop5 live failure: the analysis output rendered BOTH 'build EACH of 4
+    islands' AND the pathological branch's single-target rationale ('build
+    module bigtop-test-framework directly'). The agent picked the narrow line
+    and hammered the one broken island for 7 calls. With multiple islands the
+    island list IS the recommendation — the single-target sentence must not
+    co-render as a competing authority."""
+    from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+    tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
+    rec = {
+        "build_system": "maven",
+        "goal": "install",
+        "build_root": "/workspace/bigtop/bigtop-test-framework",
+        "rationale": (
+            "Aggregator root with no reactor modules over 2 source module(s); "
+            "build module bigtop-test-framework directly with 'install'."
+        ),
+        "build_islands": [
+            {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven",
+             "goal": "install"},
+            {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle",
+             "goal": "publishToMavenLocal"},
+            {"root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+             "system": "gradle", "goal": "build"},
+        ],
+    }
+    output = tool._render_recommended_build_output({"build_recommendation": rec})
+    assert "independent build islands" in output
+    assert "build EACH" in output
+    # the competing single-target sentence is gone
+    assert "directly with 'install'" not in output
+    assert "🧭 Recommended Build: maven 'install' in" not in output
+
+
+def test_analyzer_output_keeps_single_target_line_without_islands():
+    from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+    tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
+    rec = {
+        "build_system": "maven",
+        "goal": "install",
+        "build_root": "/workspace/proj",
+        "rationale": "Reactor root declares 3 module(s); install -fae at root.",
+        "build_islands": [],
+    }
+    output = tool._render_recommended_build_output({"build_recommendation": rec})
+    assert "🧭 Recommended Build: maven 'install' in /workspace/proj" in output
+    assert "independent build islands" not in output

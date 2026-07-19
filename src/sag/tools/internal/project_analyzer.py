@@ -2470,6 +2470,46 @@ PY"""
         logger.debug("Execution plan validation passed")
         return True
 
+    def _render_recommended_build_output(self, analysis: Dict[str, Any]) -> str:
+        """The 🧭 Recommended Build block of the analysis output.
+
+        With MULTIPLE build islands the island list IS the recommendation —
+        the pathological branch's single-target sentence must not co-render
+        (live bigtop 2026-07-18: the agent followed 'build module
+        bigtop-test-framework directly' from the rationale, hammered the one
+        upstream-broken island for 7 calls, and never touched three healthy
+        ones the island line named). One authority per fact.
+        """
+        rec = analysis.get("build_recommendation") or {}
+        output = ""
+        if rec.get("is_aggregator_only"):
+            return (
+                f"🧭 Recommended Build: NONE — {rec['rationale']} "
+                f"Consider phase(action='blocked', outcome='unknown', ...) with this "
+                f"evidence rather than forcing a compile.\n"
+            )
+        build_islands = rec.get("build_islands") or []
+        if len(build_islands) > 1:
+            isles = "; ".join(
+                f"{i}) {isl.get('system') or 'unknown'} '{isl.get('goal') or 'build'}' "
+                f"in {isl['root']}"
+                for i, isl in enumerate(build_islands, start=1)
+            )
+            output += (
+                f"🧭 Recommended Build: {len(build_islands)} independent build islands "
+                f"— build EACH: {isles}. Islands may depend on each other through the "
+                f"local maven repo: publish/install provider islands first.\n"
+            )
+        else:
+            output += (
+                f"🧭 Recommended Build: {rec.get('build_system')} "
+                f"'{rec.get('goal')}' in {rec.get('build_root')} — {rec['rationale']}\n"
+            )
+        if rec.get("source_modules"):
+            mods = ", ".join(f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6])
+            output += f"   • Source modules: {mods}\n"
+        return output
+
     def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
         """格式化分析输出"""
         output = "🔍 PROJECT ANALYSIS COMPLETED\n\n"
@@ -2496,34 +2536,7 @@ PY"""
         # empty aggregator root (e.g. Bigtop's packaging=pom over Groovy/Gradle).
         rec = analysis.get("build_recommendation") or {}
         if rec.get("rationale"):
-            if rec.get("is_aggregator_only"):
-                output += (
-                    f"🧭 Recommended Build: NONE — {rec['rationale']} "
-                    f"Consider phase(action='blocked', outcome='unknown', ...) with this "
-                    f"evidence rather than forcing a compile.\n"
-                )
-            else:
-                output += (
-                    f"🧭 Recommended Build: {rec.get('build_system')} "
-                    f"'{rec.get('goal')}' in {rec.get('build_root')} — {rec['rationale']}\n"
-                )
-                if rec.get("source_modules"):
-                    mods = ", ".join(
-                        f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6]
-                    )
-                    output += f"   • Source modules: {mods}\n"
-                # Pathological aggregators are archipelagos: name EVERY
-                # independent build island so the agent builds each (not just
-                # the one preferred module).
-                build_islands = rec.get("build_islands") or []
-                if len(build_islands) > 1:
-                    isles = "; ".join(
-                        f"{isl.get('system') or 'unknown'}:{isl['root']}" for isl in build_islands
-                    )
-                    output += (
-                        f"   • {len(build_islands)} independent build islands "
-                        f"(build EACH): {isles}\n"
-                    )
+            output += self._render_recommended_build_output(analysis)
             # Tests may live in a different module / build system than the build.
             # (Python recs are pytest-at-the-build-root by construction — their
             # differing labels must not render the "not in the build module"

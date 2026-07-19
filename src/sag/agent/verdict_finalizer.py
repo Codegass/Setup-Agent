@@ -257,90 +257,16 @@ _EVIDENCE_STATUS_MAP = {
 }
 
 
-def _module_record_richness(module: dict[str, Any]) -> int:
-    return (
-        int(module.get("class_count") or 0)
-        + int(module.get("jar_count") or 0)
-        + len(module.get("report_dirs") or [])
-        + (1 if module.get("has_test_sources") else 0)
-    )
-
-
 def _module_coverage_conflicts(validator, project_name) -> tuple[str, ...]:
     """The July kernel's module/island coverage honesty, folded at evidence-close.
 
-    These conflicts were produced by the report layer, which now renders AFTER
-    the snapshot is sealed — so nothing fed them into the run state (live
-    regression #2: bigtop sealed SUCCESS while half its islands never built and
-    only a subset of test-bearing modules ran tests). Python projects stay
-    exempt (July rule: packages-as-modules is future work). Never raises.
+    Delegates to the SHARED coverage module (sag.agent.module_coverage) — the
+    same computation the phase gates render mid-run as an agent-facing
+    checklist. One algorithm, two consumers, no drift.
     """
-    if validator is None:
-        return ()
-    try:
-        from sag.tools.module_metrics import assemble_module_metrics
+    from sag.agent.module_coverage import coverage_conflicts, module_coverage
 
-        project_path = str(getattr(validator, "project_path", "/workspace") or "/workspace")
-        project_dir = f"{project_path}/{project_name}" if project_name else project_path
-        primary = str(validator._detect_build_system(project_dir) or "").strip().lower()
-        if primary not in ("maven", "gradle"):
-            return ()
-
-        # Mixed-layout merge (July): scan BOTH JVM systems, richer record wins
-        # per path, so gradle test islands beside a maven root stay visible.
-        merged: dict[str, dict[str, Any]] = {}
-        for system in ("maven", "gradle"):
-            try:
-                modules = validator.scan_modules(project_dir, system) or []
-            except Exception:
-                continue
-            for module in modules:
-                if not isinstance(module, dict):
-                    continue
-                path = str(module.get("path") or ".")
-                current = merged.get(path)
-                if current is None or _module_record_richness(module) > _module_record_richness(
-                    current
-                ):
-                    merged[path] = module
-        if not merged:
-            return ()
-
-        tests: dict[str, Any] = {}
-        for path, module in merged.items():
-            report_dirs = module.get("report_dirs") or []
-            if not report_dirs:
-                continue
-            module_dir = f"{project_dir}/{path}" if path != "." else project_dir
-            try:
-                parsed = validator.parse_module_test_reports(module_dir, report_dirs)
-            except Exception:
-                parsed = {}
-            if parsed:
-                tests[path] = parsed
-
-        metrics = assemble_module_metrics(
-            modules=list(merged.values()),
-            reactor_status={},
-            tests=tests,
-            build_systems=[primary],
-            build_error_samples={},
-            generated_at="evidence-close",
-        )
-        summary = metrics.get("module_summary") or {}
-        conflicts: list[str] = []
-        total = int(summary.get("modules_total") or 0)
-        built = int(summary.get("modules_built") or 0)
-        if total and built < total:
-            conflicts.append("build_modules_incomplete")
-        bearing = int(summary.get("modules_test_bearing") or 0)
-        tested = summary.get("modules_tested")
-        if bearing and tested is not None and 0 < int(tested) < bearing:
-            conflicts.append("reactor_scope_narrowed")
-        return tuple(conflicts)
-    except Exception as exc:  # never let coverage folding break the seal
-        logger.debug(f"module coverage fold skipped: {exc}")
-        return ()
+    return coverage_conflicts(module_coverage(validator, project_name))
 
 
 def _physical_build_status(validator, project_name) -> dict[str, Any] | None:
