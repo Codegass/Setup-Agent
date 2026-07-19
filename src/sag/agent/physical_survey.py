@@ -1330,7 +1330,13 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
       annotation counts on the trunk derive from their content);
     * the module-layout dir LISTING as text (source/test scans key off dir
       existence: a new src/main/java changes island facts with no file
-      content change).
+      content change);
+    * the python package LAYOUT as text — ``__init__.py`` paths to depth 4,
+      covering every base ``discover_packages`` scans (root, ``src/``, a
+      declared ``package_dir``, and the native-core ``python/`` shapes).
+      ``python_packages`` derives from these PATHS: renaming ``alpha_pkg``
+      to ``beta_pkg`` changes the manifest fact with zero config change
+      (final Category-2 review P1).
 
     Per-file ``cksum`` lines — checksum, size AND file name — collapse with
     the dir listing through a final ``cksum``: names, existence, and content
@@ -1356,6 +1362,8 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
         f"find . \\( {prunes} \\) -prune -o -type f \\( {test_dirs} \\) -print ; }} "
         f"| sort -u | xargs -r cksum ; "
         f"find . \\( {prunes} \\) -prune -o -type d \\( {module_dirs} \\) -print | sort ; "
+        f"find . -maxdepth 4 \\( {prunes} \\) -prune -o "
+        f"-type f -name __init__.py -not -path '*/.*' -print | sort ; "
         f"}} 2>/dev/null | cksum"
     )
     try:

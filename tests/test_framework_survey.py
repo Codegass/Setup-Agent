@@ -25,17 +25,19 @@ class SurveyOrch:
         self.commands = []
         self.manifest_writes = 0
         self.drop_manifest_writes = drop_manifest_writes
-        # The config the fingerprint probe digests; tests mutate it to
-        # simulate an edited build file.
+        # The fingerprint probe digests config content AND the package
+        # layout; tests mutate either to simulate an edit vs. a rename.
         self.config_seed = "pyproject-v1"
+        self.package_layout = ("alpha_pkg",)
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
         if "| cksum" in command:
             if not self.config_seed:  # empty seed simulates a broken probe
                 return {"success": False, "exit_code": 1, "output": ""}
-            digest = sum(map(ord, self.config_seed))
-            return {"success": True, "exit_code": 0, "output": f"{digest} {len(self.config_seed)}"}
+            seed = self.config_seed + "|" + "|".join(self.package_layout)
+            digest = sum(map(ord, seed))
+            return {"success": True, "exit_code": 0, "output": f"{digest} {len(seed)}"}
         if "<<" in command and REQUIREMENTS_PATH in command:
             self.manifest_writes += 1
             if not self.drop_manifest_writes:
@@ -305,6 +307,25 @@ def test_fingerprint_command_covers_everything_the_survey_reads():
     # Per-file cksum lines (name + size + checksum) feed the final cksum:
     # names, existence, and content boundaries are all encoded.
     assert "xargs -r cksum" in cmd and cmd.rstrip().endswith("| cksum")
+
+
+def test_package_rename_with_unchanged_config_resurveys():
+    """Final Category-2 review P1: python_packages derives from __init__.py
+    PATHS and rides the manifest into the validator — renaming alpha_pkg to
+    beta_pkg changes the fact with zero config-file change. The layout is
+    part of the fingerprint domain, so the rename must re-survey, never
+    serve the stale package name as 'present'."""
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.package_layout = ("beta_pkg",)  # rename; config_seed untouched
+    assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
+    assert orch.manifest_writes == 2  # fresh facts, not the stale manifest
+
+    # The probe really sweeps the layout: __init__.py paths ride the command.
+    cmd = next(c for c in orch.commands if "| cksum" in c)
+    assert "-name __init__.py" in cmd
 
 
 def test_config_edit_with_dropped_rewrite_is_failed_not_created():

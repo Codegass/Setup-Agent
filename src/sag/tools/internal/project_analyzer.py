@@ -45,7 +45,10 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # module-dir layout), and 'created' verifies THIS survey's fingerprint on
 # the re-read manifest — version+path cannot distinguish two surveys of the
 # same project, so a dropped rewrite after a config edit passed as created.
-SURVEY_FACTS_VERSION = 4
+# v5: the python package LAYOUT (__init__.py paths) joins the fingerprint —
+# python_packages derives from those paths and rides the manifest into the
+# validator; a package rename with unchanged config served stale names.
+SURVEY_FACTS_VERSION = 5
 
 
 class ProjectAnalyzerTool(BaseTool):

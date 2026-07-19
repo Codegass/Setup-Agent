@@ -182,6 +182,16 @@ is unchanged.
   list is policy and composes in `_compose_python_config` at the tool
   layer.
 
+**Third-round review outcome (2026-07-19, fixed).**
+- P1 python package layout joins the fingerprint: `python_packages` derives
+  from `__init__.py` PATHS and rides the manifest into the validator — a
+  package rename with zero config change served the stale name as
+  `present`. The probe now lists `__init__.py` paths to depth 4 (covering
+  every base `discover_packages` scans: root, `src/`, declared
+  `package_dir`, native-core `python/`) as text beside the module-dir
+  listing. `SURVEY_FACTS_VERSION` 4→5; behavior test: rename with unchanged
+  config re-surveys, never `present`.
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -195,7 +205,7 @@ the validator's substrate with zero call-site behavior change (full suite at
 zero new failures after every slice); surveyor emits no `goal`/
 preferred-module fields (slice 5); manifest gains the source fingerprint
 completing the staleness contract (slice 6 + two review rounds;
-`tests/test_framework_survey.py` 19 tests — config edit re-surveys,
+`tests/test_framework_survey.py` 20 tests — config edit re-surveys,
 unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
 via both-ends fingerprint agreement, config-edit-plus-dropped-rewrite is
 `failed` not `created`, probe command covers everything the survey reads).
