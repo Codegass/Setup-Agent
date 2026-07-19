@@ -162,11 +162,13 @@ class ProjectAnalyzerTool(BaseTool):
         this at build/test entry; zero LLM tokens (container commands only).
         Never raises.
 
-        Returns ``"created"`` only after the manifest is VERIFIED on disk
-        (review 2026-07-19: an unconditional True let the engine claim
-        'facts persisted' over a dropped write); ``"present"`` when a current
-        survey already exists (agent- or framework-run); ``"failed"``
-        otherwise. A manifest from an older analyzer version re-runs.
+        Returns ``"created"`` only after (a) the trunk env metrics saved and
+        (b) the re-read manifest carries THIS survey's stamp (version AND
+        project path — a stale file left on disk keeps the readback non-empty
+        when a replacement write is dropped); ``"present"`` for an agent-era
+        stampless manifest or a current-version same-project stamp;
+        ``"failed"`` otherwise. Older-version or other-project stamps
+        re-survey.
         """
         orchestrator = getattr(self, "docker_orchestrator", None) or getattr(
             self, "orchestrator", None
@@ -177,20 +179,43 @@ class ProjectAnalyzerTool(BaseTool):
             from .build_preflight import read_build_requirements
 
             existing = read_build_requirements(orchestrator) or {}
-            if existing:
-                survey = existing.get("survey") or {}
-                if not survey or survey.get("analyzer_version") == SURVEY_FACTS_VERSION:
-                    # no stamp = agent-era manifest (still authoritative);
-                    # matching stamp = current survey. Either way: present.
-                    return "present"
+            existing_stamp = (existing.get("survey") or {}) if existing else {}
+            if existing and not existing_stamp:
+                # Agent-era manifest (pre-stamp): still authoritative — the
+                # zero-behavior-change promise when the agent DID analyze.
+                return "present"
+
             validated = self._validate_and_discover_project_path(project_path)
             if not validated:
                 return "failed"
+            if (
+                existing_stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
+                and existing_stamp.get("project_path") == validated
+            ):
+                # Current survey for THIS project (re-review 2026-07-19: a
+                # same-version manifest from another workspace project must
+                # not pass as present).
+                return "present"
+
             analysis = self._perform_comprehensive_analysis(validated)
-            if self.context_manager and self._is_analysis_valid(analysis):
-                self._update_trunk_context_with_plan(analysis)
-            # Success is what the READERS can see, not what we attempted.
-            if not (read_build_requirements(orchestrator) or {}):
+            if not self._is_analysis_valid(analysis):
+                return "failed"
+            if self.context_manager is not None:
+                # The guarantee is manifest AND trunk env metrics — a stale
+                # env would still pick the wrong phase objective (re-review
+                # 2026-07-19: ignoring this return let 'created' stand over a
+                # failed trunk save).
+                if not self._update_trunk_context_with_plan(analysis):
+                    return "failed"
+            # Success is what the READERS can see: the re-read manifest must
+            # carry THIS survey's stamp — a stale file left on disk keeps the
+            # readback non-empty even when the replacement write was dropped
+            # (re-review 2026-07-19).
+            persisted = (read_build_requirements(orchestrator) or {}).get("survey") or {}
+            if (
+                persisted.get("analyzer_version") != SURVEY_FACTS_VERSION
+                or persisted.get("project_path") != validated
+            ):
                 return "failed"
             return "created"
         except Exception as exc:

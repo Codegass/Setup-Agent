@@ -41,16 +41,20 @@ happens to call `analyze`. Eight mechanical readers depend on them
 (`build_preflight`, both build tools, python tool, facade, validator, gates,
 setup tool). Live pyyaml: agent skipped analyze → deps no-oped → run wasted.
 
-**Change.**
-1. `ProjectAnalyzerTool.ensure_facts(project_path)` — the compute+persist core
-   (`_perform_comprehensive_analysis` + trunk env metrics) WITHOUT the
-   agent-facing output. Idempotent: existing manifest → no-op. Never raises.
-2. Engine hook: at build/test phase intro, `_ensure_project_facts()` runs the
-   guarantee (no LLM tokens — container commands only). When it actually ran,
-   the intro notes it in one line, so the trace shows the framework acted.
-3. The agent's `analyze` action is unchanged (same survey, plus the fact-sheet
-   output). It remains the RECOMMENDED path — the guarantee is a net, not a
-   replacement.
+**Change (as implemented — v2 after the 2026-07-19 re-review).**
+1. `ProjectAnalyzerTool.ensure_facts(project_path)` runs the SAME survey
+   pipeline as agent-invoked analyze (including brief composition — the
+   declared temporary compatibility below) minus the tool-result text.
+   Fast path: an agent-era stampless manifest, or a stamp matching BOTH the
+   current `analyzer_version` AND this project's validated path, is
+   `present`; older-version or other-project stamps re-survey. `created`
+   requires (a) a valid analysis, (b) the trunk env metrics SAVED, and
+   (c) the re-read manifest carrying this survey's stamp. Never raises.
+2. Engine hook: the guarantee runs at build/test intro BEFORE
+   `phase_objective()` selects by build system; the trace line renders only
+   on `created`.
+3. The agent's `analyze` action is unchanged. It remains the RECOMMENDED
+   path — the guarantee is a net, not a replacement.
 
 **Review 2026-07-19 outcomes (implemented).**
 - The guarantee resolves the orchestrator the constructor actually sets
@@ -73,13 +77,19 @@ prescriptions themselves). The prescriptive output is therefore acknowledged
 as temporary: it is removed by Category 3's A/B gate, and its removal
 criterion is explicit — panel parity of facts-plus-feedback vs. prescriptions.
 
-**Done-bar (all covered in `tests/test_framework_survey.py`).** Production
-constructor path works; `created` requires on-disk verification; dropped
-writes → `failed` and no trace line; second call `present` with no
-re-analysis; agent-era stampless manifest counts as `present` (zero behavior
-change when the agent analyzed); stale version re-surveys; survey precedes
-objective selection (python objective asserted, java marker absent); test
-phase runs the guarantee too; broken container never raises.
+**Done-bar (`tests/test_framework_survey.py`, 13 tests: 12 unit + 1
+UNMOCKED integration).** Unit: production constructor path; `created`
+requires the re-read stamp (version + project path) — a stale file over a
+dropped rewrite is `failed`; trunk-save failure is `failed`; `present` never
+re-analyzes or re-writes; agent-era stampless manifest is `present`;
+same-version other-project stamp re-surveys; survey precedes objective
+selection; test phase runs the guarantee; broken container never raises.
+Integration (no monkeypatch): a skipped-analyze run reaches the build intro,
+the REAL survey pipeline executes against the scripted container, the stamped
+manifest lands, the trunk env is saved, and the objective selected in that
+same intro is the Python one. Not covered (stated, not overclaimed): a full
+recorded-transcript replay — that harness lands with the Category 2/3 panel
+work.
 
 ## Category 2 (next): surveying moves to the physical layer
 

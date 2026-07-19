@@ -23,11 +23,13 @@ class SurveyOrch:
     def __init__(self, *, drop_manifest_writes=False):
         self.files = {}
         self.commands = []
+        self.manifest_writes = 0
         self.drop_manifest_writes = drop_manifest_writes
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
         if "<<" in command and REQUIREMENTS_PATH in command:
+            self.manifest_writes += 1
             if not self.drop_manifest_writes:
                 body = command.split("<<'SAGEOF'\n", 1)[1].rsplit("\nSAGEOF", 1)[0]
                 self.files[REQUIREMENTS_PATH] = body
@@ -72,9 +74,13 @@ def test_present_when_manifest_exists_and_no_reanalysis_happens():
     orch = SurveyOrch()
     tool = ProjectAnalyzerTool(orch)
     assert tool.ensure_facts("/workspace/proj") == "created"
+    writes_before = orch.manifest_writes
     before = len(orch.commands)
     assert tool.ensure_facts("/workspace/proj") == "present"
-    assert len(orch.commands) - before <= 2  # only the manifest probe
+    # The identity check (re-review P2: stamp must match THIS project) costs a
+    # few discovery probes — but present must never re-analyze or re-write.
+    assert orch.manifest_writes == writes_before
+    assert len(orch.commands) - before <= 12
 
 
 def test_agent_written_manifest_without_stamp_counts_as_present():
@@ -158,3 +164,112 @@ def test_test_phase_intro_also_runs_the_guarantee(monkeypatch):
     )
     _mutable_engine(3, _python_env())._phase_intro_step()
     assert calls
+
+
+def test_stale_manifest_with_dropped_rewrite_is_failed_not_created():
+    """Re-review P1: the old stale file keeps the readback non-empty when the
+    replacement write is dropped — 'created' must verify THIS survey's stamp."""
+    orch = SurveyOrch(drop_manifest_writes=True)
+    orch.files[REQUIREMENTS_PATH] = '{"survey": {"analyzer_version": 0}}'
+    assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "failed"
+
+
+def test_same_version_manifest_for_another_project_resurveys():
+    """Re-review P2: version match alone must not pass — project identity too."""
+    orch = SurveyOrch()
+    orch.files[REQUIREMENTS_PATH] = (
+        '{"survey": {"analyzer_version": 1, "project_path": "/workspace/other"}}'
+    )
+    assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "created"
+    assert '"/workspace/proj"' in orch.files[REQUIREMENTS_PATH]
+
+
+def test_trunk_persistence_failure_means_failed():
+    """Re-review P1: the guarantee is manifest AND trunk env metrics — a failed
+    trunk save leaves the env stale and the objective wrong."""
+
+    class BrokenCM:
+        def load_trunk_context(self):
+            raise RuntimeError("trunk store unavailable")
+
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch, BrokenCM())
+    assert tool.ensure_facts("/workspace/proj") == "failed"
+
+
+# ---- Integration: agent-skips-analyze, NO monkeypatching (re-review P2) ----
+
+
+class _TrunkTask:
+    def __init__(self, task_id):
+        self.id = task_id
+
+
+class StrictSurveyOrch(SurveyOrch):
+    """Existence probes default to ABSENT so detection sees a clean python
+    repo (the permissive default made pom.xml 'exist' and the analysis came
+    out unknown/invalid)."""
+
+    def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+        stripped = command.strip()
+        if stripped.startswith("test -d "):
+            self.commands.append(command)
+            return {"success": True, "exit_code": 0, "output": ""}  # dirs exist
+        if stripped.startswith(("test -f ", "test -e ")) and "pyproject" not in stripped:
+            self.commands.append(command)
+            return {"success": False, "exit_code": 1, "output": ""}
+        if stripped.startswith("test -f /workspace/pyproject.toml"):
+            self.commands.append(command)
+            return {"success": True, "exit_code": 0, "output": "exists"}
+        if stripped.startswith("cat /workspace/pyproject.toml"):
+            self.commands.append(command)
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": '[project]\nname = "proj"\nrequires-python = ">=3.9"\n',
+            }
+        return super().execute_command(command, workdir=workdir, timeout=timeout, **kwargs)
+
+
+class IntegrationCM:
+    """A context manager whose trunk actually persists — the real
+    _update_trunk_context_with_plan path runs against it unmocked."""
+
+    def __init__(self):
+        self.trunk = SimpleNamespace(
+            environment_summary={},
+            todo_list=[_TrunkTask("phase_build"), _TrunkTask("phase_test")],
+        )
+        self.saves = 0
+
+    def load_trunk_context(self):
+        return self.trunk
+
+    def _save_trunk_context(self, trunk):
+        self.saves += 1
+
+
+def test_integration_skipped_analyze_run_ends_with_facts_and_python_objective():
+    """The original done-bar criterion, unmocked: an agent that never called
+    analyze reaches the build intro; the REAL survey pipeline runs against the
+    (scripted) container, the manifest lands stamped, the trunk env is saved,
+    and the objective selected in that same intro is the PYTHON one."""
+    from test_python_phase_guidance import _engine_at
+
+    cm = IntegrationCM()
+    orch = StrictSurveyOrch()
+    engine = _engine_at(2, cm.trunk.environment_summary)  # build phase, empty env
+    engine.context_manager = cm  # the real survey writes THIS trunk
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=orch)
+
+    intro = engine._phase_intro_step().content
+
+    # facts persisted and stamped for this project
+    assert REQUIREMENTS_PATH in orch.files
+    assert '"project_path": "/workspace' in orch.files[REQUIREMENTS_PATH]
+    # trunk env metrics actually saved (not just attempted)
+    assert cm.saves >= 1
+    assert cm.trunk.environment_summary.get("build_recommendation")
+    # the trace names the framework survey, and the objective is python-side
+    assert "framework survey ran" in intro
+    assert "Never run mvn/gradle via bash" not in intro
