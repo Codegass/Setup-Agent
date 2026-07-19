@@ -33,6 +33,7 @@ class SurveyOrch:
         self.config_seed = "pyproject-v1"
         self.package_layout = ("alpha_pkg",)
         self.layout_probe_broken = False  # no sentinel: probe never executed
+        self.layout_find_fails = False  # shell ran; find died mid-scan
         self.reverse_layout = False  # find order is unspecified — flip it
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
@@ -49,6 +50,10 @@ class SurveyOrch:
             paths = [f"{base}/{pkg}/__init__.py" for pkg in self.package_layout]
             if self.reverse_layout:
                 paths.reverse()
+            if self.layout_find_fails:
+                # Permission/IO death mid-scan: nonzero find exit, PARTIAL
+                # output, and the conditional sentinel does not echo.
+                return {"success": False, "exit_code": 1, "output": "\n".join(paths[:1])}
             return {
                 "success": True,
                 "exit_code": 0,
@@ -372,6 +377,33 @@ def test_layout_probe_failure_is_cannot_compare_not_empty_layout():
     assert orch.manifest_writes == 1  # and no []-overwrite of good facts
 
     orch.layout_probe_broken = False  # probe recovers, layout unchanged
+    assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_find_failure_mid_scan_is_cannot_compare_not_partial_layout():
+    """Round-6 review P1: an unconditional '; echo' let the sentinel ride
+    over find's nonzero exit — a permission/IO failure mid-scan (partial
+    output) was folded into a successful partial/empty layout. The sentinel
+    is now CONDITIONAL (find completed, or the base is absent): a failed
+    find has no sentinel, the listing is unknowable, and the fingerprint is
+    CANNOT COMPARE — the surveyed facts keep serving."""
+    orch = SurveyOrch()
+    orch.package_layout = ("alpha_pkg", "zeta_pkg")
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    # The probe SHAPE encodes the contract: sentinel only via '&&' (find
+    # completed) or the absent-base branch — never an unconditional ';'.
+    probe = next(c for c in orch.commands if "-name __init__.py" in c)
+    assert f"&& echo {LAYOUT_SCAN_SENTINEL}" in probe
+    assert f"; echo {LAYOUT_SCAN_SENTINEL}" not in probe
+    assert "test ! -e" in probe
+
+    orch.layout_find_fails = True  # shell ran; find died with partial output
+    assert tool.ensure_facts("/workspace/proj") == "present"  # no thrash
+    assert orch.manifest_writes == 1  # and no partial-layout overwrite
+
+    orch.layout_find_fails = False  # find recovers, layout unchanged
     assert tool.ensure_facts("/workspace/proj") == "present"
 
 

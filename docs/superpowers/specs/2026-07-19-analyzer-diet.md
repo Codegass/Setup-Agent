@@ -226,6 +226,21 @@ is unchanged.
   `present`, no rewrite, recovery stays `present`; reversed order →
   `present`, no rewrite.
 
+**Sixth-round review outcome (2026-07-19, fixed).**
+- P1 (continuation): the sentinel was echoed UNCONDITIONALLY (`; echo`),
+  which rides over find's nonzero exit — a permission/IO failure mid-scan
+  (with partial or no output) still looked like a successful empty layout.
+  The sentinel is now conditional and left-associative
+  (`find … && echo S || { test ! -e base && echo S; }`): it echoes only
+  when find COMPLETED or the base is ABSENT; a mid-scan failure is
+  sentinel-less → unknowable → CANNOT COMPARE. Verified against a real
+  shell (success / absent / chmod-000 permission failure). The find-first
+  command shape keeps every scripted-orch fixture matching. Regression:
+  find dies mid-scan with partial output → `present`, no rewrite,
+  recovery stays `present`; the probe shape itself is asserted
+  (`&& echo`, never `; echo`). No version bump — healthy-path digests are
+  unchanged.
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -239,7 +254,7 @@ the validator's substrate with zero call-site behavior change (full suite at
 zero new failures after every slice); surveyor emits no `goal`/
 preferred-module fields (slice 5); manifest gains the source fingerprint
 completing the staleness contract (slice 6 + two review rounds;
-`tests/test_framework_survey.py` 23 tests — config edit re-surveys,
+`tests/test_framework_survey.py` 24 tests — config edit re-surveys,
 unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
 via both-ends fingerprint agreement, config-edit-plus-dropped-rewrite is
 `failed` not `created`, probe command covers everything the survey reads).

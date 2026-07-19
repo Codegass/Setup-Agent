@@ -549,10 +549,14 @@ def _package_layout_scan(orchestrator, root: str):
     depth, symlinks, and pruning — sharing the machinery makes the fact and
     its staleness domain inseparable.
 
-    ``executed`` is True iff the trailing sentinel came back: a MISSING base
-    (find fails, sentinel echoes) is a legitimately empty listing, while a
-    probe that never ran (no sentinel) is unknowable. Discovery treats both
-    as empty (its historical behavior); the fingerprint must not.
+    ``executed`` is True iff the trailing sentinel came back, and the
+    sentinel echoes ONLY when find COMPLETED successfully or the base does
+    not exist (a legitimately empty listing). An unconditional ``; echo``
+    rode over find's nonzero exit (round-6 review: a permission/IO failure
+    mid-scan — partial or no output — was folded into a successful empty
+    layout); the conditional form leaves such failures sentinel-less, so
+    the listing is unknowable. Discovery treats every non-listing case as
+    empty (its historical behavior); the fingerprint must not.
 
     Lazy: ``discover_packages`` stops at the first base with packages,
     preserving its historical command sequence; the fingerprint drains it.
@@ -565,9 +569,13 @@ def _package_layout_scan(orchestrator, root: str):
             bases.remove(mapped_base)
         bases.insert(0, mapped_base)
     for base in bases:
+        # Left-associative: (find && echo S) || { test ! -e base && echo S; }
+        # -> sentinel iff find completed OR the base is absent. Keeping the
+        # command find-first also keeps every scripted-orch fixture matching.
         result = orchestrator.execute_command(
             f"find {base} -maxdepth 2 -name __init__.py -not -path '*/.*' 2>/dev/null"
-            f"; echo {LAYOUT_SCAN_SENTINEL}"
+            f" && echo {LAYOUT_SCAN_SENTINEL}"
+            f" || {{ test ! -e {base} && echo {LAYOUT_SCAN_SENTINEL}; }}"
         )
         raw = [line.strip() for line in (result.get("output") or "").splitlines() if line.strip()]
         executed = LAYOUT_SCAN_SENTINEL in raw
