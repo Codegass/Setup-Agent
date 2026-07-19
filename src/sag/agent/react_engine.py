@@ -1062,6 +1062,14 @@ class ReActEngine(UIEventEmitter):
                 guidance = self._python_phase_guidance(phase)
                 if guidance:
                     lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
+            # Evidence-reactive steer, injected on BOTH branches: the brief is
+            # composed at analyze time and cannot know the build outcome, so
+            # runtime state must not hide behind the projection (live TVM
+            # 2026-07-18: the smoke steer only rendered on the no-brief
+            # fallback, and the live run swept 356 collection errors again).
+            smoke = self._native_smoke_guidance(phase)
+            if smoke:
+                lines.insert(lines.index(f"Objective: {objective}") + 1, smoke)
         handoff = getattr(self, "phase_handoff", None)
         projection = None
         if handoff is not None:
@@ -1141,11 +1149,13 @@ class ReActEngine(UIEventEmitter):
         if not is_python_build_system(self._detected_build_system()):
             return None
         if phase == "test":
-            guidance = PYTHON_TEST_PHASE_GUIDANCE
-            rec = self._build_recommendation()
-            if rec.get("has_native_build") and self._build_phase_lacked_success():
-                guidance = f"{NATIVE_NOT_BUILT_TEST_GUIDANCE}\n{guidance}"
-            return guidance
+            # The native-not-built smoke steer is EVIDENCE-reactive (it depends
+            # on the build phase's outcome), so it is injected by
+            # _phase_intro_step on BOTH intro branches — not here, where only
+            # the no-brief fallback would render it (live TVM 2026-07-18: the
+            # brief-projection path skipped this method entirely and the agent
+            # swept 356 collection errors again).
+            return PYTHON_TEST_PHASE_GUIDANCE
         guidance = PYTHON_BUILD_PHASE_GUIDANCE
         rec = self._build_recommendation()
         if rec.get("has_native_build"):
@@ -2655,6 +2665,21 @@ class ReActEngine(UIEventEmitter):
             job_id=str(result.poll_ref or metadata.get("job_id") or ""),
             output_cursor=output_cursor,
         )
+
+    def _native_smoke_guidance(self, phase: str) -> Optional[str]:
+        """The native-not-built smoke steer for the test phase, or None.
+
+        Fires only for python-system repos flagged has_native_build whose build
+        phase ended without a success outcome.
+        """
+        if phase != "test":
+            return None
+        if not is_python_build_system(self._detected_build_system()):
+            return None
+        rec = self._build_recommendation()
+        if rec.get("has_native_build") and self._build_phase_lacked_success():
+            return NATIVE_NOT_BUILT_TEST_GUIDANCE
+        return None
 
     def _build_phase_lacked_success(self) -> bool:
         """True when the build phase's recorded outcome is anything but success.

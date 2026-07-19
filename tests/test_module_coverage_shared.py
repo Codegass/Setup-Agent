@@ -245,26 +245,32 @@ def _native_env():
 
 
 def test_test_phase_suggests_smoke_when_native_core_not_built():
-    """Live TVM: the agent swept the full suite without libtvm — 356 identical
-    collection errors, pure waste. The test-phase guidance must read the build
-    outcome and steer to a targeted smoke first."""
-    engine = _engine_at(3, _native_env())  # mark_done -> legacy outcome unknown
-    guidance = engine._python_phase_guidance("test")
-    assert "smoke" in guidance.lower()
-    assert "collection errors" in guidance
-    # the standard pytest guidance still follows
-    assert "build(action='test')" in guidance
+    """Live TVM (twice): the agent swept the full suite without libtvm — 356
+    identical collection errors. First fix attempt hid the steer on the
+    no-brief fallback branch while live runs walk the brief-projection branch
+    (the bug-#5/#10 seam lesson again) — so this test goes through the REAL
+    intro path WITH a brief projection present."""
+    env = _native_env()
+    env["project_brief_projection"] = "PROJECT BRIEF: python native project."
+    engine = _engine_at(3, env)  # mark_done -> legacy outcome unknown
+    intro = engine._phase_intro_step().content
+    assert "PROJECT BRIEF" in intro  # the live branch is the one under test
+    assert "smoke" in intro.lower()
+    assert "collection errors" in intro
 
 
-def test_test_phase_stays_clean_when_native_built_or_not_native(monkeypatch):
+def test_test_phase_stays_clean_when_native_built_or_not_native():
     # native repo but build phase succeeded -> no smoke detour
-    engine = _engine_at(3, _native_env())
+    env = _native_env()
+    env["project_brief_projection"] = "PROJECT BRIEF: python native project."
+    engine = _engine_at(3, env)
     for record in engine.phase_machine.records:
         if record.phase == "build":
             object.__setattr__(record, "validated_outcome", "success")
-    assert "smoke" not in engine._python_phase_guidance("test").lower()
-    # plain python repo -> byte-identical guidance to before
+    assert "smoke" not in engine._phase_intro_step().content.lower()
+    # plain python repo, fallback branch -> guidance byte-identical to before
     engine2 = _engine_at(3, _python_env())
     from sag.agent.react_engine import PYTHON_TEST_PHASE_GUIDANCE
 
     assert engine2._python_phase_guidance("test") == PYTHON_TEST_PHASE_GUIDANCE
+    assert "smoke" not in engine2._phase_intro_step().content.lower()
