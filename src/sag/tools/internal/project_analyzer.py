@@ -371,328 +371,24 @@ class ProjectAnalyzerTool(BaseTool):
         return clean_markdown_command(command)
 
     def _analyze_build_configuration(self, project_path: str, project_type: str) -> Dict[str, Any]:
-        """分析构建配置文件"""
-        config = {
-            "java_version": None,
-            "dependencies": [],
-            "plugins": [],
-            "profiles": [],
-            "build_system": None,
-        }
+        from sag.agent.physical_survey import analyze_build_configuration
 
-        if not self.docker_orchestrator:
-            return config
-
-        if project_type == "Java":
-            # 首先检查是Maven还是Gradle项目
-            maven_exists = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/pom.xml && echo 'exists'"
-            )
-            gradle_exists = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/build.gradle && echo 'exists'"
-            )
-            gradle_kts_exists = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/build.gradle.kts && echo 'exists'"
-            )
-
-            if maven_exists.get("success") and "exists" in maven_exists.get("output", ""):
-                config["build_system"] = "Maven"
-                self._analyze_maven_configuration(project_path, config)
-            elif (gradle_exists.get("success") and "exists" in gradle_exists.get("output", "")) or (
-                gradle_kts_exists.get("success") and "exists" in gradle_kts_exists.get("output", "")
-            ):
-                config["build_system"] = "Gradle"
-                self._analyze_gradle_configuration(project_path, config)
-        elif project_type == "Python":
-            # Keep the structure-detection label (this dict overwrites the
-            # analysis via update(), so a None here would erase it) and add
-            # the Python analysis depth (spec Component 1).
-            config["build_system"] = "pip/poetry"
-            self._analyze_python_project(project_path, config)
-
-        return config
+        return analyze_build_configuration(self.docker_orchestrator, project_path, project_type)
 
     def _analyze_python_project(self, project_path: str, analysis: Dict[str, Any]) -> None:
-        """Python analysis depth (spec Component 1): interpreter constraint ->
-        concrete version (newest satisfying), installer faithfulness ladder,
-        top-level package discovery, and READ-ONLY test hints (tox/nox are
-        metadata only, never executed). Fills ``analysis["python_config"]``,
-        which _persist_build_requirements merges into the handoff manifest.
-        """
-        from .python_env import (
-            detect_installer,
-            discover_packages,
-            requires_python_from_pyproject,
-            requires_python_from_setup_cfg,
-            requires_python_from_setup_py,
-            resolve_python_version,
-            setup_cfg_test_deps,
-            tox_test_hints,
-        )
+        from sag.agent.physical_survey import analyze_python_project
 
-        orch = self.docker_orchestrator
-        if not orch:
-            return
-
-        def list_dir(directory: str) -> set:
-            listing = orch.execute_command(f"ls -1 {directory} 2>/dev/null")
-            return {
-                line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
-            }
-
-        def read_from(directory: str, name: str, present: set) -> str:
-            if name not in present:
-                return ""
-            # Untruncated like the pom reads: this content is parsed
-            # internally by regex and never reaches the model's context.
-            result = orch.execute_command(f"cat {directory}/{name}", truncate_output=False)
-            return result.get("output", "") if result.get("success") else ""
-
-        # Native-core detection (live TVM regression): when the repo ROOT is a
-        # build shell (root CMakeLists.txt, or a pyproject with no [project]
-        # deps) and the real python package lives in python/ (or
-        # bindings/python/), redirect ALL python analysis to that subdir root —
-        # constraint/installer/C-extension parsing, package discovery, and the
-        # venv path — so the recommendation and manifest target the package that
-        # actually installs, not the CMake shell. has_native_build rides along.
-        root_files = list_dir(project_path)
-        root_pyproject = read_from(project_path, "pyproject.toml", root_files)
-        native = detect_python_package_root(orch, project_path, root_files, root_pyproject)
-        python_root = native["python_root"]
-        has_native_build = native["has_native_build"]
-
-        # All metadata reads now come from the DETECTED python root (identical to
-        # the repo root for a plain-python project).
-        files_present = root_files if python_root == project_path else list_dir(python_root)
-
-        def read(name: str) -> str:
-            return read_from(python_root, name, files_present)
-
-        pyproject = read("pyproject.toml")
-        setup_py = read("setup.py")
-        setup_cfg = read("setup.cfg")
-        tox_ini = read("tox.ini")
-
-        # Constraint precedence mirrors packaging reality: pyproject is
-        # authoritative when present, setup.py/setup.cfg are the legacy forms.
-        constraint = None
-        constraint_source = None
-        for source, value in (
-            ("pyproject.toml", requires_python_from_pyproject(pyproject)),
-            ("setup.py", requires_python_from_setup_py(setup_py)),
-            ("setup.cfg", requires_python_from_setup_cfg(setup_cfg)),
-        ):
-            if value:
-                constraint, constraint_source = value, source
-                break
-
-        # Bug #13 defect 3: the editable pip rungs install the extras the
-        # project ACTUALLY declares — pass the metadata contents through.
-        installer = detect_installer(
-            files_present,
-            {"pyproject.toml": pyproject, "setup.cfg": setup_cfg},
-        )
-
-        hints = tox_test_hints(tox_ini)
-        for dep in setup_cfg_test_deps(setup_cfg):
-            if dep not in hints["test_deps"]:
-                hints["test_deps"].append(dep)
-
-        # C-extension markers: ext_modules in setup.py, the [tool.setuptools]
-        # ext-modules table in pyproject, or cython anywhere in either. The
-        # bare [tool.setuptools] table is NOT a marker — every modern
-        # setuptools project has one, and flagging it would demand .so
-        # evidence from pure-Python builds.
-        has_c_extensions = bool(
-            re.search(r"\bext_modules\b", setup_py)
-            or re.search(r"\bext[-_]modules\b", pyproject)
-            or re.search(r"(?i)\bcython\b", pyproject + setup_py)
-        )
-
-        analysis["python_config"] = {
-            "python_constraint": constraint,
-            "python_constraint_source": constraint_source,
-            "python_version": resolve_python_version(constraint),
-            "python_installer": installer["installer"],
-            "python_install_commands": installer["commands"],
-            "python_install_source": installer["source"],
-            # Bug #13 defect 3: no-test-extras rides the manifest so
-            # setup_env narrates the hole instead of failing silently.
-            "python_install_note": installer.get("note"),
-            "python_packages": discover_packages(orch, python_root),
-            "python_venv": f"{python_root.rstrip('/')}/.venv",
-            "has_c_extensions": has_c_extensions,
-            # The directory the python package actually installs from (the repo
-            # root for a plain project; a python/ subdir for a native-core repo)
-            # and whether a native library must be built before it imports.
-            "python_root": python_root,
-            "has_native_build": has_native_build,
-            "test_hints": hints,
-        }
+        analyze_python_project(self.docker_orchestrator, project_path, analysis)
 
     def _analyze_maven_configuration(self, project_path: str, config: Dict[str, Any]):
-        """分析Maven配置（pom.xml）- 包括多模块项目和父POM"""
-        # First, read the main pom.xml. Read it UNTRUNCATED: the default XML-aware
-        # truncation protects the model's context window, but this content is parsed
-        # internally by regex (java version, <modules>, <packaging>, dependencies) and
-        # never reaches the model. Truncation drops <modules>/enforcer blocks on large
-        # poms (httpcomponents-client: <modules> at line 260), which mis-scoped builds.
-        result = self.docker_orchestrator.execute_command(
-            f"cat {project_path}/pom.xml", truncate_output=False
-        )
-        if not result.get("success"):
-            return
+        from sag.agent.physical_survey import analyze_maven_configuration
 
-        main_pom_content = result.get("output", "")
-
-        # Check if this is a multi-module project and look for parent POMs
-        all_pom_contents = [main_pom_content]
-        pom_locations = [f"{project_path}/pom.xml"]
-
-        # Check for parent module reference (e.g., tika-parent)
-        parent_match = re.search(
-            r"<parent>.*?<artifactId>([^<]+)</artifactId>.*?</parent>", main_pom_content, re.DOTALL
-        )
-        if parent_match:
-            parent_artifact = parent_match.group(1)
-            # Try to find the parent POM in common locations
-            potential_parent_paths = [
-                f"{project_path}/{parent_artifact}/pom.xml",
-                f"{project_path}/../{parent_artifact}/pom.xml",
-                f"{project_path}/parent/pom.xml",
-            ]
-
-            for parent_path in potential_parent_paths:
-                # First check if parent POM exists
-                check_result = self.docker_orchestrator.execute_command(
-                    f"test -f {parent_path} && echo 'exists' 2>/dev/null"
-                )
-                if check_result.get("success") and "exists" in check_result.get("output", ""):
-                    # Extract just the properties section to avoid truncation
-                    props_result = self.docker_orchestrator.execute_command(
-                        f"sed -n '/<properties>/,/<\\/properties>/p' {parent_path} 2>/dev/null | head -200"
-                    )
-                    if props_result.get("success") and props_result.get("output"):
-                        # Get a minimal version of parent POM with just properties
-                        minimal_parent = f"<project>{props_result.get('output', '')}</project>"
-                        all_pom_contents.append(minimal_parent)
-                        pom_locations.append(parent_path)
-                        logger.info(f"Found parent POM at: {parent_path}")
-                    break
-
-        # Analyze all POM contents for Java version
-        java_version = None
-        java_version_source = None
-        java_version_enforced = False
-
-        for idx, pom_content in enumerate(all_pom_contents):
-            if java_version:
-                break  # Already found
-
-            # 1. First check Maven Enforcer plugin for RequireJavaVersion
-            enforcer_match = re.search(
-                ENFORCER_JAVA_PATTERN, pom_content, re.DOTALL | re.IGNORECASE
-            )
-            if enforcer_match:
-                normalized = _normalize_java_version(enforcer_match.group(1))
-                if normalized:
-                    java_version = normalized
-                    java_version_source = "maven-enforcer"
-                    java_version_enforced = True
-                    logger.info(
-                        f"Found Java version from Maven Enforcer in {pom_locations[idx]}: {java_version}"
-                    )
-                    break
-
-            # 2. Check standard properties, then the maven-compiler-plugin
-            # <configuration> form. Many poms (e.g. cassandra-java-driver) declare the
-            # Java level only as <source>/<target>/<release> inside the compiler
-            # plugin config rather than as maven.compiler.* properties; without this
-            # the analyzer detects nothing and the wrong JDK gets provisioned.
-            java_version_patterns = [
-                r"<maven\.compiler\.release>([^<]+)</maven\.compiler\.release>",  # Highest priority
-                r"<maven\.compiler\.target>([^<]+)</maven\.compiler\.target>",
-                r"<maven\.compiler\.source>([^<]+)</maven\.compiler\.source>",
-                r"<java\.version>([^<]+)</java\.version>",
-                r"<release>\s*(1\.\d+|\d+)\s*</release>",  # compiler-plugin config
-                r"<target>\s*(1\.\d+|\d+)\s*</target>",
-                r"<source>\s*(1\.\d+|\d+)\s*</source>",
-            ]
-
-            for pattern in java_version_patterns:
-                match = re.search(pattern, pom_content)
-                if match:
-                    normalized = _normalize_java_version(match.group(1))
-                    if not normalized:
-                        # Rejected capture (e.g. ${...} indirection): fall
-                        # through to the next pattern instead of accepting it.
-                        continue
-                    java_version = normalized
-                    java_version_source = "maven-compiler"
-                    logger.info(
-                        f"Found Java version from {pattern} in {pom_locations[idx]}: {java_version}"
-                    )
-                    break
-
-        if java_version:
-            config["java_version"] = java_version
-            config["java_version_source"] = java_version_source
-            config["java_version_enforced"] = java_version_enforced
-        else:
-            logger.warning(f"No Java version found in Maven configuration for {project_path}")
-
-        # Check for multi-module project. The pom is read untruncated above, so the
-        # <modules> block is intact even on large poms.
-        modules_match = re.search(r"<modules>(.*?)</modules>", main_pom_content, re.DOTALL)
-        if modules_match:
-            modules = re.findall(r"<module>([^<]+)</module>", modules_match.group(1))
-            config["maven_modules"] = modules
-            config["is_multi_module"] = True
-            logger.info(f"Found multi-module Maven project with {len(modules)} modules: {modules}")
-        else:
-            config["maven_modules"] = []
-            config["is_multi_module"] = False
-
-        # Extract dependencies from main POM only
-        dependency_matches = re.findall(
-            r"<groupId>([^<]+)</groupId>.*?<artifactId>([^<]+)</artifactId>",
-            main_pom_content,
-            re.DOTALL,
-        )
-        config["dependencies"] = [
-            f"{group}:{artifact}" for group, artifact in dependency_matches[:10]
-        ]  # 限制输出
+        analyze_maven_configuration(self.docker_orchestrator, project_path, config)
 
     def _analyze_gradle_configuration(self, project_path: str, config: Dict[str, Any]):
-        """分析Gradle配置（build.gradle 或 build.gradle.kts）"""
-        # 首先尝试读取 build.gradle
-        gradle_content = ""
-        gradle_file = ""
+        from sag.agent.physical_survey import analyze_gradle_configuration
 
-        result = self.docker_orchestrator.execute_command(f"cat {project_path}/build.gradle")
-        if result.get("success"):
-            gradle_content = result.get("output", "")
-            gradle_file = "build.gradle"
-        else:
-            # 尝试读取 build.gradle.kts
-            result = self.docker_orchestrator.execute_command(
-                f"cat {project_path}/build.gradle.kts"
-            )
-            if result.get("success"):
-                gradle_content = result.get("output", "")
-                gradle_file = "build.gradle.kts"
-
-        if gradle_content:
-            logger.info(f"Analyzing Gradle configuration from {gradle_file}")
-
-            # 提取 Java 版本
-            self._extract_gradle_java_version(gradle_content, config)
-
-            # 提取依赖信息
-            self._extract_gradle_dependencies(gradle_content, config)
-
-            # 提取插件信息
-            self._extract_gradle_plugins(gradle_content, config)
+        analyze_gradle_configuration(self.docker_orchestrator, project_path, config)
 
     def _extract_gradle_java_version(self, gradle_content: str, config: Dict[str, Any]):
         from sag.agent.physical_survey import extract_gradle_java_version
@@ -710,85 +406,19 @@ class ProjectAnalyzerTool(BaseTool):
         extract_gradle_plugins(gradle_content, config)
 
     def _analyze_test_configuration(self, project_path: str, project_type: str) -> Dict[str, Any]:
-        """分析测试配置"""
-        test_config = {
-            "test_framework": "unknown",
-            "test_directories": [],
-            "test_patterns": [],
-            "build_system": None,
-        }
+        from sag.agent.physical_survey import analyze_test_configuration
 
-        if not self.docker_orchestrator:
-            return test_config
-
-        # 检查测试目录
-        test_dirs = ["src/test", "test", "tests", "__tests__"]
-        for test_dir in test_dirs:
-            result = self.docker_orchestrator.execute_command(
-                f"test -d {project_path}/{test_dir} && echo 'exists'"
-            )
-            if result.get("success") and "exists" in result.get("output", ""):
-                test_config["test_directories"].append(test_dir)
-
-        # 根据项目类型检测测试框架
-        if project_type == "Java":
-            # 检查是Maven还是Gradle项目
-            maven_exists = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/pom.xml && echo 'exists'"
-            )
-            gradle_exists = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/build.gradle && echo 'exists'"
-            )
-            gradle_kts_exists = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/build.gradle.kts && echo 'exists'"
-            )
-
-            if maven_exists.get("success") and "exists" in maven_exists.get("output", ""):
-                test_config["build_system"] = "Maven"
-                self._detect_maven_test_framework(project_path, test_config)
-            elif (gradle_exists.get("success") and "exists" in gradle_exists.get("output", "")) or (
-                gradle_kts_exists.get("success") and "exists" in gradle_kts_exists.get("output", "")
-            ):
-                test_config["build_system"] = "Gradle"
-                self._detect_gradle_test_framework(project_path, test_config)
-
-        return test_config
+        return analyze_test_configuration(self.docker_orchestrator, project_path, project_type)
 
     def _detect_maven_test_framework(self, project_path: str, test_config: Dict[str, Any]):
-        """检测Maven项目的测试框架"""
-        # 检查是否使用 JUnit
-        result = self.docker_orchestrator.execute_command(f"grep -r 'junit' {project_path}/pom.xml")
-        if result.get("success") and result.get("output"):
-            test_config["test_framework"] = "JUnit"
+        from sag.agent.physical_survey import detect_maven_test_framework
 
-        # 检查是否使用 TestNG
-        result = self.docker_orchestrator.execute_command(
-            f"grep -r 'testng' {project_path}/pom.xml"
-        )
-        if result.get("success") and result.get("output"):
-            test_config["test_framework"] = "TestNG"
+        detect_maven_test_framework(self.docker_orchestrator, project_path, test_config)
 
     def _detect_gradle_test_framework(self, project_path: str, test_config: Dict[str, Any]):
-        """检测Gradle项目的测试框架"""
-        # 尝试读取build.gradle文件
-        gradle_content = ""
-        result = self.docker_orchestrator.execute_command(f"cat {project_path}/build.gradle")
-        if result.get("success"):
-            gradle_content = result.get("output", "")
-        else:
-            # 尝试读取build.gradle.kts文件
-            result = self.docker_orchestrator.execute_command(
-                f"cat {project_path}/build.gradle.kts"
-            )
-            if result.get("success"):
-                gradle_content = result.get("output", "")
+        from sag.agent.physical_survey import detect_gradle_test_framework
 
-        if gradle_content:
-            # 检测测试框架
-            test_frameworks = self._parse_gradle_test_frameworks(gradle_content)
-            if test_frameworks:
-                test_config["test_framework"] = ", ".join(test_frameworks)
-                logger.info(f"Found Gradle test frameworks: {test_frameworks}")
+        detect_gradle_test_framework(self.docker_orchestrator, project_path, test_config)
 
     def _estimate_total_test_cases(
         self, project_path: str, project_type: str, build_system: str
