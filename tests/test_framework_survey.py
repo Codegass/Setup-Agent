@@ -14,7 +14,7 @@ Python repo gets the Java objective in the same intro as Python guidance.
 from types import SimpleNamespace
 
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
-from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION, ProjectAnalyzerTool
 
 
 class SurveyOrch:
@@ -25,9 +25,17 @@ class SurveyOrch:
         self.commands = []
         self.manifest_writes = 0
         self.drop_manifest_writes = drop_manifest_writes
+        # The config the fingerprint probe digests; tests mutate it to
+        # simulate an edited build file.
+        self.config_seed = "pyproject-v1"
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
+        if "| cksum" in command:
+            if not self.config_seed:  # empty seed simulates a broken probe
+                return {"success": False, "exit_code": 1, "output": ""}
+            digest = sum(map(ord, self.config_seed))
+            return {"success": True, "exit_code": 0, "output": f"{digest} {len(self.config_seed)}"}
         if "<<" in command and REQUIREMENTS_PATH in command:
             self.manifest_writes += 1
             if not self.drop_manifest_writes:
@@ -178,10 +186,39 @@ def test_same_version_manifest_for_another_project_resurveys():
     """Re-review P2: version match alone must not pass — project identity too."""
     orch = SurveyOrch()
     orch.files[REQUIREMENTS_PATH] = (
-        '{"survey": {"analyzer_version": 1, "project_path": "/workspace/other"}}'
+        '{"survey": {"analyzer_version": %d, "project_path": "/workspace/other"}}'
+        % SURVEY_FACTS_VERSION
     )
     assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "created"
     assert '"/workspace/proj"' in orch.files[REQUIREMENTS_PATH]
+
+
+def test_config_edit_invalidates_the_fast_path_and_resurveys():
+    """Category 2 staleness contract: the facts follow the config they were
+    derived from — an edited build file re-surveys instead of serving the
+    stale manifest as 'present'."""
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.config_seed = "pyproject-v2-edited"  # someone edited the config
+    assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
+    assert orch.manifest_writes == 2  # a real re-survey with fresh facts
+
+    # Unchanged config afterwards: back to the fast path.
+    assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_unreadable_fingerprint_degrades_to_present_not_thrash():
+    """A flaky fingerprint probe means CANNOT COMPARE — the fast path must
+    keep serving the surveyed facts, not re-survey on every intro."""
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+
+    orch.config_seed = ""  # probe output becomes empty -> fingerprint None
+    assert tool.ensure_facts("/workspace/proj") == "present"
+    assert orch.manifest_writes == 1
 
 
 def test_failed_trunk_save_retries_and_recovers_on_the_next_call():

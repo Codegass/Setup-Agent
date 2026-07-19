@@ -100,7 +100,7 @@ same intro is the Python one. Not covered (stated, not overclaimed): a full
 recorded-transcript replay — that harness lands with the Category 2/3 panel
 work.
 
-## Category 2 (next): surveying moves to the physical layer
+## Category 2 (implemented 2026-07-19): surveying moves to the physical layer
 
 Move the filesystem-reading functions (structure/config/island/module scan)
 beside the validator's reading machinery as the shared **physical observation**
@@ -111,6 +111,36 @@ Surveyor and judge stay distinct ROLES over one substrate. Prescriptive fields
 (`applies_maven_publish: true`), the agent decides the action, the corrective
 loops carry coordinates when it drifts.
 
+**As implemented** — `sag/agent/physical_survey.py` (the surveyor role,
+module_coverage's light-dependency posture), six slices, each committed with
+the full suite at zero new failures:
+
+1. pure parsers (java-version normalization, gradle content extractors,
+   markdown command cleaning) + shared helpers;
+2. discovery/structure/docs readers (path validation and discovery,
+   structure scan with the TVM native-core fallback, README extraction,
+   fallback build-file re-detection);
+3. build/test config readers (maven untruncated-pom + parent-POM +
+   enforcer/compiler ladder, gradle, python depth, test-framework detection);
+4. java test-counting readers (the in-container annotation scan; the
+   per-project cache is an explicit parameter the analyzer owns);
+5. island enumeration DESCRIPTIVE: the substrate emits
+   `{root, system, applies_maven_publish}` only — no goal, no rationale, no
+   preferred-first ordering. The analyzer composes the prescription on top
+   from those facts (maven→install, gradle+publish→publishToMavenLocal,
+   else build; preferred island first), keeping the emitted island shape
+   byte-identical until Category 3's A/B gate;
+6. the source fingerprint: `config_fingerprint` digests the build-config
+   files (java markers + python metadata) via POSIX cksum in one container
+   command; the survey stamp carries it (`SURVEY_FACTS_VERSION` 1→2, v1
+   stamps re-survey once); the fast path re-surveys when the fingerprint
+   mismatches, and treats an unreadable probe on either end as CANNOT
+   COMPARE (present, no thrash).
+
+The analyzer keeps thin delegating wrappers throughout, so every call site,
+external import (`project_setup_tool`, tests), and test monkeypatch surface
+is unchanged.
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -119,10 +149,12 @@ loops carry coordinates when it drifts.
 - Output slimming: the fact sheet replaces the plan text; rendering moves to
   the engine projection (Category 4, low priority — agreed acceptable as-is).
 
-**Category 2 done-bar.** Reading functions relocated beside the validator's
-substrate with zero call-site behavior change (suites green byte-for-byte);
-surveyor emits no `goal`/preferred-module fields; manifest gains the source
-fingerprint (config files digest) completing the staleness contract.
+**Category 2 done-bar (met 2026-07-19).** Reading functions relocated beside
+the validator's substrate with zero call-site behavior change (full suite at
+zero new failures after every slice); surveyor emits no `goal`/
+preferred-module fields (slice 5); manifest gains the source fingerprint
+completing the staleness contract (slice 6; `tests/test_framework_survey.py`
+16 tests — config edit re-surveys, unreadable probe degrades to present).
 
 **Category 3 done-bar.** `_generate_execution_plan` + fallback deleted with a
 grep proof of zero readers; panel A/B attached to the removal PR showing

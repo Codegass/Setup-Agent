@@ -33,7 +33,9 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # Bumped when the survey's fact semantics change: an older-version manifest is
 # re-surveyed instead of reused (review 2026-07-19: existence-as-no-op would
 # happily serve stale facts across analyzer upgrades).
-SURVEY_FACTS_VERSION = 1
+# v2: the stamp carries the config source fingerprint (Category 2) — v1
+# stamps predate it and re-survey once to gain the staleness contract.
+SURVEY_FACTS_VERSION = 2
 
 
 class ProjectAnalyzerTool(BaseTool):
@@ -70,7 +72,9 @@ class ProjectAnalyzerTool(BaseTool):
         ends (manifest and trunk env-summary — they fail independently, and a
         manifest-only partial survey must retry the trunk save, not skip it);
         ``"failed"`` otherwise. Older-version or other-project stamps
-        re-survey.
+        re-survey, and so does a current stamp whose config source
+        fingerprint no longer matches the files on disk (the staleness
+        contract: facts follow the config they were derived from).
         """
         orchestrator = getattr(self, "docker_orchestrator", None) or getattr(
             self, "orchestrator", None
@@ -94,12 +98,14 @@ class ProjectAnalyzerTool(BaseTool):
                 existing_stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
                 and existing_stamp.get("project_path") == validated
                 and self._trunk_survey_current(validated)
+                and not self._config_changed_since(orchestrator, existing_stamp, validated)
             ):
-                # Current survey for THIS project, on BOTH persisted ends
-                # (re-review 2026-07-19: a same-version manifest from another
-                # workspace project must not pass; final review: a failed
-                # trunk save left a current-stamp manifest behind, and this
-                # fast path then skipped the env-summary retry forever).
+                # Current survey for THIS project, on BOTH persisted ends,
+                # derived from the config still on disk (re-review 2026-07-19:
+                # a same-version manifest from another workspace project must
+                # not pass; final review: a failed trunk save left a
+                # current-stamp manifest behind, and this fast path then
+                # skipped the env-summary retry forever).
                 return "present"
 
             analysis = self._perform_comprehensive_analysis(validated)
@@ -143,6 +149,23 @@ class ProjectAnalyzerTool(BaseTool):
             stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
             and stamp.get("project_path") == validated
         )
+
+    def _config_changed_since(self, orchestrator, stamp: Dict[str, Any], validated: str) -> bool:
+        """Whether the build-config files changed since the stamped survey.
+
+        Completes the staleness contract (Category 2): a survey's facts
+        follow the config they were derived from — editing pom.xml or
+        pyproject.toml invalidates the fast path and re-surveys. Comparison
+        requires BOTH fingerprints readable; an unavailable probe (either
+        end) means CANNOT COMPARE and must not thrash re-surveys.
+        """
+        from sag.agent.physical_survey import config_fingerprint
+
+        stored = stamp.get("config_fingerprint")
+        if not stored:
+            return False
+        current = config_fingerprint(orchestrator, validated)
+        return bool(current) and current != stored
 
     def execute(
         self,
@@ -888,10 +911,16 @@ class ProjectAnalyzerTool(BaseTool):
         # cluster lives elsewhere (Bigtop's Gradle subtree) leave it alone.
         test_fail_at_end = fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
 
+        from sag.agent.physical_survey import config_fingerprint
+
         data = {
             "survey": {
                 "project_path": project_path,
                 "analyzer_version": SURVEY_FACTS_VERSION,
+                # Staleness contract: the facts follow the config they were
+                # derived from. None when the probe is unavailable — the fast
+                # path then skips the comparison rather than thrash.
+                "config_fingerprint": config_fingerprint(self.docker_orchestrator, project_path),
             },
             "java_version": analysis.get("java_version"),
             "java_version_source": analysis.get("java_version_source"),

@@ -1217,6 +1217,34 @@ FALLBACK_BUILD_MARKERS = (
     "pyproject.toml",
 )
 
+# The config files the survey derives its facts from — the staleness domain
+# of the survey stamp's source fingerprint (java build files plus the python
+# metadata the installer/constraint/test-hint parsing reads).
+SURVEY_FINGERPRINT_SOURCES = FALLBACK_BUILD_MARKERS + ("setup.py", "setup.cfg", "tox.ini")
+
+
+def config_fingerprint(orch, project_path: str) -> Optional[str]:
+    """Digest of the build-config files at ``project_path``, or None.
+
+    One container command: the fingerprint sources concatenated in fixed
+    order (missing files contribute nothing) through POSIX ``cksum``. Two
+    surveys of unchanged config produce the same string; editing any config
+    file changes it. Returns None when the probe is unavailable — callers
+    must treat None as CANNOT COMPARE, never as a mismatch, or a flaky
+    container would thrash re-surveys.
+    """
+    if not orch:
+        return None
+    files = " ".join(SURVEY_FINGERPRINT_SOURCES)
+    try:
+        result = orch.execute_command(f"cd {project_path} && cat {files} 2>/dev/null | cksum")
+    except Exception as exc:
+        logger.debug(f"config fingerprint unavailable: {exc}")
+        return None
+    if not result.get("success"):
+        return None
+    return (result.get("output") or "").strip() or None
+
 
 def redetect_build_files(orch, project_path: str) -> List[str]:
     """Re-scan the project root for build files.
