@@ -141,6 +141,29 @@ The analyzer keeps thin delegating wrappers throughout, so every call site,
 external import (`project_setup_tool`, tests), and test monkeypatch surface
 is unchanged.
 
+**Category-2 review outcomes (2026-07-19, all five fixed).**
+- P1 both-ends fingerprint: the trunk stamp now carries the SAME
+  `config_fingerprint` as the manifest stamp (computed once per survey), and
+  the fast path requires agreement — the repro (config edit, re-survey lands
+  the manifest, trunk save fails; the old trunk still matches version+path)
+  now re-surveys instead of serving stale env metrics forever.
+- P1 fingerprint coverage: recursive `find` by name (parent POMs, nested
+  island build files, `requirements*.txt`, `poetry.lock`, `Pipfile(.lock)`,
+  `gradlew`, `CMakeLists.txt`), pruning build output, with PER-FILE `cksum`
+  lines feeding the final digest — names, existence and content boundaries
+  are all encoded. `SURVEY_FACTS_VERSION` 2→3.
+- P2 module scan fully sunk: `scan_root_build_markers`,
+  `scan_source_modules`, `scan_test_module_dirs`, `build_system_at` join the
+  substrate; the recommendation methods consume facts only.
+- P2 surveyor no longer prescribes: `read_python_metadata` returns
+  descriptive metadata; the installer ladder (`detect_installer`) composes
+  at the analyzer beside setup/python tools' own calls; README command
+  repair (the `-Dtest` fix) moved to the tool layer — the surveyor extracts
+  commands AS DOCUMENTED.
+- P2 judge logic evicted: `count_actual_test_executions` (surefire-report
+  reading — post-hoc evidence) deleted with zero callers (grep proof in the
+  commit).
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -153,8 +176,11 @@ is unchanged.
 the validator's substrate with zero call-site behavior change (full suite at
 zero new failures after every slice); surveyor emits no `goal`/
 preferred-module fields (slice 5); manifest gains the source fingerprint
-completing the staleness contract (slice 6; `tests/test_framework_survey.py`
-16 tests — config edit re-surveys, unreadable probe degrades to present).
+completing the staleness contract (slice 6 + review fixes;
+`tests/test_framework_survey.py` 18 tests — config edit re-surveys,
+unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
+via both-ends fingerprint agreement, probe command covers nested/lock
+sources).
 
 **Category 3 done-bar.** `_generate_execution_plan` + fallback deleted with a
 grep proof of zero readers; panel A/B attached to the removal PR showing

@@ -269,6 +269,32 @@ def test_trunk_persistence_failure_means_failed():
     assert tool.ensure_facts("/workspace/proj") == "failed"
 
 
+def test_fingerprint_command_covers_nested_and_lock_sources():
+    """Category-2 review P1: a root-only concatenation missed parent POMs,
+    nested island build files, lockfiles and wrapper markers, and encoded
+    neither file names nor boundaries. The probe must enumerate recursively
+    by name with per-file digests, pruning build output."""
+    orch = SurveyOrch()
+    ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj")
+    cmd = next(c for c in orch.commands if "| cksum" in c)
+    assert cmd.strip().startswith("cd /workspace/proj && find ")
+    for source in (
+        "pom.xml",
+        "settings.gradle",
+        "gradlew",
+        "requirements*.txt",
+        "poetry.lock",
+        "Pipfile.lock",
+        "CMakeLists.txt",
+    ):
+        assert source in cmd
+    for pruned in ("target", ".git", "node_modules"):
+        assert pruned in cmd
+    # Per-file cksum lines (name + size + checksum) feed the final cksum:
+    # names, existence, and content boundaries are all encoded.
+    assert "xargs -r cksum" in cmd and cmd.rstrip().endswith("| cksum")
+
+
 # ---- Integration: agent-skips-analyze, NO monkeypatching (re-review P2) ----
 
 
@@ -345,3 +371,58 @@ def test_integration_skipped_analyze_run_ends_with_facts_and_python_objective():
     # the trace names the framework survey, and the objective is python-side
     assert "framework survey ran" in intro
     assert "Never run mvn/gradle via bash" not in intro
+
+
+class StoreCM(IntegrationCM):
+    """A trunk store with real persistence semantics: load returns the last
+    SAVED state, not the shared in-memory object — a dropped save must not
+    leak through a cached reference."""
+
+    def __init__(self):
+        super().__init__()
+        self._saved_env = dict(self.trunk.environment_summary)
+        self.fail_next_save = False
+
+    def load_trunk_context(self):
+        self.trunk = SimpleNamespace(
+            environment_summary=dict(self._saved_env),
+            todo_list=[_TrunkTask("phase_build"), _TrunkTask("phase_test")],
+        )
+        return self.trunk
+
+    def _save_trunk_context(self, trunk):
+        if self.fail_next_save:
+            self.fail_next_save = False
+            raise RuntimeError("context store briefly unavailable")
+        self.saves += 1
+        self._saved_env = dict(trunk.environment_summary)
+
+
+def test_config_edit_with_failed_trunk_save_does_not_serve_stale_trunk():
+    """Final Category-2 review P1, exact repro: survey S1 stamps both ends;
+    the config is edited; re-survey S2 lands the manifest (new fingerprint)
+    but its trunk save fails. The store still holds S1's stamp — version and
+    path MATCH, only the fingerprint disagrees. Without fingerprint agreement
+    on both ends the next call returned 'present' over S1's stale env metrics
+    forever."""
+    orch = SurveyOrch()
+    cm = StoreCM()
+    tool = ProjectAnalyzerTool(orch, cm)
+    assert tool.ensure_facts("/workspace/proj") == "created"  # S1
+
+    orch.config_seed = "pyproject-v2-edited"
+    cm.fail_next_save = True
+    assert tool.ensure_facts("/workspace/proj") == "failed"  # S2: trunk save dropped
+    # The bug precondition: S2's manifest landed, S1's trunk stamp survived.
+    assert '"config_fingerprint"' in orch.files[REQUIREMENTS_PATH]
+
+    assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
+    # Recovery leaves BOTH ends stamped with the SAME (new) fingerprint.
+    import json
+
+    manifest_stamp = json.loads(orch.files[REQUIREMENTS_PATH])["survey"]
+    trunk_stamp = cm._saved_env["survey"]
+    assert trunk_stamp["config_fingerprint"] == manifest_stamp["config_fingerprint"] is not None
+
+    # And with both ends agreeing, the fast path is back.
+    assert tool.ensure_facts("/workspace/proj") == "present"

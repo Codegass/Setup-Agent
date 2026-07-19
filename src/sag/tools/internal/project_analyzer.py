@@ -35,7 +35,12 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # happily serve stale facts across analyzer upgrades).
 # v2: the stamp carries the config source fingerprint (Category 2) — v1
 # stamps predate it and re-survey once to gain the staleness contract.
-SURVEY_FACTS_VERSION = 2
+# v3: the fingerprint is recursive-by-name with per-file digests (parent
+# POMs, nested island configs, lockfiles), and the trunk stamp carries it
+# too — the fast path requires fingerprint agreement on BOTH persisted ends
+# (final Category-2 review: a failed trunk save after a config edit left an
+# old-fingerprint trunk that still matched on version+path alone).
+SURVEY_FACTS_VERSION = 3
 
 
 class ProjectAnalyzerTool(BaseTool):
@@ -97,7 +102,9 @@ class ProjectAnalyzerTool(BaseTool):
             if (
                 existing_stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
                 and existing_stamp.get("project_path") == validated
-                and self._trunk_survey_current(validated)
+                and self._trunk_survey_current(
+                    validated, existing_stamp.get("config_fingerprint")
+                )
                 and not self._config_changed_since(orchestrator, existing_stamp, validated)
             ):
                 # Current survey for THIS project, on BOTH persisted ends,
@@ -133,13 +140,18 @@ class ProjectAnalyzerTool(BaseTool):
             logger.warning(f"framework survey failed: {exc}")
             return "failed"
 
-    def _trunk_survey_current(self, validated: str) -> bool:
-        """Whether the trunk env-summary carries THIS survey's stamp.
+    def _trunk_survey_current(self, validated: str, manifest_fingerprint) -> bool:
+        """Whether the trunk env-summary carries THIS survey's stamp —
+        version, project path AND config fingerprint.
 
         The manifest and the env-summary are persisted by different stores
         that fail independently; the fast path may only skip the survey when
-        both ends match. A load failure propagates to ``ensure_facts``'s
-        handler ('failed') — the guarantee is manifest AND trunk metrics.
+        both ends describe the SAME survey. Fingerprint equality is what
+        catches the config-edit re-survey whose trunk save failed: the old
+        trunk still matches on version+path, but its metrics were derived
+        from the config before the edit (final Category-2 review P1). A load
+        failure propagates to ``ensure_facts``'s handler ('failed') — the
+        guarantee is manifest AND trunk metrics.
         """
         if self.context_manager is None:
             return True  # no trunk store in play — nothing to keep in sync
@@ -148,6 +160,7 @@ class ProjectAnalyzerTool(BaseTool):
         return (
             stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
             and stamp.get("project_path") == validated
+            and stamp.get("config_fingerprint") == manifest_fingerprint
         )
 
     def _config_changed_since(self, orchestrator, stamp: Dict[str, Any], validated: str) -> bool:
@@ -386,7 +399,21 @@ class ProjectAnalyzerTool(BaseTool):
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
         from sag.agent.physical_survey import analyze_documentation
 
-        return analyze_documentation(self.docker_orchestrator, project_path)
+        documentation = analyze_documentation(self.docker_orchestrator, project_path)
+        # The surveyor extracts commands AS DOCUMENTED; repairing broken ones
+        # is a prescription and happens here (final Category-2 review). Skip
+        # commands with -Dtest without a value (invalid Maven syntax).
+        fixed = []
+        for clean_cmd in documentation.get("test_commands", []):
+            if "-Dtest" in clean_cmd and not re.search(r"-Dtest=\S+", clean_cmd):
+                # Fix the command by removing invalid -Dtest
+                clean_cmd = clean_cmd.replace("-Dtest", "").strip()
+                # If it becomes just 'mvn clean install', change to 'mvn clean test'
+                if clean_cmd == "mvn clean install -Dossindex.skip":
+                    clean_cmd = "mvn clean test -Dossindex.skip"
+            fixed.append(clean_cmd)
+        documentation["test_commands"] = fixed
+        return documentation
 
     def _clean_markdown_command(self, command: str) -> str:
         from sag.agent.physical_survey import clean_markdown_command
@@ -396,12 +423,52 @@ class ProjectAnalyzerTool(BaseTool):
     def _analyze_build_configuration(self, project_path: str, project_type: str) -> Dict[str, Any]:
         from sag.agent.physical_survey import analyze_build_configuration
 
-        return analyze_build_configuration(self.docker_orchestrator, project_path, project_type)
+        config = analyze_build_configuration(self.docker_orchestrator, project_path, project_type)
+        meta = config.pop("python_metadata", None)
+        if meta is not None:
+            self._compose_python_config(config, meta)
+        return config
 
     def _analyze_python_project(self, project_path: str, analysis: Dict[str, Any]) -> None:
-        from sag.agent.physical_survey import analyze_python_project
+        from sag.agent.physical_survey import read_python_metadata
 
-        analyze_python_project(self.docker_orchestrator, project_path, analysis)
+        meta = read_python_metadata(self.docker_orchestrator, project_path)
+        if meta is not None:
+            self._compose_python_config(analysis, meta)
+
+    def _compose_python_config(self, analysis: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        """Compose the install PLAN from the surveyor's descriptive metadata.
+
+        The installer faithfulness ladder is a prescription — it belongs at
+        the tool layer beside setup/python tools' own detect_installer calls,
+        not in the surveyor (final Category-2 review). Bug #13 defect 3: the
+        editable pip rungs install the extras the project ACTUALLY declares —
+        the surveyed metadata contents feed the ladder.
+        """
+        from .python_env import detect_installer
+
+        installer = detect_installer(meta["files_present"], meta["metadata_contents"])
+        python_root = meta["python_root"]
+        analysis["python_config"] = {
+            "python_constraint": meta["python_constraint"],
+            "python_constraint_source": meta["python_constraint_source"],
+            "python_version": meta["python_version"],
+            "python_installer": installer["installer"],
+            "python_install_commands": installer["commands"],
+            "python_install_source": installer["source"],
+            # Bug #13 defect 3: no-test-extras rides the manifest so
+            # setup_env narrates the hole instead of failing silently.
+            "python_install_note": installer.get("note"),
+            "python_packages": meta["python_packages"],
+            "python_venv": f"{python_root.rstrip('/')}/.venv",
+            "has_c_extensions": meta["has_c_extensions"],
+            # The directory the python package actually installs from (the repo
+            # root for a plain project; a python/ subdir for a native-core repo)
+            # and whether a native library must be built before it imports.
+            "python_root": python_root,
+            "has_native_build": meta["has_native_build"],
+            "test_hints": meta["test_hints"],
+        }
 
     def _analyze_maven_configuration(self, project_path: str, config: Dict[str, Any]):
         from sag.agent.physical_survey import analyze_maven_configuration
@@ -469,11 +536,6 @@ class ProjectAnalyzerTool(BaseTool):
         return count_java_test_annotations(
             self.docker_orchestrator, project_path, self._java_annotation_cache
         )
-
-    def _count_actual_test_executions(self, project_path: str) -> Optional[int]:
-        from sag.agent.physical_survey import count_actual_test_executions
-
-        return count_actual_test_executions(self.docker_orchestrator, project_path)
 
     def _parse_gradle_test_frameworks(self, gradle_content: str) -> List[str]:
         from sag.agent.physical_survey import parse_gradle_test_frameworks
@@ -546,58 +608,19 @@ class ProjectAnalyzerTool(BaseTool):
         if not orch:
             return rec
 
-        has_pom = _path_exists(orch, f"{project_path}/pom.xml")
-        has_gradlew = _path_exists(orch, f"{project_path}/gradlew")
-        has_build_gradle = _path_exists(orch, f"{project_path}/build.gradle") or _path_exists(
-            orch, f"{project_path}/build.gradle.kts"
-        )
-        rec["has_gradle"] = has_gradlew or has_build_gradle
+        from sag.agent.physical_survey import scan_root_build_markers, scan_source_modules
 
-        root_main_java = _path_exists(orch, f"{project_path}/src/main/java")
-        root_main_groovy = _path_exists(orch, f"{project_path}/src/main/groovy")
-        root_main_scala = _path_exists(orch, f"{project_path}/src/main/scala")
-        root_main_kotlin = _path_exists(orch, f"{project_path}/src/main/kotlin")
+        markers = scan_root_build_markers(orch, project_path)
+        has_pom = markers["has_pom"]
+        rec["has_gradle"] = markers["has_gradlew"] or markers["has_build_gradle"]
 
-        packaging = None
-        if has_pom:
-            pkg = orch.execute_command(f"grep -m1 '<packaging>' {project_path}/pom.xml 2>/dev/null")
-            match = re.search(r"<packaging>\s*([^<\s]+)\s*</packaging>", pkg.get("output") or "")
-            packaging = match.group(1).strip().lower() if match else "jar"
+        root_main_java = markers["root_main"]["java"]
+        root_main_groovy = markers["root_main"]["groovy"]
+        root_main_scala = markers["root_main"]["scala"]
+        root_main_kotlin = markers["root_main"]["kotlin"]
+        packaging = markers["packaging"]
 
-        # Find source-bearing modules DIRECTLY rather than trusting the root
-        # pom's <modules> — Bigtop declares its modules inside a profile, so the
-        # parsed list is empty and the Groovy iTest framework was missed. Scan for
-        # Java, Groovy, Scala AND Kotlin main-source dirs, excluding build output.
-        # (Live re-probe: bigpetstore-spark's only sources are src/main/scala with
-        # its own build.gradle; a java/groovy-only find never enumerated it, so
-        # the real archipelago produced 3 islands where the fixture had 4. Kotlin
-        # is the same class of gap.)
-        source_modules = []
-        find_cmd = (
-            f"find {project_path} -maxdepth 5 -type d "
-            f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' "
-            f"-o -path '*/src/main/scala' -o -path '*/src/main/kotlin' \\) "
-            f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
-        )
-        found = orch.execute_command(find_cmd)
-        seen_dirs = set()
-        for line in (found.get("output") or "").splitlines():
-            line = line.strip()
-            if not line or "/src/main/" not in line:
-                continue
-            suffix = line.rsplit("/src/main/", 1)[1]
-            lang = suffix if suffix in ("groovy", "scala", "kotlin") else "java"
-            module_dir = line.rsplit("/src/main/", 1)[0]
-            if module_dir == project_path or module_dir in seen_dirs:
-                continue
-            seen_dirs.add(module_dir)
-            source_modules.append(
-                {
-                    "module": module_dir[len(project_path) :].lstrip("/"),
-                    "dir": module_dir,
-                    "lang": lang,
-                }
-            )
+        source_modules = scan_source_modules(orch, project_path)
         rec["source_modules"] = source_modules
 
         # 1) Plain Maven module with its own sources: compile at the root.
@@ -786,21 +809,9 @@ class ProjectAnalyzerTool(BaseTool):
         if not orch:
             return
 
-        find_cmd = (
-            f"find {project_path} -maxdepth 6 -type d "
-            f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' "
-            f"-o -path '*/src/test/scala' -o -path '*/src/test/kotlin' \\) "
-            f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
-        )
-        found = orch.execute_command(find_cmd)
-        test_module_dirs = []
-        for line in (found.get("output") or "").splitlines():
-            line = line.strip()
-            if "/src/test/" not in line:
-                continue
-            module_dir = line.rsplit("/src/test/", 1)[0]
-            if module_dir not in test_module_dirs:
-                test_module_dirs.append(module_dir)
+        from sag.agent.physical_survey import build_system_at, scan_test_module_dirs
+
+        test_module_dirs = scan_test_module_dirs(orch, project_path)
         if not test_module_dirs:
             return
         build_rec["test_modules"] = [
@@ -818,14 +829,7 @@ class ProjectAnalyzerTool(BaseTool):
         test_root = f"{project_path}/{top_seg}" if top_seg else project_path
 
         # The test cluster's own build system can differ from the main build's.
-        if _path_exists(orch, f"{test_root}/settings.gradle") or _path_exists(
-            orch, f"{test_root}/build.gradle"
-        ):
-            test_system = "gradle"
-        elif _path_exists(orch, f"{test_root}/pom.xml"):
-            test_system = "maven"
-        else:
-            test_system = build_rec.get("build_system")
+        test_system = build_system_at(orch, test_root) or build_rec.get("build_system")
 
         build_rec["test_root"] = test_root
         build_rec["test_system"] = test_system
@@ -913,6 +917,14 @@ class ProjectAnalyzerTool(BaseTool):
 
         from sag.agent.physical_survey import config_fingerprint
 
+        # Computed once, stamped on BOTH persisted ends: the manifest here and
+        # the trunk env-summary via _record_environment_metrics (the fast path
+        # requires agreement — a manifest-only fingerprint let a stale trunk
+        # pass on version+path alone).
+        analysis["config_fingerprint"] = config_fingerprint(
+            self.docker_orchestrator, project_path
+        )
+
         data = {
             "survey": {
                 "project_path": project_path,
@@ -920,7 +932,7 @@ class ProjectAnalyzerTool(BaseTool):
                 # Staleness contract: the facts follow the config they were
                 # derived from. None when the probe is unavailable — the fast
                 # path then skips the comparison rather than thrash.
-                "config_fingerprint": config_fingerprint(self.docker_orchestrator, project_path),
+                "config_fingerprint": analysis["config_fingerprint"],
             },
             "java_version": analysis.get("java_version"),
             "java_version_source": analysis.get("java_version_source"),
@@ -1468,6 +1480,11 @@ class ProjectAnalyzerTool(BaseTool):
             trunk_context.environment_summary["survey"] = {
                 "project_path": survey_path,
                 "analyzer_version": SURVEY_FACTS_VERSION,
+                # The SAME fingerprint the manifest stamp carries (persisted
+                # by _persist_build_requirements earlier in this analysis) —
+                # both ends must describe the same survey or the fast path
+                # re-surveys (final Category-2 review P1).
+                "config_fingerprint": analysis.get("config_fingerprint"),
             }
 
         build_recommendation = analysis.get("build_recommendation")

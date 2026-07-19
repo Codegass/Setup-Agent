@@ -326,15 +326,10 @@ def analyze_documentation(orch, project_path: str) -> Dict[str, Any]:
             # 清理提取的命令
             for match in matches:
                 clean_cmd = clean_markdown_command(match)
-                # Filter out invalid test commands
+                # AS DOCUMENTED (markdown formatting stripped, deduped): the
+                # prescriptive repair of broken documented commands happens at
+                # the tool layer, not in the surveyor.
                 if clean_cmd and clean_cmd not in documentation["test_commands"]:
-                    # Skip commands with -Dtest without a value (invalid Maven syntax)
-                    if "-Dtest" in clean_cmd and not re.search(r"-Dtest=\S+", clean_cmd):
-                        # Fix the command by removing invalid -Dtest
-                        clean_cmd = clean_cmd.replace("-Dtest", "").strip()
-                        # If it becomes just 'mvn clean install', change to 'mvn clean test'
-                        if clean_cmd == "mvn clean install -Dossindex.skip":
-                            clean_cmd = "mvn clean test -Dossindex.skip"
                     documentation["test_commands"].append(clean_cmd)
 
     return documentation
@@ -374,22 +369,27 @@ def analyze_build_configuration(orch, project_path: str, project_type: str) -> D
     elif project_type == "Python":
         # Keep the structure-detection label (this dict overwrites the
         # analysis via update(), so a None here would erase it) and add
-        # the Python analysis depth (spec Component 1).
+        # the Python survey depth (spec Component 1). DESCRIPTIVE metadata
+        # only — the analyzer composes python_config (installer ladder) from
+        # it at the tool layer.
         config["build_system"] = "pip/poetry"
-        analyze_python_project(orch, project_path, config)
+        config["python_metadata"] = read_python_metadata(orch, project_path)
 
     return config
 
 
-def analyze_python_project(orch, project_path: str, analysis: Dict[str, Any]) -> None:
-    """Python analysis depth (spec Component 1): interpreter constraint ->
-    concrete version (newest satisfying), installer faithfulness ladder,
-    top-level package discovery, and READ-ONLY test hints (tox/nox are
-    metadata only, never executed). Fills ``analysis["python_config"]``,
-    which _persist_build_requirements merges into the handoff manifest.
+def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
+    """Python survey depth, DESCRIPTIVELY: interpreter constraint -> concrete
+    version (newest satisfying — a derived fact, not an action), native-core
+    root redirection, top-level package discovery, C-extension markers, and
+    READ-ONLY test hints (tox/nox are metadata only, never executed).
+
+    Returns the raw metadata the tool layer composes its install plan from
+    (the installer LADDER is a prescription — detect_installer runs at the
+    analyzer/setup/python-tool layer, never here; final Category-2 review:
+    the surveyor describes, it never prescribes). None when no orchestrator.
     """
     from sag.tools.internal.python_env import (
-        detect_installer,
         discover_packages,
         requires_python_from_pyproject,
         requires_python_from_setup_cfg,
@@ -400,7 +400,7 @@ def analyze_python_project(orch, project_path: str, analysis: Dict[str, Any]) ->
     )
 
     if not orch:
-        return
+        return None
 
     def list_dir(directory: str) -> set:
         listing = orch.execute_command(f"ls -1 {directory} 2>/dev/null")
@@ -454,13 +454,6 @@ def analyze_python_project(orch, project_path: str, analysis: Dict[str, Any]) ->
             constraint, constraint_source = value, source
             break
 
-    # Bug #13 defect 3: the editable pip rungs install the extras the
-    # project ACTUALLY declares — pass the metadata contents through.
-    installer = detect_installer(
-        files_present,
-        {"pyproject.toml": pyproject, "setup.cfg": setup_cfg},
-    )
-
     hints = tox_test_hints(tox_ini)
     for dep in setup_cfg_test_deps(setup_cfg):
         if dep not in hints["test_deps"]:
@@ -477,18 +470,11 @@ def analyze_python_project(orch, project_path: str, analysis: Dict[str, Any]) ->
         or re.search(r"(?i)\bcython\b", pyproject + setup_py)
     )
 
-    analysis["python_config"] = {
+    return {
         "python_constraint": constraint,
         "python_constraint_source": constraint_source,
         "python_version": resolve_python_version(constraint),
-        "python_installer": installer["installer"],
-        "python_install_commands": installer["commands"],
-        "python_install_source": installer["source"],
-        # Bug #13 defect 3: no-test-extras rides the manifest so
-        # setup_env narrates the hole instead of failing silently.
-        "python_install_note": installer.get("note"),
         "python_packages": discover_packages(orch, python_root),
-        "python_venv": f"{python_root.rstrip('/')}/.venv",
         "has_c_extensions": has_c_extensions,
         # The directory the python package actually installs from (the repo
         # root for a plain project; a python/ subdir for a native-core repo)
@@ -496,6 +482,11 @@ def analyze_python_project(orch, project_path: str, analysis: Dict[str, Any]) ->
         "python_root": python_root,
         "has_native_build": has_native_build,
         "test_hints": hints,
+        # Raw material for the tool layer's install-plan composition (Bug #13
+        # defect 3: the editable pip rungs install the extras the project
+        # ACTUALLY declares — the contents ride along for detect_installer).
+        "files_present": files_present,
+        "metadata_contents": {"pyproject.toml": pyproject, "setup.cfg": setup_cfg},
     }
 
 
@@ -960,58 +951,6 @@ def count_java_test_with_expansions(
     return result
 
 
-def count_actual_test_executions(orch, project_path: str) -> Optional[int]:
-    """Count actual test executions (including parameterized test expansions).
-
-    This method attempts to get the true count of test cases that will execute,
-    including all parameter variations of parameterized tests.
-
-    Approaches:
-    1. Check existing surefire-reports XML files for test counts
-    2. Run tests with minimal overhead to generate reports
-    3. Fall back to annotation counting if execution counting fails
-    """
-    if not orch:
-        return None
-
-    # First, try to get counts from existing test reports if available
-    xml_count_cmd = (
-        "if [ -d {project}/target/surefire-reports ]; then "
-        "grep -h 'tests=' {project}/target/surefire-reports/TEST-*.xml 2>/dev/null | "
-        "sed -n 's/.*tests=\"\\([0-9]*\\)\".*/\\1/p' | "
-        "awk '{{sum += $1}} END {{if (sum > 0) print sum; else print \"0\"}}'; "
-        "else echo '0'; fi"
-    ).format(project=project_path)
-
-    result = orch.execute_command(xml_count_cmd)
-    if result.get("success"):
-        output = (result.get("output") or "").strip()
-        try:
-            count = int(output)
-            if count > 0:
-                logger.info(f"📊 Found {count} actual test executions from surefire reports")
-                return count
-        except ValueError:
-            pass
-
-    # If no existing reports, try to run tests in list-only mode (if supported)
-    # Note: This is a lightweight operation that discovers tests without executing them
-    # However, JUnit 5's console launcher or Maven's test discovery might be needed
-
-    # For now, we'll check if we can get a quick test count by running with failfast
-    # This is still not ideal as it runs tests, but we limit the time
-    discover_cmd = (
-        "cd {project} && timeout 30 mvn test -DskipTests=false -Dmaven.test.failure.ignore=true "
-        "-DtrimStackTrace=false 2>&1 | grep -E '^\\[INFO\\] Tests run: [0-9]+' | "
-        "tail -1 | sed 's/.*Tests run: \\([0-9]*\\).*/\\1/'"
-    ).format(project=project_path)
-
-    # Actually, let's not run tests here - that's too expensive
-    # Instead, return None to indicate we couldn't get actual execution count
-    logger.debug("No existing test reports found, actual execution count unavailable")
-    return None
-
-
 def island_root_for(orch, project_path: str, source_dir: str) -> Dict[str, Any]:
     """Map one source/test-bearing dir to its nearest INDEPENDENT build
     island: the build root that owns it, plus that root's build system.
@@ -1124,6 +1063,119 @@ def enumerate_build_islands(
     return islands
 
 
+def scan_root_build_markers(orch, project_path: str) -> Dict[str, Any]:
+    """Root build markers + declared packaging, as facts.
+
+    The probe order matches the recommendation's historical inline reads:
+    pom, gradlew, build.gradle(.kts), the four main-source language dirs,
+    then the packaging grep (Maven roots only; absent <packaging> defaults
+    to jar, packaging reality).
+    """
+    has_pom = path_exists(orch, f"{project_path}/pom.xml")
+    has_gradlew = path_exists(orch, f"{project_path}/gradlew")
+    has_build_gradle = path_exists(orch, f"{project_path}/build.gradle") or path_exists(
+        orch, f"{project_path}/build.gradle.kts"
+    )
+
+    root_main = {
+        "java": path_exists(orch, f"{project_path}/src/main/java"),
+        "groovy": path_exists(orch, f"{project_path}/src/main/groovy"),
+        "scala": path_exists(orch, f"{project_path}/src/main/scala"),
+        "kotlin": path_exists(orch, f"{project_path}/src/main/kotlin"),
+    }
+
+    packaging = None
+    if has_pom:
+        pkg = orch.execute_command(f"grep -m1 '<packaging>' {project_path}/pom.xml 2>/dev/null")
+        match = re.search(r"<packaging>\s*([^<\s]+)\s*</packaging>", pkg.get("output") or "")
+        packaging = match.group(1).strip().lower() if match else "jar"
+
+    return {
+        "has_pom": has_pom,
+        "has_gradlew": has_gradlew,
+        "has_build_gradle": has_build_gradle,
+        "root_main": root_main,
+        "packaging": packaging,
+    }
+
+
+def scan_source_modules(orch, project_path: str) -> List[Dict[str, Any]]:
+    """Find source-bearing modules DIRECTLY rather than trusting the root
+    pom's <modules> — Bigtop declares its modules inside a profile, so the
+    parsed list is empty and the Groovy iTest framework was missed. Scan for
+    Java, Groovy, Scala AND Kotlin main-source dirs, excluding build output.
+    (Live re-probe: bigpetstore-spark's only sources are src/main/scala with
+    its own build.gradle; a java/groovy-only find never enumerated it, so
+    the real archipelago produced 3 islands where the fixture had 4. Kotlin
+    is the same class of gap.)
+
+    Each module is ``{module, dir, lang}`` (module = root-relative path);
+    the aggregator root itself is never a module.
+    """
+    source_modules: List[Dict[str, Any]] = []
+    find_cmd = (
+        f"find {project_path} -maxdepth 5 -type d "
+        f"\\( -path '*/src/main/java' -o -path '*/src/main/groovy' "
+        f"-o -path '*/src/main/scala' -o -path '*/src/main/kotlin' \\) "
+        f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
+    )
+    found = orch.execute_command(find_cmd)
+    seen_dirs = set()
+    for line in (found.get("output") or "").splitlines():
+        line = line.strip()
+        if not line or "/src/main/" not in line:
+            continue
+        suffix = line.rsplit("/src/main/", 1)[1]
+        lang = suffix if suffix in ("groovy", "scala", "kotlin") else "java"
+        module_dir = line.rsplit("/src/main/", 1)[0]
+        if module_dir == project_path or module_dir in seen_dirs:
+            continue
+        seen_dirs.add(module_dir)
+        source_modules.append(
+            {
+                "module": module_dir[len(project_path) :].lstrip("/"),
+                "dir": module_dir,
+                "lang": lang,
+            }
+        )
+    return source_modules
+
+
+def scan_test_module_dirs(orch, project_path: str) -> List[str]:
+    """Find every test-bearing module dir (Java/Groovy/Scala/Kotlin test
+    sources, build output excluded), deduped in find order. Bigtop: the
+    compiled classes are the Maven/Groovy test framework, but ~49 of 57
+    tests live in the Gradle data-generators modules — the test scan must
+    see the whole tree, not the build target."""
+    find_cmd = (
+        f"find {project_path} -maxdepth 6 -type d "
+        f"\\( -path '*/src/test/java' -o -path '*/src/test/groovy' "
+        f"-o -path '*/src/test/scala' -o -path '*/src/test/kotlin' \\) "
+        f"-not -path '*/target/*' -not -path '*/build/*' 2>/dev/null"
+    )
+    found = orch.execute_command(find_cmd)
+    test_module_dirs: List[str] = []
+    for line in (found.get("output") or "").splitlines():
+        line = line.strip()
+        if "/src/test/" not in line:
+            continue
+        module_dir = line.rsplit("/src/test/", 1)[0]
+        if module_dir not in test_module_dirs:
+            test_module_dirs.append(module_dir)
+    return test_module_dirs
+
+
+def build_system_at(orch, root: str) -> Optional[str]:
+    """The build system marked at ``root`` ITSELF (no ancestor walk):
+    gradle when settings.gradle/build.gradle sits there, maven on pom.xml,
+    else None. Probe order preserved from the historical inline read."""
+    if path_exists(orch, f"{root}/settings.gradle") or path_exists(orch, f"{root}/build.gradle"):
+        return "gradle"
+    if path_exists(orch, f"{root}/pom.xml"):
+        return "maven"
+    return None
+
+
 def validate_and_discover_project_path(orch, initial_path: str) -> Optional[str]:
     """Validate project path and discover actual project location if needed."""
     if not orch:
@@ -1218,26 +1270,63 @@ FALLBACK_BUILD_MARKERS = (
 )
 
 # The config files the survey derives its facts from — the staleness domain
-# of the survey stamp's source fingerprint (java build files plus the python
-# metadata the installer/constraint/test-hint parsing reads).
-SURVEY_FINGERPRINT_SOURCES = FALLBACK_BUILD_MARKERS + ("setup.py", "setup.cfg", "tox.ini")
+# of the survey stamp's source fingerprint. Recursive by NAME (final
+# Category-2 review P1: parent POMs, nested island build files, lockfiles
+# and wrapper markers all feed the facts — a root-only cat missed them):
+# java build files at every depth, the gradle wrapper marker, the python
+# metadata/lockfiles the installer/constraint/test-hint parsing reads, and
+# the native-core marker.
+SURVEY_FINGERPRINT_SOURCES = (
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "gradlew",
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "tox.ini",
+    "requirements*.txt",
+    "poetry.lock",
+    "Pipfile",
+    "Pipfile.lock",
+    "CMakeLists.txt",
+)
+
+# Never fingerprint build OUTPUT or vendored trees: configs copied into
+# target/build by a build run would churn the fingerprint after every build
+# and thrash re-surveys (the same exclusions the source-module scan uses).
+FINGERPRINT_PRUNE_DIRS = (".git", "node_modules", ".venv", "target", "build", "dist", ".tox")
 
 
 def config_fingerprint(orch, project_path: str) -> Optional[str]:
-    """Digest of the build-config files at ``project_path``, or None.
+    """Digest of the build-config files under ``project_path``, or None.
 
-    One container command: the fingerprint sources concatenated in fixed
-    order (missing files contribute nothing) through POSIX ``cksum``. Two
-    surveys of unchanged config produce the same string; editing any config
-    file changes it. Returns None when the probe is unavailable — callers
-    must treat None as CANNOT COMPARE, never as a mismatch, or a flaky
-    container would thrash re-surveys.
+    One container command: ``find`` enumerates every fingerprint source by
+    name at any depth (pruning build output), ``sort`` fixes the order, and
+    per-file ``cksum`` lines — checksum, size AND file name — collapse
+    through a final ``cksum``. Per-file digests encode what a bare
+    concatenation cannot (final Category-2 review P1): file NAMES, file
+    EXISTENCE (adding/deleting a config changes the listing), and content
+    BOUNDARIES (bytes moving between files changes the line set).
+
+    Returns None when the probe is unavailable — callers must treat None as
+    CANNOT COMPARE, never as a mismatch, or a flaky container would thrash
+    re-surveys.
     """
     if not orch:
         return None
-    files = " ".join(SURVEY_FINGERPRINT_SOURCES)
+    prunes = " -o ".join(f"-name {d}" for d in FINGERPRINT_PRUNE_DIRS)
+    names = " -o ".join(f"-name '{n}'" for n in SURVEY_FINGERPRINT_SOURCES)
+    command = (
+        f"cd {project_path} && find . \\( {prunes} \\) -prune -o "
+        f"-type f \\( {names} \\) -print 2>/dev/null | sort | "
+        f"xargs -r cksum 2>/dev/null | cksum"
+    )
     try:
-        result = orch.execute_command(f"cd {project_path} && cat {files} 2>/dev/null | cksum")
+        result = orch.execute_command(command)
     except Exception as exc:
         logger.debug(f"config fingerprint unavailable: {exc}")
         return None
