@@ -93,6 +93,51 @@ def module_coverage(validator, project_name) -> dict[str, Any] | None:
         return None
 
 
+def _island_checklist_line(
+    coverage: dict[str, Any],
+    islands: list[dict[str, Any]],
+    *,
+    limit: int = 6,
+) -> str | None:
+    """Key the checklist to the recommended islands: an island counts as built
+    when any scanned module under its root has build output."""
+    project_dir = str(coverage.get("project_dir") or "").rstrip("/")
+    modules = coverage.get("modules") or []
+    built_paths = [
+        str(m.get("path") or "") for m in modules if m.get("build_status") == "success"
+    ]
+
+    def _island_rel(root: str) -> str:
+        root = root.rstrip("/")
+        if project_dir and root.startswith(project_dir):
+            return root[len(project_dir):].strip("/") or "."
+        return root
+
+    built_islands: list[dict[str, Any]] = []
+    remaining: list[dict[str, Any]] = []
+    for island in islands:
+        root = str(island.get("root") or "")
+        if not root:
+            continue
+        rel = _island_rel(root)
+        covered = any(
+            path == rel or path.startswith(f"{rel}/") for path in built_paths if path
+        )
+        (built_islands if covered else remaining).append(island)
+
+    total = len(built_islands) + len(remaining)
+    if not total:
+        return None
+    line = f"Recommended islands: {len(built_islands)}/{total} built"
+    if remaining:
+        items = "; ".join(
+            f"{isl.get('system') or 'build'} '{isl.get('goal') or 'build'}' in {isl['root']}"
+            for isl in remaining[:limit]
+        )
+        line += f" · remaining: {items}"
+    return line
+
+
 def coverage_conflicts(coverage: dict[str, Any] | None) -> tuple[str, ...]:
     """The two July coverage caps, from a coverage rollup."""
     if not coverage:
@@ -110,14 +155,26 @@ def coverage_conflicts(coverage: dict[str, Any] | None) -> tuple[str, ...]:
     return tuple(conflicts)
 
 
-def coverage_checklist_line(coverage: dict[str, Any] | None, *, limit: int = 6) -> str | None:
+def coverage_checklist_line(
+    coverage: dict[str, Any] | None,
+    *,
+    islands: list[dict[str, Any]] | None = None,
+    limit: int = 6,
+) -> str | None:
     """A one-line, agent-facing checklist: what built, what has no output yet.
 
     The agent's window is seven steps; a ratio alone ("1/4") tells it nothing
-    actionable. NAME the modules so 'keep going' has a target.
+    actionable. With ISLANDS known, key the line to them — full root AND goal
+    per remaining island (live bigtop 2026-07-18: the raw 15-module basename
+    dump was half noise with no coordinates, and the agent kept building at
+    the root for 86 calls). Without islands, fall back to module names.
     """
     if not coverage:
         return None
+    if islands and len(islands) > 1:
+        island_line = _island_checklist_line(coverage, islands, limit=limit)
+        if island_line:
+            return island_line
     modules = coverage.get("modules") or []
     summary = coverage.get("summary") or {}
     total = int(summary.get("modules_total") or 0)

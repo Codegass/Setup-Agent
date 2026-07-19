@@ -248,7 +248,7 @@ def _inspect_phase(phase, validator, orchestrator, project_name) -> _ValidatorOb
         if phase == "analyze":
             return _inspect_analyze(validator, project_name)
         if phase == "build":
-            return _inspect_build(validator, project_name)
+            return _inspect_build(validator, project_name, orchestrator=orchestrator)
         if phase == "test":
             return _inspect_test(validator, project_name)
         if phase == "report":
@@ -439,7 +439,7 @@ def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
     )
 
 
-def _inspect_build(validator, project_name) -> _ValidatorObservation:
+def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObservation:
     if validator is None:
         raise RuntimeError("no physical validator available")
     status = validator.validate_build_status(project_name)
@@ -468,10 +468,20 @@ def _inspect_build(validator, project_name) -> _ValidatorObservation:
     # mid-run guidance can never disagree with the sealed verdict.
     from sag.agent.module_coverage import coverage_checklist_line, module_coverage
 
-    checklist = coverage_checklist_line(module_coverage(validator, project_name))
+    islands = None
+    if orchestrator is not None:
+        try:
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            islands = (read_build_requirements(orchestrator) or {}).get("build_islands")
+        except Exception:
+            islands = None
+    checklist = coverage_checklist_line(
+        module_coverage(validator, project_name), islands=islands
+    )
     if checklist:
         reason = f"{reason} · {checklist}"
-        if "no output yet" in checklist:
+        if "no output yet" in checklist or "remaining:" in checklist:
             suggestions = (
                 *suggestions,
                 "Modules without build output remain (see the coverage line) — build "

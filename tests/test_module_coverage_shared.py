@@ -274,3 +274,35 @@ def test_test_phase_stays_clean_when_native_built_or_not_native():
 
     assert engine2._python_phase_guidance("test") == PYTHON_TEST_PHASE_GUIDANCE
     assert "smoke" not in engine2._phase_intro_step().content.lower()
+
+
+# ---- Island-keyed checklist: actionable coordinates, not raw module names ----
+
+def test_checklist_prefers_islands_with_full_roots_and_goals():
+    """bigtop6 live: the module-scan checklist showed 15 basenames (half noise:
+    site, test-artifacts) with no paths or commands — the agent stayed at the
+    root for 86 calls. With islands known, the checklist must be keyed to the
+    4 actionable islands, each with its FULL root and goal."""
+    islands = [
+        {"root": "/workspace/bigtop/bigtop-test-framework", "system": "maven",
+         "goal": "install"},
+        {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle",
+         "goal": "publishToMavenLocal"},
+        {"root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+         "system": "gradle", "goal": "build"},
+    ]
+    coverage = module_coverage(_bigtop_validator(), "bigtop")
+    line = coverage_checklist_line(coverage, islands=islands)
+    assert "islands" in line.lower()
+    # the built island is recognized through its modules
+    assert "1/3 built" in line
+    # remaining entries carry full root AND goal — actionable, not just names
+    assert "gradle 'build' in /workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark" in line
+    assert "maven 'install' in /workspace/bigtop/bigtop-test-framework" in line
+    # island keying replaces the noisy 15-module dump
+    assert "site" not in line
+
+
+def test_checklist_falls_back_to_modules_without_islands():
+    line = coverage_checklist_line(module_coverage(_bigtop_validator(), "bigtop"), islands=[])
+    assert "Module coverage:" in line
