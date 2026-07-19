@@ -427,266 +427,30 @@ class ProjectAnalyzerTool(BaseTool):
         return None
 
     def _get_java_test_annotation_counts(self, project_path: str) -> Optional[Dict[str, int]]:
-        """Collect counts for key JUnit annotations inside src/test/* Java sources."""
-        if not self.docker_orchestrator:
-            return None
+        from sag.agent.physical_survey import get_java_test_annotation_counts
 
-        if project_path in self._java_annotation_cache:
-            return self._java_annotation_cache[project_path]
-
-        command = f"""cd {project_path} && python3 - <<'PY'
-import json
-import re
-from collections import Counter
-from pathlib import Path
-
-{STATIC_SCAN_EXCLUSION_HELPER}
-
-ANNOTATION_PATTERN = re.compile(r'@([A-Za-z_][A-Za-z0-9_]*)')
-
-
-def strip_comments(source: str) -> str:
-    source = re.sub(r'/\\*.*?\\*/', '', source, flags=re.S)
-    source = re.sub(r'//.*', '', source)
-    return source
-
-
-counts = Counter()
-project_root = Path('.')
-
-test_dirs = []
-for candidate in project_root.rglob('src'):
-    if candidate.name != 'src':
-        continue
-    test_dir = candidate / 'test'
-    if not test_dir.is_dir():
-        continue
-    if is_excluded(test_dir):
-        continue
-    test_dirs.append(test_dir)
-
-for test_dir in test_dirs:
-    for java_file in test_dir.rglob('*.java'):
-        if is_excluded(java_file.parent):
-            continue
-        try:
-            text = java_file.read_text(encoding='utf-8')
-        except Exception:
-            try:
-                text = java_file.read_text(encoding='latin-1')
-            except Exception:
-                continue
-        cleaned = strip_comments(text)
-        counts.update(ANNOTATION_PATTERN.findall(cleaned))
-
-result = {{
-    'Test': counts.get('Test', 0),
-    'ParameterizedTest': counts.get('ParameterizedTest', 0),
-    'RepeatedTest': counts.get('RepeatedTest', 0),
-    'TestFactory': counts.get('TestFactory', 0),
-    'TestTemplate': counts.get('TestTemplate', 0),
-    'DynamicTest': counts.get('DynamicTest', 0),
-    'Disabled': counts.get('Disabled', 0),
-}}
-print(json.dumps(result))
-PY"""
-
-        response = self.docker_orchestrator.execute_command(command)
-        if not response.get("success"):
-            return None
-
-        output = (response.get("output") or "").strip()
-        if not output:
-            return None
-
-        try:
-            counts = json.loads(output.splitlines()[-1])
-        except json.JSONDecodeError:
-            logger.debug("Unable to parse Java test annotation counts from output")
-            return None
-
-        self._java_annotation_cache[project_path] = counts
-        return counts
+        return get_java_test_annotation_counts(
+            self.docker_orchestrator, project_path, self._java_annotation_cache
+        )
 
     def _count_java_test_with_expansions(self, project_path: str) -> Dict[str, Any]:
-        """
-        Count Java test annotations and capture metadata about parameterized usage.
+        from sag.agent.physical_survey import count_java_test_with_expansions
 
-        Returns:
-            Dict with:
-            - 'method_count': Number of test method annotations
-            - 'total_test_count': Total test cases based on annotations (deduplicated)
-            - 'parameterized_info': Details about parameterized tests
-        """
-        if not self.docker_orchestrator:
-            return {"method_count": None, "total_test_count": None}
-
-        # Always calculate the raw annotation total first so we have a baseline
-        # even if the per-annotation breakdown command fails.
-        method_count = self._count_java_test_annotations(project_path)
-
-        counts = self._get_java_test_annotation_counts(project_path)
-        if counts is None and method_count is None:
-            return {"method_count": None, "total_test_count": None}
-
-        # When both approaches succeed use the scripted breakdown so we can
-        # populate the parameterized metadata, but prefer the streaming grep
-        # total as a guard against bugs in either implementation.
-        if counts is None:
-            counts = {
-                "Test": 0,
-                "ParameterizedTest": 0,
-                "RepeatedTest": 0,
-                "TestFactory": 0,
-                "TestTemplate": 0,
-                "DynamicTest": 0,
-            }
-
-        regular_tests = counts.get("Test", 0)
-        parameterized_methods = counts.get("ParameterizedTest", 0)
-        repeated_tests = counts.get("RepeatedTest", 0)
-        factory_methods = counts.get("TestFactory", 0)
-        template_methods = counts.get("TestTemplate", 0)
-        dynamic_tests = counts.get("DynamicTest", 0)
-
-        breakdown_total = (
-            regular_tests
-            + parameterized_methods
-            + repeated_tests
-            + factory_methods
-            + template_methods
-            + dynamic_tests
+        return count_java_test_with_expansions(
+            self.docker_orchestrator, project_path, self._java_annotation_cache
         )
-
-        if method_count is None:
-            method_count = breakdown_total
-        elif breakdown_total and breakdown_total != method_count:
-            logger.debug(
-                "Mismatch between streaming annotation total ({}) and breakdown total ({})",
-                method_count,
-                breakdown_total,
-            )
-            method_count = max(method_count, breakdown_total)
-
-        total_test_count = method_count
-
-        result = {
-            "method_count": method_count,
-            "total_test_count": total_test_count,
-            "parameterized_info": {
-                "regular_tests": regular_tests,
-                "parameterized_methods": parameterized_methods,
-                "parameterized_expansions": parameterized_methods,
-                "repeated_tests": repeated_tests,
-                "test_factory_methods": factory_methods,
-                "test_template_methods": template_methods,
-                "dynamic_tests": dynamic_tests,
-            },
-        }
-
-        logger.info("📊 Test count analysis:")
-        logger.info(f"   - Regular @Test methods: {regular_tests}")
-        logger.info(f"   - @ParameterizedTest methods: {parameterized_methods}")
-        if repeated_tests:
-            logger.info(f"   - @RepeatedTest methods: {repeated_tests}")
-        if factory_methods or template_methods or dynamic_tests:
-            logger.info(
-                "   - Additional test annotations (factory/template/dynamic): "
-                f"{factory_methods}/{template_methods}/{dynamic_tests}"
-            )
-        logger.info(f"   - Total annotated test methods: {method_count}")
-
-        return result
 
     def _count_java_test_annotations(self, project_path: str) -> Optional[int]:
-        """Count all test annotations across Java test sources for a project.
+        from sag.agent.physical_survey import count_java_test_annotations
 
-        Includes:
-        - @Test (standard JUnit 4/5 tests)
-        - @ParameterizedTest (JUnit 5 - runs multiple times with different parameters)
-        - @RepeatedTest (JUnit 5 - runs multiple times)
-        - @TestFactory (JUnit 5 - generates tests dynamically)
-        - @TestTemplate (JUnit 5 - template for tests)
-
-        Note: This counts test METHOD declarations, not test EXECUTIONS.
-        Parameterized tests will execute multiple times but are counted once here.
-        """
-        if not self.docker_orchestrator:
-            return None
-
-        counts = self._get_java_test_annotation_counts(project_path)
-        if counts is None:
-            return None
-
-        total = (
-            counts.get("Test", 0)
-            + counts.get("ParameterizedTest", 0)
-            + counts.get("RepeatedTest", 0)
-            + counts.get("TestFactory", 0)
-            + counts.get("TestTemplate", 0)
-            + counts.get("DynamicTest", 0)
+        return count_java_test_annotations(
+            self.docker_orchestrator, project_path, self._java_annotation_cache
         )
 
-        if total > 0:
-            logger.info(
-                f"📊 Found {total} test method annotations (Test/Parameterized/Repeated/Factory/Template)."
-            )
-            param_methods = counts.get("ParameterizedTest", 0)
-            if param_methods:
-                logger.info(f"   - Includes {param_methods} parameterized test methods")
-
-        return total if total > 0 else None
-
     def _count_actual_test_executions(self, project_path: str) -> Optional[int]:
-        """Count actual test executions (including parameterized test expansions).
+        from sag.agent.physical_survey import count_actual_test_executions
 
-        This method attempts to get the true count of test cases that will execute,
-        including all parameter variations of parameterized tests.
-
-        Approaches:
-        1. Check existing surefire-reports XML files for test counts
-        2. Run tests with minimal overhead to generate reports
-        3. Fall back to annotation counting if execution counting fails
-        """
-        if not self.docker_orchestrator:
-            return None
-
-        # First, try to get counts from existing test reports if available
-        xml_count_cmd = (
-            "if [ -d {project}/target/surefire-reports ]; then "
-            "grep -h 'tests=' {project}/target/surefire-reports/TEST-*.xml 2>/dev/null | "
-            "sed -n 's/.*tests=\"\\([0-9]*\\)\".*/\\1/p' | "
-            "awk '{{sum += $1}} END {{if (sum > 0) print sum; else print \"0\"}}'; "
-            "else echo '0'; fi"
-        ).format(project=project_path)
-
-        result = self.docker_orchestrator.execute_command(xml_count_cmd)
-        if result.get("success"):
-            output = (result.get("output") or "").strip()
-            try:
-                count = int(output)
-                if count > 0:
-                    logger.info(f"📊 Found {count} actual test executions from surefire reports")
-                    return count
-            except ValueError:
-                pass
-
-        # If no existing reports, try to run tests in list-only mode (if supported)
-        # Note: This is a lightweight operation that discovers tests without executing them
-        # However, JUnit 5's console launcher or Maven's test discovery might be needed
-
-        # For now, we'll check if we can get a quick test count by running with failfast
-        # This is still not ideal as it runs tests, but we limit the time
-        discover_cmd = (
-            "cd {project} && timeout 30 mvn test -DskipTests=false -Dmaven.test.failure.ignore=true "
-            "-DtrimStackTrace=false 2>&1 | grep -E '^\\[INFO\\] Tests run: [0-9]+' | "
-            "tail -1 | sed 's/.*Tests run: \\([0-9]*\\).*/\\1/'"
-        ).format(project=project_path)
-
-        # Actually, let's not run tests here - that's too expensive
-        # Instead, return None to indicate we couldn't get actual execution count
-        logger.debug("No existing test reports found, actual execution count unavailable")
-        return None
+        return count_actual_test_executions(self.docker_orchestrator, project_path)
 
     def _parse_gradle_test_frameworks(self, gradle_content: str) -> List[str]:
         from sag.agent.physical_survey import parse_gradle_test_frameworks
