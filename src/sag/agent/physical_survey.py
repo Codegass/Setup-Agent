@@ -1012,6 +1012,118 @@ def count_actual_test_executions(orch, project_path: str) -> Optional[int]:
     return None
 
 
+def island_root_for(orch, project_path: str, source_dir: str) -> Dict[str, Any]:
+    """Map one source/test-bearing dir to its nearest INDEPENDENT build
+    island: the build root that owns it, plus that root's build system.
+
+    Walk up from ``source_dir`` toward ``project_path`` (never above it),
+    recording the first ancestor with a build marker (pom.xml /
+    build.gradle(.kts)). Independence is defined by settings.gradle: a
+    Gradle multi-project (settings.gradle at its root) is ONE island and its
+    subprojects are NOT separate islands, so the OUTERMOST settings-gradle
+    ancestor wins over a nearer subproject build.gradle. The root aggregator
+    itself is skipped (walking stops one level below project_path) — it is
+    the pathological root we are decomposing, not an island.
+
+    Returns ``{root, system}`` when an owning build root exists (root = the
+    island dir, system = maven/gradle), or ``{"root": None, "system": None}``
+    when NO build file sits between the source dir and the aggregator root.
+    An island REQUIRES its own build root: a source dir with no build marker
+    above it (an example / vendored copy) is NOT an island — callers must
+    exclude it, never promote it (doing so manufactured a bogus system=null
+    island for examples/demo that the manifest persisted and the agent
+    guidance rendered as "build unknown in .../examples/demo").
+    """
+    root = project_path.rstrip("/")
+    cur = source_dir.rstrip("/")
+
+    nearest_build = None  # first ancestor with any build marker
+    nearest_system = None
+    settings_root = None  # OUTERMOST ancestor carrying settings.gradle
+
+    # Ascend from the module dir up to (but not including) the project root.
+    while cur.startswith(root + "/"):
+        if path_exists(orch, f"{cur}/settings.gradle") or path_exists(
+            orch, f"{cur}/settings.gradle.kts"
+        ):
+            settings_root = cur  # keep ascending -> ends on the outermost
+        has_pom = path_exists(orch, f"{cur}/pom.xml")
+        has_gradle_build = path_exists(orch, f"{cur}/build.gradle") or path_exists(
+            orch, f"{cur}/build.gradle.kts"
+        )
+        if nearest_build is None and (has_pom or has_gradle_build):
+            nearest_build = cur
+            nearest_system = "maven" if has_pom else "gradle"
+        parent = cur.rsplit("/", 1)[0]
+        if parent == cur:
+            break
+        cur = parent
+
+    if settings_root is not None:
+        # The gradle multi-project root is the island; its subprojects fold in.
+        return {"root": settings_root, "system": "gradle"}
+    if nearest_build is not None:
+        return {"root": nearest_build, "system": nearest_system}
+    # No build file above the source dir: it has no build root of its own, so
+    # it is NOT an island (vendored/example sources). Signal exclusion.
+    return {"root": None, "system": None}
+
+
+def island_applies_maven_publish(orch, root: str) -> bool:
+    """True iff the island's own build.gradle(.kts) applies the maven-publish
+    plugin — the signal that it publishes an artifact to the local maven repo
+    that a cross-island SNAPSHOT dependency can resolve."""
+    if not orch:
+        return False
+    root = root.rstrip("/")
+    cmd = f"grep -lE 'maven-publish' {root}/build.gradle {root}/build.gradle.kts " f"2>/dev/null"
+    found = orch.execute_command(cmd)
+    return bool((found.get("output") or "").strip())
+
+
+def enumerate_build_islands(
+    orch, project_path: str, source_modules: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Group every source-bearing module into its independent build island
+    (pathological-aggregator path only) — DESCRIPTIVELY.
+
+    Each island is ``{root, system, applies_maven_publish}``, deduped by root:
+    what exists on disk, nothing about what to do with it. The recommended
+    action (goal) is a prescription and stays with the analyzer tool layer —
+    the surveyor describes, it never prescribes.
+    """
+    islands: List[Dict[str, Any]] = []
+    by_root: Dict[str, Dict[str, Any]] = {}
+
+    for mod in source_modules:
+        info = island_root_for(orch, project_path, mod["dir"])
+        root = info["root"]
+        if root is None:
+            # No build root above this source dir -> not an island
+            # (vendored/example copy); exclude it rather than manufacture a
+            # bogus system=null island.
+            continue
+        existing = by_root.get(root)
+        if existing is None:
+            island = {
+                "root": root,
+                "system": info["system"],
+                "applies_maven_publish": (
+                    info["system"] == "gradle" and island_applies_maven_publish(orch, root)
+                ),
+            }
+            by_root[root] = island
+            islands.append(island)
+        elif existing.get("system") is None and info["system"]:
+            existing["system"] = info["system"]
+            # System resolved late -> the publish fact becomes knowable now.
+            existing["applies_maven_publish"] = (
+                info["system"] == "gradle" and island_applies_maven_publish(orch, root)
+            )
+
+    return islands
+
+
 def validate_and_discover_project_path(orch, initial_path: str) -> Optional[str]:
     """Validate project path and discover actual project location if needed."""
     if not orch:

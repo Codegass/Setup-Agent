@@ -669,40 +669,9 @@ class ProjectAnalyzerTool(BaseTool):
         island for examples/demo that the manifest persisted and the agent
         guidance rendered as "build unknown in .../examples/demo").
         """
-        orch = self.docker_orchestrator
-        root = project_path.rstrip("/")
-        cur = source_dir.rstrip("/")
+        from sag.agent.physical_survey import island_root_for
 
-        nearest_build = None  # first ancestor with any build marker
-        nearest_system = None
-        settings_root = None  # OUTERMOST ancestor carrying settings.gradle
-
-        # Ascend from the module dir up to (but not including) the project root.
-        while cur.startswith(root + "/"):
-            if _path_exists(orch, f"{cur}/settings.gradle") or _path_exists(
-                orch, f"{cur}/settings.gradle.kts"
-            ):
-                settings_root = cur  # keep ascending -> ends on the outermost
-            has_pom = _path_exists(orch, f"{cur}/pom.xml")
-            has_gradle_build = _path_exists(orch, f"{cur}/build.gradle") or _path_exists(
-                orch, f"{cur}/build.gradle.kts"
-            )
-            if nearest_build is None and (has_pom or has_gradle_build):
-                nearest_build = cur
-                nearest_system = "maven" if has_pom else "gradle"
-            parent = cur.rsplit("/", 1)[0]
-            if parent == cur:
-                break
-            cur = parent
-
-        if settings_root is not None:
-            # The gradle multi-project root is the island; its subprojects fold in.
-            return {"root": settings_root, "system": "gradle"}
-        if nearest_build is not None:
-            return {"root": nearest_build, "system": nearest_system}
-        # No build file above the source dir: it has no build root of its own, so
-        # it is NOT an island (vendored/example sources). Signal exclusion.
-        return {"root": None, "system": None}
+        return island_root_for(self.docker_orchestrator, project_path, source_dir)
 
     def _island_build_goal(self, root: str, system: Optional[str]) -> str:
         """The recommended build action (GOAL) for one independent island.
@@ -725,18 +694,9 @@ class ProjectAnalyzerTool(BaseTool):
         return "build"
 
     def _island_applies_maven_publish(self, root: str) -> bool:
-        """True iff the island's own build.gradle(.kts) applies the maven-publish
-        plugin — the signal that it publishes an artifact to the local maven repo
-        that a cross-island SNAPSHOT dependency can resolve."""
-        orch = self.docker_orchestrator
-        if not orch:
-            return False
-        root = root.rstrip("/")
-        cmd = (
-            f"grep -lE 'maven-publish' {root}/build.gradle {root}/build.gradle.kts " f"2>/dev/null"
-        )
-        found = orch.execute_command(cmd)
-        return bool((found.get("output") or "").strip())
+        from sag.agent.physical_survey import island_applies_maven_publish
+
+        return island_applies_maven_publish(self.docker_orchestrator, root)
 
     def _enumerate_build_islands(
         self, project_path: str, source_modules: List[Dict[str, Any]], preferred_dir: str
@@ -746,41 +706,35 @@ class ProjectAnalyzerTool(BaseTool):
 
         Each island is ``{root, system, goal, rationale}``, deduped by root, with
         the preferred module's island FIRST (so build_islands[0]["root"] ==
-        build_root for backward compatibility). ``goal`` is the recommended build
-        action for that island (maven -> 'install', gradle-with-maven-publish ->
-        'publishToMavenLocal', else 'build') so a cross-island SNAPSHOT
-        dependency resolves from the local maven repo.
+        build_root for backward compatibility). The surveyor substrate supplies
+        the DESCRIPTIVE island facts ({root, system, applies_maven_publish});
+        the goal composed here from those facts is a prescription (maven ->
+        'install', gradle-with-maven-publish -> 'publishToMavenLocal', else
+        'build' — so a cross-island SNAPSHOT dependency resolves from the local
+        maven repo) and stays at the tool layer until Category 3's A/B gate.
         """
-        islands: List[Dict[str, Any]] = []
-        by_root: Dict[str, Dict[str, Any]] = {}
+        from sag.agent.physical_survey import enumerate_build_islands
+
         preferred_island_root = self._island_root_for(project_path, preferred_dir)["root"]
 
-        for mod in source_modules:
-            info = self._island_root_for(project_path, mod["dir"])
-            root = info["root"]
-            if root is None:
-                # No build root above this source dir -> not an island
-                # (vendored/example copy); exclude it rather than manufacture a
-                # bogus system=null island.
-                continue
-            existing = by_root.get(root)
-            if existing is None:
-                goal = self._island_build_goal(root, info["system"])
-                island = {
-                    "root": root,
-                    "system": info["system"],
+        islands: List[Dict[str, Any]] = []
+        for fact in enumerate_build_islands(self.docker_orchestrator, project_path, source_modules):
+            goal = (
+                "install"
+                if fact["system"] == "maven"
+                else ("publishToMavenLocal" if fact["applies_maven_publish"] else "build")
+            )
+            islands.append(
+                {
+                    "root": fact["root"],
+                    "system": fact["system"],
                     "goal": goal,
                     "rationale": (
-                        f"Independent {info['system'] or 'unknown'} build island "
+                        f"Independent {fact['system'] or 'unknown'} build island "
                         f"under the aggregator; build it on its own with '{goal}'."
                     ),
                 }
-                by_root[root] = island
-                islands.append(island)
-            elif existing.get("system") is None and info["system"]:
-                existing["system"] = info["system"]
-                # System resolved late -> recompute the goal now that we know it.
-                existing["goal"] = self._island_build_goal(root, info["system"])
+            )
 
         # Preferred module's island leads (matches build_root).
         islands.sort(key=lambda i: 0 if i["root"] == preferred_island_root else 1)
