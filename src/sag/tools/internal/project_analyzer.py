@@ -19,6 +19,7 @@ from ..base import BaseTool, ToolResult
 # every call site — including project_setup_tool and the tests — is unchanged.
 from sag.agent.physical_survey import (  # noqa: E402
     ENFORCER_JAVA_PATTERN,
+    FALLBACK_BUILD_MARKERS,
     PYTHON_SUBDIR_CANDIDATES as _PYTHON_SUBDIR_CANDIDATES,
     detect_python_package_root,
     normalize_java_version as _normalize_java_version,
@@ -350,208 +351,19 @@ class ProjectAnalyzerTool(BaseTool):
         return analysis
 
     def _analyze_project_structure(self, project_path: str) -> Dict[str, Any]:
-        """分析项目结构，检测项目类型和构建系统"""
-        if not self.docker_orchestrator:
-            return {"project_type": "unknown", "build_system": "unknown"}
+        from sag.agent.physical_survey import analyze_project_structure
 
-        # 检查关键文件存在性
-        files_to_check = [
-            "pom.xml",  # Maven
-            "build.gradle",  # Gradle (Groovy DSL)
-            "build.gradle.kts",  # Gradle (Kotlin DSL — e.g. apache/beam root)
-            "settings.gradle",  # Gradle multi-project marker
-            "settings.gradle.kts",  # Gradle multi-project marker (Kotlin DSL)
-            "gradlew",  # Gradle wrapper — strong gradle signal even without root build file
-            "package.json",  # Node.js
-            "requirements.txt",  # Python
-            "pyproject.toml",  # Python Poetry
-            "Cargo.toml",  # Rust
-            "go.mod",  # Go
-            "CMakeLists.txt",  # CMake
-            "Makefile",  # Make
-            "README.md",
-            "README.txt",
-            "README",
-        ]
-
-        existing_files = []
-        for file in files_to_check:
-            result = self.docker_orchestrator.execute_command(
-                f"test -f {project_path}/{file} && echo 'exists' || echo 'missing'"
-            )
-            if result.get("success") and "exists" in result.get("output", ""):
-                existing_files.append(file)
-
-        gradle_markers = (
-            "build.gradle",
-            "build.gradle.kts",
-            "settings.gradle",
-            "settings.gradle.kts",
-            "gradlew",
-        )
-
-        # 检测项目类型
-        project_type = "unknown"
-        build_system = "unknown"
-
-        if "pom.xml" in existing_files:
-            project_type = "Java"
-            build_system = "Maven"
-        elif any(marker in existing_files for marker in gradle_markers):
-            project_type = "Java"
-            build_system = "Gradle"
-        elif "package.json" in existing_files:
-            project_type = "Node.js"
-            build_system = "npm/yarn"
-        elif "requirements.txt" in existing_files or "pyproject.toml" in existing_files:
-            project_type = "Python"
-            build_system = "pip/poetry"
-        elif "Cargo.toml" in existing_files:
-            project_type = "Rust"
-            build_system = "Cargo"
-        elif "go.mod" in existing_files:
-            project_type = "Go"
-            build_system = "Go modules"
-        elif "CMakeLists.txt" in existing_files and self._python_subdir_package(project_path):
-            # Native-core python repo (live TVM): the root is a CMake build shell
-            # with NO root python marker, but the real installable python package
-            # lives in python/ (or bindings/python/). Classify as Python so the
-            # python analysis + native-first guidance run — this branch is reached
-            # ONLY after every root marker above missed, so it can never reclassify
-            # a Java/Node/Rust/Go repo, and it requires an actual subdir package.
-            project_type = "Python"
-            build_system = "pip/poetry"
-
-        logger.info(f"Detected project type: {project_type}, build system: {build_system}")
-
-        structure = {
-            "project_type": project_type,
-            "build_system": build_system,
-            "existing_files": existing_files,
-        }
-
-        # An "unknown" verdict must carry its evidence: which markers were
-        # checked and what the project root actually contains — so the model
-        # can see WHY detection failed and correct course, instead of
-        # receiving a bare authoritative "unknown".
-        if project_type == "unknown":
-            structure["detection_checked"] = [
-                f for f in files_to_check if not f.startswith("README")
-            ]
-            listing = self.docker_orchestrator.execute_command(
-                f"ls -1 {project_path} 2>/dev/null | head -30"
-            )
-            if listing.get("success"):
-                structure["root_listing"] = (listing.get("output") or "").strip()
-
-        return structure
+        return analyze_project_structure(self.docker_orchestrator, project_path)
 
     def _python_subdir_package(self, project_path: str) -> bool:
-        """True when a conventional python subdir ships its own package metadata.
+        from sag.agent.physical_survey import python_subdir_package
 
-        Native-core repos (TVM) keep the installable python package in
-        ``python/`` (or ``bindings/python/``) beside a CMake build shell at the
-        root. Used only as the LAST classification fallback — a CMake root with
-        no root python marker is Python iff such a subdir package exists."""
-        orch = self.docker_orchestrator
-        if not orch:
-            return False
-        root = project_path.rstrip("/")
-        for candidate in _PYTHON_SUBDIR_CANDIDATES:
-            sub = f"{root}/{candidate}"
-            if _path_exists(orch, f"{sub}/setup.py") or _path_exists(orch, f"{sub}/pyproject.toml"):
-                return True
-        return False
+        return python_subdir_package(self.docker_orchestrator, project_path)
 
     def _analyze_documentation(self, project_path: str) -> Dict[str, Any]:
-        """分析项目文档，提取关键信息"""
-        documentation = {
-            "source_path": None,
-            "readme_content": "",
-            "setup_instructions": [],
-            "build_commands": [],
-            "test_commands": [],
-            "requirements": [],
-            "java_version_requirement": None,
-        }
+        from sag.agent.physical_survey import analyze_documentation
 
-        if not self.docker_orchestrator:
-            return documentation
-
-        # 尝试读取 README 文件
-        readme_files = ["README.md", "README.txt", "README", "docs/README.md"]
-        readme_content = ""
-
-        for readme_file in readme_files:
-            result = self.docker_orchestrator.execute_command(f"cat {project_path}/{readme_file}")
-            if result.get("success"):
-                readme_content = result.get("output", "")
-                documentation["source_path"] = readme_file
-                logger.info(f"Successfully read {readme_file}")
-                break
-
-        documentation["readme_content"] = readme_content
-
-        if readme_content:
-            # 提取 Java 版本要求
-            java_patterns = [
-                r"Java\s+(\d+)",
-                r"JDK\s+(\d+)",
-                r"java\.version.*?(\d+)",
-                r"requires.*Java\s+(\d+)",
-            ]
-
-            for pattern in java_patterns:
-                match = re.search(pattern, readme_content, re.IGNORECASE)
-                if match:
-                    documentation["java_version_requirement"] = match.group(1)
-                    break
-
-            # 提取构建命令 - 清理markdown格式
-            build_patterns = [
-                r"mvn.*?compile",
-                r"mvn.*?install",
-                r"mvn.*?package",
-                r"gradle.*?build",
-                r"npm.*?build",
-                r"pip install",
-                r"python setup\.py",
-            ]
-
-            for pattern in build_patterns:
-                matches = re.findall(pattern, readme_content, re.IGNORECASE)
-                # 清理提取的命令
-                for match in matches:
-                    clean_cmd = self._clean_markdown_command(match)
-                    if clean_cmd and clean_cmd not in documentation["build_commands"]:
-                        documentation["build_commands"].append(clean_cmd)
-
-            # 提取测试命令 - 清理markdown格式
-            test_patterns = [
-                r"mvn.*?test",
-                r"gradle.*?test",
-                r"npm.*?test",
-                r"pytest",
-                r"python.*?test",
-            ]
-
-            for pattern in test_patterns:
-                matches = re.findall(pattern, readme_content, re.IGNORECASE)
-                # 清理提取的命令
-                for match in matches:
-                    clean_cmd = self._clean_markdown_command(match)
-                    # Filter out invalid test commands
-                    if clean_cmd and clean_cmd not in documentation["test_commands"]:
-                        # Skip commands with -Dtest without a value (invalid Maven syntax)
-                        if "-Dtest" in clean_cmd and not re.search(r"-Dtest=\S+", clean_cmd):
-                            # Fix the command by removing invalid -Dtest
-                            clean_cmd = clean_cmd.replace("-Dtest", "").strip()
-                            # If it becomes just 'mvn clean install', change to 'mvn clean test'
-                            if clean_cmd == "mvn clean install -Dossindex.skip":
-                                clean_cmd = "mvn clean test -Dossindex.skip"
-                        documentation["test_commands"].append(clean_cmd)
-
-        return documentation
+        return analyze_documentation(self.docker_orchestrator, project_path)
 
     def _clean_markdown_command(self, command: str) -> str:
         from sag.agent.physical_survey import clean_markdown_command
@@ -2685,83 +2497,14 @@ OUTPUT:
 """
 
     def _validate_and_discover_project_path(self, initial_path: str) -> Optional[str]:
-        """Validate project path and discover actual project location if needed."""
-        if not self.docker_orchestrator:
-            logger.warning("No orchestrator available for path validation")
-            return initial_path
+        from sag.agent.physical_survey import validate_and_discover_project_path
 
-        # List of paths to check (in order of preference)
-        candidate_paths = [initial_path]
-
-        # If initial path is /workspace, also check common subdirectories
-        if initial_path == "/workspace":
-            # Get list of subdirectories in workspace
-            result = self.docker_orchestrator.execute_command("find /workspace -maxdepth 1 -type d")
-            if result.get("success"):
-                subdirs = [
-                    line.strip()
-                    for line in result.get("output", "").split("\n")
-                    if line.strip() and line.strip() != "/workspace"
-                ]
-                candidate_paths.extend(subdirs)
-
-        # Check each candidate path for project indicators
-        for path in candidate_paths:
-            if self._is_valid_project_directory(path):
-                logger.info(f"✅ Found valid project at: {path}")
-                return path
-            else:
-                logger.debug(f"❌ No project found at: {path}")
-
-        return None
+        return validate_and_discover_project_path(self.docker_orchestrator, initial_path)
 
     def _is_valid_project_directory(self, path: str) -> bool:
-        """Check if a directory contains valid project indicators."""
-        if not self.docker_orchestrator:
-            return False
+        from sag.agent.physical_survey import is_valid_project_directory
 
-        # Check if directory exists
-        result = self.docker_orchestrator.execute_command(f"test -d {path}")
-        if result.get("exit_code") != 0:
-            logger.debug(f"Directory does not exist: {path}")
-            return False
-
-        # Check for common project files
-        project_indicators = [
-            "pom.xml",  # Maven
-            "build.gradle",  # Gradle (Groovy)
-            "build.gradle.kts",  # Gradle (Kotlin)
-            "package.json",  # Node.js
-            "requirements.txt",  # Python
-            "pyproject.toml",  # Python Poetry
-            "Cargo.toml",  # Rust
-            "go.mod",  # Go
-            "CMakeLists.txt",  # CMake
-            "Makefile",  # Make
-            "composer.json",  # PHP
-            "Gemfile",  # Ruby
-        ]
-
-        for indicator in project_indicators:
-            result = self.docker_orchestrator.execute_command(f"test -f {path}/{indicator}")
-            if result.get("exit_code") == 0:
-                logger.debug(f"Found project indicator {indicator} in {path}")
-                return True
-
-        # Check for source code directories as secondary indicators
-        source_dirs = ["src", "lib", "app", "source"]
-        for src_dir in source_dirs:
-            result = self.docker_orchestrator.execute_command(f"test -d {path}/{src_dir}")
-            if result.get("exit_code") == 0:
-                # Check if it contains actual source files
-                result = self.docker_orchestrator.execute_command(
-                    f"find {path}/{src_dir} -name '*.java' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.go' -o -name '*.rs' | head -1"
-                )
-                if result.get("success") and result.get("output", "").strip():
-                    logger.debug(f"Found source files in {path}/{src_dir}")
-                    return True
-
-        return False
+        return is_valid_project_directory(self.docker_orchestrator, path)
 
     def _is_analysis_valid(self, analysis: Dict[str, Any]) -> bool:
         """Validate that the analysis produced meaningful results."""
@@ -2784,43 +2527,14 @@ OUTPUT:
 
         return True
 
-    # Build files that let the fallback pick a concrete build/test plan.
-    _FALLBACK_BUILD_MARKERS = (
-        "pom.xml",
-        "build.gradle",
-        "build.gradle.kts",
-        "settings.gradle",
-        "settings.gradle.kts",
-        "package.json",
-        "requirements.txt",
-        "pyproject.toml",
-    )
+    # Build files that let the fallback pick a concrete build/test plan
+    # (the canonical tuple lives with the surveyor).
+    _FALLBACK_BUILD_MARKERS = FALLBACK_BUILD_MARKERS
 
     def _redetect_build_files(self, project_path: str) -> List[str]:
-        """Re-scan the project root for build files.
+        from sag.agent.physical_survey import redetect_build_files
 
-        The main analysis can fail to record build files (it errored out, or it
-        only checked ``build.gradle`` and missed a Kotlin-DSL ``build.gradle.kts``
-        like apache/beam's root). Without this, the fallback treats a known
-        Maven/Gradle project as "completely unknown" and tells the agent to
-        manually explore, which can loop. Re-detecting here keeps the fallback
-        anchored to the real build system.
-        """
-        if not self.docker_orchestrator:
-            return []
-
-        found: List[str] = []
-        for marker in self._FALLBACK_BUILD_MARKERS:
-            try:
-                result = self.docker_orchestrator.execute_command(
-                    f"test -f {project_path}/{marker} && echo 'exists' || echo 'missing'"
-                )
-            except Exception as exc:  # never let detection crash the fallback
-                logger.debug(f"Build-file re-detection failed for {marker}: {exc}")
-                continue
-            if result.get("success") and "exists" in result.get("output", ""):
-                found.append(marker)
-        return found
+        return redetect_build_files(self.docker_orchestrator, project_path)
 
     def _generate_three_step_fallback_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
         """Generate three-step fallback plan for unknown project types."""
