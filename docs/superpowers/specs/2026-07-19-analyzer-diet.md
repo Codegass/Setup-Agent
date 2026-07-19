@@ -22,10 +22,10 @@ components read is written ONLY inside the agent-invoked tool).
 
 | Layer | Contents | Owner | Consumer |
 |---|---|---|---|
-| **1. Framework mechanics** | manifest (`build_requirements.json`), env-summary facts, brief projection persistence | engine-guaranteed survey (this spec, Category 1) | preflight, gates, finalizer, build tools — machines |
+| **1. Framework mechanics** | manifest (`build_requirements.json`), env-summary RAW facts | engine-guaranteed survey (this spec, Category 1) | preflight, gates, finalizer, build tools — machines |
 | **2. Physical observation** | filesystem READING: structure scan, config parsing, island enumeration, module scan | shared substrate beside the validator; two roles on top — **surveyor** (what EXISTS, pre-hoc) and **judge** (what HAPPENED, post-hoc) | both layers 1 and 3 |
 | **3. Agent tool surface** | `project(action='analyze')` returns the FACT SHEET only — cheap discovery | thin wrapper over the surveyor | the agent |
-| **4. Rendering projections** | fact sheet → intro/observation text | engine intro builder | the agent's window |
+| **4. Rendering projections** | fact sheet → intro/observation text, **brief projection** (review 2026-07-19: projections are renderings, not layer-1 facts) | engine intro builder | the agent's window |
 
 Hard rules carried over from the control-layer work:
 - The surveyor DESCRIBES, never prescribes; the judge VERDICTS, never recommends.
@@ -52,11 +52,34 @@ setup tool). Live pyyaml: agent skipped analyze → deps no-oped → run wasted.
    output). It remains the RECOMMENDED path — the guarantee is a net, not a
    replacement.
 
-**Done-bar.** Unit: empty manifest → ensure_facts computes and persists,
-returns True; second call no-ops (no analysis commands); engine intro invokes
-the guarantee and notes a framework-run survey; agent-skips-analyze replay
-shape ends with a populated manifest. Zero behavior change when the agent does
-call analyze (existing analyzer suites stay green).
+**Review 2026-07-19 outcomes (implemented).**
+- The guarantee resolves the orchestrator the constructor actually sets
+  (production-constructor test locks it; the first cut silently no-oped).
+- `ensure_facts` returns `created | present | failed`; `created` only after
+  the manifest is re-read and VERIFIED on disk — success is what the readers
+  can see, not what was attempted.
+- The survey runs BEFORE `phase_objective()` selects by build system, so a
+  skipped-analyze Python repo gets the Python objective, never the Java
+  objective beside Python guidance.
+- The manifest carries a `survey {project_path, analyzer_version}` stamp; an
+  older-version manifest re-surveys instead of serving stale facts (full
+  source-fingerprint invalidation lands with Category 2).
+
+**Declared temporary compatibility (review P2, option b).** The guarantee
+reuses the SAME full pipeline as agent-invoked analyze — including brief
+composition, whose projection the intro then renders. Splitting a facts-only
+pipeline now would create two divergent survey paths (a worse seam than the
+prescriptions themselves). The prescriptive output is therefore acknowledged
+as temporary: it is removed by Category 3's A/B gate, and its removal
+criterion is explicit — panel parity of facts-plus-feedback vs. prescriptions.
+
+**Done-bar (all covered in `tests/test_framework_survey.py`).** Production
+constructor path works; `created` requires on-disk verification; dropped
+writes → `failed` and no trace line; second call `present` with no
+re-analysis; agent-era stampless manifest counts as `present` (zero behavior
+change when the agent analyzed); stale version re-surveys; survey precedes
+objective selection (python objective asserted, java marker absent); test
+phase runs the guarantee too; broken container never raises.
 
 ## Category 2 (next): surveying moves to the physical layer
 
@@ -76,6 +99,19 @@ loops carry coordinates when it drifts.
   reads `execution_plan` from metadata.
 - Output slimming: the fact sheet replaces the plan text; rendering moves to
   the engine projection (Category 4, low priority — agreed acceptable as-is).
+
+**Category 2 done-bar.** Reading functions relocated beside the validator's
+substrate with zero call-site behavior change (suites green byte-for-byte);
+surveyor emits no `goal`/preferred-module fields; manifest gains the source
+fingerprint (config files digest) completing the staleness contract.
+
+**Category 3 done-bar.** `_generate_execution_plan` + fallback deleted with a
+grep proof of zero readers; panel A/B attached to the removal PR showing
+facts-plus-feedback ≥ prescriptions on all four probes.
+
+**Category 4 done-bar.** All rendering lives in the engine projection with
+marker-based snapshot tests; the analyzer tool result contains the fact sheet
+only.
 
 **Decision instrument, not taste:** the four-probe panel runs
 facts-plus-feedback vs. prescriptions-as-today. Parity or better → delete the

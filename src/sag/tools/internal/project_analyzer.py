@@ -38,6 +38,12 @@ def _normalize_java_version(raw) -> Optional[str]:
     return None
 
 
+# Bumped when the survey's fact semantics change: an older-version manifest is
+# re-surveyed instead of reused (review 2026-07-19: existence-as-no-op would
+# happily serve stale facts across analyzer upgrades).
+SURVEY_FACTS_VERSION = 1
+
+
 def _path_exists(orch, path: str) -> bool:
     result = orch.execute_command(f"test -e {path} && echo yes || echo no")
     return "yes" in (result.get("output") or "")
@@ -145,35 +151,51 @@ class ProjectAnalyzerTool(BaseTool):
         self.context_manager = context_manager
         self._java_annotation_cache: Dict[str, Dict[str, int]] = {}
 
-    def ensure_facts(self, project_path: str = "/workspace") -> bool:
+    def ensure_facts(self, project_path: str = "/workspace") -> str:
         """Framework-owned survey guarantee: compute + persist the machine
-        facts (manifest, trunk env metrics) WITHOUT the agent-facing output.
+        facts (manifest, trunk env metrics).
 
         Eight mechanical readers (preflight, build tools, gates, finalizer)
         depend on the manifest, but it was written only when the agent chose
         to call ``project(action='analyze')`` — live 2026-07-13 pyyaml: the
         agent skipped analyze and the install chain starved. The engine calls
         this at build/test entry; zero LLM tokens (container commands only).
-        Idempotent: an existing manifest means the survey already ran (agent
-        or framework) → no-op. Never raises.
+        Never raises.
 
-        Returns True when the survey actually ran here.
+        Returns ``"created"`` only after the manifest is VERIFIED on disk
+        (review 2026-07-19: an unconditional True let the engine claim
+        'facts persisted' over a dropped write); ``"present"`` when a current
+        survey already exists (agent- or framework-run); ``"failed"``
+        otherwise. A manifest from an older analyzer version re-runs.
         """
+        orchestrator = getattr(self, "docker_orchestrator", None) or getattr(
+            self, "orchestrator", None
+        )
+        if orchestrator is None:
+            return "failed"
         try:
             from .build_preflight import read_build_requirements
 
-            if read_build_requirements(self.orchestrator):
-                return False
+            existing = read_build_requirements(orchestrator) or {}
+            if existing:
+                survey = existing.get("survey") or {}
+                if not survey or survey.get("analyzer_version") == SURVEY_FACTS_VERSION:
+                    # no stamp = agent-era manifest (still authoritative);
+                    # matching stamp = current survey. Either way: present.
+                    return "present"
             validated = self._validate_and_discover_project_path(project_path)
             if not validated:
-                return False
+                return "failed"
             analysis = self._perform_comprehensive_analysis(validated)
             if self.context_manager and self._is_analysis_valid(analysis):
                 self._update_trunk_context_with_plan(analysis)
-            return True
+            # Success is what the READERS can see, not what we attempted.
+            if not (read_build_requirements(orchestrator) or {}):
+                return "failed"
+            return "created"
         except Exception as exc:
-            logger.warning(f"framework survey skipped: {exc}")
-            return False
+            logger.warning(f"framework survey failed: {exc}")
+            return "failed"
 
     def execute(
         self,
@@ -1887,6 +1909,10 @@ PY"""
         test_fail_at_end = fail_at_end and (rec.get("test_root") or "").rstrip("/") == root
 
         data = {
+            "survey": {
+                "project_path": project_path,
+                "analyzer_version": SURVEY_FACTS_VERSION,
+            },
             "java_version": analysis.get("java_version"),
             "java_version_source": analysis.get("java_version_source"),
             "java_version_enforced": bool(analysis.get("java_version_enforced")),

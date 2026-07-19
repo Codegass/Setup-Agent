@@ -1026,6 +1026,15 @@ class ReActEngine(UIEventEmitter):
         phase = machine.current_phase
         _, reserved, remaining = self._phase_budget_numbers(phase)
         budget = max(5, remaining - reserved)
+        # Framework survey guarantee (analyzer diet, Category 1) runs BEFORE
+        # the objective is selected: the objective depends on the detected
+        # build system, and with analyze skipped the stale env would pick the
+        # Java objective for a Python repo in the SAME intro that later
+        # renders Python guidance (review 2026-07-19 — the pyyaml false-block
+        # shape reopened). Idempotent and token-free.
+        survey_state = ""
+        if phase in ("build", "test"):
+            survey_state = self._ensure_project_facts()
         # Project-aware objective: by build/test time the analyzer has recorded
         # the detected build system on the trunk, so a Python project gets the
         # Python objective (deps -> compile, pytest) instead of the Java one.
@@ -1047,11 +1056,7 @@ class ReActEngine(UIEventEmitter):
         # forward in analyze key_results (Bigtop: compile the right reactor/module,
         # or block honestly on a meta-project — don't compile an empty root).
         if phase in ("build", "test"):
-            # Framework survey guarantee (analyzer diet, Category 1): the
-            # mechanical manifest readers must not depend on the agent having
-            # called project(analyze). Idempotent and token-free; when it
-            # actually ran here, say so in the trace.
-            if self._ensure_project_facts():
+            if survey_state == "created":
                 lines.append(
                     "(framework survey ran — project facts were computed and "
                     "persisted; the agent had not called project analyze)"
@@ -2675,13 +2680,13 @@ class ReActEngine(UIEventEmitter):
             output_cursor=output_cursor,
         )
 
-    def _ensure_project_facts(self) -> bool:
-        """Run the framework survey guarantee; True when it actually ran."""
+    def _ensure_project_facts(self) -> str:
+        """Run the framework survey guarantee: 'created'|'present'|'failed'."""
         orchestrator = getattr(
             getattr(self, "physical_validator", None), "docker_orchestrator", None
         )
         if orchestrator is None:
-            return False
+            return "failed"
         try:
             from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
@@ -2689,7 +2694,7 @@ class ReActEngine(UIEventEmitter):
             return analyzer.ensure_facts("/workspace")
         except Exception as exc:
             logger.debug(f"framework survey unavailable: {exc}")
-            return False
+            return "failed"
 
     def _native_smoke_guidance(self, phase: str) -> Optional[str]:
         """The native-not-built smoke steer for the test phase, or None.
