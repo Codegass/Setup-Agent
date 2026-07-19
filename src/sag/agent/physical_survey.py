@@ -394,7 +394,6 @@ def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
         requires_python_from_pyproject,
         requires_python_from_setup_cfg,
         requires_python_from_setup_py,
-        resolve_python_version,
         setup_cfg_test_deps,
         tox_test_hints,
     )
@@ -471,9 +470,11 @@ def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
     )
 
     return {
+        # The CONSTRAINT is the observed fact; picking a concrete version
+        # that satisfies it (from our supported list) is a policy decision
+        # and composes at the tool layer (final Category-2 review).
         "python_constraint": constraint,
         "python_constraint_source": constraint_source,
-        "python_version": resolve_python_version(constraint),
         "python_packages": discover_packages(orch, python_root),
         "has_c_extensions": has_c_extensions,
         # The directory the python package actually installs from (the repo
@@ -1270,12 +1271,10 @@ FALLBACK_BUILD_MARKERS = (
 )
 
 # The config files the survey derives its facts from — the staleness domain
-# of the survey stamp's source fingerprint. Recursive by NAME (final
-# Category-2 review P1: parent POMs, nested island build files, lockfiles
-# and wrapper markers all feed the facts — a root-only cat missed them):
-# java build files at every depth, the gradle wrapper marker, the python
-# metadata/lockfiles the installer/constraint/test-hint parsing reads, and
-# the native-core marker.
+# of the survey stamp's source fingerprint. Recursive by NAME (Category-2
+# reviews: parent POMs, nested island build files, lockfiles, wrapper
+# markers, and EVERY detection marker the structure scan keys off — Cargo,
+# Go, Make included — all feed the facts; a root-only cat missed them).
 SURVEY_FINGERPRINT_SOURCES = (
     "pom.xml",
     "build.gradle",
@@ -1293,6 +1292,18 @@ SURVEY_FINGERPRINT_SOURCES = (
     "Pipfile",
     "Pipfile.lock",
     "CMakeLists.txt",
+    "Cargo.toml",
+    "go.mod",
+    "Makefile",
+)
+
+# The module-layout dirs whose EXISTENCE (not content) the source/test scans
+# key off — a new src/main/java dir changes the island facts with no config
+# file touched, so the dir listing rides the fingerprint as text.
+_FINGERPRINT_MODULE_DIR_PATTERNS = tuple(
+    f"*/src/{kind}/{lang}"
+    for kind in ("main", "test")
+    for lang in ("java", "groovy", "scala", "kotlin")
 )
 
 # Never fingerprint build OUTPUT or vendored trees: configs copied into
@@ -1302,15 +1313,28 @@ FINGERPRINT_PRUNE_DIRS = (".git", "node_modules", ".venv", "target", "build", "d
 
 
 def config_fingerprint(orch, project_path: str) -> Optional[str]:
-    """Digest of the build-config files under ``project_path``, or None.
+    """Digest of everything the survey READS under (and beside)
+    ``project_path``, or None.
 
-    One container command: ``find`` enumerates every fingerprint source by
-    name at any depth (pruning build output), ``sort`` fixes the order, and
-    per-file ``cksum`` lines — checksum, size AND file name — collapse
-    through a final ``cksum``. Per-file digests encode what a bare
-    concatenation cannot (final Category-2 review P1): file NAMES, file
-    EXISTENCE (adding/deleting a config changes the listing), and content
-    BOUNDARIES (bytes moving between files changes the line set).
+    One container command, four file sections plus a dir section, all
+    order-fixed by sort (Category-2 reviews — the domain must cover every
+    input a surveyed fact derives from):
+
+    * every fingerprint source by name at any depth (pruning build output);
+    * READMEs to depth 2 (the documentation analysis reads root READMEs and
+      docs/README.md — documented commands and the java requirement are
+      surveyed facts);
+    * pom.xml files one level OUTSIDE the root (the maven analysis probes
+      ``{root}/../{parent_artifact}/pom.xml`` for parent-POM properties);
+    * test sources (java/groovy/scala/kotlin under src/test — the
+      annotation counts on the trunk derive from their content);
+    * the module-layout dir LISTING as text (source/test scans key off dir
+      existence: a new src/main/java changes island facts with no file
+      content change).
+
+    Per-file ``cksum`` lines — checksum, size AND file name — collapse with
+    the dir listing through a final ``cksum``: names, existence, and content
+    boundaries are all encoded, which a bare concatenation cannot do.
 
     Returns None when the probe is unavailable — callers must treat None as
     CANNOT COMPARE, never as a mismatch, or a flaky container would thrash
@@ -1320,10 +1344,19 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
         return None
     prunes = " -o ".join(f"-name {d}" for d in FINGERPRINT_PRUNE_DIRS)
     names = " -o ".join(f"-name '{n}'" for n in SURVEY_FINGERPRINT_SOURCES)
+    module_dirs = " -o ".join(f"-path '{p}'" for p in _FINGERPRINT_MODULE_DIR_PATTERNS)
+    test_dirs = " -o ".join(
+        f"-path '*/src/test/{lang}/*'" for lang in ("java", "groovy", "scala", "kotlin")
+    )
     command = (
-        f"cd {project_path} && find . \\( {prunes} \\) -prune -o "
-        f"-type f \\( {names} \\) -print 2>/dev/null | sort | "
-        f"xargs -r cksum 2>/dev/null | cksum"
+        f"cd {project_path} && {{ "
+        f"{{ find . \\( {prunes} \\) -prune -o -type f \\( {names} \\) -print ; "
+        f"find . -maxdepth 2 -type f -name 'README*' -print ; "
+        f"find .. -maxdepth 2 -type f -name pom.xml -print ; "
+        f"find . \\( {prunes} \\) -prune -o -type f \\( {test_dirs} \\) -print ; }} "
+        f"| sort -u | xargs -r cksum ; "
+        f"find . \\( {prunes} \\) -prune -o -type d \\( {module_dirs} \\) -print | sort ; "
+        f"}} 2>/dev/null | cksum"
     )
     try:
         result = orch.execute_command(command)

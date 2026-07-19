@@ -40,7 +40,12 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # too — the fast path requires fingerprint agreement on BOTH persisted ends
 # (final Category-2 review: a failed trunk save after a config edit left an
 # old-fingerprint trunk that still matched on version+path alone).
-SURVEY_FACTS_VERSION = 3
+# v4: the fingerprint domain covers EVERYTHING the survey reads (Cargo/Go/
+# Make markers, READMEs, outside-root parent POMs, test sources, the
+# module-dir layout), and 'created' verifies THIS survey's fingerprint on
+# the re-read manifest — version+path cannot distinguish two surveys of the
+# same project, so a dropped rewrite after a config edit passed as created.
+SURVEY_FACTS_VERSION = 4
 
 
 class ProjectAnalyzerTool(BaseTool):
@@ -70,9 +75,11 @@ class ProjectAnalyzerTool(BaseTool):
         Never raises.
 
         Returns ``"created"`` only after (a) the trunk env metrics saved and
-        (b) the re-read manifest carries THIS survey's stamp (version AND
-        project path — a stale file left on disk keeps the readback non-empty
-        when a replacement write is dropped); ``"present"`` for an agent-era
+        (b) the re-read manifest carries THIS survey's stamp (version,
+        project path AND this survey's config fingerprint — a stale file
+        left on disk keeps the readback non-empty when a replacement write
+        is dropped, and version+path alone cannot tell two surveys of the
+        same project apart); ``"present"`` for an agent-era
         stampless manifest, or a current same-project stamp on BOTH persisted
         ends (manifest and trunk env-summary — they fail independently, and a
         manifest-only partial survey must retry the trunk save, not skip it);
@@ -133,7 +140,14 @@ class ProjectAnalyzerTool(BaseTool):
             if (
                 persisted.get("analyzer_version") != SURVEY_FACTS_VERSION
                 or persisted.get("project_path") != validated
+                or persisted.get("config_fingerprint") != analysis.get("config_fingerprint")
             ):
+                # The fingerprint term is what catches a dropped rewrite after
+                # a CONFIG EDIT: the old manifest matches on version+path (same
+                # project, same analyzer), and only THIS survey's fingerprint
+                # tells the readback apart (final Category-2 review P1). Both
+                # None (probe down) is equality — a non-None mismatch in either
+                # direction means the readback is not this survey's write.
                 return "failed"
             return "created"
         except Exception as exc:
@@ -445,14 +459,17 @@ class ProjectAnalyzerTool(BaseTool):
         editable pip rungs install the extras the project ACTUALLY declares —
         the surveyed metadata contents feed the ladder.
         """
-        from .python_env import detect_installer
+        from .python_env import detect_installer, resolve_python_version
 
         installer = detect_installer(meta["files_present"], meta["metadata_contents"])
         python_root = meta["python_root"]
         analysis["python_config"] = {
             "python_constraint": meta["python_constraint"],
             "python_constraint_source": meta["python_constraint_source"],
-            "python_version": meta["python_version"],
+            # The constraint is the surveyed fact; the concrete version that
+            # satisfies it (newest from OUR supported list) is a policy pick
+            # made here at the tool layer (final Category-2 review).
+            "python_version": resolve_python_version(meta["python_constraint"]),
             "python_installer": installer["installer"],
             "python_install_commands": installer["commands"],
             "python_install_source": installer["source"],

@@ -269,15 +269,17 @@ def test_trunk_persistence_failure_means_failed():
     assert tool.ensure_facts("/workspace/proj") == "failed"
 
 
-def test_fingerprint_command_covers_nested_and_lock_sources():
-    """Category-2 review P1: a root-only concatenation missed parent POMs,
-    nested island build files, lockfiles and wrapper markers, and encoded
-    neither file names nor boundaries. The probe must enumerate recursively
-    by name with per-file digests, pruning build output."""
+def test_fingerprint_command_covers_everything_the_survey_reads():
+    """Category-2 review P1s: a root-only concatenation missed parent POMs,
+    nested island build files, lockfiles and wrapper markers; the second
+    round added the remaining survey inputs — detection markers (Cargo, Go,
+    Make), READMEs, outside-root parent POMs, test sources, and the
+    module-dir layout. The probe must enumerate recursively by name with
+    per-file digests, pruning build output."""
     orch = SurveyOrch()
     ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj")
     cmd = next(c for c in orch.commands if "| cksum" in c)
-    assert cmd.strip().startswith("cd /workspace/proj && find ")
+    assert cmd.strip().startswith("cd /workspace/proj && ")
     for source in (
         "pom.xml",
         "settings.gradle",
@@ -286,13 +288,37 @@ def test_fingerprint_command_covers_nested_and_lock_sources():
         "poetry.lock",
         "Pipfile.lock",
         "CMakeLists.txt",
+        "Cargo.toml",
+        "go.mod",
+        "Makefile",
+        "README*",
     ):
         assert source in cmd
     for pruned in ("target", ".git", "node_modules"):
         assert pruned in cmd
+    # Outside-root parent POMs (the maven analysis probes ../<artifact>/pom.xml).
+    assert "find .. -maxdepth 2 -type f -name pom.xml" in cmd
+    # Test sources: the trunk's annotation counts derive from their content.
+    assert "*/src/test/java/*" in cmd
+    # Module-layout dirs ride as a listing: existence changes island facts.
+    assert "-type d" in cmd and "*/src/main/java" in cmd
     # Per-file cksum lines (name + size + checksum) feed the final cksum:
     # names, existence, and content boundaries are all encoded.
     assert "xargs -r cksum" in cmd and cmd.rstrip().endswith("| cksum")
+
+
+def test_config_edit_with_dropped_rewrite_is_failed_not_created():
+    """Final Category-2 review P1: after a config edit forces a re-survey,
+    a DROPPED manifest rewrite leaves the old manifest on disk — it matches
+    on version+path (same project, same analyzer), and only THIS survey's
+    fingerprint tells the readback apart. 'created' must verify it."""
+    orch = SurveyOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"  # S1 lands
+
+    orch.config_seed = "pyproject-v2-edited"
+    orch.drop_manifest_writes = True  # S2's rewrite is dropped
+    assert tool.ensure_facts("/workspace/proj") == "failed"  # NOT 'created'
 
 
 # ---- Integration: agent-skips-analyze, NO monkeypatching (re-review P2) ----

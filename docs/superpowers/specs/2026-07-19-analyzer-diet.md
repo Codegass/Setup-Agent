@@ -164,6 +164,24 @@ is unchanged.
   reading — post-hoc evidence) deleted with zero callers (grep proof in the
   commit).
 
+**Second-round review outcomes (2026-07-19, all three fixed).**
+- P1 `created` verifies THIS survey's fingerprint on the re-read manifest —
+  version+path cannot tell two surveys of the same project apart, so a
+  dropped rewrite after a config edit passed as `created` over the old
+  facts. Both-None (probe down) is equality; a non-None mismatch in either
+  direction means the readback is not this survey's write.
+- P1 fingerprint domain now covers EVERYTHING the survey reads: detection
+  markers (`Cargo.toml`, `go.mod`, `Makefile`), READMEs to depth 2 (the
+  documentation facts derive from them), outside-root parent POMs
+  (`find .. -maxdepth 2 -name pom.xml`, mirroring the maven analysis's
+  probe), test sources under `src/test` (the trunk's annotation counts),
+  and the module-layout dir LISTING (source/test scans key off dir
+  existence). `SURVEY_FACTS_VERSION` 3→4.
+- P2 `resolve_python_version` moved to the analyzer: the CONSTRAINT is the
+  observed fact; picking the newest satisfying version from our supported
+  list is policy and composes in `_compose_python_config` at the tool
+  layer.
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -176,11 +194,11 @@ is unchanged.
 the validator's substrate with zero call-site behavior change (full suite at
 zero new failures after every slice); surveyor emits no `goal`/
 preferred-module fields (slice 5); manifest gains the source fingerprint
-completing the staleness contract (slice 6 + review fixes;
-`tests/test_framework_survey.py` 18 tests — config edit re-surveys,
+completing the staleness contract (slice 6 + two review rounds;
+`tests/test_framework_survey.py` 19 tests — config edit re-surveys,
 unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
-via both-ends fingerprint agreement, probe command covers nested/lock
-sources).
+via both-ends fingerprint agreement, config-edit-plus-dropped-rewrite is
+`failed` not `created`, probe command covers everything the survey reads).
 
 **Category 3 done-bar.** `_generate_execution_plan` + fallback deleted with a
 grep proof of zero readers; panel A/B attached to the removal PR showing
