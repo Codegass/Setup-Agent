@@ -533,6 +533,51 @@ def _declared_package_dir(orchestrator, root: str) -> Optional[str]:
     return None
 
 
+def _package_layout_scan(orchestrator, root: str):
+    """The ordered ``(base, raw find lines)`` scan that BOTH package
+    discovery and the survey fingerprint consume — ONE set of bases
+    (declared package_dir first, then src-layout, then flat) and ONE find
+    predicate (maxdepth 2 from each base, hidden dirs excluded, symlinks
+    accepted, no build-output pruning). Category-2 review: a hand-mirrored
+    find in the fingerprint drifted from discovery on declared-package_dir
+    depth, symlinks, and pruning — sharing the machinery makes the fact and
+    its staleness domain inseparable.
+
+    Lazy: ``discover_packages`` stops at the first base with packages,
+    preserving its historical command sequence; the fingerprint drains it.
+    """
+    bases = [f"{root}/src", root]
+    mapped = _declared_package_dir(orchestrator, root)
+    if mapped:
+        mapped_base = f"{root}/{mapped}"
+        if mapped_base in bases:
+            bases.remove(mapped_base)
+        bases.insert(0, mapped_base)
+    for base in bases:
+        result = orchestrator.execute_command(
+            f"find {base} -maxdepth 2 -name __init__.py -not -path '*/.*' 2>/dev/null"
+        )
+        lines = [
+            line.strip() for line in (result.get("output") or "").splitlines() if line.strip()
+        ]
+        yield base, lines
+
+
+def package_layout_listing(orchestrator, project_dir: str) -> List[str]:
+    """Every ``__init__.py`` path the package-discovery fact can derive
+    from, across ALL bases, each tagged with its base. Discovery stops at
+    the first productive base, but WHICH base is productive can change — so
+    the staleness domain is the union of every base's listing."""
+    root = project_dir.rstrip("/")
+    listing: List[str] = []
+    for base, lines in _package_layout_scan(orchestrator, root):
+        for line in lines:
+            entry = f"{base}::{line}"
+            if entry not in listing:
+                listing.append(entry)
+    return listing
+
+
 def discover_packages(orchestrator, project_dir: str) -> List[str]:
     """Top-level import packages: the project's declared package_dir mapping
     (``package_dir={'': 'lib'}`` — pyyaml-style layouts) first, then
@@ -552,20 +597,9 @@ def discover_packages(orchestrator, project_dir: str) -> List[str]:
     import-probed, and a junk dir kept here still cannot block. src-layout
     and package_dir bases are never ranked."""
     root = project_dir.rstrip("/")
-    bases = [f"{root}/src", root]
-    mapped = _declared_package_dir(orchestrator, root)
-    if mapped:
-        mapped_base = f"{root}/{mapped}"
-        if mapped_base in bases:
-            bases.remove(mapped_base)
-        bases.insert(0, mapped_base)
-    for base in bases:
-        result = orchestrator.execute_command(
-            f"find {base} -maxdepth 2 -name __init__.py -not -path '*/.*' 2>/dev/null"
-        )
+    for base, lines in _package_layout_scan(orchestrator, root):
         packages = []
-        for line in (result.get("output") or "").splitlines():
-            line = line.strip()
+        for line in lines:
             if not line.endswith("/__init__.py"):
                 continue
             parent, _, name = line[: -len("/__init__.py")].rpartition("/")

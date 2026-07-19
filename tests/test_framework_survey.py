@@ -25,8 +25,10 @@ class SurveyOrch:
         self.commands = []
         self.manifest_writes = 0
         self.drop_manifest_writes = drop_manifest_writes
-        # The fingerprint probe digests config content AND the package
-        # layout; tests mutate either to simulate an edit vs. a rename.
+        # The container probe digests config content (seed below); the
+        # package layout reaches the fingerprint through the REAL shared
+        # discovery scan — this fake answers those find probes from
+        # package_layout, so a rename exercises the actual machinery.
         self.config_seed = "pyproject-v1"
         self.package_layout = ("alpha_pkg",)
 
@@ -35,9 +37,12 @@ class SurveyOrch:
         if "| cksum" in command:
             if not self.config_seed:  # empty seed simulates a broken probe
                 return {"success": False, "exit_code": 1, "output": ""}
-            seed = self.config_seed + "|" + "|".join(self.package_layout)
-            digest = sum(map(ord, seed))
-            return {"success": True, "exit_code": 0, "output": f"{digest} {len(seed)}"}
+            digest = sum(map(ord, self.config_seed))
+            return {"success": True, "exit_code": 0, "output": f"{digest} {len(self.config_seed)}"}
+        if "-name __init__.py" in command:
+            base = command.split("find ", 1)[1].split(" ", 1)[0]
+            paths = [f"{base}/{pkg}/__init__.py" for pkg in self.package_layout]
+            return {"success": True, "exit_code": 0, "output": "\n".join(paths)}
         if "<<" in command and REQUIREMENTS_PATH in command:
             self.manifest_writes += 1
             if not self.drop_manifest_writes:
@@ -87,10 +92,11 @@ def test_present_when_manifest_exists_and_no_reanalysis_happens():
     writes_before = orch.manifest_writes
     before = len(orch.commands)
     assert tool.ensure_facts("/workspace/proj") == "present"
-    # The identity check (re-review P2: stamp must match THIS project) costs a
-    # few discovery probes — but present must never re-analyze or re-write.
+    # The fast path re-verifies identity AND the full staleness domain
+    # (container digest + the shared package-layout scan) — bounded probes,
+    # but it must never re-analyze or re-write.
     assert orch.manifest_writes == writes_before
-    assert len(orch.commands) - before <= 12
+    assert len(orch.commands) - before <= 30
 
 
 def test_agent_written_manifest_without_stamp_counts_as_present():
@@ -304,6 +310,9 @@ def test_fingerprint_command_covers_everything_the_survey_reads():
     assert "*/src/test/java/*" in cmd
     # Module-layout dirs ride as a listing: existence changes island facts.
     assert "-type d" in cmd and "*/src/main/java" in cmd
+    # The python package layout does NOT ride this command: it flows through
+    # discovery's own shared scan (asserted in the rename tests).
+    assert "__init__.py" not in cmd
     # Per-file cksum lines (name + size + checksum) feed the final cksum:
     # names, existence, and content boundaries are all encoded.
     assert "xargs -r cksum" in cmd and cmd.rstrip().endswith("| cksum")
@@ -323,9 +332,61 @@ def test_package_rename_with_unchanged_config_resurveys():
     assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
     assert orch.manifest_writes == 2  # fresh facts, not the stale manifest
 
-    # The probe really sweeps the layout: __init__.py paths ride the command.
-    cmd = next(c for c in orch.commands if "| cksum" in c)
-    assert "-name __init__.py" in cmd
+    # The layout reaches the fingerprint through the SAME find predicate
+    # discovery uses: per-base maxdepth 2, hidden dirs excluded, symlinks
+    # accepted (no -type f), no build-output pruning (final review: a
+    # hand-mirrored find drifted from discovery on exactly these).
+    layout_probes = [c for c in orch.commands if "-name __init__.py" in c]
+    assert layout_probes
+    for probe in layout_probes:
+        assert "-maxdepth 2" in probe
+        assert "-not -path '*/.*'" in probe
+        assert "-type f" not in probe
+        assert "-prune" not in probe
+
+
+def test_deep_declared_package_dir_rename_resurveys():
+    """Final Category-2 review P1 (isomorph): discover_packages accepts an
+    ARBITRARY-depth declared package_dir — package-dir {'': 'lib/generated/
+    python'} puts alpha_pkg/__init__.py at depth 5, beyond the old
+    fixed-maxdepth mirror scan. The fingerprint shares discovery's own scan,
+    so a rename at that depth (zero config change) must re-survey and the
+    manifest must carry the NEW package name."""
+    deep_pyproject = (
+        '[project]\nname = "proj"\nrequires-python = ">=3.9"\n\n'
+        '[tool.setuptools.package-dir]\n"" = "lib/generated/python"\n'
+    )
+
+    class DeepLayoutOrch(SurveyOrch):
+        def __init__(self):
+            super().__init__()
+            self.deep_pkg = "alpha_pkg"
+
+        def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+            if "-name __init__.py" in command:
+                self.commands.append(command)
+                base = command.split("find ", 1)[1].split(" ", 1)[0]
+                if base == "/workspace/proj/lib/generated/python":
+                    return {
+                        "success": True,
+                        "exit_code": 0,
+                        "output": f"{base}/{self.deep_pkg}/__init__.py",
+                    }
+                return {"success": True, "exit_code": 0, "output": ""}
+            if command.startswith("cat /workspace/proj/pyproject.toml"):
+                self.commands.append(command)
+                return {"success": True, "exit_code": 0, "output": deep_pyproject}
+            return super().execute_command(command, workdir=workdir, timeout=timeout, **kwargs)
+
+    orch = DeepLayoutOrch()
+    tool = ProjectAnalyzerTool(orch)
+    assert tool.ensure_facts("/workspace/proj") == "created"
+    assert '"alpha_pkg"' in orch.files[REQUIREMENTS_PATH]  # the deep fact landed
+
+    orch.deep_pkg = "beta_pkg"  # rename at depth 5; NO config change
+    assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
+    assert '"beta_pkg"' in orch.files[REQUIREMENTS_PATH]
+    assert '"alpha_pkg"' not in orch.files[REQUIREMENTS_PATH]
 
 
 def test_config_edit_with_dropped_rewrite_is_failed_not_created():

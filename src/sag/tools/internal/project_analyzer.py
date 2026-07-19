@@ -48,7 +48,10 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # v5: the python package LAYOUT (__init__.py paths) joins the fingerprint —
 # python_packages derives from those paths and rides the manifest into the
 # validator; a package rename with unchanged config served stale names.
-SURVEY_FACTS_VERSION = 5
+# v6: the layout section shares discover_packages' OWN scan machinery
+# (arbitrary-depth declared package_dir, symlinks, no pruning) instead of a
+# hand-mirrored fixed-depth find that drifted from it.
+SURVEY_FACTS_VERSION = 6
 
 
 class ProjectAnalyzerTool(BaseTool):

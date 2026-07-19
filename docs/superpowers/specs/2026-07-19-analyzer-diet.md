@@ -192,6 +192,25 @@ is unchanged.
   listing. `SURVEY_FACTS_VERSION` 4→5; behavior test: rename with unchanged
   config re-surveys, never `present`.
 
+**Fourth-round review outcome (2026-07-19, fixed).**
+- P1 isomorph: the fixed-maxdepth `__init__.py` mirror missed an
+  ARBITRARY-depth declared `package_dir` (e.g. `{'': 'lib/generated/
+  python'}` → depth 5), and its predicates drifted from discovery's
+  (`-type f` rejected symlinks discovery accepts; prunes hid dirs discovery
+  scans). Root fix, per the reviewer's suggestion: the layout section now
+  CONSUMES discovery's own machinery — `python_env._package_layout_scan`
+  (one set of bases, one find predicate; lazy, so `discover_packages`
+  keeps its historical command sequence) with `package_layout_listing`
+  draining all bases for the staleness union, rooted at the surveyed
+  python root and folded into the digest locally. The fact and its
+  staleness domain are now inseparable by construction.
+  `SURVEY_FACTS_VERSION` 5→6. The fixture no longer hand-mixes layout into
+  the digest: the fake answers the REAL find probes, the rename tests
+  assert discovery's exact predicate shape (maxdepth 2 per base, hidden
+  dirs excluded, no `-type f`, no prunes), and a deep-package_dir
+  regression drives rename-at-depth-5 end-to-end (manifest carries
+  `beta_pkg`, old name gone).
+
 ## Category 3 (behind A/B): prescriptions and dead weight
 
 - `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
@@ -205,7 +224,7 @@ the validator's substrate with zero call-site behavior change (full suite at
 zero new failures after every slice); surveyor emits no `goal`/
 preferred-module fields (slice 5); manifest gains the source fingerprint
 completing the staleness contract (slice 6 + two review rounds;
-`tests/test_framework_survey.py` 20 tests — config edit re-surveys,
+`tests/test_framework_survey.py` 21 tests — config edit re-surveys,
 unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
 via both-ends fingerprint agreement, config-edit-plus-dropped-rewrite is
 `failed` not `created`, probe command covers everything the survey reads).

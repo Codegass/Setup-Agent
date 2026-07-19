@@ -19,6 +19,7 @@ recommendations) stays at the tool layer until Category 3's A/B gate.
 from __future__ import annotations
 
 import re
+import zlib
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -1331,12 +1332,15 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
     * the module-layout dir LISTING as text (source/test scans key off dir
       existence: a new src/main/java changes island facts with no file
       content change);
-    * the python package LAYOUT as text — ``__init__.py`` paths to depth 4,
-      covering every base ``discover_packages`` scans (root, ``src/``, a
-      declared ``package_dir``, and the native-core ``python/`` shapes).
+    * the python package LAYOUT — via the SAME scan machinery
+      ``discover_packages`` uses (``python_env.package_layout_listing``:
+      identical bases including an arbitrary-depth declared package_dir,
+      identical find predicate — symlinks accepted, no pruning), rooted at
+      the surveyed python root and folded into the digest locally.
       ``python_packages`` derives from these PATHS: renaming ``alpha_pkg``
       to ``beta_pkg`` changes the manifest fact with zero config change
-      (final Category-2 review P1).
+      (Category-2 reviews; the first cut hand-mirrored the find and drifted
+      on depth, symlinks, and pruning).
 
     Per-file ``cksum`` lines — checksum, size AND file name — collapse with
     the dir listing through a final ``cksum``: names, existence, and content
@@ -1362,18 +1366,45 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
         f"find . \\( {prunes} \\) -prune -o -type f \\( {test_dirs} \\) -print ; }} "
         f"| sort -u | xargs -r cksum ; "
         f"find . \\( {prunes} \\) -prune -o -type d \\( {module_dirs} \\) -print | sort ; "
-        f"find . -maxdepth 4 \\( {prunes} \\) -prune -o "
-        f"-type f -name __init__.py -not -path '*/.*' -print | sort ; "
         f"}} 2>/dev/null | cksum"
     )
     try:
         result = orch.execute_command(command)
+        if not result.get("success"):
+            return None
+        container = (result.get("output") or "").strip()
+        if not container:
+            return None
+        # Python package layout: the SAME bases and find predicates package
+        # discovery uses — shared machinery, never a hand-mirrored find
+        # (Category-2 review: the mirror drifted on declared-package_dir
+        # depth, symlink acceptance, and pruning). The listing is folded
+        # locally: the fact derives from paths, not file content.
+        from sag.tools.internal.python_env import package_layout_listing
+
+        layout = package_layout_listing(orch, _surveyed_python_root(orch, project_path))
+        layout_digest = zlib.crc32("\n".join(layout).encode("utf-8", "replace"))
+        return f"{container} L{layout_digest}"
     except Exception as exc:
         logger.debug(f"config fingerprint unavailable: {exc}")
         return None
-    if not result.get("success"):
-        return None
-    return (result.get("output") or "").strip() or None
+
+
+def _surveyed_python_root(orch, project_path: str) -> str:
+    """The python root the survey's package fact is scanned from — the same
+    ``detect_python_package_root`` chain ``read_python_metadata`` walks
+    (plain repo: the root itself; native-core: the python/ subdir)."""
+    listing = orch.execute_command(f"ls -1 {project_path} 2>/dev/null")
+    root_files = {
+        line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
+    }
+    root_pyproject = ""
+    if "pyproject.toml" in root_files:
+        result = orch.execute_command(f"cat {project_path}/pyproject.toml", truncate_output=False)
+        root_pyproject = result.get("output", "") if result.get("success") else ""
+    return detect_python_package_root(orch, project_path, root_files, root_pyproject)[
+        "python_root"
+    ]
 
 
 def redetect_build_files(orch, project_path: str) -> List[str]:
