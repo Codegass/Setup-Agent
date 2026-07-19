@@ -166,7 +166,9 @@ class ProjectAnalyzerTool(BaseTool):
         (b) the re-read manifest carries THIS survey's stamp (version AND
         project path — a stale file left on disk keeps the readback non-empty
         when a replacement write is dropped); ``"present"`` for an agent-era
-        stampless manifest or a current-version same-project stamp;
+        stampless manifest, or a current same-project stamp on BOTH persisted
+        ends (manifest and trunk env-summary — they fail independently, and a
+        manifest-only partial survey must retry the trunk save, not skip it);
         ``"failed"`` otherwise. Older-version or other-project stamps
         re-survey.
         """
@@ -191,10 +193,13 @@ class ProjectAnalyzerTool(BaseTool):
             if (
                 existing_stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
                 and existing_stamp.get("project_path") == validated
+                and self._trunk_survey_current(validated)
             ):
-                # Current survey for THIS project (re-review 2026-07-19: a
-                # same-version manifest from another workspace project must
-                # not pass as present).
+                # Current survey for THIS project, on BOTH persisted ends
+                # (re-review 2026-07-19: a same-version manifest from another
+                # workspace project must not pass; final review: a failed
+                # trunk save left a current-stamp manifest behind, and this
+                # fast path then skipped the env-summary retry forever).
                 return "present"
 
             analysis = self._perform_comprehensive_analysis(validated)
@@ -221,6 +226,23 @@ class ProjectAnalyzerTool(BaseTool):
         except Exception as exc:
             logger.warning(f"framework survey failed: {exc}")
             return "failed"
+
+    def _trunk_survey_current(self, validated: str) -> bool:
+        """Whether the trunk env-summary carries THIS survey's stamp.
+
+        The manifest and the env-summary are persisted by different stores
+        that fail independently; the fast path may only skip the survey when
+        both ends match. A load failure propagates to ``ensure_facts``'s
+        handler ('failed') — the guarantee is manifest AND trunk metrics.
+        """
+        if self.context_manager is None:
+            return True  # no trunk store in play — nothing to keep in sync
+        trunk = self.context_manager.load_trunk_context()
+        stamp = ((getattr(trunk, "environment_summary", None) or {}).get("survey")) or {}
+        return (
+            stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
+            and stamp.get("project_path") == validated
+        )
 
     def execute(
         self,
@@ -2354,8 +2376,15 @@ PY"""
             # This ensures we don't lose test counts if the execution plan is rejected
             self._record_environment_metrics(trunk_context, analysis)
 
-            # Save the metrics immediately in case we return early
-            self.context_manager._save_trunk_context(trunk_context)
+            # Save the metrics immediately in case we return early. The trunk
+            # survey stamp asserts THESE metrics are PERSISTED — if the save
+            # fails, strip it from the (possibly cached) in-memory trunk, or a
+            # later fast path would trust an env-summary that never landed.
+            try:
+                self.context_manager._save_trunk_context(trunk_context)
+            except Exception:
+                (trunk_context.environment_summary or {}).pop("survey", None)
+                raise
 
             # Stage-2 phase machine (spec §3.1): a phase trunk (phase_<name>
             # task ids) is owned by the engine — the analyzer's execution plan
@@ -2468,6 +2497,16 @@ PY"""
         )
         if not incoming_unknown:
             trunk_context.environment_summary["build_system"] = analysis.get("build_system")
+
+        # Mirror the manifest's survey stamp on the trunk end: the fast path
+        # in ensure_facts requires the CURRENT stamp on BOTH persisted stores
+        # before it may skip the survey (final review 2026-07-19).
+        survey_path = analysis.get("project_path")
+        if survey_path:
+            trunk_context.environment_summary["survey"] = {
+                "project_path": survey_path,
+                "analyzer_version": SURVEY_FACTS_VERSION,
+            }
 
         build_recommendation = analysis.get("build_recommendation")
         if build_recommendation:

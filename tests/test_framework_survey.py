@@ -72,7 +72,7 @@ def test_created_requires_the_manifest_verified_on_disk():
 
 def test_present_when_manifest_exists_and_no_reanalysis_happens():
     orch = SurveyOrch()
-    tool = ProjectAnalyzerTool(orch)
+    tool = ProjectAnalyzerTool(orch, IntegrationCM())  # both persisted ends in play
     assert tool.ensure_facts("/workspace/proj") == "created"
     writes_before = orch.manifest_writes
     before = len(orch.commands)
@@ -182,6 +182,41 @@ def test_same_version_manifest_for_another_project_resurveys():
     )
     assert ProjectAnalyzerTool(orch).ensure_facts("/workspace/proj") == "created"
     assert '"/workspace/proj"' in orch.files[REQUIREMENTS_PATH]
+
+
+def test_failed_trunk_save_retries_and_recovers_on_the_next_call():
+    """Final review P1: the failed first call leaves a CURRENT-stamp manifest
+    behind (the manifest write precedes the trunk save), so the second call
+    hit the fast path and returned 'present' — the env-summary was never
+    retried and the objective could stay wrong for the whole run. The fast
+    path must require the stamp on BOTH persisted ends."""
+
+    class FlakyCM(IntegrationCM):
+        def __init__(self):
+            super().__init__()
+            self.fail_next_save = True
+
+        def _save_trunk_context(self, trunk):
+            if self.fail_next_save:
+                self.fail_next_save = False
+                raise RuntimeError("context store briefly unavailable")
+            super()._save_trunk_context(trunk)
+
+    orch = SurveyOrch()
+    cm = FlakyCM()
+    tool = ProjectAnalyzerTool(orch, cm)
+
+    assert tool.ensure_facts("/workspace/proj") == "failed"
+    # The manifest DID land with a current stamp — the exact bug precondition.
+    assert REQUIREMENTS_PATH in orch.files
+    # The unsaved stamp must not linger on the cached in-memory trunk, or the
+    # both-ends check would trust an env-summary that never landed.
+    assert cm.trunk.environment_summary.get("survey") is None
+
+    assert tool.ensure_facts("/workspace/proj") == "created"  # NOT 'present'
+    assert orch.manifest_writes == 2  # a real re-survey, not a fast path
+    assert cm.saves >= 1
+    assert cm.trunk.environment_summary["survey"]["project_path"] == "/workspace/proj"
 
 
 def test_trunk_persistence_failure_means_failed():

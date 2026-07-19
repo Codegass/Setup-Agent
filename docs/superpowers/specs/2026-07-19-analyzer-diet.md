@@ -45,11 +45,17 @@ setup tool). Live pyyaml: agent skipped analyze → deps no-oped → run wasted.
 1. `ProjectAnalyzerTool.ensure_facts(project_path)` runs the SAME survey
    pipeline as agent-invoked analyze (including brief composition — the
    declared temporary compatibility below) minus the tool-result text.
-   Fast path: an agent-era stampless manifest, or a stamp matching BOTH the
-   current `analyzer_version` AND this project's validated path, is
-   `present`; older-version or other-project stamps re-survey. `created`
-   requires (a) a valid analysis, (b) the trunk env metrics SAVED, and
-   (c) the re-read manifest carrying this survey's stamp. Never raises.
+   Fast path: an agent-era stampless manifest is `present`; a stamped
+   manifest is `present` only when the current stamp (`analyzer_version` AND
+   this project's validated path) matches on BOTH persisted ends — manifest
+   and trunk env-summary. The two stores fail independently: a failed trunk
+   save leaves a current-stamp manifest behind, and a manifest-only fast path
+   would skip the env-summary retry forever (final review 2026-07-19).
+   Older-version or other-project stamps re-survey. `created` requires (a) a
+   valid analysis, (b) the trunk env metrics SAVED (a save failure also
+   strips the stamp from the in-memory trunk, so a caching store cannot
+   serve an unsaved stamp), and (c) the re-read manifest carrying this
+   survey's stamp. Never raises.
 2. Engine hook: the guarantee runs at build/test intro BEFORE
    `phase_objective()` selects by build system; the trace line renders only
    on `created`.
@@ -77,11 +83,14 @@ prescriptions themselves). The prescriptive output is therefore acknowledged
 as temporary: it is removed by Category 3's A/B gate, and its removal
 criterion is explicit — panel parity of facts-plus-feedback vs. prescriptions.
 
-**Done-bar (`tests/test_framework_survey.py`, 13 tests: 12 unit + 1
+**Done-bar (`tests/test_framework_survey.py`, 14 tests: 13 unit + 1
 UNMOCKED integration).** Unit: production constructor path; `created`
 requires the re-read stamp (version + project path) — a stale file over a
-dropped rewrite is `failed`; trunk-save failure is `failed`; `present` never
-re-analyzes or re-writes; agent-era stampless manifest is `present`;
+dropped rewrite is `failed`; trunk-save failure is `failed` AND the next
+call re-surveys to `created` (fail-then-recover: the fast path requires the
+stamp on both persisted ends, so a manifest-only partial survey retries the
+trunk save); `present` (with both ends stamped) never re-analyzes or
+re-writes; agent-era stampless manifest is `present`;
 same-version other-project stamp re-surveys; survey precedes objective
 selection; test phase runs the guarantee; broken container never raises.
 Integration (no monkeypatch): a skipped-analyze run reaches the build intro,
