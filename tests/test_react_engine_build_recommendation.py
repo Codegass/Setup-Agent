@@ -1,5 +1,6 @@
-"""ReActEngine surfaces the analyzer's build recommendation in the build/test
-intro, read from the trunk environment_summary (best-effort)."""
+"""ReActEngine surfaces the analyzer's build/test coordinates (facts only —
+system + where) in the build/test intro, read from the trunk
+environment_summary (best-effort)."""
 
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ def _engine_with_recommendation(rec):
     return engine
 
 
-def test_recommended_build_line_renders_target_and_goal():
+def test_recommended_build_line_renders_coordinates():
     engine = _engine_with_recommendation(
         {
             "build_system": "maven",
@@ -30,17 +31,19 @@ def test_recommended_build_line_renders_target_and_goal():
         }
     )
     line = engine._recommended_build_line()
-    assert "maven 'install'" in line
-    assert "/workspace/bigtop" in line
+    assert line == "Build coordinates: maven at /workspace/bigtop."
+    # facts only — no goal/rationale action wording.
+    assert "'install'" not in line
 
 
-def test_recommended_build_line_directs_block_for_meta_project():
+def test_recommended_build_line_for_aggregator_only_renders_no_target_coordinates():
     engine = _engine_with_recommendation(
         {"is_aggregator_only": True, "rationale": "No Java compile target."}
     )
     line = engine._recommended_build_line()
-    assert "NONE" in line
-    assert "blocked" in line.lower()
+    assert "no standard compile target" in line
+    assert "NONE" not in line
+    assert "blocked" not in line.lower()
 
 
 def test_recommended_build_line_absent_returns_none():
@@ -57,6 +60,7 @@ def test_test_phase_line_points_at_separate_test_target():
         }
     )
     line = engine._recommended_build_line("test")
+    assert line == "Test coordinates: gradle at /workspace/bigtop/bigtop-data-generators."
     assert "gradle" in line
     assert "/workspace/bigtop/bigtop-data-generators" in line
 

@@ -60,7 +60,6 @@ from .phase_transitions import (
     TransitionDecision,
 )
 from .physical_validator import PhysicalValidator
-from .project_brief import PROJECT_BRIEF_PATH, PROJECT_BRIEF_PROJECTION_CHARS
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_response_parser import ReActResponseParser
@@ -92,6 +91,11 @@ from .verdict_finalizer import (
 # Per-phase objectives for the setup phase machine (spec §3.1). These
 # prescribe TOOLS, never raw commands — task text outranks prompt guidance
 # (round-4 lesson), so the only safe vocabulary here is the tool surface.
+#
+# dim (d) deleted (Category-3 analyzer diet, 2026-07-20): these ARE the
+# facts-wording objectives. The old "Recommended Build/Tests" variants and the
+# `.replace()`-derived FACTS_* maps that sat beside them are gone — the survey
+# facts (detected build system + manifest coordinates) are the only wording.
 PHASE_OBJECTIVES = {
     "provision": (
         "Get the repository cloned and the toolchain installed: "
@@ -101,14 +105,13 @@ PHASE_OBJECTIVES = {
     ),
     "analyze": (
         "Understand the project: project(action='analyze'). Record build system, the "
-        "analyzer's Recommended Build (target dir + goal), test counts, and special "
+        "build coordinates from the survey facts (target dirs), test counts, and special "
         "requirements in key_results. An honest 'unknown' with evidence is acceptable."
     ),
     "build": (
-        "Make the project compile: build(action='compile'). Follow the analyzer's "
-        "Recommended Build when it differs from a plain root compile — an aggregator "
-        "root over Groovy modules needs build(action='package'/'install'), and a "
-        "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
+        "Make the project compile: build(action='compile'). Consult the survey facts "
+        "for the build coordinates — an aggregator root can compile nothing at the "
+        "root while the real sources live in island modules. If the survey facts show NO Java "
         "compile target (a packaging/meta-project), phase(action='blocked', "
         "outcome='unknown', ...) with that "
         "evidence instead of forcing a compile. If compilation fails on missing "
@@ -118,10 +121,10 @@ PHASE_OBJECTIVES = {
         "registered toolchain. Long builds detach; poll the job ref with search."
     ),
     "test": (
-        "Run the test suite: build(action='test'). Run it in the analyzer's "
-        "Recommended Tests target (the tests can live in a different module — and "
-        "even a different build system — than the build, e.g. Gradle test modules "
-        "beside a Maven build); otherwise use the build root. Partial pass above "
+        "Run the test suite: build(action='test'). Run it where the "
+        "survey facts place the tests (they can live in a different module — and "
+        "even a different build system — than the build); otherwise use the build root. "
+        "Partial pass above "
         "threshold is a valid outcome — report the numbers honestly in key_results. "
         "If tests genuinely cannot run, phase(action='blocked', outcome='failed', ...) "
         "with evidence."
@@ -134,11 +137,12 @@ PHASE_OBJECTIVES = {
 
 # Python overrides for the build/test objectives (live-run 2026-06-24 pyyaml
 # false-red, root cause 1): the Java build objective tells the agent to
-# phase(action='blocked') when the analyzer reports no Java compile target —
+# phase(action='blocked') when the survey facts show no Java compile target —
 # on a Python project the agent obeyed, and the blocked-build cap turned an
 # honest physical PARTIAL into FAILED. Python projects get their own build and
-# test objectives; the Java strings above stay byte-identical for Java
-# projects (see phase_objective).
+# test objectives; the Java strings above apply to Java projects (see
+# phase_objective). These carry no "Recommended" wording, so dim (d) never
+# touched them.
 PYTHON_PHASE_OBJECTIVES = {
     "build": (
         "Set up the environment and install dependencies: build(action='deps'), "
@@ -152,7 +156,7 @@ PYTHON_PHASE_OBJECTIVES = {
     ),
     "test": (
         "Run the test suite with pytest via build(action='test'). Run it in "
-        "the analyzer's Recommended Tests target when one is present; otherwise "
+        "the test location the survey facts name when one is present; otherwise "
         "the project root. Partial pass above threshold is a valid outcome — "
         "report the numbers honestly in key_results. If tests genuinely cannot "
         "run, phase(action='blocked', outcome='failed', ...) with evidence."
@@ -162,17 +166,15 @@ PYTHON_PHASE_OBJECTIVES = {
 # Kickoff-plan variant of the build objective. The plan is authored at t=0,
 # BEFORE the repo is cloned/analyzed, so it cannot know the ecosystem — and
 # live python runs (4/5, 2026-06/07 probes) obeyed the unconditional
-# "NO Java compile target -> phase(action='blocked')" instruction from the
-# static task text and blocked the build phase. The sentence is made
-# conditional here; the project-aware correction happens AT RUNTIME in the
-# phase intros (phase_objective + _python_phase_guidance), once the analyzer
-# has run. PHASE_OBJECTIVES itself stays byte-identical so the runtime Java
-# intros do not change.
+# "NO Java compile target -> phase(action='blocked')" instruction and blocked
+# the build phase. The sentence is made conditional here; the project-aware
+# correction happens AT RUNTIME in the phase intros (phase_objective), once the
+# analyzer has run.
 _KICKOFF_BLOCK_SENTENCE_BEFORE = (
-    "If the analyzer reports NO Java compile target (a packaging/meta-project), "
+    "If the survey facts show NO Java compile target (a packaging/meta-project), "
 )
 _KICKOFF_BLOCK_SENTENCE_AFTER = (
-    "If the analyzer reports NO Java compile target (a packaging/meta-project) "
+    "If the survey facts show NO Java compile target (a packaging/meta-project) "
     "AND the project is not a Python/other-ecosystem project, "
 )
 assert _KICKOFF_BLOCK_SENTENCE_BEFORE in PHASE_OBJECTIVES["build"], (
@@ -186,123 +188,27 @@ KICKOFF_PHASE_OBJECTIVES = {
     ),
 }
 
-# Treatment mask dim (d): the objectives' "Recommended Build" wording is a
-# prescription channel. The facts variants replace ONLY the recommendation
-# references (anchor-asserted, the kickoff-softening pattern); everything
-# else stays byte-identical so arm P is untouched when the flag is on.
-_D_ANALYZE_BEFORE = (
-    "Record build system, the "
-    "analyzer's Recommended Build (target dir + goal), test counts"
-)
-_D_ANALYZE_AFTER = (
-    "Record build system, the "
-    "build coordinates from the survey facts (target dirs), test counts"
-)
-_D_BUILD_BEFORE = (
-    "Follow the analyzer's "
-    "Recommended Build when it differs from a plain root compile — an aggregator "
-    "root over Groovy modules needs build(action='package'/'install'), and a "
-    "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
-    "compile target"
-)
-_D_BUILD_AFTER = (
-    "Consult the survey facts "
-    "for the build coordinates — an aggregator root can compile nothing at the "
-    "root while the real sources live in island modules. If the survey facts show NO Java "
-    "compile target"
-)
-assert _D_ANALYZE_BEFORE in PHASE_OBJECTIVES["analyze"], (
-    "facts-wording variant lost its analyze anchor — update _D_ANALYZE_BEFORE "
-    "alongside PHASE_OBJECTIVES['analyze']"
-)
-assert _D_BUILD_BEFORE in PHASE_OBJECTIVES["build"], (
-    "facts-wording variant lost its build anchor — update _D_BUILD_BEFORE "
-    "alongside PHASE_OBJECTIVES['build']"
-)
-_D_TEST_BEFORE = (
-    "Run it in the analyzer's "
-    "Recommended Tests target (the tests can live in a different module — and "
-    "even a different build system — than the build, e.g. Gradle test modules "
-    "beside a Maven build); otherwise use the build root."
-)
-_D_TEST_AFTER = (
-    "Run it where the "
-    "survey facts place the tests (they can live in a different module — and "
-    "even a different build system — than the build); otherwise use the build root."
-)
-assert _D_TEST_BEFORE in PHASE_OBJECTIVES["test"], (
-    "facts-wording variant lost its test anchor — update _D_TEST_BEFORE "
-    "alongside PHASE_OBJECTIVES['test']"
-)
-_D_PYTHON_TEST_BEFORE = (
-    "Run it in "
-    "the analyzer's Recommended Tests target when one is present; otherwise "
-    "the project root."
-)
-_D_PYTHON_TEST_AFTER = (
-    "Run it in "
-    "the test location the survey facts name when one is present; otherwise "
-    "the project root."
-)
-assert _D_PYTHON_TEST_BEFORE in PYTHON_PHASE_OBJECTIVES["test"], (
-    "facts-wording variant lost its python-test anchor — update "
-    "_D_PYTHON_TEST_BEFORE alongside PYTHON_PHASE_OBJECTIVES['test']"
-)
-FACTS_PHASE_OBJECTIVES = {
-    "analyze": PHASE_OBJECTIVES["analyze"].replace(_D_ANALYZE_BEFORE, _D_ANALYZE_AFTER),
-    "build": PHASE_OBJECTIVES["build"].replace(_D_BUILD_BEFORE, _D_BUILD_AFTER),
-    "test": PHASE_OBJECTIVES["test"].replace(_D_TEST_BEFORE, _D_TEST_AFTER),
-}
-FACTS_PYTHON_PHASE_OBJECTIVES = {
-    "test": PYTHON_PHASE_OBJECTIVES["test"].replace(_D_PYTHON_TEST_BEFORE, _D_PYTHON_TEST_AFTER),
-}
-
-# Kickoff (P2-7): the initial trunk tasks are a persisted prompt surface —
-# they must carry the same wording arm the runtime intros do. The kickoff
-# softening re-anchors on the facts build variant (its conditional sentence
-# changed wording with dim d).
-_D_KICKOFF_BEFORE = "If the survey facts show NO Java compile target (a packaging/meta-project), "
-_D_KICKOFF_AFTER = (
-    "If the survey facts show NO Java compile target (a packaging/meta-project) "
-    "AND the project is not a Python/other-ecosystem project, "
-)
-assert _D_KICKOFF_BEFORE in FACTS_PHASE_OBJECTIVES["build"], (
-    "facts kickoff softening lost its anchor — update _D_KICKOFF_BEFORE "
-    "alongside _D_BUILD_AFTER"
-)
-FACTS_KICKOFF_PHASE_OBJECTIVES = {
-    **KICKOFF_PHASE_OBJECTIVES,
-    **FACTS_PHASE_OBJECTIVES,
-    "build": FACTS_PHASE_OBJECTIVES["build"].replace(_D_KICKOFF_BEFORE, _D_KICKOFF_AFTER),
-}
+# Back-compat aliases: dim (d) collapsed the FACTS_* variants INTO the base
+# maps above, so these names now point at the same facts-wording objects. Kept
+# so existing importers (tests, callers) resolve without a rename churn.
+FACTS_PHASE_OBJECTIVES = PHASE_OBJECTIVES
+FACTS_PYTHON_PHASE_OBJECTIVES = PYTHON_PHASE_OBJECTIVES
+FACTS_KICKOFF_PHASE_OBJECTIVES = KICKOFF_PHASE_OBJECTIVES
 
 
 def kickoff_phase_objectives() -> dict:
-    """The kickoff task texts under the current treatment mask (dim d)."""
-    from sag.config.prescriptions import prescription_flags
+    """The kickoff task texts. dim (d) deleted: the facts wording (detected
+    build system + manifest coordinates) is THE wording — the old
+    "Recommended Build/Tests" phrasing is gone, so there is no variant to
+    select between."""
+    return KICKOFF_PHASE_OBJECTIVES
 
-    if prescription_flags()["objectives_wording"]:
-        return KICKOFF_PHASE_OBJECTIVES
-    return FACTS_KICKOFF_PHASE_OBJECTIVES
-
-# Runtime python guidance for the BUILD/TEST phase intros, injected AFTER the
-# analyzer has run (the same environment_summary["build_recommendation"]
-# plumbing as _recommended_build_line). This is the live-effective seam: the
-# kickoff plan text cannot know the project type, and live runs proved the
-# template-time python objectives alone did not stop agents from blocking the
-# build phase and under-executing tests (0-2 executions vs 1287 passing).
-PYTHON_BUILD_PHASE_GUIDANCE = (
-    "This is a Python project — there is no Java compile target and that is "
-    "NOT grounds for phase(action='blocked', outcome='failed', ...). "
-    "Do: build(action='deps') to "
-    "create the venv and install dependencies with the project's own tool, "
-    "then build(action='compile') to verify byte-compilation. Never run "
-    "pip/pytest via bash — the build tool resolves the project venv."
-)
-PYTHON_TEST_PHASE_GUIDANCE = (
-    "Run tests with build(action='test') — it runs pytest with a JUnit XML "
-    "report; a partial pass above threshold is a valid, honest outcome."
-)
+# dim (e) deleted: the PRE-HOC python/native-first guidance block
+# (PYTHON_BUILD_PHASE_GUIDANCE, PYTHON_TEST_PHASE_GUIDANCE, and the
+# NATIVE_FIRST_BUILD_GUIDANCE prepend) is gone — pre-hoc advice is a
+# prescription. The REACTIVE native smoke steer below stays: it is
+# evidence-triggered (fires only when the build phase left the native core
+# unbuilt) and is part of the corrective-loop allowlist, not a dimension.
 
 # Rendered before the test guidance when the build phase did NOT get the native
 # core built (live TVM 2026-07-18: the agent swept the full suite without
@@ -315,21 +221,6 @@ NATIVE_NOT_BUILT_TEST_GUIDANCE = (
     "bare build(action='test') collects the WHOLE suite and is exactly the "
     "sweep to avoid. Report the smoke result honestly and only expand if it "
     "passes."
-)
-
-# Native-first block, PREPENDED to the python build guidance when the analyzer
-# flagged has_native_build (live TVM: root CMakeLists.txt native core, real
-# python package in python/). Licenses the cmake dance instead of railroading a
-# root `pip install -e .` that targets the wrong thing and imports nothing until
-# libtvm.so exists. {python_root} is the analyzer's detected install target.
-NATIVE_FIRST_BUILD_GUIDANCE = (
-    "This package has a NATIVE core (CMakeLists.txt at the repo root). Read the "
-    "project's install docs and build the native library FIRST (cmake + the "
-    "documented deps) — the python package will not import without it. If a "
-    "3rdparty/ dependency dir is empty (submodule not fetched), run "
-    "`git submodule update --init --recursive` before cmake. Then "
-    "install the python package from {python_root}. Long native builds detach; "
-    "poll with search."
 )
 
 # Build-system labels the analyzer emits for Python projects: structure
@@ -352,24 +243,15 @@ def phase_objective(phase: str, build_system: Optional[str] = None) -> str:
 
     When the analyzer detected a Python project, the build/test phases get the
     PYTHON_PHASE_OBJECTIVES overrides; every other project (and an unknown
-    build system) gets the PHASE_OBJECTIVES defaults byte-identical."""
-    from sag.config.prescriptions import prescription_flags
+    build system) gets the PHASE_OBJECTIVES defaults.
 
-    facts_mode = not prescription_flags()["objectives_wording"]
+    dim (d) deleted: PHASE_OBJECTIVES/PYTHON_PHASE_OBJECTIVES already carry the
+    facts wording (detected build system + manifest coordinates) — there is no
+    longer a variant to select between."""
     if is_python_build_system(build_system):
-        # dim (d) must reach the ecosystem override too (panel review: the
-        # python test objective also names Recommended Tests).
-        if facts_mode:
-            facts_override = FACTS_PYTHON_PHASE_OBJECTIVES.get(phase)
-            if facts_override:
-                return facts_override
         override = PYTHON_PHASE_OBJECTIVES.get(phase)
         if override:
             return override
-    if facts_mode:
-        facts = FACTS_PHASE_OBJECTIVES.get(phase)
-        if facts:
-            return facts
     return PHASE_OBJECTIVES.get(phase, "")
 
 
@@ -1175,26 +1057,18 @@ class ReActEngine(UIEventEmitter):
                     "(framework survey ran — project facts were computed and "
                     "persisted; the agent had not called project analyze)"
                 )
-            brief_projection = self._project_brief_projection()
-            if brief_projection:
-                lines.insert(
-                    lines.index(f"Objective: {objective}") + 1,
-                    brief_projection,
-                )
-            else:
-                rec_line = self._recommended_build_line(phase)
-                if rec_line:
-                    lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
-                # Backward-compatible fallback for analyzer state created
-                # before the role-typed brief existed.
-                guidance = self._python_phase_guidance(phase)
-                if guidance:
-                    lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
-            # Evidence-reactive steer, injected on BOTH branches: the brief is
-            # composed at analyze time and cannot know the build outcome, so
-            # runtime state must not hide behind the projection (live TVM
-            # 2026-07-18: the smoke steer only rendered on the no-brief
-            # fallback, and the live run swept 356 collection errors again).
+            # dim (b) deleted: the recommendation is coordinates-only; dim (c)
+            # and dim (e) deleted: no project_brief projection, no pre-hoc
+            # python guidance block. The agent gets the coordinate line and the
+            # reactive smoke steer only.
+            rec_line = self._recommended_build_line(phase)
+            if rec_line:
+                lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
+            # Evidence-reactive steer: the analyzer runs at analyze time and
+            # cannot know the build outcome, so this runtime state is injected
+            # here on every intro (live TVM 2026-07-18: the smoke steer only
+            # rendered on the no-brief fallback, and the live run swept 356
+            # collection errors again).
             smoke = self._native_smoke_guidance(phase)
             if smoke:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, smoke)
@@ -1245,61 +1119,6 @@ class ReActEngine(UIEventEmitter):
             return {}
         return env.get("build_recommendation") or {}
 
-    def _project_brief_projection(self) -> Optional[str]:
-        """Return the analyzer's single bounded projection, never raw sections."""
-        try:
-            trunk = self.context_manager.load_trunk_context()
-            env = getattr(trunk, "environment_summary", None) or {}
-        except Exception:
-            return None
-        projection = str(env.get("project_brief_projection") or "").strip()
-        if not projection:
-            return None
-        if len(projection) <= PROJECT_BRIEF_PROJECTION_CHARS:
-            return projection
-        ref = str(env.get("project_brief_ref") or PROJECT_BRIEF_PATH)
-        return f"PROJECT BRIEF projection exceeded its budget; read the complete brief: {ref}"
-
-    def _python_phase_guidance(self, phase: str) -> Optional[str]:
-        """Explicit python guidance block for the build/test intros, keyed off
-        the analyzer's recorded build system (build_recommendation or the env
-        summary — the same best-effort plumbing as _recommended_build_line).
-        Returns None for every non-python project, keeping Java intros
-        byte-identical.
-
-        Native-core repos (has_native_build on the recommendation, live TVM):
-        the build-phase guidance PREPENDS the native-first block — build the
-        native library before installing the python package, from the analyzer's
-        detected python root. A plain-python repo carries no native text, so its
-        intro is byte-identical to before."""
-        if phase not in ("build", "test"):
-            return None
-        from sag.config.prescriptions import prescription_flags
-
-        if not prescription_flags()["python_prehoc_guidance"]:
-            # Treatment mask dim (e): this whole block is PRE-HOC advice.
-            # The evidence-reactive native smoke steer is allowlisted and
-            # injected by _phase_intro_step, not here — it stays.
-            return None
-        if not is_python_build_system(self._detected_build_system()):
-            return None
-        if phase == "test":
-            # The native-not-built smoke steer is EVIDENCE-reactive (it depends
-            # on the build phase's outcome), so it is injected by
-            # _phase_intro_step on BOTH intro branches — not here, where only
-            # the no-brief fallback would render it (live TVM 2026-07-18: the
-            # brief-projection path skipped this method entirely and the agent
-            # swept 356 collection errors again).
-            return PYTHON_TEST_PHASE_GUIDANCE
-        guidance = PYTHON_BUILD_PHASE_GUIDANCE
-        rec = self._build_recommendation()
-        if rec.get("has_native_build"):
-            native = NATIVE_FIRST_BUILD_GUIDANCE.format(
-                python_root=rec.get("build_root") or "the detected python root"
-            )
-            guidance = f"{native}\n{guidance}"
-        return guidance
-
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
         """One-line build/test recommendation from the analyzer, read from the
         trunk's environment_summary. Best-effort: any failure yields no line."""
@@ -1310,54 +1129,13 @@ class ReActEngine(UIEventEmitter):
             return None
         if not rec:
             return None
-        from sag.config.prescriptions import prescription_flags
-
-        if not prescription_flags()["recommendation_fields"]:
-            return self._coordinates_line(rec, phase)
-        if phase == "test":
-            # Pathological aggregators are archipelagos: run tests in EACH test
-            # island (Bigtop: the maven framework's own unit tests were skipped
-            # while only the dominant Gradle cluster ran). Guidance, not
-            # orchestration — the agent still owns the how.
-            test_islands = rec.get("test_islands")
-            if test_islands and len(test_islands) > 1:
-                return self._island_test_line(test_islands)
-            test_root = rec.get("test_root")
-            if not test_root:
-                return None
-            # Only worth calling out when the tests are NOT where we built.
-            # A python rec is pytest-at-the-build-root by construction, so its
-            # differing labels (pytest vs python) must not render the
-            # misleading "lives here, not in the build module" call-out.
-            if test_root == rec.get("build_root") and (
-                rec.get("test_system") == rec.get("build_system")
-                or is_python_build_system(rec.get("build_system"))
-            ):
-                return None
-            return (
-                f"Recommended Tests: run {rec.get('test_system')} 'test' in {test_root} "
-                "— the test suite lives here, not in the build module."
-            )
-        # Build phase. Pathological aggregators: build EACH independent island so
-        # none is left UNKNOWN (Bigtop: bigpetstore-spark + transaction-queue
-        # never built when only one preferred module was targeted).
-        build_islands = rec.get("build_islands")
-        if build_islands and len(build_islands) > 1:
-            return self._island_build_line(build_islands)
-        if rec.get("is_aggregator_only"):
-            return (
-                f"Recommended Build: NONE — {rec.get('rationale', '')} "
-                "Use phase(action='blocked', outcome='unknown', ...) with this evidence "
-                "rather than forcing a compile."
-            )
-        return (
-            f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
-            f"{rec.get('build_root')} — {rec.get('rationale', '')}"
-        )
+        # dim (b) deleted: the intro call-out is coordinate FACTS only —
+        # detected system + where, no goal/rationale action wording.
+        return self._coordinates_line(rec, phase)
 
     @staticmethod
     def _coordinates_line(rec, phase: str) -> Optional[str]:
-        """Treatment mask dim (b): the intro call-out without action wording —
+        """The intro call-out without action wording (dim b deleted) —
         coordinate FACTS only (system + where), for build and test alike."""
         if phase == "test":
             islands = rec.get("test_islands")
@@ -1379,44 +1157,6 @@ class ReActEngine(UIEventEmitter):
         if rec.get("is_aggregator_only"):
             return "Build coordinates: the survey found no standard compile target at the root."
         return f"Build coordinates: {rec.get('build_system')} at {rec.get('build_root')}."
-
-    @staticmethod
-    def _island_build_line(islands) -> str:
-        """Render the build-phase call-out that lists EVERY independent build
-        island for a pathological aggregator (each must be built on its own),
-        naming the recommended GOAL beside each island and appending the
-        cross-island dependency guidance (see below)."""
-        items = "; ".join(
-            f"{n}) {isl.get('system') or 'unknown'} '{isl.get('goal') or 'build'}' "
-            f"in {isl.get('root')}"
-            for n, isl in enumerate(islands, 1)
-        )
-        return (
-            f"Recommended Build: this repo has {len(islands)} independent build "
-            f"islands — build EACH: {items}. "
-            # CROSS-ISLAND dependency guidance (live bigtop re-probe: the
-            # transaction-queue island died 13x resolving an org-internal
-            # SNAPSHOT the data-generators island produces but never PUBLISHED).
-            "Islands may depend on each other through the local maven repo: if a "
-            "build fails resolving an org-internal SNAPSHOT artifact (searched in "
-            "file:/root/.m2/...), FIRST build/publish the island that produces it "
-            "(maven 'install' / gradle 'publishToMavenLocal'), then retry this "
-            "island once. "
-            "In the test phase, run tests in EACH test island."
-        )
-
-    @staticmethod
-    def _island_test_line(islands) -> str:
-        """Render the test-phase call-out that lists EVERY independent test
-        island for a pathological aggregator (run tests in each)."""
-        items = "; ".join(
-            f"{n}) {isl.get('system') or 'unknown'} in {isl.get('root')}"
-            for n, isl in enumerate(islands, 1)
-        )
-        return (
-            f"Recommended Tests: this repo has {len(islands)} independent test "
-            f"islands — run tests in EACH test island: {items}."
-        )
 
     def _repair_budgets(self) -> RepairBudgets:
         return RepairBudgets(

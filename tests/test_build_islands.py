@@ -303,12 +303,15 @@ def _engine_with_recommendation(rec):
     return engine
 
 
-def test_build_intro_lists_all_islands_for_pathological_repo():
+def test_build_intro_lists_all_island_coordinates_for_pathological_repo():
+    # dim (b) deleted: the intro line is COORDINATES only (system + where per
+    # island), no "build EACH"/goal action wording — but every island is still
+    # named so no island is left invisible.
     _orch, analysis = _analyze_bigtop()
     engine = _engine_with_recommendation(analysis["build_recommendation"])
     line = engine._recommended_build_line("build")
-    assert "independent build islands" in line
-    assert "build EACH" in line
+    assert "Build coordinates (independent islands):" in line
+    assert "build EACH" not in line  # action wording gone (dim b)
     for root in [
         f"{BIGTOP}/bigtop-test-framework",
         f"{BIGTOP}/bigtop-data-generators",
@@ -318,11 +321,11 @@ def test_build_intro_lists_all_islands_for_pathological_repo():
         assert root in line
 
 
-def test_test_intro_lists_test_islands_for_pathological_repo():
+def test_test_intro_lists_test_island_coordinates_for_pathological_repo():
     _orch, analysis = _analyze_bigtop()
     engine = _engine_with_recommendation(analysis["build_recommendation"])
     line = engine._recommended_build_line("test")
-    assert "test island" in line
+    assert "Test coordinates (independent islands):" in line
     assert f"{BIGTOP}/bigtop-test-framework" in line
     assert f"{BIGTOP}/bigtop-data-generators" in line
 
@@ -373,30 +376,22 @@ def test_single_module_has_no_islands_fields():
     assert not rec.get("test_islands")
 
 
-def test_healthy_reactor_build_intro_byte_identical_to_pre_change_snapshot():
+def test_healthy_reactor_build_intro_is_coordinates_only():
     rec = _healthy_reactor_rec()
     engine = _engine_with_recommendation(rec)
     line = engine._recommended_build_line("build")
-    # Pre-change snapshot: the single-target recommendation, unchanged. The
-    # expected string is a FULL literal (not prefix + rec["rationale"]) so a
-    # rationale drift on the healthy path cannot slip past the byte-compare.
-    assert line == (
-        "Recommended Build: maven 'install' in /workspace/proj — "
-        "Aggregator root over 1 source module(s) (0 Groovy); "
-        "build the reactor at the root with 'install'."
-    )
+    # dim (b) deleted: coordinates only, no goal/rationale action wording.
+    assert line == "Build coordinates: maven at /workspace/proj."
+    assert "Recommended Build" not in line
     assert "independent build islands" not in line
 
 
-def test_single_module_build_intro_byte_identical_to_pre_change_snapshot():
+def test_single_module_build_intro_is_coordinates_only():
     rec = _single_module_rec()
     engine = _engine_with_recommendation(rec)
     line = engine._recommended_build_line("build")
-    # Full literal (see healthy-reactor snapshot rationale above).
-    assert line == (
-        "Recommended Build: maven 'compile' in /workspace/proj — "
-        "Root Maven module has main sources; compile at the root."
-    )
+    assert line == "Build coordinates: maven at /workspace/proj."
+    assert "Recommended Build" not in line
     assert "independent build islands" not in line
 
 
@@ -672,31 +667,33 @@ def test_manifest_carries_per_island_goals():
     assert by_root[f"{BIGTOP}/bigtop-test-framework"]["goal"] == "install"
 
 
-def test_build_intro_renders_per_island_goals():
+def test_build_intro_renders_island_coordinates_without_goals():
+    # dim (b) deleted: the per-island GOAL action wording ("'publishToMavenLocal'",
+    # "'install'", "'build'") is gone from the rendered intro line; each island's
+    # coordinate FACTS (system + where) remain. The per-island goals still live
+    # on the manifest for the mechanical readers (test_manifest_carries_per_island_goals).
     _orch, analysis = _analyze_bigtop()
     engine = _engine_with_recommendation(analysis["build_recommendation"])
     line = engine._recommended_build_line("build")
-    # The intro names the goal beside each island, e.g.
-    # "gradle 'publishToMavenLocal' in .../bigtop-data-generators".
-    assert (
-        f"gradle 'publishToMavenLocal' in {BIGTOP}/bigtop-data-generators" in line
-    )
-    assert f"maven 'install' in {BIGTOP}/bigtop-test-framework" in line
-    assert (
-        f"gradle 'build' in {BIGTOP}/bigtop-bigpetstore/bigpetstore-spark" in line
-    )
+    assert f"gradle in {BIGTOP}/bigtop-data-generators" in line
+    assert f"maven in {BIGTOP}/bigtop-test-framework" in line
+    assert f"gradle in {BIGTOP}/bigtop-bigpetstore/bigpetstore-spark" in line
+    assert "'publishToMavenLocal'" not in line
+    assert "'install'" not in line
 
 
-def test_build_intro_appends_cross_island_dependency_guidance():
+def test_build_intro_carries_no_cross_island_prose():
+    # dim (b) deleted: the cross-island dependency PROSE (publish-provider-first,
+    # retry-once) was action advice — it is gone from the coordinate line. The
+    # reactive loop-redirect (untried-island targets, tested in
+    # test_facts_only_behavior.py) still carries the island goals from the shared
+    # manifest when the agent actually drifts.
     _orch, analysis = _analyze_bigtop()
     engine = _engine_with_recommendation(analysis["build_recommendation"])
     line = engine._recommended_build_line("build")
-    # The cross-island guidance: a SNAPSHOT resolution failure from
-    # file:/root/.m2/... means build/publish the producing island FIRST.
-    assert "local maven repo" in line
-    assert "file:/root/.m2/" in line
-    assert "publishToMavenLocal" in line
-    assert "retry this island once" in line
+    assert "local maven repo" not in line
+    assert "retry this island once" not in line
+    assert "build EACH" not in line
 
 
 # --------------------------------------------------------------------------- #
@@ -719,37 +716,28 @@ def test_gradle_backend_install_verb_mapping_is_stable():
 # 7c) Honesty invariant: healthy-reactor + single-module intros stay
 #     byte-identical (no per-island goal / cross-island guidance leaks in).
 # --------------------------------------------------------------------------- #
-def test_healthy_reactor_build_intro_still_byte_identical_after_r2():
+def test_healthy_reactor_build_intro_stays_coordinates_only():
     rec = _healthy_reactor_rec()
     engine = _engine_with_recommendation(rec)
     line = engine._recommended_build_line("build")
-    assert line == (
-        "Recommended Build: maven 'install' in /workspace/proj — "
-        "Aggregator root over 1 source module(s) (0 Groovy); "
-        "build the reactor at the root with 'install'."
-    )
+    assert line == "Build coordinates: maven at /workspace/proj."
     assert "local maven repo" not in line
     assert "publishToMavenLocal" not in line
 
 
-def test_single_module_build_intro_still_byte_identical_after_r2():
+def test_single_module_build_intro_stays_coordinates_only():
     rec = _single_module_rec()
     engine = _engine_with_recommendation(rec)
     line = engine._recommended_build_line("build")
-    assert line == (
-        "Recommended Build: maven 'compile' in /workspace/proj — "
-        "Root Maven module has main sources; compile at the root."
-    )
+    assert line == "Build coordinates: maven at /workspace/proj."
     assert "local maven repo" not in line
 
 
-def test_analyzer_output_does_not_render_competing_single_target_line_with_islands():
-    """bigtop5 live failure: the analysis output rendered BOTH 'build EACH of 4
-    islands' AND the pathological branch's single-target rationale ('build
-    module bigtop-test-framework directly'). The agent picked the narrow line
-    and hammered the one broken island for 7 calls. With multiple islands the
-    island list IS the recommendation — the single-target sentence must not
-    co-render as a competing authority."""
+def test_analyzer_output_renders_island_coordinates_no_goal_or_single_target():
+    """dim (b) deleted: with multiple islands the analyzer output renders the
+    island COORDINATES only — no per-island goal, no competing single-target
+    'Recommended Build' sentence (the bigtop5 competing-authority failure cannot
+    recur because neither authority carries an action)."""
     from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
     tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
@@ -771,14 +759,15 @@ def test_analyzer_output_does_not_render_competing_single_target_line_with_islan
         ],
     }
     output = tool._render_recommended_build_output({"build_recommendation": rec})
-    assert "independent build islands" in output
-    assert "build EACH" in output
-    # the competing single-target sentence is gone
+    assert "Build coordinates (independent islands):" in output
+    assert "maven in /workspace/bigtop/bigtop-test-framework" in output
+    # no action wording of any kind
+    assert "Recommended Build" not in output
     assert "directly with 'install'" not in output
-    assert "🧭 Recommended Build: maven 'install' in" not in output
+    assert "'publishToMavenLocal'" not in output
 
 
-def test_analyzer_output_keeps_single_target_line_without_islands():
+def test_analyzer_output_renders_single_coordinate_without_islands():
     from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
     tool = ProjectAnalyzerTool.__new__(ProjectAnalyzerTool)
@@ -790,5 +779,6 @@ def test_analyzer_output_keeps_single_target_line_without_islands():
         "build_islands": [],
     }
     output = tool._render_recommended_build_output({"build_recommendation": rec})
-    assert "🧭 Recommended Build: maven 'install' in /workspace/proj" in output
+    assert "📍 Build coordinates: maven at /workspace/proj" in output
+    assert "Recommended Build" not in output
     assert "independent build islands" not in output

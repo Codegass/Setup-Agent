@@ -3222,14 +3222,16 @@ class PhysicalValidator:
                             "This is essential for accurate test coverage reporting."
                         )
 
-                    # Check for other analysis markers
+                    # Check for other analysis markers. dim (c) deleted
+                    # (Category-3 analyzer diet): the analyzer no longer writes
+                    # project_brief_ref/fingerprint, so the survey facts
+                    # (build system / recommendation) are the readiness markers.
                     if any(
                         (
                             env_summary.get("project_type"),
                             env_summary.get("build_system"),
                             env_summary.get("build_recommendation"),
-                            env_summary.get("project_brief_ref"),
-                            env_summary.get("project_brief_fingerprint"),
+                            env_summary.get("survey"),
                         )
                     ):
                         result["analyzed"] = True  # At least partial analysis was done

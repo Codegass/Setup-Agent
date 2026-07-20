@@ -16,7 +16,6 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
-from sag.config.prescriptions import prescription_feature_flags
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
 
@@ -276,9 +275,6 @@ class SetupAgent:
                 "control_events": True,
                 "reasoning_scheduler": True,
                 "phase_machine": self.phase_machine is not None,
-                # The five-boolean prescription treatment mask (A/B panel):
-                # every recorded run carries its exact arm/stage-2 mask.
-                **prescription_feature_flags(),
             },
             "random_seed_or_null": random_seed,
             "run_order_index": run_order_index,

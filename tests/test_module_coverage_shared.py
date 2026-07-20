@@ -388,15 +388,13 @@ def _native_env():
 
 def test_test_phase_suggests_smoke_when_native_core_not_built():
     """Live TVM (twice): the agent swept the full suite without libtvm — 356
-    identical collection errors. First fix attempt hid the steer on the
-    no-brief fallback branch while live runs walk the brief-projection branch
-    (the bug-#5/#10 seam lesson again) — so this test goes through the REAL
-    intro path WITH a brief projection present."""
+    identical collection errors. The REACTIVE smoke steer fires whenever the
+    build phase left the native core unbuilt — evidence-triggered, on every
+    intro (there is no brief projection to hide behind after the analyzer
+    diet)."""
     env = _native_env()
-    env["project_brief_projection"] = "PROJECT BRIEF: python native project."
     engine = _engine_at(3, env)  # mark_done -> legacy outcome unknown
     intro = engine._phase_intro_step().content
-    assert "PROJECT BRIEF" in intro  # the live branch is the one under test
     assert "smoke" in intro.lower()
     assert "collection errors" in intro
 
@@ -404,18 +402,17 @@ def test_test_phase_suggests_smoke_when_native_core_not_built():
 def test_test_phase_stays_clean_when_native_built_or_not_native():
     # native repo but build phase succeeded -> no smoke detour
     env = _native_env()
-    env["project_brief_projection"] = "PROJECT BRIEF: python native project."
     engine = _engine_at(3, env)
     for record in engine.phase_machine.records:
         if record.phase == "build":
             object.__setattr__(record, "validated_outcome", "success")
     assert "smoke" not in engine._phase_intro_step().content.lower()
-    # plain python repo, fallback branch -> guidance byte-identical to before
+    # plain (non-native) python repo -> the pytest FACTS objective, no reactive
+    # smoke steer (the steer is native-only and evidence-triggered).
     engine2 = _engine_at(3, _python_env())
-    from sag.agent.react_engine import PYTHON_TEST_PHASE_GUIDANCE
-
-    assert engine2._python_phase_guidance("test") == PYTHON_TEST_PHASE_GUIDANCE
-    assert "smoke" not in engine2._phase_intro_step().content.lower()
+    intro2 = engine2._phase_intro_step().content
+    assert "pytest via build(action='test')" in intro2
+    assert "smoke" not in intro2.lower()
 
 
 # ---- Island-keyed checklist: actionable coordinates, not raw module names ----

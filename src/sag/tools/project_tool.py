@@ -10,23 +10,12 @@ from .base import BaseTool, ToolResult
 
 class ProjectTool(BaseTool):
     def __init__(self, setup_tool=None, analyzer_tool=None, system_tool=None, env_tool=None):
-        from sag.config.prescriptions import prescription_flags
-
-        # Treatment mask dim (a): THIS description is what the prompt builder
-        # actually injects (panel review: masking only the inner analyzer
-        # tool's description left 'plan' in the initial prompt — the facade
-        # is the registered surface).
-        analyze_wording = (
-            "analyze (detect build system, plan)"
-            if prescription_flags()["plan_pipeline"]
-            else "analyze (survey the project; persist build facts)"
-        )
         super().__init__(
             name="project",
             description=(
                 "Project lifecycle: action = clone (repo_url[, ref]) | "
                 "provision (install toolchain: java_version for a JDK, packages for apt) | "
-                f"{analyze_wording} | "
+                "analyze (survey the project; persist build facts) | "
                 "env (register env vars/executables; tool + executable [+ env])."
             ),
         )
