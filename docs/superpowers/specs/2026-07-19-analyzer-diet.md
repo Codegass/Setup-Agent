@@ -587,3 +587,60 @@ failure beyond them blocks the panel.
   phase machine.
 - No new prose guidance anywhere — this whole effort is subtraction plus
   coordinates.
+
+## Category 3 — executed (2026-07-20)
+
+The panel ran per the pinned protocol (evidence `logs/panel-category3/report.md`,
+72 evidence runs; filed reviewer rulings, incl. the httpcomponents dim-e
+applicability ruling). Verdict: **all five dimensions a–e authorized for
+deletion.** The arm-F behavior (mask 00000, all prescriptions OFF) is now the
+ONLY behavior — there is no runtime `SAG_PRESCRIPTIONS` switch. Deleted per
+dimension:
+
+- **(a) plan_pipeline** — `_generate_execution_plan` + `_generate_three_step_fallback_plan`,
+  the `execution_plan` metadata field, the plan TEXT section of the analyze
+  output, and the plan→todo rewrite (`_update_trunk_context_with_plan` →
+  `_update_trunk_context_with_facts`, facts-only; `_is_execution_plan_valid`
+  gone). `_is_analysis_valid` is facts-based (no plan-length check); the legacy
+  ContextTool analyzer gate verifies persisted survey facts (not `todo_list > 4`).
+- **(b) recommendation_fields** — goal/rationale prose composition; the intro
+  line and analyze output are coordinates-only (`_coordinates_line` is the sole
+  rendering). Dead prose helpers deleted (`_island_build_line`, `_island_test_line`,
+  `_render_recommended_build_output_prescriptive`). Islands become mechanical
+  `{root, system}`; per-island goals survive ONLY on the manifest for the shared
+  loop-redirect reader.
+- **(c) project_brief** — `_compose_project_brief` + its projection + the trunk
+  brief keys + the analyze file ref; the validator's readiness marker no longer
+  reads `project_brief_ref`/`_fingerprint`. (The self-contained
+  `sag/agent/project_brief.py` module and its direct unit tests are left in
+  place — dead in production, removable as a separate Category-4 cleanup.)
+- **(d) objectives_wording** — the "Recommended Build/Tests" objective variants
+  and the `.replace()`-derived FACTS_* selection chain collapsed: the facts
+  wording IS `PHASE_OBJECTIVES`/`PYTHON_PHASE_OBJECTIVES`/`KICKOFF_PHASE_OBJECTIVES`,
+  and `phase_objective`/`kickoff_phase_objectives` no longer select between
+  variants (FACTS_* names retained as aliases for importers).
+- **(e) python_prehoc_guidance** — the pre-hoc python/native-first block
+  (`_python_phase_guidance`, `PYTHON_BUILD/TEST_PHASE_GUIDANCE`,
+  `NATIVE_FIRST_BUILD_GUIDANCE`). KEPT: the reactive `NATIVE_NOT_BUILT_TEST_GUIDANCE`
+  smoke steer with its invocation coordinates (allowlisted corrective loop).
+
+**Switch machinery.** The runtime-gating functions (`prescription_flags`,
+`prescription_feature_flags`, `reset_prescription_flags_cache`) and all their
+call sites are gone; `prescription_feature_flags()` dropped from the run-pin
+feature_flags. `sag/config/prescriptions.py` is retained as PURE naming/parsing
+helpers (`PRESCRIPTION_FLAG_NAMES`, `parse_treatment_mask`,
+`feature_flags_for_mask`, `treatment_mask_environment`) because the historical
+A/B harness under `scripts/` still imports them to reproduce the sealed panel
+evidence — the scripts run against pinned old SHAs and were left untouched.
+
+**KEPT (shared substrate, both arms):** island checklist, loop redirects,
+`_recommended_workdir`, installer ladder, manifest mechanical fields, framework
+survey guarantee, all physical-observation substrate.
+
+**Tests.** `test_prescription_switch.py` → `test_facts_only_behavior.py`
+(F-arm/off-behavior assertions became permanent-behavior tests; flag-parsing
+and arm-P tests deleted; collector-harness mask tests retained). Other suites
+adjusted to the facts-only rendering. Full suite: 2158 passed, 1 skipped, 6
+failed — exactly the registered baseline reds (test_evidence_ingestion×1,
+test_stage1_review_fixes×2, test_lineage_idempotence_followup×2,
+test_packaging_smoke×1); no new failures.
