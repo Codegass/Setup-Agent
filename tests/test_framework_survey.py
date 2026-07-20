@@ -515,7 +515,7 @@ class StrictSurveyOrch(SurveyOrch):
 
 class IntegrationCM:
     """A context manager whose trunk actually persists — the real
-    _update_trunk_context_with_plan path runs against it unmocked."""
+    _update_trunk_context_with_facts path runs against it unmocked."""
 
     def __init__(self):
         self.trunk = SimpleNamespace(

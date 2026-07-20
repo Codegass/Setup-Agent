@@ -514,17 +514,18 @@ def test_collected_json_fallback_feeds_static_test_count():
     assert result["static_test_count"] == 42
 
 
-def test_project_brief_marks_analysis_ready_before_python_test_collection():
+def test_survey_facts_mark_analysis_ready_before_python_test_collection():
+    # dim (c) deleted (Category-3 analyzer diet): the project brief is gone, so
+    # the persisted SURVEY FACTS (build recommendation / survey stamp) are the
+    # analysis-ready markers — no project_brief_ref/fingerprint is written.
     orch = CollectedOrch(
         collected=None,
         trunk_env={
             "build_recommendation": {
                 "build_system": "python",
                 "build_root": "/workspace/proj",
-                "goal": "deps",
             },
-            "project_brief_ref": "/workspace/.setup_agent/project_brief.json",
-            "project_brief_fingerprint": "a" * 64,
+            "survey": {"project_path": "/workspace/proj", "analyzer_version": 7},
         },
     )
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")

@@ -246,12 +246,13 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
 
 # Byte-identical snapshot of the JAVA build objective (the template source).
 # If this fails, the Java guidance changed — that is out of scope for the
-# Python fix and must be an intentional, separate change.
+# Python fix and must be an intentional, separate change. dim (d) of the
+# Category-3 analyzer diet made this the FACTS wording (survey coordinates,
+# not "Recommended Build"); that is now THE Java build objective.
 _JAVA_BUILD_OBJECTIVE_SNAPSHOT = (
-    "Make the project compile: build(action='compile'). Follow the analyzer's "
-    "Recommended Build when it differs from a plain root compile — an aggregator "
-    "root over Groovy modules needs build(action='package'/'install'), and a "
-    "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
+    "Make the project compile: build(action='compile'). Consult the survey facts "
+    "for the build coordinates — an aggregator root can compile nothing at the "
+    "root while the real sources live in island modules. If the survey facts show NO Java "
     "compile target (a packaging/meta-project), phase(action='blocked', "
     "outcome='unknown', ...) with that "
     "evidence instead of forcing a compile. If compilation fails on missing "

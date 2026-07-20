@@ -1,10 +1,21 @@
-"""The prescription treatment mask (analyzer diet, Category 3 A/B panel).
+"""Facts-only behavior — the permanent post-Category-3 contract.
 
-The panel spec's treatment matrix is an implementation contract: arm F must
-close EVERY channel a prescription reaches the agent through — generator,
-metadata, trunk, brief, objectives wording, pre-hoc python guidance — while
-arm P stays byte-identical to today, and the corrective-loop allowlist plus
-the shared gates behave the same in both arms. One test per channel here.
+The A/B panel authorized deleting all five prescription dimensions (analyzer-
+diet spec, Category 3; evidence logs/panel-category3/report.md, 72 runs). The
+former arm-F behavior is now the ONLY behavior: no runtime switch, no
+`SAG_PRESCRIPTIONS` env. One test per channel that a prescription used to reach
+the agent through — each asserts the channel is permanently closed to prose
+advice and open only to survey FACTS:
+
+  (a) plan pipeline: no generator call, no plan field, no plan text
+  (b) recommendation fields: coordinates only — no goal/rationale
+  (c) project brief: not composed by the analyzer
+  (d) objectives wording: facts wording, no "Recommended Build/Tests"
+  (e) pre-hoc python guidance: closed; the REACTIVE smoke steer stays
+
+The corrective-loop allowlist (island checklist, loop redirect, native smoke
+steer) and the shared mechanical machinery (workdir default, manifest reads)
+are retained — this file asserts they still behave.
 """
 
 from types import SimpleNamespace
@@ -14,9 +25,6 @@ import pytest
 from sag.config.prescriptions import (
     PRESCRIPTION_FLAG_NAMES,
     parse_treatment_mask,
-    prescription_feature_flags,
-    prescription_flags,
-    reset_prescription_flags_cache,
     treatment_mask_environment,
 )
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
@@ -24,111 +32,39 @@ from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 from test_framework_survey import SurveyOrch
 
 
-@pytest.fixture(autouse=True)
-def _fresh_mask(monkeypatch):
-    """The mask is process-cached (pin/behavior identity) — every test starts
-    from a clean cache and a clean env, and resets after."""
-    for name in PRESCRIPTION_FLAG_NAMES:
-        monkeypatch.delenv(f"SAG_PRESCRIPTION_{name.upper()}", raising=False)
-    monkeypatch.delenv("SAG_PRESCRIPTIONS", raising=False)
-    reset_prescription_flags_cache()
-    yield
-    reset_prescription_flags_cache()
-
-
-@pytest.fixture()
-def arm_f(monkeypatch):
-    monkeypatch.setenv("SAG_PRESCRIPTIONS", "off")
-    reset_prescription_flags_cache()
-
-
 def _analysis(tool, path="/workspace/proj"):
     return tool._perform_comprehensive_analysis(path)
 
 
-# ---- the flag surface itself ----------------------------------------------
+# ---- dim (a): plan pipeline is deleted --------------------------------------
 
 
-def test_default_is_arm_p_all_on():
-    assert all(prescription_flags().values())
+def test_analyzer_has_no_plan_generator():
+    """The generator and its fallback are gone — no method to call, so no plan
+    can be produced (the deletion is real, not gated)."""
+    assert not hasattr(ProjectAnalyzerTool, "_generate_execution_plan")
+    assert not hasattr(ProjectAnalyzerTool, "_generate_three_step_fallback_plan")
 
 
-def test_off_closes_all_five_and_per_dimension_override_wins(monkeypatch):
-    monkeypatch.setenv("SAG_PRESCRIPTIONS", "off")
-    monkeypatch.setenv("SAG_PRESCRIPTION_PLAN_PIPELINE", "on")
-    reset_prescription_flags_cache()
-    flags = prescription_flags()
-    assert flags["plan_pipeline"] is True  # a stage-2 mask bit
-    assert flags["recommendation_fields"] is False
-
-
-def test_unrecognized_value_raises_never_defaults(monkeypatch):
-    """Panel review P1: SAG_PRESCRIPTIONS=offf silently becoming arm P would
-    archive a run into the wrong experimental arm."""
-    monkeypatch.setenv("SAG_PRESCRIPTIONS", "offf")
-    reset_prescription_flags_cache()
-    with pytest.raises(ValueError):
-        prescription_flags()
-
-
-def test_mask_is_process_cached_for_pin_identity(monkeypatch):
-    """The run pin snapshots the mask once; behavior must not drift from it
-    when the env mutates mid-process."""
-    first = prescription_flags()
-    monkeypatch.setenv("SAG_PRESCRIPTIONS", "off")
-    assert prescription_flags() == first  # cached — no drift
-    reset_prescription_flags_cache()
-    assert not any(prescription_flags().values())
-
-
-def test_run_pin_carries_the_five_named_keys(arm_f):
-    flags = prescription_feature_flags()
-    assert sorted(flags) == sorted(f"prescription_{n}" for n in PRESCRIPTION_FLAG_NAMES)
-    assert not any(flags.values())
-
-
-def test_treatment_mask_parse_and_environment_round_trip():
-    mask = parse_treatment_mask("10010")
-    assert mask["plan_pipeline"] is True and mask["objectives_wording"] is True
-    assert mask["recommendation_fields"] is False
-    env = treatment_mask_environment(mask)
-    assert env["SAG_PRESCRIPTION_PLAN_PIPELINE"] == "on"
-    assert env["SAG_PRESCRIPTION_RECOMMENDATION_FIELDS"] == "off"
-    with pytest.raises(ValueError):
-        parse_treatment_mask("1001")  # wrong width
-    with pytest.raises(ValueError):
-        parse_treatment_mask("offf")
-
-
-# ---- dim (a): plan pipeline ------------------------------------------------
-
-
-def test_arm_f_never_calls_the_generator(arm_f, monkeypatch):
-    called = []
-    monkeypatch.setattr(
-        ProjectAnalyzerTool,
-        "_generate_execution_plan",
-        lambda self, analysis: called.append(1) or [],
-    )
+def test_analysis_has_no_execution_plan_field():
+    """The field is ABSENT from the fact sheet — never an empty list (an empty
+    list is still an observable plan-shaped signal)."""
     tool = ProjectAnalyzerTool(SurveyOrch())
     analysis = _analysis(tool)
-    assert not called  # NOT CALLED — simulated deletion, not hidden output
-    assert "execution_plan" not in analysis  # the FIELD is absent, not empty
+    assert "execution_plan" not in analysis
 
 
-def test_arm_f_metadata_has_no_plan_field_at_all(arm_f):
-    """Spec: the field is ABSENT from metadata/the control record — not an
-    empty list (an empty list is still an observable plan-shaped signal)."""
+def test_metadata_and_output_have_no_plan():
     tool = ProjectAnalyzerTool(SurveyOrch())
     result = tool.execute(action="analyze", project_path="/workspace/proj")
     assert "execution_plan" not in result.metadata
     assert "EXECUTION PLAN" not in result.output
 
 
-def test_arm_f_renders_facts_success_not_plan_failure(arm_f):
-    """Panel review P1: 'No execution plan generated' / 'Analysis failed'
-    injected a NEGATIVE signal into arm F beyond the deletion under test. A
-    successful facts-only survey renders as success."""
+def test_output_renders_facts_success_not_plan_failure():
+    """A successful facts-only survey renders as success — the deleted plan
+    path never injects a 'No execution plan generated' / 'Analysis failed'
+    negative signal."""
     tool = ProjectAnalyzerTool(SurveyOrch())
     result = tool.execute(action="analyze", project_path="/workspace/proj")
     assert "No execution plan generated" not in result.output
@@ -137,9 +73,9 @@ def test_arm_f_renders_facts_success_not_plan_failure(arm_f):
     assert "Survey complete" in result.output
 
 
-def test_arm_f_recommended_tests_hint_is_coordinates_only(arm_f):
-    """Panel review P1: the split-root test hint bypassed dim (b) — a
-    bigtop-shape recommendation must not render 'Recommended Tests' in F."""
+def test_split_root_test_hint_is_coordinates_only():
+    """A bigtop-shape recommendation renders 'Test coordinates', never
+    'Recommended Tests' (dim b)."""
     tool = ProjectAnalyzerTool(SurveyOrch())
     analysis = {
         "project_type": "Java",
@@ -160,17 +96,10 @@ def test_arm_f_recommended_tests_hint_is_coordinates_only(arm_f):
     assert "Recommended Build" not in out
 
 
-def test_arm_p_generator_and_metadata_unchanged(monkeypatch):
-    monkeypatch.delenv("SAG_PRESCRIPTIONS", raising=False)
-    tool = ProjectAnalyzerTool(SurveyOrch())
-    result = tool.execute(action="analyze", project_path="/workspace/proj")
-    assert result.metadata["execution_plan"]  # today's behavior intact
+# ---- dim (b): recommendation is coordinates only ----------------------------
 
 
-# ---- dim (b): recommendation action fields ---------------------------------
-
-
-def test_arm_f_recommendation_keeps_coordinates_drops_actions(arm_f):
+def test_recommendation_keeps_coordinates_drops_actions():
     tool = ProjectAnalyzerTool(SurveyOrch())
     result = tool.execute(action="analyze", project_path="/workspace/proj")
     rec = result.metadata.get("build_recommendation") or {}
@@ -179,7 +108,7 @@ def test_arm_f_recommendation_keeps_coordinates_drops_actions(arm_f):
     assert "Recommended Build" not in result.output
 
 
-def test_arm_f_trunk_recommendation_is_stripped(arm_f):
+def test_trunk_recommendation_is_stripped():
     from test_framework_survey import IntegrationCM
 
     cm = IntegrationCM()
@@ -190,26 +119,21 @@ def test_arm_f_trunk_recommendation_is_stripped(arm_f):
     assert "goal" not in rec and "rationale" not in rec
 
 
-# ---- dim (c): project brief -----------------------------------------------
+# ---- dim (c): project brief is not composed by the analyzer -----------------
 
 
-def test_arm_f_brief_not_generated(arm_f, monkeypatch):
-    composed = []
-    monkeypatch.setattr(
-        ProjectAnalyzerTool,
-        "_compose_project_brief",
-        lambda self, path, analysis: composed.append(1),
-    )
+def test_analyzer_does_not_compose_a_brief():
+    assert not hasattr(ProjectAnalyzerTool, "_compose_project_brief")
     tool = ProjectAnalyzerTool(SurveyOrch())
     analysis = _analysis(tool)
-    assert not composed  # no artifact, no ref, no projection
     assert "project_brief_ref" not in analysis
+    assert "project_brief_projection" not in analysis
 
 
-# ---- dim (d): objectives wording -------------------------------------------
+# ---- dim (d): objectives carry facts wording --------------------------------
 
 
-def test_arm_f_objectives_lose_recommendation_wording(arm_f):
+def test_objectives_carry_no_recommendation_wording():
     from sag.agent.react_engine import phase_objective
 
     build = phase_objective("build")
@@ -218,47 +142,34 @@ def test_arm_f_objectives_lose_recommendation_wording(arm_f):
     python_test = phase_objective("test", "python")
     for text in (build, analyze, test, python_test):
         assert "Recommended Build" not in text
-        assert "Recommended Tests" not in text  # panel review P1: test leaked
+        assert "Recommended Tests" not in text
     # The surviving semantics are intact: honest blocking and the bash ban.
     assert "compile target" in build
     assert "Never run mvn/gradle via bash" in build
     assert "pytest" in python_test  # ecosystem override still selected
 
 
-def test_arm_f_kickoff_tasks_lose_recommendation_wording(arm_f):
+def test_kickoff_tasks_carry_no_recommendation_wording():
     from sag.agent.react_engine import kickoff_phase_objectives
 
     tasks = kickoff_phase_objectives()
     for name in ("analyze", "build", "test"):
         assert "Recommended Build" not in tasks[name]
         assert "Recommended Tests" not in tasks[name]
-    # The kickoff softening survives the facts variant.
+    # The kickoff softening survives the facts wording.
     assert "not a Python/other-ecosystem project" in tasks["build"]
 
 
-def test_arm_p_kickoff_byte_identical():
-    from sag.agent.react_engine import KICKOFF_PHASE_OBJECTIVES, kickoff_phase_objectives
-
-    assert kickoff_phase_objectives() == KICKOFF_PHASE_OBJECTIVES
-
-
-def test_arm_p_objectives_byte_identical(monkeypatch):
-    monkeypatch.delenv("SAG_PRESCRIPTIONS", raising=False)
-    from sag.agent.react_engine import PHASE_OBJECTIVES, phase_objective
-
-    assert phase_objective("build") == PHASE_OBJECTIVES["build"]
-    assert phase_objective("analyze") == PHASE_OBJECTIVES["analyze"]
-
-
-def test_python_objectives_unaffected_by_dim_d(arm_f):
+def test_python_objectives_carry_no_recommendation_wording():
     from sag.agent.react_engine import PYTHON_PHASE_OBJECTIVES, phase_objective
 
-    # Python objectives carry no recommendation wording — dim (d) must not
-    # touch the ecosystem override path.
+    # Python objectives never carried "Recommended" wording; dim (d) leaves
+    # the ecosystem override path exactly as it was.
     assert phase_objective("build", "python") == PYTHON_PHASE_OBJECTIVES["build"]
+    assert "Recommended" not in PYTHON_PHASE_OBJECTIVES["build"]
 
 
-# ---- dim (e): pre-hoc python guidance vs the reactive allowlist ------------
+# ---- dim (e): pre-hoc python guidance closed; reactive steer stays ----------
 
 
 def _engine_with_python_rec(env=None):
@@ -267,27 +178,32 @@ def _engine_with_python_rec(env=None):
     return _engine_at(2, env if env is not None else _python_env())
 
 
-def test_arm_f_prehoc_python_guidance_closed(arm_f):
-    engine = _engine_with_python_rec()
-    assert engine._python_phase_guidance("build") is None
-    assert engine._python_phase_guidance("test") is None
+def test_no_prehoc_python_guidance_block_renders():
+    """dim (e) deleted: the pre-hoc python/native-first block is gone. There is
+    no `_python_phase_guidance` method and its distinctive wording never
+    reaches the intro."""
+    from test_python_phase_guidance import _engine_at, _python_env
+
+    assert not hasattr(_engine_with_python_rec(), "_python_phase_guidance")
+    build_intro = _engine_at(2, _python_env())._phase_intro_step().content
+    assert "build(action='deps') to create the venv" not in build_intro
+    assert "This package has a NATIVE core" not in build_intro
 
 
-def test_reactive_smoke_steer_is_allowlisted_not_a_dimension(arm_f):
+def test_reactive_smoke_steer_is_allowlisted_not_a_dimension():
     from sag.agent.react_engine import NATIVE_NOT_BUILT_TEST_GUIDANCE
 
     engine = _engine_with_python_rec()
-    # The steer keys off observed build-phase evidence, not the mask.
+    # The steer keys off observed build-phase evidence, never a mask.
     if engine._build_phase_lacked_success():
         assert engine._native_smoke_guidance("test") == NATIVE_NOT_BUILT_TEST_GUIDANCE
 
 
 def test_native_smoke_steer_carries_the_args_invocation_form():
-    # Reviewer-flagged missing regression: the smoke steer must show the
-    # STRUCTURED invocation coordinates — build(action='test', args=...) with a
-    # bounded --maxfail=1 — not just prose. The TVM 357-sweep root cause was a
-    # steer that read as pure prose, so the agent fell back to a bare
-    # build(action='test') full-suite sweep.
+    # The smoke steer must show the STRUCTURED invocation coordinates —
+    # build(action='test', args=...) with a bounded --maxfail=1 — not just
+    # prose. The TVM 357-sweep root cause was a steer that read as pure prose,
+    # so the agent fell back to a bare full-suite build(action='test') sweep.
     from sag.agent.react_engine import NATIVE_NOT_BUILT_TEST_GUIDANCE
 
     assert "args=" in NATIVE_NOT_BUILT_TEST_GUIDANCE
@@ -295,27 +211,25 @@ def test_native_smoke_steer_carries_the_args_invocation_form():
     assert "action='test'" in NATIVE_NOT_BUILT_TEST_GUIDANCE
 
 
-# ---- shared machinery identical in both arms --------------------------------
+# ---- shared machinery: retained coordinates + gates -------------------------
 
 
-def test_shared_gates_identical_across_arms(monkeypatch):
+def test_analysis_validity_is_facts_based():
+    """Validity keys off the survey facts (project identified + files found),
+    never plan generation (shared gate rework #1)."""
     analysis = {
         "project_type": "Python",
         "build_system": "pip/poetry",
         "existing_files": ["pyproject.toml"],
     }
     tool = ProjectAnalyzerTool(SurveyOrch())
-    monkeypatch.delenv("SAG_PRESCRIPTIONS", raising=False)
-    in_p = tool._is_analysis_valid(analysis)
-    monkeypatch.setenv("SAG_PRESCRIPTIONS", "off")
-    in_f = tool._is_analysis_valid(analysis)
-    assert in_p is in_f is True
+    assert tool._is_analysis_valid(analysis) is True
 
 
-def test_loop_redirect_reads_the_shared_manifest_identically_in_both_arms(monkeypatch):
-    """Panel review P1: the redirect read island goals from the trunk rec,
-    which dim (b) strips — P said 'maven install', F degraded to 'build'.
-    Both arms now read the shared manifest, goals included."""
+def test_loop_redirect_reads_island_goals_from_the_shared_manifest():
+    """The redirect reads island goals from the shared manifest (not the
+    stripped trunk rec), so the coordinates carry the recommended goal per
+    island."""
     import json
 
     from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
@@ -334,23 +248,13 @@ def test_loop_redirect_reads_the_shared_manifest_identically_in_both_arms(monkey
                 return {"success": True, "exit_code": 0, "output": json.dumps(manifest)}
             return {"success": True, "exit_code": 0, "output": ""}
 
-    def line_for_arm(env_value):
-        if env_value is None:
-            monkeypatch.delenv("SAG_PRESCRIPTIONS", raising=False)
-        else:
-            monkeypatch.setenv("SAG_PRESCRIPTIONS", env_value)
-        reset_prescription_flags_cache()
-        engine = _engine_at(2, _python_env())
-        engine.physical_validator = SimpleNamespace(docker_orchestrator=ManifestOrch())
-        return engine._untried_island_targets()
-
-    p_line = line_for_arm(None)
-    f_line = line_for_arm("off")
-    assert p_line == f_line
-    assert "'install'" in p_line and "'publishToMavenLocal'" in p_line
+    engine = _engine_at(2, _python_env())
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=ManifestOrch())
+    line = engine._untried_island_targets()
+    assert "'install'" in line and "'publishToMavenLocal'" in line
 
 
-def test_island_checklist_renders_without_goals(arm_f):
+def test_island_checklist_renders_coordinates_not_none():
     from sag.agent.module_coverage import coverage_checklist_line
 
     coverage = {"built_islands": [], "total_islands": 2}
@@ -394,21 +298,35 @@ def _initial_prompt_with_project_tool():
     )
 
 
-def test_arm_f_initial_prompt_carries_no_plan_claim(arm_f):
-    """Panel review P1: the REGISTERED surface is the ProjectTool facade —
-    masking only the inner analyzer description left 'analyze (detect build
-    system, plan)' in the initial prompt. Full prompt-level regression."""
+def test_initial_prompt_describes_analyze_as_survey_not_plan():
+    """The registered surface is the ProjectTool facade — the analyze
+    description is the survey wording, with no 'plan' claim."""
     prompt = _initial_prompt_with_project_tool()
+    assert "analyze (detect build system, plan)" not in prompt
     assert "plan)" not in prompt
     assert "survey the project; persist build facts" in prompt
 
 
-def test_arm_p_initial_prompt_unchanged():
-    prompt = _initial_prompt_with_project_tool()
-    assert "analyze (detect build system, plan)" in prompt
+# ---- historical collector harness: mask naming/parsing still intact ---------
+#
+# The scripts under scripts/ (collect_control_layer_ab.py, run_category3_*.py)
+# are HISTORICAL EVIDENCE TOOLING — they run against pinned old SHAs and still
+# express/verify treatment masks so the sealed panel evidence stays
+# reproducible. prescriptions.py keeps the PURE naming/parsing helpers they
+# call (no env reads, no process state). These tests guard that surface.
 
 
-# ---- collector: stage->mask binding + pin verification ---------------------
+def test_treatment_mask_parse_and_environment_round_trip():
+    mask = parse_treatment_mask("10010")
+    assert mask["plan_pipeline"] is True and mask["objectives_wording"] is True
+    assert mask["recommendation_fields"] is False
+    env = treatment_mask_environment(mask)
+    assert env["SAG_PRESCRIPTION_PLAN_PIPELINE"] == "on"
+    assert env["SAG_PRESCRIPTION_RECOMMENDATION_FIELDS"] == "off"
+    with pytest.raises(ValueError):
+        parse_treatment_mask("1001")  # wrong width
+    with pytest.raises(ValueError):
+        parse_treatment_mask("offf")
 
 
 def test_stage_mask_binding():
@@ -446,3 +364,13 @@ def test_pin_verification_uses_the_shared_naming_and_catches_drift():
     # Missing keys (pre-mask pin) are drift too, not a silent pass.
     with pytest.raises(CollectionError):
         _verify_prescription_pin(SimpleNamespace(feature_flags={}), f_mask)
+
+
+def test_flag_names_are_the_five_dimensions():
+    assert PRESCRIPTION_FLAG_NAMES == (
+        "plan_pipeline",
+        "recommendation_fields",
+        "project_brief",
+        "objectives_wording",
+        "python_prehoc_guidance",
+    )

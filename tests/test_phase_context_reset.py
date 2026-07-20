@@ -80,7 +80,6 @@ def test_phase_reset_injects_cumulative_typed_handoff(tmp_path):
     engine._get_timestamp = lambda: "2026-07-17T00:00:00Z"
     engine._detected_build_system = lambda: None
     engine._recommended_build_line = lambda phase: None
-    engine._python_phase_guidance = lambda phase: None
 
     engine._apply_phase_decision(record, decision)
 

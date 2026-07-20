@@ -22,9 +22,11 @@ Sections:
      manifest carries has_native_build=True; discovery/install target the
      python subdir. A plain-pyproject repo carries no native signal and its
      recommendation/manifest are byte-identical to the pre-change shape.
-  B. guidance: the build-phase intro of a native repo PREPENDS the native-first
-     block (build the native library first, then install from the detected
-     python root); a plain-python repo's intro is byte-identical to before.
+  B. guidance: dim (e) of the Category-3 analyzer diet DELETED the pre-hoc
+     native-first prose block. The native repo's build intro now carries the
+     python FACTS objective + coordinates only (no "build the native library
+     first" prose, no project brief); a plain-python repo likewise. The native
+     FACT still drives the REACTIVE smoke steer and the validator cap.
   C. validator: has_native_build + no built .so caps the build at PARTIAL with
      the reason "native core not built" (never BLOCKED — pure-python parts may
      still run); with a .so present the ladder is unchanged.
@@ -279,41 +281,42 @@ def _engine_at(phase_done_count, environment_summary):
     return engine
 
 
+# dim (e) deleted (Category-3 analyzer diet, 2026-07-20): the PRE-HOC
+# native-first guidance block is a prescription and is gone. The native FACT
+# (has_native_build) is retained on the recommendation/manifest and drives the
+# REACTIVE smoke steer and the validator's PARTIAL cap (sections A and C); it no
+# longer emits a pre-hoc "build the native library FIRST" prose block.
 _NATIVE_FIRST_MARKERS = (
     "NATIVE core",
     "CMakeLists.txt at the repo root",
     "Build the native library FIRST",
     "will not import without it",
-    "install the package from python",  # portable, project-relative package root
-    "Long native builds detach; poll with search",
 )
 
 
-def test_native_build_intro_prepends_native_first_block():
+def test_native_build_intro_has_no_prehoc_native_first_block():
     env = _env_from(_analyzed(_TVM_ROOT, _TVM_FILES)[0])
     intro = _engine_at(2, env)._phase_intro_step().content
+    # dim (e) deleted: no pre-hoc native-first prose.
     for marker in _NATIVE_FIRST_MARKERS:
-        assert marker in intro, f"missing native-first marker: {marker!r}"
-    # The native-first requirement PRECEDES the ordinary python deps/compile
-    # instruction in the single composed project brief.
+        assert marker not in intro, f"native-first prose should be gone: {marker!r}"
+    # The python FACTS objective + coordinates remain (physical substrate).
     assert "build(action='deps')" in intro
     assert "build(action='compile')" in intro
-    assert intro.index("Build the native library FIRST") < intro.index(
-        "Python project: use build(action='deps')"
-    )
+    assert f"Build coordinates: python at {_TVM_ROOT}/python." in intro
 
 
-def test_plain_python_intro_has_no_native_text_and_keeps_phase_contract_markers():
-    """Plain Python keeps its semantics without the native-only requirement."""
+def test_plain_python_intro_carries_facts_objective_and_coordinates():
+    """Plain Python keeps its semantics — the FACTS objective and coordinates,
+    no native prose, no project brief."""
     env = _env_from(_analyzed(_PLAIN_ROOT, _PLAIN_FILES)[0])
     intro = _engine_at(2, env)._phase_intro_step().content
     assert "NATIVE core" not in intro
     assert "native library FIRST" not in intro
-    assert intro.count("=== PROJECT BRIEF v1 ===") == 1
+    assert "=== PROJECT BRIEF v1 ===" not in intro  # dim (c) deleted
     assert "build(action='deps')" in intro
     assert "build(action='compile')" in intro
-    assert "root=. system=python goal=deps" in intro
-    assert "/workspace/.setup_agent/project_brief.json" in intro
+    assert f"Build coordinates: python at {_PLAIN_ROOT}." in intro
 
 
 # ---------------------------------------------------------------------------

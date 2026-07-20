@@ -3,8 +3,6 @@ from copy import deepcopy
 from types import SimpleNamespace
 
 from sag.agent.project_brief import PROJECT_BRIEF_PATH, ProjectBriefAdapter
-from sag.agent.react_engine import ReActEngine
-from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
 
 class _WorkspaceFiles:
@@ -148,68 +146,14 @@ def test_project_location_is_not_part_of_the_semantic_fingerprint():
     assert first.brief.model_dump(mode="json") == second.brief.model_dump(mode="json")
 
 
-def test_analyzer_hook_attaches_complete_brief_and_planner_projection():
-    orchestrator = _WorkspaceFiles()
-    analyzer = ProjectAnalyzerTool(docker_orchestrator=orchestrator)
-    analysis = _analysis()
-
-    analyzer._compose_project_brief(orchestrator.project_path, analysis)
-
-    assert analysis["project_brief"]["input_fingerprint"]
-    assert analysis["project_brief_ref"] == PROJECT_BRIEF_PATH
-    assert len(analysis["project_brief_projection"]) <= 1200
-    assert analysis["project_brief_cache_hit"] is False
-    assert PROJECT_BRIEF_PATH in analyzer._format_analysis_output(analysis)
-
-    trunk = SimpleNamespace(environment_summary={})
-    analyzer._record_environment_metrics(trunk, analysis)
-    assert trunk.environment_summary["project_brief_ref"] == PROJECT_BRIEF_PATH
-    assert (
-        trunk.environment_summary["project_brief_fingerprint"]
-        == analysis["project_brief"]["input_fingerprint"]
-    )
-    assert (
-        trunk.environment_summary["project_brief_projection"]
-        == analysis["project_brief_projection"]
-    )
-
-
-def test_phase_intro_consumes_brief_projection_without_legacy_duplicate_blocks():
-    projection = (
-        "=== PROJECT BRIEF v1 ===\nRECOMMENDED BUILD:\n- root=python system=python goal=deps"
-    )
-    trunk = SimpleNamespace(
-        environment_summary={
-            "build_system": "python",
-            "build_recommendation": {
-                "build_system": "python",
-                "build_root": "/workspace/project/python",
-                "goal": "deps",
-                "has_native_build": True,
-            },
-            "project_brief_projection": projection,
-            "project_brief_ref": PROJECT_BRIEF_PATH,
-        }
-    )
-    engine = ReActEngine.__new__(ReActEngine)
-    engine.phase_machine = SimpleNamespace(
-        current_phase="build",
-        digest_lines=lambda: ["• analyze [success]: project analyzed"],
-    )
-    engine.context_manager = SimpleNamespace(load_trunk_context=lambda: trunk)
-    engine.config = SimpleNamespace(
-        max_iterations=150,
-        phase_min_floors={},
-        phase_handoff_char_budget=6000,
-    )
-    engine._run_max_iterations = 150
-    engine.current_iteration = 5
-    engine.phase_handoff = None
-    engine.prompt_builder = None
-    engine._get_timestamp = lambda: "ts"
-
-    intro = engine._phase_intro_step().content
-
-    assert intro.count(projection) == 1
-    assert "NATIVE CORE FIRST" not in intro
-    assert "Recommended Build:" not in intro
+# dim (c) deleted (Category-3 analyzer diet, 2026-07-20): the analyzer no
+# longer composes or persists a project brief, and the phase intro no longer
+# consumes a brief projection. The former tests here —
+# test_analyzer_hook_attaches_complete_brief_and_planner_projection (drove the
+# deleted ProjectAnalyzerTool._compose_project_brief) and
+# test_phase_intro_consumes_brief_projection_without_legacy_duplicate_blocks
+# (drove the deleted brief-projection intro consumption) — were removed. The
+# facts-only equivalents live in tests/test_facts_only_behavior.py
+# (test_analyzer_does_not_compose_a_brief) and tests/test_python_phase_guidance.py
+# (the intros carry no PROJECT BRIEF block). The ProjectBriefAdapter/composer
+# unit tests below stay: the module is self-contained and still tested directly.
