@@ -339,6 +339,8 @@ def test_setup_agent_updates_complete_run_pin_after_clone(tmp_path):
         "prompt_bundle_sha256": "d" * 64,
         "feature_flags": {"control_events": True},
         "random_seed_or_null": None,
+        # The runner assigns a real run-order index; it must reach the pin.
+        "run_order_index": 5,
         "dependency_cache_state": "warm",
         "host_arch": "arm64",
     }
@@ -348,7 +350,57 @@ def test_setup_agent_updates_complete_run_pin_after_clone(tmp_path):
 
     pin = RunPin.model_validate_json((tmp_path / "run-pin.json").read_text(encoding="utf-8"))
     assert pin.target_repo_sha == "a" * 40
+    assert pin.run_order_index == 5
     assert mirrored == [(tmp_path / "run-pin.json").read_text(encoding="utf-8")]
+
+
+def _pin_template_agent(tmp_path):
+    class PinConfig(BaseModel):
+        thinking_model: str = "thinking-model"
+        action_model: str = "action-model"
+        max_iterations: int = 50
+
+    agent = object.__new__(SetupAgent)
+    agent._run_pin_host_path = tmp_path / "run-pin.json"
+    agent._run_pin_mirror = None
+    agent.config = PinConfig()
+    agent.react_engine = SimpleNamespace(prompts=PromptConfig({"system": "sys"}))
+    agent.phase_machine = object()
+    agent.agent_logger = SimpleNamespace(warning=lambda *_a, **_k: None)
+    agent._resolve_sag_git_sha = lambda: "a" * 40
+    agent._resolve_container_image_digest = lambda: "sha256:" + "b" * 64
+    return agent
+
+
+def test_run_pin_is_written_at_startup_even_without_a_target_sha(tmp_path):
+    """Item-3 regression: the pin write previously fired ONLY inside
+    _record_target_repo_sha, so a run that never observed a target SHA left NO
+    pin file at all (real 2026-07-19 S2-00000-r3). The template init now writes
+    the pin UNCONDITIONALLY with a null target SHA."""
+    agent = _pin_template_agent(tmp_path)
+
+    agent._initialize_run_pin_template()
+
+    pin_path = tmp_path / "run-pin.json"
+    assert pin_path.is_file(), "run pin must exist after startup even with no target SHA"
+    pin = RunPin.model_validate_json(pin_path.read_text(encoding="utf-8"))
+    assert pin.target_repo_sha is None
+    # The rest of the provenance is already complete at startup.
+    assert pin.sag_git_sha == "a" * 40
+    assert pin.container_image_digest == "sha256:" + "b" * 64
+
+
+def test_observed_target_sha_rewrites_the_startup_pin(tmp_path):
+    """The startup pin's null SHA is replaced the moment a real one is
+    observed — the collector's current-run validation requires the real SHA."""
+    agent = _pin_template_agent(tmp_path)
+    agent._initialize_run_pin_template()
+    pin_path = tmp_path / "run-pin.json"
+    assert RunPin.model_validate_json(pin_path.read_text(encoding="utf-8")).target_repo_sha is None
+
+    agent._record_target_repo_sha("f" * 40)
+
+    assert RunPin.model_validate_json(pin_path.read_text(encoding="utf-8")).target_repo_sha == "f" * 40
 
 
 def test_run_pin_hashes_the_complete_prompt_bundle(tmp_path):
@@ -372,3 +424,29 @@ def test_run_pin_hashes_the_complete_prompt_bundle(tmp_path):
     agent._initialize_run_pin_template()
 
     assert agent._run_pin_template["prompt_bundle_sha256"] != first
+
+
+def test_run_pin_template_reads_run_order_index_from_env(tmp_path, monkeypatch):
+    class PinConfig(BaseModel):
+        thinking_model: str = "thinking-model"
+        action_model: str = "action-model"
+        max_iterations: int = 50
+
+    agent = object.__new__(SetupAgent)
+    agent._run_pin_host_path = tmp_path / "run-pin.json"
+    agent.config = PinConfig()
+    agent.react_engine = SimpleNamespace(prompts=PromptConfig({"system": "sys"}))
+    agent.phase_machine = object()
+    agent.agent_logger = SimpleNamespace(warning=lambda *_a, **_k: None)
+    agent._resolve_sag_git_sha = lambda: "a" * 40
+    agent._resolve_container_image_digest = lambda: "sha256:" + "b" * 64
+
+    # The runner injects SAG_RUN_ORDER_INDEX; the template must carry it.
+    monkeypatch.setenv("SAG_RUN_ORDER_INDEX", "11")
+    agent._initialize_run_pin_template()
+    assert agent._run_pin_template["run_order_index"] == 11
+
+    # Absent (ad-hoc run) -> None, never a crash.
+    monkeypatch.delenv("SAG_RUN_ORDER_INDEX", raising=False)
+    agent._initialize_run_pin_template()
+    assert agent._run_pin_template["run_order_index"] is None

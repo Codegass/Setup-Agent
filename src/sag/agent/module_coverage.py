@@ -131,7 +131,11 @@ def _island_checklist_line(
     line = f"Recommended islands: {len(built_islands)}/{total} built"
     if remaining:
         items = "; ".join(
-            f"{isl.get('system') or 'build'} '{isl.get('goal') or 'build'}' in {isl['root']}"
+            (
+                f"{isl.get('system') or 'build'} '{isl['goal']}' in {isl['root']}"
+                if isl.get("goal")
+                else f"{isl.get('system') or 'build'} in {isl['root']}"
+            )
             for isl in remaining[:limit]
         )
         line += f" · remaining: {items}"

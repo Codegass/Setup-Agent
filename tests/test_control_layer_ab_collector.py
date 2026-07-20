@@ -26,6 +26,9 @@ PIN = {
     "prompt_bundle_sha256": "d" * 64,
     "feature_flags": {"control_scheduler": True},
     "random_seed_or_null": 17,
+    # A REAL run-order index (the runner now assigns it per run, sequential
+    # across the campaign plan) rather than the historical None placeholder.
+    "run_order_index": 7,
     "dependency_cache_state": "warm",
     "host_arch": "arm64",
 }
@@ -269,7 +272,95 @@ def test_legacy_adapter_prefers_structured_physical_report_metrics(tmp_path):
     assert record.metrics.unique_errors == 89
     assert record.metrics.raw_executions == 4928
     assert record.metrics.conflicts == ("test_errors_detected",)
-    assert str(setup / "report_metrics.json") in record.structured_inputs
+    # Path relativized at generation time (item 5): the record leaks no absolute
+    # host worktree path, but still names the artifact by its tail.
+    assert any(
+        entry.endswith("report_metrics.json") for entry in record.structured_inputs
+    )
+    for entry in record.structured_inputs:
+        assert not entry.startswith("/"), entry
+
+
+def _valid_session_at(base: Path, session_name: str = "session_20260719_x") -> Path:
+    """A complete session (valid pin + verdict + events + token csv) under base."""
+    session = base / "logs" / session_name
+    setup = session / ".setup_agent"
+    setup.mkdir(parents=True)
+    (setup / "run-pin.json").write_text(json.dumps(PIN), encoding="utf-8")
+    (setup / "verdict.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "run_id": "run-1",
+                "finalized_at": "2026-07-19T12:00:00Z",
+                "verdict": "success",
+                "build_evidence": {
+                    "observed": True,
+                    "green": True,
+                    "outcome": "success",
+                    "evidence_status": "verified",
+                    "refs": [],
+                    "compiled_classes": 10,
+                },
+                "test_stats": {
+                    "discovered": 5,
+                    "unique": {"executed": 5, "passed": 5, "failed": 0, "errors": 0, "skipped": 0},
+                    "raw": {"executed": 5, "passed": 5, "failed": 0, "errors": 0, "skipped": 0},
+                    "flaky_count": 0,
+                    "judgment": "success",
+                },
+                "conflicts": [],
+                "phase_records": [],
+                "input_refs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (setup / "control_events.jsonl").write_text(
+        '{"sequence":1,"kind":"evidence_close","payload":{"reason":"test_terminated"}}\n',
+        encoding="utf-8",
+    )
+    (session / "token_usage.csv").write_text(
+        "model_type,total_tokens\nthinking,100\naction,50\n", encoding="utf-8"
+    )
+    return session
+
+
+def test_collector_relativizes_all_paths_no_host_leak(tmp_path):
+    # Item 5: a session materialized OUTSIDE the repo (a throwaway panel
+    # worktree) must yield a record whose session_path and every
+    # structured_inputs entry are relative — no absolute host path leaks into
+    # the committed, hand-verified evidence. The <worktree> placeholder anchors
+    # at the logs/ segment so the artifact is still identifiable.
+    session = _valid_session_at(tmp_path / "wt-abc123")
+
+    record = ABCollector().collect(session)
+
+    host_prefix = str(tmp_path)
+    assert not record.session_path.startswith("/")
+    assert host_prefix not in record.session_path
+    assert record.session_path.startswith("<worktree>/logs/session_")
+    assert len(record.structured_inputs) >= 3  # pin + events + token + verdict
+    for entry in record.structured_inputs:
+        assert not entry.startswith("/"), entry
+        assert host_prefix not in entry, entry
+        assert entry.startswith("<worktree>/logs/session_"), entry
+
+
+def test_collector_relativizes_in_repo_session_to_repo_relative(tmp_path, monkeypatch):
+    # A run that lives UNDER this checkout relativizes to a repo-root-relative
+    # path (no <worktree> placeholder, no leading slash).
+    from scripts import collect_control_layer_ab as mod
+
+    repo_root = tmp_path / "checkout"
+    session = _valid_session_at(repo_root, session_name="session_in_repo")
+    monkeypatch.setattr(mod, "_REPO_ROOT_FOR_RELATIVIZE", repo_root.resolve())
+
+    record = ABCollector().collect(session)
+    assert record.session_path == "logs/session_in_repo"
+    assert not record.session_path.startswith("<worktree>")
+    for entry in record.structured_inputs:
+        assert entry.startswith("logs/session_in_repo"), entry
 
 
 def test_collector_counts_the_live_token_csv_type_column(tmp_path):
@@ -398,6 +489,54 @@ def test_campaign_rejects_duplicate_run_ids_and_pin_drift(tmp_path):
     )
     with pytest.raises(CollectionError, match="pin mismatch"):
         campaign.append("paramiko", "ws7", changed)
+
+
+def test_campaign_append_allows_two_runs_differing_only_in_run_order_index(tmp_path):
+    """Repeat runs under one probe/stage carry different run_order_index values
+    (their position in the campaign's total order). That difference alone MUST
+    NOT be rejected as pin drift — every other pin field still matches (P1)."""
+    session = _session(tmp_path)
+    record = ABCollector().collect(session)
+    assert record.pin.run_order_index == PIN["run_order_index"]
+    campaign = CampaignStore(tmp_path / "campaign")
+
+    first = campaign.append("paramiko", "ws7", record)
+    # Same arm, second run: identical pin EXCEPT a later run_order_index.
+    second_record = record.model_copy(
+        update={
+            "run_id": "run-2",
+            "pin": record.pin.model_copy(
+                update={"run_order_index": record.pin.run_order_index + 3}
+            ),
+        }
+    )
+    campaign.append("paramiko", "ws7", second_record)
+
+    payload = json.loads(Path(first).read_text(encoding="utf-8"))
+    assert [r["run_id"] for r in payload["runs"]] == ["run-1", "run-2"]
+    # The differing index stays recorded verbatim on each pin (not normalized).
+    indices = [r["pin"]["run_order_index"] for r in payload["runs"]]
+    assert indices == [PIN["run_order_index"], PIN["run_order_index"] + 3]
+
+
+def test_campaign_append_rejects_non_index_drift_even_with_matching_index(tmp_path):
+    """Excluding run_order_index from the pin comparison must not weaken any
+    other check: a run whose index matches but whose sag_git_sha (or any other
+    field) drifted is still rejected as a pin mismatch (P1)."""
+    session = _session(tmp_path)
+    record = ABCollector().collect(session)
+    campaign = CampaignStore(tmp_path / "campaign")
+    campaign.append("paramiko", "ws7", record)
+
+    drifted = record.model_copy(
+        update={
+            "run_id": "run-2",
+            # run_order_index intentionally UNCHANGED; a different pin field drifts.
+            "pin": record.pin.model_copy(update={"sag_git_sha": "e" * 40}),
+        }
+    )
+    with pytest.raises(CollectionError, match="pin mismatch"):
+        campaign.append("paramiko", "ws7", drifted)
 
 
 def _populate_valid_six_bar_campaign(tmp_path, *, current_stage="ws7"):
@@ -553,6 +692,7 @@ def test_current_run_pin_requires_exact_host_container_mirrors(tmp_path):
     )
 
     assert pin.model_dump(mode="json") == PIN
+    assert pin.run_order_index == 7
     (setup / "run-pin.json").write_text(canonical + "\n", encoding="utf-8")
     assert (
         _validate_current_run_pin(

@@ -88,6 +88,136 @@ def test_python_projects_are_exempt():
     assert coverage_checklist_line(None) is None
 
 
+def _httpcomponents_validator():
+    """Live httpcomponents-client shape: a Maven packaging=pom reactor root
+    (aggregator shell, zero own sources) over 5 real modules that all built and
+    tested. scan_modules marks the root aggregator_shell=True; the coverage
+    summary must exclude it so the ratio reads 5/5, not 5/6."""
+    modules = [
+        {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+         "report_dirs": [], "has_test_sources": False, "aggregator_shell": True},
+    ]
+    for i in range(1, 6):
+        modules.append({
+            "path": f"module{i}", "name": f"module{i}",
+            "class_count": 100 + i, "jar_count": 1,
+            "report_dirs": [f"/x/module{i}/target/surefire-reports"],
+            "has_test_sources": True,
+        })
+    return FakeValidator(
+        primary="maven",
+        by_system={"maven": modules},
+        tests_by_path={
+            f"module{i}": {"tests_total": 400 + i, "tests_passed": 400 + i,
+                           "failing_count": 0}
+            for i in range(1, 6)
+        },
+    )
+
+
+def test_aggregator_shell_root_excluded_from_module_ratio():
+    """httpcomponents regression: the packaging=pom root must not count as an
+    unbuilt denominator entry. 5/5 built, no build_modules_incomplete conflict."""
+    coverage = module_coverage(_httpcomponents_validator(), "httpcomponents-client")
+    assert coverage is not None
+    summary = coverage["summary"]
+    assert summary["modules_total"] == 5
+    assert summary["modules_built"] == 5
+    # the shell row still ships for display/debug — it is not deleted, just uncounted
+    paths = {m["path"] for m in coverage["modules"]}
+    assert "." in paths
+    # the '5/6 built' cap is gone: no coverage conflict on the shell
+    assert coverage_conflicts(coverage) == ()
+
+
+def test_aggregator_shell_verdict_folds_to_success():
+    """End-to-end: with the shell uncounted, an otherwise-green run seals SUCCESS
+    (the httpcomponents cap folded it to partial)."""
+    from sag.agent.evidence_state import EvidenceRole, StateScope
+    from sag.agent.evidence_state import RunEvidenceState as _RunEvidenceState
+    from sag.agent.verdict_finalizer import EvidenceCloseReason, VerdictFinalizer
+    from sag.evidence import EvidenceStatus, OperationOutcome, TestStats
+    from sag.tools.base import ToolResult
+
+    class RunEvidenceState(_RunEvidenceState):
+        def ingest_tool_result(self, scope, tool_name, result, provenance=None, *, roles=()):
+            explicit = list(roles)
+            if not explicit:
+                if scope is StateScope.ARTIFACTS:
+                    explicit.append(EvidenceRole.BUILD)
+                if result.test_stats is not None:
+                    explicit.append(EvidenceRole.TEST)
+            return super().ingest_tool_result(scope, tool_name, result, provenance, roles=explicit)
+
+    inner = _httpcomponents_validator()
+
+    class Orch:
+        def __init__(self):
+            self.files = {}
+
+        def execute_command(self, command):
+            if command.startswith("mkdir -p "):
+                return {"success": True, "exit_code": 0, "output": ""}
+            if command.startswith("test -f ") and " && cat " in command:
+                path = command.split()[2]
+                if path not in self.files:
+                    return {"success": False, "exit_code": 1, "output": ""}
+                return {"success": True, "exit_code": 0, "output": self.files[path]}
+            if command.startswith("cat > "):
+                path = command.split()[2]
+                self.files[path] = command.split("\n", 1)[1].rsplit("\n", 1)[0] + "\n"
+                return {"success": True, "exit_code": 0, "output": ""}
+            if command.startswith("truncate -s -1 "):
+                path = command.split()[-1]
+                self.files[path] = self.files[path][:-1]
+                return {"success": True, "exit_code": 0, "output": ""}
+            if command.startswith("mv "):
+                _, src, tgt = command.split()
+                self.files[tgt] = self.files.pop(src)
+                return {"success": True, "exit_code": 0, "output": ""}
+            return {"success": True, "exit_code": 0, "output": ""}
+
+    class V:
+        project_path = "/workspace"
+
+        def __init__(self, cov):
+            self._cov = cov
+
+        def validate_build_status(self, project_name):
+            return {"success": True, "build_complete": True, "reason": "all compiled",
+                    "conflicts": [], "evidence_status": "success",
+                    "evidence": {"class_count": 515}}
+
+        def _detect_build_system(self, project_dir):
+            return self._cov._detect_build_system(project_dir)
+
+        def scan_modules(self, project_dir, build_system):
+            return self._cov.scan_modules(project_dir, build_system)
+
+        def parse_module_test_reports(self, module_dir, report_dirs):
+            return self._cov.parse_module_test_reports(module_dir, report_dirs)
+
+    state = RunEvidenceState(run_id="session-httpcomponents")
+    state.ingest_tool_result(
+        StateScope.ARTIFACTS, "build",
+        ToolResult.completed_success(output="all modules built", refs=["output_build"]),
+        provenance="output_build",
+    )
+    state.ingest_tool_result(
+        StateScope.TEST_RUNTIME, "build",
+        ToolResult.completed_success(
+            output="green",
+            test_stats=TestStats(discovered=2255, executed=2255, passed=2255, failed=0, skipped=0),
+            refs=["output_tests"],
+        ),
+        provenance="output_tests",
+    )
+    finalizer = VerdictFinalizer(Orch(), validator=V(inner), project_name="httpcomponents-client")
+    snapshot = finalizer.finalize(state, EvidenceCloseReason.TEST_TERMINATED)
+    assert "build_modules_incomplete" not in snapshot.conflicts
+    assert snapshot.verdict == "success"
+
+
 def test_checklist_line_names_built_and_unbuilt_modules():
     line = coverage_checklist_line(module_coverage(_bigtop_validator(), "bigtop"))
     assert line is not None
@@ -179,15 +309,27 @@ from sag.agent.react_engine import ReActEngine
 
 
 def _loop_engine(islands, observed_workdirs):
+    """The redirect reads islands from the SHARED manifest (panel review: the
+    trunk recommendation is projected by treatment dim (b), so sourcing there
+    made the allowlisted loop differ across arms)."""
+    import json
+
+    from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
+
     engine = ReActEngine.__new__(ReActEngine)
 
-    class FakeCM:
-        def load_trunk_context(self):
-            return SimpleNamespace(
-                environment_summary={"build_recommendation": {"build_islands": islands}}
-            )
+    class ManifestOrch:
+        def execute_command(self, command, **kwargs):
+            if command == f"cat {REQUIREMENTS_PATH}":
+                return {
+                    "success": True,
+                    "exit_code": 0,
+                    "output": json.dumps({"build_islands": islands}),
+                }
+            return {"success": True, "exit_code": 0, "output": ""}
 
-    engine.context_manager = FakeCM()
+    engine.physical_validator = SimpleNamespace(docker_orchestrator=ManifestOrch())
+    engine.context_manager = SimpleNamespace(load_trunk_context=lambda: None)
     engine.run_evidence_state = SimpleNamespace(
         tool_observations=tuple(
             SimpleNamespace(params={"working_directory": wd}) for wd in observed_workdirs

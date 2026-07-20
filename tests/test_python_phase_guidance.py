@@ -201,6 +201,54 @@ def test_maven_test_intro_matches_control_layer_contract():
 
 
 # ---------------------------------------------------------------------------
+# B'. dimension-applicability gate: dim e (python_prehoc_guidance) is a
+# byte-identical NO-OP for a Maven-shaped probe, so masks 00001 (e kept) and
+# 00000 (e removed) produce BYTE-EQUAL build+test intros. This is the evidence
+# for the reviewer ruling that e is non-identifying / ABSTAIN on HTTP and thus
+# authorized for deletion (spec §Stage-2 dimension-applicability gate).
+# ---------------------------------------------------------------------------
+def _maven_intros_under_mask(mask, monkeypatch):
+    """Build+test Maven intros with the exact five-bit prescription mask set via
+    the same env the runner injects; the cache is reset so the env is re-read."""
+    from sag.config.prescriptions import (
+        PRESCRIPTION_FLAG_NAMES,
+        reset_prescription_flags_cache,
+    )
+
+    for name, bit in zip(PRESCRIPTION_FLAG_NAMES, mask):
+        monkeypatch.setenv(f"SAG_PRESCRIPTION_{name.upper()}", "on" if bit == "1" else "off")
+    monkeypatch.setenv("SAG_PRESCRIPTIONS", "on" if set(mask) == {"1"} else "off")
+    reset_prescription_flags_cache()
+    build_intro = _engine_at(2, _MAVEN_ENV)._phase_intro_step().content
+    test_intro = _engine_at(3, _MAVEN_ENV)._phase_intro_step().content
+    reset_prescription_flags_cache()
+    return build_intro, test_intro
+
+
+def test_maven_dual_mask_e_is_byte_identical_noop(monkeypatch):
+    """dim e reads only python build/test guidance; _python_phase_guidance
+    returns None for a non-python (Maven) probe. So toggling e alone — mask
+    00001 (e kept) vs 00000 (e removed) — leaves the Maven build AND test
+    intros byte-identical: e is an inactive, non-identifying dimension for HTTP.
+    (Real 2026-07-19 Stage-2: 00001 vs 00000 Maven build+test intros byte-equal
+    for the failing httpcomponents rep.)"""
+    keep_e_build, keep_e_test = _maven_intros_under_mask("00001", monkeypatch)
+    drop_e_build, drop_e_test = _maven_intros_under_mask("00000", monkeypatch)
+
+    assert keep_e_build == drop_e_build, "dim e must be a byte-identical no-op on the Maven build intro"
+    assert keep_e_test == drop_e_test, "dim e must be a byte-identical no-op on the Maven test intro"
+    # The byte-equal intros are the real, substantive Maven contract (not empty
+    # strings). No python guidance ever renders on either mask — dim e's block
+    # abstains for a non-python probe, which is the whole point.
+    assert "=== PHASE: BUILD ===" in keep_e_build
+    assert "build(action='compile')" in keep_e_build
+    assert "=== PHASE: TEST ===" in keep_e_test
+    assert "build(action='test')" in keep_e_test
+    assert PYTHON_BUILD_PHASE_GUIDANCE not in keep_e_build
+    assert PYTHON_TEST_PHASE_GUIDANCE not in keep_e_test
+
+
+# ---------------------------------------------------------------------------
 # C. analyzer emits the canonical python signal on the recommendation
 # ---------------------------------------------------------------------------
 
@@ -262,10 +310,12 @@ def test_kickoff_other_phases_identical_to_runtime_objectives():
 
 
 def test_agent_authors_kickoff_plan_from_kickoff_objectives():
-    """agent.py authors the t=0 trunk tasks from the kickoff variant, not the
-    runtime PHASE_OBJECTIVES (source-level wiring guard)."""
+    """agent.py authors the t=0 trunk tasks from the MASK-AWARE kickoff
+    selector (panel review P2: the kickoff surface must carry the same
+    wording arm as the runtime intros), not the runtime PHASE_OBJECTIVES
+    (source-level wiring guard)."""
     source = inspect.getsource(agent_module)
-    assert "KICKOFF_PHASE_OBJECTIVES" in source
+    assert "kickoff_phase_objectives()" in source
 
 
 # ---------------------------------------------------------------------------

@@ -3734,17 +3734,71 @@ class PhysicalValidator:
             )
             has_test_sources = "EXISTS" in (tst.get("output") or "")
 
-            modules.append(
-                {
-                    "path": rel,
-                    "name": name,
-                    "class_count": class_count,
-                    "jar_count": jar_count,
-                    "report_dirs": report_dirs,
-                    "has_test_sources": has_test_sources,
-                }
-            )
+            record = {
+                "path": rel,
+                "name": name,
+                "class_count": class_count,
+                "jar_count": jar_count,
+                "report_dirs": report_dirs,
+                "has_test_sources": has_test_sources,
+            }
+
+            # Aggregator-shell detection (root record only, in a MULTI-module
+            # scan). Live httpcomponents-client: the reactor root is a Maven
+            # packaging=pom aggregator with zero sources — it produces nothing
+            # by design, yet it was counted as an unbuilt denominator entry,
+            # capping "5/6 built" and folding the verdict to partial while all 5
+            # real modules built and tested. A shell is not an unbuildable
+            # module; it is scaffolding. We mark it here so the summary can
+            # exclude it from the built/total ratio (the row still ships for
+            # display/debug).
+            #
+            # Detected PHYSICALLY, never project-bound: the root must have
+            # submodules AND zero own artifacts (0 classes, 0 jars), then the
+            # missing packaging semantics confirm it — maven: root pom.xml
+            # declares <packaging>pom</packaging>; gradle: the root has no build
+            # sources (no src/main). A root WITH its own sources or artifacts
+            # (commons-chain's 33 classes) never trips this and stays counted
+            # byte-identically. Single-module scans (no submodules) are exempt:
+            # the sole module is the project, not a shell.
+            if (
+                rel == "."
+                and len(module_dirs) > 1
+                and (class_count or 0) == 0
+                and (jar_count or 0) == 0
+                and self._is_aggregator_shell_root(module_dir, build_system)
+            ):
+                record["aggregator_shell"] = True
+
+            modules.append(record)
         return modules
+
+    def _is_aggregator_shell_root(self, root_dir: str, build_system: str) -> bool:
+        """Probe whether the root is a pure aggregator with no own sources.
+
+        Confirms the missing packaging semantics for a root that already has
+        zero compiled artifacts (the caller guards on that). Maven: the root
+        pom.xml declares ``<packaging>pom</packaging>``. Gradle: the root has no
+        ``src/main`` build sources. Either signal means the root builds nothing
+        of its own and must not count as an unbuilt module. Never raises: an
+        unreadable probe returns False, preserving today's counted behavior.
+        """
+        if build_system == "gradle":
+            # No root build sources -> the root aggregates subprojects only.
+            chk = self._execute_command_with_logging(
+                f"test -d {root_dir}/src/main && echo EXISTS",
+                "checking root gradle sources",
+            )
+            return "EXISTS" not in (chk.get("output") or "")
+
+        # Maven: read <packaging>pom</packaging> from the root pom. grep is
+        # whitespace-tolerant; the shell echo makes a match unambiguous.
+        chk = self._execute_command_with_logging(
+            f"grep -q '<packaging>[[:space:]]*pom[[:space:]]*</packaging>' "
+            f"{root_dir}/pom.xml && echo POM",
+            "reading root maven packaging",
+        )
+        return "POM" in (chk.get("output") or "")
 
     def parse_module_test_reports(self, module_dir: str, report_dirs: List[str]) -> Dict[str, any]:
         """Parse one module's JUnit XML report dirs into counts + failing names.

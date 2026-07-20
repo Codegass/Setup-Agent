@@ -657,3 +657,53 @@ def test_final_report_matcher_finds_report_phase_task():
     assert trunk.key_results_updates and trunk.key_results_updates[0][0] == "phase_report"
     # Phase tasks stay current until phase(action='done') closes them.
     assert cm.current_task_id == "phase_report"
+
+
+# --- analyzer-diet shared gate rework #4: survey facts, not todo count -----
+
+
+ANALYZE_ACTION = {
+    "type": "action",
+    "tool_name": "project",
+    "success": True,
+    "output": "=== PROJECT ANALYSIS COMPLETED ===\nbuild system: maven",
+}
+
+
+def _analyze_cm(env=None, history=None):
+    """Legacy trunk (4 original tasks, NO plan->todo expansion) whose
+    env-summary optionally carries the persisted survey facts."""
+    task = FakeTask("task_2", "Use project_analyzer to analyze project structure")
+    trunk = FakeTrunk([task] * 4)
+    trunk.environment_summary = env or {}
+    return SimpleNamespace(
+        current_task_id="task_2",
+        load_branch_history=lambda task_id: SimpleNamespace(history=history or [ANALYZE_ACTION]),
+        load_trunk_context=lambda: trunk,
+    )
+
+
+def test_analyze_task_facts_only_completion_passes():
+    """Analyzer-diet spec, gate rework #4 regression: a legacy run whose
+    analyze persisted SURVEY FACTS but expanded no todos (facts-only
+    completion) must pass — the todo_list > 4 arithmetic is superseded."""
+    cm = _analyze_cm(env={"survey": {"analyzer_version": 7}, "build_system": "Maven"})
+    result = ContextTool(cm)._validate_task_completion(
+        _task("Use project_analyzer to analyze project structure"),
+        summary="Analyzed the project; facts persisted to the trunk.",
+        key_results="maven; survey facts recorded",
+    )
+    assert result["valid"] is True
+
+
+def test_analyze_task_rejected_without_persisted_survey_facts():
+    """The replacement criterion still gates: analyze evidence in history but
+    NOTHING persisted to the trunk env-summary is an incomplete analysis."""
+    cm = _analyze_cm(env={})
+    result = ContextTool(cm)._validate_task_completion(
+        _task("Use project_analyzer to analyze project structure"),
+        summary="Analyzed the project.",
+        key_results="looks like maven",
+    )
+    assert result["valid"] is False
+    assert "survey facts" in result["reason"]
