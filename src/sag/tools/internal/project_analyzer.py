@@ -78,25 +78,12 @@ class ProjectAnalyzerTool(BaseTool):
     """Tool for analyzing project structure and generating intelligent execution plans."""
 
     def __init__(self, docker_orchestrator=None, context_manager=None):
-        from sag.config.prescriptions import prescription_flags
-
-        if prescription_flags()["plan_pipeline"]:
-            description = (
-                "Analyze cloned project structure, requirements, and documentation to generate intelligent execution plan. "
-                "This tool reads README files, analyzes build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts), "
-                "detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), and creates optimized task lists for "
-                "Maven and Gradle projects. Essential for intelligent project setup planning."
-            )
-        else:
-            # dim (a): the tool must not CLAIM plan generation it will not do
-            # (panel review: a prompt surface contradicting the persisted
-            # behavior confounds the arms).
-            description = (
-                "Survey the cloned project's structure, requirements, and documentation, and persist the machine facts. "
-                "This tool reads README files, analyzes build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts), "
-                "detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), and records the survey facts "
-                "(manifest + trunk metrics) the build/test phases consume."
-            )
+        description = (
+            "Survey the cloned project's structure, requirements, and documentation, and persist the machine facts. "
+            "This tool reads README files, analyzes build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts), "
+            "detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), and records the survey facts "
+            "(manifest + trunk metrics) the build/test phases consume."
+        )
         super().__init__(
             name="project_analyzer",
             description=description,
@@ -172,7 +159,7 @@ class ProjectAnalyzerTool(BaseTool):
                 # env would still pick the wrong phase objective (re-review
                 # 2026-07-19: ignoring this return let 'created' stand over a
                 # failed trunk save).
-                if not self._update_trunk_context_with_plan(analysis):
+                if not self._update_trunk_context_with_facts(analysis):
                     return "failed"
             # Success is what the READERS can see: the re-read manifest must
             # carry THIS survey's stamp — a stale file left on disk keeps the
@@ -308,7 +295,7 @@ class ProjectAnalyzerTool(BaseTool):
 
                 # Step 4: Update context if requested
                 if update_context and self.context_manager:
-                    success = self._update_trunk_context_with_plan(analysis_result)
+                    success = self._update_trunk_context_with_facts(analysis_result)
                     if success:
                         analysis_result["context_updated"] = True
                     else:
@@ -317,7 +304,7 @@ class ProjectAnalyzerTool(BaseTool):
 
                 return ToolResult.completed_success(
                     output=self._format_analysis_output(analysis_result),
-                    metadata=self._prescription_projected_metadata(analysis_result),
+                    metadata=self._facts_projected_metadata(analysis_result),
                 )
             else:
                 return ToolResult.completed_failure(
@@ -349,23 +336,16 @@ class ProjectAnalyzerTool(BaseTool):
                 error_code="ANALYSIS_EXCEPTION",
             )
 
-    def _prescription_projected_metadata(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
+    def _facts_projected_metadata(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """The analysis as recorded in ToolResult.metadata / the control
-        record, under the treatment mask: dim (a) keeps the plan out, dim (b)
-        keeps goal/rationale strings out. All-on returns the dict unchanged
-        (arm P byte-identical)."""
-        from sag.config.prescriptions import prescription_flags
-
-        flags = prescription_flags()
-        if flags["plan_pipeline"] and flags["recommendation_fields"]:
-            return analysis
+        record: facts only. The plan is absent (dim a deleted) and the build
+        recommendation carries coordinate FACTS only — no goal/rationale
+        strings (dim b deleted)."""
         projected = dict(analysis)
-        if not flags["plan_pipeline"]:
-            projected.pop("execution_plan", None)
-        if not flags["recommendation_fields"]:
-            projected["build_recommendation"] = _strip_recommendation_prescriptions(
-                projected.get("build_recommendation")
-            )
+        projected.pop("execution_plan", None)
+        projected["build_recommendation"] = _strip_recommendation_prescriptions(
+            projected.get("build_recommendation")
+        )
         return projected
 
     def _perform_comprehensive_analysis(self, project_path: str) -> Dict[str, Any]:
@@ -380,7 +360,6 @@ class ProjectAnalyzerTool(BaseTool):
             "test_framework": "unknown",
             "documentation": {},
             "special_requirements": [],
-            "execution_plan": [],
             "static_test_count": None,  # Add static test count field
         }
 
@@ -446,30 +425,12 @@ class ProjectAnalyzerTool(BaseTool):
         except Exception as exc:
             logger.warning(f"Build-approach recommendation failed: {exc}")
 
-        # Step 5: 生成智能执行计划
-        from sag.config.prescriptions import prescription_flags
+        # dim (a) deleted: no execution plan is generated and the field is
+        # absent from the fact sheet (never an empty list).
+        analysis.pop("execution_plan", None)
 
-        flags = prescription_flags()
-        if flags["plan_pipeline"]:
-            analysis["execution_plan"] = self._generate_execution_plan(analysis)
-        else:
-            # Treatment mask dim (a): the generator is NOT CALLED and the
-            # FIELD IS ABSENT (spec: removed from metadata/control record,
-            # not empty) — the deletion is simulated, not hidden.
-            analysis.pop("execution_plan", None)
-
-        # One deterministic role-typed composition pass owns all build/test
-        # planner guidance. Persistence failure is evidence, not a reason to
-        # discard an otherwise valid project analysis.
-        try:
-            if flags["project_brief"]:
-                self._compose_project_brief(project_path, analysis)
-            # dim (c) off: no artifact, no ref, no projection — the analyze
-            # output's brief line and the trunk brief keys render only when
-            # the ref exists.
-        except Exception as exc:
-            analysis["project_brief_error"] = type(exc).__name__
-            logger.warning(f"Project brief composition failed: {exc}")
+        # dim (c) deleted: no project_brief artifact, ref, or projection is
+        # composed — the analyze output and trunk carry the survey facts only.
 
         return analysis
 
@@ -809,26 +770,6 @@ class ProjectAnalyzerTool(BaseTool):
 
         return island_root_for(self.docker_orchestrator, project_path, source_dir)
 
-    def _island_build_goal(self, root: str, system: Optional[str]) -> str:
-        """The recommended build action (GOAL) for one independent island.
-
-        LIVE EVIDENCE (bigtop re-probe): the transaction-queue gradle island died
-        13x resolving org.apache.bigtop:bigpetstore-data-generator:3.5.0-SNAPSHOT
-        from file:/root/.m2/... — an artifact the data-generators island PRODUCES
-        but only if it PUBLISHES to the local maven repo, which a bare `build`
-        never does. This is the gradle-island version of the reactor-install
-        lesson (a maven island `install`s so siblings resolve its artifact).
-
-        So: maven island -> 'install'; gradle island whose build.gradle(.kts)
-        applies the maven-publish plugin -> 'publishToMavenLocal' (it publishes a
-        SNAPSHOT other islands consume); every other gradle island -> 'build'.
-        """
-        if system == "maven":
-            return "install"
-        if system == "gradle" and self._island_applies_maven_publish(root):
-            return "publishToMavenLocal"
-        return "build"
-
     def _island_applies_maven_publish(self, root: str) -> bool:
         from sag.agent.physical_survey import island_applies_maven_publish
 
@@ -1069,211 +1010,11 @@ class ProjectAnalyzerTool(BaseTool):
 
         write_build_requirements(self.docker_orchestrator, data)
 
-    def _compose_project_brief(
-        self,
-        project_path: str,
-        analysis: Dict[str, Any],
-    ):
-        """Compose and atomically publish the complete role-typed brief."""
-        from sag.agent.project_brief import ProjectBriefAdapter
-
-        artifact = ProjectBriefAdapter(
-            self.docker_orchestrator,
-            analyzer_version=str(
-                analysis.get("analyzer_version") or PROJECT_ANALYZER_VERSION
-            ),
-        ).compose(analysis, project_path=project_path)
-        analysis["project_brief"] = artifact.brief.model_dump(mode="json")
-        analysis["project_brief_ref"] = artifact.artifact_ref
-        analysis["project_brief_projection"] = artifact.planner_projection
-        analysis["project_brief_cache_hit"] = artifact.cache_hit
-        return artifact
-
-    def _generate_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
-        """
-        Generate intelligent execution plan based on THREE CORE STEPS:
-        1. Clone repository (assumed already done by project_setup)
-        2. Build project (compile/package)
-        3. Test project (run tests)
-        4. Generate report
-        """
-        plan = []
-
-        project_type = analysis.get("project_type", "unknown")
-        build_system = analysis.get("build_system", "unknown")
-        java_version = analysis.get("java_version")
-        documentation = analysis.get("documentation", {})
-
-        logger.info(
-            f"Generating three-step execution plan for {project_type} project with {build_system}"
-        )
-
-        # Handle unknown projects with fallback strategies
-        if project_type == "unknown" or build_system == "unknown":
-            logger.warning("Project type or build system unknown, generating fallback plan")
-            return self._generate_three_step_fallback_plan(analysis)
-
-        # STEP 1: Environment setup (if needed)
-        if java_version:
-            # Check if Java version is enforced (stricter requirement)
-            is_enforced = analysis.get("java_version_enforced", False)
-            version_source = analysis.get("java_version_source", "unknown")
-
-            if is_enforced:
-                plan.append(
-                    {
-                        "id": "setup_java_environment",
-                        "description": f"Install and configure Java {java_version} (Required by Maven Enforcer)",
-                        "priority": "critical",
-                        "type": "environment",
-                        "core_step": "preparation",
-                        "commands": [
-                            f'bash(command=\'java -version 2>&1 | grep "version" || echo "Java not found"\')',
-                            f"bash(command='apt-get update && apt-get install -y openjdk-{java_version}-jdk')",
-                            f"bash(command='update-alternatives --set java /usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture)/bin/java')",
-                            f"bash(command='export JAVA_HOME=/usr/lib/jvm/java-{java_version}-openjdk-$(dpkg --print-architecture) && java -version')",
-                        ],
-                    }
-                )
-            else:
-                plan.append(
-                    {
-                        "id": "setup_environment",
-                        "description": f"Verify Java {java_version} environment and install dependencies",
-                        "priority": "high",
-                        "type": "environment",
-                        "core_step": "preparation",
-                    }
-                )
-
-        # STEP 2: BUILD - Compile/package the project
-        if project_type == "Java" and build_system == "Maven":
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Compile project using Maven",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-        elif project_type == "Java" and build_system == "Gradle":
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Compile project using Gradle",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-        elif project_type == "Node.js":
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Build project using npm/yarn",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-        elif project_type == "Python":
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Setup and validate Python project",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-        else:
-            # Generic build step
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": f"Build {project_type} project using {build_system}",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-
-        # STEP 3: TEST - Run project tests
-        test_framework = analysis.get("test_framework", "unknown")
-        test_commands = documentation.get("test_commands", [])
-
-        if test_commands:
-            # The documented command is REFERENCE ONLY: the task must prescribe
-            # the build tool, which resolves the registered toolchain. Round-4
-            # eval: a task saying "documented commands: mvn" steered the model
-            # into raw bash mvn with a stale PATH (50 wrong-path failures).
-            test_desc = (
-                "Run tests with build(action='test') "
-                f"(documented command for reference: {', '.join(test_commands[:2])})"
-            )
-        elif project_type == "Java" and build_system == "Maven":
-            # Check if this is a multi-module project
-            is_multi_module = analysis.get("is_multi_module", False)
-            if is_multi_module:
-                test_desc = "Run tests for all modules using Maven (multi-module project)"
-                # Add specific command recommendation
-                test_commands = ["build(action='test')"]
-            else:
-                test_desc = "Run tests using Maven"
-            if test_framework != "unknown":
-                test_desc += f" ({test_framework})"
-        elif project_type == "Java" and build_system == "Gradle":
-            test_desc = "Run tests using Gradle"
-            if test_framework != "unknown":
-                test_desc += f" ({test_framework})"
-        elif project_type == "Node.js":
-            test_desc = "Execute tests using npm/yarn test"
-        elif project_type == "Python":
-            test_desc = "Run Python tests (pytest/unittest)"
-        else:
-            test_desc = f"Execute {project_type} project tests"
-
-        test_step = {
-            "id": "run_tests",
-            "description": test_desc,
-            "priority": "critical",
-            "type": "test",
-            "core_step": "test",
-        }
-
-        # Add specific commands for multi-module Maven projects
-        if (
-            project_type == "Java"
-            and build_system == "Maven"
-            and analysis.get("is_multi_module", False)
-        ):
-            test_step["commands"] = [
-                "maven(command='test', fail_at_end=True)",
-                "# This ensures all modules are tested even if some have failures",
-            ]
-            test_step["notes"] = "Multi-module project: use fail_at_end=True to test all modules"
-
-        plan.append(test_step)
-
-        # STEP 4: REPORT - Generate completion report
-        plan.append(
-            {
-                "id": "generate_completion_report",
-                "description": "Generate comprehensive setup completion report",
-                "priority": "high",
-                "type": "report",
-                "core_step": "report",
-            }
-        )
-
-        logger.info(f"Generated {len(plan)} tasks in three-step execution plan")
-        logger.info(f"Core steps: {[task.get('core_step') for task in plan]}")
-
-        return plan
-
-    def _update_trunk_context_with_plan(self, analysis: Dict[str, Any]) -> bool:
-        """更新trunk context的todo list（安全版本）"""
+    def _update_trunk_context_with_facts(self, analysis: Dict[str, Any]) -> bool:
+        """Record the survey facts (build system + static test metrics) on the
+        trunk and persist them. Facts-only: the plan->todo rewrite (dim a) is
+        deleted — a facts-only analysis is a SUCCESS, and the recorded metrics
+        ARE the completion."""
         if not self.context_manager:
             logger.warning("No context manager available for updating trunk context")
             return False
@@ -1284,125 +1025,20 @@ class ProjectAnalyzerTool(BaseTool):
                 logger.error("No trunk context found to update")
                 return False
 
-            # ALWAYS record environment metrics (like static test count) unconditionally
-            # This ensures we don't lose test counts if the execution plan is rejected
+            # ALWAYS record environment metrics (like static test count).
             self._record_environment_metrics(trunk_context, analysis)
 
-            # Save the metrics immediately in case we return early. The trunk
-            # survey stamp asserts THESE metrics are PERSISTED — if the save
-            # fails, strip it from the (possibly cached) in-memory trunk, or a
-            # later fast path would trust an env-summary that never landed.
+            # Persist. The trunk survey stamp asserts THESE metrics are
+            # PERSISTED — if the save fails, strip it from the (possibly cached)
+            # in-memory trunk, or a later fast path would trust an env-summary
+            # that never landed.
             try:
                 self.context_manager._save_trunk_context(trunk_context)
             except Exception:
                 (trunk_context.environment_summary or {}).pop("survey", None)
                 raise
 
-            # Stage-2 phase machine (spec §3.1): a phase trunk (phase_<name>
-            # task ids) is owned by the engine — the analyzer's execution plan
-            # is phase-internal advice surfaced in the tool output, never trunk
-            # tasks. Rewriting here deleted the pending phase_build/phase_test/
-            # phase_report entries, turning every later _persist_phase_record
-            # into a silent no-op and orphaning task_N entries in the webui.
-            if any(str(task.id).startswith("phase_") for task in trunk_context.todo_list):
-                logger.info(
-                    "Phase trunk detected: preserved phase_* tasks (analyzer plan "
-                    "stays phase-internal advice; recorded analysis metrics only)"
-                )
-                return True
-
-            from sag.config.prescriptions import prescription_flags
-
-            if not prescription_flags()["plan_pipeline"]:
-                # Treatment mask dim (a): plan->todo is not executed. The
-                # metrics above ARE the completion — a facts-only analysis
-                # is a SUCCESS, not a failed context update (panel review:
-                # rendering it as failure injected a negative signal into
-                # arm F beyond the deletion under test).
-                logger.info("Prescriptions off: survey facts recorded; plan->todo skipped")
-                return True
-
-            execution_plan = analysis.get("execution_plan", [])
-            if not execution_plan:
-                logger.warning("No execution plan generated, trunk context unchanged")
-                return False
-
-            # Evidence hierarchy: a derived re-analysis must not overwrite a
-            # plan grounded in stronger evidence. If THIS analysis failed to
-            # identify the build system while a previous one succeeded (the
-            # trunk remembers it), keep the existing plan — re-planning from
-            # "unknown" is exactly the loop that burned beam's 06-10 run
-            # (25 re-plans driven by an analyzer blind to the Kotlin DSL).
-            incoming_unknown = str(analysis.get("build_system", "unknown")).lower() in (
-                "unknown",
-                "none",
-                "",
-            )
-            known_system = (trunk_context.environment_summary or {}).get("build_system")
-            if incoming_unknown and known_system:
-                logger.warning(
-                    f"Analyzer returned unknown build system but trunk already has "
-                    f"evidence of '{known_system}'; preserving the existing plan"
-                )
-                return True
-
-            # 验证执行计划的质量
-            if not self._is_execution_plan_valid(execution_plan):
-                logger.warning(
-                    "Generated execution plan appears invalid, preserving existing tasks"
-                )
-                return False
-
-            # 获取当前pending任务数量
-            current_pending = len(
-                [task for task in trunk_context.todo_list if task.status.value == "pending"]
-            )
-            logger.info(
-                f"Current pending tasks: {current_pending}, new plan has {len(execution_plan)} tasks"
-            )
-
-            # 只有在新计划看起来合理时才替换现有任务
-            if len(execution_plan) >= 3:  # 至少3个任务才认为是合理的计划
-                # Idempotent plan application: keep completed/in-progress tasks
-                # AND pending tasks that are part of the new plan (so their ids
-                # stay stable across analyzer re-runs); drop only stale pending
-                # tasks the new plan no longer contains. A full clear+re-add
-                # renumbered the same tasks on every re-run (beam 2026-06-10:
-                # plan re-applied 3x in 90s, churning ids and orphaning the
-                # branch contexts/outputs joined on them).
-                normalize = trunk_context._normalize_task_description
-                plan_descriptions = {
-                    normalize(item.get("description", "Unknown task")) for item in execution_plan
-                }
-                trunk_context.todo_list = [
-                    task
-                    for task in trunk_context.todo_list
-                    if task.status.value != "pending"
-                    or normalize(task.description) in plan_descriptions
-                ]
-
-                # 添加新的智能任务 (add_task dedup keeps already-present ones)
-                for plan_item in execution_plan:
-                    task_description = plan_item.get("description", "Unknown task")
-                    task_type = plan_item.get("type", "general")
-                    logger.debug(f"Adding task: {task_description} (type: {task_type})")
-                    trunk_context.add_task(task_description)
-
-                # Remember the identified build system + test metrics so weaker
-                # future analyses cannot regress the plan (see guard above).
-                # (Metrics already recorded unconditionally at the top of method)
-
-                # 保存更新后的context
-                self.context_manager._save_trunk_context(trunk_context)
-                logger.info(
-                    f"✅ Successfully updated trunk context with {len(execution_plan)} new intelligent tasks"
-                )
-                return True
-            else:
-                logger.warning(
-                    f"Execution plan too short ({len(execution_plan)} tasks), preserving existing tasks"
-                )
-                return False
+            return True
 
         except Exception as e:
             logger.error(f"Failed to update trunk context: {e}")
@@ -1411,8 +1047,9 @@ class ProjectAnalyzerTool(BaseTool):
     def _record_environment_metrics(self, trunk_context, analysis: Dict[str, Any]) -> None:
         """Record build system + static test metrics in environment_summary.
 
-        Shared by the legacy plan-rewrite path and the phase-trunk path (which
-        never touches the todo list but still feeds the report/test phases)."""
+        The facts-only completion (dim a deleted): the survey never rewrites the
+        todo list — these recorded metrics ARE the analysis result the report/
+        test phases consume."""
         incoming_unknown = str(analysis.get("build_system", "unknown")).lower() in (
             "unknown",
             "none",
@@ -1438,30 +1075,16 @@ class ProjectAnalyzerTool(BaseTool):
 
         build_recommendation = analysis.get("build_recommendation")
         if build_recommendation:
-            from sag.config.prescriptions import prescription_flags
-
-            if not prescription_flags()["recommendation_fields"]:
-                # Treatment mask dim (b): the trunk carries coordinate FACTS
-                # only — the intro line and gates read from here.
-                build_recommendation = _strip_recommendation_prescriptions(build_recommendation)
+            # dim (b) deleted: the trunk carries coordinate FACTS only (system,
+            # roots, islands as {root, system}) — no goal/rationale. The intro
+            # line and gates read from here.
+            build_recommendation = _strip_recommendation_prescriptions(build_recommendation)
             trunk_context.environment_summary["build_recommendation"] = build_recommendation
             logger.info(
-                "📊 Stored build recommendation: "
-                f"{build_recommendation.get('build_system')} '{build_recommendation.get('goal')}' "
+                "📊 Stored build coordinates: "
+                f"{build_recommendation.get('build_system')} "
                 f"at {build_recommendation.get('build_root')}"
             )
-
-        project_brief = analysis.get("project_brief") or {}
-        project_brief_projection = analysis.get("project_brief_projection")
-        project_brief_ref = analysis.get("project_brief_ref")
-        if project_brief and project_brief_projection and project_brief_ref:
-            trunk_context.environment_summary["project_brief_fingerprint"] = project_brief.get(
-                "input_fingerprint"
-            )
-            trunk_context.environment_summary["project_brief_projection"] = (
-                project_brief_projection
-            )
-            trunk_context.environment_summary["project_brief_ref"] = project_brief_ref
 
         static_test_count = analysis.get("static_test_count")
         if static_test_count is not None:
@@ -1490,99 +1113,22 @@ class ProjectAnalyzerTool(BaseTool):
                     "by_module": test_catalog.get("by_module", {}),
                 }
 
-    def _is_execution_plan_valid(self, execution_plan: List[Dict[str, str]]) -> bool:
-        """验证执行计划是否有效"""
-        if not execution_plan or len(execution_plan) < 2:
-            logger.debug("Execution plan too short")
-            return False
-
-        # 检查是否只有报告任务（这通常意味着分析失败）
-        non_report_tasks = [
-            task
-            for task in execution_plan
-            if task.get("type") != "report" and "report" not in task.get("description", "").lower()
-        ]
-
-        if len(non_report_tasks) < 2:
-            logger.debug("Execution plan contains mostly report tasks")
-            return False
-
-        # 检查是否有实际的构建/测试任务
-        has_build_or_test = any(
-            task.get("type") in ["build", "test", "dependencies", "environment"]
-            or any(
-                keyword in task.get("description", "").lower()
-                for keyword in ["build", "compile", "test", "install", "setup"]
-            )
-            for task in execution_plan
-        )
-
-        if not has_build_or_test:
-            logger.debug("Execution plan lacks build/test tasks")
-            return False
-
-        logger.debug("Execution plan validation passed")
-        return True
-
     def _render_recommended_build_output(self, analysis: Dict[str, Any]) -> str:
-        from sag.config.prescriptions import prescription_flags
-
-        if not prescription_flags()["recommendation_fields"]:
-            # Treatment mask dim (b): coordinates only, no action wording.
-            rec = analysis.get("build_recommendation") or {}
-            if not rec:
-                return ""
-            islands = rec.get("build_islands") or []
-            if len(islands) > 1:
-                coords = "; ".join(
-                    f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
-                )
-                return f"\n🏝️ Build coordinates (independent islands): {coords}\n"
-            return (
-                f"\n📍 Build coordinates: {rec.get('build_system')} at "
-                f"{rec.get('build_root')}\n"
-            )
-        return self._render_recommended_build_output_prescriptive(analysis)
-
-    def _render_recommended_build_output_prescriptive(self, analysis: Dict[str, Any]) -> str:
-        """The 🧭 Recommended Build block of the analysis output.
-
-        With MULTIPLE build islands the island list IS the recommendation —
-        the pathological branch's single-target sentence must not co-render
-        (live bigtop 2026-07-18: the agent followed 'build module
-        bigtop-test-framework directly' from the rationale, hammered the one
-        upstream-broken island for 7 calls, and never touched three healthy
-        ones the island line named). One authority per fact.
-        """
+        # dim (b) deleted: build coordinates only — the survey facts (system,
+        # roots, islands as {root, system}), no goal/rationale action wording.
         rec = analysis.get("build_recommendation") or {}
-        output = ""
-        if rec.get("is_aggregator_only"):
-            return (
-                f"🧭 Recommended Build: NONE — {rec['rationale']} "
-                f"Consider phase(action='blocked', outcome='unknown', ...) with this "
-                f"evidence rather than forcing a compile.\n"
+        if not rec:
+            return ""
+        islands = rec.get("build_islands") or []
+        if len(islands) > 1:
+            coords = "; ".join(
+                f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
             )
-        build_islands = rec.get("build_islands") or []
-        if len(build_islands) > 1:
-            isles = "; ".join(
-                f"{i}) {isl.get('system') or 'unknown'} '{isl.get('goal') or 'build'}' "
-                f"in {isl['root']}"
-                for i, isl in enumerate(build_islands, start=1)
-            )
-            output += (
-                f"🧭 Recommended Build: {len(build_islands)} independent build islands "
-                f"— build EACH: {isles}. Islands may depend on each other through the "
-                f"local maven repo: publish/install provider islands first.\n"
-            )
-        else:
-            output += (
-                f"🧭 Recommended Build: {rec.get('build_system')} "
-                f"'{rec.get('goal')}' in {rec.get('build_root')} — {rec['rationale']}\n"
-            )
-        if rec.get("source_modules"):
-            mods = ", ".join(f"{m['module']}({m['lang']})" for m in rec["source_modules"][:6])
-            output += f"   • Source modules: {mods}\n"
-        return output
+            return f"\n🏝️ Build coordinates (independent islands): {coords}\n"
+        return (
+            f"\n📍 Build coordinates: {rec.get('build_system')} at "
+            f"{rec.get('build_root')}\n"
+        )
 
     def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
         """格式化分析输出"""
@@ -1597,27 +1143,17 @@ class ProjectAnalyzerTool(BaseTool):
         build_system = analysis.get("build_system", "Unknown")
         output += f"📂 Project Type: {project_type}\n"
         output += f"🔧 Build System: {build_system}\n"
-        if analysis.get("project_brief_ref"):
-            fingerprint = (analysis.get("project_brief") or {}).get(
-                "input_fingerprint", "unknown"
-            )
-            output += (
-                f"🧾 Project Brief: {analysis['project_brief_ref']} "
-                f"(fingerprint {str(fingerprint)[:16]})\n"
-            )
 
-        # Recommended build target — steer the build phase away from compiling an
-        # empty aggregator root (e.g. Bigtop's packaging=pom over Groovy/Gradle).
-        from sag.config.prescriptions import prescription_flags
-
-        flags = prescription_flags()
+        # Build coordinates — the survey facts that steer the build phase away
+        # from an empty aggregator root (e.g. Bigtop's packaging=pom over
+        # Groovy/Gradle). dim (b) deleted: coordinates only, no action wording.
         rec = analysis.get("build_recommendation") or {}
-        if rec.get("rationale") or (rec and not flags["recommendation_fields"]):
+        if rec:
             output += self._render_recommended_build_output(analysis)
             # Tests may live in a different module / build system than the build.
             # (Python recs are pytest-at-the-build-root by construction — their
-            # differing labels must not render the "not in the build module"
-            # call-out; mirrors react_engine._recommended_build_line.)
+            # differing labels must not render the call-out; mirrors
+            # react_engine._recommended_build_line.)
             test_root = rec.get("test_root")
             if test_root and (
                 test_root != rec.get("build_root")
@@ -1626,17 +1162,7 @@ class ProjectAnalyzerTool(BaseTool):
                     and str(rec.get("build_system", "")).strip().lower() != "python"
                 )
             ):
-                if flags["recommendation_fields"]:
-                    output += (
-                        f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "
-                        f"— the test suite lives here, not in the build module.\n"
-                    )
-                else:
-                    # dim (b): coordinates, no action wording (panel review:
-                    # this branch bypassed the mask on split-root projects).
-                    output += (
-                        f"🧪 Test coordinates: {rec.get('test_system')} at {test_root}\n"
-                    )
+                output += f"🧪 Test coordinates: {rec.get('test_system')} at {test_root}\n"
 
         # 显示发现的文件
         existing_files = analysis.get("existing_files", [])
@@ -1720,71 +1246,19 @@ class ProjectAnalyzerTool(BaseTool):
                 output += f"📊 Test Count: {static_test_count} test method annotations found\n"
                 output += f"   ℹ️ Note: Parameterized tests will execute multiple times\n"
 
-        # 执行计划
-        execution_plan = analysis.get("execution_plan", [])
-        if not flags["plan_pipeline"]:
-            # Treatment mask dim (a): no plan status AT ALL — neither the
-            # section nor 'no plan generated' (panel review: that line plus
-            # 'Analysis failed' rendered a successful facts-only survey as a
-            # failure, injecting negative signal into arm F).
-            if analysis.get("context_updated"):
-                output += "\n✅ Survey facts recorded on the trunk\n"
-            elif analysis.get("context_updated") is False:
-                output += (
-                    f"\n⚠️ Context update failed: "
-                    f"{analysis.get('context_error', 'Unknown error')}\n"
-                )
-            if project_type != "Unknown" and build_system != "Unknown":
-                output += "\n🎯 Survey complete — facts persisted for the build/test phases."
-            else:
-                output += "\n⚠️ Project analysis incomplete - manual investigation may be needed"
-            return output
-        if execution_plan:
-            # 分析计划类型
-            plan_types = [task.get("type", "general") for task in execution_plan]
-            type_counts = {}
-            for t in plan_types:
-                type_counts[t] = type_counts.get(t, 0) + 1
-
-            output += f"\n📋 GENERATED EXECUTION PLAN ({len(execution_plan)} tasks):\n"
-            for i, task in enumerate(execution_plan, 1):
-                task_type = task.get("type", "general")
-                task_desc = task.get("description", "Unknown task")
-                priority = task.get("priority", "medium")
-                type_emoji = {
-                    "environment": "🔧",
-                    "dependencies": "📦",
-                    "build": "🔨",
-                    "test": "🧪",
-                    "report": "📊",
-                    "analysis": "🔍",
-                    "exploration": "🗺️",
-                }.get(task_type, "📋")
-                output += f"  {i}. {type_emoji} {task_desc} [{priority}]\n"
-
-            # 显示计划质量指标
-            non_report_tasks = [t for t in execution_plan if t.get("type") != "report"]
-            if len(non_report_tasks) >= 3:
-                output += f"\n✅ Plan Quality: Good ({len(non_report_tasks)} actionable tasks)\n"
-            else:
-                output += f"\n⚠️ Plan Quality: Limited ({len(non_report_tasks)} actionable tasks)\n"
-        else:
-            output += f"\n❌ No execution plan generated\n"
-
-        # Context更新状态
+        # dim (a) deleted: no execution plan is generated — the analyze output
+        # reports the survey facts and whether they persisted, no plan section.
         if analysis.get("context_updated"):
-            output += f"\n✅ Trunk context updated with new intelligent task plan\n"
-        elif analysis.get("context_updated") == False:
-            context_error = analysis.get("context_error", "Unknown error")
-            output += f"\n⚠️ Context update failed: {context_error}\n"
-
-        # 最终状态
-        if project_type != "Unknown" and build_system != "Unknown" and execution_plan:
-            output += f"\n🎯 Ready to execute intelligent project setup plan!"
-        elif project_type == "Unknown" or build_system == "Unknown":
-            output += f"\n⚠️ Project analysis incomplete - manual investigation may be needed"
+            output += "\n✅ Survey facts recorded on the trunk\n"
+        elif analysis.get("context_updated") is False:
+            output += (
+                f"\n⚠️ Context update failed: "
+                f"{analysis.get('context_error', 'Unknown error')}\n"
+            )
+        if project_type != "Unknown" and build_system != "Unknown":
+            output += "\n🎯 Survey complete — facts persisted for the build/test phases."
         else:
-            output += f"\n❌ Analysis failed - please check project structure and try again"
+            output += "\n⚠️ Project analysis incomplete - manual investigation may be needed"
 
         return output
 
@@ -1931,154 +1405,3 @@ OUTPUT:
 
         return redetect_build_files(self.docker_orchestrator, project_path)
 
-    def _generate_three_step_fallback_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Generate three-step fallback plan for unknown project types."""
-        plan = []
-        existing_files = analysis.get("existing_files", [])
-        project_path = analysis.get("project_path", "/workspace")
-
-        # If the analysis recorded no recognizable build file, re-scan the root
-        # before giving up. This stops a known build system (e.g. a Gradle repo
-        # whose root is build.gradle.kts) from being mislabeled "unknown" and
-        # sending the agent into a manual-exploration loop.
-        if not any(marker in existing_files for marker in self._FALLBACK_BUILD_MARKERS):
-            redetected = self._redetect_build_files(project_path)
-            if redetected:
-                existing_files = list(dict.fromkeys([*existing_files, *redetected]))
-                logger.info(f"Fallback re-detected build files: {redetected}")
-
-        logger.info("Generating three-step fallback execution plan for unknown project type")
-
-        # STEP 1: Environment/Dependencies
-        if "pom.xml" in existing_files:
-            plan.append(
-                {
-                    "id": "setup_environment",
-                    "description": "Install Maven dependencies and verify build environment",
-                    "priority": "high",
-                    "type": "environment",
-                    "core_step": "preparation",
-                }
-            )
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Compile project using Maven",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-            plan.append(
-                {
-                    "id": "run_tests",
-                    "description": "Execute Maven project tests",
-                    "priority": "critical",
-                    "type": "test",
-                    "core_step": "test",
-                }
-            )
-        elif any(
-            f in existing_files
-            for f in [
-                "build.gradle",
-                "build.gradle.kts",
-                "settings.gradle",
-                "settings.gradle.kts",
-            ]
-        ):
-            plan.append(
-                {
-                    "id": "setup_environment",
-                    "description": "Install Gradle dependencies and verify build environment",
-                    "priority": "high",
-                    "type": "environment",
-                    "core_step": "preparation",
-                }
-            )
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Compile project using Gradle",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-            plan.append(
-                {
-                    "id": "run_tests",
-                    "description": "Execute Gradle project tests",
-                    "priority": "critical",
-                    "type": "test",
-                    "core_step": "test",
-                }
-            )
-        elif "package.json" in existing_files:
-            plan.append(
-                {
-                    "id": "setup_environment",
-                    "description": "Install Node.js dependencies using npm/yarn",
-                    "priority": "high",
-                    "type": "environment",
-                    "core_step": "preparation",
-                }
-            )
-            plan.append(
-                {
-                    "id": "build_project",
-                    "description": "Build Node.js project",
-                    "priority": "critical",
-                    "type": "build",
-                    "core_step": "build",
-                }
-            )
-            plan.append(
-                {
-                    "id": "run_tests",
-                    "description": "Execute Node.js project tests",
-                    "priority": "critical",
-                    "type": "test",
-                    "core_step": "test",
-                }
-            )
-        else:
-            # Completely unknown project
-            plan.extend(
-                [
-                    {
-                        "id": "explore_project",
-                        "description": f"Manually explore and identify project structure at {project_path}",
-                        "priority": "high",
-                        "type": "exploration",
-                        "core_step": "preparation",
-                    },
-                    {
-                        "id": "attempt_build",
-                        "description": "Attempt to build project using identified tools",
-                        "priority": "critical",
-                        "type": "build",
-                        "core_step": "build",
-                    },
-                    {
-                        "id": "attempt_tests",
-                        "description": "Attempt to run project tests",
-                        "priority": "critical",
-                        "type": "test",
-                        "core_step": "test",
-                    },
-                ]
-            )
-
-        # STEP 4: Always add report
-        plan.append(
-            {
-                "id": "generate_completion_report",
-                "description": "Generate comprehensive setup completion report",
-                "priority": "high",
-                "type": "report",
-                "core_step": "report",
-            }
-        )
-
-        return plan
