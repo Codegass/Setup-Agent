@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "baseline_sag_sha": "f48a039bfab5ea4ab88116af42ddfdbfefaca1ad",
+  "model_config_note": "thinking+action models and config hash are recorded per-run in each run-pin.json (sanitized_config + prompt_bundle_sha256); this panel does not override them.",
+  "image_digest_source": "run-pin.json:container_image_digest — verified against the created container by the collector's run-probe path (_container_image_digest).",
+  "pinned_floors": {
+    "bigtop": {
+      "compiled_classes_min": 96,
+      "unique_executed_min": 50,
+      "unique_failed_max": 0,
+      "note": "compiled_classes floor = floor(0.8 * min(121,121,121)); executed/failed from final7 x3 baseline (50/50). judgment/source predicates fresh-run only (final7 predates the oracle fix)."
+    },
+    "httpcomponents-client": {
+      "unique_executed_min": 1500,
+      "note": "historical 1,856; the 16-test mis-scope must be impossible."
+    },
+    "tvm": {
+      "collected_after_deselection_max": 50,
+      "note": "structured python-tool field; never summary text. Evidence source mode pinned tool-emitted for this campaign."
+    },
+    "pyyaml": {
+      "unique_executed_min": null,
+      "unique_failed_max": 0,
+      "note": "executed floor is CALIBRATED (three arm-P calibration runs, excluded from the panel) and appended to the ledger before the panel starts: floor = max(1, floor(0.8 * min(executed over three valid runs)))."
+    }
+  },
+  "evidence_source_mode": "tool-emitted",
+  "probes": {
+    "bigtop": {
+      "url": "https://github.com/apache/bigtop.git",
+      "ref": "e32423c444a9311b802946d5b695767a9b921e1e",
+      "class": "pathological aggregator / archipelago",
+      "arms": ["P", "F"],
+      "acceptance": {"category3_anchor": "bigtop"}
+    },
+    "tvm": {
+      "url": "https://github.com/apache/tvm.git",
+      "ref": "3a5b4d4e64707a1528146e28c0fb75f45da99dd7",
+      "class": "python native-core",
+      "arms": ["P", "F"],
+      "acceptance": {"category3_anchor": "tvm"}
+    },
+    "pyyaml": {
+      "url": "https://github.com/yaml/pyyaml.git",
+      "ref": "49790e73684bebad1df05ef8d828fa12f685bffb",
+      "release": "6.0.3",
+      "class": "skipped-analyze / package_dir layout",
+      "arms": ["P", "F"],
+      "acceptance": {"category3_anchor": "pyyaml"}
+    },
+    "httpcomponents-client": {
+      "url": "https://github.com/apache/httpcomponents-client.git",
+      "ref": "4f86ca6a5eb528613edb892a4f7161e23dce15d7",
+      "release": "rel/v5.6.1",
+      "class": "healthy reactor scoping",
+      "arms": ["P", "F"],
+      "acceptance": {"category3_anchor": "httpcomponents-client"}
+    }
+  },
+  "baseline_reds": {
+    "note": "Panel precondition (analyzer-diet.md:536-555): the SIX pre-existing SUITE failures registered in the campaign ledger at panel start; any NEW suite failure BLOCKS the panel. These are suite reds, NOT probes.",
+    "accepted": [
+      {"keyword": "test_evidence_ingestion", "max_count": 1},
+      {"keyword": "test_stage1_review_fixes", "max_count": 2},
+      {"keyword": "test_lineage_idempotence_followup", "max_count": 2},
+      {"keyword": "test_packaging_smoke", "max_count": 1}
+    ]
+  }
+}

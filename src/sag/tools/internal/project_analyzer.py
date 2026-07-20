@@ -57,16 +57,49 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 SURVEY_FACTS_VERSION = 7
 
 
+def _strip_recommendation_prescriptions(rec):
+    """Treatment mask dim (b): drop the ACTION fields (goal/rationale) from a
+    build recommendation, keeping the coordinate FACTS (system, roots,
+    islands as {root, system}) that the shared machinery — workdir default,
+    island checklist — consumes in both arms."""
+    if not rec:
+        return rec
+    projected = {k: v for k, v in rec.items() if k not in ("goal", "rationale")}
+    for key in ("build_islands", "test_islands"):
+        islands = projected.get(key)
+        if islands:
+            projected[key] = [
+                {k: isl[k] for k in ("root", "system") if k in isl} for isl in islands
+            ]
+    return projected
+
+
 class ProjectAnalyzerTool(BaseTool):
     """Tool for analyzing project structure and generating intelligent execution plans."""
 
     def __init__(self, docker_orchestrator=None, context_manager=None):
+        from sag.config.prescriptions import prescription_flags
+
+        if prescription_flags()["plan_pipeline"]:
+            description = (
+                "Analyze cloned project structure, requirements, and documentation to generate intelligent execution plan. "
+                "This tool reads README files, analyzes build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts), "
+                "detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), and creates optimized task lists for "
+                "Maven and Gradle projects. Essential for intelligent project setup planning."
+            )
+        else:
+            # dim (a): the tool must not CLAIM plan generation it will not do
+            # (panel review: a prompt surface contradicting the persisted
+            # behavior confounds the arms).
+            description = (
+                "Survey the cloned project's structure, requirements, and documentation, and persist the machine facts. "
+                "This tool reads README files, analyzes build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts), "
+                "detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), and records the survey facts "
+                "(manifest + trunk metrics) the build/test phases consume."
+            )
         super().__init__(
             name="project_analyzer",
-            description="Analyze cloned project structure, requirements, and documentation to generate intelligent execution plan. "
-            "This tool reads README files, analyzes build configurations (Maven pom.xml, Gradle build.gradle/build.gradle.kts), "
-            "detects Java versions, dependencies, test frameworks (JUnit, TestNG, Spock), and creates optimized task lists for "
-            "Maven and Gradle projects. Essential for intelligent project setup planning.",
+            description=description,
         )
         self.docker_orchestrator = docker_orchestrator
         self.context_manager = context_manager
@@ -284,7 +317,7 @@ class ProjectAnalyzerTool(BaseTool):
 
                 return ToolResult.completed_success(
                     output=self._format_analysis_output(analysis_result),
-                    metadata=analysis_result,
+                    metadata=self._prescription_projected_metadata(analysis_result),
                 )
             else:
                 return ToolResult.completed_failure(
@@ -315,6 +348,25 @@ class ProjectAnalyzerTool(BaseTool):
                 ],
                 error_code="ANALYSIS_EXCEPTION",
             )
+
+    def _prescription_projected_metadata(self, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """The analysis as recorded in ToolResult.metadata / the control
+        record, under the treatment mask: dim (a) keeps the plan out, dim (b)
+        keeps goal/rationale strings out. All-on returns the dict unchanged
+        (arm P byte-identical)."""
+        from sag.config.prescriptions import prescription_flags
+
+        flags = prescription_flags()
+        if flags["plan_pipeline"] and flags["recommendation_fields"]:
+            return analysis
+        projected = dict(analysis)
+        if not flags["plan_pipeline"]:
+            projected.pop("execution_plan", None)
+        if not flags["recommendation_fields"]:
+            projected["build_recommendation"] = _strip_recommendation_prescriptions(
+                projected.get("build_recommendation")
+            )
+        return projected
 
     def _perform_comprehensive_analysis(self, project_path: str) -> Dict[str, Any]:
         """Perform comprehensive project analysis."""
@@ -395,14 +447,26 @@ class ProjectAnalyzerTool(BaseTool):
             logger.warning(f"Build-approach recommendation failed: {exc}")
 
         # Step 5: 生成智能执行计划
-        execution_plan = self._generate_execution_plan(analysis)
-        analysis["execution_plan"] = execution_plan
+        from sag.config.prescriptions import prescription_flags
+
+        flags = prescription_flags()
+        if flags["plan_pipeline"]:
+            analysis["execution_plan"] = self._generate_execution_plan(analysis)
+        else:
+            # Treatment mask dim (a): the generator is NOT CALLED and the
+            # FIELD IS ABSENT (spec: removed from metadata/control record,
+            # not empty) — the deletion is simulated, not hidden.
+            analysis.pop("execution_plan", None)
 
         # One deterministic role-typed composition pass owns all build/test
         # planner guidance. Persistence failure is evidence, not a reason to
         # discard an otherwise valid project analysis.
         try:
-            self._compose_project_brief(project_path, analysis)
+            if flags["project_brief"]:
+                self._compose_project_brief(project_path, analysis)
+            # dim (c) off: no artifact, no ref, no projection — the analyze
+            # output's brief line and the trunk brief keys render only when
+            # the ref exists.
         except Exception as exc:
             analysis["project_brief_error"] = type(exc).__name__
             logger.warning(f"Project brief composition failed: {exc}")
@@ -1208,158 +1272,6 @@ class ProjectAnalyzerTool(BaseTool):
 
         return plan
 
-    def _generate_fallback_execution_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
-        """为未知项目类型生成fallback执行计划"""
-        plan = []
-        existing_files = analysis.get("existing_files", [])
-        project_path = analysis.get("project_path", "/workspace")
-
-        logger.info("Generating fallback execution plan for unknown project type")
-
-        # 检查是否有任何构建文件
-        if "pom.xml" in existing_files:
-            plan.extend(
-                [
-                    {
-                        "id": "analyze_maven_project",
-                        "description": "Analyze Maven project structure and dependencies",
-                        "priority": "high",
-                        "type": "analysis",
-                    },
-                    {
-                        "id": "setup_maven_environment",
-                        "description": "Setup Maven build environment and install dependencies",
-                        "priority": "high",
-                        "type": "environment",
-                    },
-                    {
-                        "id": "build_maven_project",
-                        "description": "Compile Maven project",
-                        "priority": "high",
-                        "type": "build",
-                    },
-                    {
-                        "id": "test_maven_project",
-                        "description": "Execute Maven project tests",
-                        "priority": "high",
-                        "type": "test",
-                    },
-                ]
-            )
-        elif any(f in existing_files for f in ["build.gradle", "build.gradle.kts"]):
-            plan.extend(
-                [
-                    {
-                        "id": "analyze_gradle_project",
-                        "description": "Analyze Gradle project structure and dependencies",
-                        "priority": "high",
-                        "type": "analysis",
-                    },
-                    {
-                        "id": "setup_gradle_environment",
-                        "description": "Setup Gradle build environment and install dependencies",
-                        "priority": "high",
-                        "type": "environment",
-                    },
-                    {
-                        "id": "build_gradle_project",
-                        "description": "Compile Gradle project",
-                        "priority": "high",
-                        "type": "build",
-                    },
-                    {
-                        "id": "test_gradle_project",
-                        "description": "Execute Gradle project tests",
-                        "priority": "high",
-                        "type": "test",
-                    },
-                ]
-            )
-        elif "package.json" in existing_files:
-            plan.extend(
-                [
-                    {
-                        "id": "analyze_nodejs_project",
-                        "description": "Analyze Node.js project dependencies and scripts",
-                        "priority": "high",
-                        "type": "analysis",
-                    },
-                    {
-                        "id": "install_npm_dependencies",
-                        "description": "Install Node.js dependencies using npm/yarn",
-                        "priority": "high",
-                        "type": "dependencies",
-                    },
-                    {
-                        "id": "build_nodejs_project",
-                        "description": "Build Node.js project",
-                        "priority": "high",
-                        "type": "build",
-                    },
-                    {
-                        "id": "test_nodejs_project",
-                        "description": "Execute Node.js project tests",
-                        "priority": "high",
-                        "type": "test",
-                    },
-                ]
-            )
-        else:
-            # 完全未知的项目，使用通用方法
-            plan.extend(
-                [
-                    {
-                        "id": "manual_project_exploration",
-                        "description": f"Manually explore project structure at {project_path}",
-                        "priority": "high",
-                        "type": "exploration",
-                    },
-                    {
-                        "id": "identify_build_system",
-                        "description": "Identify project build system and requirements",
-                        "priority": "high",
-                        "type": "analysis",
-                    },
-                    {
-                        "id": "setup_development_environment",
-                        "description": "Setup appropriate development environment",
-                        "priority": "high",
-                        "type": "environment",
-                    },
-                    {
-                        "id": "attempt_project_build",
-                        "description": "Attempt to build project using identified tools",
-                        "priority": "medium",
-                        "type": "build",
-                    },
-                ]
-            )
-
-        return plan
-
-    def _generate_basic_setup_plan(self, analysis: Dict[str, Any]) -> List[Dict[str, str]]:
-        """生成基本的setup计划作为最后的fallback"""
-        return [
-            {
-                "id": "verify_project_structure",
-                "description": "Verify project structure and identify key components",
-                "priority": "high",
-                "type": "verification",
-            },
-            {
-                "id": "setup_basic_environment",
-                "description": "Setup basic development environment",
-                "priority": "high",
-                "type": "environment",
-            },
-            {
-                "id": "manual_build_attempt",
-                "description": "Attempt manual project build",
-                "priority": "medium",
-                "type": "build",
-            },
-        ]
-
     def _update_trunk_context_with_plan(self, analysis: Dict[str, Any]) -> bool:
         """更新trunk context的todo list（安全版本）"""
         if not self.context_manager:
@@ -1397,6 +1309,17 @@ class ProjectAnalyzerTool(BaseTool):
                     "Phase trunk detected: preserved phase_* tasks (analyzer plan "
                     "stays phase-internal advice; recorded analysis metrics only)"
                 )
+                return True
+
+            from sag.config.prescriptions import prescription_flags
+
+            if not prescription_flags()["plan_pipeline"]:
+                # Treatment mask dim (a): plan->todo is not executed. The
+                # metrics above ARE the completion — a facts-only analysis
+                # is a SUCCESS, not a failed context update (panel review:
+                # rendering it as failure injected a negative signal into
+                # arm F beyond the deletion under test).
+                logger.info("Prescriptions off: survey facts recorded; plan->todo skipped")
                 return True
 
             execution_plan = analysis.get("execution_plan", [])
@@ -1515,6 +1438,12 @@ class ProjectAnalyzerTool(BaseTool):
 
         build_recommendation = analysis.get("build_recommendation")
         if build_recommendation:
+            from sag.config.prescriptions import prescription_flags
+
+            if not prescription_flags()["recommendation_fields"]:
+                # Treatment mask dim (b): the trunk carries coordinate FACTS
+                # only — the intro line and gates read from here.
+                build_recommendation = _strip_recommendation_prescriptions(build_recommendation)
             trunk_context.environment_summary["build_recommendation"] = build_recommendation
             logger.info(
                 "📊 Stored build recommendation: "
@@ -1596,6 +1525,26 @@ class ProjectAnalyzerTool(BaseTool):
         return True
 
     def _render_recommended_build_output(self, analysis: Dict[str, Any]) -> str:
+        from sag.config.prescriptions import prescription_flags
+
+        if not prescription_flags()["recommendation_fields"]:
+            # Treatment mask dim (b): coordinates only, no action wording.
+            rec = analysis.get("build_recommendation") or {}
+            if not rec:
+                return ""
+            islands = rec.get("build_islands") or []
+            if len(islands) > 1:
+                coords = "; ".join(
+                    f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
+                )
+                return f"\n🏝️ Build coordinates (independent islands): {coords}\n"
+            return (
+                f"\n📍 Build coordinates: {rec.get('build_system')} at "
+                f"{rec.get('build_root')}\n"
+            )
+        return self._render_recommended_build_output_prescriptive(analysis)
+
+    def _render_recommended_build_output_prescriptive(self, analysis: Dict[str, Any]) -> str:
         """The 🧭 Recommended Build block of the analysis output.
 
         With MULTIPLE build islands the island list IS the recommendation —
@@ -1659,8 +1608,11 @@ class ProjectAnalyzerTool(BaseTool):
 
         # Recommended build target — steer the build phase away from compiling an
         # empty aggregator root (e.g. Bigtop's packaging=pom over Groovy/Gradle).
+        from sag.config.prescriptions import prescription_flags
+
+        flags = prescription_flags()
         rec = analysis.get("build_recommendation") or {}
-        if rec.get("rationale"):
+        if rec.get("rationale") or (rec and not flags["recommendation_fields"]):
             output += self._render_recommended_build_output(analysis)
             # Tests may live in a different module / build system than the build.
             # (Python recs are pytest-at-the-build-root by construction — their
@@ -1674,10 +1626,17 @@ class ProjectAnalyzerTool(BaseTool):
                     and str(rec.get("build_system", "")).strip().lower() != "python"
                 )
             ):
-                output += (
-                    f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "
-                    f"— the test suite lives here, not in the build module.\n"
-                )
+                if flags["recommendation_fields"]:
+                    output += (
+                        f"🧪 Recommended Tests: {rec.get('test_system')} test in {test_root} "
+                        f"— the test suite lives here, not in the build module.\n"
+                    )
+                else:
+                    # dim (b): coordinates, no action wording (panel review:
+                    # this branch bypassed the mask on split-root projects).
+                    output += (
+                        f"🧪 Test coordinates: {rec.get('test_system')} at {test_root}\n"
+                    )
 
         # 显示发现的文件
         existing_files = analysis.get("existing_files", [])
@@ -1763,6 +1722,23 @@ class ProjectAnalyzerTool(BaseTool):
 
         # 执行计划
         execution_plan = analysis.get("execution_plan", [])
+        if not flags["plan_pipeline"]:
+            # Treatment mask dim (a): no plan status AT ALL — neither the
+            # section nor 'no plan generated' (panel review: that line plus
+            # 'Analysis failed' rendered a successful facts-only survey as a
+            # failure, injecting negative signal into arm F).
+            if analysis.get("context_updated"):
+                output += "\n✅ Survey facts recorded on the trunk\n"
+            elif analysis.get("context_updated") is False:
+                output += (
+                    f"\n⚠️ Context update failed: "
+                    f"{analysis.get('context_error', 'Unknown error')}\n"
+                )
+            if project_type != "Unknown" and build_system != "Unknown":
+                output += "\n🎯 Survey complete — facts persisted for the build/test phases."
+            else:
+                output += "\n⚠️ Project analysis incomplete - manual investigation may be needed"
+            return output
         if execution_plan:
             # 分析计划类型
             plan_types = [task.get("type", "general") for task in execution_plan]
@@ -1835,7 +1811,7 @@ class ProjectAnalyzerTool(BaseTool):
                 },
                 "update_context": {
                     "type": "boolean",
-                    "description": "Whether to update trunk context with generated plan",
+                    "description": "Whether to persist the analysis results to the trunk context",
                     "default": True,
                 },
             },
@@ -1939,12 +1915,11 @@ OUTPUT:
             logger.warning("Analysis found no project files")
             return False
 
-        # Check if execution plan was generated
-        execution_plan = analysis.get("execution_plan", [])
-        if not execution_plan or len(execution_plan) < 2:
-            logger.warning("Analysis generated insufficient execution plan")
-            return False
-
+        # Facts-based validity ONLY (analyzer-diet spec, shared gate rework
+        # #1): the superseded plan-length criterion made analysis validity —
+        # and therefore ensure_facts — depend on plan GENERATION succeeding.
+        # A survey that identified the project and found its files is valid,
+        # plan or no plan.
         return True
 
     # Build files that let the fallback pick a concrete build/test plan

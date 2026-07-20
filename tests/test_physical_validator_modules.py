@@ -39,6 +39,79 @@ def test_scan_modules_single_module_returns_root():
     assert len(modules) == 1 and modules[0]["path"] == "."
 
 
+def test_scan_modules_marks_maven_aggregator_shell_root():
+    """Live httpcomponents-client: the reactor root is a packaging=pom aggregator
+    with zero own sources. It must be marked aggregator_shell so the summary can
+    exclude it from the built/total ratio (the '5/6 built' cap)."""
+    responses = {
+        # two real submodules found -> multi-module scan
+        "-name 'pom.xml'": {"output": "/w/p/httpclient5/pom.xml\n/w/p/httpclient5-fluent/pom.xml"},
+        # root produces nothing of its own
+        "/w/p/target/classes": {"output": "0"},
+        "/w/p/target' -name '*.jar": {"output": "0"},
+        # submodules built
+        "/httpclient5/target/classes": {"output": "800"},
+        "/httpclient5-fluent/target/classes": {"output": "40"},
+        # root pom declares <packaging>pom</packaging>
+        "grep -q '<packaging>": {"output": "POM"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/p", "maven")
+    by_path = {m["path"]: m for m in modules}
+    assert by_path["."].get("aggregator_shell") is True
+    # real modules never carry the flag
+    assert "aggregator_shell" not in by_path["httpclient5"]
+    assert "aggregator_shell" not in by_path["httpclient5-fluent"]
+
+
+def test_scan_modules_root_with_own_sources_is_not_a_shell():
+    """commons-chain shape: a root with its OWN compiled classes stays a real,
+    counted module — never flagged as a shell even though it has submodules."""
+    responses = {
+        "-name 'pom.xml'": {"output": "/w/p/apps/example/pom.xml"},
+        "/w/p/target/classes": {"output": "33"},  # root has its own sources
+        "/w/p/target' -name '*.jar": {"output": "1"},
+        # even if the root pom were packaging=pom, artifacts on the root veto the shell
+        "grep -q '<packaging>": {"output": "POM"},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/p", "maven")
+    by_path = {m["path"]: m for m in modules}
+    assert "aggregator_shell" not in by_path["."]
+
+
+def test_scan_modules_zero_source_root_but_jar_packaging_not_a_shell():
+    """A zero-class multi-module root whose pom is NOT packaging=pom (e.g. a jar
+    root that simply hasn't compiled) must not be misread as a shell — the
+    physical packaging probe is the confirmation, never the class count alone."""
+    responses = {
+        "-name 'pom.xml'": {"output": "/w/p/sub/pom.xml"},
+        "/w/p/target/classes": {"output": "0"},
+        "/w/p/target' -name '*.jar": {"output": "0"},
+        # grep finds no <packaging>pom</packaging> -> echo POM never fires
+        "grep -q '<packaging>": {"output": ""},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/p", "maven")
+    assert "aggregator_shell" not in {m["path"]: m for m in modules}["."]
+
+
+def test_scan_modules_gradle_aggregator_shell_root_no_src_main():
+    """Gradle aggregator: a multi-project root with no src/main is a shell."""
+    responses = {
+        "build.gradle": {"output": "/w/g/moduleA/build.gradle\n/w/g/moduleB/build.gradle"},
+        "/w/g/build/classes": {"output": "0"},
+        "/w/g/build/libs' -name '*.jar": {"output": "0"},
+        "/moduleA/build/classes": {"output": "120"},
+        "/moduleB/build/classes": {"output": "60"},
+        # root has NO src/main -> the "test -d .../src/main && echo EXISTS" is empty
+        "src/main": {"output": ""},
+    }
+    v = PhysicalValidator(docker_orchestrator=FakeOrch(responses))
+    modules = v.scan_modules("/w/g", "gradle")
+    assert {m["path"]: m for m in modules}["."].get("aggregator_shell") is True
+
+
 def test_parse_module_test_reports_counts_per_module():
     surefire_xml = (
         '<testsuite tests="3" failures="1" errors="0" skipped="1">'

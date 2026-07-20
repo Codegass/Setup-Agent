@@ -159,7 +159,13 @@ class RunPin(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    target_repo_sha: str = Field(min_length=1)
+    # None until the target repo SHA is observed. The pin is written
+    # UNCONDITIONALLY at agent startup so the reproducibility file always
+    # exists (a run that never observes a target SHA still leaves a pin for
+    # post-mortem); it is rewritten with the real SHA the moment one is seen.
+    # The collector's current-run validation demands the observed SHA, so a
+    # still-null pin fails collection exactly as an absent pin used to.
+    target_repo_sha: str | None = None
     container_image_digest: str = Field(min_length=1)
     sag_git_sha: str = Field(min_length=1)
     thinking_model: str = Field(min_length=1)
@@ -167,13 +173,21 @@ class RunPin(BaseModel):
     sanitized_config: dict[str, Any]
     prompt_bundle_sha256: str
     feature_flags: dict[str, bool]
+    # Spec-required run-order index (protocol deviation registered for the
+    # 2026-07-19 stage-1 runs, reconstructed from ledger order there).
+    run_order_index: int | None = None
     random_seed_or_null: int | None
     dependency_cache_state: str = Field(min_length=1)
     host_arch: str = Field(min_length=1)
 
     @field_validator("target_repo_sha", "sag_git_sha")
     @classmethod
-    def _valid_git_sha(cls, value: str) -> str:
+    def _valid_git_sha(cls, value: str | None) -> str | None:
+        # target_repo_sha is optional (None until observed); sag_git_sha is
+        # always required by its own field constraint, so None never reaches
+        # here for it.
+        if value is None:
+            return None
         normalized = value.strip().lower()
         if len(normalized) != 40 or any(char not in "0123456789abcdef" for char in normalized):
             raise ValueError("git pins must be full 40-character SHAs")

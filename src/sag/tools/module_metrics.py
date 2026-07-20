@@ -111,6 +111,13 @@ def assemble_module_metrics(
 
     any_failure = any(_norm_status(v) == "failure" for v in reactor_status.values())
     reactor_index = _build_reactor_index(reactor_status)
+    # Aggregator-shell rows (marked by scan_modules: a packaging=pom / no-source
+    # root with submodules and zero own artifacts) are scaffolding, not modules.
+    # They keep their emitted row for display/debug but must NOT count toward the
+    # built/total denominator — live httpcomponents-client capped "5/6 built" on
+    # its reactor root shell while all 5 real modules built and tested. Tracked by
+    # the row's identity here so the flag never has to leak into the JSON artifact.
+    shell_rows: set[int] = set()
     # When a live Maven Reactor Summary was captured it is AUTHORITATIVE for the
     # "detected" module set: the detected modules are exactly the modules Maven
     # built. A scanned dir that is not in the reactor is not part of the build
@@ -188,7 +195,7 @@ def assemble_module_metrics(
         if failing_count is None and has_tests:
             failing_count = len(t.get("failing_names") or [])
 
-        out_modules.append({
+        row = {
             "name": name,
             "path": path,
             "build_status": build_status,
@@ -207,7 +214,10 @@ def assemble_module_metrics(
             "failing_names": failing_names,
             "failing_count": failing_count,
             "evidence_refs": _str_list(t.get("evidence_refs") or scan.get("report_dirs"), 25),
-        })
+        }
+        if scan.get("aggregator_shell"):
+            shell_rows.add(id(row))
+        out_modules.append(row)
 
     # Reactor entries that no disk scan matched were still built by Maven — count
     # them (one row each) so "detected" equals the reactor module count exactly.
@@ -247,20 +257,25 @@ def assemble_module_metrics(
                 "evidence_refs": [],
             })
 
-    total = len(out_modules)
-    tested = sum(1 for m in out_modules if (m["tests_total"] or 0) > 0)
+    # Aggregator shells keep their emitted row but are excluded from every
+    # summary count: they are build scaffolding (packaging=pom / no sources),
+    # not modules that can build, test, or fail. Counting them capped live
+    # httpcomponents-client at "5/6 built" on its zero-source reactor root.
+    counted = [m for m in out_modules if id(m) not in shell_rows]
+    total = len(counted)
+    tested = sum(1 for m in counted if (m["tests_total"] or 0) > 0)
     summary = {
         "modules_total": total,
-        "modules_built": sum(1 for m in out_modules if m["build_status"] == "success"),
-        "modules_failed": sum(1 for m in out_modules if m["build_status"] == "failure"),
-        "modules_skipped": sum(1 for m in out_modules if m["build_status"] == "skipped"),
+        "modules_built": sum(1 for m in counted if m["build_status"] == "success"),
+        "modules_failed": sum(1 for m in counted if m["build_status"] == "failure"),
+        "modules_skipped": sum(1 for m in counted if m["build_status"] == "skipped"),
         "modules_tested": tested,
         "modules_not_tested": total - tested,
         "modules_test_bearing": sum(
-            1 for m in out_modules if m.get("has_test_sources")
+            1 for m in counted if m.get("has_test_sources")
         ),
         "modules_with_test_failures": sum(
-            1 for m in out_modules if (m["failing_count"] or 0) > 0
+            1 for m in counted if (m["failing_count"] or 0) > 0
         ),
         "build_systems": _str_list(build_systems, 5),
         "single_module": total <= 1,

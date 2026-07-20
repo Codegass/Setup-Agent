@@ -1700,24 +1700,37 @@ IMPORTANT:
                             "reason": "Task requires project(action='analyze') execution but no evidence found",
                             "suggestions": [
                                 "Use project(action='analyze') before completing this task",
-                                "The analyze action must be called to generate the intelligent execution plan",
-                                "Do not complete this task until project(action='analyze') has created additional tasks",
+                                "The analyze action surveys the project and persists its facts",
+                                "Do not complete this task until project(action='analyze') has recorded the survey facts",
                             ],
                         }
                     )
                     return validation_result
 
-                # Check if additional tasks were generated (evidence of proper analysis)
+                # Persisted SURVEY FACTS are the completion evidence
+                # (analyzer-diet spec, shared gate rework #4): the todo-count
+                # arithmetic (todo_list > 4) treated plan->todo expansion as
+                # proof of analysis and rejected legitimate facts-only
+                # completions; it is superseded. The analyzer records the
+                # survey stamp / build facts on the trunk env-summary — that
+                # is what completing an analyze task must show.
                 trunk_context = self.context_manager.load_trunk_context()
-                if trunk_context and len(trunk_context.todo_list) <= 4:  # Original 4 tasks
+                env = (
+                    (getattr(trunk_context, "environment_summary", None) or {})
+                    if trunk_context
+                    else {}
+                )
+                has_survey_facts = bool(
+                    env.get("survey") or env.get("build_recommendation") or env.get("build_system")
+                )
+                if trunk_context and not has_survey_facts:
                     validation_result.update(
                         {
                             "valid": False,
-                            "reason": "Project analysis should generate additional tasks but todo list unchanged",
+                            "reason": "Project analysis completed but no survey facts were persisted",
                             "suggestions": [
-                                "Ensure project(action='analyze') generated additional tasks",
-                                "The analysis should expand the todo list with specific build/test tasks",
-                                "Check if project(action='analyze') completed successfully with update_context=True",
+                                "Ensure project(action='analyze') ran with update_context=True",
+                                "The analysis must record the build system / survey facts on the trunk",
                             ],
                         }
                     )

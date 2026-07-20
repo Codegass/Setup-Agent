@@ -588,6 +588,32 @@ def _legacy_metrics(
     return str(snapshot.get("run_id") or session.name), metrics, phase_report
 
 
+_REPO_ROOT_FOR_RELATIVIZE = Path(__file__).resolve().parent.parent
+
+
+def _relativize_session_path(path: Path) -> str:
+    """Strip the absolute worktree prefix so archived records leak no host path.
+
+    A CollectedRun is committed into repo ``logs/`` and hand-verified; an
+    absolute path like ``/private/tmp/wt-abc123/logs/session_...`` names the
+    developer's throwaway worktree, not reproducible truth. Preference order:
+      1. repo-root-relative (the run lives under this checkout);
+      2. anchored at the last ``logs/`` segment under a ``<worktree>``
+         placeholder (a clean panel worktree elsewhere);
+      3. verbatim only if neither anchor exists (never silently — but the panel
+         always produces logs/session_* paths, so 1/2 always apply)."""
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(_REPO_ROOT_FOR_RELATIVIZE).as_posix()
+    except ValueError:
+        pass
+    parts = resolved.parts
+    if "logs" in parts:
+        anchor = len(parts) - 1 - list(reversed(parts)).index("logs")
+        return "<worktree>/" + Path(*parts[anchor:]).as_posix()
+    return "<worktree>/" + resolved.name
+
+
 class ABCollector:
     """Read structured run truth only. Rendered artifacts are never opened."""
 
@@ -608,11 +634,14 @@ class ABCollector:
         events = _read_control_events(events_path)
         thought_calls, action_calls = _token_call_counts(token_path)
         event_metrics = _event_metrics(events)
-        structured = [str(pin_path)]
+        # Relativize EVERY stored path at generation time so the archived record
+        # (committed into repo logs/ and hand-verified) leaks no host worktree
+        # path (round-review item 5).
+        structured = [_relativize_session_path(pin_path)]
         if events_path is not None:
-            structured.append(str(events_path))
+            structured.append(_relativize_session_path(events_path))
         if token_path is not None:
-            structured.append(str(token_path))
+            structured.append(_relativize_session_path(token_path))
         if verdict_path is not None:
             run_id, metrics = _new_snapshot_metrics(
                 _load_json(verdict_path),
@@ -621,7 +650,7 @@ class ABCollector:
                 event_metrics=event_metrics,
             )
             source_schema = "verdict_v3"
-            structured.append(str(verdict_path))
+            structured.append(_relativize_session_path(verdict_path))
         else:
             run_id, metrics, phase_report = _legacy_metrics(
                 session,
@@ -630,13 +659,13 @@ class ABCollector:
                 event_metrics=event_metrics,
             )
             source_schema = "legacy_structured"
-            structured.append(str(phase_report))
+            structured.append(_relativize_session_path(phase_report))
             report_metrics = session / ".setup_agent" / "report_metrics.json"
             if report_metrics.is_file():
-                structured.append(str(report_metrics))
+                structured.append(_relativize_session_path(report_metrics))
         return CollectedRun(
             run_id=run_id,
-            session_path=str(session),
+            session_path=_relativize_session_path(session),
             source_schema=source_schema,
             pin=pin,
             metrics=metrics,
@@ -875,6 +904,16 @@ def check_surfaces(session_path: str | Path) -> SurfaceCheckResult:
     )
 
 
+def _pin_without_order_index(pin: Any) -> Any:
+    """A copy of a serialized run pin with run_order_index dropped, used only for
+    the append-time pin-equality check. The field stays on the stored pin; it is
+    excluded from the comparison because it is a per-run position in the campaign
+    order and thus legitimately differs across a probe/stage's repeat runs."""
+    if not isinstance(pin, dict):
+        return pin
+    return {key: value for key, value in pin.items() if key != "run_order_index"}
+
+
 class CampaignStore:
     def __init__(self, campaign_path: str | Path) -> None:
         self.path = Path(campaign_path)
@@ -901,8 +940,16 @@ class CampaignStore:
         if any(item.get("run_id") == record.run_id for item in runs):
             raise CollectionError(f"duplicate run id: {record.run_id}")
         if runs:
-            first_pin = runs[0].get("pin")
-            if first_pin != record.pin.model_dump(mode="json"):
+            # Compare pins EXCLUDING run_order_index only: that field is a
+            # per-run position in the campaign's total order, so it legitimately
+            # differs between the repeat runs collected under one probe/stage.
+            # Every other pin field (repo/image/sag SHAs, models, config, flags,
+            # seed, cache, arch) must still match the first recorded run — real
+            # reproducibility drift is still rejected. run_order_index remains
+            # recorded verbatim on each pin below (P1/P2 review findings).
+            first_pin = _pin_without_order_index(runs[0].get("pin"))
+            this_pin = _pin_without_order_index(record.pin.model_dump(mode="json"))
+            if first_pin != this_pin:
                 raise CollectionError("pin mismatch within probe/stage campaign")
         runs.append(record.model_dump(mode="json"))
         payload["runs"] = runs
@@ -1310,6 +1357,59 @@ def _write_external_baseline_pin(
     return ControlEventSink.write_run_pin(target, pin)
 
 
+# Canonical panel stages carry their treatment mask in the NAME — the
+# binding the panel spec requires (review P1: a free-text stage plus a
+# defaulted mask let --stage F archive a 11111 run into arm F).
+_CANONICAL_STAGE_MASKS = {"p": "on", "f": "off"}
+
+
+def _stage_treatment_mask(stage: str, prescriptions_arg: str | None) -> dict:
+    """The stage->mask binding. Canonical panel stages (P, F, S2-<5bits>)
+    DERIVE the mask from the stage name and reject a disagreeing
+    --prescriptions; every other stage must state its mask explicitly —
+    there is no default arm."""
+    from sag.config.prescriptions import parse_treatment_mask
+
+    key = str(stage).strip().lower()
+    canonical = _CANONICAL_STAGE_MASKS.get(key)
+    if canonical is None and key.startswith("s2-"):
+        canonical = key[len("s2-") :]
+    if canonical is not None:
+        mask = parse_treatment_mask(canonical)
+        if prescriptions_arg is not None and parse_treatment_mask(prescriptions_arg) != mask:
+            raise CollectionError(
+                f"--prescriptions {prescriptions_arg!r} disagrees with the canonical "
+                f"treatment mask for stage {stage!r}"
+            )
+        return mask
+    if prescriptions_arg is None:
+        raise CollectionError(
+            f"stage {stage!r} has no canonical treatment mask — pass --prescriptions "
+            "explicitly (on, off, or five 0/1 chars); a run must never inherit an arm"
+        )
+    return parse_treatment_mask(prescriptions_arg)
+
+
+def _verify_prescription_pin(pin, expected_mask: dict) -> None:
+    """Bit-by-bit treatment-mask verification BEFORE archiving (panel review
+    P1: without this, --prescriptions off with a broken env still archives a
+    11111 run into arm F). Key names come from the SAME pure mapping the
+    agent's run pin uses — the two sides cannot drift apart."""
+    from sag.config.prescriptions import feature_flags_for_mask
+
+    expected = feature_flags_for_mask(expected_mask)
+    flags = dict(getattr(pin, "feature_flags", None) or {})
+    drift = {
+        key: {"expected": value, "actual": flags.get(key)}
+        for key, value in expected.items()
+        if flags.get(key) is not value
+    }
+    if drift:
+        raise CollectionError(
+            f"run pin treatment mask disagrees with the requested arm: {canonical_json(drift)}"
+        )
+
+
 def _probe_environment(env_file: str | None) -> dict[str, str]:
     environment = dict(os.environ)
     if not env_file:
@@ -1362,9 +1462,19 @@ def run_probe(args: argparse.Namespace) -> CollectedRun:
         run_name,
         "--record",
     ]
+    from sag.config.prescriptions import treatment_mask_environment
+
+    treatment_mask = _stage_treatment_mask(args.stage, args.prescriptions)
     run_environment = _probe_environment(args.env_file)
     run_environment["SAG_RANDOM_SEED"] = str(args.seed)
     run_environment["SAG_DEPENDENCY_CACHE_STATE"] = args.dependency_cache
+    # Spec-required run-order index (analyzer-diet.md:453-455): injected so the
+    # agent stamps it into the run pin. Presence is verified below for live runs.
+    if args.run_order_index is not None:
+        run_environment["SAG_RUN_ORDER_INDEX"] = str(args.run_order_index)
+    # Every dimension injected EXPLICITLY — the child process must not inherit
+    # a stray SAG_PRESCRIPTION_* from the collector's own environment.
+    run_environment.update(treatment_mask_environment(treatment_mask))
     process = subprocess.run(
         command,
         check=False,
@@ -1406,6 +1516,16 @@ def run_probe(args: argparse.Namespace) -> CollectedRun:
             dependency_cache_state=args.dependency_cache,
             host_arch=platform.machine() or "unknown",
         )
+        _verify_prescription_pin(pin, treatment_mask)
+        # The run-order index must survive into the pin for a NEW live run when
+        # the runner assigned one (analyzer-diet.md:453-455). A None here means
+        # the agent dropped it — a provenance gap the collector refuses to
+        # archive silently.
+        if args.run_order_index is not None and pin.run_order_index != args.run_order_index:
+            raise CollectionError(
+                f"run pin run_order_index is {pin.run_order_index!r}, expected "
+                f"{args.run_order_index} (SAG_RUN_ORDER_INDEX did not reach the pin)"
+            )
     observed_image = RunPin.model_validate(
         {**pin.model_dump(mode="json"), "container_image_digest": _container_image_digest(run_name)}
     ).container_image_digest
@@ -1413,16 +1533,29 @@ def run_probe(args: argparse.Namespace) -> CollectedRun:
         raise CollectionError("run pin container image digest disagrees with the created container")
     record = ABCollector().collect(session)
     if args.stage != "baseline":
-        prepare_surface_artifacts(session, cli_path)
-        surface = check_surfaces(session)
-        record = record.model_copy(
-            update={
-                "surface_ok": surface.ok,
-                "surface_mismatches": tuple(
-                    f"{item.surface}:{item.field}" for item in surface.mismatches
-                ),
-            }
-        )
+        try:
+            prepare_surface_artifacts(session, cli_path)
+            surface = check_surfaces(session)
+            record = record.model_copy(
+                update={
+                    "surface_ok": surface.ok,
+                    "surface_mismatches": tuple(
+                        f"{item.surface}:{item.field}" for item in surface.mismatches
+                    ),
+                }
+            )
+        except CollectionError as exc:
+            # Panel stages: the webui surface check is orthogonal to the
+            # Category-3 anchors, and a run that produced no setup-report is
+            # itself a RESULT to record — never a reason to drop an archived
+            # run on the floor (bigtop-P-r2: the SAG run completed, the
+            # collector crashed here, the campaign stalled for hours).
+            record = record.model_copy(
+                update={
+                    "surface_ok": False,
+                    "surface_mismatches": (f"surface_unavailable: {exc}",),
+                }
+            )
     CampaignStore(campaign).append(args.probe, args.stage, record)
     if process.returncode != 0:
         print(
@@ -1479,7 +1612,25 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--sag-root", required=True)
     run.add_argument("--dependency-cache", required=True, choices=("cold", "warm"))
     run.add_argument("--seed", required=True, type=int)
+    run.add_argument(
+        "--run-order-index",
+        type=int,
+        default=None,
+        help="Spec-required run-order index (sequential across the campaign "
+        "plan). Injected as SAG_RUN_ORDER_INDEX so the agent stamps it into "
+        "the run pin; the collector verifies its presence on new runs.",
+    )
     run.add_argument("--env-file")
+    run.add_argument(
+        "--prescriptions",
+        default=None,
+        help="Treatment mask: on (arm P), off (arm F), or five 0/1 chars "
+        "in plan_pipeline/recommendation_fields/project_brief/"
+        "objectives_wording/python_prehoc_guidance order. Canonical stages "
+        "(P, F, S2-<bits>) derive the mask from the stage name and reject a "
+        "disagreement; every other stage REQUIRES this flag — no default arm. "
+        "Injected into the run env and verified bit-by-bit on the pin.",
+    )
 
     collect = subparsers.add_parser("collect", help="collect structured metrics from one session")
     collect.add_argument("--session", required=True)

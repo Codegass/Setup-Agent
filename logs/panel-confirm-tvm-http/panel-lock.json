@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "panel": "category3-confirmatory-tvm-http",
+  "purpose": "Pre-registered 12-run confirmatory panel (tvm + httpcomponents-client, 2 arms x 3 repeats). Follows path (b) of the reviewer ruling (report.md): the two arm-independent noise classes were treated as real bugs and fixed (tvm smoke steer coordinatized -> the 357-sweep is gone; http verdict coverage-cap fixed), and the ANCHORS were split/refined pre-registration BEFORE this panel sees data. NO post-hoc majority rule. This lock freezes the SPLIT tvm anchors and the EXECUTION-BEARING http anchor VERBATIM; it must match scripts/panel_category3_evaluator.py bit-for-bit.",
+  "baseline_sag_sha": "f48a039bfab5ea4ab88116af42ddfdbfefaca1ad",
+  "image_digest_source": "run-pin.json:container_image_digest — the agent stamps the image digest into the host+container run-pin mirrors; the collector's run-probe path re-derives it from the created container (_container_image_digest) and refuses to archive on any disagreement.",
+  "model_config_note": "thinking_model, action_model, sanitized_config, and prompt_bundle_sha256 are recorded per run in each run-pin.json. This panel pins neither model id nor config hash; the run-pin snapshot is authoritative and the collector verifies pin/behavior identity (feature_flags) bit-by-bit before archiving.",
+  "run_order_index_note": "run_order_index is now LIVE: the runner (scripts/run_category3_panel.py campaign_run_order) assigns it sequentially across the whole campaign plan and injects it as SAG_RUN_ORDER_INDEX; agent.py stamps it into the run pin; the collector run-probe verifies its presence on every new live run and refuses to archive a dropped index. No reconstruction-from-ledger-order this time.",
+  "evidence_source_mode": "tool-emitted",
+  "pre_registered_floors": {
+    "tvm": {
+      "build_failed_physical_or_better": "build_evidence.judgment=='failed' AND build_evidence.source=='physical', OR the honest native middle state build_evidence.judgment=='partial' AND build_evidence.source=='physical' AND build_evidence.green==false, OR strictly better (verdict in {partial,success} with build_evidence.green)",
+      "never_sweep_while_unbuilt": "HARD per-run SAFETY anchor: while the native core is unbuilt, EVERY execution-bearing pytest invocation (one carrying a recorded pytest command) carries a node-id path or -k filter (--maxfail alone does NOT select) AND its structured collected_after_deselection <= 50. ZERO pytest invocations PASSES this safety anchor — nothing was swept. A strictly-better run (build green) is EXEMPT and may run the full suite.",
+      "collected_after_deselection_max": 50,
+      "verdict_not_unknown": true,
+      "smoke_liveness_is_reported_metric_not_anchor": "smoke_liveness = the count of reps in which the agent landed a REAL smoke (an execution-bearing pytest carrying a node-id/-k filter). REPORTED as a fleet-health metric, aggregated across reps; it is NOT a per-run must-pass anchor (reviewer split: a per-run smoke gate re-punished arm-independent 5/6 compliance noise).",
+      "note": "SPLIT anchors (reviewer). collected_after_deselection is the structured python-tool result field; NEVER summary text. Evidence source mode pinned tool-emitted for the whole campaign; it may not switch mid-campaign. This mirrors scripts/panel_category3_evaluator.py evaluate_tvm + tvm_smoke_liveness."
+    },
+    "httpcomponents-client": {
+      "test_phase_workdir_is_root": "EXECUTION-BEARING test invocations ONLY: every build(action='test') invocation that ACTUALLY RAN a command (non-empty recorded command, or a success) has working_directory == project root (from the control record's clone/analyze event, never derived from the invocations) AND at least one execution-bearing root test invocation exists. A REJECTED ATTEMPT — empty recorded command with a non-success outcome (the failing reruns' non-root /workspace events) — is NOT a test execution and is excluded.",
+      "unique_executed_min": 1500,
+      "verdict": "success",
+      "build_evidence_source": "physical",
+      "note": "historical 1,856 / recent reruns 2,255; the 16-test mis-scope must be impossible. The execution-bearing refinement mirrors scripts/panel_category3_evaluator.py evaluate_httpcomponents (_is_execution_bearing)."
+    }
+  },
+  "probes": {
+    "tvm": {
+      "url": "https://github.com/apache/tvm.git",
+      "ref": "3a5b4d4e64707a1528146e28c0fb75f45da99dd7",
+      "locked_sha": "3a5b4d4e64707a1528146e28c0fb75f45da99dd7",
+      "class": "python native-core",
+      "arms": ["P", "F"]
+    },
+    "httpcomponents-client": {
+      "url": "https://github.com/apache/httpcomponents-client.git",
+      "ref": "4f86ca6a5eb528613edb892a4f7161e23dce15d7",
+      "locked_sha": "4f86ca6a5eb528613edb892a4f7161e23dce15d7",
+      "release": "rel/v5.6.1",
+      "class": "healthy reactor scoping",
+      "arms": ["P", "F"]
+    }
+  },
+  "protocol": {
+    "runs": "12 (2 probes x 2 arms x 3 repeats), interleaved P,F per probe; no pyyaml calibration in this rerun (--only-probes tvm,httpcomponents-client)",
+    "run_order_index": "live, sequential across the campaign plan (see run_order_index_note)"
+  },
+  "baseline_reds": {
+    "note": "Panel precondition (analyzer-diet.md:536-555): the SIX pre-existing SUITE failures registered in the campaign ledger at panel start; any NEW suite failure BLOCKS the panel. Suite reds, NOT probes. Matched by node-id keyword up to max_count; an accepted red that spreads to a new call site (count overflow) is a NEW regression that blocks.",
+    "accepted": [
+      {"keyword": "test_evidence_ingestion", "max_count": 1},
+      {"keyword": "test_stage1_review_fixes", "max_count": 2},
+      {"keyword": "test_lineage_idempotence_followup", "max_count": 2},
+      {"keyword": "test_packaging_smoke", "max_count": 1}
+    ]
+  }
+}

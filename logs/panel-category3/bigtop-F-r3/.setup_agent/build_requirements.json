@@ -1,0 +1,65 @@
+{
+  "build_goal": "install",
+  "build_islands": [
+    {
+      "goal": "install",
+      "rationale": "Independent maven build island under the aggregator; build it on its own with 'install'.",
+      "root": "/workspace/bigtop/bigtop-test-framework",
+      "system": "maven"
+    },
+    {
+      "goal": "build",
+      "rationale": "Independent gradle build island under the aggregator; build it on its own with 'build'.",
+      "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+      "system": "gradle"
+    },
+    {
+      "goal": "build",
+      "rationale": "Independent gradle build island under the aggregator; build it on its own with 'build'.",
+      "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-transaction-queue",
+      "system": "gradle"
+    },
+    {
+      "goal": "publishToMavenLocal",
+      "rationale": "Independent gradle build island under the aggregator; build it on its own with 'publishToMavenLocal'.",
+      "root": "/workspace/bigtop/bigtop-data-generators",
+      "system": "gradle"
+    }
+  ],
+  "build_root": "/workspace/bigtop/bigtop-test-framework",
+  "fail_at_end": false,
+  "java_version": null,
+  "java_version_enforced": false,
+  "java_version_source": null,
+  "root_shape": "pathological_aggregator",
+  "survey": {
+    "analyzer_version": 7,
+    "config_fingerprint": "2806625103 15378 L0",
+    "project_path": "/workspace/bigtop"
+  },
+  "test_fail_at_end": false,
+  "test_islands": [
+    {
+      "rationale": "Independent gradle test island; run its tests on its own.",
+      "root": "/workspace/bigtop/bigtop-data-generators",
+      "system": "gradle"
+    },
+    {
+      "rationale": "Independent gradle test island; run its tests on its own.",
+      "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+      "system": "gradle"
+    },
+    {
+      "rationale": "Independent gradle test island; run its tests on its own.",
+      "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-transaction-queue",
+      "system": "gradle"
+    },
+    {
+      "rationale": "Independent maven test island; run its tests on its own.",
+      "root": "/workspace/bigtop/bigtop-test-framework",
+      "system": "maven"
+    }
+  ],
+  "test_root": "/workspace/bigtop/bigtop-data-generators",
+  "test_system": "gradle"
+}

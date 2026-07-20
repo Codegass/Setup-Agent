@@ -1,0 +1,19 @@
+{
+  "build_goal": "install",
+  "build_islands": [],
+  "build_root": "/workspace/httpcomponents-client",
+  "fail_at_end": true,
+  "java_version": "8",
+  "java_version_enforced": false,
+  "java_version_source": "maven-compiler",
+  "root_shape": "healthy_reactor",
+  "survey": {
+    "analyzer_version": 7,
+    "config_fingerprint": "4109343886 43229 L0",
+    "project_path": "/workspace/httpcomponents-client"
+  },
+  "test_fail_at_end": true,
+  "test_islands": [],
+  "test_root": "/workspace/httpcomponents-client",
+  "test_system": "maven"
+}

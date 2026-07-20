@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from sag.config import Config, create_agent_logger, create_command_logger, get_session_logger
+from sag.config.prescriptions import prescription_feature_flags
 from sag.docker_orch.orch import DockerOrchestrator
 from sag.ui import EventType, PhaseType, UIEvent, UIManager
 
@@ -251,6 +252,12 @@ class SetupAgent:
             return
         seed_text = str(os.getenv("SAG_RANDOM_SEED") or "").strip()
         random_seed = int(seed_text) if re.fullmatch(r"-?[0-9]+", seed_text) else None
+        # Spec-required run-order index: the panel runner assigns it sequentially
+        # across the campaign plan and injects it as SAG_RUN_ORDER_INDEX (the
+        # P/F interleave lives in the index, so drift is attributable). Absent
+        # for ad-hoc runs, where it stays None.
+        order_text = str(os.getenv("SAG_RUN_ORDER_INDEX") or "").strip()
+        run_order_index = int(order_text) if re.fullmatch(r"-?[0-9]+", order_text) else None
         prompt_bundle = getattr(
             self.react_engine.prompts,
             "canonical_payload",
@@ -269,17 +276,27 @@ class SetupAgent:
                 "control_events": True,
                 "reasoning_scheduler": True,
                 "phase_machine": self.phase_machine is not None,
+                # The five-boolean prescription treatment mask (A/B panel):
+                # every recorded run carries its exact arm/stage-2 mask.
+                **prescription_feature_flags(),
             },
             "random_seed_or_null": random_seed,
+            "run_order_index": run_order_index,
             "dependency_cache_state": str(os.getenv("SAG_DEPENDENCY_CACHE_STATE") or "unspecified"),
             "host_arch": platform.machine() or "unknown",
         }
+        # Write the pin UNCONDITIONALLY at startup so the reproducibility file
+        # always exists — even when no target repo SHA is ever observed (the
+        # pin write previously fired only inside _record_target_repo_sha, so an
+        # interrupted run left NO pin at all; real 2026-07-19 S2-00000-r3). The
+        # SHA is None here and is filled in the moment it is observed.
+        self._write_run_pin(target_repo_sha=None)
 
-    def _record_target_repo_sha(self, target_repo_sha: str) -> None:
+    def _write_run_pin(self, *, target_repo_sha: str | None) -> None:
         template = getattr(self, "_run_pin_template", None)
         host_path = getattr(self, "_run_pin_host_path", None)
         if template is None or host_path is None:
-            self.agent_logger.warning("Target SHA observed before run-pin provenance was ready")
+            self.agent_logger.warning("Run pin write attempted before provenance was ready")
             return
         try:
             pin = RunPin(target_repo_sha=target_repo_sha, **template)
@@ -289,7 +306,12 @@ class SetupAgent:
                 mirror=getattr(self, "_run_pin_mirror", None),
             )
         except Exception as exc:
-            self.agent_logger.warning(f"Could not persist complete run pin: {exc}")
+            self.agent_logger.warning(f"Could not persist run pin: {exc}")
+
+    def _record_target_repo_sha(self, target_repo_sha: str) -> None:
+        # Rewrite the pin with the observed SHA (the startup write left it
+        # None); the collector's current-run validation requires the real SHA.
+        self._write_run_pin(target_repo_sha=target_repo_sha)
 
     def _initialize_tools(self, workflow_mode: str = "setup") -> List:
         """Initialize all available tools for the given workflow mode.
@@ -610,12 +632,12 @@ class SetupAgent:
             # rendering); descriptions are the one-line phase objectives
             # (TOOLS, never raw commands).
             from sag.agent.phase_machine import PHASE_NAMES
-            from sag.agent.react_engine import KICKOFF_PHASE_OBJECTIVES
+            from sag.agent.react_engine import kickoff_phase_objectives
 
             # KICKOFF variant: authored at t=0 BEFORE the repo is analyzed, so
             # the build objective's blocking instruction is conditional on
             # ecosystem (live python runs obeyed the unconditional Java text).
-            initial_tasks = [KICKOFF_PHASE_OBJECTIVES[name] for name in PHASE_NAMES]
+            initial_tasks = [kickoff_phase_objectives()[name] for name in PHASE_NAMES]
             phase_task_ids = [f"phase_{name}" for name in PHASE_NAMES]
 
             logger.info("Creating trunk context from the engine-owned phase plan...")

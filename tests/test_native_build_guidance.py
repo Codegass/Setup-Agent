@@ -378,10 +378,31 @@ class NativeLadderOrch:
                 self.import_ok,
                 "" if self.import_ok else "ImportError: cannot find libtvm.so",
             )
-        if "compileall" in c:
-            return res(True)
+        if "cache_from_source" in c:
+            # The validator's scripted metrics probe (compileall_metrics_command
+            # runs an inline python script — the word 'compileall' never appears
+            # in it) expects a JSON payload; the fixture predated the probe and
+            # its empty default parsed as 'metrics unavailable', capping an
+            # all-green ladder below build_complete.
+            return res(
+                True,
+                json.dumps(
+                    {
+                        "status": "valid",
+                        "source_count": 10,
+                        "compiled_source_count": 10,
+                        "missing_source_count": 0,
+                        "foreign_pyc_count": 0,
+                        "coverage": 1.0,
+                        "missing_sources": [],
+                        "foreign_pycs": [],
+                    }
+                ),
+            )
         if "__pycache__" in c and "wc -l" in c:
             return res(True, "10")
+        if "-m compileall" in c:
+            return res(True)
         if "'*.py'" in c and "wc -l" in c:
             return res(True, "10")
         if "'*.so'" in c or "'*.dylib'" in c:

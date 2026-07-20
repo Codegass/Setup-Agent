@@ -1,0 +1,37 @@
+{
+  "build_goal": "deps",
+  "build_islands": [],
+  "build_root": "/workspace/tvm",
+  "fail_at_end": false,
+  "has_c_extensions": false,
+  "has_native_build": true,
+  "java_version": null,
+  "java_version_enforced": false,
+  "java_version_source": null,
+  "python_constraint": ">=3.10",
+  "python_constraint_source": "pyproject.toml",
+  "python_install_commands": [
+    "{venv}/bin/python -m pip install -e .",
+    "{venv}/bin/python -m pip install pytest pytest-xdist pytest-cov pytest-mock pytest-benchmark pytest-timeout pytest-rerunfailures pytest-repeat torch psutil cloudpickle ruff pre-commit"
+  ],
+  "python_install_note": null,
+  "python_install_source": "pyproject.toml",
+  "python_installer": "pip",
+  "python_packages": [],
+  "python_venv": "/workspace/tvm/.venv",
+  "python_version": "3.13",
+  "root_shape": "single_module",
+  "survey": {
+    "analyzer_version": 7,
+    "config_fingerprint": "2376954094 33193 L0",
+    "project_path": "/workspace/tvm"
+  },
+  "test_fail_at_end": false,
+  "test_hints": {
+    "pytest_args": null,
+    "test_deps": []
+  },
+  "test_islands": [],
+  "test_root": "/workspace/tvm",
+  "test_system": "pytest"
+}

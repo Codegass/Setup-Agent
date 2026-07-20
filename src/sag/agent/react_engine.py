@@ -186,6 +186,105 @@ KICKOFF_PHASE_OBJECTIVES = {
     ),
 }
 
+# Treatment mask dim (d): the objectives' "Recommended Build" wording is a
+# prescription channel. The facts variants replace ONLY the recommendation
+# references (anchor-asserted, the kickoff-softening pattern); everything
+# else stays byte-identical so arm P is untouched when the flag is on.
+_D_ANALYZE_BEFORE = (
+    "Record build system, the "
+    "analyzer's Recommended Build (target dir + goal), test counts"
+)
+_D_ANALYZE_AFTER = (
+    "Record build system, the "
+    "build coordinates from the survey facts (target dirs), test counts"
+)
+_D_BUILD_BEFORE = (
+    "Follow the analyzer's "
+    "Recommended Build when it differs from a plain root compile — an aggregator "
+    "root over Groovy modules needs build(action='package'/'install'), and a "
+    "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
+    "compile target"
+)
+_D_BUILD_AFTER = (
+    "Consult the survey facts "
+    "for the build coordinates — an aggregator root can compile nothing at the "
+    "root while the real sources live in island modules. If the survey facts show NO Java "
+    "compile target"
+)
+assert _D_ANALYZE_BEFORE in PHASE_OBJECTIVES["analyze"], (
+    "facts-wording variant lost its analyze anchor — update _D_ANALYZE_BEFORE "
+    "alongside PHASE_OBJECTIVES['analyze']"
+)
+assert _D_BUILD_BEFORE in PHASE_OBJECTIVES["build"], (
+    "facts-wording variant lost its build anchor — update _D_BUILD_BEFORE "
+    "alongside PHASE_OBJECTIVES['build']"
+)
+_D_TEST_BEFORE = (
+    "Run it in the analyzer's "
+    "Recommended Tests target (the tests can live in a different module — and "
+    "even a different build system — than the build, e.g. Gradle test modules "
+    "beside a Maven build); otherwise use the build root."
+)
+_D_TEST_AFTER = (
+    "Run it where the "
+    "survey facts place the tests (they can live in a different module — and "
+    "even a different build system — than the build); otherwise use the build root."
+)
+assert _D_TEST_BEFORE in PHASE_OBJECTIVES["test"], (
+    "facts-wording variant lost its test anchor — update _D_TEST_BEFORE "
+    "alongside PHASE_OBJECTIVES['test']"
+)
+_D_PYTHON_TEST_BEFORE = (
+    "Run it in "
+    "the analyzer's Recommended Tests target when one is present; otherwise "
+    "the project root."
+)
+_D_PYTHON_TEST_AFTER = (
+    "Run it in "
+    "the test location the survey facts name when one is present; otherwise "
+    "the project root."
+)
+assert _D_PYTHON_TEST_BEFORE in PYTHON_PHASE_OBJECTIVES["test"], (
+    "facts-wording variant lost its python-test anchor — update "
+    "_D_PYTHON_TEST_BEFORE alongside PYTHON_PHASE_OBJECTIVES['test']"
+)
+FACTS_PHASE_OBJECTIVES = {
+    "analyze": PHASE_OBJECTIVES["analyze"].replace(_D_ANALYZE_BEFORE, _D_ANALYZE_AFTER),
+    "build": PHASE_OBJECTIVES["build"].replace(_D_BUILD_BEFORE, _D_BUILD_AFTER),
+    "test": PHASE_OBJECTIVES["test"].replace(_D_TEST_BEFORE, _D_TEST_AFTER),
+}
+FACTS_PYTHON_PHASE_OBJECTIVES = {
+    "test": PYTHON_PHASE_OBJECTIVES["test"].replace(_D_PYTHON_TEST_BEFORE, _D_PYTHON_TEST_AFTER),
+}
+
+# Kickoff (P2-7): the initial trunk tasks are a persisted prompt surface —
+# they must carry the same wording arm the runtime intros do. The kickoff
+# softening re-anchors on the facts build variant (its conditional sentence
+# changed wording with dim d).
+_D_KICKOFF_BEFORE = "If the survey facts show NO Java compile target (a packaging/meta-project), "
+_D_KICKOFF_AFTER = (
+    "If the survey facts show NO Java compile target (a packaging/meta-project) "
+    "AND the project is not a Python/other-ecosystem project, "
+)
+assert _D_KICKOFF_BEFORE in FACTS_PHASE_OBJECTIVES["build"], (
+    "facts kickoff softening lost its anchor — update _D_KICKOFF_BEFORE "
+    "alongside _D_BUILD_AFTER"
+)
+FACTS_KICKOFF_PHASE_OBJECTIVES = {
+    **KICKOFF_PHASE_OBJECTIVES,
+    **FACTS_PHASE_OBJECTIVES,
+    "build": FACTS_PHASE_OBJECTIVES["build"].replace(_D_KICKOFF_BEFORE, _D_KICKOFF_AFTER),
+}
+
+
+def kickoff_phase_objectives() -> dict:
+    """The kickoff task texts under the current treatment mask (dim d)."""
+    from sag.config.prescriptions import prescription_flags
+
+    if prescription_flags()["objectives_wording"]:
+        return KICKOFF_PHASE_OBJECTIVES
+    return FACTS_KICKOFF_PHASE_OBJECTIVES
+
 # Runtime python guidance for the BUILD/TEST phase intros, injected AFTER the
 # analyzer has run (the same environment_summary["build_recommendation"]
 # plumbing as _recommended_build_line). This is the live-effective seam: the
@@ -211,9 +310,11 @@ PYTHON_TEST_PHASE_GUIDANCE = (
 NATIVE_NOT_BUILT_TEST_GUIDANCE = (
     "The NATIVE core was not built in the build phase. Do NOT sweep the full "
     "suite — without the native library it only repeats hundreds of identical "
-    "collection errors. Run a small targeted smoke first (one or two fast test "
-    "files) to confirm what actually works, report the result honestly, and "
-    "only expand if the smoke passes."
+    "collection errors. Run a small targeted smoke first: pick ONE small test "
+    "file and call build(action='test', args='<that file> --maxfail=1') — a "
+    "bare build(action='test') collects the WHOLE suite and is exactly the "
+    "sweep to avoid. Report the smoke result honestly and only expand if it "
+    "passes."
 )
 
 # Native-first block, PREPENDED to the python build guidance when the analyzer
@@ -252,10 +353,23 @@ def phase_objective(phase: str, build_system: Optional[str] = None) -> str:
     When the analyzer detected a Python project, the build/test phases get the
     PYTHON_PHASE_OBJECTIVES overrides; every other project (and an unknown
     build system) gets the PHASE_OBJECTIVES defaults byte-identical."""
+    from sag.config.prescriptions import prescription_flags
+
+    facts_mode = not prescription_flags()["objectives_wording"]
     if is_python_build_system(build_system):
+        # dim (d) must reach the ecosystem override too (panel review: the
+        # python test objective also names Recommended Tests).
+        if facts_mode:
+            facts_override = FACTS_PYTHON_PHASE_OBJECTIVES.get(phase)
+            if facts_override:
+                return facts_override
         override = PYTHON_PHASE_OBJECTIVES.get(phase)
         if override:
             return override
+    if facts_mode:
+        facts = FACTS_PHASE_OBJECTIVES.get(phase)
+        if facts:
+            return facts
     return PHASE_OBJECTIVES.get(phase, "")
 
 
@@ -1160,6 +1274,13 @@ class ReActEngine(UIEventEmitter):
         intro is byte-identical to before."""
         if phase not in ("build", "test"):
             return None
+        from sag.config.prescriptions import prescription_flags
+
+        if not prescription_flags()["python_prehoc_guidance"]:
+            # Treatment mask dim (e): this whole block is PRE-HOC advice.
+            # The evidence-reactive native smoke steer is allowlisted and
+            # injected by _phase_intro_step, not here — it stays.
+            return None
         if not is_python_build_system(self._detected_build_system()):
             return None
         if phase == "test":
@@ -1189,6 +1310,10 @@ class ReActEngine(UIEventEmitter):
             return None
         if not rec:
             return None
+        from sag.config.prescriptions import prescription_flags
+
+        if not prescription_flags()["recommendation_fields"]:
+            return self._coordinates_line(rec, phase)
         if phase == "test":
             # Pathological aggregators are archipelagos: run tests in EACH test
             # island (Bigtop: the maven framework's own unit tests were skipped
@@ -1229,6 +1354,31 @@ class ReActEngine(UIEventEmitter):
             f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
             f"{rec.get('build_root')} — {rec.get('rationale', '')}"
         )
+
+    @staticmethod
+    def _coordinates_line(rec, phase: str) -> Optional[str]:
+        """Treatment mask dim (b): the intro call-out without action wording —
+        coordinate FACTS only (system + where), for build and test alike."""
+        if phase == "test":
+            islands = rec.get("test_islands")
+            if islands and len(islands) > 1:
+                coords = "; ".join(
+                    f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
+                )
+                return f"Test coordinates (independent islands): {coords}."
+            test_root = rec.get("test_root")
+            if not test_root or test_root == rec.get("build_root"):
+                return None
+            return f"Test coordinates: {rec.get('test_system')} at {test_root}."
+        islands = rec.get("build_islands")
+        if islands and len(islands) > 1:
+            coords = "; ".join(
+                f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
+            )
+            return f"Build coordinates (independent islands): {coords}."
+        if rec.get("is_aggregator_only"):
+            return "Build coordinates: the survey found no standard compile target at the root."
+        return f"Build coordinates: {rec.get('build_system')} at {rec.get('build_root')}."
 
     @staticmethod
     def _island_build_line(islands) -> str:
@@ -2737,11 +2887,19 @@ class ReActEngine(UIEventEmitter):
         sat untouched). The redirect must carry a destination.
         """
         try:
-            trunk = self.context_manager.load_trunk_context()
-            rec = (getattr(trunk, "environment_summary", None) or {}).get(
-                "build_recommendation"
-            ) or {}
-            islands = rec.get("build_islands") or []
+            # Panel review P1: this allowlisted corrective loop must be
+            # IDENTICAL in both arms. The trunk recommendation is projected
+            # by treatment dim (b) (goals stripped in arm F), so the islands
+            # come from the shared MANIFEST — a mechanical field both arms
+            # keep, goals included.
+            orchestrator = getattr(
+                getattr(self, "physical_validator", None), "docker_orchestrator", None
+            )
+            if orchestrator is None:
+                return ""
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            islands = (read_build_requirements(orchestrator) or {}).get("build_islands") or []
             if len(islands) < 2:
                 return ""
             observed = [

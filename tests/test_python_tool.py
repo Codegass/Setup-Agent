@@ -967,3 +967,53 @@ def test_setup_tool_python_branch_issues_the_shared_ladder_commands():
         for c in orch.commands
         if DEFAULT_OVERLAY_JSON not in c
     )
+
+
+# ---- Category-3 panel anchor: structured collected_after_deselection -------
+
+
+def test_filtered_test_records_selected_count_not_total():
+    """Panel spec: the TVM smoke anchor reads collected_after_deselection as
+    a STRUCTURED field of the recorded result — never the summary text. A
+    filtered run gets a scoped collect pass; the X of 'X/Y tests collected'
+    is the selection (the naive regex would read Y, the total)."""
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            (
+                "--collect-only -q -k",
+                ok("tests/test_a.py::test_x\n3/357 tests collected (354 deselected)"),
+            ),
+            ("--collect-only", ok("357 tests collected in 1.2s")),
+        ],
+    )
+    result = PythonTool(orch).execute(
+        "test", working_directory="/workspace/proj", args="-k smoke"
+    )
+    assert result.metadata["collected"] == 357  # denominator unchanged
+    assert result.metadata["collected_after_deselection"] == 3
+
+
+def test_unfiltered_test_selection_equals_denominator_no_extra_collect():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("--collect-only", ok("42 tests collected in 0.2s"))],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    assert result.metadata["collected_after_deselection"] == 42
+    collects = [c for c in orch.commands if "--collect-only" in c]
+    assert len(collects) == 1  # no scoped pass without a filter
+
+
+def test_unparseable_scoped_collection_is_none_never_invented():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only -q -k", ok("some garbage the parser does not know")),
+            ("--collect-only", ok("357 tests collected in 1.2s")),
+        ],
+    )
+    result = PythonTool(orch).execute(
+        "test", working_directory="/workspace/proj", args="-k smoke"
+    )
+    assert result.metadata["collected_after_deselection"] is None

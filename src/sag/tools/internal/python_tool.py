@@ -50,6 +50,10 @@ COLLECTED_JSON = "/workspace/.setup_agent/pytest_collected.json"
 _PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
 
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
+# The SELECTED count of a filtered collection: the X of pytest's
+# "X/Y tests collected (Z deselected)". The plain _COLLECTED_RE would match
+# Y (the digits touching "tests collected") — the TOTAL, not the selection.
+_SELECTED_RE = re.compile(r"(\d+)/\d+\s+tests?\s+collected")
 _NO_TESTS_RE = re.compile(r"no tests collected|no tests ran")
 
 # Bug #13 defect 2: install-failure signatures that must redden the result
@@ -635,6 +639,22 @@ class PythonTool(BaseTool):
         collected = self._parse_collected(collect.get("output") or "")
         self._write_collected(collected)
 
+        # Panel anchor source (Category-3 spec): the SELECTED count for THIS
+        # invocation as a STRUCTURED field — never parsed from the run's
+        # summary text downstream. A filtered invocation gets its own scoped
+        # collect pass; an unfiltered one selects the full denominator.
+        if pytest_args:
+            scoped = self._run(
+                f"{python} -m pytest --collect-only -q {pytest_args}",
+                working_directory,
+                timeout,
+            )
+            collected_after_deselection = self._parse_collected_after_deselection(
+                scoped.get("output") or ""
+            )
+        else:
+            collected_after_deselection = collected
+
         self._test_attempt_counter += 1
         attempt_id = self._test_attempt_counter
         report = f"{PYTEST_REPORT_DIR}/pytest-attempt-{attempt_id:06d}.xml"
@@ -691,6 +711,7 @@ class PythonTool(BaseTool):
             "report": report,
             "attempt_id": attempt_id,
             "collected": collected,
+            "collected_after_deselection": collected_after_deselection,
             "collected_json": COLLECTED_JSON,
             **junit_counts,
         }
@@ -984,6 +1005,16 @@ class PythonTool(BaseTool):
         if _NO_TESTS_RE.search(output or ""):
             return 0
         return None
+
+    def _parse_collected_after_deselection(self, output: str) -> Optional[int]:
+        """The SELECTED count of a scoped `--collect-only -q` run: the X of
+        `X/Y tests collected (Z deselected)`; a plain `N tests collected`
+        (nothing deselected) IS the selection; `no tests collected` is an
+        honest 0; unparseable is None — never invented."""
+        matches = _SELECTED_RE.findall(output or "")
+        if matches:
+            return int(matches[-1])
+        return self._parse_collected(output)
 
     def _write_collected(self, collected: Optional[int]) -> None:
         body = json.dumps({"collected": collected})

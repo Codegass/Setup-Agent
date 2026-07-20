@@ -610,3 +610,25 @@ def test_config_edit_with_failed_trunk_save_does_not_serve_stale_trunk():
 
     # And with both ends agreeing, the fast path is back.
     assert tool.ensure_facts("/workspace/proj") == "present"
+
+
+def test_analysis_validity_is_facts_based_not_plan_based():
+    """Analyzer-diet spec, shared gate rework #1: the superseded plan-length
+    criterion made validity (and therefore ensure_facts) depend on plan
+    GENERATION; a survey that identified the project and found its files is
+    valid with NO execution plan at all."""
+    tool = ProjectAnalyzerTool(SurveyOrch())
+    analysis = {
+        "project_type": "Python",
+        "build_system": "pip/poetry",
+        "existing_files": ["pyproject.toml"],
+        # no execution_plan key at all
+    }
+    assert tool._is_analysis_valid(analysis) is True
+    # The facts criteria still gate: an unidentified project is invalid.
+    assert (
+        tool._is_analysis_valid(
+            {"project_type": "unknown", "build_system": "unknown", "existing_files": ["x"]}
+        )
+        is False
+    )

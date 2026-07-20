@@ -34,6 +34,81 @@ Hard rules carried over from the control-layer work:
   mid-run, on EVERY intro branch (the tvm4 seam lesson: runtime-reactive
   guidance may not hide behind the brief projection).
 
+## Role taxonomy: the surveyor is NOT a verifier (settled 2026-07-19)
+
+Same instruments — both read the container disk directly, no LLM — but two
+DISTINCT roles. Four dividing lines:
+
+1. **Temporal axis — relative to the action/claim under audit, not global
+   time.** The surveyor reads BEFORE the action it informs (what the world
+   looks like); the judge reads AFTER the action whose claim it audits
+   (what that action left behind). A mid-run re-survey is still pre-hoc
+   with respect to the NEXT action; a validator pass is post-hoc with
+   respect to the claim in front of it.
+2. **A claim under test, or none.** The judge's essence is COMPARISON: the
+   agent claims "build succeeded", the judge holds that claim against the
+   disk — its output takes a position (real / refuted / unknown). The
+   surveyor has no claim in front of it; it takes inventory. Its output has
+   no position, only description. This is the root of both hard rules:
+   verdicts-never-recommends, describes-never-prescribes. One produces a
+   RULING, the other produces a MAP.
+3. **Cost of being wrong.** A wrong map costs the agent a detour; the
+   corrective loops (island checklist, loop-redirect) pull it back —
+   recoverable. A wrong ruling is a phantom-green run or a false report —
+   the system's credibility, unrecoverable. Hence the validator is 立身之本
+   while the analyzer is a convenience: their failure classes differ by an
+   order of magnitude, and so must the caution applied when changing them.
+4. **Opposite service directions.** The surveyor works FOR the agent (the
+   charter: lower discovery cost, amplify through the framework); the
+   verifier keeps the agent HONEST (evidence over claims). Folding helper
+   and referee into one component blurs the trust boundary.
+
+**Placement** — the surveyor is a ROLE of the physical observation layer
+(layer 2), beside the judge, over shared reading machinery:
+
+    Layer 2: physical observation (shared readers: module scan, build-system
+             detection, package-layout scan)
+      ├── surveyor (pre-hoc, draws the map)
+      │     → feeds analyze's fact sheet (layer 3) and ensure_facts (layer 1)
+      └── judge = verifier (post-hoc, audits)
+            → feeds gates, finalizer, report
+
+One set of instruments; a mapmaker and an auditor using them. Sharing the
+instruments is deliberate (Category 2's whole point — the fact and its
+staleness domain must use the same eyes); merging the roles is deliberately
+refused.
+
+**Why the surveyor must not merge into the verifier.** Ruling independence,
+stated precisely (review 2026-07-19: the absolute form was wrong — the
+validator DOES read the survey manifest to pick its checking coordinates:
+which JDK to expect, which python packages to import-probe, which module
+scope to scan). The rule, stated to what the implementation
+actually guarantees (round-2 review: the manifest supplies WHAT to expect —
+JDK level, package names, module scope — not merely where to look): **the
+map defines the checking ASSUMPTIONS — scope and expectations — but only a
+FRESH PHYSICAL PROBE may satisfy an assumption; the map itself is never
+verdict evidence and never overrides what a probe returned.** A wrong map
+can therefore misdirect or narrow a check (a scoped-green risk we
+acknowledge rather than deny — absolute independence would require the
+validator to re-derive requirements from the ground, which is not claimed
+or implemented); what it cannot do is stand in for the probe. Housed
+together, even that boundary erodes — map errors would become verdict
+errors: the second-hand-evidence class the control-layer redesign existed
+to eliminate.
+
+**Two gray zones, stated honestly.**
+- `module_coverage` stands between the roles: one computation feeding the
+  finalizer's verdict conflicts (audit side) AND the gates' island checklist
+  (map side). The precedent it sets: share the ALGORITHM, never the role.
+- The survey fingerprint looks like the surveyor verifying — but its object
+  is whether the MAP is current, not whether the JOURNEY succeeded. That is
+  a mapmaker's self-calibration, not an audit.
+
+**Consequence for Category 3.** The A/B panel tries the PRESCRIPTION layer
+(tool-layer goal/plan composition) — neither the surveyor nor the judge is
+on trial. The observation layer is the shared foundation under both arms
+and does not move.
+
 ## Category 1 (now): the framework guarantees the survey
 
 **Problem.** Manifest + env-summary facts are produced only when the agent
@@ -241,13 +316,221 @@ is unchanged.
   (`&& echo`, never `; echo`). No version bump — healthy-path digests are
   unchanged.
 
-## Category 3 (behind A/B): prescriptions and dead weight
+## Category 3 (prep done 2026-07-19; deletion behind A/B): prescriptions and dead weight
 
-- `_generate_execution_plan` + fallback plans: `validate_execution_plan_completeness`
-  has zero callers — delete the generator after confirming phase-mode never
-  reads `execution_plan` from metadata.
-- Output slimming: the fact sheet replaces the plan text; rendering moves to
-  the engine projection (Category 4, low priority — agreed acceptable as-is).
+**Reader census (grep proof, 2026-07-19; precision fixed on review).**
+`execution_plan` has ZERO production SEMANTIC readers outside
+`project_analyzer.py` — nothing outside the analyzer branches on its
+content. Two observability caveats, stated exactly: tests read it, and the
+full `analysis_result` (plan included) flows into `ToolResult.metadata` and
+the control record — an observable DATA SHAPE whose disappearance is a
+recorded-artifact change (replay/webui tolerate absent fields, but the
+deletion PR must say so, not assume so). Within the analyzer:
+
+| Symbol | Callers | Status |
+|---|---|---|
+| `_generate_fallback_execution_plan` | 0 | DELETED (dead) |
+| `_generate_basic_setup_plan` | 0 | DELETED (dead) |
+| `context_manager.validate_execution_plan_completeness` | 0 | DELETED (dead) |
+| `_generate_execution_plan` (+ its `_generate_three_step_fallback_plan`) | 1 (`_perform_comprehensive_analysis`) | LIVE — behind the panel |
+
+The live generator's couplings the deletion PR must rework — three inside
+the analyzer plus one OUTSIDE it that the first census missed (review P1):
+1. `_is_analysis_valid` requires plan length ≥ 2 — analysis validity (and
+   therefore `ensure_facts`) currently depends on plan GENERATION
+   succeeding; validity must key off facts instead.
+2. `_update_trunk_context_with_plan`'s LEGACY branch rewrites the todo list
+   from the plan — phase trunks return before reaching it; only pre-phase
+   flows consume it.
+3. `_format_analysis_output` renders the plan text — the prescription
+   surface the panel judges.
+4. **Legacy `ContextTool` analyzer-success gate** (`context_tool.py`
+   ~1694): completing an analyze task on a legacy trunk requires
+   `todo_list > 4` — plan→todo expansion treated as PROOF of analysis.
+   With plan→todo off, a legitimate facts-only completion is rejected.
+   Rework: the gate verifies persisted survey facts (the stamped manifest
+   / analyzer-success marker), not todo arithmetic; plus a legacy
+   `run_task` facts-only regression test.
+
+**The A/B panel (the decision instrument, not taste).**
+
+*Arms.* One binary, one runtime switch (`SAG_PRESCRIPTIONS=on|off`),
+recorded in every run pin. Review P1: hiding the plan TEXT alone tests
+nothing — prescriptions also reach the run through metadata, the trunk, and
+the phase intros, so arm F must close EVERY channel. The treatment matrix
+is the switch's implementation contract:
+
+| Surface (channel) | Arm P | Arm F |
+|---|---|---|
+| `_generate_execution_plan` (+ three-step fallback) | runs | **NOT CALLED** — the deletion is simulated, not hidden |
+| `_is_analysis_valid` | facts-based validity (SHARED — coupling #1 rework runs in BOTH arms; the plan-length ≥ 2 criterion is SUPERSEDED and appears in neither) | same as P |
+| plan→todo rewrite (legacy trunks) | as today | not executed |
+| legacy ContextTool analyzer gate | persisted-survey-facts marker (SHARED — coupling #4 rework runs in BOTH arms; the `todo_list > 4` criterion is SUPERSEDED and appears in neither) | same as P |
+| analyze ToolResult TEXT | plan + recommendation prose | fact sheet only |
+| `ToolResult.metadata` + control record | full analysis incl. plan | facts-only — no `execution_plan`, no goal/rationale strings |
+| trunk `build_recommendation` | {system, root, goal, rationale} | {system, root, islands-as-facts} — no goal, no rationale |
+| `project_brief` (WHOLE artifact — round-2 review: it carries `actions` and `recommended-build`, persists, and analyze exposes its file ref; hiding only the projection is not facts-only) | composed + persisted + projection rendered | **NOT generated** — no artifact, no ref, no projection |
+| `PHASE_OBJECTIVES` text (analyze/build objectives say "Record/Follow the analyzer's Recommended Build") | as today | objective VARIANT with the recommendation references removed (facts wording: detected build system + manifest coordinates) |
+| python fallback guidance (`_python_phase_guidance`, fires when the brief projection is absent — which in arm F is ALWAYS) | full, incl. the PRE-HOC native-first block | pre-hoc native-first prose OFF (it is a prescription); only the REACTIVE smoke steer from the allowlist remains |
+| `_recommended_workdir` (tool_orchestration: enforced workdir default from `build_root`/`test_root` when the model omits one) | enforced | **SHARED-MECHANICAL, both arms** — it consumes coordinate FACTS that arm F retains ({system, roots}), is overridable per call, and contains no action choice; classified, not overlooked |
+| phase-intro recommendation line | with recommended action | coordinates line only (detected system + roots) |
+| installer ladder (`python_install_commands`) | unchanged | unchanged — mechanical tool input, NOT on trial |
+| **Corrective-loop allowlist**: island checklist, loop redirect, native smoke steer (REACTIVE, evidence-triggered) | ON | ON — the replacement mechanism, identical in both arms |
+
+The classification rule the matrix applies: PRE-HOC advice (what to do
+before evidence exists) is a prescription and arm F closes it; REACTIVE
+evidence-with-coordinates (fires only on observed failure) is a corrective
+loop and both arms keep it; mechanical consumption of retained fact
+coordinates is shared.
+
+**Field-level dimension mapping (round-4 review: several matrix ROWS mix
+dimensions — the mapping is by FIELD, and this table is authoritative for
+the treatment mask):**
+
+| Field / behavior | Dim |
+|---|---|
+| `_generate_execution_plan` + three-step fallback execution | a |
+| plan section of analyze TEXT | a |
+| `execution_plan` in ToolResult.metadata / control record | a |
+| plan→todo rewrite (legacy trunks) | a |
+| recommendation prose section of analyze TEXT | b |
+| goal/rationale strings in metadata / control record | b |
+| trunk `build_recommendation.goal`/`rationale` | b |
+| phase-intro recommendation line (action wording) | b |
+| `project_brief` artifact + projection + analyze file ref | c |
+| `PHASE_OBJECTIVES` recommendation wording | d |
+| pre-hoc python/native-first guidance block | e |
+| `_is_analysis_valid` facts-based rework; ContextTool survey-facts gate | SHARED (both arms, both stages) — enabling infrastructure, not a prescription; tying them to mask bit *a* would make validity logic flip with the mask and break dimension orthogonality |
+| `_recommended_workdir`, installer ladder, corrective-loop allowlist | SHARED (as in the matrix) |
+
+The run pin records five NAMED booleans —
+`plan_pipeline, recommendation_fields, project_brief, objectives_wording,
+python_prehoc_guidance` — which fit the existing
+`feature_flags: dict[str, bool]` shape (a `"11111"` string does not).
+
+*Probes and anchors.* Four probes, each anchoring a failure class fixed
+this month. Anchors are MACHINE-CHECKABLE predicates over the REAL
+artifact schema (verified against sealed campaign verdicts, schema_version
+3): top-level `verdict`, `build_evidence.{judgment,source,compiled_classes}`,
+`test_stats.unique.{executed,failed,errors}`. Quantities the verdict does
+not carry are derived from NAMED envelopes: build/test invocation workdirs
+and success come from the control record's tool invocations. The pytest
+collection count is NOT read from summary text (round-3 review: the
+summary line is unstructured and drifts across collection-error shapes) —
+the panel-prep implementation adds `collected_after_deselection` as a
+structured field of the python tool's recorded result, and the anchor
+reads that field. Only if tool emission proves infeasible does the
+fallback apply: a VERSIONED parser whose derived record carries the hash
+of the raw output it parsed.
+
+Numeric floors are PRE-REGISTERED ABSOLUTE values from historical campaign
+evidence, written to the ledger before the panel starts — no mid-panel
+calibration, so the P/F interleave stays intact. A probe with no usable
+historical floor (pyyaml — its only prior run starved before tests) gets a
+SEPARATE calibration phase, EXCLUDED from the 24-run panel and completed
+before its first run: THREE arm-P calibration runs; a calibration run is
+VALID only if every non-count anchor passes AND `unique.executed > 0` — an
+invalid run ABORTS calibration (fix the probe, restart); no floor is ever
+registered from invalid runs (round-3 review: a starved single-run
+calibration would have registered floor 0 and made the count anchor
+vacuous). Floor = max(1, ⌊0.8 × min(unique.executed over the three valid
+runs)⌋) — the max(1, …) guard because ⌊0.8×1⌋ = 0 would void the
+never-zero promise (round-4 review); formula and repetition count
+pre-registered here, result appended to the ledger before the panel
+starts.
+
+| Probe (pinned SHA) | Class | Anchor predicates |
+|---|---|---|
+| bigtop | pathological aggregator / archipelago | PHYSICAL evidence, calibrated to what the archived P baseline (final7 ×3) actually achieves — its verdicts are honest `"failed"` (test-framework build invocations failed 3/3) while 121 compiled classes sit on disk and 50/50 tests ran, so invocation-success over both islands is NOT the baseline and must not be the anchor (round-3 review): `verdict != "unknown"`; NOT(`verdict=="success"` ∧ `build_evidence.compiled_classes==0`) — phantom-green guard; `build_evidence.compiled_classes ≥ 96` (⌊0.8 × min(121,121,121)⌋, physical artifacts regardless of which invocation produced them); at least one SUCCESSFUL data-generators build invocation in the control record (the one invocation-level fact the baseline does meet); `test_stats.unique.executed ≥ 50` ∧ `test_stats.unique.failed == 0` (baseline 50/50). Caveat recorded: final7 predates the oracle fix (`build_evidence.judgment/source` are null there) — floors use only fields the archive actually carries; judgment/source predicates apply to fresh runs only |
+| TVM | python native-core | **Build anchor:** `build_evidence.judgment=="failed"` ∧ `build_evidence.source=="physical"`, OR the honest native middle state `build_evidence.judgment=="partial"` ∧ `build_evidence.source=="physical"` ∧ `build_evidence.green==false` (native library absent while pure-python evidence exists), OR strictly better (`verdict ∈ {"partial","success"}` with `build_evidence.green`). **HARD per-run SAFETY anchor `never_sweep_while_unbuilt` (SPLIT — round-review):** while the native core is unbuilt, EVERY *execution-bearing* pytest invocation (one carrying a recorded pytest command) carries a NODE-ID path or `-k` filter (`--maxfail` alone does NOT select — round-2 review) AND the recorded python-tool result's `collected_after_deselection` field ≤ 50 (the structured field defined above — never the summary text; the campaign lock pre-registers the evidence source mode, tool-emitted vs fallback parser, and it may not switch mid-campaign). CRITICAL: **ZERO pytest invocations PASSES this safety anchor — nothing was swept** (the old "no pytest invocation" FAIL conflated an idle-but-safe run with a sweeping one and re-punished arm-independent 5/6 smoke-compliance noise); a strictly-better run (build green) is exempt and may run the full suite (round-review P2-1). `verdict != "unknown"`. **REPORTED METRIC `smoke_liveness` (NOT a per-run must-pass anchor — round-review split):** the count of reps in which the agent landed a REAL smoke (an execution-bearing pytest carrying a node-id/-k filter); aggregated across reps as a fleet-health signal, never gating an individual run. |
+| pyyaml | skipped-analyze / package_dir layout | stamped manifest exists even though the agent skipped analyze; `"yaml" ∈ python_packages` (calibration pyyaml-cal-r1: the C-extension package `_yaml` is real and discovered beside it — exact equality mis-failed correct discovery); `verdict ∈ {success, partial}` ∧ `unique.failed == 0` (calibration: 1,281/1,281 passed while the honest ladder verdicts partial — the C extension is unbuilt; success-only was unachievable-by-construction, the bigtop round-3 lesson re-learned) ∧ `unique.executed ≥ ⌊calibration⌋` |
+| httpcomponents-client | healthy reactor scoping | **EXECUTION-BEARING test invocations ONLY (round-review item 3):** every build(action='test') invocation that ACTUALLY RAN a command (non-empty recorded command, or a success) has working_directory == project root (control record) AND at least one execution-bearing root test invocation exists. A REJECTED ATTEMPT — empty recorded command with a non-success outcome (the two failing rerun campaigns' non-root `/workspace` events) — is NOT a test execution and is excluded; scoring it as a mis-scoped test punished arm-independent noise. `test_stats.unique.executed ≥ 1500` (historical: 1,856; the 16-test mis-scope must be impossible); `verdict=="success"` ∧ `build_evidence.source=="physical"` |
+
+*Protocol (pinned).*
+- **3 repetitions per arm per probe = 24 runs** — the control-layer
+  campaign-gate norm (≥ 3); the earlier 2-rep sketch is superseded rather
+  than deviated from.
+- **Run pin, recorded per run:** target repo SHA, SAG SHA, image digest,
+  model id + config hash, prompt bundle hash, cache mode, host arch, run
+  order index, and `SAG_PRESCRIPTIONS`.
+- **Interleaved order** (P,F,P,F,…) per probe — drift affects both arms
+  symmetrically.
+- **Collector:** extend the existing panel collector (today:
+  TVM/Bigtop/Paramiko/Cassandra) with pyyaml + httpcomponents probes and a
+  Category-3 evaluator that computes the anchor predicates from the
+  structured artifacts. It launches from a CLEAN worktree at a committed
+  SHA — never the developer's dirty tree.
+- **Evidence:** --record artifacts + probe logs archived into repo `logs/`
+  with checksums and a campaign-ledger append; containers/worktrees cleaned
+  per ledger only AFTER all three complete (standing evidence rule).
+
+*Verdict (three-outcome, per probe — review P1: a single global switch
+cannot identify a minimal subset, and a double failure indicts the probe,
+not the prescriptions).*
+- **P pass ∧ F pass** → the probe votes DELETE.
+- **P pass ∧ F fail** → attributable regression → stage-2 ablation on that
+  probe (below) — the ONLY way a keep-set is ever derived.
+- **P fail** (either F) → shared failure or invalid experiment: NO
+  retention conclusion from this probe; fix the probe or environment and
+  rerun.
+
+*Stage-2 ablation (round-2 review: single-surface restoration only finds
+singleton-sufficient prescriptions and misses interactions; and the
+surfaces are not independent — plan text presupposes the generator).* The
+restorable DIMENSIONS — round-3 review: every F→OFF row of the treatment
+matrix must map to exactly one dimension, or stage 2 silently restores an
+uncontrolled prescription and can emit a keep-set that hides it (the
+python guidance was exactly such a leak):
+  (a) plan pipeline (generator + plan text + plan metadata — one dimension,
+      restored together);
+  (b) recommendation action fields (trunk goal/rationale + intro line);
+  (c) `project_brief` artifact + projection;
+  (d) `PHASE_OBJECTIVES` recommendation wording;
+  (e) pre-hoc python/native-first guidance block (the `_python_phase_guidance`
+      prescription the matrix closes in F; the REACTIVE smoke steer stays
+      allowlisted and is never a dimension).
+The five-bit treatment mask (a–e) is part of EVERY run pin — stage-1 runs
+are mask 11111 (P) / 00000 (F); stage-2 runs record their exact mask.
+Procedure: start from FULL restoration on the failing probe (= arm P,
+known to pass), then greedy BACKWARD ELIMINATION: attempt to remove each
+dimension in turn (pins identical EXCEPT the treatment mask, same 3-rep
+rule, anchors re-evaluated); a removal that keeps every anchor passing
+stays removed; iterate until no single dimension can be removed. The result is the probe's keep-set —
+LOCALLY minimal (every retained member is individually necessary given the
+others), which is the claim made; the escalation if a locally-minimal
+result is disputed is the full mask search — five dimensions give 31
+non-empty masks, 30 of them new after reusing the already-run 11111.
+
+Global deletion proceeds only when every probe either votes delete or has
+its keep-set identified by stage 2; every dimension not in any probe's
+keep-set is deleted.
+
+*Dimension-applicability gate (round-4 review — added 2026-07-19 after the
+httpcomponents Stage-2 keep-set search).* A candidate rep may NOT KEEP a
+dimension whose treatment is a BYTE-IDENTICAL NO-OP for the probe under test.
+An inactive dimension is non-identifying: toggling it does not change a single
+byte the agent sees, so a rep that "fails with it removed" cannot attribute
+that failure to the dimension — the correct verdict for that dimension is
+ABSTAIN, not KEEP. Applicability is ruled MECHANICALLY by intro byte-equality:
+if the two masks that differ only in that one dimension produce byte-identical
+phase intros for the probe, the dimension is INACTIVE for that probe and
+CANNOT enter its keep-set. A keep-set may retain only dimensions that are (i)
+applicable (change some byte of the probe's inputs) AND (ii) individually
+necessary given the others.
+
+**Reviewer ruling filed verbatim (httpcomponents dim e, 2026-07-19):** e's
+HTTP keep vote lacked causal force (failing rep's partial came from
+jdk_mismatch in provision, phase_provision.json evidence; dim e reads only
+python build/test guidance, react_engine.py returns None for non-python;
+00001 vs 00000 Maven build+test intros byte-identical) → e reclassified
+INVALID/non-identifying for HTTP; with pyyaml+tvm providing e's
+applicable-domain evidence, e is ALSO authorized for deletion.
+
+The gate is guarded by the Maven dual-mask byte-equality regression
+(`tests/test_python_phase_guidance.py::test_maven_dual_mask_e_is_byte_identical_noop`):
+the build+test intros are byte-equal between masks 00001 and 00000 for a
+maven-shaped engine fixture, proving dim e is a byte-identical no-op on a
+non-python probe.
 
 **Category 2 done-bar (met 2026-07-19).** Reading functions relocated beside
 the validator's substrate with zero call-site behavior change (full suite at
@@ -259,18 +542,44 @@ unreadable probe degrades to present, failed-trunk-save-after-edit re-surveys
 via both-ends fingerprint agreement, config-edit-plus-dropped-rewrite is
 `failed` not `created`, probe command covers everything the survey reads).
 
-**Category 3 done-bar.** `_generate_execution_plan` + fallback deleted with a
-grep proof of zero readers; panel A/B attached to the removal PR showing
-facts-plus-feedback ≥ prescriptions on all four probes.
+**Category 3 done-bar (authoritative — supersedes every earlier binary
+phrasing).** The panel ran per the pinned protocol; each probe resolved via
+the three-outcome verdict; regressing probes carry a stage-2 keep-set; the
+removal PR deletes exactly the dimensions in no keep-set (dead fallbacks
+already deleted 2026-07-19 with grep proof) and reworks couplings #1–#4.
+There is no unconditional "generator must go": if a stage-2 keep-set
+retains the plan pipeline, it stays and the spec records which probe kept
+it and why.
 
 **Category 4 done-bar.** All rendering lives in the engine projection with
 marker-based snapshot tests; the analyzer tool result contains the fact sheet
 only.
 
-**Decision instrument, not taste:** the four-probe panel runs
-facts-plus-feedback vs. prescriptions-as-today. Parity or better → delete the
-prose; regression → keep the minimal prescriptive set. (This is model-strength
-dependent; the panel answers it empirically.)
+**Decision instrument, not taste:** the panel is empirical because the
+answer is model-strength dependent. The authoritative decision rule is the
+three-outcome verdict + stage-2 ablation in the Category 3 section — this
+paragraph no longer states its own (superseded) binary rule.
+
+## Panel precondition: baseline reds (registered 2026-07-19)
+
+The panel's pass/fail semantics require a KNOWN suite baseline. Fixed
+before the panel: the two `test_native_build_guidance` ladder tests (the
+fixture predated the scripted `cache_from_source` metrics probe; its empty
+default parsed as 'metrics unavailable' and capped an all-green ladder —
+fixture now answers the real probe; this mattered because the TVM probe's
+better-branch anchor reads the same ladder). REGISTERED as the accepted
+baseline (6, all pre-existing, none touching panel anchor paths):
+
+- `test_evidence_ingestion` ×1 — asserts a `control_event_sink` attribute
+  the agent no longer exposes under that name (wiring drift);
+- `test_stage1_review_fixes` ×2 — recovery re-runs `verify` where the
+  fixtures expect `test` (recovery semantics evolved past the fixtures);
+- `test_lineage_idempotence_followup` ×2 — same recovery-era drift;
+- `test_packaging_smoke` ×1 — needs network (hatchling download) in an
+  isolated build; environment-dependent, not code.
+
+These six are recorded in the campaign ledger at panel start; any NEW
+failure beyond them blocks the panel.
 
 ## Non-goals
 
