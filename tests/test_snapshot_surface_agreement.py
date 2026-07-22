@@ -103,6 +103,20 @@ def snapshot_factory():
                 ),
                 evidence_status=EvidenceStatus.VERIFIED,
                 refs=("build.log",),
+                module_summary={
+                    "modules_total": 2,
+                    "modules_built": 1,
+                    "modules_failed": 1,
+                    "modules_skipped": 0,
+                    "modules_tested": 1,
+                    "modules_not_tested": 1,
+                },
+                modules=(
+                    {"name": "core", "build_status": "success", "tests_passed": 1,
+                     "tests_failed": 0, "tests_skipped": 0},
+                    {"name": "api", "build_status": "failure", "tests_passed": 0,
+                     "tests_failed": 1, "tests_skipped": 0},
+                ),
             ),
             test_stats=SnapshotTestStats(
                 discovered=unique_total,
@@ -288,6 +302,16 @@ def test_all_surfaces_render_the_same_snapshot(tvm_snapshot, surface_harness):
         rendered.cli.tests,
         rendered.web.tests,
     } == {tvm_snapshot.test_stats.executed}
+
+
+def test_setup_report_renders_sealed_module_metrics(tvm_snapshot, surface_harness):
+    rendered = surface_harness.render_all(tvm_snapshot)
+
+    assert "1 built / 2 detected" in rendered.condensed.text
+    assert "Module Coverage" in rendered.markdown.text
+    assert "Submodule Breakdown" in rendered.markdown.text
+    assert "| `core` | SUCCESS |" in rendered.markdown.text
+    assert "| `api` | FAILURE |" in rendered.markdown.text
 
 
 def test_all_surfaces_keep_failures_and_errors_distinct(tvm_snapshot, surface_harness):
