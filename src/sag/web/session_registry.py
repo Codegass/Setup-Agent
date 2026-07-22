@@ -601,7 +601,10 @@ def _setup_artifact_item(
     metrics = _read_report_metrics(orchestrator)
     module_metrics = _read_module_metrics(orchestrator)
     test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
-    build_payload = _build_payload_from_metrics(metrics) or _build_payload_from_report(report_raw)
+    build_payload = _merge_build_payloads(
+        _build_payload_from_metrics(metrics),
+        _build_payload_from_report(report_raw),
+    )
     evidence_status = _setup_evidence_status(trunk_data, tasks, report_raw)
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     project_name = _text(
@@ -985,17 +988,26 @@ def _build_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any
         return None
     return {
         "state": _text(build.get("state"), default="none"),
-        "system": build.get("system"),
+        "system": _value_for_keys(build, "system", "build_system", "buildSystem"),
         "tool": _text(build.get("tool"), default="—") if build.get("tool") else "—",
-        "time": _text(build.get("time"), default="—") if build.get("time") else "—",
+        "time": _text(
+            _value_for_keys(build, "time", "build_time", "buildTime", "duration"),
+            default="—",
+        ),
         "note": build.get("note"),
         "artifact": build.get("artifact"),
-        "class_count": build.get("class_count"),
-        "jar_count": build.get("jar_count"),
-        "module_output_count": build.get("module_output_count"),
-        "artifact_samples": build.get("artifact_samples") or [],
+        "class_count": _optional_int(
+            _value_for_keys(build, "class_count", "classCount", "class_files", "classFiles")
+        ),
+        "jar_count": _optional_int(
+            _value_for_keys(build, "jar_count", "jarCount", "jar_files", "jarFiles")
+        ),
+        "module_output_count": _optional_int(
+            _value_for_keys(build, "module_output_count", "moduleOutputCount")
+        ),
+        "artifact_samples": _value_for_keys(build, "artifact_samples", "artifactSamples") or [],
         "warnings": build.get("warnings") or [],
-        "evidence_refs": build.get("evidence_refs") or [],
+        "evidence_refs": _value_for_keys(build, "evidence_refs", "evidenceRefs") or [],
     }
 
 
@@ -1130,12 +1142,39 @@ def _build_payload_from_report(report_raw: str | None) -> dict[str, Any]:
     if not report_raw:
         return {"state": state}
 
+    note = _build_note_from_report(report_raw)
     return {
         "state": state,
         "tool": _build_tool_from_report(report_raw),
-        "time": "—",
-        "note": _build_note_from_report(report_raw),
+        "time": _build_time_from_report(report_raw),
+        "note": note,
+        "class_count": _build_output_count(note, "classes"),
+        "jar_count": _build_output_count(note, "jars"),
     }
+
+
+def _merge_build_payloads(metrics: dict[str, Any] | None, report: dict[str, Any]) -> dict[str, Any]:
+    if metrics is None:
+        return report
+
+    merged = dict(metrics)
+    for key, fallback in report.items():
+        value = merged.get(key)
+        if value is None or value == "" or value == "—" or value == []:
+            merged[key] = fallback
+    if merged.get("state") in {None, "", "none", "unknown"}:
+        merged["state"] = report.get("state", "none")
+    return merged
+
+
+def _build_time_from_report(report_raw: str) -> str:
+    match = re.search(r"\bbuild\s*time\s*[:|]\s*([^|\n]+)", report_raw, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else "—"
+
+
+def _build_output_count(note: str, label: str) -> int | None:
+    match = re.search(rf"([0-9][0-9,]*)\s*{label}\b", note, flags=re.IGNORECASE)
+    return _to_int(match.group(1).replace(",", "")) if match else None
 
 
 def _build_tool_from_report(report_raw: str) -> str:

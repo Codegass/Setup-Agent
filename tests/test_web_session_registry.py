@@ -704,7 +704,12 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
                 "model": "claude-sonnet-4.5",
                 "total_iterations": 6,
                 "max_iterations": 40,
-                "build": {"state": "partial", "system": "maven", "tool": "Maven"},
+                "build": {
+                    "state": "partial",
+                    "system": "maven",
+                    "tool": "Maven",
+                    "buildTime": "42.3 s",
+                },
                 "test": {
                     "state": "partial",
                     "total": 1205,
@@ -729,6 +734,7 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
             "# Project Setup Report\n\n"
             "**Generated:** 2026-06-18 10:08:01\n"
             "**Result:** PARTIAL\n"
+            "\n| Build | ✅ 240 classes, 4 JARs | Maven |\n"
         ),
     }
     registry = ContainerSessionRegistry(
@@ -746,6 +752,9 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
     assert detail.model == "claude-sonnet-4.5"
     assert detail.steps == 6
     assert detail.step_budget == 40
+    assert detail.build.time == "42.3 s"
+    assert detail.build.class_count == 240
+    assert detail.build.jar_count == 4
     # finding 6: the verdict is composed from the serialized (by_alias) model
     # dicts; assert the real keys feed compose_verdict end-to-end.
     assert detail.verdict is not None
