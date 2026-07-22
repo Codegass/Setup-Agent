@@ -1500,6 +1500,19 @@ class ReportTool(BaseTool, UIEventEmitter):
                 "failed": False,
             }.get(tests.judgment),
         }
+        module_summary = snapshot.build_evidence.module_summary
+        if module_summary:
+            status.update(
+                {
+                    "modules_detected": module_summary.get("modules_total"),
+                    "modules_built": module_summary.get("modules_built"),
+                    "modules_failed_count": module_summary.get("modules_failed"),
+                    "modules_skipped_count": module_summary.get("modules_skipped"),
+                    "modules_tested": module_summary.get("modules_tested"),
+                    "modules_not_tested": module_summary.get("modules_not_tested"),
+                    "modules_test_bearing": module_summary.get("modules_test_bearing"),
+                }
+            )
         evidence_refs = list(dict.fromkeys([*snapshot.input_refs, *snapshot.build_evidence.refs]))
         evidence_result = {
             "status": snapshot.verdict,
@@ -1546,6 +1559,8 @@ class ReportTool(BaseTool, UIEventEmitter):
             },
             "test_history": {},
             "per_module": {},
+            "module_summary": module_summary,
+            "modules": list(snapshot.build_evidence.modules),
             "flags": {},
             "last_command": {},
             "failed_tests": [],
@@ -3261,7 +3276,16 @@ class ReportTool(BaseTool, UIEventEmitter):
                 report_lines.extend(test_analysis_section)
 
             # Add per-submodule build/test breakdown (multi-module projects only)
-            if not setup_snapshot:
+            if setup_snapshot:
+                report_lines.extend(
+                    self._render_submodule_breakdown(
+                        {
+                            "module_summary": report_snapshot.get("module_summary") or {},
+                            "modules": report_snapshot.get("modules") or [],
+                        }
+                    )
+                )
+            else:
                 try:
                     mm = self._build_module_metrics(
                         self._load_test_history() or {},

@@ -132,6 +132,10 @@ class BuildEvidenceSnapshot(BaseModel):
     evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
     refs: tuple[str, ...] = ()
     compiled_classes: int | None = None
+    # The physical validator computes this at evidence-close. Preserve it in
+    # the sealed snapshot so report rendering does not need a second scan.
+    module_summary: dict[str, Any] = Field(default_factory=dict)
+    modules: tuple[dict[str, Any], ...] = ()
 
 
 class PhaseClaimSnapshot(BaseModel):
@@ -257,18 +261,6 @@ _EVIDENCE_STATUS_MAP = {
 }
 
 
-def _module_coverage_conflicts(validator, project_name) -> tuple[str, ...]:
-    """The July kernel's module/island coverage honesty, folded at evidence-close.
-
-    Delegates to the SHARED coverage module (sag.agent.module_coverage) — the
-    same computation the phase gates render mid-run as an agent-facing
-    checklist. One algorithm, two consumers, no drift.
-    """
-    from sag.agent.module_coverage import coverage_conflicts, module_coverage
-
-    return coverage_conflicts(module_coverage(validator, project_name))
-
-
 def _physical_build_status(validator, project_name) -> dict[str, Any] | None:
     """One authoritative physical scan at evidence-close; never raises."""
     if validator is None:
@@ -380,6 +372,8 @@ def _fold_build_evidence(
     physical = _physical_build_status(validator, project_name)
     judgment = _physical_judgment(physical) if physical is not None else None
     if judgment is not None:
+        from sag.agent.module_coverage import coverage_conflicts, module_coverage
+
         evidence = physical.get("evidence") if isinstance(physical.get("evidence"), dict) else {}
         compiled = _nonnegative_int(
             evidence.get("class_count") if isinstance(evidence, dict) else None
@@ -389,6 +383,9 @@ def _fold_build_evidence(
         physical_refs = tuple(
             str(ref) for ref in (physical.get("evidence_refs") or ()) if str(ref).strip()
         )
+        coverage = module_coverage(validator, project_name)
+        module_summary = dict((coverage or {}).get("summary") or {})
+        modules = tuple((coverage or {}).get("modules") or ())
         conflicts = tuple(
             dict.fromkeys(
                 [
@@ -397,7 +394,7 @@ def _fold_build_evidence(
                         for conflict in (physical.get("conflicts") or ())
                         if str(conflict).strip()
                     ),
-                    *_module_coverage_conflicts(validator, project_name),
+                    *coverage_conflicts(coverage),
                 ]
             )
         )
@@ -415,6 +412,8 @@ def _fold_build_evidence(
                 evidence_status=evidence_status,
                 refs=_dedupe([*physical_refs, *observation_refs]),
                 compiled_classes=compiled,
+                module_summary=module_summary,
+                modules=modules,
             ),
             conflicts,
         )
