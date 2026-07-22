@@ -22,7 +22,6 @@ from sag.web.models import (
     ModuleRollup,
     ModuleSummary,
     ReportDocument,
-    TerminalConnectionState,
     TestSummary,
     VerdictSummary,
     WorkspaceSummary,
@@ -429,17 +428,4 @@ def get_demo_session(session_id: str) -> ExecutionSessionDetail:
         model="claude-sonnet-4.5",
         steps=6,
         step_budget=40,
-    )
-
-
-def get_demo_terminal(workspace_id: str) -> TerminalConnectionState:
-    return TerminalConnectionState(
-        container=workspace_id,
-        cwd="/workspace/commons-cli",
-        status="connected",
-        tty="120 × 32",
-        lines=[
-            {"time": "02:14:08", "text": f"connected to {workspace_id}"},
-            {"time": "02:16:41", "text": "mvn test completed with HelpFormatter width failures"},
-        ],
     )

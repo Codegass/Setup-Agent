@@ -15,7 +15,10 @@ from typing import Any
 
 from loguru import logger
 
+from sag.ui.state import UIEvidenceRecord
 from sag.web.context_trace import ContextTraceBuilder
+from sag.web.evidence import EvidenceIndex
+from sag.web.file_tracker import FileChangeTracker, FileSnapshot
 from sag.web.models import (
     BuildSummary,
     ContextTrace,
@@ -25,6 +28,7 @@ from sag.web.models import (
     ExecutionSessionSummary,
     ModuleRollup,
     ModuleSummary,
+    FileChangeDigest,
     ReportDocument,
     TestSummary,
     VerdictSummary,
@@ -174,7 +178,9 @@ class ContainerSessionRegistry:
         if client is not None:
             running = getattr(getattr(workspace, "docker", None), "status", "") == "running"
             mirror = ensure_mirror(client, workspace.id, running, self.logs_root)
-        return MirrorReader(mirror if mirror is not None else self.logs_root / "web_mirror" / "__missing__")
+        return MirrorReader(
+            mirror if mirror is not None else self.logs_root / "web_mirror" / "__missing__"
+        )
 
     def _docker_client(self) -> Any:
         if self._client is None:
@@ -213,6 +219,7 @@ class ContainerSessionStore:
     ):
         self.orchestrator_factory = orchestrator_factory
         self.clock = clock if clock is not None else datetime.now
+        self._file_snapshots: dict[tuple[str, str], FileSnapshot] = {}
 
     def mark_started(
         self,
@@ -223,6 +230,10 @@ class ContainerSessionStore:
         source_session: str | None,
     ) -> None:
         now = self.clock().isoformat(timespec="seconds")
+        orchestrator = self._orchestrator(workspace_id)
+        self._file_snapshots[(workspace_id, session_id)] = _workspace_snapshot(
+            orchestrator, f"session:{session_id}:start"
+        )
         item = {
             "id": session_id,
             "workspace": workspace_id,
@@ -243,7 +254,7 @@ class ContainerSessionStore:
             "source_session": source_session,
             "updated": now,
         }
-        self._upsert(workspace_id, item)
+        self._upsert(workspace_id, item, orchestrator=orchestrator)
 
     def mark_finished(
         self,
@@ -252,6 +263,7 @@ class ContainerSessionStore:
         session_id: str,
         success: bool,
         outcome: str,
+        evidence_records: list[dict[str, Any]] | None = None,
     ) -> None:
         now = self.clock().isoformat(timespec="seconds")
         orchestrator = self._orchestrator(workspace_id)
@@ -284,11 +296,25 @@ class ContainerSessionStore:
         item["outcome"] = outcome
         item["updated"] = now
         item["evidence"] = max(_to_int(item.get("evidence")), 1)
+        if evidence_records:
+            item["evidence_records"] = evidence_records
+            item["evidence"] = len(evidence_records)
+
+        base = self._file_snapshots.pop((workspace_id, session_id), None)
+        if base is not None:
+            head = _workspace_snapshot(orchestrator, f"session:{session_id}:finish")
+            digest = FileChangeTracker(Path("/workspace")).diff(base, head)
+            item["file_digest"] = digest.model_dump(mode="json", by_alias=True)
+            item["files"] = len(digest.items)
 
         _write_index_payload(orchestrator, {"sessions": sessions})
 
-    def _upsert(self, workspace_id: str, item: dict[str, Any]) -> None:
-        orchestrator = self._orchestrator(workspace_id)
+    def _upsert(
+        self, workspace_id: str, item: dict[str, Any], *, orchestrator: Any | None = None
+    ) -> None:
+        orchestrator = (
+            orchestrator if orchestrator is not None else self._orchestrator(workspace_id)
+        )
         payload = _read_index_payload(orchestrator)
         sessions = _session_items(payload)
         sessions = [
@@ -353,15 +379,20 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
                 _value_for_keys(test, "execution_rate", "executionRate")
             ),
             errors=_to_int(test.get("errors")),
-            report_file_count=test.get("report_file_count"),
-            unique_total=test.get("unique_total"),
-            unique_passed=test.get("unique_passed"),
-            unique_failed=test.get("unique_failed"),
-            unique_errors=test.get("unique_errors"),
-            unique_skipped=test.get("unique_skipped"),
-            declared_total=test.get("declared_total"),
-            method_execution_rate=_to_float_or_none(test.get("method_execution_rate")),
-            failing_names=test.get("failing_names") or [],
+            flaky_count=_optional_int(_value_for_keys(test, "flaky_count", "flakyCount")),
+            report_file_count=_optional_int(
+                _value_for_keys(test, "report_file_count", "reportFileCount")
+            ),
+            unique_total=_optional_int(_value_for_keys(test, "unique_total", "uniqueTotal")),
+            unique_passed=_optional_int(_value_for_keys(test, "unique_passed", "uniquePassed")),
+            unique_failed=_optional_int(_value_for_keys(test, "unique_failed", "uniqueFailed")),
+            unique_errors=_optional_int(_value_for_keys(test, "unique_errors", "uniqueErrors")),
+            unique_skipped=_optional_int(_value_for_keys(test, "unique_skipped", "uniqueSkipped")),
+            declared_total=_optional_int(_value_for_keys(test, "declared_total", "declaredTotal")),
+            method_execution_rate=_to_float_or_none(
+                _value_for_keys(test, "method_execution_rate", "methodExecutionRate")
+            ),
+            failing_names=_value_for_keys(test, "failing_names", "failingNames") or [],
             conflicts=test.get("conflicts") or [],
             evidence_refs=test.get("evidence_refs") or [],
         ),
@@ -410,9 +441,11 @@ def _session_detail(
     verdict = compose_verdict(
         build=build.model_dump(mode="json", by_alias=True),
         test=summary.test.model_dump(mode="json", by_alias=True),
-        module_summary=module_summary.model_dump(mode="json", by_alias=True)
-        if module_summary is not None
-        else None,
+        module_summary=(
+            module_summary.model_dump(mode="json", by_alias=True)
+            if module_summary is not None
+            else None
+        ),
         outcome=outcome,
         blocker=item.get("blocker"),
     )
@@ -435,7 +468,7 @@ def _session_detail(
         report_doc=report_doc,
         blocker=None,
         evidence=_evidence(item, outcome),
-        files=None,
+        files=_file_digest(item),
         context=context,
         logs=_log_lines(item.get("logs")),
         partial=False,
@@ -1343,6 +1376,10 @@ def _build_summary(value: Any) -> BuildSummary:
 
 
 def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
+    records = _evidence_records(item.get("evidence_records"))
+    if records:
+        return EvidenceIndex().from_ui_records(records)
+
     time = _display_time(_optional_text(item.get("finish")) or _text(item.get("start"), default=""))
     status = _status_for_evidence(_evidence_status(item))
     record = EvidenceRecord(
@@ -1362,6 +1399,40 @@ def _evidence(item: dict[str, Any], outcome: str) -> list[EvidenceGroup]:
             records=[record],
         )
     ]
+
+
+def _evidence_records(value: Any) -> list[UIEvidenceRecord]:
+    records: list[UIEvidenceRecord] = []
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        timestamp = _optional_text(item.get("timestamp"))
+        try:
+            parsed_timestamp = datetime.fromisoformat(timestamp) if timestamp else datetime.min
+        except ValueError:
+            parsed_timestamp = datetime.min
+        metadata = item.get("metadata")
+        records.append(
+            UIEvidenceRecord(
+                timestamp=parsed_timestamp,
+                kind=_text(item.get("kind"), default="evidence"),
+                summary=_text(item.get("summary"), default="Evidence"),
+                details=_optional_text(item.get("details")),
+                path=_optional_text(item.get("path")),
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+        )
+    return records
+
+
+def _file_digest(item: dict[str, Any]) -> FileChangeDigest | None:
+    value = _value_for_keys(item, "file_digest", "fileDigest")
+    if not isinstance(value, dict):
+        return None
+    try:
+        return FileChangeDigest.model_validate(value)
+    except Exception:
+        return None
 
 
 def _status_for_evidence(status: str) -> str:
@@ -1422,6 +1493,29 @@ def _read_container_file(orchestrator: Any, path: str) -> str | None:
         return None
 
     return output
+
+
+def _workspace_snapshot(orchestrator: Any, snapshot_id: str) -> FileSnapshot:
+    command = (
+        "find /workspace -xdev "
+        "\\( -path /workspace/.setup_agent -o -path '/workspace/.setup_agent/*' "
+        "-o -path /workspace/.git -o -path '/workspace/.git/*' "
+        "-o -path '*/node_modules' -o -path '*/node_modules/*' "
+        "-o -path '*/target' -o -path '*/target/*' "
+        "-o -path '*/build' -o -path '*/build/*' "
+        "-o -path '*/dist' -o -path '*/dist/*' \\) -prune -o "
+        "-printf '%y\\t%s\\t%T@\\t%C@\\t%p\\n'"
+    )
+    try:
+        result = orchestrator.execute_command(command, timeout=30)
+    except TypeError:
+        result = orchestrator.execute_command(command)
+    except Exception:
+        result = None
+    output = (
+        result.get("output") if isinstance(result, dict) and result.get("exit_code") == 0 else ""
+    )
+    return FileChangeTracker.snapshot_from_manifest(snapshot_id, Path("/workspace"), output or "")
 
 
 def _read_index_payload(orchestrator: Any) -> dict[str, Any]:

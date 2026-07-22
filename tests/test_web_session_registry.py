@@ -32,7 +32,9 @@ def test_setup_logs_matches_latest_run_by_mtime_ignoring_dir_name_timezone(tmp_p
     # pick the most recent run regardless of the dir-name timezone.
     logs = tmp_path / "logs"
     _make_session_dir(logs, "session_20260101_000000_111", "commons-cli", "OLD run", 1_000_000)
-    newer = _make_session_dir(logs, "session_20260616_134219_222", "commons-cli", "NEW run", 2_000_000)
+    newer = _make_session_dir(
+        logs, "session_20260616_134219_222", "commons-cli", "NEW run", 2_000_000
+    )
 
     assert _matching_log_session_dir(logs, "commons-cli") == newer
     assert _setup_logs(logs, "commons-cli") == ["NEW run"]
@@ -309,6 +311,86 @@ def test_container_session_store_preserves_explicit_evidence_status_on_finish():
 
     payload = json.loads(files["/workspace/.setup_agent/sessions/index.json"])
     assert payload["sessions"][0]["evidence_status"] == "partial"
+
+
+def test_session_index_accepts_camel_case_extended_test_metrics(tmp_path: Path):
+    sessions = tmp_path / ".setup_agent" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "index.json").write_text(
+        json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "UI-metrics",
+                        "test": {
+                            "flakyCount": 2,
+                            "reportFileCount": 3,
+                            "uniqueTotal": 12,
+                            "methodExecutionRate": 0.75,
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    row = SessionRegistry().read_index(tmp_path, "sag-commons-cli")[0]
+
+    assert row.test.flaky_count == 2
+    assert row.test.report_file_count == 3
+    assert row.test.unique_total == 12
+    assert row.test.method_execution_rate == 0.75
+
+
+def test_session_detail_reads_persisted_file_and_evidence_artifacts():
+    files = {
+        "/workspace/.setup_agent/sessions/index.json": json.dumps(
+            {
+                "sessions": [
+                    {
+                        "id": "UI-artifacts",
+                        "workspace": "sag-commons-cli",
+                        "title": "Run tests",
+                        "status": "completed",
+                        "entry": "Web UI",
+                        "start": "2026-06-08T06:30:00",
+                        "duration": "1s",
+                        "build": "none",
+                        "test": {},
+                        "report": "none",
+                        "files": 1,
+                        "evidence": 1,
+                        "outcome": "Tests passed.",
+                        "file_digest": {
+                            "snapshot": {"base": "start", "head": "finish", "mode": "metadata"},
+                            "counts": {"added": 1, "modified": 0, "deleted": 0, "renamed": 0},
+                            "items": [{"path": "result.txt", "change": "added"}],
+                        },
+                        "evidence_records": [
+                            {
+                                "timestamp": "2026-06-08T06:30:01",
+                                "kind": "validation",
+                                "summary": "Tests passed.",
+                                "metadata": {"source": "Test validator", "status": "success"},
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    }
+    registry = ContainerSessionRegistry(
+        orchestrator_factory=lambda workspace_id: FakeOrchestrator(files)
+    )
+
+    detail = registry.get_workspace_session_detail(workspace_summary(), "UI-artifacts")
+
+    assert detail is not None
+    assert detail.files is not None
+    assert detail.files.items[0].path == "result.txt"
+    assert detail.evidence[0].source == "Test validator"
+    assert detail.evidence[0].status == "success"
 
 
 def test_container_session_registry_falls_back_to_last_comment_without_index():
@@ -625,7 +707,10 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
                 "build": {"state": "partial", "system": "maven", "tool": "Maven"},
                 "test": {
                     "state": "partial",
-                    "total": 1205, "passed": 1186, "failed": 7, "skipped": 12,
+                    "total": 1205,
+                    "passed": 1186,
+                    "failed": 7,
+                    "skipped": 12,
                 },
             }
         ),
@@ -633,7 +718,9 @@ def test_setup_artifact_detail_surfaces_runtime_metadata_and_verdict():
             {
                 "modules": [],
                 "module_summary": {
-                    "modulesTotal": 4, "modulesBuilt": 3, "modulesFailed": 1,
+                    "modulesTotal": 4,
+                    "modulesBuilt": 3,
+                    "modulesFailed": 1,
                     "singleModule": False,
                 },
             }
@@ -843,13 +930,20 @@ def test_same_second_setup_sessions_resolve_to_their_own_workspace():
 
 
 def test_build_payload_surfaces_time_note_artifact():
-    payload = _build_payload_from_metrics({
-        "build": {
-            "state": "success", "system": "maven", "tool": "Maven 3.9.6",
-            "class_count": 115, "jar_count": 1,
-            "time": "47.2s", "note": "clean package", "artifact": "target/x.jar",
+    payload = _build_payload_from_metrics(
+        {
+            "build": {
+                "state": "success",
+                "system": "maven",
+                "tool": "Maven 3.9.6",
+                "class_count": 115,
+                "jar_count": 1,
+                "time": "47.2s",
+                "note": "clean package",
+                "artifact": "target/x.jar",
+            }
         }
-    })
+    )
     assert payload is not None
     assert payload["time"] == "47.2s"
     assert payload["note"] == "clean package"

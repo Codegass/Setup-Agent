@@ -93,6 +93,11 @@ class TestSummary(WebModel):
     )
     note: str = ""
     errors: int = 0
+    flaky_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("flaky_count", "flakyCount"),
+        serialization_alias="flakyCount",
+    )
     report_file_count: int | None = Field(
         default=None,
         validation_alias=AliasChoices("report_file_count", "reportFileCount"),
@@ -470,9 +475,7 @@ class ModuleRollup(WebModel):
     )
     modules_with_test_failures: int = Field(
         default=0,
-        validation_alias=AliasChoices(
-            "modules_with_test_failures", "modulesWithTestFailures"
-        ),
+        validation_alias=AliasChoices("modules_with_test_failures", "modulesWithTestFailures"),
         serialization_alias="modulesWithTestFailures",
     )
     build_systems: list[str] = Field(
@@ -566,14 +569,6 @@ class ExecutionSessionDetail(WebModel):
         validation_alias=AliasChoices("step_budget", "stepBudget"),
         serialization_alias="stepBudget",
     )
-
-
-class TerminalConnectionState(WebModel):
-    container: str
-    cwd: str = "/workspace"
-    status: str
-    tty: str = "120 × 32"
-    lines: list[dict[str, str]] = Field(default_factory=list)
 
 
 class DashboardResponse(WebModel):

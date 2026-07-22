@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from loguru import logger
@@ -22,11 +20,6 @@ from sag.web.read_model import ReadModelBuilder
 from sag.web.task_runner import TaskRequest, TaskRunner
 from sag.web.terminal import TerminalAdapter, close_socket, recv_socket, send_socket
 from sag.web.workspace_service import WorkspaceDeletionError, WorkspaceService
-
-
-def _single_snapshot(payload: dict) -> Iterator[str]:
-    yield "event: snapshot\n"
-    yield f"data: {json.dumps(payload)}\n\n"
 
 
 def create_app(
@@ -118,14 +111,6 @@ def create_app(
             ) from exc
 
         return detail.model_dump(mode="json", by_alias=True)
-
-    @app.get("/api/stream/dashboard")
-    def stream_dashboard() -> StreamingResponse:
-        payload = builder.dashboard().model_dump(mode="json", by_alias=True)
-        return StreamingResponse(
-            _single_snapshot(payload),
-            media_type="text/event-stream",
-        )
 
     @app.websocket("/api/workspaces/{workspace_id}/terminal")
     async def workspace_terminal(websocket: WebSocket, workspace_id: str) -> None:
