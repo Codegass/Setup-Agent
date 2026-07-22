@@ -502,6 +502,31 @@ def test_web_valid_snapshot_owns_verdict_and_primary_counts(tvm_snapshot):
     assert detail.report_delivery_status is None
 
 
+def test_web_snapshot_enriches_build_display_without_changing_its_verdict(snapshot_factory):
+    snapshot = snapshot_factory(verdict="partial")
+    snapshot = snapshot.model_copy(
+        update={
+            "build_evidence": snapshot.build_evidence.model_copy(update={"compiled_classes": 240})
+        }
+    )
+    files = {
+        VERDICT_PATH: snapshot.model_dump_json(),
+        "/workspace/.setup_agent/contexts/trunk_tvm.json": _phase_trunk(),
+        "/workspace/.setup_agent/report_metrics.json": json.dumps(
+            {"build": {"buildTime": "42.3 s"}}
+        ),
+        "/workspace/setup-report-20260717-120000.md": "| Build | ✅ 240 classes, 4 JARs | Maven |\n",
+    }
+
+    item = _setup_artifact_item(SnapshotOrchestrator(files), "sag-tvm")
+    detail = _session_detail(item, "sag-tvm", None)
+
+    assert detail.canonical_verdict == "partial"
+    assert detail.build.time == "42.3 s"
+    assert detail.build.class_count == 240
+    assert detail.build.jar_count == 4
+
+
 def test_web_valid_snapshot_headline_ignores_mutable_module_rollup(snapshot_factory):
     snapshot = snapshot_factory(
         verdict="success",

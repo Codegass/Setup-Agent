@@ -7,7 +7,7 @@ import { TestCard } from "./TestCard"
 
 const test: TestSummary = {
   state: "partial", pass: 18805, fail: 5, skip: 29, total: 18839, errors: 0,
-  passRate: 99.8, reportFileCount: 760,
+  passRate: 99.8, reportFileCount: 760, flakyCount: 2,
   uniqueTotal: 9497, uniquePassed: 9480, uniqueFailed: 5, uniqueErrors: 0, uniqueSkipped: 12,
   declaredTotal: 20500, methodExecutionRate: 46.3,
   failingNames: ["com.x.FooTest.testA", "com.x.BarTest.testB"],
@@ -24,6 +24,7 @@ describe("TestCard", () => {
     expect(screen.getByText(/9,497 unique methods/)).toBeInTheDocument()
     expect(screen.getByText(/46.3% method coverage/)).toBeInTheDocument()
     expect(screen.getByText(/760 XML reports/)).toBeInTheDocument()
+    expect(screen.getByText(/2 flaky/)).toBeInTheDocument()
   })
 
   it("opens the detail page when Details is clicked", () => {

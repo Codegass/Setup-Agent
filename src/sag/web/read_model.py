@@ -15,6 +15,7 @@ from sag.web.models import (
     SystemSummary,
     WorkspaceSummary,
 )
+from sag.web.session_mirror import prune_mirrors
 from sag.web.session_registry import ContainerSessionRegistry
 from sag.web.workspace_registry import WorkspaceRegistry
 
@@ -42,6 +43,12 @@ class ReadModelBuilder:
                 self._with_session_state(workspace)
                 for workspace in self.workspace_registry.list_workspaces()
             ]
+
+            # Mirrors of removed containers are dead weight; drop them on the poll
+            # that would otherwise serve them. Fakes without logs_root skip this.
+            logs_root = getattr(self._session_registry(), "logs_root", None)
+            if logs_root is not None:
+                prune_mirrors(logs_root, {workspace.id for workspace in workspaces})
         except Exception:
             logger.exception("Failed to build SAG Workbench dashboard")
             return DashboardResponse(

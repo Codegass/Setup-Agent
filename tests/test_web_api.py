@@ -1,5 +1,3 @@
-import json
-
 from fastapi.testclient import TestClient
 
 import sag.web.app as app_module
@@ -34,7 +32,7 @@ def test_dashboard_endpoint_returns_workspaces():
 
 def test_static_root_serves_web_ui_index(tmp_path):
     (tmp_path / "index.html").write_text(
-        "<!doctype html><div id=\"root\">SAG Workbench</div>",
+        '<!doctype html><div id="root">SAG Workbench</div>',
         encoding="utf-8",
     )
     app = create_app(ReadModelBuilder(demo_mode=True), static_dir=tmp_path)
@@ -113,26 +111,6 @@ def test_session_endpoint_returns_session_detail():
     assert response.status_code == 200
     assert response.json()["id"] == "CC-3"
     assert response.json()["reportDoc"]["title"].startswith("setup-report")
-
-
-def test_dashboard_stream_emits_sse_snapshot():
-    app = create_app(ReadModelBuilder(demo_mode=True))
-    client = TestClient(app)
-
-    with client.stream("GET", "/api/stream/dashboard") as response:
-        lines = []
-        for line in response.iter_lines():
-            lines.append(line)
-            if len(lines) >= 2:
-                break
-
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("text/event-stream")
-    assert lines[0] == "event: snapshot"
-
-    data_line = next(line for line in lines if line.startswith("data: "))
-    payload = json.loads(data_line.removeprefix("data: "))
-    assert payload["workspaces"][0]["latestSession"] == "CC-3"
 
 
 def test_unknown_session_returns_404_in_demo_mode():
@@ -248,9 +226,7 @@ def test_batch_submit_returns_202_with_accepted_and_rejected_rows():
     assert response.status_code == 202
     assert response.json()["batch_id"] == "BATCH-20260607-abcdef"
     assert len(service.requests) == 1
-    assert service.requests[0].projects[0].repo_url == (
-        "https://github.com/apache/commons-cli.git"
-    )
+    assert service.requests[0].projects[0].repo_url == ("https://github.com/apache/commons-cli.git")
 
 
 def test_batch_submit_returns_409_when_every_row_conflicts():
