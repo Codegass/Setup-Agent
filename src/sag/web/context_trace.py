@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from sag.agent.history_state import HistoryActionState, decode_history_action_state
+
 from sag.web.models import (
     ContextReference,
     ContextTrace,
@@ -239,7 +241,15 @@ class ContextTraceBuilder:
             parameters = {}
         return ContextTraceAction(
             tool_name=str(entry.get("tool_name") or entry.get("toolName") or "tool"),
-            success=entry.get("success") if isinstance(entry.get("success"), bool) else None,
+            success=(
+                True
+                if decode_history_action_state(entry) is HistoryActionState.SUCCESS
+                else (
+                    False
+                    if decode_history_action_state(entry) is HistoryActionState.FAILED
+                    else None
+                )
+            ),
             parameters=parameters,
             output=self._clean_internal_output_markers(output),
             observation=str(entry.get("observation") or ""),

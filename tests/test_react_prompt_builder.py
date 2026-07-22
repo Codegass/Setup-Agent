@@ -26,7 +26,7 @@ class DummyTool(BaseTool):
         super().__init__("dummy", "Dummy tool for prompt tests")
 
     def execute(self) -> ToolResult:
-        return ToolResult(success=True, output="ok")
+        return ToolResult.completed_success(output="ok")
 
     def get_usage_example(self):
         return "dummy()"

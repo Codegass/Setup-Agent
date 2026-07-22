@@ -17,6 +17,13 @@ mode puts the tests dir on sys.path); the small fakes our tests introduced live 
 import json as _json
 import re
 
+from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
+from test_build_tool import FakeBackendTool, _tool
+
+# Reusable fakes/helpers from the original suites.
+from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
+from test_physical_validator_modules import FakeOrch
+
 from sag.agent.physical_validator import PhysicalValidator
 from sag.config.settings import (
     DEFAULT_TEST_EXECUTION_THRESHOLD,
@@ -26,12 +33,6 @@ from sag.tools.internal.maven_tool import MavenTool
 from sag.tools.module_metrics import assemble_module_metrics
 from sag.tools.report_tool import ReportTool
 from sag.verdict import run_verdict
-
-# Reusable fakes/helpers from the original suites.
-from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
-from test_build_tool import FakeBackendTool, _tool
-from test_physical_validator_modules import FakeOrch
-from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
 
 
 # ===========================================================================
@@ -168,8 +169,12 @@ def test_validate_build_status_zero_classes_no_artifacts_blocked_despite_trivial
         {"type": "jar", "path": "/workspace/cc/target/cc.jar", "artifact": "cc.jar"}
     ]
     validator._verify_expected_artifacts = lambda *a, **k: {
-        "all_present": False, "found": [], "missing": ["cc.jar"],
-        "classes_expected": 0, "classes_found": 0, "class_coverage": 1.0,
+        "all_present": False,
+        "found": [],
+        "missing": ["cc.jar"],
+        "classes_expected": 0,
+        "classes_found": 0,
+        "class_coverage": 1.0,
     }
 
     result = validator.validate_build_status("cc")
@@ -225,9 +230,7 @@ def test_active_maven_module_dirs_excludes_profile_gated():
     </project>
     """
     core_pom = "<project><artifactId>core</artifactId></project>"
-    orch = FakeMavenPomOrchestrator(
-        {"/w/p/pom.xml": root_pom, "/w/p/core/pom.xml": core_pom}
-    )
+    orch = FakeMavenPomOrchestrator({"/w/p/pom.xml": root_pom, "/w/p/core/pom.xml": core_pom})
     v = PhysicalValidator(docker_orchestrator=orch, project_path="/w")
 
     dirs = v._active_maven_module_dirs("/w/p")
@@ -245,11 +248,26 @@ def test_reactor_authoritative_excludes_non_reactor_scanned_modules():
     metrics = assemble_module_metrics(
         modules=[
             {"path": "api", "name": "api", "class_count": 10, "jar_count": 1, "report_dirs": []},
-            {"path": "runtime", "name": "runtime", "class_count": 0, "jar_count": 0, "report_dirs": []},
-            {"path": "examples", "name": "examples", "class_count": 0, "jar_count": 0, "report_dirs": []},
+            {
+                "path": "runtime",
+                "name": "runtime",
+                "class_count": 0,
+                "jar_count": 0,
+                "report_dirs": [],
+            },
+            {
+                "path": "examples",
+                "name": "examples",
+                "class_count": 0,
+                "jar_count": 0,
+                "report_dirs": [],
+            },
         ],
         reactor_status={"api": "success", "runtime": "failure"},
-        tests={}, build_systems=["maven"], build_error_samples={}, generated_at="t",
+        tests={},
+        build_systems=["maven"],
+        build_error_samples={},
+        generated_at="t",
     )
     s = metrics["module_summary"]
     assert s["modules_total"] == 2  # detected = reactor modules; examples excluded
@@ -260,9 +278,14 @@ def test_reactor_authoritative_excludes_non_reactor_scanned_modules():
 def test_reactor_only_module_counted_when_no_scan_match():
     """A reactor module no disk scan found is still counted (detected == reactor count)."""
     metrics = assemble_module_metrics(
-        modules=[{"path": "api", "name": "api", "class_count": 5, "jar_count": 0, "report_dirs": []}],
+        modules=[
+            {"path": "api", "name": "api", "class_count": 5, "jar_count": 0, "report_dirs": []}
+        ],
         reactor_status={"api": "success", "ghost": "success"},
-        tests={}, build_systems=["maven"], build_error_samples={}, generated_at="t",
+        tests={},
+        build_systems=["maven"],
+        build_error_samples={},
+        generated_at="t",
     )
     s = metrics["module_summary"]
     assert s["modules_total"] == 2 and s["modules_built"] == 2
@@ -275,10 +298,14 @@ def test_no_reactor_jar_without_classes_is_not_built():
     # It must read detected-but-not-built, not an optimistic "success".
     metrics = assemble_module_metrics(
         modules=[
-            {"path": "core", "name": "core", "class_count": 12, "jar_count": 1,
-             "report_dirs": []},
-            {"path": "examples", "name": "examples", "class_count": 0, "jar_count": 1,
-             "report_dirs": []},
+            {"path": "core", "name": "core", "class_count": 12, "jar_count": 1, "report_dirs": []},
+            {
+                "path": "examples",
+                "name": "examples",
+                "class_count": 0,
+                "jar_count": 1,
+                "report_dirs": [],
+            },
         ],
         reactor_status={},
         tests={},
@@ -287,8 +314,8 @@ def test_no_reactor_jar_without_classes_is_not_built():
         generated_at="t",
     )
     by_path = {m["path"]: m for m in metrics["modules"]}
-    assert by_path["core"]["build_status"] == "success"        # has classes
-    assert by_path["examples"]["build_status"] != "success"    # jar only -> not built
+    assert by_path["core"]["build_status"] == "success"  # has classes
+    assert by_path["examples"]["build_status"] != "success"  # jar only -> not built
     assert metrics["module_summary"]["modules_total"] == 2
     assert metrics["module_summary"]["modules_built"] == 1
 
@@ -304,31 +331,61 @@ def test_module_summary_counts_tested_and_not_tested():
         reactor_status={"api": "success", "core": "success", "util": "success"},
         tests={
             "api": {"tests_total": 12, "tests_passed": 12, "failing_count": 0},
-            "core": {"tests_total": 0, "tests_passed": 0, "failing_count": 0},  # built, no tests run
+            "core": {
+                "tests_total": 0,
+                "tests_passed": 0,
+                "failing_count": 0,
+            },  # built, no tests run
         },
-        build_systems=["maven"], build_error_samples={}, generated_at="t",
+        build_systems=["maven"],
+        build_error_samples={},
+        generated_at="t",
     )
     s = metrics["module_summary"]
     assert s["modules_total"] == 3
-    assert s["modules_tested"] == 1            # only api ran tests
-    assert s["modules_not_tested"] == 2        # core (0 tests) + util (no entry)
+    assert s["modules_tested"] == 1  # only api ran tests
+    assert s["modules_not_tested"] == 2  # core (0 tests) + util (no entry)
     assert s["modules_tested"] + s["modules_not_tested"] == s["modules_total"]
 
 
 def test_submodule_breakdown_header_shows_tested_not_tested():
     """The markdown breakdown header surfaces tested / not-tested alongside built/detected."""
     metrics = {
-        "module_summary": {"modules_total": 3, "modules_built": 2, "modules_failed": 0,
-                           "modules_skipped": 0, "modules_tested": 1, "modules_not_tested": 2,
-                           "modules_with_test_failures": 0,
-                           "build_systems": ["maven"], "single_module": False},
+        "module_summary": {
+            "modules_total": 3,
+            "modules_built": 2,
+            "modules_failed": 0,
+            "modules_skipped": 0,
+            "modules_tested": 1,
+            "modules_not_tested": 2,
+            "modules_with_test_failures": 0,
+            "build_systems": ["maven"],
+            "single_module": False,
+        },
         "modules": [
-            {"name": "api", "path": "api", "build_status": "success",
-             "tests_total": 12, "tests_passed": 12, "tests_failed": 0, "failing_count": 0},
-            {"name": "core", "path": "core", "build_status": "success",
-             "tests_total": 0, "failing_count": 0},
-            {"name": "util", "path": "util", "build_status": "unknown",
-             "tests_total": None, "failing_count": None},
+            {
+                "name": "api",
+                "path": "api",
+                "build_status": "success",
+                "tests_total": 12,
+                "tests_passed": 12,
+                "tests_failed": 0,
+                "failing_count": 0,
+            },
+            {
+                "name": "core",
+                "path": "core",
+                "build_status": "success",
+                "tests_total": 0,
+                "failing_count": 0,
+            },
+            {
+                "name": "util",
+                "path": "util",
+                "build_status": "unknown",
+                "tests_total": None,
+                "failing_count": None,
+            },
         ],
     }
     body = "\n".join(ReportTool()._render_submodule_breakdown(metrics))
@@ -456,15 +513,26 @@ def test_agent_caps_at_partial_when_modules_incomplete():
                 "conflicts": ["build_modules_incomplete"],
             },
             test_status={
-                "has_test_reports": True, "status": "SUCCESS", "reason": "All tests passed",
-                "pass_rate": 100.0, "total_tests": 50, "passed_tests": 50,
-                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "SUCCESS",
+                "reason": "All tests passed",
+                "pass_rate": 100.0,
+                "total_tests": 50,
+                "passed_tests": 50,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "test_exclusions": [],
+                "modules_without_tests": [],
             },
-            analysis_status={"analyzed": True, "has_static_test_count": True, "static_test_count": 50},
+            analysis_status={
+                "analyzed": True,
+                "has_static_test_count": True,
+                "static_test_count": 50,
+            },
         )
     )
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
     assert agent.final_verdict == "partial"
 
 
@@ -475,15 +543,26 @@ def test_agent_caps_at_partial_on_low_test_execution():
         FakePhysicalValidator(
             build_status={"success": True, "build_complete": True, "reason": "Built 100%"},
             test_status={
-                "has_test_reports": True, "status": "SUCCESS", "reason": "1/1 passed",
-                "pass_rate": 100.0, "total_tests": 1, "passed_tests": 1,
-                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "SUCCESS",
+                "reason": "1/1 passed",
+                "pass_rate": 100.0,
+                "total_tests": 1,
+                "passed_tests": 1,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "test_exclusions": [],
+                "modules_without_tests": [],
             },
-            analysis_status={"analyzed": True, "has_static_test_count": True, "static_test_count": 1122},
+            analysis_status={
+                "analyzed": True,
+                "has_static_test_count": True,
+                "static_test_count": 1122,
+            },
         )
     )
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
     assert agent.final_verdict == "partial"
 
 
@@ -495,15 +574,26 @@ def test_agent_zero_executed_tests_is_partial_not_failed():
         FakePhysicalValidator(
             build_status={"success": True, "build_complete": True, "reason": "Built 100%"},
             test_status={
-                "has_test_reports": True, "status": "WARNING", "reason": "no tests ran",
-                "pass_rate": 0.0, "total_tests": 0, "passed_tests": 0,
-                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "WARNING",
+                "reason": "no tests ran",
+                "pass_rate": 0.0,
+                "total_tests": 0,
+                "passed_tests": 0,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "test_exclusions": [],
+                "modules_without_tests": [],
             },
-            analysis_status={"analyzed": True, "has_static_test_count": True, "static_test_count": 1122},
+            analysis_status={
+                "analyzed": True,
+                "has_static_test_count": True,
+                "static_test_count": 1122,
+            },
         )
     )
-    agent._get_verified_final_status(react_engine_success=True)
+    agent._legacy_get_verified_final_status(react_engine_success=True)
     assert agent.final_verdict == "partial"  # not "failed"
 
 
@@ -539,8 +629,20 @@ def test_module_metrics_keeps_built_submodules_without_reactor():
     project_dir = "/workspace/p"
     scanned = [
         {"path": ".", "name": ".", "class_count": 0, "jar_count": 0, "report_dirs": []},
-        {"path": "tools/cli", "name": "tools:cli", "class_count": 27, "jar_count": 0, "report_dirs": []},
-        {"path": "examples", "name": "examples", "class_count": 0, "jar_count": 0, "report_dirs": []},
+        {
+            "path": "tools/cli",
+            "name": "tools:cli",
+            "class_count": 27,
+            "jar_count": 0,
+            "report_dirs": [],
+        },
+        {
+            "path": "examples",
+            "name": "examples",
+            "class_count": 0,
+            "jar_count": 0,
+            "report_dirs": [],
+        },
     ]
     tool = ReportTool()
     tool.physical_validator = _ModuleScanValidator(project_dir, scanned, active_dirs=[project_dir])

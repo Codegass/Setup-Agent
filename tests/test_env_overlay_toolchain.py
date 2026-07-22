@@ -70,7 +70,7 @@ def test_env_register_rejects_missing_executable():
         activate=True,
     )
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "ENV_EXECUTABLE_NOT_FOUND"
     assert "not executable" in result.error
 

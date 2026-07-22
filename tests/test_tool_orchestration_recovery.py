@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
+from sag.evidence import InvocationStatus
 from sag.tools.base import BaseTool, ToolResult
 
 
@@ -35,7 +36,7 @@ class ResultTool(BaseTool):
         self.calls.append(dict(params))
         if self.results:
             return self.results.pop(0)
-        return ToolResult(success=False, output="", error="No queued result")
+        return ToolResult.completed_failure(output="", error="No queued result")
 
 
 @dataclass
@@ -96,7 +97,7 @@ def _orchestrator(
         successful_states=successful_states,
         repository_url=repository_url,
         repository_ref=repository_ref,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -143,13 +144,12 @@ def test_project_setup_recovery_injects_repository_url():
     tool = ResultTool(
         "project_setup",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="repository_url is required",
                 error_code="MISSING_PARAMETERS",
             ),
-            ToolResult(success=True, output="cloned repository"),
+            ToolResult.completed_success(output="cloned repository"),
         ],
     )
     orchestrator = _orchestrator(
@@ -169,7 +169,7 @@ def test_project_setup_recovery_injects_repository_url():
     )
 
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "project_setup_repository_url"
     assert execution.executed_params == {
@@ -193,7 +193,7 @@ def test_project_setup_recovery_injects_repository_url():
     assert recovery_events[0].metadata["recovery_strategy"] == "project_setup_repository_url"
     assert recovery_events[0].metadata["recovery_params"]["ref"] == "rel/commons-cli-1.11.0"
     assert recovery_events[0].metadata["success"] is True
-    assert recovery_events[0].metadata["replacement_result_success"] is True
+    assert recovery_events[0].metadata["replacement_result_succeeded"] is True
     assert recovery_events[0].metadata["recovery_params"] == execution.executed_params
     assert state_updates == [("project_setup", execution.executed_params, execution.result)]
 
@@ -203,8 +203,8 @@ def test_recovery_and_error_events_include_required_metadata():
     project_setup = ResultTool(
         "project_setup",
         [
-            ToolResult(success=False, output="", error="missing url"),
-            ToolResult(success=True, output="cloned"),
+            ToolResult.completed_failure(output="", error="missing url"),
+            ToolResult.completed_success(output="cloned"),
         ],
     )
     orchestrator = _orchestrator(
@@ -227,7 +227,7 @@ def test_recovery_and_error_events_include_required_metadata():
     assert recovery_event.metadata["attempted"] is True
     assert recovery_event.metadata["success"] is True
     assert recovery_event.metadata["guidance"]
-    assert recovery_event.metadata["replacement_result_success"] is True
+    assert recovery_event.metadata["replacement_result_succeeded"] is True
     assert (
         recovery_event.metadata["recovery_params"]["repository_url"] == "https://example/repo.git"
     )
@@ -246,7 +246,7 @@ def test_recovery_and_error_events_include_required_metadata():
         recent_tool_executions=[],
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -268,13 +268,12 @@ def test_manage_context_recovery_uses_single_in_progress_task():
     tool = ResultTool(
         "manage_context",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="No active task to complete",
                 error_code="NO_ACTIVE_TASK",
             ),
-            ToolResult(success=True, output="completed task"),
+            ToolResult.completed_success(output="completed task"),
         ],
     )
     context_manager = ContextManager(
@@ -300,7 +299,7 @@ def test_manage_context_recovery_uses_single_in_progress_task():
     )
 
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "manage_context_active_task"
     assert context_manager.current_task_id == "task_2"
@@ -323,13 +322,12 @@ def test_manage_context_invalid_task_id_recovery_uses_next_pending_task():
     tool = ResultTool(
         "manage_context",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Invalid task ID: task_1",
                 error_code="INVALID_TASK_ID",
             ),
-            ToolResult(success=True, output="started task_2"),
+            ToolResult.completed_success(output="started task_2"),
         ],
     )
     context = ContextManager(
@@ -374,8 +372,7 @@ def test_generic_recovery_returns_failure_without_silent_success():
     tool = ResultTool(
         "echo",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="something failed",
                 error_code="GENERIC_FAILURE",
@@ -393,7 +390,7 @@ def test_generic_recovery_returns_failure_without_silent_success():
     )
 
     assert execution.status == "failure"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.recovery_applied is False
     assert execution.recovery_strategy is None
     assert execution.executed_params == {"command": "run"}
@@ -404,12 +401,39 @@ def test_generic_recovery_returns_failure_without_silent_success():
     assert execution.metadata["recovery"]["message"] == "No generic recovery strategy available"
 
 
+def test_crashed_failure_reaches_recovery_without_losing_guidance_or_metadata():
+    crashed = ToolResult.terminal_failure(
+        invocation_status=InvocationStatus.CRASHED,
+        output="worker crashed after writing diagnostics",
+        error="worker crashed",
+        error_code="WORKER_CRASHED",
+        suggestions=["inspect the worker diagnostics"],
+        metadata={"crash_report": "output_crash_report"},
+    )
+    tool = ResultTool("echo", [crashed])
+    orchestrator = _orchestrator(tools={"echo": tool})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="echo",
+            raw_params={"command": "run"},
+            validated_params={"command": "run"},
+        )
+    )
+
+    assert execution.result is crashed
+    assert execution.result.invocation_status is InvocationStatus.CRASHED
+    assert execution.result.suggestions == ["inspect the worker diagnostics"]
+    assert execution.result.metadata["crash_report"] == "output_crash_report"
+    assert execution.metadata["recovery"]["attempted"] is False
+    assert execution.metadata["recovery"]["strategy"] == "generic_no_strategy"
+
+
 def test_maven_java_version_recovery_installs_and_retries():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Java 17 is required",
                 error_code="JAVA_VERSION_MISMATCH",
@@ -422,14 +446,14 @@ def test_maven_java_version_recovery_installs_and_retries():
                     }
                 },
             ),
-            ToolResult(success=True, output="build ok"),
+            ToolResult.completed_success(output="build ok"),
         ],
     )
     system = ResultTool(
         "system",
         [
-            ToolResult(success=False, output="", error="missing"),
-            ToolResult(success=True, output="installed"),
+            ToolResult.completed_failure(output="", error="missing"),
+            ToolResult.completed_success(output="installed"),
         ],
     )
     orchestrator = _orchestrator(tools={"maven": maven, "system": system})
@@ -443,7 +467,7 @@ def test_maven_java_version_recovery_installs_and_retries():
     )
 
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert execution.recovery_strategy == "maven_java_version"
     assert execution.executed_params == {"command": "test"}
     assert maven.calls == [{"command": "test"}, {"command": "test"}]
@@ -458,8 +482,7 @@ def test_maven_java_version_failed_install_preserves_maven_execution_params():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Java 17 is required",
                 error_code="JAVA_VERSION_MISMATCH",
@@ -477,8 +500,8 @@ def test_maven_java_version_failed_install_preserves_maven_execution_params():
     system = ResultTool(
         "system",
         [
-            ToolResult(success=False, output="", error="missing"),
-            ToolResult(success=False, output="", error="install failed"),
+            ToolResult.completed_failure(output="", error="missing"),
+            ToolResult.completed_failure(output="", error="install failed"),
         ],
     )
     orchestrator = _orchestrator(tools={"maven": maven, "system": system})
@@ -510,13 +533,12 @@ def test_maven_working_directory_recovery_retries_known_directory():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="pom.xml not found: no such file",
                 error_code="MISSING_PROJECT",
             ),
-            ToolResult(success=True, output="build ok"),
+            ToolResult.completed_success(output="build ok"),
         ],
     )
     orchestrator = _orchestrator(
@@ -549,13 +571,12 @@ def test_maven_compile_before_test_recovery():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Compilation failure before tests",
                 error_code="BUILD_FAILED",
             ),
-            ToolResult(success=True, output="compiled"),
+            ToolResult.completed_success(output="compiled"),
         ],
     )
     orchestrator = _orchestrator(tools={"maven": maven})
@@ -585,14 +606,13 @@ def test_maven_pom_discovery_recovery_targets_detected_pom():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="The goal requires a pom but no pom was found",
                 error_code="BUILD_FAILED",
                 metadata={"analysis": {"error_type": "MISSING_PROJECT"}},
             ),
-            ToolResult(success=True, output="build ok"),
+            ToolResult.completed_success(output="build ok"),
         ],
     )
     build_orchestrator = FakeBuildOrchestrator(
@@ -635,13 +655,12 @@ def test_maven_no_pom_xml_recovery_targets_detected_pom_before_known_directory()
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="No pom.xml found at /workspace",
                 error_code="NO_POM_XML",
             ),
-            ToolResult(success=True, output="build ok"),
+            ToolResult.completed_success(output="build ok"),
         ],
     )
     build_orchestrator = FakeBuildOrchestrator(
@@ -678,8 +697,7 @@ def test_maven_module_and_test_exclusion_recovery_records_exclusions():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Module and test failures",
                 error_code="BUILD_FAILED",
@@ -696,7 +714,7 @@ def test_maven_module_and_test_exclusion_recovery_records_exclusions():
                     }
                 },
             ),
-            ToolResult(success=True, output="remaining modules ok"),
+            ToolResult.completed_success(output="remaining modules ok"),
         ],
     )
     orchestrator = _orchestrator(
@@ -742,8 +760,7 @@ def test_maven_version_error_returns_env_overlay_guidance_without_retry():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output=(
                     "[ERROR] Detected Maven Version: 3.8.7 is not in the allowed range [3.9,)."
                 ),
@@ -793,8 +810,8 @@ def test_maven_timeout_returns_guidance_without_retry():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="timed out",
                 error_code="TIMEOUT_WALL",
@@ -816,7 +833,7 @@ def test_maven_timeout_returns_guidance_without_retry():
     )
 
     assert execution.status == "recovery_attempted"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "MAVEN_TIMEOUT_HANDLED"
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "maven_timeout_guidance"
@@ -826,7 +843,7 @@ def test_maven_timeout_returns_guidance_without_retry():
     assert guidance[0][1] == "high"
     assert "MAVEN TIMEOUT" in guidance[0][0]
     assert execution.metadata["recovery"]["success"] is False
-    assert execution.metadata["recovery"]["replacement_result_success"] is False
+    assert execution.metadata["recovery"]["replacement_result_succeeded"] is False
 
 
 def test_maven_timeout_takes_precedence_over_retry_recovery():
@@ -834,8 +851,8 @@ def test_maven_timeout_takes_precedence_over_retry_recovery():
     maven = ResultTool(
         "maven",
         [
-            ToolResult(
-                success=False,
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="pom not found during timeout",
                 error_code="TIMEOUT_IDLE",
@@ -844,7 +861,7 @@ def test_maven_timeout_takes_precedence_over_retry_recovery():
                     "termination_reason": "idle_timeout",
                 },
             ),
-            ToolResult(success=True, output="should not retry"),
+            ToolResult.completed_success(output="should not retry"),
         ],
     )
     orchestrator = _orchestrator(
@@ -875,8 +892,8 @@ def test_gradle_timeout_returns_guidance_without_retry():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult(
-                success=False,
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="timed out",
                 error_code="TIMEOUT_WALL",
@@ -898,7 +915,7 @@ def test_gradle_timeout_returns_guidance_without_retry():
     )
 
     assert execution.status == "recovery_attempted"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "GRADLE_TIMEOUT_HANDLED"
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "gradle_timeout_guidance"
@@ -908,20 +925,19 @@ def test_gradle_timeout_returns_guidance_without_retry():
     assert guidance[0][1] == "high"
     assert "GRADLE TIMEOUT" in guidance[0][0]
     assert execution.metadata["recovery"]["success"] is False
-    assert execution.metadata["recovery"]["replacement_result_success"] is False
+    assert execution.metadata["recovery"]["replacement_result_succeeded"] is False
 
 
 def test_gradle_working_directory_recovery_retries_known_directory():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="build.gradle not found: no such file",
                 error_code="MISSING_PROJECT",
             ),
-            ToolResult(success=True, output="build ok"),
+            ToolResult.completed_success(output="build ok"),
         ],
     )
     orchestrator = _orchestrator(
@@ -949,13 +965,12 @@ def test_gradle_build_file_not_found_recovery_retries_known_directory():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="No build.gradle or build.gradle.kts found in /workspace",
                 error_code="BUILD_FILE_NOT_FOUND",
             ),
-            ToolResult(success=True, output="build ok"),
+            ToolResult.completed_success(output="build ok"),
         ],
     )
     orchestrator = _orchestrator(
@@ -982,13 +997,12 @@ def test_gradle_compile_fallback_recovery():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Compilation failure before tests",
                 error_code="BUILD_FAILED",
             ),
-            ToolResult(success=True, output="compiled"),
+            ToolResult.completed_success(output="compiled"),
         ],
     )
     orchestrator = _orchestrator(tools={"gradle": gradle})
@@ -1016,13 +1030,12 @@ def test_gradle_compile_fallback_recovery_accepts_tasks_parameter():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Compilation failure before tests",
                 error_code="BUILD_FAILED",
             ),
-            ToolResult(success=True, output="compiled"),
+            ToolResult.completed_success(output="compiled"),
         ],
     )
     orchestrator = _orchestrator(tools={"gradle": gradle})
@@ -1049,13 +1062,12 @@ def test_gradle_compile_fallback_recovery_accepts_command_alias():
     gradle = ResultTool(
         "gradle",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="Compilation failure before tests",
                 error_code="BUILD_FAILED",
             ),
-            ToolResult(success=True, output="compiled"),
+            ToolResult.completed_success(output="compiled"),
         ],
     )
     orchestrator = _orchestrator(tools={"gradle": gradle})
@@ -1083,8 +1095,8 @@ def test_bash_timeout_guidance_adds_system_guidance():
     bash = ResultTool(
         "bash",
         [
-            ToolResult(
-                success=False,
+            ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.TIMEOUT,
                 output="",
                 error="timed out",
                 error_code="TIMEOUT_WALL",
@@ -1093,7 +1105,7 @@ def test_bash_timeout_guidance_adds_system_guidance():
                     "termination_reason": "wall_clock_timeout",
                 },
             ),
-            ToolResult(success=True, output="should not retry"),
+            ToolResult.completed_success(output="should not retry"),
         ],
     )
     orchestrator = _orchestrator(tools={"bash": bash}, guidance=guidance)
@@ -1107,7 +1119,7 @@ def test_bash_timeout_guidance_adds_system_guidance():
     )
 
     assert execution.status == "recovery_attempted"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "TIMEOUT_HANDLED"
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "bash_timeout_guidance"
@@ -1129,13 +1141,12 @@ def test_bash_workspace_recreation_retries_original_command():
     bash = ResultTool(
         "bash",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="OCI runtime exec failed: no such file or directory",
                 metadata={"exit_code": 127},
             ),
-            ToolResult(success=True, output="workspace fixed"),
+            ToolResult.completed_success(output="workspace fixed"),
         ],
     )
     workspace_orchestrator = WorkspaceRecoveryOrchestrator()
@@ -1154,7 +1165,7 @@ def test_bash_workspace_recreation_retries_original_command():
 
     expected_params = {"command": "pwd", "working_directory": "/workspace"}
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert execution.recovery_strategy == "bash_workspace_recreation"
     assert execution.executed_params == expected_params
     assert bash.calls == [
@@ -1173,12 +1184,11 @@ def test_bash_known_working_directory_recovery():
     bash = ResultTool(
         "bash",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="working directory is unavailable",
             ),
-            ToolResult(success=True, output="ok"),
+            ToolResult.completed_success(output="ok"),
         ],
     )
     orchestrator = _orchestrator(
@@ -1196,7 +1206,7 @@ def test_bash_known_working_directory_recovery():
 
     expected_params = {"command": "ls", "working_directory": "/workspace/app"}
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert execution.recovery_strategy == "bash_known_working_directory"
     assert execution.executed_params == expected_params
     assert bash.calls == [{"command": "ls"}, expected_params]
@@ -1207,12 +1217,11 @@ def test_file_io_path_recovery_uses_known_working_directory():
     file_io = ResultTool(
         "file_io",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="README.md not found",
             ),
-            ToolResult(success=True, output="contents"),
+            ToolResult.completed_success(output="contents"),
         ],
     )
     orchestrator = _orchestrator(
@@ -1230,7 +1239,7 @@ def test_file_io_path_recovery_uses_known_working_directory():
 
     expected_params = {"action": "read", "path": "/workspace/app/README.md"}
     assert execution.status == "recovered"
-    assert execution.result.success is True
+    assert execution.result.succeeded is True
     assert execution.recovery_strategy == "file_io_known_working_directory"
     assert execution.executed_params == expected_params
     assert file_io.calls == [
@@ -1244,12 +1253,11 @@ def test_recovery_failed_status_when_replacement_result_fails():
     bash = ResultTool(
         "bash",
         [
-            ToolResult(
-                success=False,
+            ToolResult.completed_failure(
                 output="",
                 error="working directory is unavailable",
             ),
-            ToolResult(success=False, output="", error="still failed"),
+            ToolResult.completed_failure(output="", error="still failed"),
         ],
     )
     orchestrator = _orchestrator(
@@ -1267,12 +1275,12 @@ def test_recovery_failed_status_when_replacement_result_fails():
 
     expected_params = {"command": "ls", "working_directory": "/workspace/app"}
     assert execution.status == "recovery_failed"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.recovery_applied is True
     assert execution.recovery_strategy == "bash_known_working_directory"
     assert execution.executed_params == expected_params
     assert bash.calls == [{"command": "ls"}, expected_params]
     assert execution.metadata["recovery"]["attempted"] is True
     assert execution.metadata["recovery"]["success"] is False
-    assert execution.metadata["recovery"]["replacement_result_success"] is False
+    assert execution.metadata["recovery"]["replacement_result_succeeded"] is False
     assert execution.metadata["recovery"]["recovery_params"] == expected_params

@@ -15,7 +15,7 @@ class ProjectTool(BaseTool):
             description=(
                 "Project lifecycle: action = clone (repo_url[, ref]) | "
                 "provision (install toolchain: java_version for a JDK, packages for apt) | "
-                "analyze (detect build system, plan) | "
+                "analyze (survey the project; persist build facts) | "
                 "env (register env vars/executables; tool + executable [+ env])."
             ),
         )
@@ -38,15 +38,15 @@ class ProjectTool(BaseTool):
             "env": self.env_tool,
         }
         if verb not in routes:
-            return ToolResult(
-                success=False, output=f"Unknown project action: {action!r}",
-                verdict="failed", error="invalid action",
+            return ToolResult.completed_failure(
+                output=f"Unknown project action: {action!r}",
+                error="invalid action",
                 suggestions=["Use action= clone | provision | analyze | env"],
             )
         delegate = routes[verb]
         if delegate is None:
-            return ToolResult(
-                success=False, output=f"{verb} unavailable", verdict="failed",
+            return ToolResult.completed_failure(
+                output=f"{verb} unavailable",
                 error="delegate missing",
             )
         if verb == "clone":
@@ -85,7 +85,10 @@ class ProjectTool(BaseTool):
                 "project_path": {"type": "string", "description": "analyze: project directory"},
                 "java_version": {"type": "string", "description": "provision: JDK version"},
                 "packages": {"type": "array", "description": "provision: apt packages to install"},
-                "tool": {"type": "string", "description": "env: tool name to register (e.g. 'java')"},
+                "tool": {
+                    "type": "string",
+                    "description": "env: tool name to register (e.g. 'java')",
+                },
                 "executable": {"type": "string", "description": "env: executable path to register"},
                 "env": {"type": "object", "description": "env: variables to set"},
             },

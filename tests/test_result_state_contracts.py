@@ -7,6 +7,8 @@ import sag.agent.agent as agent_module
 from sag.agent.agent import SetupAgent
 from sag.agent.agent_state_evaluator import AgentStateAnalysis, AgentStateEvaluator, AgentStatus
 from sag.agent.react_types import StepType
+from sag.agent.tool_orchestration import ToolExecutionRecord
+from sag.evidence import InvocationStatus, OperationOutcome
 from sag.tools.base import ToolResult
 
 
@@ -20,8 +22,7 @@ class FakeContextManager:
 
 
 def test_tool_result_preserves_declared_raw_data():
-    result = ToolResult(
-        success=True,
+    result = ToolResult.completed_success(
         output="ok",
         raw_data={"full_report": "report text", "report_snapshot": {"status": "success"}},
     )
@@ -32,6 +33,53 @@ def test_tool_result_preserves_declared_raw_data():
 
 def test_agent_status_has_stuck_state():
     assert AgentStatus.STUCK.value == "stuck"
+
+
+def test_repetition_evaluator_consumes_canonical_execution_records():
+    evaluator = AgentStateEvaluator(FakeContextManager())
+    records = [
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            timestamp=f"ts-{index}",
+        )
+        for index in range(3)
+    ]
+
+    analysis = evaluator._check_repetitive_execution(records)
+
+    assert analysis.status is AgentStatus.STUCK_REPETITION
+    assert analysis.needs_guidance is True
+
+
+def test_repetition_evaluator_does_not_count_pending_as_failure():
+    evaluator = AgentStateEvaluator(FakeContextManager())
+    records = [
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.COMPLETED,
+            operation_outcome=OperationOutcome.FAILED,
+            timestamp="ts-failed",
+        ),
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            timestamp="ts-pending-1",
+        ),
+        ToolExecutionRecord(
+            signature="build:[('action', 'test')]",
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            timestamp="ts-pending-2",
+        ),
+    ]
+
+    analysis = evaluator._check_repetitive_execution(records)
+
+    assert analysis.status is AgentStatus.PROCEEDING
+    assert analysis.needs_guidance is False
 
 
 def test_agent_state_analysis_uses_declared_guidance_fields():
@@ -146,7 +194,7 @@ def test_agent_state_evaluator_run_task_completion_ignores_setup_todo_workflow()
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -171,7 +219,7 @@ def test_agent_state_evaluator_run_task_completion_accepts_verified_no_more_acti
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -199,7 +247,7 @@ def test_agent_state_evaluator_run_task_completion_accepts_bare_task_complete():
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(step_type=StepType.THOUGHT, content="TASK COMPLETE"),
     ]
@@ -220,7 +268,7 @@ def test_agent_state_evaluator_run_task_completion_rejects_negated_task_complete
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="partial output"),
+            tool_result=ToolResult.completed_success(output="partial output"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -244,7 +292,7 @@ def test_agent_state_evaluator_run_task_completion_rejects_negated_verification(
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="partial output"),
+            tool_result=ToolResult.completed_success(output="partial output"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,
@@ -268,7 +316,7 @@ def test_agent_state_evaluator_setup_mode_keeps_setup_todo_workflow_guard():
         SimpleNamespace(
             step_type=StepType.ACTION,
             tool_name="bash",
-            tool_result=ToolResult(success=True, output="Apache Maven 3.6.3"),
+            tool_result=ToolResult.completed_success(output="Apache Maven 3.6.3"),
         ),
         SimpleNamespace(
             step_type=StepType.THOUGHT,

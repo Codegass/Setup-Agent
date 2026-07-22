@@ -1,4 +1,5 @@
 from sag.docker_orch.orch import DockerOrchestrator
+from sag.evidence import InvocationStatus
 from sag.tools.bash import BashTool
 
 
@@ -148,7 +149,8 @@ def test_bash_tool_regular_timeout_result_uses_timeout_error_code():
 
     result = tool.execute(command="sleep 99", timeout=5)
 
-    assert result.success is False
+    assert result.succeeded is False
+    assert result.invocation_status is InvocationStatus.TIMEOUT
     assert result.error_code == "TIMEOUT_ABSOLUTE_TIMEOUT"
     assert result.metadata["timeout"] == 5
     assert result.metadata["termination_reason"] == "absolute_timeout"
@@ -160,7 +162,7 @@ def test_bash_tool_accepts_timeout_and_passes_it_to_regular_execution():
 
     result = tool.execute(command="echo hi", timeout=7)
 
-    assert result.success is True
+    assert result.succeeded is True
     command_call = next(call for call in orchestrator.command_calls if call["command"] == "echo hi")
     assert command_call["timeout"] == 7
     assert result.metadata["timeout"] == 7
@@ -172,7 +174,7 @@ def test_bash_tool_safe_execute_accepts_schema_timeout():
 
     result = tool.safe_execute(command="echo hi", timeout=11)
 
-    assert result.success is True
+    assert result.succeeded is True
     command_call = next(call for call in orchestrator.command_calls if call["command"] == "echo hi")
     assert command_call["timeout"] == 11
 
@@ -183,7 +185,7 @@ def test_bash_tool_timeout_overrides_monitored_absolute_timeout():
 
     result = tool.execute(command="npm install", timeout=120)
 
-    assert result.success is True
+    assert result.succeeded is True
     assert orchestrator.monitoring_calls
     monitoring_call = orchestrator.monitoring_calls[-1]
     assert monitoring_call["absolute_timeout"] == 120
@@ -205,7 +207,8 @@ def test_bash_tool_timeout_termination_reports_requested_timeout():
 
     result = tool.execute(command="npm install", timeout=120)
 
-    assert result.success is False
+    assert result.succeeded is False
+    assert result.invocation_status is InvocationStatus.TIMEOUT
     assert "2 minutes" in result.error
     assert result.metadata["timeout"] == 120
     assert result.metadata["termination_reason"] == "absolute_timeout"
@@ -225,7 +228,7 @@ def test_bash_tool_monitoring_error_is_not_marked_as_timeout():
 
     result = tool.execute(command="npm install", timeout=120)
 
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "MONITORING_ERROR"
     assert result.metadata["execution"]["timed_out"] is False
     assert result.metadata["termination_reason"] == "monitoring_error"

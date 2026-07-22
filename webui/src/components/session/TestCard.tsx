@@ -42,6 +42,8 @@ export function TestCard({
   // explain the discrepancy in the details panel instead.
   const methodCoverage = isValidCoverage(test.methodExecutionRate) ? pct(test.methodExecutionRate) : null
   const uniqueTotal = num(test.uniqueTotal)
+  const rawExecutions = num(test.rawExecutions)
+  const snapshotUniquePrimary = test.rawExecutions != null
 
   if (!hasTests) {
     return (
@@ -67,13 +69,19 @@ export function TestCard({
         {passRate ? `${passRate} passed` : `${test.pass.toLocaleString()} passed`}
       </div>
 
-      <div className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-muted" aria-label="runner pass rate">
+      <div
+        className="mt-2 flex h-1.5 overflow-hidden rounded-full bg-muted"
+        aria-label={snapshotUniquePrimary ? "unique test pass rate" : "runner pass rate"}
+      >
         <div className="h-full bg-status-success" style={{ width: barWidth(test.pass, test.total) }} />
         <div className="h-full bg-status-failed" style={{ width: barWidth(failed, test.total) }} />
       </div>
 
       <div className="mt-2.5 space-y-1 font-mono text-[11px] text-muted-foreground">
-        <div>{test.pass.toLocaleString()} / {test.total.toLocaleString()} runner executions passed</div>
+        <div>
+          {test.pass.toLocaleString()} / {test.total.toLocaleString()}{" "}
+          {snapshotUniquePrimary ? "unique tests" : "runner executions"} passed
+        </div>
         <div>
           <span className={failed ? "text-status-failed" : ""}>{failed} failed</span>
           {errors ? <span className="text-status-failed">{" · "}{errors} errors</span> : null}
@@ -81,7 +89,12 @@ export function TestCard({
           {" · "}{test.skip} skipped
           {test.reportFileCount != null ? <> · {test.reportFileCount.toLocaleString()} XML reports</> : null}
         </div>
-        {uniqueTotal ? (
+        {rawExecutions ? (
+          <div className="text-muted-foreground">
+            {rawExecutions} raw executions (diagnostic)
+          </div>
+        ) : null}
+        {uniqueTotal && !snapshotUniquePrimary ? (
           <div className="text-muted-foreground">
             {uniqueTotal} unique methods{methodCoverage ? ` · ${methodCoverage} method coverage` : ""}
           </div>

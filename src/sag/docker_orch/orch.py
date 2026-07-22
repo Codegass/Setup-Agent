@@ -934,6 +934,7 @@ class DockerOrchestrator:
         job_id = uuid.uuid4().hex[:12]
         log_path = f"{self.DISPATCH_DIR}/{job_id}.log"
         exit_code_path = f"{log_path}.exit"
+        pid_path = f"{self.DISPATCH_DIR}/{job_id}.pid"
 
         runtime_profile_prefix = self._runtime_profile_prefix()
         if workdir:
@@ -947,7 +948,8 @@ class DockerOrchestrator:
         wrapped = f"{inner}; echo $? > {quoted_exit_tmp} && mv {quoted_exit_tmp} {quoted_exit}"
         launcher = (
             f"mkdir -p {self.DISPATCH_DIR} && "
-            f"nohup bash -c {shlex.quote(wrapped)} > {shlex.quote(log_path)} 2>&1 & echo $!"
+            f"(nohup bash -c {shlex.quote(wrapped)} > {shlex.quote(log_path)} 2>&1 & "
+            f'pid=$!; printf \'%s\\n\' "$pid" > {shlex.quote(pid_path)}; echo "$pid")'
         )
 
         result = self.execute_command(
@@ -973,10 +975,31 @@ class DockerOrchestrator:
             "started": started,
             "job_id": job_id,
             "pid": pid,
+            "pid_path": pid_path,
             "log_path": log_path,
             "exit_code_path": exit_code_path,
             "command": command,
             "launch_output": result.get("output", ""),
+        }
+
+    def detached_handle(self, job_id: str) -> Dict[str, Any]:
+        """Reconstruct a stable detached-job handle from its public poll id."""
+        if (
+            not job_id
+            or len(job_id) > 64
+            or any(
+                char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                for char in job_id
+            )
+        ):
+            raise ValueError("invalid detached job id")
+        log_path = f"{self.DISPATCH_DIR}/{job_id}.log"
+        return {
+            "job_id": job_id,
+            "pid": None,
+            "pid_path": f"{self.DISPATCH_DIR}/{job_id}.pid",
+            "log_path": log_path,
+            "exit_code_path": f"{log_path}.exit",
         }
 
     def poll_detached_command(self, handle: Dict[str, Any], tail_lines: int = 40) -> Dict[str, Any]:
@@ -984,15 +1007,15 @@ class DockerOrchestrator:
         log_path = shlex.quote(handle["log_path"])
         exit_code_path = shlex.quote(handle["exit_code_path"])
         pid = handle.get("pid")
-
-        liveness = (
-            f'elif kill -0 {int(pid)} 2>/dev/null; then echo "STATE:RUNNING"; '
-            if pid
-            else ""
-        )
-        probe = (
+        if pid:
+            pid_assignment = f"pid={int(pid)}; "
+        else:
+            pid_path = shlex.quote(handle.get("pid_path") or f"{handle['log_path']}.pid")
+            pid_assignment = f'pid="$(cat {pid_path} 2>/dev/null)"; '
+        probe = pid_assignment + (
             f'if [ -f {exit_code_path} ]; then echo "STATE:EXIT:$(cat {exit_code_path})"; '
-            f'{liveness}'
+            f'elif [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; '
+            f'then echo "STATE:RUNNING"; '
             f'else echo "STATE:VANISHED"; fi; '
             f'echo "SIZE:$(wc -c < {log_path} 2>/dev/null || echo 0)"; '
             f'echo "---TAIL---"; tail -n {int(tail_lines)} {log_path} 2>/dev/null'
@@ -1007,12 +1030,14 @@ class DockerOrchestrator:
 
         finished = False
         running = False
+        state = "unknown"
         exit_code: Optional[int] = None
         log_size = 0
         for line in head.splitlines():
             stripped = line.strip()
             if stripped.startswith("STATE:EXIT:"):
                 finished = True
+                state = "finished"
                 code_text = stripped.rsplit(":", 1)[-1].strip()
                 try:
                     exit_code = int(code_text)
@@ -1020,6 +1045,9 @@ class DockerOrchestrator:
                     exit_code = None
             elif stripped == "STATE:RUNNING":
                 running = True
+                state = "running"
+            elif stripped == "STATE:VANISHED":
+                state = "vanished"
             elif stripped.startswith("SIZE:"):
                 try:
                     log_size = int(stripped.split(":", 1)[1].strip())
@@ -1033,7 +1061,21 @@ class DockerOrchestrator:
             "tail": tail,
             "log_size": log_size,
             "probe_success": result.get("exit_code") == 0,
+            "state": state,
         }
+
+    @staticmethod
+    def _detached_poll_state(poll: Dict[str, Any]) -> str:
+        state = poll.get("state")
+        if state in {"finished", "running", "vanished"}:
+            return str(state)
+        if poll.get("finished"):
+            return "finished"
+        if poll.get("running"):
+            return "running"
+        if poll.get("probe_success"):
+            return "vanished"
+        return "unknown"
 
     def execute_command_with_soft_timeout(
         self,
@@ -1048,11 +1090,10 @@ class DockerOrchestrator:
 
         The command runs detached with output in a container log file. If it
         finishes within soft_timeout, the result looks like a normal
-        execute_command result. If it is still running when the window closes,
-        the result is a handoff (dispatch_status="running_detached") carrying
-        the log tail and poll instructions — the process keeps running and the
-        agent checks the log tail across iterations; only the run-level
-        wall-clock cap bounds it.
+        execute_command result. If it is still running or its liveness cannot
+        be established when the window closes, the result is a handoff carrying
+        the log tail and poll instructions. Only terminal observations are
+        collected.
         """
         config = getattr(self, "config", None)
         if soft_timeout is None:
@@ -1083,22 +1124,37 @@ class DockerOrchestrator:
             time.sleep(max(0.05, min(delay, deadline - now)))
             poll_count += 1
             poll = self.poll_detached_command(handle, tail_lines=tail_lines)
-            if poll.get("finished") or (poll.get("probe_success") and not poll.get("running")):
-                return self._collect_detached_result(handle, poll)
+            if self._detached_poll_state(poll) in {"finished", "vanished"}:
+                return self.collect_detached_result(handle, poll)
 
         final_poll = self.poll_detached_command(handle, tail_lines=tail_lines)
-        if final_poll.get("finished") or (
-            final_poll.get("probe_success") and not final_poll.get("running")
-        ):
-            return self._collect_detached_result(handle, final_poll)
+        final_state = self._detached_poll_state(final_poll)
+        if final_state in {"finished", "vanished"}:
+            return self.collect_detached_result(handle, final_poll)
 
-        logger.info(
-            f"⏳ Soft window of {soft_timeout}s expired; handing off still-running command "
-            f"(pid {handle['pid']}, log {handle['log_path']})"
-        )
+        liveness_unknown = final_state == "unknown"
+        dispatch_status = "liveness_unknown_detached" if liveness_unknown else "running_detached"
+        if liveness_unknown:
+            logger.warning(
+                f"Soft window of {soft_timeout}s expired without a conclusive liveness "
+                f"probe; preserving detached command handle (pid {handle['pid']}, "
+                f"log {handle['log_path']})"
+            )
+            handoff_summary = (
+                "Command liveness could not be established after the soft window. "
+                "Its detached handle was preserved and the operation remains pending."
+            )
+        else:
+            logger.info(
+                f"⏳ Soft window of {soft_timeout}s expired; handing off still-running command "
+                f"(pid {handle['pid']}, log {handle['log_path']})"
+            )
+            handoff_summary = (
+                f"⏳ Command still running after the {soft_timeout}s soft window — it was left "
+                "running in the background (NOT killed)."
+            )
         handoff_output = (
-            f"⏳ Command still running after the {soft_timeout}s soft window — it was left "
-            f"running in the background (NOT killed).\n"
+            f"{handoff_summary}\n"
             f"Background job: pid {handle['pid']}, log file {handle['log_path']}\n"
             f"Last output:\n{final_poll.get('tail') or '(no output yet)'}\n\n"
             f"NEXT STEPS — poll the log instead of re-running the command:\n"
@@ -1112,7 +1168,9 @@ class DockerOrchestrator:
             "exit_code": None,
             "output": handoff_output,
             "termination_reason": None,
-            "dispatch_status": "running_detached",
+            "dispatch_status": dispatch_status,
+            "lifecycle_state": "pending",
+            "liveness_state": final_state,
             "dispatch": {
                 **handle,
                 "last_tail": final_poll.get("tail", ""),
@@ -1121,7 +1179,7 @@ class DockerOrchestrator:
             },
         }
 
-    def _collect_detached_result(
+    def collect_detached_result(
         self, handle: Dict[str, Any], poll: Dict[str, Any]
     ) -> Dict[str, Any]:
         """Build an execute_command-shaped result for a finished detached command."""
@@ -1139,9 +1197,10 @@ class DockerOrchestrator:
         )
         full_output = log_result.get("output") or poll.get("tail") or ""
 
+        state = self._detached_poll_state(poll)
         exit_code = poll.get("exit_code")
-        if exit_code is None:
-            # Process gone without an exit file (crashed/killed) — fail safe.
+        if exit_code is None and state == "vanished":
+            # A vanished process with no exit file is explicit crash evidence.
             exit_code = 1
             full_output += "\n[detached command ended without recording an exit code]"
 
@@ -1157,7 +1216,14 @@ class DockerOrchestrator:
             "termination_reason": None,
             "dispatch_status": "completed_detached",
             "dispatch": handle,
+            "lifecycle_state": state,
         }
+
+    def _collect_detached_result(
+        self, handle: Dict[str, Any], poll: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Backward-compatible private entry point for internal callers/tests."""
+        return self.collect_detached_result(handle, poll)
 
     def _monitor_execution_with_timeouts(
         self, exec_result, monitoring_state: dict, silent_timeout: int, absolute_timeout: int

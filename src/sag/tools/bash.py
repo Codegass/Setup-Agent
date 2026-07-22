@@ -11,7 +11,12 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from .base import BaseTool, ToolError, ToolResult
-from .internal.build_utils import detached_handoff_tool_result
+from .internal.build_utils import (
+    DETACHED_HANDOFF_STATUSES,
+    classify_detached_completion,
+    detached_handoff_tool_result,
+    detached_poll_ref,
+)
 
 
 @dataclass
@@ -133,8 +138,7 @@ class BashTool(BaseTool):
         suggestions: Optional[List[str]] = None,
         raw_output: str = "",
     ) -> ToolResult:
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output=output,
             error=error,
             error_code=error_code,
@@ -683,10 +687,41 @@ class BashTool(BaseTool):
                     timeout=timeout,
                 )
 
-            # Handle dispatch-and-poll handoff: the command is still running in
-            # the background; tell the agent how to poll the log tail.
-            if result.get("dispatch_status") == "running_detached":
+            # Handle a nonterminal dispatch-and-poll handoff; tell the agent how
+            # to poll the same job even when the latest liveness probe was inconclusive.
+            if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("bash", command, result)
+
+            if result.get("dispatch_status") == "completed_detached":
+                detached_result = classify_detached_completion(
+                    result.get("exit_code"),
+                    str(result.get("output") or ""),
+                    full_output=str(result.get("full_output") or result.get("output") or ""),
+                    poll_ref=detached_poll_ref(result),
+                    invocation_status=(
+                        "crashed"
+                        if result.get("lifecycle_state") == "vanished"
+                        else "completed"
+                    ),
+                )
+                if not detached_result.succeeded:
+                    detached_result.metadata.update(
+                        self._with_execution_metadata(
+                            {
+                                "dispatch_status": "completed_detached",
+                                "exit_code": result.get("exit_code"),
+                                "execution_directory": workdir,
+                                "environment_vars": env_vars,
+                                "timeout": timeout,
+                            },
+                            command=command,
+                            working_directory=workdir,
+                            exit_code=result.get("exit_code"),
+                            timed_out=False,
+                            duration=result.get("duration"),
+                        )
+                    )
+                    return detached_result
 
             # Handle timeout terminations
             if result.get("termination_reason"):
@@ -715,9 +750,11 @@ class BashTool(BaseTool):
                 error_code = (
                     f"TIMEOUT_{termination_reason.upper()}"
                     if is_timeout
-                    else "MONITORING_ERROR"
-                    if termination_reason == "monitoring_error"
-                    else f"COMMAND_TERMINATED_{termination_reason.upper()}"
+                    else (
+                        "MONITORING_ERROR"
+                        if termination_reason == "monitoring_error"
+                        else f"COMMAND_TERMINATED_{termination_reason.upper()}"
+                    )
                 )
 
                 # Include monitoring info in suggestions
@@ -734,8 +771,8 @@ class BashTool(BaseTool):
                         f"CPU warnings detected: {monitoring_info['cpu_warnings']} (possible hang)"
                     )
 
-                return ToolResult(
-                    success=False,
+                return ToolResult.terminal_failure(
+                    invocation_status=("timeout" if is_timeout else "crashed"),
                     output=result.get("output", ""),
                     error=error_msg,
                     suggestions=suggestions,
@@ -776,8 +813,7 @@ class BashTool(BaseTool):
                 stdout = result.get("stdout", result["output"])
                 stderr = result.get("stderr", "")
 
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=extracted_output,
                     raw_output=result["output"],
                     metadata=self._with_execution_metadata(
@@ -813,8 +849,7 @@ class BashTool(BaseTool):
                 stdout = result.get("stdout", result["output"])
                 stderr = result.get("stderr", "")
 
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=result["output"],
                     error=f"Command failed with exit code {result.get('exit_code', 'unknown')}",
                     suggestions=self._generate_error_suggestions(
@@ -868,74 +903,39 @@ class BashTool(BaseTool):
     def _execute_background_command(
         self, command: str, workdir: str, env_vars: Dict[str, str]
     ) -> ToolResult:
-        """Execute a command in the background and return immediately with PID."""
+        """Dispatch a background command and return its stable poll handle."""
         try:
-            # Build command that starts process in background and returns PID
-            # Use nohup to prevent SIGHUP when shell exits
-            pid_command = f"nohup {command} > /tmp/sag_bg_$$.out 2>&1 & echo $!"
-
-            # Add environment variables to the command
-            if env_vars:
-                env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in env_vars.items())
-                pid_command = f"{env_prefix} {pid_command}"
-
-            # Execute command to get PID
-            result = self.docker_orchestrator.execute_command(pid_command, workdir=workdir)
-
-            if result["success"] and result["output"].strip().isdigit():
-                pid = int(result["output"].strip())
-
-                # Track the background process
-                container_name = self.docker_orchestrator.container_name
-                if container_name not in self.background_processes:
-                    self.background_processes[container_name] = []
-                self.background_processes[container_name].append(pid)
-
-                logger.info(f"🚀 Started background process with PID {pid}")
-
-                return ToolResult(
-                    success=True,
-                    output=f"Background process started with PID: {pid}",
-                    metadata=self._with_execution_metadata(
-                        {
-                            "background_pids": [pid],
-                            "execution_directory": workdir,
-                            "environment_vars": env_vars,
-                            "command_type": "background",
-                            "output_file": f"/tmp/sag_bg_{pid}.out",
-                            "stdout": "",
-                            "stderr": "",
-                            "exit_code": None,
-                            "signal": None,
-                        },
-                        command=command,
-                        working_directory=workdir,
-                        exit_code=None,
-                        timed_out=False,
-                        duration=result.get("duration"),
-                        executed=True,
-                    ),
+            handle = self.docker_orchestrator.execute_command_detached(
+                command, workdir=workdir, environment=env_vars
+            )
+            if handle.get("started"):
+                return detached_handoff_tool_result(
+                    "bash",
+                    command,
+                    {
+                        "output": f"Background command dispatched as job:{handle['job_id']}",
+                        "dispatch": handle,
+                    },
                 )
-            else:
-                return ToolResult(
-                    success=False,
-                    output=result.get("output", ""),
-                    error="Failed to start background process",
-                    suggestions=[
-                        "Check command syntax",
-                        "Verify the command can run in the container",
-                        "Check container logs for errors",
-                    ],
-                    error_code="BACKGROUND_START_FAILED",
-                    metadata=self._with_execution_metadata(
-                        {"background_pids": []},
-                        command=command,
-                        working_directory=workdir,
-                        exit_code=result.get("exit_code"),
-                        timed_out=False,
-                        duration=result.get("duration"),
-                    ),
-                )
+            return ToolResult.completed_failure(
+                output=handle.get("launch_output", ""),
+                error="Failed to dispatch background process",
+                suggestions=[
+                    "Check command syntax",
+                    "Verify the command can run in the container",
+                    "Check container logs for errors",
+                ],
+                error_code="BACKGROUND_START_FAILED",
+                metadata=self._with_execution_metadata(
+                    {},
+                    command=command,
+                    working_directory=workdir,
+                    exit_code=None,
+                    timed_out=False,
+                    duration=None,
+                    executed=False,
+                ),
+            )
 
         except Exception as e:
             logger.error(f"Failed to execute background command: {e}")
@@ -1338,8 +1338,11 @@ class BashTool(BaseTool):
         # model retried './bin/mvn' 50x instead of using build(action='test').
         command_head = command.split("&&")[-1].strip().split()
         if command_head and any(
-            tok in ("mvn", "gradle") or tok.endswith("/mvn") or tok.endswith("/gradle")
-            or tok.endswith("mvnw") or tok.endswith("gradlew")
+            tok in ("mvn", "gradle")
+            or tok.endswith("/mvn")
+            or tok.endswith("/gradle")
+            or tok.endswith("mvnw")
+            or tok.endswith("gradlew")
             for tok in command_head[:1]
         ):
             suggestions.append(

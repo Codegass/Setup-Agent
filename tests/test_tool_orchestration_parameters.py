@@ -11,8 +11,7 @@ class BashLikeTool(BaseTool):
         super().__init__("bash", "Bash-like test tool")
 
     def execute(self, command: str, timeout: int, working_directory: str = "") -> ToolResult:
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=f"{working_directory}: {command} ({timeout})",
             metadata={
                 "command": command,
@@ -36,7 +35,20 @@ class ProjectSetupLikeTool(BaseTool):
         }
 
     def execute(self, **params) -> ToolResult:
-        return ToolResult(success=True, output=str(params))
+        return ToolResult.completed_success(output=str(params))
+
+
+class SchemaLikeTool(BaseTool):
+    def __init__(self, name, properties, required=None):
+        super().__init__(name, f"{name} schema test tool")
+        self._parameter_schema = {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+        }
+
+    def execute(self, **params) -> ToolResult:
+        return ToolResult.completed_success(output=str(params))
 
 
 def _orchestrator(**overrides):
@@ -57,7 +69,7 @@ def _orchestrator(**overrides):
             },
         ),
         repository_url=overrides.pop("repository_url", None),
-        track_tool_execution=lambda signature, success: tracking_calls.append((signature, success)),
+        track_tool_execution=lambda signature, result: tracking_calls.append((signature, result)),
         update_successful_states=lambda tool_name, params, result: state_updates.append(
             (tool_name, params, result)
         ),
@@ -106,10 +118,42 @@ def test_parameter_alias_default_and_state_injection_are_recorded():
         (
             "bash:[('command', 'echo hi'), ('timeout', 60), "
             "('working_directory', '/workspace/project')]",
-            True,
+            execution.result,
         )
     ]
     assert len(state_updates) == 1
+
+
+def test_normalized_action_envelope_is_emitted_before_tool_execution():
+    trace = []
+
+    class TracedBashTool(BashLikeTool):
+        def execute(self, command: str, timeout: int, working_directory: str = "") -> ToolResult:
+            trace.append(("tool", {"command": command, "timeout": timeout}))
+            return super().execute(command, timeout, working_directory)
+
+    def before_tool_execute(call, params):
+        trace.append(("envelope", call.name, dict(params)))
+        return "envelope-1"
+
+    orchestrator, _, _, _ = _orchestrator(
+        tools={"bash": TracedBashTool()},
+        before_tool_execute=before_tool_execute,
+    )
+
+    execution = orchestrator.execute(ToolCall(name="bash", raw_params={"cmd": "echo hi"}))
+
+    assert trace[0] == (
+        "envelope",
+        "bash",
+        {
+            "command": "echo hi",
+            "timeout": 60,
+            "working_directory": "/workspace/project",
+        },
+    )
+    assert trace[1][0] == "tool"
+    assert execution.metadata["control_envelope_id"] == "envelope-1"
 
 
 def test_parameter_normalizer_owns_alias_default_and_state_injection():
@@ -271,6 +315,95 @@ def test_project_setup_parameter_normalizer_maps_version_handle_aliases_to_ref(a
     assert params["version"] == "1.11.0"
 
 
+def test_project_parameter_normalizer_maps_path_to_project_path():
+    fixes = []
+    project = SchemaLikeTool(
+        "project",
+        {
+            "action": {"type": "string"},
+            "project_path": {"type": "string"},
+        },
+        required=["action"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"project": project},
+        successful_states={"working_directory": "/workspace/paramiko"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "project", {"action": "analyze", "path": "/workspace/paramiko"}, fixes
+    )
+
+    assert params == {"action": "analyze", "project_path": "/workspace/paramiko"}
+    assert ("schema_alias", "project_path", None, "/workspace/paramiko") in {
+        (fix.source, fix.field, fix.before, fix.after) for fix in fixes
+    }
+
+
+def test_project_path_alias_is_limited_to_analyze_action():
+    project = SchemaLikeTool(
+        "project",
+        {
+            "action": {"type": "string"},
+            "project_path": {"type": "string"},
+        },
+        required=["action"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"project": project},
+        successful_states={"working_directory": "/workspace"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "project", {"action": "clone", "path": "/workspace/paramiko"}
+    )
+
+    assert params == {"action": "clone", "path": "/workspace/paramiko"}
+
+
+def test_report_parameter_normalizer_repairs_live_model_aliases_and_action():
+    fixes = []
+    report = SchemaLikeTool(
+        "report",
+        {
+            "action": {"type": "string", "enum": ["generate"]},
+            "summary": {"type": "string"},
+            "status": {"type": "string"},
+            "details": {"type": "string"},
+            "evidence_refs": {"type": "array"},
+        },
+        required=["action"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"report": report},
+        successful_states={"working_directory": "/workspace/paramiko"},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "report",
+        {
+            "action": "report",
+            "summary": "Paramiko is ready",
+            "status": "success",
+            "key_results": ["dependencies installed", "tests passed"],
+            "evidence": "/workspace/paramiko/.setup_agent/report.json",
+        },
+        fixes,
+    )
+
+    assert params == {
+        "action": "generate",
+        "summary": "Paramiko is ready",
+        "status": "success",
+        "details": "dependencies installed tests passed",
+        "evidence_refs": ["/workspace/paramiko/.setup_agent/report.json"],
+    }
+    assert {fix.source for fix in fixes} >= {"schema_alias", "safety_fix"}
+
+
 def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():
     fixes = []
     normalizer = ToolParameterNormalizer(
@@ -303,7 +436,7 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
 
         def execute(self, command: str) -> ToolResult:
             execution_attempts.append(command)
-            return ToolResult(success=True, output=command)
+            return ToolResult.completed_success(output=command)
 
     orchestrator, events, tracking_calls, state_updates = _orchestrator(tools={"echo": EchoTool()})
 
@@ -315,7 +448,7 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
     execution = orchestrator.execute(ToolCall(name="echo", raw_params={"command": "run"}))
 
     assert execution.status == "validation_failed"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.result.error_code == "PARAMETER_VALIDATION_FAILED"
     assert execution.attempted_execution is False
     assert execution.executed_params is None
@@ -324,6 +457,13 @@ def test_validation_failed_status_when_fixing_raises(monkeypatch):
     assert tracking_calls == []
     assert state_updates == []
     assert [event.event_type for event in events] == ["tool_start", "tool_error"]
+    error_metadata = events[-1].metadata
+    assert error_metadata["invocation_status"] == "completed"
+    assert error_metadata["operation_outcome"] == "failed"
+    assert error_metadata["evidence_status"] == "verified"
+    assert error_metadata["failure_signature"] == execution.result.failure_signature
+    assert error_metadata["error_tail_preview"] == execution.result.error_tail_preview
+    assert error_metadata["output_ref"] == execution.result.output_ref
 
 
 def test_react_engine_no_longer_exposes_parameter_wrapper():

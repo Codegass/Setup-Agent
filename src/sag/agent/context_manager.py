@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from sag.evidence import EvidenceFinding, EvidenceStatus, coerce_evidence_status
+from sag.evidence import EvidenceAssessment, EvidenceFinding, coerce_evidence_status
 from sag.utils.container_io import write_container_text
 
 
@@ -34,7 +34,7 @@ class Task(BaseModel):
     completed_at: Optional[datetime] = None
     notes: str = ""
     key_results: str = ""  # Stores key results after task completion
-    evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
+    evidence_status: EvidenceAssessment = EvidenceAssessment.UNKNOWN
     evidence_refs: List[str] = Field(default_factory=list)
     conflicts: List[str] = Field(default_factory=list)
     validator_findings: List[EvidenceFinding] = Field(default_factory=list)
@@ -199,7 +199,7 @@ class TrunkContext(BaseContext):
     def update_task_evidence(
         self,
         task_id: str,
-        evidence_status: EvidenceStatus | str | None = None,
+        evidence_status: EvidenceAssessment | str | None = None,
         evidence_refs: Optional[List[str]] = None,
         conflicts: Optional[List[str]] = None,
         validator_findings: Optional[List[EvidenceFinding | Dict[str, Any]]] = None,
@@ -545,7 +545,7 @@ CONTEXT_EOF"""
     def update_task_evidence(
         self,
         task_id: str,
-        evidence_status: EvidenceStatus | str | None = None,
+        evidence_status: EvidenceAssessment | str | None = None,
         evidence_refs: Optional[List[str]] = None,
         conflicts: Optional[List[str]] = None,
         validator_findings: Optional[List[EvidenceFinding | Dict[str, Any]]] = None,
@@ -1080,66 +1080,6 @@ CONTEXT_EOF"""
         except Exception as e:
             logger.error(f"Failed to get todo list status: {e}")
             return {"error": f"Failed to get status: {str(e)}"}
-
-    def validate_execution_plan_completeness(self) -> Dict[str, Any]:
-        """
-        Validate that the execution plan includes essential components.
-        Ensures that critical tasks like final reporting are not forgotten.
-
-        Returns:
-            Dict with validation results and suggestions
-        """
-        try:
-            trunk_context = self.load_trunk_context()
-            if not trunk_context:
-                return {"valid": False, "error": "No trunk context found"}
-
-            task_descriptions = [task.description.lower() for task in trunk_context.todo_list]
-
-            validation = {
-                "valid": True,
-                "warnings": [],
-                "missing_components": [],
-                "recommendations": [],
-            }
-
-            # Check for essential components
-            essential_components = {
-                "setup_environment": ["environment", "setup", "install", "dependencies"],
-                "build_project": ["build", "compile", "maven", "gradle"],
-                "run_tests": ["test", "testing", "verify"],
-                "generate_report": ["report", "completion", "summary", "generate"],
-            }
-
-            for component, keywords in essential_components.items():
-                found = any(
-                    any(keyword in desc for keyword in keywords) for desc in task_descriptions
-                )
-
-                if not found:
-                    validation["missing_components"].append(component)
-
-                    if component == "generate_report":
-                        validation["warnings"].append(
-                            "⚠️ CRITICAL: No final report generation task found! "
-                            "This is essential for proper completion."
-                        )
-                        validation["recommendations"].append(
-                            "Add a final task: 'Generate comprehensive setup completion report'"
-                        )
-                    elif component == "run_tests":
-                        validation["warnings"].append(
-                            "⚠️ No testing task found - consider adding test execution"
-                        )
-
-            if validation["missing_components"]:
-                validation["valid"] = False
-
-            return validation
-
-        except Exception as e:
-            logger.error(f"Failed to validate execution plan: {e}")
-            return {"valid": False, "error": f"Validation failed: {str(e)}"}
 
     def load_or_create_trunk_context(
         self, goal: str, project_url: str, project_name: str, tasks: List[str] = None

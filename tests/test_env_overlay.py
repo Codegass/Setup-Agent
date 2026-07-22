@@ -106,9 +106,9 @@ def test_env_tool_register_activate_inspect():
     )
     inspected = tool.execute({"action": "inspect"})
 
-    assert registered.success is True
-    assert activated.success is True
-    assert inspected.success is True
+    assert registered.succeeded is True
+    assert activated.succeeded is True
+    assert inspected.succeeded is True
     assert inspected.raw_data["overlay"]["tools"]["maven"]["active"] == (
         "/opt/apache-maven-3.9.9/bin/mvn"
     )
@@ -127,8 +127,8 @@ def test_env_tool_block_defaults_to_build_error_without_source():
     )
     block_from_kwargs = tool.execute("block", tool="gradle", executable="/usr/bin/gradle")
 
-    assert block_from_dict.success is True
-    assert block_from_kwargs.success is True
+    assert block_from_dict.succeeded is True
+    assert block_from_kwargs.succeeded is True
     assert (
         block_from_dict.raw_data["overlay"]["tools"]["maven"]["blocked"][0]["source"]
         == "build_error"

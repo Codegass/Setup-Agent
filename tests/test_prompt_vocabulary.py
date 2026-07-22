@@ -60,9 +60,7 @@ def test_react_engine_yaml_teaches_consolidated_tools():
 def test_react_engine_yaml_section_line_references_stay_valid():
     """The sweep must not shift the yaml lines referenced from the builder."""
     yaml_lines = YAML_PATH.read_text().splitlines()
-    refs = re.findall(
-        r"react_engine\.yaml:(\d+) [\w]+\.([\w]+)", BUILDER_PATH.read_text()
-    )
+    refs = re.findall(r"react_engine\.yaml:(\d+) [\w]+\.([\w]+)", BUILDER_PATH.read_text())
     assert refs, "expected # Prompt: react_engine.yaml:<line> comments in builder"
     for line_number, key in refs:
         line = yaml_lines[int(line_number) - 1]
@@ -165,13 +163,13 @@ def test_task2_analyzer_requirement_satisfied_by_project_analyze_step():
         SimpleNamespace(
             tool_name="project",
             tool_params={"action": "analyze"},
-            tool_result=SimpleNamespace(success=True),
+            tool_result=SimpleNamespace(succeeded=True),
             input=None,
         ),
         SimpleNamespace(
             tool_name="file_io",
             tool_params={"action": "read"},
-            tool_result=SimpleNamespace(success=True),
+            tool_result=SimpleNamespace(succeeded=True),
             input="read pom.xml",
         ),
     ]
@@ -187,7 +185,7 @@ def test_task2_analyzer_guidance_uses_project_vocabulary():
         SimpleNamespace(
             tool_name="bash",
             tool_params=None,
-            tool_result=SimpleNamespace(success=True),
+            tool_result=SimpleNamespace(succeeded=True),
             input="cat pom.xml",
         )
     ]
@@ -239,9 +237,11 @@ def test_setup_yaml_sections_teach_phase_verbs():
     lifecycle = sections["initial_system.context_management"]
     assert 'phase(action="done"' in lifecycle or "phase(action='done'" in lifecycle
     assert 'phase(action="blocked"' in lifecycle or "phase(action='blocked'" in lifecycle
-    assert "provision" in lifecycle and "report" in lifecycle, (
-        "phase order must be visible so the model never tries to reorder phases"
-    )
+    assert 'phase(action="repair"' in lifecycle or "phase(action='repair'" in lifecycle
+    assert "outcome=" in lifecycle
+    assert (
+        "provision" in lifecycle and "report" in lifecycle
+    ), "phase order must be visible so the model never tries to reorder phases"
 
 
 def test_run_task_yaml_sections_keep_manage_context_and_no_phase_tool():
@@ -249,9 +249,7 @@ def test_run_task_yaml_sections_keep_manage_context_and_no_phase_tool():
     assert "manage_context" in sections["initial_system.run_task_context_management"]
     assert "manage_context" in sections["initial_system.run_task_tool_clarification"]
     run_task_text = "\n".join(
-        text
-        for key, text in sections.items()
-        if key.split(".", 1)[1].startswith("run_task_")
+        text for key, text in sections.items() if key.split(".", 1)[1].startswith("run_task_")
     )
     assert "phase(action=" not in run_task_text
 
@@ -282,6 +280,8 @@ def test_setup_prompt_teaches_phase_verbs_not_task_ceremony():
     prompt = _initial_prompt("setup")
     assert 'phase(action="done"' in prompt or "phase(action='done'" in prompt
     assert 'phase(action="blocked"' in prompt or "phase(action='blocked'" in prompt
+    assert 'phase(action="repair"' in prompt or "phase(action='repair'" in prompt
+    assert "outcome=" in prompt
     assert "complete_with_results" not in prompt
     assert "manage_context" not in prompt
     assert "start_task" not in prompt
@@ -366,8 +366,7 @@ def test_phase_mode_never_emits_context_switch_ceremony():
 def test_phase_mode_idle_thinking_guidance_uses_phase_tools():
     evaluator = _phase_evaluator()
     steps = [
-        SimpleNamespace(step_type=StepType.THOUGHT, content="hmm", tool_name=None)
-        for _ in range(3)
+        SimpleNamespace(step_type=StepType.THOUGHT, content="hmm", tool_name=None) for _ in range(3)
     ]
 
     analysis = _evaluate(evaluator, steps)
@@ -388,9 +387,7 @@ def test_phase_mode_stands_down_ghost_state_and_task_ceremony_checks():
 
     evaluator = _phase_evaluator(_NoTaskCM())
     steps = [
-        SimpleNamespace(
-            step_type=StepType.ACTION, tool_name="bash", content="", tool_result=None
-        )
+        SimpleNamespace(step_type=StepType.ACTION, tool_name="bash", content="", tool_result=None)
         for _ in range(3)
     ]
 

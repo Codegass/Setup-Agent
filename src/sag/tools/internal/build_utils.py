@@ -11,7 +11,25 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from ..base import ToolResult
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
+
+from ..base import ToolResult, require_persisted_output_storage_ref
+
+
+DETACHED_HANDOFF_STATUSES = frozenset({"running_detached", "liveness_unknown_detached"})
+
+
+def detached_poll_ref(result: Dict[str, Any]) -> str:
+    """Return the stable public poll reference for a detached raw result."""
+    dispatch = result.get("dispatch") or {}
+    job_id = dispatch.get("job_id")
+    log_path = dispatch.get("log_path")
+    if not job_id and log_path:
+        match = re.fullmatch(r"/tmp/sag_jobs/([A-Za-z0-9_-]+)\.log", str(log_path))
+        job_id = match.group(1) if match else None
+    if not job_id:
+        raise ValueError("detached execution requires a stable job id")
+    return f"job:{job_id}"
 
 
 def detached_handoff_tool_result(
@@ -19,28 +37,98 @@ def detached_handoff_tool_result(
 ) -> ToolResult:
     """ToolResult for a build command handed off to background execution.
 
-    The command is still running (dispatch_status="running_detached"); success
-    is True because nothing failed — the observation tells the agent how to
-    poll the log tail and detect completion.
+    Dispatch only promises a future observation. It says nothing about the
+    operation's eventual outcome.
     """
     dispatch = result.get("dispatch") or {}
-    job_id = dispatch.get("job_id")
+    poll_ref = detached_poll_ref(result)
+    job_id = poll_ref.removeprefix("job:")
+    log_path = dispatch.get("log_path")
     return ToolResult(
-        success=True,
+        invocation_status=InvocationStatus.PENDING,
+        operation_outcome=OperationOutcome.UNKNOWN,
+        evidence_status=EvidenceStatus.UNKNOWN,
+        poll_ref=poll_ref,
         output=result.get("output", ""),
         # The prompt promises a job log ref for detached builds; attach it so
         # search(target='job:<id>') has something real to poll.
-        refs=[f"job:{job_id}"] if job_id else [],
+        refs=[poll_ref],
         metadata={
-            "dispatch_status": "running_detached",
+            "dispatch_status": result.get("dispatch_status", "running_detached"),
             "tool": tool_name,
             "command": command,
             "job_id": job_id,
             "pid": dispatch.get("pid"),
-            "log_path": dispatch.get("log_path"),
+            "pid_path": dispatch.get("pid_path"),
+            "log_path": log_path,
             "exit_code_path": dispatch.get("exit_code_path"),
             "soft_timeout": dispatch.get("soft_timeout"),
         },
+    )
+
+
+def classify_detached_completion(
+    exit_code: int | None,
+    tail: str,
+    full_output_ref: str | None = None,
+    *,
+    full_output: str | None = None,
+    poll_ref: str | None = None,
+    output_ref_storage: Any = None,
+    invocation_status: InvocationStatus | str = InvocationStatus.COMPLETED,
+) -> ToolResult:
+    """Classify a terminal detached observation, preferring fatal evidence."""
+    terminal_status = InvocationStatus(invocation_status)
+    analyses = [
+        BuildAnalyzer.detect_build_status(tail, command)
+        for command in ("mvn", "gradle", "npm", "pytest", "make")
+    ]
+    fatal_markers = (
+        r"\bCMake Error\b",
+        r"\bconfiguration failed\b",
+        r"\bcompilation (?:error|failed)\b",
+        r"\bcannot find symbol\b",
+        r"\bTraceback \(most recent call last\)",
+        r"\bsegmentation fault\b",
+        r"\bfatal error\b",
+    )
+    fatal_tail = any(analysis["success"] is False for analysis in analyses) or any(
+        re.search(pattern, tail, flags=re.IGNORECASE) for pattern in fatal_markers
+    )
+    failed = (exit_code is not None and exit_code != 0) or fatal_tail
+    if failed:
+        return ToolResult.terminal_failure(
+            invocation_status=terminal_status,
+            output=tail,
+            error="Detached operation failed",
+            error_code="DETACHED_OPERATION_FAILED",
+            raw_output=full_output or tail,
+            error_tail_preview=tail[-400:],
+            output_ref=full_output_ref,
+            output_ref_storage=output_ref_storage,
+            poll_ref=poll_ref,
+        )
+    if full_output_ref is not None:
+        require_persisted_output_storage_ref(
+            full_output_ref,
+            storage=output_ref_storage,
+        )
+    if exit_code is None:
+        if not poll_ref:
+            raise ValueError("inconclusive detached completion requires a stable poll_ref")
+        return ToolResult(
+            invocation_status=InvocationStatus.PENDING,
+            operation_outcome=OperationOutcome.UNKNOWN,
+            evidence_status=EvidenceStatus.UNKNOWN,
+            poll_ref=poll_ref,
+            output=tail,
+            output_ref=full_output_ref,
+            refs=[poll_ref],
+        )
+    return ToolResult.completed_success(
+        output=tail,
+        output_ref=full_output_ref,
+        poll_ref=poll_ref,
     )
 
 

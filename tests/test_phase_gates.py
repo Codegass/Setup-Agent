@@ -3,7 +3,13 @@ returns evidence + options, never blocks tool use; probe errors fail OPEN."""
 
 from types import SimpleNamespace
 
-from sag.agent.phase_gates import check_phase_done
+from sag.agent.phase_gates import (
+    ClaimDisposition,
+    ValidatorState,
+    check_phase_claim,
+    check_phase_done,
+)
+from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
 
 
 class FakeValidator:
@@ -11,10 +17,21 @@ class FakeValidator:
         self._b, self._s, self._t = build_success, build_system, has_test_reports
 
     def validate_build_status(self, project_name=None):
-        return {"success": self._b, "evidence": {"build_system": self._s}, "reason": "scripted"}
+        return {
+            "success": self._b,
+            "build_complete": self._b,
+            "evidence_status": "success" if self._b else "blocked",
+            "evidence": {"build_system": self._s},
+            "reason": "scripted build validation",
+        }
 
     def validate_test_status(self, project_name=None):
-        return {"has_test_reports": self._t, "status": "scripted"}
+        return {
+            "has_test_reports": self._t,
+            "status": "SUCCESS" if self._t else "WARNING",
+            "evidence_status": "success" if self._t else "unknown",
+            "reason": "scripted test validation",
+        }
 
 
 def _orch(java_ok=True, workspace_exists=True):
@@ -26,13 +43,16 @@ def _orch(java_ok=True, workspace_exists=True):
         if "setup-report-" in command:
             return {"exit_code": 0, "output": "/workspace/setup-report-x.md"}
         return {"exit_code": 0, "output": ""}
+
     return SimpleNamespace(execute_command=execute_command)
 
 
 def test_build_done_rejected_without_artifacts():
     verdict = check_phase_done(
-        "build", validator=FakeValidator(build_success=False),
-        orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=FakeValidator(build_success=False),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is False
     assert "artifact" in verdict["reason"].lower() or "build" in verdict["reason"].lower()
@@ -40,25 +60,125 @@ def test_build_done_rejected_without_artifacts():
 
 
 def test_build_done_accepted_with_artifacts():
+    validator = FakeValidator(build_success=True)
     verdict = check_phase_done(
-        "build", validator=FakeValidator(build_success=True),
-        orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=FakeValidator(build_success=True),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is True
 
-
-def test_build_gate_fails_open_for_non_jvm_systems():
-    verdict = check_phase_done(
-        "build", validator=FakeValidator(build_success=False, build_system="nodejs"),
-        orchestrator=_orch(), project_name="demo",
+    result = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=validator,
+        orchestrator=_orch(),
+        project_name="demo",
     )
-    assert verdict["ok"] is True, "artifact gate is maven/gradle-scoped (round-3 over-block fix)"
+    assert result.validated_facts["build.test_entry_ready"] is True
+    assert result.to_metadata()["validated_facts"]["build.test_entry_ready"] is True
+
+
+def test_phase_gates_preserve_validator_owned_physical_rollups():
+    class PhysicalRollups(FakeValidator):
+        def validate_build_status(self, project_name=None):
+            return {
+                "success": True,
+                "build_complete": True,
+                "evidence_status": "success",
+                "evidence": {
+                    "build_system": "maven",
+                    "class_count": 8916,
+                },
+                "reason": "Found 8916 compiled classes",
+                "evidence_refs": ["artifact://classes"],
+            }
+
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "evidence_status": "partial",
+                "reason": "4598/4928 tests passed",
+                "report_files": ["report://surefire"],
+                "test_stats": {
+                    "discovered": 4928,
+                    "executed": 4928,
+                    "passed": 4598,
+                    "failed": 156,
+                    "skipped": 174,
+                    "flaky_count": 3,
+                },
+                "raw_total_tests": 5000,
+                "raw_passed_tests": 4660,
+                "raw_failed_tests": 0,
+                "raw_error_tests": 160,
+                "raw_skipped_tests": 180,
+                "unique_tests": 4928,
+                "unique_passed_tests": 4598,
+                "unique_failed_tests": 0,
+                "unique_error_tests": 156,
+                "unique_skipped_tests": 174,
+                "flaky_count": 3,
+                "metrics_conflicts": [],
+            }
+
+    validator = PhysicalRollups()
+    build = check_phase_claim(
+        "build",
+        PhaseClaim(phase="build", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=validator,
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+    test = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=validator,
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert build.validated_facts["build.compiled_classes"] == 8916
+    assert test.validated_facts["test.stats"] == {
+        "discovered": 4928,
+        "unique": {
+            "executed": 4928,
+            "passed": 4598,
+            "failed": 0,
+            "errors": 156,
+            "skipped": 174,
+        },
+        "raw": {
+            "executed": 5000,
+            "passed": 4660,
+            "failed": 0,
+            "errors": 160,
+            "skipped": 180,
+        },
+        "flaky_count": 3,
+        "conflicts": ["test_errors_detected"],
+    }
+
+
+def test_build_gate_uses_physical_validator_for_non_jvm_systems():
+    verdict = check_phase_done(
+        "build",
+        validator=FakeValidator(build_success=False, build_system="nodejs"),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+    assert verdict["ok"] is False
+    assert verdict["validator_state"] == "red"
 
 
 def test_test_done_rejected_without_reports():
     verdict = check_phase_done(
-        "test", validator=FakeValidator(has_test_reports=False),
-        orchestrator=_orch(), project_name="demo",
+        "test",
+        validator=FakeValidator(has_test_reports=False),
+        orchestrator=_orch(),
+        project_name="demo",
     )
     assert verdict["ok"] is False
     assert "report" in verdict["reason"].lower()
@@ -66,26 +186,134 @@ def test_test_done_rejected_without_reports():
 
 def test_provision_rejected_without_workspace():
     verdict = check_phase_done(
-        "provision", validator=FakeValidator(),
-        orchestrator=_orch(workspace_exists=False), project_name="demo",
+        "provision",
+        validator=FakeValidator(),
+        orchestrator=_orch(workspace_exists=False),
+        project_name="demo",
     )
     assert verdict["ok"] is False
 
 
-def test_gate_fails_open_on_probe_error():
+def test_phase_gate_emits_only_validator_derived_entry_facts():
+    provision = check_phase_claim(
+        "provision",
+        PhaseClaim(phase="provision", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=FakeValidator(),
+        orchestrator=_orch(workspace_exists=True),
+        project_name="demo",
+    )
+
+    assert provision.validated_facts == {"provision.workspace_ready": True}
+
+
+def test_gate_probe_error_is_explicitly_unavailable():
     class Exploding:
         def validate_build_status(self, project_name=None):
             raise RuntimeError("docker down")
 
     verdict = check_phase_done(
-        "build", validator=Exploding(), orchestrator=_orch(), project_name="demo",
+        "build",
+        validator=Exploding(),
+        orchestrator=_orch(),
+        project_name="demo",
     )
-    assert verdict["ok"] is True, "infrastructure failure must never trap the model"
+    assert verdict["ok"] is False
+    assert verdict["validator_state"] == "unavailable"
 
 
-def test_analyze_always_passes_with_note():
-    # Analysis quality is advisory; an honest 'unknown' must not trap the run.
-    verdict = check_phase_done(
-        "analyze", validator=FakeValidator(), orchestrator=_orch(), project_name="demo",
+def test_analyze_unknown_claim_can_end_when_evidence_is_unavailable():
+    result = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.UNKNOWN),
+        validator=FakeValidator(),
+        orchestrator=_orch(),
+        project_name="demo",
     )
-    assert verdict["ok"] is True
+    assert result.accepted is True
+    assert result.validator_state is ValidatorState.UNAVAILABLE
+    assert result.claim_disposition is ClaimDisposition.CONFIRMED
+    assert result.validated_outcome is PhaseOutcome.UNKNOWN
+
+
+def test_analyze_validator_maps_complete_and_partial_evidence():
+    class Analyzer(FakeValidator):
+        def __init__(self, *, counted):
+            super().__init__()
+            self.counted = counted
+
+        def validate_project_analysis_status(self, project_name=None):
+            return {
+                "analyzed": True,
+                "has_static_test_count": self.counted,
+                "static_test_count": 12 if self.counted else None,
+            }
+
+    green = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=Analyzer(counted=True),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+    partial = check_phase_claim(
+        "analyze",
+        PhaseClaim(phase="analyze", claimed_outcome=PhaseOutcome.PARTIAL),
+        validator=Analyzer(counted=False),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert green.accepted is True
+    assert green.validator_state is ValidatorState.GREEN
+    assert partial.accepted is True
+    assert partial.validator_state is ValidatorState.PARTIAL
+
+
+def test_all_collection_errors_are_red_even_when_report_exists():
+    class CollectionFailure(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "evidence_status": "success",
+                "total_tests": 328,
+                "error_tests": 328,
+                "test_stats": {"executed": 328, "discovered": 328},
+                "reason": "collection errors",
+                "report_files": ["report://junit"],
+            }
+
+    result = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=CollectionFailure(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is False
+    assert result.validator_state is ValidatorState.RED
+    assert result.validated_outcome is PhaseOutcome.FAILED
+    assert result.code == "test_collection_failed"
+
+
+def test_detected_but_unexecuted_tests_are_red():
+    class NoExecution(FakeValidator):
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "evidence_status": "success",
+                "test_stats": {"executed": 0, "discovered": 12},
+                "reason": "empty runner",
+            }
+
+    result = check_phase_claim(
+        "test",
+        PhaseClaim(phase="test", claimed_outcome=PhaseOutcome.SUCCESS),
+        validator=NoExecution(),
+        orchestrator=_orch(),
+        project_name="demo",
+    )
+
+    assert result.accepted is False
+    assert result.validator_state is ValidatorState.RED
+    assert result.code == "tests_not_executed"

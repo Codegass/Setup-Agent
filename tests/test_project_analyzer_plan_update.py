@@ -1,22 +1,15 @@
-"""Analyzer plan application must be idempotent and preserve task ids.
+"""Analyzer facts recording must feed environment_summary, never the todo list.
 
-Beam 2026-06-10 evidence: the analyzer plan was applied at 09:56:37 and
-re-applied at 10:11:06, 10:11:39, 10:12:26 — each re-run cleared the pending
-tasks and re-added the same plan under fresh ids, churning ids and orphaning
-branch contexts/outputs in the webui.
+Facts-only behavior (Category-3 refactor): the analyzer no longer expands an
+execution plan into the trunk todo list. `_update_trunk_context_with_facts`
+records survey facts (build system + static test metrics) into the trunk's
+environment_summary and persists them; it must never rewrite a phase trunk's
+todo list. The report/test phases consume those recorded metrics.
 """
 
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
 from sag.agent.phase_machine import PHASE_NAMES
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
-
-
-PLAN = [
-    {"description": "Install Gradle dependencies and verify build environment", "type": "environment"},
-    {"description": "Compile project using Gradle", "type": "build"},
-    {"description": "Execute Gradle project tests", "type": "test"},
-    {"description": "Generate comprehensive setup completion report", "type": "report"},
-]
 
 
 class FakeContextManager:
@@ -42,95 +35,19 @@ def _analyzer_with_trunk():
     return analyzer, trunk
 
 
-def _ids_and_descriptions(trunk):
-    return [(t.id, t.description) for t in trunk.todo_list]
-
-
-def test_plan_application_adds_tasks_once():
-    analyzer, trunk = _analyzer_with_trunk()
-
-    assert analyzer._update_trunk_context_with_plan({"execution_plan": PLAN}) is True
-
-    descriptions = [t.description for t in trunk.todo_list]
-    for item in PLAN:
-        assert item["description"] in descriptions
-    assert len(trunk.todo_list) == 2 + len(PLAN)
-
-
-def test_plan_reapplication_is_idempotent_and_preserves_ids():
-    analyzer, trunk = _analyzer_with_trunk()
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
-    snapshot = _ids_and_descriptions(trunk)
-
-    # Re-running the analyzer with the same plan must not renumber or
-    # duplicate anything.
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
-
-    assert _ids_and_descriptions(trunk) == snapshot
-
-
-def test_plan_reapplication_keeps_in_progress_and_completed_tasks():
-    analyzer, trunk = _analyzer_with_trunk()
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
-    # First plan task is being worked on
-    first_plan_task = trunk.todo_list[2]
-    first_plan_task.status = TaskStatus.IN_PROGRESS
-
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
-
-    assert first_plan_task in trunk.todo_list
-    assert first_plan_task.status == TaskStatus.IN_PROGRESS
-
-
-def test_stale_pending_tasks_not_in_new_plan_are_removed():
-    analyzer, trunk = _analyzer_with_trunk()
-    stale_id = trunk.add_task("Manually explore and identify project structure")
-
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
-
-    assert all(t.id != stale_id for t in trunk.todo_list)
-
-
-def test_unknown_analysis_cannot_overwrite_known_plan():
-    """Evidence hierarchy: once a plan from a KNOWN build system is applied,
-    a later analysis that fails detection (unknown/none) must not replace it
-    (beam 06-10: 25 'unknown'-driven re-plans churned the trunk)."""
-    analyzer, trunk = _analyzer_with_trunk()
-    analyzer._update_trunk_context_with_plan(
-        {"execution_plan": PLAN, "build_system": "Gradle", "project_type": "Java"}
-    )
-    snapshot = _ids_and_descriptions(trunk)
-    assert trunk.environment_summary.get("build_system") == "Gradle"
-
-    fallback_plan = [
-        {"description": "Manually explore and identify project structure", "type": "analysis"},
-        {"description": "Setup environment", "type": "environment"},
-        {"description": "Attempt generic build", "type": "build"},
-    ]
-    result = analyzer._update_trunk_context_with_plan(
-        {"execution_plan": fallback_plan, "build_system": "unknown", "project_type": "unknown"}
-    )
-
-    assert result is True
-    assert _ids_and_descriptions(trunk) == snapshot
-
-
 def test_known_analysis_records_build_system_in_trunk():
     analyzer, trunk = _analyzer_with_trunk()
-    analyzer._update_trunk_context_with_plan(
-        {"execution_plan": PLAN, "build_system": "Maven", "project_type": "Java"}
-    )
+    analyzer._update_trunk_context_with_facts({"build_system": "Maven", "project_type": "Java"})
     assert trunk.environment_summary.get("build_system") == "Maven"
 
 
 # --- Stage-2 phase machine (spec §3.1) --------------------------------------
 #
-# A phase trunk (phase_<name> task ids) is owned by the engine: the analyzer's
-# execution plan is phase-internal advice surfaced in the tool output, never
-# trunk tasks. Rewriting the trunk deleted pending phase_build/phase_test/
-# phase_report entries, turning every later _persist_phase_record into a
-# silent no-op and orphaning task_N entries in the webui.
+# A phase trunk (phase_<name> task ids) is owned by the engine. The analyzer
+# records facts into environment_summary but must never touch the todo list.
+# Rewriting the trunk deleted pending phase_build/phase_test/phase_report
+# entries, turning every later _persist_phase_record into a silent no-op and
+# orphaning task_N entries in the webui.
 
 
 def _phase_trunk():
@@ -142,12 +59,12 @@ def _phase_trunk():
     return trunk
 
 
-def test_phase_trunk_task_ids_survive_analyzer_plan():
+def test_phase_trunk_task_ids_survive_facts_update():
     trunk = _phase_trunk()
     analyzer = ProjectAnalyzerTool(None, FakeContextManager(trunk))
 
-    result = analyzer._update_trunk_context_with_plan(
-        {"execution_plan": PLAN, "build_system": "Gradle", "static_test_count": 42}
+    result = analyzer._update_trunk_context_with_facts(
+        {"build_system": "Gradle", "static_test_count": 42}
     )
 
     assert result is True
@@ -167,19 +84,19 @@ def test_phase_trunk_still_records_analysis_metrics():
     trunk = _phase_trunk()
     analyzer = ProjectAnalyzerTool(None, FakeContextManager(trunk))
 
-    analyzer._update_trunk_context_with_plan(
-        {"execution_plan": PLAN, "build_system": "Gradle", "static_test_count": 42}
+    analyzer._update_trunk_context_with_facts(
+        {"build_system": "Gradle", "static_test_count": 42}
     )
 
     assert trunk.environment_summary.get("build_system") == "Gradle"
     assert trunk.environment_summary.get("static_test_count") == 42
 
 
-def test_phase_trunk_record_persists_after_analyzer_plan():
+def test_phase_trunk_record_persists_after_facts_update():
     """End-to-end shape of the original defect: after the analyze phase runs
     the analyzer, the engine must still be able to mark phase_build done."""
     trunk = _phase_trunk()
     analyzer = ProjectAnalyzerTool(None, FakeContextManager(trunk))
-    analyzer._update_trunk_context_with_plan({"execution_plan": PLAN})
+    analyzer._update_trunk_context_with_facts({"build_system": "Gradle"})
 
     assert trunk.update_task_status("phase_build", TaskStatus.COMPLETED, "ok") is True

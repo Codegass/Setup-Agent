@@ -1,58 +1,119 @@
 """ReAct Engine for Setup-Agent (SAG)."""
 
+import hashlib
 import json
 import re
+import shlex
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict
+from typing import Any, Dict, List, Mapping, Optional
 
 from loguru import logger
 
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
-from sag.evidence import EvidenceStatus, coerce_evidence_status
+from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
 from sag.reporting import render_condensed_summary
-from sag.tools.base import BaseTool, ToolResult
+from sag.tools.base import (
+    BaseTool,
+    OutputPersistenceError,
+    ToolResult,
+    UnpersistedToolResult,
+    is_output_storage_ref,
+    new_execution_id,
+)
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
 from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
-from .output_storage import OutputStorageManager
-from .phase_machine import PHASE_NAMES, PhaseMachine
+from .control_events import (
+    ControlEventSink,
+    action_envelope_sha256,
+    canonical_sha256,
+    compact_control_value,
+)
+from .current_plan import CurrentPlan, PlanFault, PlanFaultCode
+from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
+from .loop_memory import LoopDecision, LoopEvent, LoopMemory
+from .output_storage import OutputStorageManager, attach_durable_output_ref
+from .phase_gates import (
+    ClaimDisposition,
+    GateResult,
+    ValidatorState,
+    check_phase_claim,
+    validate_phase_claim,
+)
+from .phase_handoff import PhaseHandoff
+from .phase_machine import (
+    PHASE_NAMES,
+    PhaseClaim,
+    PhaseMachine,
+    PhaseOutcome,
+    PhaseTermination,
+)
+from .phase_transitions import (
+    PhaseTransitionPolicy,
+    RepairBudgets,
+    RepairRequest,
+    TransitionDecision,
+)
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
 from .react_response_parser import ReActResponseParser
 from .react_types import ReactModelMode, ReActStep, StepType
+from .reasoning_scheduler import (
+    ReasoningScheduler,
+    ReasoningTrigger,
+    SchedulerMode,
+    SchedulerTurn,
+)
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
+    ActualToolExecution,
     ToolCall,
     ToolExecution,
+    ToolExecutionRecord,
     ToolLifecycleEvent,
     ToolOrchestrator,
+    format_tool_result,
+)
+from .verdict_finalizer import (
+    EvidenceCloseReason,
+    ReportDeliveryStatus,
+    RunTermination,
+    RunTerminationStatus,
+    VerdictFinalizer,
 )
 
 # Per-phase objectives for the setup phase machine (spec §3.1). These
 # prescribe TOOLS, never raw commands — task text outranks prompt guidance
 # (round-4 lesson), so the only safe vocabulary here is the tool surface.
+#
+# dim (d) deleted (Category-3 analyzer diet, 2026-07-20): these ARE the
+# facts-wording objectives. The old "Recommended Build/Tests" variants and the
+# `.replace()`-derived FACTS_* maps that sat beside them are gone — the survey
+# facts (detected build system + manifest coordinates) are the only wording.
 PHASE_OBJECTIVES = {
     "provision": (
         "Get the repository cloned and the toolchain installed: "
         "project(action='clone', repo_url=...), then project(action='provision', ...) "
-        "for the JDK the project needs. Claim phase(action='done') with what was installed."
+        "for the JDK the project needs. Claim phase(action='done', outcome='success', ...) "
+        "with what was installed."
     ),
     "analyze": (
         "Understand the project: project(action='analyze'). Record build system, the "
-        "analyzer's Recommended Build (target dir + goal), test counts, and special "
+        "build coordinates from the survey facts (target dirs), test counts, and special "
         "requirements in key_results. An honest 'unknown' with evidence is acceptable."
     ),
     "build": (
-        "Make the project compile: build(action='compile'). Follow the analyzer's "
-        "Recommended Build when it differs from a plain root compile — an aggregator "
-        "root over Groovy modules needs build(action='package'/'install'), and a "
-        "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
-        "compile target (a packaging/meta-project), phase(action='blocked') with that "
+        "Make the project compile: build(action='compile'). Consult the survey facts "
+        "for the build coordinates — an aggregator root can compile nothing at the "
+        "root while the real sources live in island modules. If the survey facts show NO Java "
+        "compile target (a packaging/meta-project), phase(action='blocked', "
+        "outcome='unknown', ...) with that "
         "evidence instead of forcing a compile. If compilation fails on missing "
         "dependencies, build(action='deps') can resolve them — but do not run deps "
         "first by default (multi-module reactors can fail dependency resolution while "
@@ -60,56 +121,60 @@ PHASE_OBJECTIVES = {
         "registered toolchain. Long builds detach; poll the job ref with search."
     ),
     "test": (
-        "Run the test suite: build(action='test'). Run it in the analyzer's "
-        "Recommended Tests target (the tests can live in a different module — and "
-        "even a different build system — than the build, e.g. Gradle test modules "
-        "beside a Maven build); otherwise use the build root. Partial pass above "
+        "Run the test suite: build(action='test'). Run it where the "
+        "survey facts place the tests (they can live in a different module — and "
+        "even a different build system — than the build); otherwise use the build root. "
+        "Partial pass above "
         "threshold is a valid outcome — report the numbers honestly in key_results. "
-        "If tests genuinely cannot run, phase(action='blocked') with evidence."
+        "If tests genuinely cannot run, phase(action='blocked', outcome='failed', ...) "
+        "with evidence."
     ),
-    "report": "Generate the final report with the report tool, then phase(action='done').",
+    "report": (
+        "Generate the final report with the report tool, then "
+        "phase(action='done', outcome='success', ...)."
+    ),
 }
 
 # Python overrides for the build/test objectives (live-run 2026-06-24 pyyaml
 # false-red, root cause 1): the Java build objective tells the agent to
-# phase(action='blocked') when the analyzer reports no Java compile target —
+# phase(action='blocked') when the survey facts show no Java compile target —
 # on a Python project the agent obeyed, and the blocked-build cap turned an
 # honest physical PARTIAL into FAILED. Python projects get their own build and
-# test objectives; the Java strings above stay byte-identical for Java
-# projects (see phase_objective).
+# test objectives; the Java strings above apply to Java projects (see
+# phase_objective). These carry no "Recommended" wording, so dim (d) never
+# touched them.
 PYTHON_PHASE_OBJECTIVES = {
     "build": (
         "Set up the environment and install dependencies: build(action='deps'), "
         "then verify byte-compilation with build(action='compile'). A Python "
         "project has no Java compile target — that is NOT grounds for "
-        "phase(action='blocked'). Block only when the environment or dependency "
+        "phase(action='blocked', outcome='failed', ...). Block only when the "
+        "environment or dependency "
         "install itself genuinely fails, with that evidence. Never run "
         "pip/python via bash — build resolves the registered toolchain. Long "
         "installs detach; poll the job ref with search."
     ),
     "test": (
         "Run the test suite with pytest via build(action='test'). Run it in "
-        "the analyzer's Recommended Tests target when one is present; otherwise "
+        "the test location the survey facts name when one is present; otherwise "
         "the project root. Partial pass above threshold is a valid outcome — "
         "report the numbers honestly in key_results. If tests genuinely cannot "
-        "run, phase(action='blocked') with evidence."
+        "run, phase(action='blocked', outcome='failed', ...) with evidence."
     ),
 }
 
 # Kickoff-plan variant of the build objective. The plan is authored at t=0,
 # BEFORE the repo is cloned/analyzed, so it cannot know the ecosystem — and
 # live python runs (4/5, 2026-06/07 probes) obeyed the unconditional
-# "NO Java compile target -> phase(action='blocked')" instruction from the
-# static task text and blocked the build phase. The sentence is made
-# conditional here; the project-aware correction happens AT RUNTIME in the
-# phase intros (phase_objective + _python_phase_guidance), once the analyzer
-# has run. PHASE_OBJECTIVES itself stays byte-identical so the runtime Java
-# intros do not change.
+# "NO Java compile target -> phase(action='blocked')" instruction and blocked
+# the build phase. The sentence is made conditional here; the project-aware
+# correction happens AT RUNTIME in the phase intros (phase_objective), once the
+# analyzer has run.
 _KICKOFF_BLOCK_SENTENCE_BEFORE = (
-    "If the analyzer reports NO Java compile target (a packaging/meta-project), "
+    "If the survey facts show NO Java compile target (a packaging/meta-project), "
 )
 _KICKOFF_BLOCK_SENTENCE_AFTER = (
-    "If the analyzer reports NO Java compile target (a packaging/meta-project) "
+    "If the survey facts show NO Java compile target (a packaging/meta-project) "
     "AND the project is not a Python/other-ecosystem project, "
 )
 assert _KICKOFF_BLOCK_SENTENCE_BEFORE in PHASE_OBJECTIVES["build"], (
@@ -123,37 +188,39 @@ KICKOFF_PHASE_OBJECTIVES = {
     ),
 }
 
-# Runtime python guidance for the BUILD/TEST phase intros, injected AFTER the
-# analyzer has run (the same environment_summary["build_recommendation"]
-# plumbing as _recommended_build_line). This is the live-effective seam: the
-# kickoff plan text cannot know the project type, and live runs proved the
-# template-time python objectives alone did not stop agents from blocking the
-# build phase and under-executing tests (0-2 executions vs 1287 passing).
-PYTHON_BUILD_PHASE_GUIDANCE = (
-    "This is a Python project — there is no Java compile target and that is "
-    "NOT grounds for phase(action='blocked'). Do: build(action='deps') to "
-    "create the venv and install dependencies with the project's own tool, "
-    "then build(action='compile') to verify byte-compilation. Never run "
-    "pip/pytest via bash — the build tool resolves the project venv."
-)
-PYTHON_TEST_PHASE_GUIDANCE = (
-    "Run tests with build(action='test') — it runs pytest with a JUnit XML "
-    "report; a partial pass above threshold is a valid, honest outcome."
-)
+# Back-compat aliases: dim (d) collapsed the FACTS_* variants INTO the base
+# maps above, so these names now point at the same facts-wording objects. Kept
+# so existing importers (tests, callers) resolve without a rename churn.
+FACTS_PHASE_OBJECTIVES = PHASE_OBJECTIVES
+FACTS_PYTHON_PHASE_OBJECTIVES = PYTHON_PHASE_OBJECTIVES
+FACTS_KICKOFF_PHASE_OBJECTIVES = KICKOFF_PHASE_OBJECTIVES
 
-# Native-first block, PREPENDED to the python build guidance when the analyzer
-# flagged has_native_build (live TVM: root CMakeLists.txt native core, real
-# python package in python/). Licenses the cmake dance instead of railroading a
-# root `pip install -e .` that targets the wrong thing and imports nothing until
-# libtvm.so exists. {python_root} is the analyzer's detected install target.
-NATIVE_FIRST_BUILD_GUIDANCE = (
-    "This package has a NATIVE core (CMakeLists.txt at the repo root). Read the "
-    "project's install docs and build the native library FIRST (cmake + the "
-    "documented deps) — the python package will not import without it. If a "
-    "3rdparty/ dependency dir is empty (submodule not fetched), run "
-    "`git submodule update --init --recursive` before cmake. Then "
-    "install the python package from {python_root}. Long native builds detach; "
-    "poll with search."
+
+def kickoff_phase_objectives() -> dict:
+    """The kickoff task texts. dim (d) deleted: the facts wording (detected
+    build system + manifest coordinates) is THE wording — the old
+    "Recommended Build/Tests" phrasing is gone, so there is no variant to
+    select between."""
+    return KICKOFF_PHASE_OBJECTIVES
+
+# dim (e) deleted: the PRE-HOC python/native-first guidance block
+# (PYTHON_BUILD_PHASE_GUIDANCE, PYTHON_TEST_PHASE_GUIDANCE, and the
+# NATIVE_FIRST_BUILD_GUIDANCE prepend) is gone — pre-hoc advice is a
+# prescription. The REACTIVE native smoke steer below stays: it is
+# evidence-triggered (fires only when the build phase left the native core
+# unbuilt) and is part of the corrective-loop allowlist, not a dimension.
+
+# Rendered before the test guidance when the build phase did NOT get the native
+# core built (live TVM 2026-07-18: the agent swept the full suite without
+# libtvm — 356 identical collection errors, pure waste of the phase budget).
+NATIVE_NOT_BUILT_TEST_GUIDANCE = (
+    "The NATIVE core was not built in the build phase. Do NOT sweep the full "
+    "suite — without the native library it only repeats hundreds of identical "
+    "collection errors. Run a small targeted smoke first: pick ONE small test "
+    "file and call build(action='test', args='<that file> --maxfail=1') — a "
+    "bare build(action='test') collects the WHOLE suite and is exactly the "
+    "sweep to avoid. Report the smoke result honestly and only expand if it "
+    "passes."
 )
 
 # Build-system labels the analyzer emits for Python projects: structure
@@ -176,7 +243,11 @@ def phase_objective(phase: str, build_system: Optional[str] = None) -> str:
 
     When the analyzer detected a Python project, the build/test phases get the
     PYTHON_PHASE_OBJECTIVES overrides; every other project (and an unknown
-    build system) gets the PHASE_OBJECTIVES defaults byte-identical."""
+    build system) gets the PHASE_OBJECTIVES defaults.
+
+    dim (d) deleted: PHASE_OBJECTIVES/PYTHON_PHASE_OBJECTIVES already carry the
+    facts wording (detected build system + manifest coordinates) — there is no
+    longer a variant to select between."""
     if is_python_build_system(build_system):
         override = PYTHON_PHASE_OBJECTIVES.get(phase)
         if override:
@@ -246,16 +317,44 @@ class ReActEngine(UIEventEmitter):
         repository_ref: str = None,
         phase_machine: Optional[PhaseMachine] = None,
         context_journal=None,
+        run_evidence_state: Optional[RunEvidenceState] = None,
+        verdict_finalizer: Optional[VerdictFinalizer] = None,
+        transition_policy: Optional[PhaseTransitionPolicy] = None,
+        control_event_sink: Optional[ControlEventSink] = None,
+        target_repo_sha_callback=None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
+        self.reasoning_scheduler = ReasoningScheduler(
+            available_tools=self.tools,
+            heartbeat_actions=getattr(self.config, "reasoning_heartbeat_actions", 5),
+        )
+        self._scheduler_active = False
+        self._scheduled_turn: SchedulerTurn | None = None
+        self.control_event_sink = control_event_sink
+        self._target_repo_sha_callback = target_repo_sha_callback
+        self._active_control_envelope_id: str | None = None
 
         # Engine-owned phase machine for setup runs (spec §3.1). None keeps the
         # legacy free-form behavior (`sag run --task` passes neither).
         self.phase_machine = phase_machine
         self.context_journal = context_journal
+        self.run_evidence_state = run_evidence_state
+        self.verdict_finalizer = verdict_finalizer
+        self.loop_memory = LoopMemory()
+        if transition_policy is None:
+            self.transition_policy = PhaseTransitionPolicy(repair_guard=self.loop_memory)
+        else:
+            self.transition_policy = transition_policy
+            if self.transition_policy.repair_guard is None:
+                self.transition_policy.repair_guard = self.loop_memory
+        self._repair_global_remaining = 2
+        self._repair_phase_remaining = {"test": 1, "build": 1}
+        self._report_attempted = False
+        self._report_delivered = False
+        self._report_failed = False
         self._phase_iterations = 0
         # Window-reset marker: the first journal record after a reset carries
         # the new phase intro text (spec §7 reconstruction).
@@ -323,6 +422,23 @@ class ReActEngine(UIEventEmitter):
             else None
         )
         self.output_storage = OutputStorageManager(contexts_dir, orchestrator=orchestrator)
+        self.phase_handoff = None
+        if self.phase_machine is not None:
+            if self.run_evidence_state is None:
+                run_id = str(
+                    getattr(self.context_manager, "session_id", None)
+                    or f"react-{self._get_timestamp()}"
+                )
+                self.run_evidence_state = RunEvidenceState(run_id=run_id)
+            if self.verdict_finalizer is None and orchestrator is not None:
+                self.verdict_finalizer = VerdictFinalizer(
+                    orchestrator,
+                    test_pass_threshold=self.config.test_pass_threshold,
+                )
+            self.phase_handoff = PhaseHandoff(
+                self.run_evidence_state,
+                orchestrator=orchestrator,
+            )
 
         # Initialize physical validator for fact-based validation
         self.physical_validator = PhysicalValidator(
@@ -337,6 +453,16 @@ class ReActEngine(UIEventEmitter):
         # of constructing a fresh one per completion attempt.
         if getattr(self.context_manager, "physical_validator", None) is None:
             self.context_manager.physical_validator = self.physical_validator
+
+        # Late-bind the finalizer's build oracle (same contract as
+        # SetupAgent._initialize_tools): gates and finalizer must read the SAME
+        # physical validator, or the sealed snapshot can carry a gate-validated
+        # SUCCESS next to observation-derived FAILED (live ws7-final7 bigtop).
+        finalizer = getattr(self, "verdict_finalizer", None)
+        if finalizer is not None and getattr(finalizer, "validator", None) is None:
+            finalizer.validator = self.physical_validator
+            if getattr(finalizer, "project_name", None) is None:
+                finalizer.project_name = self._project_name_for_gate()
 
         # No-physical-progress guard: halt a run that completes tasks without
         # ever producing build artifacts (anti-thrash). Only armed for
@@ -353,10 +479,9 @@ class ReActEngine(UIEventEmitter):
         # Update state evaluator with physical validator
         self.state_evaluator.physical_validator = self.physical_validator
 
-        # Stage 2: in machine-driven setup runs the evaluator must never end
-        # the run from the report tool's completion signal — the report PHASE
-        # done does (run_react_loop returns on machine completion with the
-        # machine's honest overall outcome).
+        # In machine-driven setup runs the evaluator never ends the run from
+        # the report tool's completion signal. A validated report-phase claim
+        # closes flow; the sealed snapshot remains the verdict authority.
         self.state_evaluator.phase_machine_active = self.phase_machine is not None
 
         # Initialize token tracker and LLM client for monitoring model usage
@@ -472,6 +597,409 @@ class ReActEngine(UIEventEmitter):
         return tripped
 
     # ------------------------------------------------------------------
+    # Evidence ownership and run closure (setup mode only)
+    # ------------------------------------------------------------------
+
+    _NON_EVIDENCE_TOOLS = frozenset({"phase", "manage_context", "report"})
+    _BUILD_EVIDENCE_TOOLS = frozenset({"build", "maven", "gradle", "python"})
+
+    @staticmethod
+    def _backend_operation_tokens(params: Dict[str, Any]) -> List[str]:
+        values = [
+            params[key]
+            for key in ("command", "tasks", "task", "operation")
+            if params.get(key) not in (None, "", [])
+        ]
+        if not values:
+            values = [params.get("action")]
+
+        tokens: List[str] = []
+        pending = list(values)
+        while pending:
+            value = pending.pop(0)
+            if isinstance(value, (list, tuple, set)):
+                pending[0:0] = list(value)
+                continue
+            text = str(value or "").strip()
+            if not text:
+                continue
+            try:
+                tokens.extend(shlex.split(text))
+            except ValueError:
+                tokens.extend(text.split())
+        return tokens
+
+    @staticmethod
+    def _is_test_operation(token: str) -> bool:
+        if token.startswith("-"):
+            return False
+        leaf = token.rsplit(":", 1)[-1]
+        normalized = leaf.lower()
+        if normalized in {"test", "tests", "verify", "verify_tests", "check"}:
+            return True
+        if re.search(r"(?:^|[-_])tests?(?:$|[-_])", normalized):
+            return True
+        return bool(re.search(r"^test(?=$|[A-Z])", leaf) or re.search(r"Test(?=$|[A-Z])", leaf))
+
+    @staticmethod
+    def _is_dependency_operation(token: str) -> bool:
+        if token.startswith("-"):
+            return False
+        normalized = token.lower()
+        leaf = normalized.rsplit(":", 1)[-1]
+        return normalized.startswith("dependency:") or leaf in {
+            "deps",
+            "dependencies",
+            "dependency",
+            "dependencyinsight",
+            "resolve",
+            "install_dependencies",
+            "setup_env",
+        }
+
+    def _tool_evidence_action(self, params: Dict[str, Any]) -> str:
+        action = str((params or {}).get("action") or "").strip().lower()
+        if action:
+            return action
+        operations = self._backend_operation_tokens(params or {})
+        return " ".join(operations).lower() or "execute"
+
+    def _tool_evidence_scope(self, tool_name: str, params: Dict[str, Any]) -> StateScope:
+        action = str((params or {}).get("action") or "").strip().lower()
+        if tool_name in {"project", "project_analyzer"} and action == "analyze":
+            return StateScope.PROJECT_ANALYSIS
+        if tool_name in {"project", "project_setup", "system", "env"}:
+            return StateScope.ENVIRONMENT
+        if tool_name in {"build", "maven", "gradle", "python"}:
+            operations = self._backend_operation_tokens(params or {})
+            if any(self._is_test_operation(operation) for operation in operations):
+                return StateScope.TEST_RUNTIME
+            if any(self._is_dependency_operation(operation) for operation in operations):
+                return StateScope.DEPENDENCIES
+            return StateScope.ARTIFACTS
+
+        phase = getattr(getattr(self, "phase_machine", None), "current_phase", None)
+        return {
+            "provision": StateScope.ENVIRONMENT,
+            "analyze": StateScope.PROJECT_ANALYSIS,
+            "build": StateScope.ARTIFACTS,
+            "test": StateScope.TEST_RUNTIME,
+        }.get(phase, StateScope.PROJECT_ANALYSIS)
+
+    def _tool_evidence_roles(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        result: ToolResult | UnpersistedToolResult,
+    ) -> tuple[EvidenceRole, ...]:
+        roles: list[EvidenceRole] = []
+        if tool_name in self._BUILD_EVIDENCE_TOOLS:
+            operations = [
+                operation
+                for operation in self._backend_operation_tokens(params or {})
+                if not operation.startswith("-")
+            ]
+            test_only = bool(operations) and all(
+                self._is_test_operation(operation)
+                and operation.rsplit(":", 1)[-1].lower() not in {"verify", "check"}
+                for operation in operations
+            )
+            dependency_only = bool(operations) and all(
+                self._is_dependency_operation(operation) for operation in operations
+            )
+            if not test_only and not dependency_only:
+                roles.append(EvidenceRole.BUILD)
+        if result.test_stats is not None:
+            roles.append(EvidenceRole.TEST)
+        return tuple(roles)
+
+    def _record_current_phase_evidence(
+        self,
+        state: RunEvidenceState,
+        evidence_refs: List[str],
+    ) -> None:
+        machine = getattr(self, "phase_machine", None)
+        attempt_id = getattr(machine, "current_attempt_id", None)
+        refs = self._dedupe_strings(evidence_refs)
+        if attempt_id and refs:
+            state.record_phase_evidence(attempt_id, refs)
+
+    def _record_tool_execution(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        result: ToolResult,
+        *,
+        attempted_execution: bool = True,
+        execution_id: str | None = None,
+    ) -> ToolResult:
+        """Persist provenance and ingest one evidence-bearing execution once."""
+        if tool_name == "report":
+            self._report_attempted = True
+            if attempted_execution and result.succeeded:
+                self._report_delivered = True
+            elif result.is_terminal or not attempted_execution:
+                self._report_failed = True
+            return result
+
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed or tool_name in self._NON_EVIDENCE_TOOLS:
+            return result
+
+        execution_id = execution_id or new_execution_id()
+        scope = self._tool_evidence_scope(tool_name, params)
+        roles = self._tool_evidence_roles(tool_name, params, result)
+        action = self._tool_evidence_action(params)
+        machine = getattr(self, "phase_machine", None)
+        source_phase = getattr(machine, "current_phase", None)
+        source_attempt_id = getattr(machine, "current_attempt_id", None)
+        if state.has_execution_id(execution_id):
+            state.ingest_tool_result(
+                scope,
+                tool_name,
+                result,
+                provenance=result.output_ref or f"tool:{tool_name}:{action}:replay",
+                roles=roles,
+                execution_id=execution_id,
+                params=params,
+                source_phase=source_phase,
+                source_attempt_id=source_attempt_id,
+            )
+            return result
+        if not attempted_execution:
+            state.record_attempt(
+                action=f"{tool_name}:{action}",
+                relevant_scopes=[scope],
+                outcome=result.operation_outcome,
+                evidence_refs=self._dedupe_strings(
+                    [result.output_ref, *result.evidence_refs, *result.refs]
+                ),
+            )
+            return result
+
+        task_id = str(
+            getattr(self.context_manager, "current_task_id", None)
+            or f"{tool_name}_{getattr(self, 'current_iteration', 0)}"
+        )
+        try:
+            durable = attach_durable_output_ref(
+                result,
+                self.output_storage,
+                task_id=task_id,
+                tool_name=tool_name,
+            )
+        except OutputPersistenceError as exc:
+            logger.error(f"Failed to persist full output for {tool_name}: {exc}")
+            state.record_attempt(
+                action=f"{tool_name}:{action}",
+                relevant_scopes=[scope],
+                outcome=result.operation_outcome,
+                evidence_refs=self._dedupe_strings(
+                    [
+                        ref
+                        for ref in [*result.evidence_refs, *result.refs]
+                        if not is_output_storage_ref(ref)
+                    ]
+                ),
+            )
+            state.ingest_tool_result(
+                scope,
+                tool_name,
+                result,
+                provenance=f"tool:{tool_name}:{action}:output-persistence-failed",
+                roles=roles,
+                execution_id=execution_id,
+                params=params,
+                source_phase=source_phase,
+                source_attempt_id=source_attempt_id,
+            )
+            self._record_current_phase_evidence(
+                state,
+                self._dedupe_strings([result.output_ref, *result.evidence_refs, *result.refs]),
+            )
+            state.record_conflict("output_storage_failed")
+            raise
+        state.record_attempt(
+            action=f"{tool_name}:{action}",
+            relevant_scopes=[scope],
+            outcome=durable.operation_outcome,
+            evidence_refs=self._dedupe_strings(
+                [durable.output_ref, *durable.evidence_refs, *durable.refs]
+            ),
+        )
+        state.ingest_tool_result(
+            scope,
+            tool_name,
+            durable,
+            provenance=durable.output_ref,
+            roles=roles,
+            execution_id=execution_id,
+            params=params,
+            source_phase=source_phase,
+            source_attempt_id=source_attempt_id,
+        )
+        self._record_current_phase_evidence(
+            state,
+            self._dedupe_strings([durable.output_ref, *durable.evidence_refs, *durable.refs]),
+        )
+        return durable
+
+    def _report_execution_allowed(self) -> bool:
+        if getattr(self, "phase_machine", None) is None:
+            return True
+        state = getattr(self, "run_evidence_state", None)
+        finalizer = getattr(self, "verdict_finalizer", None)
+        return bool(
+            state is not None
+            and state.sealed
+            and finalizer is not None
+            and finalizer.has_current_snapshot(state)
+        )
+
+    def _evidence_execution_closed(self, call: ToolCall) -> bool:
+        state = getattr(self, "run_evidence_state", None)
+        return bool(
+            state is not None and state.sealed and call.name not in self._NON_EVIDENCE_TOOLS
+        )
+
+    @staticmethod
+    def _refused_closed_evidence_execution(call: ToolCall) -> ToolExecution:
+        result = ToolResult.completed(
+            output="Tool execution refused because setup evidence is already sealed.",
+            operation_outcome=OperationOutcome.SKIPPED,
+            metadata={"execution_refused": "evidence_closed"},
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="skipped",
+            raw_params=call.raw_params,
+            validated_params=call.validated_params,
+            observation_text=format_tool_result(call.name, result),
+            attempted_execution=False,
+            metadata={"execution_refused": "evidence_closed"},
+        )
+
+    @staticmethod
+    def _refused_report_execution(call: ToolCall) -> ToolExecution:
+        result = ToolResult.completed(
+            output="Report execution refused until evidence-close persistence completes.",
+            operation_outcome=OperationOutcome.SKIPPED,
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="skipped",
+            raw_params=call.raw_params,
+            validated_params=call.validated_params,
+            observation_text=format_tool_result(call.name, result),
+            attempted_execution=False,
+            metadata={"report_refused": "evidence_not_closed"},
+        )
+
+    @staticmethod
+    def _failed_report_persistence_execution(
+        call: ToolCall, exc: OutputPersistenceError
+    ) -> ToolExecution:
+        result = ToolResult.completed(
+            output="Report delivery failed because output persistence was unavailable.",
+            operation_outcome=OperationOutcome.SKIPPED,
+            metadata={
+                "report_delivery_failure": "output_persistence",
+                "persistence_error": type(exc).__name__,
+            },
+        )
+        return ToolExecution(
+            call=call,
+            result=result,
+            status="failure",
+            raw_params=call.raw_params,
+            validated_params=call.validated_params,
+            observation_text=format_tool_result(call.name, result),
+            attempted_execution=True,
+            metadata={"report_delivery_failure": "output_persistence"},
+        )
+
+    def _record_phase_audit(self, record) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            state.record_phase_record(record)
+
+    def _finalize_evidence(self, reason: EvidenceCloseReason):
+        state = getattr(self, "run_evidence_state", None)
+        finalizer = getattr(self, "verdict_finalizer", None)
+        if state is None or finalizer is None:
+            raise RuntimeError("setup evidence finalization is not configured")
+        was_sealed = state.sealed
+        snapshot = finalizer.finalize(state, reason)
+        if not was_sealed:
+            self._emit_control_event("evidence_close", {"reason": reason.value})
+        return snapshot
+
+    def _report_delivery_status(self) -> ReportDeliveryStatus:
+        if getattr(self, "_report_delivered", False):
+            return ReportDeliveryStatus.DELIVERED
+        if getattr(self, "_report_attempted", False) or getattr(self, "_report_failed", False):
+            return ReportDeliveryStatus.FAILED
+        return ReportDeliveryStatus.SKIPPED
+
+    def _close_flow(self, termination: RunTerminationStatus) -> RunTermination:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None:
+            raise RuntimeError("setup flow closure requires run evidence state")
+        sealed_reason = None
+        if state.sealed:
+            try:
+                sealed_reason = EvidenceCloseReason(state.close_reason)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("sealed setup evidence has no typed close reason") from exc
+
+        if sealed_reason in {
+            EvidenceCloseReason.TEST_TERMINATED,
+            EvidenceCloseReason.DEPENDENTS_SKIPPED,
+        }:
+            # Evidence-close is immutable. A later report-phase abort or
+            # cancellation changes flow/delivery status, never snapshot inputs.
+            reason = sealed_reason
+        elif termination is RunTerminationStatus.CANCELLED:
+            reason = EvidenceCloseReason.CANCELLED
+        elif termination is RunTerminationStatus.ABORTED:
+            reason = EvidenceCloseReason.ABORTED
+        else:
+            reason = EvidenceCloseReason.DEPENDENTS_SKIPPED
+        # This is a cache hit after a successful evidence-close. If persistence
+        # failed after sealing, the same reason safely retries the atomic write.
+        self._finalize_evidence(reason)
+        return RunTermination(
+            termination=termination,
+            report_delivery_status=self._report_delivery_status(),
+        )
+
+    def abort(self, *, reason: str) -> RunTermination:
+        machine = getattr(self, "phase_machine", None)
+        if machine is None:
+            raise RuntimeError("abort termination is available only for setup runs")
+        if not machine.is_complete:
+            record = machine.record_abort(reason, evidence=[])
+            self._record_phase_audit(record)
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            self._finalize_evidence(EvidenceCloseReason.ABORTED)
+        return self._close_flow(RunTerminationStatus.ABORTED)
+
+    def cancel(self, *, reason: str = "explicit cancellation") -> RunTermination:
+        machine = getattr(self, "phase_machine", None)
+        if machine is None:
+            raise RuntimeError("cancel termination is available only for setup runs")
+        if not machine.is_complete:
+            record = machine.record_abort(reason, evidence=[])
+            self._record_phase_audit(record)
+        state = getattr(self, "run_evidence_state", None)
+        if state is not None and not state.sealed:
+            self._finalize_evidence(EvidenceCloseReason.CANCELLED)
+        return self._close_flow(RunTerminationStatus.CANCELLED)
+
+    # ------------------------------------------------------------------
     # Phase-machine wiring (setup mode only; spec §3.1/§3.2/§7)
     # ------------------------------------------------------------------
 
@@ -494,6 +1022,15 @@ class ReActEngine(UIEventEmitter):
         phase = machine.current_phase
         _, reserved, remaining = self._phase_budget_numbers(phase)
         budget = max(5, remaining - reserved)
+        # Framework survey guarantee (analyzer diet, Category 1) runs BEFORE
+        # the objective is selected: the objective depends on the detected
+        # build system, and with analyze skipped the stale env would pick the
+        # Java objective for a Python repo in the SAME intro that later
+        # renders Python guidance (review 2026-07-19 — the pyyaml false-block
+        # shape reopened). Idempotent and token-free.
+        survey_state = ""
+        if phase in ("build", "test"):
+            survey_state = self._ensure_project_facts()
         # Project-aware objective: by build/test time the analyzer has recorded
         # the detected build system on the trunk, so a Python project gets the
         # Python objective (deps -> compile, pytest) instead of the Java one.
@@ -506,27 +1043,57 @@ class ReActEngine(UIEventEmitter):
             f"Objective: {objective}",
             f"Budget: flexible — up to ~{budget} iterations available (a small reserve is "
             f"kept for later phases). When finished, call phase(action='done', "
-            f"key_results=..., evidence=[refs]). If it cannot be finished, "
-            f"phase(action='blocked', reason=..., evidence=[refs]).",
+            f"outcome='success|partial|failed|unknown', key_results=..., evidence=[refs]). "
+            f"For an external impediment, call phase(action='blocked', "
+            f"outcome='failed|partial|unknown', reason=..., evidence=[refs]).",
         ]
         # Surface the analyzer's build recommendation directly in the build/test
         # intro so the target/goal is present even if the model didn't carry it
         # forward in analyze key_results (Bigtop: compile the right reactor/module,
         # or block honestly on a meta-project — don't compile an empty root).
         if phase in ("build", "test"):
+            if survey_state == "created":
+                lines.append(
+                    "(framework survey ran — project facts were computed and "
+                    "persisted; the agent had not called project analyze)"
+                )
+            # dim (b) deleted: the recommendation is coordinates-only; dim (c)
+            # and dim (e) deleted: no project_brief projection, no pre-hoc
+            # python guidance block. The agent gets the coordinate line and the
+            # reactive smoke steer only.
             rec_line = self._recommended_build_line(phase)
             if rec_line:
                 lines.insert(lines.index(f"Objective: {objective}") + 1, rec_line)
-            # Python guidance is injected HERE, at runtime, because this is
-            # the first text the model sees after the analyzer has recorded
-            # the project type — the kickoff plan (authored at t=0) still
-            # carries the generic text and cannot be trusted to correct it.
-            guidance = self._python_phase_guidance(phase)
-            if guidance:
-                lines.insert(lines.index(f"Objective: {objective}") + 1, guidance)
+            # Evidence-reactive steer: the analyzer runs at analyze time and
+            # cannot know the build outcome, so this runtime state is injected
+            # here on every intro (live TVM 2026-07-18: the smoke steer only
+            # rendered on the no-brief fallback, and the live run swept 356
+            # collection errors again).
+            smoke = self._native_smoke_guidance(phase)
+            if smoke:
+                lines.insert(lines.index(f"Objective: {objective}") + 1, smoke)
+        handoff = getattr(self, "phase_handoff", None)
+        projection = None
+        if handoff is not None:
+            char_budget = int(getattr(self.config, "phase_handoff_char_budget", 6000))
+            projection = handoff.project_for(phase, char_budget=char_budget)
+        contract = "\n".join(lines)
+        builder = getattr(self, "prompt_builder", None)
+        render_intro = getattr(builder, "build_phase_intro_guidance", None)
+        if callable(render_intro):
+            content = render_intro(
+                phase_contract=contract,
+                handoff_projection=projection,
+            )
+        else:
+            content = (
+                f"{contract}\n\n{projection.to_prompt_text()}"
+                if projection is not None
+                else contract
+            )
         return ReActStep(
             step_type=StepType.SYSTEM_GUIDANCE,
-            content="\n".join(lines),
+            content=content,
             timestamp=self._get_timestamp(),
         )
 
@@ -552,33 +1119,6 @@ class ReActEngine(UIEventEmitter):
             return {}
         return env.get("build_recommendation") or {}
 
-    def _python_phase_guidance(self, phase: str) -> Optional[str]:
-        """Explicit python guidance block for the build/test intros, keyed off
-        the analyzer's recorded build system (build_recommendation or the env
-        summary — the same best-effort plumbing as _recommended_build_line).
-        Returns None for every non-python project, keeping Java intros
-        byte-identical.
-
-        Native-core repos (has_native_build on the recommendation, live TVM):
-        the build-phase guidance PREPENDS the native-first block — build the
-        native library before installing the python package, from the analyzer's
-        detected python root. A plain-python repo carries no native text, so its
-        intro is byte-identical to before."""
-        if phase not in ("build", "test"):
-            return None
-        if not is_python_build_system(self._detected_build_system()):
-            return None
-        if phase == "test":
-            return PYTHON_TEST_PHASE_GUIDANCE
-        guidance = PYTHON_BUILD_PHASE_GUIDANCE
-        rec = self._build_recommendation()
-        if rec.get("has_native_build"):
-            native = NATIVE_FIRST_BUILD_GUIDANCE.format(
-                python_root=rec.get("build_root") or "the detected python root"
-            )
-            guidance = f"{native}\n{guidance}"
-        return guidance
-
     def _recommended_build_line(self, phase: str = "build") -> Optional[str]:
         """One-line build/test recommendation from the analyzer, read from the
         trunk's environment_summary. Best-effort: any failure yields no line."""
@@ -589,90 +1129,175 @@ class ReActEngine(UIEventEmitter):
             return None
         if not rec:
             return None
+        # dim (b) deleted: the intro call-out is coordinate FACTS only —
+        # detected system + where, no goal/rationale action wording.
+        return self._coordinates_line(rec, phase)
+
+    @staticmethod
+    def _coordinates_line(rec, phase: str) -> Optional[str]:
+        """The intro call-out without action wording (dim b deleted) —
+        coordinate FACTS only (system + where), for build and test alike."""
         if phase == "test":
-            # Pathological aggregators are archipelagos: run tests in EACH test
-            # island (Bigtop: the maven framework's own unit tests were skipped
-            # while only the dominant Gradle cluster ran). Guidance, not
-            # orchestration — the agent still owns the how.
-            test_islands = rec.get("test_islands")
-            if test_islands and len(test_islands) > 1:
-                return self._island_test_line(test_islands)
+            islands = rec.get("test_islands")
+            if islands and len(islands) > 1:
+                coords = "; ".join(
+                    f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
+                )
+                return f"Test coordinates (independent islands): {coords}."
             test_root = rec.get("test_root")
-            if not test_root:
+            if not test_root or test_root == rec.get("build_root"):
                 return None
-            # Only worth calling out when the tests are NOT where we built.
-            # A python rec is pytest-at-the-build-root by construction, so its
-            # differing labels (pytest vs python) must not render the
-            # misleading "lives here, not in the build module" call-out.
-            if test_root == rec.get("build_root") and (
-                rec.get("test_system") == rec.get("build_system")
-                or is_python_build_system(rec.get("build_system"))
-            ):
-                return None
-            return (
-                f"Recommended Tests: run {rec.get('test_system')} 'test' in {test_root} "
-                "— the test suite lives here, not in the build module."
+            return f"Test coordinates: {rec.get('test_system')} at {test_root}."
+        islands = rec.get("build_islands")
+        if islands and len(islands) > 1:
+            coords = "; ".join(
+                f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
             )
-        # Build phase. Pathological aggregators: build EACH independent island so
-        # none is left UNKNOWN (Bigtop: bigpetstore-spark + transaction-queue
-        # never built when only one preferred module was targeted).
-        build_islands = rec.get("build_islands")
-        if build_islands and len(build_islands) > 1:
-            return self._island_build_line(build_islands)
+            return f"Build coordinates (independent islands): {coords}."
         if rec.get("is_aggregator_only"):
-            return (
-                f"Recommended Build: NONE — {rec.get('rationale', '')} "
-                "Use phase(action='blocked') with this evidence rather than forcing a compile."
+            return "Build coordinates: the survey found no standard compile target at the root."
+        return f"Build coordinates: {rec.get('build_system')} at {rec.get('build_root')}."
+
+    def _repair_budgets(self) -> RepairBudgets:
+        return RepairBudgets(
+            global_remaining=getattr(self, "_repair_global_remaining", 2),
+            phase_remaining=dict(getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1})),
+        )
+
+    def _consume_repair_budget(self, phase: str) -> None:
+        self._repair_global_remaining = max(0, getattr(self, "_repair_global_remaining", 2) - 1)
+        phase_remaining = dict(getattr(self, "_repair_phase_remaining", {"test": 1, "build": 1}))
+        phase_remaining[phase] = max(0, phase_remaining.get(phase, 0) - 1)
+        self._repair_phase_remaining = phase_remaining
+
+    def _record_gate_facts(self, phase: str, gate: GateResult) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return
+        provenance = (
+            gate.evidence_refs[0]
+            if gate.evidence_refs
+            else f"validator:{phase}:{getattr(self.phase_machine, 'current_attempt_id', '')}"
+        )
+        for key, value in gate.validated_facts.items():
+            state.set_fact(
+                key,
+                value,
+                evidence_ref=provenance,
+                source_phase=phase,
+                source_attempt_id=self.phase_machine.current_attempt_id,
             )
-        return (
-            f"Recommended Build: {rec.get('build_system')} '{rec.get('goal')}' in "
-            f"{rec.get('build_root')} — {rec.get('rationale', '')}"
-        )
+        if gate.evidence_refs:
+            state.record_phase_evidence(
+                self.phase_machine.current_attempt_id,
+                gate.evidence_refs,
+            )
 
     @staticmethod
-    def _island_build_line(islands) -> str:
-        """Render the build-phase call-out that lists EVERY independent build
-        island for a pathological aggregator (each must be built on its own),
-        naming the recommended GOAL beside each island and appending the
-        cross-island dependency guidance (see below)."""
-        items = "; ".join(
-            f"{n}) {isl.get('system') or 'unknown'} '{isl.get('goal') or 'build'}' "
-            f"in {isl.get('root')}"
-            for n, isl in enumerate(islands, 1)
-        )
-        return (
-            f"Recommended Build: this repo has {len(islands)} independent build "
-            f"islands — build EACH: {items}. "
-            # CROSS-ISLAND dependency guidance (live bigtop re-probe: the
-            # transaction-queue island died 13x resolving an org-internal
-            # SNAPSHOT the data-generators island produces but never PUBLISHED).
-            "Islands may depend on each other through the local maven repo: if a "
-            "build fails resolving an org-internal SNAPSHOT artifact (searched in "
-            "file:/root/.m2/...), FIRST build/publish the island that produces it "
-            "(maven 'install' / gradle 'publishToMavenLocal'), then retry this "
-            "island once. "
-            "In the test phase, run tests in EACH test island."
-        )
+    def _phase_record_status(record) -> str:
+        if (
+            record.termination in {PhaseTermination.BLOCKED, PhaseTermination.SKIPPED}
+            or record.outcome is PhaseOutcome.FAILED
+        ):
+            return "failed"
+        return "completed"
 
-    @staticmethod
-    def _island_test_line(islands) -> str:
-        """Render the test-phase call-out that lists EVERY independent test
-        island for a pathological aggregator (run tests in each)."""
-        items = "; ".join(
-            f"{n}) {isl.get('system') or 'unknown'} in {isl.get('root')}"
-            for n, isl in enumerate(islands, 1)
+    def _apply_phase_decision(
+        self,
+        record,
+        decision: TransitionDecision,
+        *,
+        repair_request: RepairRequest | None = None,
+    ) -> None:
+        machine = self.phase_machine
+        self._emit_control_phase_transition(decision, repair_request=repair_request)
+        appended = machine.apply(decision)
+        self._request_scheduler_reasoning(ReasoningTrigger.PHASE_CHANGE)
+        for applied in appended:
+            self._record_phase_audit(applied)
+            text = applied.key_results or applied.reason or applied.outcome.value
+            self._persist_phase_record(
+                applied.phase,
+                self._phase_record_status(applied),
+                f"[{applied.outcome.value}] {text}",
+            )
+
+        if decision.route.kind == "evidence_close":
+            reason = (
+                EvidenceCloseReason.DEPENDENTS_SKIPPED
+                if decision.skips or record.phase != "test"
+                else EvidenceCloseReason.TEST_TERMINATED
+            )
+            self._finalize_evidence(reason)
+
+        self._phase_iterations = 0
+        self.steps_since_context_switch = 0
+        if not machine.is_complete:
+            self._archive_window_steps()
+            self.steps = [self._phase_intro_step()]
+            self._journal_intro_dirty = True
+            self._journal_last_ledger = None
+            self._start_phase_branch()
+
+    def _project_name_for_gate(self) -> str | None:
+        try:
+            trunk = self.context_manager.load_trunk_context()
+            return getattr(trunk, "project_name", None)
+        except Exception:
+            return getattr(self.context_manager, "project_name", None)
+
+    def _handle_repair_signal(self, metadata: Dict[str, Any]) -> str | None:
+        machine = self.phase_machine
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return None
+        try:
+            request = RepairRequest.from_metadata(metadata.get("repair_request") or {})
+        except (TypeError, ValueError) as exc:
+            self.agent_logger.warning(f"Rejected malformed repair proposal: {exc}")
+            return None
+        if (
+            request.from_phase != machine.current_phase
+            or request.source_attempt_id != machine.current_attempt_id
+        ):
+            self.agent_logger.warning("Rejected repair proposal for a stale phase attempt")
+            return None
+
+        claim = PhaseClaim(
+            phase=request.from_phase,
+            signal="done",
+            claimed_outcome=PhaseOutcome.FAILED,
+            reason=request.hypothesis,
+            evidence_refs=request.evidence_refs,
         )
-        return (
-            f"Recommended Tests: this repo has {len(islands)} independent test "
-            f"islands — run tests in EACH test island: {items}."
+        gate = check_phase_claim(
+            request.from_phase,
+            claim,
+            getattr(self, "physical_validator", None),
+            getattr(getattr(self, "physical_validator", None), "docker_orchestrator", None),
+            self._project_name_for_gate(),
         )
+        self._emit_control_gate(claim, gate)
+        if not gate.accepted:
+            self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
+            self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
+            return None
+        self._record_gate_facts(request.from_phase, gate)
+        record = machine.close_attempt(gate)
+        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+        decision = policy.request_repair(
+            request,
+            state=state,
+            budgets=self._repair_budgets(),
+            source_record=record,
+        )
+        if decision.route.kind == "repair":
+            self._consume_repair_budget(request.from_phase)
+        self._apply_phase_decision(record, decision, repair_request=request)
+        return "repair"
 
     def _handle_phase_signals(self, executed_steps) -> Optional[str]:
-        """Advance the machine when the phase tool signalled done/blocked.
-
-        The ENGINE is the single owner of phase state: the tool only emits
-        `metadata.phase_signal`; this method mutates the machine, persists the
-        phase record to the trunk, and performs the window reset."""
+        """Validate terminal claims, then route them through exactly one policy call."""
         if getattr(self, "phase_machine", None) is None:
             return None
         for step in executed_steps:
@@ -682,26 +1307,46 @@ class ReActEngine(UIEventEmitter):
             if not signal:
                 continue
             machine = self.phase_machine
-            finished = machine.current_phase
             if signal == "note":
-                self._persist_phase_note(finished, metadata.get("text", ""))
+                self._persist_phase_note(machine.current_phase, metadata.get("text", ""))
                 return signal
-            if signal == "done":
-                machine.mark_done(metadata.get("key_results", ""), metadata.get("evidence", []))
-                self._persist_phase_record(finished, "completed", metadata.get("key_results", ""))
-            else:
-                machine.mark_blocked(metadata.get("reason", ""), metadata.get("evidence", []))
-                self._persist_phase_record(finished, "failed", metadata.get("reason", ""))
-            self._phase_iterations = 0
-            # Phase transitions are the context switches of phase mode (no
-            # manage_context actions exist to reset the legacy counter).
-            self.steps_since_context_switch = 0
-            if not machine.is_complete:
-                self._archive_window_steps()
-                self.steps = [self._phase_intro_step()]
-                self._journal_intro_dirty = True
-                self._journal_last_ledger = None
-                self._start_phase_branch()
+            if signal == "repair":
+                return self._handle_repair_signal(metadata)
+            if signal not in {"done", "blocked"}:
+                self.agent_logger.warning(f"Ignoring unknown phase signal: {signal}")
+                return None
+
+            claim_data = metadata.get("phase_claim")
+            gate_data = metadata.get("gate_result")
+            if not isinstance(claim_data, dict) or not isinstance(gate_data, dict):
+                self.agent_logger.warning("Ignoring unvalidated legacy terminal phase signal")
+                return None
+            try:
+                claim = PhaseClaim.from_metadata(claim_data)
+                gate = GateResult.from_metadata(gate_data, claim=claim)
+            except (TypeError, ValueError, PermissionError) as exc:
+                self.agent_logger.warning(f"Ignoring malformed phase validation metadata: {exc}")
+                return None
+            if claim.phase != machine.current_phase or claim.signal != signal:
+                self.agent_logger.warning("Ignoring a stale or mismatched phase claim")
+                return None
+            self._emit_control_gate(claim, gate)
+            if not gate.accepted:
+                self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
+                self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
+                return None
+            self._record_gate_facts(claim.phase, gate)
+            record = machine.close_attempt(gate)
+            state = getattr(self, "run_evidence_state", None)
+            if state is None:
+                raise RuntimeError("phase routing requires RunEvidenceState")
+            policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+            decision = policy.decide(
+                record,
+                state=state,
+                budgets=self._repair_budgets(),
+            )
+            self._apply_phase_decision(record, decision)
             return signal
         return None
 
@@ -736,9 +1381,9 @@ class ReActEngine(UIEventEmitter):
                     counts["tools_used"][tool_name] = counts["tools_used"].get(tool_name, 0) + 1
                 result = getattr(s, "tool_result", None)
                 if result is not None:
-                    if getattr(result, "success", False):
+                    if result.succeeded:
                         counts["successful_actions"] += 1
-                    else:
+                    elif result.operation_outcome is OperationOutcome.FAILED:
                         counts["failed_actions"] += 1
                         if tool_name:
                             counts["tool_failures"][tool_name] = (
@@ -793,7 +1438,15 @@ class ReActEngine(UIEventEmitter):
         evidence, never on inability to check."""
         validator = getattr(self, "physical_validator", None)
         if validator is None:
-            return {"ok": False, "reason": "no validator available", "suggestions": []}
+            return {
+                "ok": False,
+                "reason": "no validator available",
+                "suggestions": [],
+                "validator_state": ValidatorState.UNAVAILABLE.value,
+                "evidence_refs": [],
+                "validated_facts": {},
+                "code": "validator_unavailable",
+            }
         from .phase_gates import check_phase_done
 
         project_name = None
@@ -830,7 +1483,8 @@ class ReActEngine(UIEventEmitter):
                 content=(
                     f"EVIDENCE CHECK: the completion gate for phase '{machine.current_phase}' "
                     f"already passes on physical evidence. If you agree the objective is met, "
-                    f"claim phase(action='done', key_results=..., evidence=[refs]) now and move on. "
+                    f"claim phase(action='done', outcome='success', key_results=..., "
+                    f"evidence=[refs]) now. The engine will route from prerequisites. "
                     f"If you are pursuing something beyond this phase's objective, consider "
                     f"whether it belongs to a later phase or a note."
                 ),
@@ -840,11 +1494,7 @@ class ReActEngine(UIEventEmitter):
         return True
 
     def _enforce_phase_floors(self) -> bool:
-        """Force-finish the current phase ONLY when continuing would starve the
-        minimum floors of later phases (no per-phase quotas: build may consume
-        everything the easy phases saved). Round-5 vfs lesson: consult the
-        evidence gate first — green evidence auto-completes the phase as done;
-        only a failing gate records blocked."""
+        """Close a starved attempt honestly, then let transition policy route it."""
         machine = getattr(self, "phase_machine", None)
         if machine is None or machine.is_complete:
             return False
@@ -853,33 +1503,43 @@ class ReActEngine(UIEventEmitter):
         if remaining > reserved:
             return False
 
-        gate = self._phase_gate_check(phase)
-        if gate.get("ok"):
-            machine.mark_done(
-                f"auto-completed at floor exhaustion (remaining {remaining} iterations "
-                f"reserved for later phases); evidence gate passed",
-                [],
-            )
-            self._persist_phase_record(
-                phase, "completed", "auto-completed at floor exhaustion; evidence gate passed"
-            )
-        else:
-            machine.mark_blocked(
-                f"remaining {remaining} iterations are reserved for later phases "
-                f"({reserved} needed)",
-                [],
-            )
-            self._persist_phase_record(
-                phase, "failed", "remaining iterations reserved for later phases"
-            )
-        self._phase_iterations = 0
-        self.steps_since_context_switch = 0
-        if not machine.is_complete:
-            self._archive_window_steps()
-            self.steps = [self._phase_intro_step()]
-            self._journal_intro_dirty = True
-            self._journal_last_ledger = None
-            self._start_phase_branch()
+        probe = self._phase_gate_check(phase)
+        validator_state = ValidatorState(
+            probe.get("validator_state", ValidatorState.UNAVAILABLE.value)
+        )
+        claimed_outcome = {
+            ValidatorState.GREEN: PhaseOutcome.SUCCESS,
+            ValidatorState.PARTIAL: PhaseOutcome.PARTIAL,
+            ValidatorState.RED: PhaseOutcome.FAILED,
+            ValidatorState.UNAVAILABLE: PhaseOutcome.UNKNOWN,
+        }[validator_state]
+        claim = PhaseClaim(
+            phase=phase,
+            claimed_outcome=claimed_outcome,
+            key_results=(
+                f"attempt closed at floor exhaustion; {remaining} iterations remain and "
+                f"{reserved} are reserved for downstream work"
+            ),
+            evidence_refs=tuple(probe.get("evidence_refs") or ()),
+        )
+        gate = validate_phase_claim(
+            claim,
+            validator_state,
+            reason=str(probe.get("reason") or "phase budget exhausted"),
+            evidence_refs=tuple(probe.get("evidence_refs") or ()),
+            suggestions=tuple(probe.get("suggestions") or ()),
+            code=str(probe.get("code") or "phase_floor_exhausted"),
+            validated_facts=dict(probe.get("validated_facts") or {}),
+        )
+        self._emit_control_gate(claim, gate)
+        self._record_gate_facts(phase, gate)
+        record = machine.close_attempt(gate)
+        state = getattr(self, "run_evidence_state", None)
+        if state is None:
+            raise RuntimeError("phase routing requires RunEvidenceState")
+        policy = getattr(self, "transition_policy", None) or PhaseTransitionPolicy()
+        decision = policy.decide(record, state=state, budgets=self._repair_budgets())
+        self._apply_phase_decision(record, decision)
         return True
 
     def _persist_phase_record(self, phase_name: str, status: str, text: str) -> None:
@@ -999,12 +1659,47 @@ class ReActEngine(UIEventEmitter):
         except Exception as exc:
             logger.warning(f"Could not start phase branch context for {task_id}: {exc}")
 
+    def run_setup_loop(
+        self,
+        initial_prompt: str,
+        max_iterations: Optional[int] = None,
+    ) -> RunTermination:
+        """Run setup mode with a typed flow-close result."""
+        if self.phase_machine is None:
+            raise RuntimeError("run_setup_loop requires a phase machine")
+        result = self._run_react_loop(
+            initial_prompt,
+            max_iterations=max_iterations,
+            completion_mode="setup",
+        )
+        if not isinstance(result, RunTermination):
+            raise RuntimeError("setup loop exited without typed termination")
+        return result
+
     def run_react_loop(
         self,
         initial_prompt: str,
         max_iterations: Optional[int] = None,
         completion_mode: str = "setup",
     ) -> bool:
+        """Preserve the legacy free-form boolean contract."""
+        if completion_mode == "setup" and self.phase_machine is not None:
+            raise RuntimeError("setup callers must use run_setup_loop")
+        result = self._run_react_loop(
+            initial_prompt,
+            max_iterations=max_iterations,
+            completion_mode=completion_mode,
+        )
+        if isinstance(result, RunTermination):
+            raise RuntimeError("legacy loop exited with setup termination")
+        return bool(result)
+
+    def _run_react_loop(
+        self,
+        initial_prompt: str,
+        max_iterations: Optional[int] = None,
+        completion_mode: str = "setup",
+    ):
         """Run the main ReAct loop."""
         max_iter = max_iterations or self.max_iterations
         self._run_max_iterations = max_iter
@@ -1014,6 +1709,16 @@ class ReActEngine(UIEventEmitter):
         # Setup-mode phase machine: the engine drives provision→…→report and the
         # model signals with the phase tool. None (run-task mode) = legacy path.
         phase_mode = completion_mode == "setup" and self.phase_machine is not None
+        configured_scheduler = getattr(self, "reasoning_scheduler", None)
+        if phase_mode and configured_scheduler is not None:
+            self.reasoning_scheduler = ReasoningScheduler(
+                available_tools=self.tools,
+                heartbeat_actions=getattr(configured_scheduler, "heartbeat_actions", 5),
+            )
+            self._scheduler_active = True
+        else:
+            self._scheduler_active = False
+        self._scheduled_turn = None
 
         # Initialize with the initial prompt. In phase mode the window opens on
         # the phase intro digest instead of empty.
@@ -1059,6 +1764,8 @@ class ReActEngine(UIEventEmitter):
                         f"reached after {elapsed:.0f}s / {self.current_iteration} iterations"
                     )
                     self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="wall clock cap exceeded")
                     return False
 
                 # FLOOR RESERVATIONS (phase mode): force-block the current
@@ -1066,7 +1773,7 @@ class ReActEngine(UIEventEmitter):
                 # guaranteeing the run always reaches report and ends honestly.
                 if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
                     self._export_token_usage_csv()
-                    return self.phase_machine.overall_outcome() == "success"
+                    return self._close_flow(RunTerminationStatus.COMPLETED)
 
                 self.current_iteration += 1
                 self._phase_iterations += 1
@@ -1081,7 +1788,21 @@ class ReActEngine(UIEventEmitter):
 
                 # Get LLM response
                 wrapped_prompt = self.prompt_builder.build_mode_prompt(
-                    current_prompt, mode, workflow_mode=completion_mode
+                    current_prompt,
+                    mode,
+                    workflow_mode=completion_mode,
+                    planned_step=(
+                        self._scheduled_turn.step if self._scheduled_turn is not None else None
+                    ),
+                    reasoning_reasons=(
+                        self._scheduled_turn.reasons if self._scheduled_turn is not None else ()
+                    ),
+                    scheduler_fault=(
+                        str(self._scheduled_turn.fault)
+                        if self._scheduled_turn is not None
+                        and self._scheduled_turn.fault is not None
+                        else None
+                    ),
                 )
                 response = self.llm_client.get_response(wrapped_prompt, mode)
 
@@ -1089,6 +1810,8 @@ class ReActEngine(UIEventEmitter):
                     logger.error("Failed to get LLM response")
                     # Export token usage before early return due to failed LLM response
                     self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="LLM response unavailable")
                     return False
 
                 # Parse the response
@@ -1099,25 +1822,36 @@ class ReActEngine(UIEventEmitter):
                     was_thinking_model=is_thinking_step,
                 )
 
+                scheduler = self._active_reasoning_scheduler()
+                if scheduler is not None and self._scheduled_turn is not None:
+                    parsed_steps = self._prepare_scheduler_steps(
+                        response,
+                        parsed_steps,
+                        self._scheduled_turn,
+                    )
+
                 if not parsed_steps:
                     logger.warning("No valid steps parsed from LLM response")
                     logger.warning(f"Raw response was: {repr(response)}")
-                    continue
+                    if scheduler is None:
+                        continue
 
                 # Execute the steps
                 self._execute_steps(parsed_steps)
 
-                # PHASE SIGNALS (phase mode): a phase tool done/blocked advances
-                # the machine, persists the record, and resets the window. When
-                # the report phase ends, the machine — not the evaluator — ends
-                # the run with its honest overall outcome.
+                # PHASE SIGNALS (phase mode): the engine validates the claim,
+                # applies one policy route, persists its audit records, and
+                # resets the window. Report termination closes control flow;
+                # the already sealed snapshot remains the only run verdict.
                 if phase_mode:
                     self._handle_phase_signals(parsed_steps)
                     if self.phase_machine.is_complete:
-                        outcome = self.phase_machine.overall_outcome()
-                        self.agent_logger.info(f"All phases complete; overall outcome: {outcome}")
+                        termination = self.phase_machine.termination_state()
+                        self.agent_logger.info(
+                            f"All phases complete; flow termination: {termination}"
+                        )
                         self._export_token_usage_csv()
-                        return outcome == "success"
+                        return self._close_flow(RunTerminationStatus.COMPLETED)
                     # Mid-phase evidence nudge: when the gate already passes,
                     # tell the model — break rabbit holes with evidence.
                     self._maybe_nudge_phase_done()
@@ -1138,6 +1872,11 @@ class ReActEngine(UIEventEmitter):
 
                 # Check for task completion
                 if state_analysis.is_task_complete:
+                    if phase_mode:
+                        self.agent_logger.info(
+                            "Ignoring direct evaluator completion until setup flow-close"
+                        )
+                        continue
                     self.agent_logger.info("Task completed successfully")
                     # Export token usage before successful completion
                     self._export_token_usage_csv()
@@ -1152,7 +1891,7 @@ class ReActEngine(UIEventEmitter):
                     and step.tool_name == "manage_context"
                     and (step.tool_params or {}).get("action") == "complete_with_results"
                     and step.tool_result is not None
-                    and step.tool_result.success
+                    and step.tool_result.succeeded
                     for step in parsed_steps
                 )
                 if completed_task_this_iteration and self._check_progress_after_task():
@@ -1161,6 +1900,8 @@ class ReActEngine(UIEventEmitter):
                     )
                     # Export token usage before no-progress completion
                     self._export_token_usage_csv()
+                    if phase_mode:
+                        return self.abort(reason="no physical progress")
                     return False
 
                 # DEPRECATED: Legacy checks now handled by state_evaluator
@@ -1227,18 +1968,401 @@ class ReActEngine(UIEventEmitter):
             logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
             # Export token usage before max iterations completion
             self._export_token_usage_csv()
+            if phase_mode:
+                return self.abort(reason="iteration budget exhausted")
             return False
 
+        except KeyboardInterrupt:
+            logger.warning("ReAct loop cancelled by keyboard interrupt")
+            self._export_token_usage_csv()
+            if phase_mode:
+                return self.cancel(reason="keyboard interrupt")
+            return False
         except Exception as e:
             logger.error(f"ReAct loop failed: {e}", exc_info=True)
             # Export token usage before exception completion
             self._export_token_usage_csv()
+            if phase_mode:
+                return self.abort(reason=f"engine exception: {type(e).__name__}")
             return False
         finally:
+            self._scheduler_active = False
+            self._scheduled_turn = None
             self.state_evaluator.completion_mode = previous_completion_mode
+
+    def _record_setup_abort(self, phase_mode: bool, reason: str) -> None:
+        if phase_mode and not self.phase_machine.is_complete:
+            record = self.phase_machine.record_abort(reason, evidence=[])
+            self._record_phase_audit(record)
+
+    def _emit_control_event(self, kind: str, payload: Dict[str, Any]):
+        sink = getattr(self, "control_event_sink", None)
+        if sink is None:
+            return None
+        try:
+            return sink.emit(kind, compact_control_value(payload))
+        except Exception as exc:
+            logger.warning(f"Control-event emission failed for {kind}: {exc}")
+            return None
+
+    def _emit_control_scheduler_decision(self, turn: SchedulerTurn) -> None:
+        self._emit_control_event(
+            "scheduler_decision",
+            {
+                "mode": turn.mode.value,
+                "reasons": [reason.value for reason in turn.reasons],
+                "plan_index": turn.step.plan_index if turn.step is not None else None,
+            },
+        )
+
+    def _emit_control_planner_response(self, plan: CurrentPlan) -> None:
+        plan_payload = compact_control_value(plan.model_dump(mode="json"))
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        ordinal = getattr(scheduler, "thinking_turns", 0)
+        self._emit_control_event(
+            "planner_response",
+            {
+                "plan_id": f"plan-{ordinal:04d}",
+                "plan": plan_payload,
+                "response_sha256": canonical_sha256(plan_payload),
+            },
+        )
+
+    def _emit_control_planner_rejection(self, response: str, code: str) -> None:
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        ordinal = getattr(scheduler, "thinking_turns", 0)
+        self._emit_control_event(
+            "planner_response",
+            {
+                "plan_id": f"rejected-{code}-{ordinal:04d}",
+                "plan": {"rejected": True, "code": code},
+                "response_sha256": canonical_sha256(str(response)),
+            },
+        )
+
+    def _emit_control_action_envelope(
+        self,
+        tool: str,
+        params: Dict[str, Any],
+    ) -> str | None:
+        sink = getattr(self, "control_event_sink", None)
+        if sink is None or self._active_reasoning_scheduler() is None:
+            return None
+        turn = getattr(self, "_scheduled_turn", None)
+        step = turn.step if turn is not None else None
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        if step is None and scheduler is not None:
+            step = getattr(scheduler, "active_step", None)
+        if step is None:
+            logger.warning("Control envelope omitted because no scheduler action is active")
+            return None
+        safe_params = compact_control_value(params)
+        envelope_id = f"envelope-{sink.sequence + 1:06d}"
+        emitted = self._emit_control_event(
+            "action_envelope",
+            {
+                "envelope_id": envelope_id,
+                "plan_index": step.plan_index,
+                "tool": tool,
+                "exact_params": safe_params,
+                "envelope_sha256": action_envelope_sha256(
+                    plan_index=step.plan_index,
+                    tool=tool,
+                    exact_params=safe_params,
+                ),
+            },
+        )
+        if emitted is None:
+            return None
+        self._active_control_envelope_id = envelope_id
+        return envelope_id
+
+    @staticmethod
+    def _control_result_projection(result: ToolResult) -> Dict[str, Any]:
+        output_ref = result.output_ref or next(
+            (str(ref) for ref in [*result.evidence_refs, *result.refs] if ref),
+            None,
+        )
+        projection: Dict[str, Any] = {
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
+            "output": (
+                f"stored as {output_ref}"
+                if output_ref
+                else "output body omitted; verify output_sha256"
+            ),
+            "evidence_assessment": result.evidence_assessment.value,
+            "metadata": compact_control_value(result.metadata),
+            "evidence_refs": list(result.evidence_refs),
+            "conflicts": list(result.conflicts),
+            "validator_findings": [
+                finding.model_dump(mode="json") for finding in result.validator_findings
+            ],
+            "facts": compact_control_value(result.facts),
+            "refs": list(result.refs),
+        }
+        for name in (
+            "poll_ref",
+            "failure_signature",
+            "error_tail_preview",
+            "output_ref",
+            "error",
+            "error_code",
+        ):
+            value = getattr(result, name)
+            if value is not None:
+                projection[name] = compact_control_value(value)
+        if result.test_stats is not None:
+            projection["test_stats"] = result.test_stats.model_dump(mode="json")
+        return projection
+
+    def _emit_control_tool_result(
+        self,
+        *,
+        envelope_id: str | None,
+        execution_id: str,
+        tool: str,
+        params: Dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        if not envelope_id:
+            return
+        machine = getattr(self, "phase_machine", None)
+        safe_params = compact_control_value(params)
+        output_source = result.raw_output if result.raw_output is not None else result.output
+        self._emit_control_event(
+            "tool_result",
+            {
+                "envelope_id": envelope_id,
+                "execution_id": execution_id,
+                "tool": tool,
+                "params": safe_params,
+                "scope": self._tool_evidence_scope(tool, params).value,
+                "roles": [role.value for role in self._tool_evidence_roles(tool, params, result)],
+                "result": self._control_result_projection(result),
+                "source_phase": getattr(machine, "current_phase", "") or "",
+                "source_attempt_id": getattr(machine, "current_attempt_id", "") or "",
+                "output_sha256": hashlib.sha256(
+                    str(output_source or "").encode("utf-8", errors="replace")
+                ).hexdigest(),
+            },
+        )
+        self._active_control_envelope_id = None
+        resolved_commit = (result.metadata or {}).get("resolved_commit")
+        callback = getattr(self, "_target_repo_sha_callback", None)
+        if resolved_commit and callable(callback):
+            try:
+                callback(str(resolved_commit))
+            except Exception as exc:
+                logger.warning(f"Could not update target repository run pin: {exc}")
+
+    def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult) -> None:
+        validated_facts = compact_control_value(dict(gate.validated_facts))
+        self._emit_control_event(
+            "validator_observation",
+            {
+                "phase": claim.phase,
+                "validator_state": gate.validator_state.value,
+                "reason": gate.reason,
+                "evidence_refs": list(gate.evidence_refs),
+                "validated_facts": validated_facts,
+            },
+        )
+        self._emit_control_event(
+            "gate_decision",
+            {
+                "phase": claim.phase,
+                "signal": claim.signal,
+                "claimed_outcome": claim.claimed_outcome.value,
+                "validator_state": gate.validator_state.value,
+                "expected_accepted": gate.accepted,
+                "expected_outcome": gate.validated_outcome.value,
+                "reason": gate.reason,
+                "key_results": claim.key_results,
+                "evidence_refs": list(gate.evidence_refs),
+                "validated_facts": validated_facts,
+            },
+        )
+
+    def _emit_control_phase_transition(
+        self,
+        decision: TransitionDecision,
+        *,
+        repair_request: RepairRequest | None = None,
+    ) -> None:
+        self._emit_control_event(
+            "phase_transition",
+            {
+                "expected_kind": decision.route.kind,
+                "expected_target": decision.route.target,
+                "expected_reason_code": decision.reason_code,
+                "repair_request": (
+                    repair_request.to_metadata() if repair_request is not None else None
+                ),
+            },
+        )
+
+    def _emit_control_loop_decision(
+        self,
+        event: LoopEvent,
+        decision: LoopDecision,
+    ) -> None:
+        event_payload = asdict(event)
+        event_payload["relevant_state"] = {
+            getattr(scope, "value", str(scope)): value
+            for scope, value in event.relevant_state.items()
+        }
+        event_payload["recurrence_count"] = decision.recurrence_count
+        self._emit_control_event(
+            "loop_decision",
+            {
+                "event": event_payload,
+                "expected_decision": decision.decision,
+                "expected_reason_code": decision.reason_code,
+            },
+        )
+
+    def _active_reasoning_scheduler(self) -> ReasoningScheduler | None:
+        if not getattr(self, "_scheduler_active", False):
+            return None
+        scheduler = getattr(self, "reasoning_scheduler", None)
+        return scheduler if isinstance(scheduler, ReasoningScheduler) else None
+
+    def _request_scheduler_reasoning(
+        self,
+        trigger: ReasoningTrigger | str,
+    ) -> bool:
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is None:
+            return False
+        scheduler.request_reasoning(trigger)
+        return True
+
+    def _prepare_scheduler_steps(
+        self,
+        response: str,
+        parsed_steps: List[ReActStep],
+        turn: SchedulerTurn,
+    ) -> List[ReActStep]:
+        """Validate a model response against the scheduler before execution."""
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is None:
+            return parsed_steps
+
+        action_steps = [step for step in parsed_steps if step.step_type is StepType.ACTION]
+        thought_steps = [step for step in parsed_steps if step.step_type is StepType.THOUGHT]
+
+        if turn.mode is SchedulerMode.THINK:
+            if action_steps:
+                scheduler.reject_plan(
+                    PlanFault(
+                        code=PlanFaultCode.MALFORMED_PLAN,
+                        message="thinking response included an ACTION; no tool was executed",
+                    )
+                )
+                self._emit_control_planner_rejection(response, "thinking_included_action")
+            else:
+                try:
+                    plan = CurrentPlan.from_thinking_response(response)
+                    scheduler.accept_plan(self._canonicalize_scheduler_plan(plan))
+                    accepted = True
+                except PlanFault as fault:
+                    scheduler.reject_plan(fault)
+                    accepted = False
+                if accepted and scheduler.current_plan is not None:
+                    self._emit_control_planner_response(scheduler.current_plan)
+                else:
+                    self._emit_control_planner_rejection(response, "malformed_plan")
+            return thought_steps
+
+        if len(action_steps) == 1:
+            candidate = action_steps[0]
+            if candidate.tool_name is not None:
+                tool_name, tool_params = self._canonicalize_scheduler_action(
+                    candidate.tool_name,
+                    candidate.tool_params,
+                )
+                candidate.tool_name = tool_name
+                candidate.tool_params = tool_params
+                if scheduler.validate_actor_action(tool_name, tool_params):
+                    return [candidate]
+            else:
+                scheduler.validate_actor_action(None, candidate.tool_params)
+        else:
+            scheduler.validate_actor_action(None, None)
+
+        self._add_system_guidance(
+            "SCHEDULER FAULT: the actor response did not exactly match the resolved "
+            "CurrentPlan step. No tool was executed; reason again with exact parameters.",
+            priority=9,
+        )
+        return []
+
+    def _canonicalize_scheduler_plan(self, plan: CurrentPlan) -> CurrentPlan:
+        """Normalize planner parameters before they become the exact contract.
+
+        Function-calling schemas canonicalize actor parameters (for example
+        ``path`` to ``project_path`` and structured values to strings).  Doing
+        the same deterministic normalization when accepting the plan keeps the
+        authoritative prompt, strict comparison, emitted envelope, and actual
+        tool invocation on one representation.
+        """
+        normalized_steps = []
+        for step in plan.steps:
+            tool_name, normalized_params = self._canonicalize_scheduler_action(
+                step.tool,
+                dict(step.exact_params),
+            )
+            normalized_steps.append(
+                step.model_copy(update={"tool": tool_name, "exact_params": normalized_params})
+            )
+        return plan.model_copy(update={"steps": tuple(normalized_steps)})
+
+    def _canonicalize_scheduler_action(
+        self,
+        tool_name: str,
+        params: Mapping[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Put planner and actor actions on the same schema representation."""
+        raw_params = dict(params or {})
+        tools = getattr(self, "tools", None)
+        if not isinstance(tools, dict) or not tools:
+            return tool_name, raw_params
+
+        from .tool_parameters import ToolParameterNormalizer
+
+        normalizer = ToolParameterNormalizer(
+            tools=tools,
+            successful_states=getattr(self, "successful_states", {}),
+            repository_url=getattr(self, "repository_url", None),
+            repository_ref=getattr(self, "repository_ref", None),
+            logger=logger,
+        )
+        normalized_tool, aliased_params = normalizer.resolve_legacy_alias(
+            tool_name,
+            raw_params,
+        )
+        return normalized_tool, normalizer.validate_and_fix(normalized_tool, aliased_params)
 
     def _should_use_thinking_model(self) -> bool:
         """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""
+        scheduler = self._active_reasoning_scheduler()
+        if scheduler is not None:
+            self._scheduled_turn = scheduler.next_turn()
+            self._emit_control_scheduler_decision(self._scheduled_turn)
+            if self._scheduled_turn.mode is SchedulerMode.THINK:
+                logger.info(
+                    "Using thinking model for scheduler triggers: "
+                    + ", ".join(reason.value for reason in self._scheduled_turn.reasons)
+                )
+                return True
+            logger.info(
+                f"Using action model for planned step {self._scheduled_turn.step.plan_index + 1}"
+            )
+            return False
+
+        self._scheduled_turn = None
         # CRITICAL: Check if thinking model was requested after successful tool execution
         if self._force_thinking_after_success:
             self._force_thinking_after_success = False  # Reset the flag
@@ -1278,7 +2402,9 @@ class ReActEngine(UIEventEmitter):
         recent_errors = [
             s
             for s in recent_steps
-            if s.step_type == StepType.ACTION and s.tool_result and not s.tool_result.success
+            if s.step_type == StepType.ACTION
+            and s.tool_result
+            and s.tool_result.operation_outcome is OperationOutcome.FAILED
         ]
 
         if len(recent_errors) >= 2:  # Lower threshold for quicker analysis
@@ -1302,6 +2428,11 @@ class ReActEngine(UIEventEmitter):
             add_system_guidance=self._add_system_guidance,
             get_timestamp=self._get_timestamp,
             event_sink=self._handle_tool_lifecycle_event,
+            before_tool_execute=lambda call, params: self._emit_control_action_envelope(
+                call.name,
+                params,
+            ),
+            output_storage=self.output_storage,
             logger=logger,
         )
 
@@ -1342,18 +2473,324 @@ class ReActEngine(UIEventEmitter):
             model_used=step.model_used,
         )
 
-    def _apply_tool_execution_loop_effects(self, execution: ToolExecution) -> None:
-        """Apply loop-level side effects requested by orchestration metadata."""
+    def _execute_tool_call(self, call: ToolCall) -> ToolExecution:
+        """Execute one call and audit construction-time persistence failure."""
+        try:
+            return self._get_tool_orchestrator().execute(call)
+        except OutputPersistenceError as exc:
+            logger.error(f"Failed to construct durable result for {call.name}: {exc}")
+            state = getattr(self, "run_evidence_state", None)
+            if (
+                call.name == "report"
+                and state is not None
+                and state.sealed
+                and self._report_execution_allowed()
+            ):
+                return self._failed_report_persistence_execution(call, exc)
+            if (
+                state is not None
+                and not state.sealed
+                and call.name not in self._NON_EVIDENCE_TOOLS
+                and call.name != "report"
+            ):
+                for actual in exc.actual_executions:
+                    self._record_tool_execution(
+                        actual.tool_name,
+                        actual.params,
+                        actual.result,
+                        execution_id=actual.execution_id,
+                    )
+                tool_name = exc.tool_name or call.name
+                params = exc.params or call.validated_params or call.raw_params
+                scope = self._tool_evidence_scope(tool_name, params)
+                action = self._tool_evidence_action(params)
+                state.record_attempt(
+                    action=f"{tool_name}:{action}",
+                    relevant_scopes=[scope],
+                    outcome=(
+                        exc.draft.operation_outcome
+                        if exc.draft is not None
+                        else OperationOutcome.FAILED
+                    ),
+                    evidence_refs=(
+                        self._dedupe_strings([*exc.draft.evidence_refs, *exc.draft.refs])
+                        if exc.draft is not None
+                        else []
+                    ),
+                )
+                if exc.draft is not None:
+                    state.ingest_unpersisted_result(
+                        scope,
+                        tool_name,
+                        exc.draft,
+                        provenance=(f"tool:{tool_name}:{action}:output-persistence-failed"),
+                        roles=self._tool_evidence_roles(tool_name, params, exc.draft),
+                        execution_id=exc.execution_id or exc.draft.execution_id,
+                        params=params,
+                    )
+                state.record_conflict("output_storage_failed")
+            raise
+
+    def _loop_event_for_execution(self, execution: ToolExecution) -> LoopEvent:
+        result = execution.result
+        params = execution.executed_params or execution.validated_params or execution.raw_params
+        state = getattr(self, "run_evidence_state", None)
+        state_vector = (
+            state.state_vector(tuple(StateScope))
+            if state is not None
+            else {scope.value: 0 for scope in StateScope}
+        )
+        machine = getattr(self, "phase_machine", None)
+        metadata = result.metadata or {}
+        output_cursor = next(
+            (
+                str(metadata[key])
+                for key in ("output_cursor", "cursor", "bytes_read", "poll_sequence")
+                if metadata.get(key) not in (None, "")
+            ),
+            "",
+        )
+        evidence_ref = next(
+            (str(ref) for ref in [result.output_ref, *result.evidence_refs, *result.refs] if ref),
+            "",
+        )
+        return LoopEvent(
+            tool_name=execution.call.name,
+            args=params or {},
+            operation_outcome=result.operation_outcome.value,
+            error_code=result.error_code or "",
+            failure_signature=result.failure_signature or "",
+            relevant_state=state_vector,
+            phase=getattr(machine, "current_phase", "") or "",
+            attempt_id=getattr(machine, "current_attempt_id", "") or "",
+            iteration=getattr(self, "current_iteration", 0),
+            evidence_ref=evidence_ref,
+            invocation_status=result.invocation_status.value,
+            job_id=str(result.poll_ref or metadata.get("job_id") or ""),
+            output_cursor=output_cursor,
+        )
+
+    def _ensure_project_facts(self) -> str:
+        """Run the framework survey guarantee: 'created'|'present'|'failed'."""
+        orchestrator = getattr(
+            getattr(self, "physical_validator", None), "docker_orchestrator", None
+        )
+        if orchestrator is None:
+            return "failed"
+        try:
+            from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
+
+            analyzer = ProjectAnalyzerTool(orchestrator, self.context_manager)
+            return analyzer.ensure_facts("/workspace")
+        except Exception as exc:
+            logger.debug(f"framework survey unavailable: {exc}")
+            return "failed"
+
+    def _native_smoke_guidance(self, phase: str) -> Optional[str]:
+        """The native-not-built smoke steer for the test phase, or None.
+
+        Fires only for python-system repos flagged has_native_build whose build
+        phase ended without a success outcome.
+        """
+        if phase != "test":
+            return None
+        if not is_python_build_system(self._detected_build_system()):
+            return None
+        rec = self._build_recommendation()
+        if rec.get("has_native_build") and self._build_phase_lacked_success():
+            return NATIVE_NOT_BUILT_TEST_GUIDANCE
+        return None
+
+    def _build_phase_lacked_success(self) -> bool:
+        """True when the build phase's recorded outcome is anything but success.
+
+        Read from the phase machine's records (validated outcome first, the
+        legacy outcome as fallback). No build record yet -> False.
+        """
+        machine = getattr(self, "phase_machine", None)
+        for record in getattr(machine, "records", ()) or ():
+            if str(getattr(record, "phase", "")) != "build":
+                continue
+            validated = getattr(record, "validated_outcome", None)
+            outcome = getattr(validated, "value", validated) or getattr(
+                getattr(record, "outcome", None), "value", getattr(record, "outcome", None)
+            )
+            return str(outcome or "unknown") != "success"
+        return False
+
+    def _untried_island_targets(self, *, limit: int = 4) -> str:
+        """Recommended build islands with NO observed work yet, as one line.
+
+        A seven-step window means 'change approach' lands on an agent that may
+        no longer remember the alternatives (live bigtop 2026-07-18: it
+        hammered the one broken island for 7 calls while three healthy islands
+        sat untouched). The redirect must carry a destination.
+        """
+        try:
+            # Panel review P1: this allowlisted corrective loop must be
+            # IDENTICAL in both arms. The trunk recommendation is projected
+            # by treatment dim (b) (goals stripped in arm F), so the islands
+            # come from the shared MANIFEST — a mechanical field both arms
+            # keep, goals included.
+            orchestrator = getattr(
+                getattr(self, "physical_validator", None), "docker_orchestrator", None
+            )
+            if orchestrator is None:
+                return ""
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            islands = (read_build_requirements(orchestrator) or {}).get("build_islands") or []
+            if len(islands) < 2:
+                return ""
+            observed = [
+                str((getattr(obs, "params", None) or {}).get("working_directory") or "")
+                for obs in getattr(
+                    getattr(self, "run_evidence_state", None), "tool_observations", ()
+                )
+            ]
+            untried = [
+                isl
+                for isl in islands
+                if isl.get("root")
+                and not any(wd.startswith(str(isl["root"])) for wd in observed if wd)
+            ]
+            if not untried:
+                return ""
+            items = "; ".join(
+                f"{isl.get('system') or 'build'} '{isl.get('goal') or 'build'}' in {isl['root']}"
+                for isl in untried[:limit]
+            )
+            return f" Untried recommended islands: {items}."
+        except Exception:
+            return ""
+
+    def _loop_guidance(self, decision: LoopDecision) -> str:
+        attempts = ", ".join(decision.prior_attempt_ids) or "current run"
+        scopes = ", ".join(decision.missing_progress_scopes) or "declared scopes"
+        untried = self._untried_island_targets()
+        if decision.decision == "diversity_advisory":
+            return (
+                "ACTION DIVERSITY ADVISORY: many distinct actions have been tried in this "
+                "phase attempt. Consolidate evidence before expanding the search further."
+            )
+        if decision.decision == "force_break":
+            return (
+                "LOOP FORCE-BREAK ARMED: the identical action/outcome recurred four times "
+                f"with no progress in {scopes}. Prior attempts: {attempts}. Reason once, "
+                "then choose a materially different action; an immediate identical repeat "
+                f"will close this phase as failed.{untried}"
+            )
+        return (
+            "RECURRENCE WITHOUT PROGRESS: the same action and outcome recurred while "
+            f"{scopes} stayed unchanged. Prior attempts: {attempts}. Use the failure "
+            f"reference and choose a different hypothesis before retrying.{untried}"
+        )
+
+    def _record_loop_blocker(self, decision: LoopDecision) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        machine = getattr(self, "phase_machine", None)
+        if state is None or state.sealed:
+            return
+        state.record_blocker(
+            category="loop",
+            error_code="LOOP_WITHOUT_PROGRESS",
+            failure_signature=decision.blocker_signature,
+            evidence_ref=decision.failure_ref or None,
+            source_phase=getattr(machine, "current_phase", None),
+            source_attempt_id=getattr(machine, "current_attempt_id", None),
+        )
+
+    def _resolve_progressed_loop_blockers(self, decision: LoopDecision) -> None:
+        state = getattr(self, "run_evidence_state", None)
+        if state is None or state.sealed:
+            return
+        signatures = set(decision.resolved_blocker_signatures)
+        for blocker in state.blockers:
+            if blocker.status == "active" and blocker.failure_signature in signatures:
+                state.resolve_blocker(
+                    blocker.blocker_id,
+                    resolution="relevant state epoch progressed",
+                    evidence_ref=decision.failure_ref or None,
+                )
+
+    def _apply_tool_execution_loop_effects(
+        self,
+        execution: ToolExecution,
+    ) -> LoopDecision | None:
+        """Consume orchestrator metadata, then consult engine-owned loop memory."""
         metadata = execution.metadata or {}
 
         if metadata.get("force_thinking_next"):
-            self._force_thinking_next = True
+            if not self._request_scheduler_reasoning(ReasoningTrigger.LOOP_BREAKER):
+                self._force_thinking_next = True
 
         if metadata.get("invalidate_trunk_cache"):
             self.prompt_builder.invalidate_trunk_cache()
 
-        if metadata.get("force_next_task") and hasattr(self.context_manager, "force_next_task"):
-            self.context_manager.force_next_task()
+        memory = getattr(self, "loop_memory", None)
+        if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
+            return None
+        loop_event = self._loop_event_for_execution(execution)
+        decision = memory.observe(loop_event)
+        self._emit_control_loop_decision(loop_event, decision)
+        execution.metadata["loop_decision"] = decision.to_metadata()
+        self._resolve_progressed_loop_blockers(decision)
+        if decision.decision in {"guide", "force_break", "diversity_advisory"}:
+            priority = 9 if decision.decision == "force_break" else 7
+            if decision.decision == "diversity_advisory":
+                priority = 4
+            self._add_system_guidance(self._loop_guidance(decision), priority=priority)
+        if decision.decision == "force_break":
+            self._record_loop_blocker(decision)
+        if decision.request_thinking:
+            if not self._request_scheduler_reasoning(ReasoningTrigger.LOOP_BREAKER):
+                self._force_thinking_next = True
+        return decision
+
+    def _close_phase_for_loop(
+        self,
+        decision: LoopDecision,
+        execution: ToolExecution,
+    ) -> bool:
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if machine is None or state is None or state.sealed or machine.is_complete:
+            return False
+        refs = tuple(
+            self._dedupe_strings(
+                [
+                    decision.failure_ref,
+                    execution.result.output_ref,
+                    *execution.result.evidence_refs,
+                    *execution.result.refs,
+                ]
+            )
+        )
+        claim = PhaseClaim(
+            phase=machine.current_phase,
+            signal="done",
+            claimed_outcome=PhaseOutcome.FAILED,
+            reason="loop repeated after an engine force-break",
+            evidence_refs=refs,
+        )
+        gate = GateResult(
+            accepted=True,
+            validated_outcome=PhaseOutcome.FAILED,
+            claim_disposition=ClaimDisposition.CONFIRMED,
+            validator_state=ValidatorState.RED,
+            reason="identical typed failure recurred without relevant state progress",
+            evidence_refs=refs,
+            claim=claim,
+        )
+        self._emit_control_gate(claim, gate)
+        record = machine.close_attempt(gate)
+        route = self.transition_policy.decide(
+            record,
+            state=state,
+            budgets=self._repair_budgets(),
+        )
+        self._apply_phase_decision(record, route)
+        return True
 
     def _execute_steps(self, steps: List[ReActStep]) -> bool:
         """Execute a list of ReAct steps."""
@@ -1414,10 +2851,71 @@ class ReActEngine(UIEventEmitter):
 
                 branch_task_id = getattr(self.context_manager, "current_task_id", None)
                 call = self._build_tool_call_from_step(step)
-                execution = self._get_tool_orchestrator().execute(call)
-                result = execution.result
+                if self._evidence_execution_closed(call):
+                    execution = self._refused_closed_evidence_execution(call)
+                elif call.name == "report" and not self._report_execution_allowed():
+                    execution = self._refused_report_execution(call)
+                else:
+                    execution = self._execute_tool_call(call)
+                control_execution_id: str | None = None
+                if execution.actual_executions:
+                    result = execution.result
+                    recorded_executions = []
+                    for actual in execution.actual_executions:
+                        recorded = self._record_tool_execution(
+                            actual.tool_name,
+                            actual.params,
+                            actual.result,
+                            attempted_execution=True,
+                            execution_id=actual.execution_id,
+                        )
+                        recorded_executions.append(
+                            ActualToolExecution(
+                                tool_name=actual.tool_name,
+                                params=actual.params,
+                                result=recorded,
+                                execution_id=actual.execution_id,
+                            )
+                        )
+                        if actual.result is execution.result:
+                            result = recorded
+                            control_execution_id = actual.execution_id
+                    execution.actual_executions = recorded_executions
+                else:
+                    control_execution_id = new_execution_id()
+                    result = self._record_tool_execution(
+                        call.name,
+                        call.validated_params or call.raw_params,
+                        execution.result,
+                        attempted_execution=execution.attempted_execution,
+                        execution_id=control_execution_id,
+                    )
+                if result is not execution.result:
+                    execution.result = result
+                    execution.observation_text = format_tool_result(call.name, result)
                 step.tool_result = result
-                self._apply_tool_execution_loop_effects(execution)
+                control_envelope_id = (
+                    str(execution.metadata.get("control_envelope_id") or "") or None
+                )
+                if execution.validated_params is not None:
+                    control_params = execution.validated_params
+                elif call.validated_params is not None:
+                    control_params = call.validated_params
+                else:
+                    control_params = call.raw_params
+                if control_envelope_id is None:
+                    control_envelope_id = self._emit_control_action_envelope(
+                        call.name,
+                        control_params,
+                    )
+                self._emit_control_tool_result(
+                    envelope_id=control_envelope_id,
+                    execution_id=control_execution_id or new_execution_id(),
+                    tool=call.name,
+                    params=control_params,
+                    result=result,
+                )
+                loop_decision = self._apply_tool_execution_loop_effects(execution)
 
                 # Log tool result in verbose mode
                 if self.config.verbose:
@@ -1426,18 +2924,34 @@ class ReActEngine(UIEventEmitter):
                 # Add observation step with improved formatting
                 self._add_observation_step(execution.observation_text)
 
-                # CRITICAL: Force thinking after successful tool execution to prevent cognitive rush
-                evidence_status = coerce_evidence_status(result.status)
-                should_force_thinking = result.success or evidence_status in {
-                    EvidenceStatus.PARTIAL,
-                    EvidenceStatus.CONFLICT,
-                    EvidenceStatus.UNKNOWN,
-                }
-                if should_force_thinking:
-                    self._force_thinking_after_success = True
-                    logger.debug(
-                        f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
+                scheduler = self._active_reasoning_scheduler()
+                if scheduler is not None:
+                    scheduler.observe_result(result)
+                else:
+                    # Legacy run-task cadence: setup phase mode is owned by the
+                    # executable-plan scheduler above.
+                    evidence_assessment = result.evidence_assessment
+                    should_force_thinking = (
+                        result.invocation_status is InvocationStatus.PENDING
+                        or result.succeeded
+                        or evidence_assessment
+                        in {
+                            EvidenceAssessment.PARTIAL,
+                            EvidenceAssessment.CONFLICT,
+                            EvidenceAssessment.UNKNOWN,
+                        }
                     )
+                    if should_force_thinking:
+                        self._force_thinking_after_success = True
+                        logger.debug(
+                            f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
+                        )
+                    if loop_decision is not None and loop_decision.request_thinking:
+                        # LoopMemory owns this reasoning trigger.  Collapse the
+                        # generic success trigger so one decision yields exactly
+                        # one thinking step, never two consecutive forced turns.
+                        self._force_thinking_after_success = False
+                        self._force_thinking_next = True
 
                 # Log to branch context if we're in one
                 if branch_task_id:
@@ -1450,7 +2964,11 @@ class ReActEngine(UIEventEmitter):
 
                         # Store full output and get reference if output is large
                         stored_output_refs = []
-                        if len(output_to_store) > 800 and self.output_storage is not None:
+                        if (
+                            len(output_to_store) > 800
+                            and self.output_storage is not None
+                            and not result.output_ref
+                        ):
                             # Store the full output
                             ref_id = self.output_storage.store_output(
                                 task_id=self.context_manager.current_task_id,
@@ -1458,7 +2976,9 @@ class ReActEngine(UIEventEmitter):
                                 output=output_to_store,
                                 timestamp=timestamp,
                                 metadata={
-                                    "success": result.success,
+                                    "invocation_status": result.invocation_status.value,
+                                    "operation_outcome": result.operation_outcome.value,
+                                    "evidence_status": result.evidence_status.value,
                                     "iteration": self.current_iteration,
                                 },
                             )
@@ -1477,19 +2997,26 @@ class ReActEngine(UIEventEmitter):
                             "iteration": self.current_iteration,
                             "tool_name": step.tool_name,
                             "parameters": step.tool_params or {},
-                            "success": result.success,
+                            "succeeded": result.succeeded,
+                            "invocation_status": result.invocation_status.value,
+                            "operation_outcome": result.operation_outcome.value,
+                            "evidence_status": result.evidence_status.value,
                             "output": output_to_store,
                             "observation": execution.observation_text,
                             "output_refs": self._dedupe_strings(
                                 [
                                     *stored_output_refs,
+                                    result.output_ref,
                                     *self._output_refs_from_text(output_to_store),
                                 ]
                             ),
                         }
-                        # A dispatch-and-poll handoff is success=True but is NOT
-                        # build-execution evidence (the command is still
-                        # running); completion gates must be able to tell.
+                        for field_name in ("failure_signature", "error_tail_preview"):
+                            value = getattr(result, field_name)
+                            if value:
+                                history_entry[field_name] = value
+                        # A pending dispatch is not build-execution evidence;
+                        # completion gates must be able to tell.
                         dispatch_status = (result.metadata or {}).get("dispatch_status")
                         if dispatch_status:
                             history_entry["dispatch_status"] = dispatch_status
@@ -1499,6 +3026,21 @@ class ReActEngine(UIEventEmitter):
                         )
                     except Exception as e:
                         logger.warning(f"Failed to log action to branch history: {e}")
+
+                if (
+                    loop_decision is not None
+                    and loop_decision.close_phase
+                    and self._close_phase_for_loop(loop_decision, execution)
+                ):
+                    logger.debug("Stopping the action batch after loop-driven phase closure")
+                    break
+
+                phase_signal = (result.metadata or {}).get("phase_signal")
+                if phase_signal in {"done", "blocked", "repair"}:
+                    # The engine must apply the accepted proposal before any
+                    # later action can run under a new or closed prerequisite.
+                    logger.debug(f"Stopping the action batch at phase signal {phase_signal!r}")
+                    break
 
         return True
 
@@ -1534,7 +3076,7 @@ class ReActEngine(UIEventEmitter):
                 if action in context_changing_actions:
                     # Reset the counter regardless of success/failure
                     self.steps_since_context_switch = 0
-                    if result.success:
+                    if result.succeeded:
                         logger.info(
                             f"✅ Reset steps_since_context_switch counter after successful {action}"
                         )
@@ -1602,7 +3144,7 @@ class ReActEngine(UIEventEmitter):
                 # tool needed the output marker; the consolidated build tool's
                 # success already reflects the backend verdict.
                 build_succeeded = (
-                    result.success
+                    result.succeeded
                     if tool_name == "build"
                     else "BUILD SUCCESS" in (result.output or "")
                 )
@@ -1724,13 +3266,14 @@ class ReActEngine(UIEventEmitter):
         except Exception as e:
             logger.error(f"Failed to propagate working directory change: {e}")
 
-    def _track_tool_execution(self, tool_signature: str, success: bool):
+    def _track_tool_execution(self, tool_signature: str, result: ToolResult):
         """Track tool execution to detect repetitive patterns."""
-        execution_info = {
-            "signature": tool_signature,
-            "success": success,
-            "timestamp": self._get_timestamp(),
-        }
+        execution_info = ToolExecutionRecord(
+            signature=tool_signature,
+            invocation_status=result.invocation_status,
+            operation_outcome=result.operation_outcome,
+            timestamp=self._get_timestamp(),
+        )
 
         self.recent_tool_executions.append(execution_info)
 
@@ -1808,7 +3351,7 @@ class ReActEngine(UIEventEmitter):
                     step.step_type == StepType.ACTION
                     and step.tool_name == "maven"
                     and step.tool_result
-                    and step.tool_result.success
+                    and step.tool_result.succeeded
                 ):
 
                     output = step.tool_result.output or ""
@@ -1844,7 +3387,7 @@ class ReActEngine(UIEventEmitter):
                 step.step_type == StepType.ACTION
                 and step.tool_name == "report"
                 and step.tool_result
-                and step.tool_result.success
+                and step.tool_result.succeeded
             ):
                 return True
         return False
@@ -1976,7 +3519,10 @@ class ReActEngine(UIEventEmitter):
             "event": "tool_execution_result",
             "tool_name": tool_name,
             "iteration": self.current_iteration,
-            "success": result.success,
+            "succeeded": result.succeeded,
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
             "output_length": len(result.output) if result.output else 0,
             "full_output": result.output,  # Show full output instead of preview
             "error": result.error if hasattr(result, "error") else None,
@@ -2032,7 +3578,7 @@ class ReActEngine(UIEventEmitter):
                 continue
             tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
             result = getattr(s, "tool_result", None)
-            if result is not None and not getattr(result, "success", False):
+            if result is not None and result.operation_outcome is OperationOutcome.FAILED:
                 tool_failures[tool_name] = tool_failures.get(tool_name, 0) + 1
 
         return {
@@ -2054,7 +3600,7 @@ class ReActEngine(UIEventEmitter):
                 [
                     s
                     for s in self.steps
-                    if s.step_type == StepType.ACTION and s.tool_result and s.tool_result.success
+                    if s.step_type == StepType.ACTION and s.tool_result and s.tool_result.succeeded
                 ]
             )
             + archived.get("successful_actions", 0),
@@ -2064,7 +3610,7 @@ class ReActEngine(UIEventEmitter):
                     for s in self.steps
                     if s.step_type == StepType.ACTION
                     and s.tool_result
-                    and not s.tool_result.success
+                    and s.tool_result.operation_outcome is OperationOutcome.FAILED
                 ]
             )
             + archived.get("failed_actions", 0),

@@ -18,7 +18,7 @@ class FakeBackendTool:
 
     def __init__(self, result=None):
         self.calls = []
-        self.result = result or ToolResult(success=True, output="BUILD SUCCESS")
+        self.result = result or ToolResult.completed_success(output="BUILD SUCCESS")
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
@@ -70,7 +70,7 @@ def test_maven_project_routes_compile_to_maven_backend():
 
     result = tool.execute(action="compile", working_directory="/workspace/p")
 
-    assert result.success
+    assert result.succeeded
     assert maven.calls and maven.calls[0]["command"] == "compile"
     assert result.facts["system"] == "maven"
 
@@ -82,7 +82,7 @@ def test_build_marker_probe_quotes_working_directory_with_spaces():
 
     result = tool.execute(action="compile", working_directory="/workspace/project with spaces")
 
-    assert result.success
+    assert result.succeeded
     assert result.facts["system"] == "maven"
     assert maven.calls and maven.calls[0]["working_directory"] == "/workspace/project with spaces"
 
@@ -110,7 +110,7 @@ def test_unknown_system_returns_unknown_with_evidence():
     tool = _tool(set())
     result = tool.execute(action="compile", working_directory="/workspace/p")
 
-    assert result.verdict == "unknown"
+    assert result.operation_outcome.value == "unknown"
     assert "checked" in result.facts
     assert result.facts["checked"], "must list the markers probed"
 
@@ -119,8 +119,7 @@ def test_test_stats_surface_in_facts():
     from sag.evidence import TestStats
 
     maven = FakeBackendTool(
-        result=ToolResult(
-            success=True,
+        result=ToolResult.completed_success(
             output="tests done",
             test_stats=TestStats(executed=214, passed=206, failed=3, skipped=5),
         )
@@ -131,7 +130,17 @@ def test_test_stats_surface_in_facts():
 
     assert result.facts["executed"] == 214
     assert result.facts["passed"] == 206
-    assert result.verdict == "partial"  # failures present but pass rate >= threshold
+    assert result.operation_outcome.value == "partial"
+
+
+def test_maven_test_runs_the_full_verify_lifecycle():
+    maven = FakeBackendTool()
+    tool = _tool({"pom.xml"}, maven=maven)
+
+    tool.execute(action="test", working_directory="/w")
+
+    assert maven.calls[0]["command"] == "verify"
+    assert maven.calls[0]["fail_at_end"] is True
 
 
 def test_args_passthrough():

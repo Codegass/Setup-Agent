@@ -13,15 +13,27 @@ from sag.web.verdict import compose_verdict
 
 
 def test_detail_serializes_new_fields_camelcase():
-    d = ExecutionSessionDetail.model_validate({
-        "id": "S1", "workspace": "w", "title": "t", "status": "partial", "entry": "e",
-        "start": "now", "duration": "1s", "outcome": "⚠️ PARTIAL", "report": "ready",
-        "build": {"state": "success", "tool": "maven", "time": "2m", "note": ""},
-        "test": {"state": "partial", "pass": 1, "fail": 1, "skip": 0, "total": 2},
-        "evidence": [], "logs": [],
-        "verdict": {"tone": "attention", "headline": "x", "detail": None},
-        "model": "claude-sonnet-4.5", "steps": 6, "stepBudget": 40,
-    })
+    d = ExecutionSessionDetail.model_validate(
+        {
+            "id": "S1",
+            "workspace": "w",
+            "title": "t",
+            "status": "partial",
+            "entry": "e",
+            "start": "now",
+            "duration": "1s",
+            "outcome": "⚠️ PARTIAL",
+            "report": "ready",
+            "build": {"state": "success", "tool": "maven", "time": "2m", "note": ""},
+            "test": {"state": "partial", "pass": 1, "fail": 1, "skip": 0, "total": 2},
+            "evidence": [],
+            "logs": [],
+            "verdict": {"tone": "attention", "headline": "x", "detail": None},
+            "model": "claude-sonnet-4.5",
+            "steps": 6,
+            "stepBudget": 40,
+        }
+    )
     out = d.model_dump(mode="json", by_alias=True)
     assert out["verdict"]["tone"] == "attention"
     assert out["model"] == "claude-sonnet-4.5"
@@ -29,13 +41,23 @@ def test_detail_serializes_new_fields_camelcase():
 
 
 def test_new_fields_default_none():
-    d = ExecutionSessionDetail.model_validate({
-        "id": "S1", "workspace": "w", "title": "t", "status": "ok", "entry": "e",
-        "start": "now", "duration": "1s", "outcome": "", "report": "none",
-        "build": {"state": "success", "tool": "maven", "time": "", "note": ""},
-        "test": {"state": "none", "pass": 0, "fail": 0, "skip": 0, "total": 0},
-        "evidence": [], "logs": [],
-    })
+    d = ExecutionSessionDetail.model_validate(
+        {
+            "id": "S1",
+            "workspace": "w",
+            "title": "t",
+            "status": "ok",
+            "entry": "e",
+            "start": "now",
+            "duration": "1s",
+            "outcome": "",
+            "report": "none",
+            "build": {"state": "success", "tool": "maven", "time": "", "note": ""},
+            "test": {"state": "none", "pass": 0, "fail": 0, "skip": 0, "total": 0},
+            "evidence": [],
+            "logs": [],
+        }
+    )
     out = d.model_dump(mode="json", by_alias=True)
     assert out["verdict"] is None and out["model"] is None and out["stepBudget"] is None
 
@@ -46,9 +68,7 @@ def test_compose_verdict_reads_serialized_model_aliases():
     modulesBuilt) must line up with the models' serialization_alias values. A rename
     of any alias would silently drop a clause / mis-tone the verdict — lock it here."""
     verdict = compose_verdict(
-        build=BuildSummary(state="partial", tool="Maven").model_dump(
-            mode="json", by_alias=True
-        ),
+        build=BuildSummary(state="partial", tool="Maven").model_dump(mode="json", by_alias=True),
         test=TestSummary(pass_count=1186, fail_count=7, total=1205).model_dump(
             mode="json", by_alias=True
         ),
@@ -68,4 +88,10 @@ def test_compose_verdict_reads_serialized_model_aliases():
 def test_verdict_summary_model_roundtrips():
     v = VerdictSummary.model_validate({"tone": "success", "headline": "Build passed"})
     out = v.model_dump(mode="json", by_alias=True)
-    assert out == {"tone": "success", "headline": "Build passed", "detail": None}
+    assert out == {
+        "tone": "success",
+        "headline": "Build passed",
+        "detail": None,
+        "verdict": None,
+        "source": "derived",
+    }

@@ -55,7 +55,7 @@ def detect_jvm_binding_dir(project_type: Dict[str, Any], directory: str) -> Opti
         # Root-level build files are the python repo's own; only a build file
         # strictly below the root is a binding subdirectory.
         if path.startswith(root_prefix):
-            remainder = path[len(root_prefix):]
+            remainder = path[len(root_prefix) :]
             if "/" in remainder:  # e.g. "jvm/pom.xml" -> nested
                 return f"{root}/{remainder.rsplit('/', 1)[0]}"
     return None
@@ -371,9 +371,7 @@ class ProjectSetupTool(BaseTool):
         requested_ref = ref or legacy_branch
 
         # Build git clone command
-        clone_cmd = (
-            f"git clone {shlex.quote(repository_url)} {shlex.quote(target_directory)}"
-        )
+        clone_cmd = f"git clone {shlex.quote(repository_url)} {shlex.quote(target_directory)}"
 
         # Check if git is installed
         git_check = self.orchestrator.execute_command("which git", workdir=working_directory)
@@ -514,7 +512,7 @@ class ProjectSetupTool(BaseTool):
             output += f"• Analyze project structure: project(action='analyze')\n"
             output += f"• Use bash tool for custom setup commands\n"
 
-        return ToolResult(success=True, output=output, metadata=metadata)
+        return ToolResult.completed_success(output=output, metadata=metadata)
 
     def _checkout_ref(
         self,
@@ -543,9 +541,7 @@ class ProjectSetupTool(BaseTool):
         checkout_cmd = (
             f"git -C {shlex.quote(clone_path)} checkout --detach {shlex.quote(requested_ref)}"
         )
-        checkout_result = self.orchestrator.execute_command(
-            checkout_cmd, workdir=working_directory
-        )
+        checkout_result = self.orchestrator.execute_command(checkout_cmd, workdir=working_directory)
         if checkout_result["exit_code"] != 0:
             return self._handle_ref_checkout_error(
                 output=checkout_result.get("output", ""),
@@ -612,8 +608,7 @@ class ProjectSetupTool(BaseTool):
     ) -> ToolResult:
         """Return a clone result failure when the requested ref cannot be checked out."""
 
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error=f"Failed to check out repository ref '{requested_ref}'",
             error_code=error_code,
@@ -656,7 +651,7 @@ class ProjectSetupTool(BaseTool):
             for tool in project_type["suggested_tools"]:
                 output += f"  • {tool}\n"
 
-        return ToolResult(success=True, output=output, metadata=project_type)
+        return ToolResult.completed_success(output=output, metadata=project_type)
 
     def _detect_project_type_in_directory(self, directory: str) -> Dict[str, Any]:
         """Detect project type in a specific directory."""
@@ -699,7 +694,7 @@ class ProjectSetupTool(BaseTool):
             if not path.startswith(directory_prefix):
                 # Relative or unexpected shape: treat "bare-name" (no slash) as root.
                 return "/" not in path
-            return "/" not in path[len(directory_prefix):]
+            return "/" not in path[len(directory_prefix) :]
 
         root_files = [f for f in build_files if _is_root_file(f)]
         classify_files = root_files or build_files
@@ -1127,12 +1122,12 @@ class ProjectSetupTool(BaseTool):
             f"Python-primary repo ships a JVM binding at {binding_dir}; "
             f"additively provisioning Java+Maven (required Java: {java_version or 'default'})"
         )
-        return self._install_dependencies_for_project_type(
-            binding_type, binding_dir, java_version
-        )
+        return self._install_dependencies_for_project_type(binding_type, binding_dir, java_version)
 
     @staticmethod
-    def _merge_jvm_binding_result(python_result: Dict[str, Any], jvm_result: Dict[str, Any]) -> None:
+    def _merge_jvm_binding_result(
+        python_result: Dict[str, Any], jvm_result: Dict[str, Any]
+    ) -> None:
         """Fold an additive JVM-binding install into the python result in place.
 
         The overall install is a success only when python succeeded; the Java
@@ -1175,9 +1170,7 @@ class ProjectSetupTool(BaseTool):
 
         # Venv next. A provisioning pre-flight already created it (uv/apt).
         if not outcome.provisioned and not self._python_venv_exists(venv):
-            made = self.orchestrator.execute_command(
-                f"python3 -m venv {venv}", workdir=directory
-            )
+            made = self.orchestrator.execute_command(f"python3 -m venv {venv}", workdir=directory)
             if not made.get("success"):
                 return {
                     "success": False,
@@ -1218,8 +1211,7 @@ class ProjectSetupTool(BaseTool):
             logger.info(f"[setup] {ladder['note']}")
             output_lines.append(f"[setup] {ladder['note']}")
         commands = [
-            c.replace("{venv}", venv).replace("{dir}", directory)
-            for c in ladder["commands"]
+            c.replace("{venv}", venv).replace("{dir}", directory) for c in ladder["commands"]
         ]
         for cmd in commands:
             result = self.orchestrator.execute_command(cmd, workdir=directory)
@@ -1245,8 +1237,7 @@ class ProjectSetupTool(BaseTool):
         else:
             # Honest empty ladder: nothing declared means nothing installed.
             installed = (
-                f"Python venv at {venv}; no declared install commands found — "
-                "nothing installed"
+                f"Python venv at {venv}; no declared install commands found — " "nothing installed"
             )
         return {
             "success": True,
@@ -1575,8 +1566,7 @@ class ProjectSetupTool(BaseTool):
                 logger.info(f"✅ Verified git repository at: {target_directory}")
 
                 # Return success with the verification info
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=f"Repository cloned successfully to {target_directory}",
                     metadata={
                         "repository_url": repository_url,
@@ -1637,8 +1627,7 @@ class ProjectSetupTool(BaseTool):
                 "Check if git is properly installed and configured",
             ]
 
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error=f"Failed to clone repository: {repository_url}",
             error_code=error_code,
@@ -1789,8 +1778,7 @@ class ProjectSetupTool(BaseTool):
         project_type = self._detect_project_type_in_directory(working_directory)
 
         if project_type["type"] == "unknown":
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error="Cannot install dependencies: Unknown project type",
                 suggestions=[
@@ -1813,14 +1801,12 @@ class ProjectSetupTool(BaseTool):
             )
 
             if result["success"]:
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output=f"✅ Dependencies installed successfully for {project_type['type']} project!\n\nInstalled: {result['installed']}",
                     metadata=result,
                 )
             else:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output="",
                     error=result["error"],
                     suggestions=[
@@ -1884,7 +1870,9 @@ class ProjectSetupTool(BaseTool):
             output += f"2. Install packages: npm(command='install')\n"
             output += f"3. Run build: npm(command='run build')\n"
         elif project_type["type"] == "python":
-            output += f"1. Set up the Python environment: project_setup(action='install_dependencies')\n"
+            output += (
+                f"1. Set up the Python environment: project_setup(action='install_dependencies')\n"
+            )
             output += f"2. Install packages into ./.venv: build(action='deps')\n"
             output += f"3. Run tests: build(action='test')\n"
         else:
@@ -1892,8 +1880,7 @@ class ProjectSetupTool(BaseTool):
             output += f"2. Use bash tool for custom setup commands\n"
             output += f"3. Check project documentation for setup instructions\n"
 
-        return ToolResult(
-            success=True,
+        return ToolResult.completed_success(
             output=output,
             metadata={
                 "project_type": project_type,

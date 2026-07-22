@@ -1,0 +1,41 @@
+{
+  "build_goal": "deps",
+  "build_islands": [],
+  "build_root": "/workspace/pyyaml",
+  "fail_at_end": false,
+  "has_c_extensions": true,
+  "has_native_build": false,
+  "java_version": null,
+  "java_version_enforced": false,
+  "java_version_source": null,
+  "python_constraint": ">=3.8",
+  "python_constraint_source": "setup.py",
+  "python_install_commands": [
+    "{venv}/bin/python -m pip install -e ."
+  ],
+  "python_install_note": "no test extras declared \u2014 test deps may be missing",
+  "python_install_source": "pyproject.toml",
+  "python_installer": "pip",
+  "python_packages": [
+    "_yaml",
+    "yaml"
+  ],
+  "python_venv": "/workspace/pyyaml/.venv",
+  "python_version": "3.13",
+  "root_shape": "single_module",
+  "survey": {
+    "analyzer_version": 7,
+    "config_fingerprint": "1804410504 137 L2977537469",
+    "project_path": "/workspace/pyyaml"
+  },
+  "test_fail_at_end": false,
+  "test_hints": {
+    "pytest_args": null,
+    "test_deps": [
+      "Cython"
+    ]
+  },
+  "test_islands": [],
+  "test_root": "/workspace/pyyaml",
+  "test_system": "pytest"
+}

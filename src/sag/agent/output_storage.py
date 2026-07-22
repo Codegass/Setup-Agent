@@ -14,7 +14,129 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
+from sag.tools.base import (
+    OutputPersistenceError,
+    ToolResult,
+    bind_tool_result_output_storage,
+    canonical_full_output_source,
+    is_output_storage_ref,
+)
 from sag.utils.container_io import write_container_text
+
+
+class OutputDurabilityError(OutputPersistenceError):
+    """Raised when no validated durable home can be established for output."""
+
+
+def _output_round_trips(storage: Any, ref: str, output: str) -> bool:
+    if not is_output_storage_ref(ref):
+        return False
+    try:
+        return storage.retrieve_output(ref) == output
+    except Exception as exc:
+        logger.warning(f"Failed to validate output reference {ref}: {exc}")
+        return False
+
+
+def _with_validated_output_ref(
+    result: ToolResult,
+    storage: Any,
+    *,
+    ref: str,
+    task_id: str,
+    tool_name: str,
+) -> ToolResult:
+    payload = result.model_dump(mode="python")
+    payload["output_ref"] = ref
+    with bind_tool_result_output_storage(
+        storage,
+        task_id=task_id,
+        tool_name=tool_name,
+    ):
+        return ToolResult.model_validate(payload)
+
+
+def attach_durable_output_ref(
+    result: ToolResult,
+    storage: "OutputStorageManager",
+    *,
+    task_id: str,
+    tool_name: str,
+) -> ToolResult:
+    """Return a detached result whose full output has durable provenance."""
+    output = canonical_full_output_source(
+        raw_output=result.raw_output,
+        output=result.output,
+        error=result.error,
+    )
+    if result.output_ref:
+        if _output_round_trips(storage, result.output_ref, output):
+            return result
+        logger.warning(
+            f"Re-persisting inaccessible output reference {result.output_ref} for {tool_name}"
+        )
+    metadata = {
+        "invocation_status": result.invocation_status.value,
+        "operation_outcome": result.operation_outcome.value,
+        "evidence_status": result.evidence_status.value,
+        "error_code": result.error_code,
+        "failure_signature": result.failure_signature,
+    }
+    failures: list[str] = []
+    persistence_methods = (
+        ("primary", getattr(storage, "store_output", None)),
+        ("emergency", getattr(storage, "store_emergency_output", None)),
+    )
+    for label, persist in persistence_methods:
+        if not callable(persist):
+            failures.append(f"{label} persistence is unavailable")
+            continue
+        try:
+            ref = persist(
+                task_id=task_id,
+                tool_name=tool_name,
+                output=output,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            failures.append(f"{label} persistence raised {type(exc).__name__}")
+            continue
+        if not is_output_storage_ref(ref):
+            failures.append(f"{label} persistence returned no durable reference")
+            continue
+        if not _output_round_trips(storage, ref, output):
+            failures.append(f"{label} tool output reference is not immediately retrievable")
+            continue
+        try:
+            return _with_validated_output_ref(
+                result,
+                storage,
+                ref=ref,
+                task_id=task_id,
+                tool_name=tool_name,
+            )
+        except (TypeError, ValueError) as exc:
+            failures.append(f"{label} result validation raised {type(exc).__name__}")
+
+    raise OutputDurabilityError(
+        "primary and emergency output persistence failed: " + "; ".join(failures)
+    )
+
+
+def atomic_write_container_text(orchestrator, path: str, content: str) -> None:
+    """Persist exact text with a temp write followed by an atomic rename."""
+    tmp_path = f"{path}.tmp"
+    if not write_container_text(orchestrator, tmp_path, content):
+        raise OSError(f"failed to write temporary file {tmp_path}")
+
+    # write_container_text appends one newline for JSONL callers. Remove only
+    # that helper-owned byte so canonical JSON bytes and returned JSON match.
+    trim_result = orchestrator.execute_command(f"truncate -s -1 {tmp_path}")
+    if not (trim_result.get("exit_code") == 0 or trim_result.get("success")):
+        raise OSError(f"failed to finalize temporary file {tmp_path}")
+    rename_result = orchestrator.execute_command(f"mv {tmp_path} {path}")
+    if not (rename_result.get("exit_code") == 0 or rename_result.get("success")):
+        raise OSError(f"failed to atomically rename {tmp_path} to {path}")
 
 
 class OutputStorageManager:
@@ -114,7 +236,7 @@ class OutputStorageManager:
                         return json.load(f)
                 except Exception as e:
                     logger.warning(f"Failed to load output index: {e}")
-        return {}
+        return self._rebuild_index_from_storage()
 
     def _save_index(self):
         """Save the current index to disk."""
@@ -122,19 +244,77 @@ class OutputStorageManager:
             if self.orchestrator:
                 index_json = json.dumps(self.current_index, indent=2)
                 if not self._write_container_text(self.container_index_file, index_json):
-                    logger.error("Failed to save index to container")
+                    raise OSError("failed to save output index to container")
             else:
                 # Local filesystem fallback
                 with open(self.index_file, "w") as f:
                     json.dump(self.current_index, f, indent=2)
-        except Exception as e:
-            logger.error(f"Failed to save output index: {e}")
+        except Exception as exc:
+            raise OSError(f"failed to save output index: {exc}") from exc
 
     def _write_container_text(self, path: str, content: str, *, append: bool = False) -> bool:
         # Delegate to the shared writer: it keeps the fast single-command heredoc
         # for small content and streams large content as base64 chunks, so a big
         # payload never trips the kernel per-arg limit ("argument list too long").
         return write_container_text(self.orchestrator, path, content, append=append)
+
+    @staticmethod
+    def _index_entry(record: Dict[str, Any], line_number: int) -> Dict[str, Any]:
+        output = str(record.get("output") or "")
+        return {
+            "task_id": record.get("task_id"),
+            "tool_name": record.get("tool_name"),
+            "timestamp": record.get("timestamp"),
+            "output_length": record.get("output_length", len(output)),
+            "line_number": line_number,
+            "first_100_chars": output[:100],
+            "last_100_chars": output[-100:] if len(output) > 100 else output,
+            "metadata": record.get("metadata") or {},
+        }
+
+    def _read_storage_line(self, line_number: int) -> Optional[Dict[str, Any]]:
+        try:
+            if self.orchestrator:
+                result = self.orchestrator.execute_command(
+                    f"sed -n '{line_number}p' {self.container_storage_file}"
+                )
+                if result.get("exit_code") != 0 or not result.get("output"):
+                    return None
+                return json.loads(result["output"])
+
+            if not self.storage_file.exists():
+                return None
+            with open(self.storage_file, "r") as storage_file:
+                for current, line in enumerate(storage_file, 1):
+                    if current == line_number:
+                        return json.loads(line)
+        except Exception as exc:
+            logger.warning(f"Failed to read output storage line {line_number}: {exc}")
+        return None
+
+    def _rebuild_index_from_storage(self) -> Dict[str, Dict[str, Any]]:
+        """Recover searchable metadata from the append-only JSONL source of truth."""
+        rebuilt: Dict[str, Dict[str, Any]] = {}
+        for line_number in range(1, self._count_lines_in_file() + 1):
+            record = self._read_storage_line(line_number)
+            if not isinstance(record, dict):
+                continue
+            ref_id = record.get("ref_id")
+            if not is_output_storage_ref(ref_id):
+                continue
+            rebuilt[ref_id] = self._index_entry(record, line_number)
+        return rebuilt
+
+    def _index_may_be_stale(self) -> bool:
+        indexed_line = max(
+            (
+                int(info.get("line_number", 0) or 0)
+                for info in self.current_index.values()
+                if isinstance(info, dict)
+            ),
+            default=0,
+        )
+        return self._count_lines_in_file() > indexed_line
 
     def store_output(
         self,
@@ -224,8 +404,98 @@ class OutputStorageManager:
             "metadata": metadata or {},
         }
 
-        self._save_index()
+        try:
+            self._save_index()
+        except OSError as exc:
+            recovered = self._rebuild_index_from_storage()
+            if ref_id not in recovered:
+                raise OSError(
+                    f"output index persistence failed and JSONL recovery lost {ref_id}"
+                ) from exc
+            self.current_index = recovered
+            logger.warning(f"Output index write failed; using JSONL recovery: {exc}")
         logger.debug(f"Stored full output with ref_id: {ref_id} ({len(output)} chars)")
+        return ref_id
+
+    def _emergency_path(self, ref_id: str) -> Path:
+        return self.storage_dir / f"emergency-{ref_id}.json"
+
+    def _container_emergency_path(self, ref_id: str) -> str:
+        return f"{self.container_storage_dir}/emergency-{ref_id}.json"
+
+    def _read_emergency_record(self, ref_id: str) -> Optional[Dict[str, Any]]:
+        if not ref_id.startswith("output_emergency_") or not is_output_storage_ref(ref_id):
+            return None
+        try:
+            if self.orchestrator:
+                path = self._container_emergency_path(ref_id)
+                result = self.orchestrator.execute_command(f"test -f {path} && cat {path}")
+                if result.get("exit_code") != 0 or not result.get("output"):
+                    return None
+                record = json.loads(result["output"])
+            else:
+                path = self._emergency_path(ref_id)
+                if not path.is_file():
+                    return None
+                record = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning(f"Failed to read emergency output record {ref_id}: {exc}")
+            return None
+        if not isinstance(record, dict) or record.get("ref_id") != ref_id:
+            return None
+        return record
+
+    def store_emergency_output(
+        self,
+        task_id: str,
+        tool_name: str,
+        output: str,
+        timestamp: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Store one content-addressed record outside the primary JSONL/index pair."""
+        identity = {
+            "task_id": task_id,
+            "tool_name": tool_name,
+            "timestamp": timestamp,
+            "output_length": len(output),
+            "output": output,
+            "metadata": metadata or {},
+            "storage_mode": "emergency",
+        }
+        canonical_identity = json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        )
+        digest = hashlib.sha256(canonical_identity.encode("utf-8")).hexdigest()[:24]
+        ref_id = f"output_emergency_{digest}"
+        record_json = json.dumps(
+            {"ref_id": ref_id, **identity},
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            default=str,
+        )
+
+        try:
+            if self.orchestrator:
+                atomic_write_container_text(
+                    self.orchestrator,
+                    self._container_emergency_path(ref_id),
+                    record_json,
+                )
+            else:
+                path = self._emergency_path(ref_id)
+                temp_path = path.with_suffix(f"{path.suffix}.tmp")
+                temp_path.write_text(record_json, encoding="utf-8")
+                temp_path.replace(path)
+        except Exception as exc:
+            raise OSError(f"failed to store emergency output {ref_id}: {exc}") from exc
+
+        logger.warning(f"Stored output in emergency record: {ref_id}")
         return ref_id
 
     def _count_lines_in_file(self) -> int:
@@ -261,6 +531,10 @@ class OutputStorageManager:
         Returns:
             The full output text, or None if not found
         """
+        emergency_record = self._read_emergency_record(ref_id)
+        if emergency_record is not None:
+            return str(emergency_record.get("output") or "")
+
         if ref_id not in self.current_index:
             # current_index is an in-memory cache populated at construction time.
             # Another OutputStorageManager instance (e.g. the build tool's own
@@ -272,8 +546,11 @@ class OutputStorageManager:
             self.current_index = self._load_index()
 
         if ref_id not in self.current_index:
-            logger.warning(f"Reference ID not found in index: {ref_id}")
-            return None
+            if self._index_may_be_stale():
+                self.current_index = self._rebuild_index_from_storage()
+            if ref_id not in self.current_index:
+                logger.warning(f"Reference ID not found in index or JSONL: {ref_id}")
+                return None
 
         index_info = self.current_index[ref_id]
         line_number = index_info.get("line_number", 0)
@@ -281,11 +558,8 @@ class OutputStorageManager:
         try:
             if self.orchestrator:
                 # Retrieve from container using container path
-                retrieve_cmd = f"sed -n '{line_number}p' {self.container_storage_file}"
-                retrieve_result = self.orchestrator.execute_command(retrieve_cmd)
-
-                if retrieve_result.get("exit_code") == 0 and retrieve_result.get("output"):
-                    record = json.loads(retrieve_result["output"])
+                record = self._read_storage_line(line_number)
+                if record and record.get("ref_id") == ref_id:
                     return record.get("output", "")
             else:
                 # Local filesystem fallback
@@ -298,6 +572,15 @@ class OutputStorageManager:
             logger.error(f"Failed to retrieve output: {e}")
 
         return None
+
+    def has_output_ref(self, ref_id: str) -> bool:
+        """Check the primary index or deterministic emergency record."""
+        if self._read_emergency_record(ref_id) is not None:
+            return True
+        self.current_index = self._load_index()
+        if ref_id not in self.current_index and self._index_may_be_stale():
+            self.current_index = self._rebuild_index_from_storage()
+        return ref_id in self.current_index
 
     def search_outputs(
         self,
@@ -325,6 +608,8 @@ class OutputStorageManager:
         # retrieve_output). Without this, search/list miss build outputs written by
         # the build tool's separate manager.
         self.current_index = self._load_index()
+        if self._index_may_be_stale():
+            self.current_index = self._rebuild_index_from_storage()
 
         # First, filter by index criteria
         candidates = []

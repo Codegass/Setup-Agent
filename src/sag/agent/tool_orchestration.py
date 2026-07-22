@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import re
 import time
 from dataclasses import dataclass, field
@@ -11,16 +10,26 @@ from typing import Any, Callable, Dict, Literal, MutableSequence, Optional
 
 from loguru import logger as default_logger
 
-from sag.evidence import EvidenceStatus, coerce_evidence_status
-from sag.tools.base import BaseTool, ToolResult
+from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
+from sag.tools.base import (
+    ActualToolExecution,
+    BaseTool,
+    OutputPersistenceError,
+    ToolResult,
+    bind_tool_result_output_storage,
+    new_execution_id,
+)
 
 ParameterFixSource = Literal["schema_alias", "default", "state_injection", "safety_fix"]
 ToolExecutionStatus = Literal[
     "success",
+    "pending",
+    "partial",
+    "unknown",
+    "skipped",
     "failure",
     "missing_tool",
     "validation_failed",
-    "repetition_blocked",
     "recovery_attempted",
     "recovered",
     "recovery_failed",
@@ -58,10 +67,11 @@ class ToolCall:
     model_used: Optional[str] = None
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class ToolExecutionRecord:
     signature: str
-    success: bool
+    invocation_status: InvocationStatus
+    operation_outcome: OperationOutcome
     timestamp: str
 
 
@@ -72,6 +82,7 @@ class RecoveryDecision:
     guidance: Optional[str] = None
     replacement_result: Optional[ToolResult] = None
     replacement_params: Optional[Dict[str, Any]] = None
+    replacement_tool_name: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -88,6 +99,7 @@ class ToolExecution:
     recovery_applied: bool = False
     recovery_strategy: Optional[str] = None
     attempted_execution: bool = False
+    actual_executions: list[ActualToolExecution] = field(default_factory=list)
     parameter_fixes: list[ParameterFix] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -133,13 +145,9 @@ def _format_maven_version_contract(result: ToolResult) -> str:
 
 
 def _format_evidence_observation(result: ToolResult) -> list[str]:
-    normalized_status = (
-        ToolResult._status_from_success(result.success)
-        if result.status is None
-        else coerce_evidence_status(result.status)
-    )
+    normalized_status = result.evidence_assessment
     include_status = bool(
-        normalized_status != EvidenceStatus.SUCCESS
+        normalized_status != EvidenceAssessment.SUCCESS
         or result.evidence_refs
         or result.conflicts
         or result.test_stats
@@ -161,17 +169,21 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
     """Format tool result for observation. Output truncation is now handled in BaseTool."""
     evidence_lines = _format_evidence_observation(result)
 
-    if result.success:
-        # For successful results, preserve key status information
-        verdict = getattr(result, "verdict", None) or "success"
-        if (result.metadata or {}).get("dispatch_status") == "running_detached":
-            # A handoff is not a completed command — don't announce success.
-            formatted = f"⏳ {tool_name} dispatched — command still running in background"
-        elif verdict == "success":
+    if result.operation_outcome is not OperationOutcome.FAILED:
+        if result.invocation_status is InvocationStatus.PENDING:
+            if result.metadata.get("dispatch_status") == "liveness_unknown_detached":
+                formatted = (
+                    f"⏳ {tool_name} dispatched — command liveness is unknown; "
+                    f"poll existing job {result.poll_ref}"
+                )
+            else:
+                formatted = f"⏳ {tool_name} dispatched — command still running in background"
+        elif result.succeeded:
             formatted = f"✅ {tool_name} executed successfully"
         else:
-            icon = {"partial": "⚠️", "running": "⏳", "unknown": "❔", "skipped": "⏭"}.get(verdict, "✅")
-            formatted = f"{icon} {tool_name} result: {verdict.upper()}"
+            outcome = result.operation_outcome.value
+            icon = {"partial": "⚠️", "unknown": "❔", "skipped": "⏭"}.get(outcome, "✅")
+            formatted = f"{icon} {tool_name} result: {outcome.upper()}"
 
         if evidence_lines:
             formatted += "\n" + "\n".join(evidence_lines)
@@ -229,6 +241,12 @@ def format_tool_result(tool_name: str, result: ToolResult) -> str:
 
         if result.error_code:
             formatted += f"\nError code: {result.error_code}"
+        if result.failure_signature:
+            formatted += f"\nFailure signature: {result.failure_signature}"
+        if result.error_tail_preview:
+            formatted += f"\nError tail: {result.error_tail_preview}"
+        if result.output_ref:
+            formatted += f"\nFull output ref: {result.output_ref}"
 
         # Add full raw output if available and error message is unclear (and no specific output was provided)
         if (
@@ -251,11 +269,13 @@ class ToolOrchestrator:
         successful_states: Dict[str, Any],
         repository_url: Optional[str],
         repository_ref: Optional[str] = None,
-        track_tool_execution: Callable[[str, bool], None],
+        track_tool_execution: Callable[[str, ToolResult], None],
         update_successful_states: Callable[[str, Dict[str, Any], ToolResult], None],
         add_system_guidance: Callable[[str, GuidancePriority], None],
         get_timestamp: Callable[[], str],
         event_sink: Optional[Callable[[ToolLifecycleEvent], None]] = None,
+        before_tool_execute: Optional[Callable[[ToolCall, Dict[str, Any]], Any]] = None,
+        output_storage: Any = None,
         logger: Any = None,
     ):
         from sag.agent.tool_parameters import ToolParameterNormalizer
@@ -272,6 +292,8 @@ class ToolOrchestrator:
         self.add_system_guidance = add_system_guidance
         self.get_timestamp = get_timestamp
         self.event_sink = event_sink
+        self.before_tool_execute = before_tool_execute
+        self.output_storage = output_storage
         self.logger = logger or default_logger
         self.parameter_normalizer = ToolParameterNormalizer(
             tools=self.tools,
@@ -290,6 +312,48 @@ class ToolOrchestrator:
             logger=self.logger,
         )
 
+    @classmethod
+    def _flatten_actual_execution(
+        cls,
+        tool_name: str,
+        params: Dict[str, Any],
+        result: ToolResult,
+        *,
+        include_untraced: bool = True,
+        execution_id: str | None = None,
+        _seen_executions: dict[str, ActualToolExecution] | None = None,
+    ) -> list[ActualToolExecution]:
+        seen = _seen_executions if _seen_executions is not None else {}
+        if not result.execution_trace:
+            if not include_untraced:
+                return []
+            actual = ActualToolExecution(
+                tool_name=tool_name,
+                params=dict(params),
+                result=result,
+                execution_id=execution_id or new_execution_id(),
+            )
+            existing = seen.get(actual.execution_id)
+            if existing is not None:
+                if not existing.is_exact_replay_of(actual):
+                    raise ValueError(f"conflicting execution_id {actual.execution_id}")
+                return []
+            seen[actual.execution_id] = actual
+            return [actual]
+
+        flattened: list[ActualToolExecution] = []
+        for actual in result.execution_trace:
+            flattened.extend(
+                cls._flatten_actual_execution(
+                    actual.tool_name,
+                    actual.params,
+                    actual.result,
+                    execution_id=actual.execution_id,
+                    _seen_executions=seen,
+                )
+            )
+        return flattened
+
     def _recommended_workdir(self, action: str) -> Optional[str]:
         """Analyzer's recommended reactor root for a build/test call, or None.
 
@@ -300,9 +364,7 @@ class ToolOrchestrator:
         """
         try:
             trunk = self.context_manager.load_trunk_context()
-            rec = (getattr(trunk, "environment_summary", None) or {}).get(
-                "build_recommendation"
-            )
+            rec = (getattr(trunk, "environment_summary", None) or {}).get("build_recommendation")
         except Exception:
             return None
         if not rec:
@@ -311,6 +373,17 @@ class ToolOrchestrator:
         return root or None
 
     def execute(self, call: ToolCall) -> ToolExecution:
+        if self.output_storage is None:
+            return self._execute(call)
+        task_id = str(getattr(self.context_manager, "current_task_id", None) or call.name)
+        with bind_tool_result_output_storage(
+            self.output_storage,
+            task_id=task_id,
+            tool_name=call.name,
+        ):
+            return self._execute(call)
+
+    def _execute(self, call: ToolCall) -> ToolExecution:
         started_at = time.perf_counter()
         model_omitted_workdir = not str(
             (call.raw_params or {}).get("working_directory") or ""
@@ -322,9 +395,7 @@ class ToolOrchestrator:
                 call.name, call.raw_params
             )
             if resolved_name != call.name:
-                self.logger.info(
-                    f"Legacy tool alias resolved: {call.name} -> {resolved_name}"
-                )
+                self.logger.info(f"Legacy tool alias resolved: {call.name} -> {resolved_name}")
                 call.name = resolved_name
                 call.raw_params = resolved_params
         start_signature = call.execution_signature or self._execution_signature(
@@ -346,8 +417,7 @@ class ToolOrchestrator:
         if call.name not in self.tools:
             feedback = self._generate_unknown_tool_feedback(call.name)
             self._log_unknown_tool_attempt(call, feedback)
-            result = ToolResult(
-                success=False,
+            result = ToolResult.completed_failure(
                 output=feedback,
                 error=f"Unknown tool requested: {call.name}",
                 error_code="UNKNOWN_TOOL",
@@ -409,8 +479,7 @@ class ToolOrchestrator:
                     call.name, call.raw_params, parameter_fixes
                 )
             except Exception as exc:
-                result = ToolResult(
-                    success=False,
+                result = ToolResult.completed_failure(
                     output="",
                     error=f"Tool {call.name} parameter validation failed: {exc}",
                     error_code="PARAMETER_VALIDATION_FAILED",
@@ -472,105 +541,21 @@ class ToolOrchestrator:
                 },
             )
 
-        repetition_level = self._get_repetition_level(signature)
-        repetition_metadata: Dict[str, Any] = {}
-        if repetition_level > 0:
-            recent_executions = self._recent_executions_for_tool(call.name)
-            failure_count = sum(
-                1 for execution in recent_executions if not self._execution_success(execution)
-            )
-            repetition_metadata = {
-                "repetition_level": repetition_level,
-                "recent_execution_count": len(recent_executions),
-                "failure_count": failure_count,
-            }
+        control_envelope_id = None
+        if self.before_tool_execute is not None:
+            try:
+                control_envelope_id = self.before_tool_execute(call, validated_params)
+            except Exception as exc:
+                self.logger.warning(f"Before-execute hook failed for {call.name}: {exc}")
 
-            if repetition_level >= 3:
-                if self._is_java_configuration_loop(call.name, validated_params, recent_executions):
-                    execution = self._attempt_java_configuration_auto_fix(
-                        call,
-                        signature,
-                        validated_params,
-                        repetition_metadata,
-                    )
-                    execution.duration_ms = self._duration_since(started_at)
-                    self._emit(
-                        "tool_result",
-                        call,
-                        message=execution.observation_text,
-                        level="success" if execution.result.success else "error",
-                        metadata={
-                            "status": execution.status,
-                            "duration_ms": execution.duration_ms,
-                            "result_success": execution.result.success,
-                            "error_code": execution.result.error_code,
-                            "executed_params": execution.executed_params,
-                            "recovery_applied": execution.recovery_applied,
-                            "execution_signature": signature,
-                            "recovery_strategy": execution.recovery_strategy,
-                            "recovery": execution.metadata.get("recovery"),
-                            **repetition_metadata,
-                        },
-                    )
-                    return execution
-
-                result = ToolResult(
-                    success=False,
-                    output=(
-                        f"INFINITE LOOP BROKEN: {call.name} was called "
-                        f"{len(recent_executions)} times without progress.\n"
-                        f"Failures: {failure_count}/{len(recent_executions)}\n"
-                        "Moving to next task to prevent resource waste."
-                    ),
-                    error="Infinite loop detected and broken",
-                    error_code="INFINITE_LOOP_BROKEN",
-                    suggestions=[
-                        "Task has been marked as incomplete",
-                        "Proceeding with next task",
-                        "Review logs for root cause analysis",
-                    ],
-                    metadata={"failure_category": "execution"},
-                )
-                self._track_tool_execution(signature, False)
-                duration_ms = self._duration_since(started_at)
-                observation_text = format_tool_result(call.name, result)
-                metadata = {
-                    "execution_signature": signature,
-                    "force_next_task": True,
-                    **repetition_metadata,
-                }
-                execution = ToolExecution(
-                    call=call,
-                    result=result,
-                    status="repetition_blocked",
-                    raw_params=call.raw_params,
-                    validated_params=validated_params,
-                    executed_params=None,
-                    duration_ms=duration_ms,
-                    observation_text=observation_text,
-                    attempted_execution=False,
-                    parameter_fixes=call.parameter_fixes,
-                    metadata=metadata,
-                )
-                self._emit(
-                    "tool_error",
-                    call,
-                    message=observation_text,
-                    level="error",
-                    metadata={
-                        "status": execution.status,
-                        **metadata,
-                        **self._tool_error_metadata(result, recovery_attempted=False),
-                    },
-                )
-                return execution
-
+        escaped_exception_result: Optional[ToolResult] = None
         try:
             result = self.tools[call.name].safe_execute(**validated_params)
+        except OutputPersistenceError:
+            raise
         except Exception as exc:
-            self._track_tool_execution(signature, False)
-            result = ToolResult(
-                success=False,
+            result = ToolResult.terminal_failure(
+                invocation_status=InvocationStatus.CRASHED,
                 output="",
                 error=f"Tool {call.name} execution failed unexpectedly: {exc}",
                 error_code="TOOL_EXECUTION_EXCEPTION",
@@ -579,42 +564,28 @@ class ToolOrchestrator:
                     "failure_category": "system",
                 },
             )
-            duration_ms = self._duration_since(started_at)
-            observation_text = format_tool_result(call.name, result)
-            execution = ToolExecution(
-                call=call,
-                result=result,
-                status="exception",
-                raw_params=call.raw_params,
-                validated_params=validated_params,
-                executed_params=validated_params,
-                duration_ms=duration_ms,
-                observation_text=observation_text,
-                attempted_execution=True,
-                parameter_fixes=call.parameter_fixes,
-                metadata={"execution_signature": signature, **repetition_metadata},
-            )
-            self._emit(
-                "tool_error",
-                call,
-                message=observation_text,
-                level="error",
-                metadata={
-                    "status": execution.status,
-                    "execution_signature": signature,
-                    **self._tool_error_metadata(result, recovery_attempted=False),
-                },
-            )
-            return execution
+            escaped_exception_result = result
 
+        actual_executions = self._flatten_actual_execution(
+            call.name,
+            validated_params,
+            result,
+        )
         executed_params = validated_params
         recovery_applied = False
         recovery_strategy: Optional[str] = None
         recovery_metadata: Optional[Dict[str, Any]] = None
-        status: ToolExecutionStatus = "success" if result.success else "failure"
+        status = (
+            "exception"
+            if escaped_exception_result is not None
+            else self._result_execution_status(result)
+        )
 
-        if not result.success:
-            decision = self.recovery_handler.recover(call.name, validated_params, result)
+        if result.is_terminal and result.operation_outcome is OperationOutcome.FAILED:
+            try:
+                decision = self.recovery_handler.recover(call.name, validated_params, result)
+            except OutputPersistenceError as exc:
+                raise exc.attach_actual_executions(actual_executions)
             recovery_metadata = dict(decision.metadata)
             recovery_metadata.setdefault("attempted", decision.should_recover)
             recovery_metadata.setdefault("success", False)
@@ -623,7 +594,7 @@ class ToolOrchestrator:
 
             if decision.should_recover:
                 replacement_success = (
-                    decision.replacement_result.success
+                    decision.replacement_result.succeeded
                     if decision.replacement_result is not None
                     else False
                 )
@@ -638,8 +609,8 @@ class ToolOrchestrator:
                         "attempted": True,
                         "success": replacement_success,
                         "guidance": decision.guidance,
-                        "replacement_result_success": (
-                            decision.replacement_result.success
+                        "replacement_result_succeeded": (
+                            decision.replacement_result.succeeded
                             if decision.replacement_result is not None
                             else None
                         ),
@@ -652,34 +623,39 @@ class ToolOrchestrator:
                 if decision.replacement_result is not None:
                     result = decision.replacement_result
                     executed_params = recovery_params
-                    if recovery_metadata.get("guidance_only"):
+                    guidance_only = bool(recovery_metadata.get("guidance_only"))
+                    if guidance_only:
                         status = "recovery_attempted"
                     else:
-                        status = "recovered" if result.success else "recovery_failed"
+                        actual_executions.extend(
+                            self._flatten_actual_execution(
+                                decision.replacement_tool_name or call.name,
+                                recovery_params,
+                                result,
+                                _seen_executions={
+                                    actual.execution_id: actual for actual in actual_executions
+                                },
+                            )
+                        )
+                        status = (
+                            "recovered"
+                            if result.operation_outcome is OperationOutcome.SUCCESS
+                            else "recovery_failed"
+                        )
                     recovery_applied = True
-                    recovery_metadata["success"] = result.success
+                    recovery_metadata["success"] = result.succeeded
                 else:
                     status = "recovery_attempted"
 
-        self._track_tool_execution(signature, result.success)
-        if result.success:
+        self._track_tool_execution(signature, result)
+        if result.succeeded:
             self._update_successful_states(call.name, executed_params, result)
-
-        if repetition_level in {1, 2}:
-            warning = self._build_repetition_warning(
-                call.name,
-                validated_params,
-                repetition_level,
-                repetition_metadata["recent_execution_count"],
-                repetition_metadata["failure_count"],
-            )
-            result.output = f"{warning}\n\n{result.output}" if result.output else warning
 
         duration_ms = self._duration_since(started_at)
         observation_text = format_tool_result(call.name, result)
-        execution_metadata = {"execution_signature": signature, **repetition_metadata}
-        if repetition_level == 2:
-            execution_metadata["force_thinking_next"] = True
+        execution_metadata: Dict[str, Any] = {"execution_signature": signature}
+        if control_envelope_id is not None:
+            execution_metadata["control_envelope_id"] = control_envelope_id
         if recovery_metadata is not None:
             execution_metadata["recovery"] = recovery_metadata
         if recovery_strategy:
@@ -697,10 +673,11 @@ class ToolOrchestrator:
             recovery_applied=recovery_applied,
             recovery_strategy=recovery_strategy,
             attempted_execution=True,
+            actual_executions=actual_executions,
             parameter_fixes=call.parameter_fixes,
             metadata=execution_metadata,
         )
-        if result.success and call.name == "manage_context":
+        if result.succeeded and call.name == "manage_context":
             action = executed_params.get("action", "")
             if action in {
                 "start_task",
@@ -717,29 +694,46 @@ class ToolOrchestrator:
         event_metadata = {
             "status": execution.status,
             "duration_ms": duration_ms,
-            "result_success": result.success,
             "error_code": result.error_code,
             "executed_params": executed_params,
             "recovery_applied": recovery_applied,
             "execution_signature": signature,
+            **self._result_lifecycle_metadata(result),
         }
         if recovery_strategy:
             event_metadata["recovery_strategy"] = recovery_strategy
         if recovery_metadata is not None:
             event_metadata["recovery"] = recovery_metadata
-        event_metadata.update(repetition_metadata)
         if execution.metadata.get("force_thinking_next"):
             event_metadata["force_thinking_next"] = True
         if execution.metadata.get("invalidate_trunk_cache"):
             event_metadata["invalidate_trunk_cache"] = True
 
-        self._emit(
-            "tool_result",
-            call,
-            message=observation_text,
-            level="success" if result.success else "error",
-            metadata=event_metadata,
-        )
+        if escaped_exception_result is not None:
+            self._emit(
+                "tool_error",
+                call,
+                message=format_tool_result(call.name, escaped_exception_result),
+                level="error",
+                metadata={
+                    "status": execution.status,
+                    "execution_signature": signature,
+                    **self._tool_error_metadata(
+                        escaped_exception_result,
+                        recovery_attempted=bool(
+                            recovery_metadata and recovery_metadata.get("attempted")
+                        ),
+                    ),
+                },
+            )
+        else:
+            self._emit(
+                "tool_result",
+                call,
+                message=observation_text,
+                level=self._result_event_level(result),
+                metadata=event_metadata,
+            )
         return execution
 
     def _execution_signature(self, tool_name: str, params: Dict[str, Any]) -> str:
@@ -756,6 +750,7 @@ class ToolOrchestrator:
         category: Optional[str] = None,
     ) -> Dict[str, Any]:
         return {
+            **self._result_lifecycle_metadata(result),
             "error_code": result.error_code,
             "category": category or result.metadata.get("failure_category") or "execution",
             "suggestions": list(result.suggestions),
@@ -799,303 +794,69 @@ class ToolOrchestrator:
             return execution.signature
         return str(execution.get("signature", ""))
 
-    def _execution_success(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
+    def _execution_failed(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
         if isinstance(execution, ToolExecutionRecord):
-            return execution.success
-        return bool(execution.get("success", False))
+            return execution.operation_outcome is OperationOutcome.FAILED
+        return execution.get("operation_outcome") in {
+            OperationOutcome.FAILED,
+            OperationOutcome.FAILED.value,
+        }
 
-    def _recent_executions_for_tool(
-        self, tool_name: str
-    ) -> list[dict[str, Any] | ToolExecutionRecord]:
-        return [
-            execution
-            for execution in self.recent_tool_executions
-            if self._recent_signature(execution).startswith(tool_name + ":")
-        ]
+    def _execution_succeeded(self, execution: dict[str, Any] | ToolExecutionRecord) -> bool:
+        if isinstance(execution, ToolExecutionRecord):
+            return (
+                execution.invocation_status is InvocationStatus.COMPLETED
+                and execution.operation_outcome is OperationOutcome.SUCCESS
+            )
+        return execution.get("invocation_status") in {
+            InvocationStatus.COMPLETED,
+            InvocationStatus.COMPLETED.value,
+        } and execution.get("operation_outcome") in {
+            OperationOutcome.SUCCESS,
+            OperationOutcome.SUCCESS.value,
+        }
+
+    @staticmethod
+    def _result_execution_status(result: ToolResult) -> ToolExecutionStatus:
+        if result.invocation_status is InvocationStatus.PENDING:
+            return "pending"
+        return {
+            OperationOutcome.SUCCESS: "success",
+            OperationOutcome.PARTIAL: "partial",
+            OperationOutcome.UNKNOWN: "unknown",
+            OperationOutcome.SKIPPED: "skipped",
+            OperationOutcome.FAILED: "failure",
+        }[result.operation_outcome]
+
+    @staticmethod
+    def _result_event_level(result: ToolResult) -> ToolLifecycleLevel:
+        if result.invocation_status is InvocationStatus.PENDING:
+            return "info"
+        return {
+            OperationOutcome.SUCCESS: "success",
+            OperationOutcome.PARTIAL: "warning",
+            OperationOutcome.UNKNOWN: "info",
+            OperationOutcome.SKIPPED: "info",
+            OperationOutcome.FAILED: "error",
+        }[result.operation_outcome]
+
+    @staticmethod
+    def _result_lifecycle_metadata(result: ToolResult) -> Dict[str, Any]:
+        metadata: Dict[str, Any] = {
+            "invocation_status": result.invocation_status.value,
+            "operation_outcome": result.operation_outcome.value,
+            "evidence_status": result.evidence_status.value,
+        }
+        for field_name in ("failure_signature", "error_tail_preview", "output_ref"):
+            value = getattr(result, field_name)
+            if value:
+                metadata[field_name] = value
+        return metadata
 
     def _get_repetition_level(self, tool_signature: str) -> int:
-        """
-        Get the level of repetition for graduated response.
-        Returns:
-            0: No repetition concern
-            1: Warning level (3 repetitions)
-            2: Guidance level (4 repetitions)
-            3: Force break level (5+ repetitions)
-        """
-        exact_match_count = sum(
-            1
-            for execution in self.recent_tool_executions
-            if self._recent_signature(execution) == tool_signature
-        )
-
-        tool_name = tool_signature.split(":")[0]
-
-        if tool_name == "manage_context":
-            if "start_task" in tool_signature or "get_info" in tool_signature:
-                return 0
-            if "complete_with_results" in tool_signature:
-                if exact_match_count >= 6:
-                    return 3
-                if exact_match_count >= 5:
-                    return 2
-                if exact_match_count >= 4:
-                    return 1
-                return 0
-
-        # Polling a detached build's log/exit file is PRESCRIBED behavior (the
-        # dispatch-and-poll handoff tells the agent to repeat these commands),
-        # not a loop — never warn/block it, and don't let it inflate the
-        # per-tool flood count for other commands.
-        if self._is_dispatch_poll_signature(tool_signature):
-            return 0
-
-        tool_count = len(
-            [
-                execution
-                for execution in self._recent_executions_for_tool(tool_name)
-                if not self._is_dispatch_poll_signature(self._recent_signature(execution))
-            ]
-        )
-
-        if exact_match_count >= 5 or tool_count >= 8:
-            return 3
-        if exact_match_count >= 4 or tool_count >= 6:
-            return 2
-        if exact_match_count >= 3 or tool_count >= 5:
-            return 1
-
+        """Compatibility seam; loop authority lives in engine-owned LoopMemory."""
+        del tool_signature
         return 0
-
-    def _build_repetition_warning(
-        self,
-        tool_name: str,
-        params: Dict[str, Any],
-        repetition_level: int,
-        recent_execution_count: int,
-        failure_count: int,
-    ) -> str:
-        lines = [
-            (
-                f"REPETITIVE EXECUTION WARNING: {tool_name} has been called "
-                f"{recent_execution_count} times."
-            ),
-            f"Failures: {failure_count}/{recent_execution_count}.",
-        ]
-        if repetition_level >= 2:
-            suggestions = self._generate_alternative_suggestions(
-                tool_name, params, self._recent_executions_for_tool(tool_name)
-            )
-            lines.extend(
-                [
-                    "Consider alternative approaches:",
-                    f"• {suggestions}",
-                ]
-            )
-        return "\n".join(lines)
-
-    def _generate_alternative_suggestions(
-        self,
-        tool_name: str,
-        params: Dict[str, Any],
-        recent_executions: list[dict[str, Any] | ToolExecutionRecord],
-    ) -> str:
-        """Generate context-aware alternative suggestions."""
-        suggestions = []
-
-        if tool_name == "bash":
-            if any("update-alternatives" in str(execution) for execution in recent_executions):
-                suggestions.append(
-                    "Use project(action='provision', java_version=...) instead of manual update-alternatives"
-                )
-            if any("java" in str(execution) for execution in recent_executions):
-                suggestions.append(
-                    "Try: bash(command='java -version') to check the current Java version"
-                )
-            suggestions.append("Use file_io tool to examine files before executing commands")
-
-        elif tool_name in ("maven", "build"):
-            suggestions.append("Try: bash(command='mvn --version') to verify Maven installation")
-            suggestions.append("Check pom.xml exists: file_io(action='read', file_path='pom.xml')")
-            suggestions.append("Use bash tool for manual investigation: bash(command='ls -la')")
-
-        elif tool_name == "project" and params.get("action") == "provision":
-            suggestions.append(
-                "Java might already be installed - verify with: bash(command='java -version')"
-            )
-            suggestions.append("Check available Java versions: bash(command='ls /usr/lib/jvm/')")
-
-        return "\n• ".join(suggestions) if suggestions else "Try a different tool or approach"
-
-    def _is_java_configuration_loop(
-        self,
-        tool_name: str,
-        validated_params: Dict[str, Any],
-        recent_executions: list[dict[str, Any] | ToolExecutionRecord],
-    ) -> bool:
-        def _is_java_install_call(name: str, call_params: Dict[str, Any]) -> bool:
-            call_action = str(call_params.get("action", "")).lower()
-            if name == "system" and call_action in {"install_java", "verify_java"}:
-                return True
-            # Stage-1 surface: JDK installs go through project(action='provision').
-            return (
-                name == "project"
-                and call_action == "provision"
-                and bool(call_params.get("java_version"))
-            )
-
-        if _is_java_install_call(tool_name, validated_params):
-            return True
-
-        command_contexts = [str(validated_params.get("command", ""))]
-        for execution in recent_executions:
-            signature = self._recent_signature(execution)
-            recent_tool_name, _, _ = signature.partition(":")
-            recent_params = self._params_from_signature(signature)
-            if _is_java_install_call(recent_tool_name, recent_params):
-                return True
-            command_contexts.append(str(recent_params.get("command", "")))
-
-        return any(self._has_java_alternatives_marker(context) for context in command_contexts)
-
-    def _params_from_signature(self, signature: str) -> Dict[str, Any]:
-        _, _, params_repr = signature.partition(":")
-        try:
-            return dict(ast.literal_eval(params_repr))
-        except (TypeError, ValueError, SyntaxError):
-            return {}
-
-    def _has_java_alternatives_marker(self, value: str) -> bool:
-        context = value.lower()
-        if "update-java-alternatives" in context:
-            return True
-        if re.search(r"\bupdate-alternatives\b[^\n;]*\bjava(?:c)?\b", context):
-            return True
-        return bool(re.search(r"\balternatives\s+--config\s+java(?:c)?\b", context))
-
-    def _attempt_java_configuration_auto_fix(
-        self,
-        call: ToolCall,
-        signature: str,
-        validated_params: Dict[str, Any],
-        repetition_metadata: Dict[str, Any],
-    ) -> ToolExecution:
-        recovery_strategy = "java_configuration_auto_fix"
-        try:
-            result = self._auto_fix_java_configuration()
-        except Exception as exc:
-            result = ToolResult(
-                success=False,
-                output="Could not auto-fix Java configuration. Skipping to next task.",
-                error=f"Auto-fix failed: {exc}",
-                error_code="JAVA_AUTO_FIX_EXCEPTION",
-                metadata={"exception_type": type(exc).__name__},
-            )
-
-        self._track_tool_execution(signature, result.success)
-        status: ToolExecutionStatus = "recovered" if result.success else "recovery_failed"
-        observation_text = format_tool_result(call.name, result)
-        recovery_params = self._java_auto_fix_recovery_params(result)
-        recovery_metadata = {
-            "attempted": True,
-            "success": result.success,
-            "message": observation_text,
-            "strategy": recovery_strategy,
-            "replacement_result_success": result.success,
-            "recovery_params": recovery_params,
-            "parameter_diff": self._parameter_diff(validated_params, recovery_params),
-        }
-        metadata = {
-            "execution_signature": signature,
-            "recovery_strategy": recovery_strategy,
-            "recovery": recovery_metadata,
-            **repetition_metadata,
-        }
-        execution = ToolExecution(
-            call=call,
-            result=result,
-            status=status,
-            raw_params=call.raw_params,
-            validated_params=validated_params,
-            executed_params=None,
-            observation_text=observation_text,
-            recovery_applied=True,
-            recovery_strategy=recovery_strategy,
-            attempted_execution=False,
-            parameter_fixes=call.parameter_fixes,
-            metadata=metadata,
-        )
-        self._emit(
-            "tool_recovery",
-            call,
-            message=observation_text,
-            level="success" if result.success else "error",
-            metadata={
-                "recovery_strategy": recovery_strategy,
-                "attempted": True,
-                "success": result.success,
-                "guidance": observation_text,
-                "replacement_result_success": result.success,
-                "recovery_params": recovery_params,
-                "parameter_diff": recovery_metadata["parameter_diff"],
-                **metadata,
-            },
-        )
-        return execution
-
-    def _java_auto_fix_recovery_params(self, result: ToolResult) -> Dict[str, Any]:
-        java_version = (result.metadata or {}).get("java_version")
-        if java_version:
-            return {"action": "install_java", "java_version": java_version}
-        return {"action": "verify_java"}
-
-    def _system_delegate(self):
-        """SystemTool by retired direct name or via the project facade."""
-        tool = self.tools.get("system")
-        if tool is None:
-            project = self.tools.get("project")
-            tool = getattr(project, "system_tool", None) if project is not None else None
-        return tool
-
-    def _auto_fix_java_configuration(self) -> ToolResult:
-        """Automatically fix Java configuration issues."""
-        self.logger.info("Attempting automatic Java configuration fix")
-
-        system_tool = self._system_delegate()
-        if system_tool is not None:
-            system_tool.safe_execute(action="verify_java")
-
-            current_context = ""
-            if self.context_manager and hasattr(self.context_manager, "get_current_context"):
-                try:
-                    current_context = str(self.context_manager.get_current_context())
-                except Exception as exc:
-                    self.logger.warning(f"Failed to inspect current context for Java fix: {exc}")
-
-            if "17" in current_context:
-                self.logger.info(
-                    "Detected Java 17 requirement, using system tool for proper installation"
-                )
-                install_result = system_tool.safe_execute(
-                    action="install_java", java_version="17"
-                )
-
-                if install_result.success:
-                    return ToolResult(
-                        success=True,
-                        output=(
-                            "Auto-fixed Java configuration using enhanced system tool\n"
-                            + install_result.output
-                        ),
-                        metadata={"auto_fixed": True, "java_version": "17"},
-                    )
-
-        return ToolResult(
-            success=False,
-            output="Could not auto-fix Java configuration. Skipping to next task.",
-            error="Auto-fix failed",
-            error_code="AUTO_FIX_FAILED",
-            suggestions=["Manual intervention may be required", "Check Java installation logs"],
-        )
 
     def _generate_unknown_tool_feedback(self, requested_tool: str) -> str:
         """Generate comprehensive feedback for unknown tool requests."""
@@ -1188,7 +949,9 @@ class ToolOrchestrator:
         feedback_parts.append("\n\n💡 Tips:")
         feedback_parts.append("• For shell commands, use 'bash' tool with command parameter")
         feedback_parts.append("• For file operations, use 'file_io' tool with action parameter")
-        feedback_parts.append("• For builds and tests, use the 'build' tool (auto-selects maven/gradle)")
+        feedback_parts.append(
+            "• For builds and tests, use the 'build' tool (auto-selects maven/gradle)"
+        )
         feedback_parts.append(
             "• Check tool parameter requirements with action='help' where supported"
         )
@@ -1224,9 +987,9 @@ class ToolOrchestrator:
         except Exception as exc:
             self.logger.warning(f"Failed to log unknown tool to error logger: {exc}")
 
-    def _track_tool_execution(self, signature: str, success: bool) -> None:
+    def _track_tool_execution(self, signature: str, result: ToolResult) -> None:
         try:
-            self.track_tool_execution(signature, success)
+            self.track_tool_execution(signature, result)
         except Exception as exc:
             self.logger.warning(f"Failed to track tool execution: {exc}")
 

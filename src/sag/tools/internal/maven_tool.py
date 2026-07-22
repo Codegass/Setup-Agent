@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
-from sag.evidence import EvidenceStatus, TestStats
+from sag.evidence import EvidenceAssessment, TestStats
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
@@ -20,7 +20,12 @@ from .build_preflight import (
     classify_version_error,
     read_build_requirements,
 )
-from .build_utils import detached_handoff_tool_result
+from .build_utils import (
+    DETACHED_HANDOFF_STATUSES,
+    classify_detached_completion,
+    detached_handoff_tool_result,
+    detached_poll_ref,
+)
 from .command_tracker import CommandTracker
 from .toolchain_manager import ToolchainManager, ToolchainSpec, ToolVersionRequirement
 
@@ -246,7 +251,7 @@ class MavenTool(BaseTool):
         if not resolved_maven:
             if self.toolchain_manager:
                 install_result = self._install_maven()
-                if not install_result.success:
+                if not install_result.succeeded:
                     return install_result
                 resolved_maven = self._resolve_maven_executable(
                     working_directory=working_directory,
@@ -257,7 +262,7 @@ class MavenTool(BaseTool):
                     return self._maven_executable_not_resolved_result(working_directory)
             elif not self._is_maven_installed():
                 install_result = self._install_maven()
-                if not install_result.success:
+                if not install_result.succeeded:
                     return install_result
 
         maven_executable = (
@@ -266,9 +271,7 @@ class MavenTool(BaseTool):
             else ("./mvnw" if use_wrapper else "mvn")
         )
         maven_runtime = self._maven_runtime_metadata(resolved_maven, maven_executable)
-        requested_requirement_metadata = self._maven_version_requirement_metadata(
-            required_version
-        )
+        requested_requirement_metadata = self._maven_version_requirement_metadata(required_version)
 
         version_command = self._normalize_maven_version_command(command)
         if version_command:
@@ -284,8 +287,8 @@ class MavenTool(BaseTool):
                 maven_executable=maven_executable,
             )
             result = self.orchestrator.execute_command(maven_cmd, workdir=working_directory)
-            return ToolResult(
-                success=result.get("exit_code") == 0,
+            return ToolResult.completed(
+                operation_outcome=("success" if result.get("exit_code") == 0 else "failed"),
                 output=result.get("output", ""),
                 raw_output=result.get("output", ""),
                 error=None if result.get("exit_code") == 0 else result.get("output", ""),
@@ -443,7 +446,7 @@ class MavenTool(BaseTool):
                         result = _run_build()
             _build_elapsed = time.monotonic() - _build_t0
 
-            if result.get("dispatch_status") == "running_detached":
+            if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
                 return detached_handoff_tool_result("maven", maven_cmd, result)
 
             if result.get("termination_reason"):
@@ -461,9 +464,7 @@ class MavenTool(BaseTool):
                 analysis["build_success"] = False
                 analysis["error_type"] = analysis.get("error_type") or "TEST_FAILURE"
                 analysis["ignored_test_failures_detected"] = True
-            if requested_requirement_metadata and not analysis.get(
-                "maven_version_requirement"
-            ):
+            if requested_requirement_metadata and not analysis.get("maven_version_requirement"):
                 analysis["maven_version_requirement"] = requested_requirement_metadata
 
             # Store full output if large. For detached builds the orchestrator
@@ -472,7 +473,7 @@ class MavenTool(BaseTool):
             # can surface the real failure, not just a 50-line tail.
             full_output = result.get("full_output") or result["output"]
             ref_id = None
-            if len(full_output) > 800:
+            if len(full_output) > 800 or result.get("dispatch_status") == "completed_detached":
                 if not self.output_storage:
                     contexts_dir = Path("/workspace/.setup_agent/contexts")
                     self.output_storage = OutputStorageManager(contexts_dir, self.orchestrator)
@@ -484,6 +485,37 @@ class MavenTool(BaseTool):
                     metadata={"command": maven_cmd, "exit_code": result["exit_code"]},
                 )
                 logger.debug(f"Stored Maven output with ref_id: {ref_id}")
+
+            if result.get("dispatch_status") == "completed_detached":
+                detached_result = classify_detached_completion(
+                    result.get("exit_code"),
+                    str(result.get("output") or ""),
+                    ref_id,
+                    full_output=str(full_output),
+                    poll_ref=detached_poll_ref(result),
+                    output_ref_storage=self.output_storage,
+                    invocation_status=(
+                        "crashed"
+                        if result.get("lifecycle_state") == "vanished"
+                        else "completed"
+                    ),
+                )
+                if not detached_result.succeeded:
+                    detached_result.metadata.update(
+                        {
+                            "command": maven_cmd,
+                            "exit_code": result.get("exit_code"),
+                            "analysis": analysis,
+                            "dispatch_status": "completed_detached",
+                            "maven_runtime": maven_runtime,
+                            "output_ref_id": ref_id,
+                        }
+                    )
+                    return self._finalize_main_result(
+                        detached_result,
+                        preamble,
+                        jdk_retry_meta,
+                    )
 
             # Track command for fact-based validation
             if self.command_tracker:
@@ -519,8 +551,7 @@ class MavenTool(BaseTool):
                 evidence_fields = self._maven_evidence_fields(analysis, ref_id)
                 if analysis["build_success"]:
                     return self._finalize_main_result(
-                        ToolResult(
-                            success=True,
+                        ToolResult.completed_success(
                             output=result["output"],
                             raw_output=result["output"],
                             **evidence_fields,
@@ -610,8 +641,7 @@ class MavenTool(BaseTool):
                         logger.warning(f"Could not validate build artifacts: {e}")
 
                 return self._finalize_main_result(
-                    ToolResult(
-                        success=True,
+                    ToolResult.completed_success(
                         output=self._format_success_output_enhanced(analysis, ref_id),
                         raw_output=result["output"],
                         **evidence_fields,
@@ -829,8 +859,7 @@ class MavenTool(BaseTool):
         required_version: ToolVersionRequirement,
         working_directory: str,
     ) -> ToolResult:
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error=f"No Maven executable satisfies requested version {required_version.raw}",
             error_code="MAVEN_VERSION_NOT_RESOLVED",
@@ -856,8 +885,7 @@ class MavenTool(BaseTool):
         )
 
     def _maven_executable_not_resolved_result(self, working_directory: str) -> ToolResult:
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error="No Maven executable could be resolved by the toolchain manager",
             error_code="MAVEN_EXECUTABLE_NOT_RESOLVED",
@@ -940,8 +968,8 @@ class MavenTool(BaseTool):
         if maven_version_requirement:
             metadata["maven_version_requirement"] = maven_version_requirement
 
-        return ToolResult(
-            success=False,
+        return ToolResult.terminal_failure(
+            invocation_status="timeout",
             output=(
                 f"Maven command timed out due to {reason} after " f"{execution_time_display:.1f}s."
             ),
@@ -1141,8 +1169,7 @@ class MavenTool(BaseTool):
                 ]
             )
 
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output="",
             error=f"No pom.xml found at {validation_result.get('searched_path', working_directory)}",
             error_code="NO_POM_XML",
@@ -1178,14 +1205,12 @@ class MavenTool(BaseTool):
                 # Ensure mvn is in PATH for bash tool compatibility
                 self._ensure_maven_in_path()
                 logger.info("Maven installed successfully and added to PATH")
-                return ToolResult(
-                    success=True,
+                return ToolResult.completed_success(
                     output="Maven installed successfully and added to PATH",
                     metadata={"auto_installed": True, "path_updated": True},
                 )
             else:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=install_result["output"],
                     error="Failed to install Maven automatically",
                     error_code="MAVEN_INSTALL_FAILED",
@@ -1197,8 +1222,7 @@ class MavenTool(BaseTool):
                     documentation_links=["https://maven.apache.org/install.html"],
                 )
         except Exception as e:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Failed to install Maven: {str(e)}",
                 error_code="MAVEN_INSTALL_ERROR",
@@ -1646,11 +1670,12 @@ class MavenTool(BaseTool):
             analysis.get("has_build_success_marker") or analysis.get("exit_code") == 0
         )
         if has_test_failures and build_claimed_success:
-            fields["status"] = EvidenceStatus.PARTIAL
+            fields["evidence_assessment"] = EvidenceAssessment.PARTIAL
             fields["conflicts"] = ["maven_success_vs_test_failures"]
 
         if output_ref_id:
             fields["evidence_refs"] = [output_ref_id]
+            fields["output_ref_storage"] = self.output_storage
 
         return fields
 
@@ -1851,9 +1876,7 @@ class MavenTool(BaseTool):
                         "project(action='env', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
                         "version='<version>', activate=True)"
                     ),
-                    (
-                        f"Retry with build(action='{command}')"
-                    ),
+                    (f"Retry with build(action='{command}')"),
                     (
                         "If an exact Maven executable is proven incompatible, note that "
                         "executable/version finding and register a compatible one instead"
@@ -2006,8 +2029,7 @@ class MavenTool(BaseTool):
             metadata["compatible_maven_candidate"] = None
 
         evidence_fields = self._maven_evidence_fields(analysis, output_ref_id)
-        return ToolResult(
-            success=False,
+        return ToolResult.completed_failure(
             output=error_output,  # Show key error lines immediately
             error=error_message,
             error_code=error_code,

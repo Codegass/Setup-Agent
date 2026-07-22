@@ -1,5 +1,5 @@
 from sag.agent.tool_orchestration import format_tool_result
-from sag.evidence import EvidenceStatus, TestStats
+from sag.evidence import EvidenceAssessment, TestStats
 from sag.agent.tool_orchestration import (
     ParameterFix,
     ToolCall,
@@ -34,9 +34,8 @@ def test_tool_call_keeps_raw_and_validated_params_separate():
     assert call.parameter_fixes[0].source == "schema_alias"
 
 
-def test_tool_execution_status_is_separate_from_tool_result_success():
-    result = ToolResult(
-        success=False,
+def test_tool_execution_status_is_separate_from_tool_result_outcome():
+    result = ToolResult.completed_failure(
         output="timeout guidance",
         error="timed out",
         error_code="TIMEOUT_HANDLED",
@@ -56,7 +55,7 @@ def test_tool_execution_status_is_separate_from_tool_result_success():
     )
 
     assert execution.status == "recovery_attempted"
-    assert execution.result.success is False
+    assert execution.result.succeeded is False
     assert execution.executed_params["working_directory"] == "/workspace"
 
 
@@ -75,9 +74,8 @@ def test_lifecycle_event_is_ui_agnostic_metadata_carrier():
 
 
 def test_tool_observation_includes_evidence_status_refs_and_conflicts():
-    result = ToolResult(
-        success=True,
-        status=EvidenceStatus.PARTIAL,
+    result = ToolResult.completed_success(
+        evidence_assessment=EvidenceAssessment.PARTIAL,
         output="Maven exited zero but tests failed.",
         evidence_refs=["output_abc"],
         conflicts=["maven_success_vs_surefire_failures"],
@@ -91,9 +89,8 @@ def test_tool_observation_includes_evidence_status_refs_and_conflicts():
 
 
 def test_tool_observation_includes_test_stats_summary_when_present():
-    result = ToolResult(
-        success=True,
-        status=EvidenceStatus.PARTIAL,
+    result = ToolResult.completed_success(
+        evidence_assessment=EvidenceAssessment.PARTIAL,
         output="Maven exited zero but tests failed.",
         test_stats=TestStats(executed=214, passed=206, failed=3, skipped=5),
     )
@@ -104,7 +101,7 @@ def test_tool_observation_includes_test_stats_summary_when_present():
 
 
 def test_tool_observation_omits_success_status_for_raw_success_string():
-    result = ToolResult.model_construct(success=True, status="success", output="ok")
+    result = ToolResult.completed_success(output="ok", evidence_assessment="success")
 
     observation = format_tool_result("bash", result)
 
@@ -112,23 +109,17 @@ def test_tool_observation_omits_success_status_for_raw_success_string():
 
 
 def test_tool_observation_omits_success_status_for_default_success():
-    result = ToolResult(success=True, output="ok")
+    result = ToolResult.completed_success(output="ok")
 
     observation = format_tool_result("bash", result)
 
     assert "Evidence status:" not in observation
 
 
-def test_tool_observation_omits_success_status_for_legacy_constructed_success():
-    result = ToolResult.model_construct(success=True, output="ok")
-
-    observation = format_tool_result("bash", result)
-
-    assert "Evidence status:" not in observation
-
-
-def test_tool_observation_normalizes_raw_success_string_before_visibility_check():
-    result = ToolResult.model_construct(success=True, status="SUCCESS", output="ok")
+def test_tool_observation_uses_typed_success_assessment_for_visibility_check():
+    result = ToolResult.completed_success(
+        output="ok", evidence_assessment=EvidenceAssessment.SUCCESS
+    )
 
     observation = format_tool_result("bash", result)
 

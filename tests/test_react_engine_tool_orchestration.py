@@ -2,7 +2,7 @@ from sag.agent.react_engine import ReActEngine, ReActStep, StepType
 from sag.agent.react_prompt_builder import ReActPromptBuilder
 from sag.agent.tool_orchestration import ToolCall, ToolExecution, ToolLifecycleEvent
 from sag.config.prompt_loader import load_react_engine_prompts
-from sag.evidence import EvidenceStatus
+from sag.evidence import EvidenceAssessment, EvidenceStatus, InvocationStatus, OperationOutcome
 from sag.tools.base import BaseTool, ToolResult
 from sag.ui.events import EventType
 
@@ -28,6 +28,13 @@ class RecordingBranchContext:
     def add_to_branch_history(self, task_id, entry):
         self.entries.append((task_id, entry))
         return {"success": True}
+
+    def load_branch_history(self, task_id):
+        return type(
+            "BranchHistory",
+            (),
+            {"history": [entry for entry_task_id, entry in self.entries if entry_task_id == task_id]},
+        )()
 
 
 class FakeAgentLogger:
@@ -55,7 +62,7 @@ class EchoTool(BaseTool):
         super().__init__("echo", "Echo test tool")
 
     def execute(self, command: str) -> ToolResult:
-        return ToolResult(success=True, output=f"ran {command}")
+        return ToolResult.completed_success(output=f"ran {command}")
 
 
 def _engine_with_context(context=None):
@@ -72,6 +79,7 @@ def _engine_with_context(context=None):
         tools=engine.tools,
     )
     engine.recent_tool_executions = []
+    engine.max_recent_executions = 10
     engine.successful_states = {"working_directory": None}
     engine.repository_url = "https://example.test/repo.git"
     engine.current_iteration = 7
@@ -110,6 +118,24 @@ def test_build_tool_call_from_step_preserves_action_metadata():
     assert call.source_step_index == 7
     assert call.model_used == "action-model"
     assert call.validated_params is None
+
+
+def test_react_engine_tracks_pending_with_canonical_lifecycle_record():
+    engine = _engine_with_context()
+    result = ToolResult(
+        invocation_status=InvocationStatus.PENDING,
+        operation_outcome=OperationOutcome.UNKNOWN,
+        evidence_status=EvidenceStatus.UNKNOWN,
+        poll_ref="job:pending-1",
+        output="still running",
+    )
+
+    engine._track_tool_execution("build:[('action', 'test')]", result)
+
+    record = engine.recent_tool_executions[0]
+    assert record.invocation_status is InvocationStatus.PENDING
+    assert record.operation_outcome is OperationOutcome.UNKNOWN
+    assert not hasattr(record, "success")
 
 
 def test_get_tool_orchestrator_wires_engine_dependencies():
@@ -200,7 +226,7 @@ def test_react_engine_preserves_real_tool_result_lifecycle_metadata():
             metadata={
                 "status": "success",
                 "duration_ms": 125.0,
-                "result_success": True,
+                "result_succeeded": True,
                 "error_code": None,
                 "executed_params": {
                     "goal": "compile",
@@ -263,7 +289,7 @@ def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
         event_type="tool_result",
         call=ToolCall(name="echo", raw_params={"command": "pwd"}),
         message="echo finished",
-        metadata={"status": "success", "result_success": True},
+        metadata={"status": "success", "result_succeeded": True},
     )
     recovery_event = ToolLifecycleEvent(
         event_type="tool_recovery",
@@ -323,7 +349,7 @@ def test_react_engine_tool_event_adapter_emits_typed_lifecycle_ui_events():
 
 
 def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypatch):
-    result = ToolResult(success=True, output="ok")
+    result = ToolResult.completed_success(output="ok")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",
@@ -365,7 +391,7 @@ def test_execute_steps_delegates_action_to_orchestrator_after_migration(monkeypa
 
 def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
     context = RecordingBranchContext()
-    result = ToolResult(success=True, output="Full output ref: output_build")
+    result = ToolResult.completed_success(output="Full output ref: output_build")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: build",
@@ -406,9 +432,54 @@ def test_execute_steps_records_action_trace_for_phase_context(monkeypatch):
     assert entry["output_refs"] == ["output_build"]
 
 
+def test_execute_steps_persists_short_failed_output_ref_in_branch_history(
+    monkeypatch, durable_tool_result_storage
+):
+    context = RecordingBranchContext()
+    result = ToolResult.completed_failure(
+        output="compiler cannot find symbol Widget",
+        error="build failed",
+        error_code="BUILD_FAILED",
+    )
+    step = ReActStep(
+        step_type=StepType.ACTION,
+        content="ACTION: build",
+        tool_name="build",
+        tool_params={"action": "compile"},
+        timestamp="ts",
+        model_used="model",
+    )
+    execution = ToolExecution(
+        call=ToolCall(name="build", raw_params={"action": "compile"}),
+        result=result,
+        status="failure",
+        raw_params={"action": "compile"},
+        validated_params={"action": "compile"},
+        executed_params={"action": "compile"},
+        observation_text="build failed",
+        attempted_execution=True,
+    )
+    engine = _engine_with_context(context=context)
+    engine.tools = {}
+
+    monkeypatch.setattr(
+        engine,
+        "_get_tool_orchestrator",
+        lambda: type("Orchestrator", (), {"execute": lambda self, call: execution})(),
+    )
+
+    assert engine._execute_steps([step]) is True
+
+    entry = context.load_branch_history("phase_build").history[0]
+    assert result.output_ref in entry["output_refs"]
+    assert entry["failure_signature"] == result.failure_signature
+    assert entry["error_tail_preview"] == result.error_tail_preview
+    assert durable_tool_result_storage.retrieve_output(result.output_ref) == result.output
+
+
 def test_execute_steps_records_action_even_if_tool_clears_current_task(monkeypatch):
     context = RecordingBranchContext()
-    result = ToolResult(success=True, output="Final setup report generated.")
+    result = ToolResult.completed_success(output="Final setup report generated.")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: report",
@@ -470,8 +541,10 @@ def test_execute_steps_emits_single_observation_ui_event_with_real_orchestrator(
     assert "echo executed successfully" in observation_events[0][1]["message"]
 
 
-def test_execute_steps_forces_thinking_after_partial_status_without_success(monkeypatch):
-    result = ToolResult(success=False, status=EvidenceStatus.PARTIAL, output="needs review")
+def test_execute_steps_forces_thinking_after_partial_assessment_without_success(monkeypatch):
+    result = ToolResult.completed_failure(
+        evidence_assessment=EvidenceAssessment.PARTIAL, output="needs review"
+    )
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",
@@ -504,8 +577,8 @@ def test_execute_steps_forces_thinking_after_partial_status_without_success(monk
     assert engine._force_thinking_after_success is True
 
 
-def test_execute_steps_forces_thinking_after_raw_partial_status_without_success(monkeypatch):
-    result = ToolResult.model_construct(success=False, status=" partial ", output="needs review")
+def test_execute_steps_forces_thinking_after_string_partial_assessment(monkeypatch):
+    result = ToolResult.completed_failure(evidence_assessment="partial", output="needs review")
     step = ReActStep(
         step_type=StepType.ACTION,
         content="ACTION: example",
@@ -538,12 +611,12 @@ def test_execute_steps_forces_thinking_after_raw_partial_status_without_success(
     assert engine._force_thinking_after_success is True
 
 
-def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
+def test_apply_tool_execution_loop_effects_ignores_legacy_force_next_task():
     context = ContextWithForceNextTask()
     engine = _engine_with_context(context=context)
     execution = ToolExecution(
         call=ToolCall(name="manage_context", raw_params={"action": "complete_task"}),
-        result=ToolResult(success=False, output="loop broken"),
+        result=ToolResult.completed_failure(output="loop broken"),
         status="repetition_blocked",
         raw_params={"action": "complete_task"},
         metadata={
@@ -558,14 +631,14 @@ def test_apply_tool_execution_loop_effects_applies_metadata_side_effects():
     assert engine._force_thinking_next is True
     assert engine.prompt_builder._cached_trunk_context is None
     assert engine.prompt_builder._trunk_context_cache_timestamp is None
-    assert context.force_next_task_calls == 1
+    assert context.force_next_task_calls == 0
 
 
 def test_apply_tool_execution_loop_effects_skips_unavailable_force_next_task():
     engine = _engine_with_context(context=ContextWithoutForceNextTask())
     execution = ToolExecution(
         call=ToolCall(name="bash", raw_params={"command": "pwd"}),
-        result=ToolResult(success=False, output="loop broken"),
+        result=ToolResult.completed_failure(output="loop broken"),
         status="repetition_blocked",
         raw_params={"command": "pwd"},
         metadata={"force_next_task": True},

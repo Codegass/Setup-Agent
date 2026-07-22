@@ -7,8 +7,17 @@ the agent gets the log tail + poll instructions and the process keeps running.
 
 from types import SimpleNamespace
 
+import pytest
+
+from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
+from sag.agent.output_storage import OutputStorageManager
 from sag.docker_orch.orch import DockerOrchestrator
-from sag.tools.internal.build_utils import detached_handoff_tool_result
+from sag.tools.base import bind_tool_result_output_storage
+from sag.tools.internal.build_utils import (
+    classify_detached_completion,
+    detached_handoff_tool_result,
+)
+from sag.tools.search_tool import SearchTool
 
 
 def build_orchestrator(execute_command=None):
@@ -41,9 +50,11 @@ def test_detached_dispatch_builds_nohup_launcher_and_returns_handle():
     assert handle["pid"] == 12345
     assert handle["log_path"].startswith("/tmp/sag_jobs/")
     assert handle["exit_code_path"] == handle["log_path"] + ".exit"
+    assert handle["pid_path"].endswith(".pid")
     launcher = orchestrator.command_log[0]
     assert "nohup bash -c" in launcher
-    assert "echo $!" in launcher
+    assert "pid=$!" in launcher
+    assert handle["pid_path"] in launcher
     assert "/workspace/beam" in launcher
     assert "./gradlew compileJava --no-daemon" in launcher
 
@@ -67,6 +78,7 @@ def _handle():
         "started": True,
         "job_id": "abc",
         "pid": 12345,
+        "pid_path": "/tmp/sag_jobs/abc.pid",
         "log_path": "/tmp/sag_jobs/abc.log",
         "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
         "command": "./gradlew compileJava",
@@ -238,6 +250,35 @@ def test_soft_timeout_vanished_process_fails_safe():
     assert result["dispatch_status"] == "completed_detached"
 
 
+def test_soft_timeout_unknown_liveness_returns_distinct_pending_handoff():
+    unknown = {
+        "finished": False,
+        "running": False,
+        "exit_code": None,
+        "tail": "last known output",
+        "log_size": 17,
+        "probe_success": False,
+        "state": "unknown",
+    }
+    orchestrator = _soft_timeout_orchestrator([unknown], log_content="last known output")
+    collect_calls = []
+    orchestrator.collect_detached_result = lambda *args: collect_calls.append(args) or {}
+
+    result = orchestrator.execute_command_with_soft_timeout(
+        "./gradlew compileJava", soft_timeout=1, poll_interval=0.01
+    )
+
+    assert result["success"] is True
+    assert result["exit_code"] is None
+    assert result["dispatch_status"] == "liveness_unknown_detached"
+    assert result["lifecycle_state"] == "pending"
+    assert result["liveness_state"] == "unknown"
+    assert result["dispatch"]["job_id"] == "abc"
+    assert result["dispatch"]["last_tail"] == "last known output"
+    assert "last known output" in result["output"]
+    assert collect_calls == []
+
+
 def test_soft_timeout_dispatch_failure_is_failure_result():
     orchestrator = build_orchestrator()
     orchestrator.execute_command_detached = lambda command, **kwargs: {
@@ -259,11 +300,12 @@ def test_soft_timeout_dispatch_failure_is_failure_result():
 # --- tool-level handoff -------------------------------------------------------
 
 
-def test_detached_handoff_tool_result_shape():
+def test_detached_handoff_is_a_promise_not_success():
     result = {
         "output": "still running; tail -n 50 /tmp/sag_jobs/abc.log",
         "dispatch_status": "running_detached",
         "dispatch": {
+            "job_id": "abc",
             "pid": 12345,
             "log_path": "/tmp/sag_jobs/abc.log",
             "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
@@ -273,11 +315,227 @@ def test_detached_handoff_tool_result_shape():
 
     tool_result = detached_handoff_tool_result("gradle", "./gradlew build", result)
 
-    assert tool_result.success is True
+    assert tool_result.invocation_status is InvocationStatus.PENDING
+    assert tool_result.operation_outcome is OperationOutcome.UNKNOWN
+    assert tool_result.evidence_status is EvidenceStatus.UNKNOWN
+    assert tool_result.poll_ref == "job:abc"
     assert "tail -n 50" in tool_result.output
     assert tool_result.metadata["dispatch_status"] == "running_detached"
     assert tool_result.metadata["pid"] == 12345
     assert tool_result.metadata["log_path"] == "/tmp/sag_jobs/abc.log"
+
+
+def test_fatal_tail_overrides_zero_exit_plumbing(tmp_path):
+    outer_storage = OutputStorageManager(tmp_path / "outer")
+    origin_storage = OutputStorageManager(tmp_path / "origin")
+    output_ref = origin_storage.store_output(
+        task_id="detached",
+        tool_name="build",
+        output="CMake Error: configuration failed",
+    )
+    with bind_tool_result_output_storage(outer_storage):
+        result = classify_detached_completion(
+            exit_code=0,
+            tail="CMake Error: configuration failed",
+            full_output_ref=output_ref,
+            output_ref_storage=origin_storage,
+        )
+
+    assert result.invocation_status is InvocationStatus.COMPLETED
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.error_code == "DETACHED_OPERATION_FAILED"
+    assert result.failure_signature
+    assert result.error_tail_preview == "CMake Error: configuration failed"
+    assert result.output_ref == output_ref
+    assert origin_storage.retrieve_output(output_ref) == "CMake Error: configuration failed"
+
+
+def test_missing_exit_code_preserves_pending_unknown_with_poll_ref(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    output_ref = storage.store_output(
+        task_id="detached",
+        tool_name="build",
+        output="detached process state could not be established",
+    )
+    with bind_tool_result_output_storage(storage):
+        result = classify_detached_completion(
+            exit_code=None,
+            tail="detached process state could not be established",
+            full_output_ref=output_ref,
+            poll_ref="job:detached",
+        )
+
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
+    assert result.evidence_status is EvidenceStatus.UNKNOWN
+    assert result.poll_ref == "job:detached"
+    assert result.succeeded is False
+
+
+def test_detached_completion_rejects_shape_valid_unpersisted_output_ref():
+    with pytest.raises(ValueError, match="persisted.*OutputStorage"):
+        classify_detached_completion(
+            exit_code=None,
+            tail="detached process state could not be established",
+            full_output_ref="output_missing",
+            poll_ref="job:missing",
+        )
+
+
+def test_detached_failure_checks_origin_index_once_without_loading_output():
+    class IndexedOutputStorage:
+        def __init__(self):
+            self.lookups = 0
+
+        def has_output_ref(self, ref_id):
+            self.lookups += 1
+            return ref_id == "output_detached_failure"
+
+        def retrieve_output(self, ref_id):
+            raise AssertionError("ref validation must not load full output")
+
+    storage = IndexedOutputStorage()
+    result = classify_detached_completion(
+        exit_code=0,
+        tail="CMake Error: configuration failed",
+        full_output_ref="output_detached_failure",
+        output_ref_storage=storage,
+    )
+
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert storage.lookups == 1
+
+
+class PollingJobOrchestrator:
+    def __init__(self, poll, collected=None):
+        self.poll = poll
+        self.collected = collected or {}
+        self.handles = []
+
+    def detached_handle(self, job_id):
+        return {
+            "job_id": job_id,
+            "log_path": f"/tmp/sag_jobs/{job_id}.log",
+            "exit_code_path": f"/tmp/sag_jobs/{job_id}.log.exit",
+            "pid_path": f"/tmp/sag_jobs/{job_id}.pid",
+        }
+
+    def poll_detached_command(self, handle, **kwargs):
+        self.handles.append(handle)
+        return dict(self.poll)
+
+    def collect_detached_result(self, handle, poll):
+        return dict(self.collected)
+
+    def execute_command(self, command, **kwargs):
+        # The old implementation greps the log and reports that grep invocation
+        # as the original operation's successful completion.
+        return {"exit_code": 0, "output": self.poll.get("tail", "")}
+
+
+def test_search_job_poll_preserves_pending_for_active_original_operation():
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": False,
+            "running": True,
+            "exit_code": None,
+            "tail": "compiling module 3/10",
+            "log_size": 200,
+            "probe_success": True,
+            "state": "running",
+        }
+    )
+
+    result = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
+    assert result.evidence_status is EvidenceStatus.UNKNOWN
+    assert result.poll_ref == "job:abc"
+    assert "compiling module 3/10" in result.output
+
+
+def test_search_job_poll_keeps_same_ref_when_probe_cannot_establish_liveness():
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": False,
+            "running": False,
+            "exit_code": None,
+            "tail": "last known output",
+            "log_size": 17,
+            "probe_success": False,
+            "state": "unknown",
+        }
+    )
+
+    first = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+    second = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    for result in (first, second):
+        assert result.invocation_status is InvocationStatus.PENDING
+        assert result.operation_outcome is OperationOutcome.UNKNOWN
+        assert result.evidence_status is EvidenceStatus.UNKNOWN
+        assert result.poll_ref == "job:abc"
+    assert len(orchestrator.handles) == 2
+
+
+def test_search_job_poll_classifies_terminal_fatal_tail_for_original_operation(tmp_path):
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": True,
+            "running": False,
+            "exit_code": 0,
+            "tail": "CMake Error: configuration failed",
+            "log_size": 42,
+            "probe_success": True,
+            "state": "finished",
+        },
+        {
+            "exit_code": 0,
+            "output": "CMake Error: configuration failed",
+            "full_output": "CMake Error: configuration failed",
+            "dispatch_status": "completed_detached",
+        },
+    )
+    storage = OutputStorageManager(tmp_path)
+
+    with bind_tool_result_output_storage(storage, task_id="detached", tool_name="search"):
+        result = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    assert result.invocation_status is InvocationStatus.COMPLETED
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.poll_ref == "job:abc"
+    assert result.output_ref.startswith("output_")
+    assert storage.retrieve_output(result.output_ref) == "CMake Error: configuration failed"
+    assert result.error_code == "DETACHED_OPERATION_FAILED"
+
+
+def test_search_job_poll_reports_observed_vanish_as_crashed(tmp_path):
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": False,
+            "running": False,
+            "exit_code": None,
+            "tail": "process disappeared",
+            "log_size": 19,
+            "probe_success": True,
+            "state": "vanished",
+        },
+        {
+            "exit_code": 1,
+            "output": "process disappeared",
+            "full_output": "process disappeared",
+            "dispatch_status": "completed_detached",
+        },
+    )
+    storage = OutputStorageManager(tmp_path)
+
+    with bind_tool_result_output_storage(storage, task_id="detached", tool_name="search"):
+        result = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    assert result.invocation_status is InvocationStatus.CRASHED
+    assert result.operation_outcome is OperationOutcome.FAILED
+    assert result.poll_ref == "job:abc"
 
 
 # --- review fixes: spoof-proof poll parsing, atomic exit file ----------------
@@ -286,10 +544,7 @@ def test_detached_handoff_tool_result_shape():
 def test_poll_markers_in_log_tail_cannot_spoof_completion():
     """STATE:/SIZE: lines printed by the build itself land in the tail and
     must not be parsed as completion markers."""
-    output = (
-        "STATE:RUNNING\nSIZE:100\n---TAIL---\n"
-        "some build output\nSTATE:EXIT:0\nSIZE:99999\n"
-    )
+    output = "STATE:RUNNING\nSIZE:100\n---TAIL---\n" "some build output\nSTATE:EXIT:0\nSIZE:99999\n"
     orchestrator = build_orchestrator(
         execute_command=lambda command, **kwargs: {"exit_code": 0, "output": output}
     )
@@ -329,11 +584,12 @@ class RoutingOrchestrator:
     tests/test_maven_gradle_tool_contracts.py's fake does.
     """
 
-    def __init__(self, handoff=True):
+    def __init__(self, handoff=True, handoff_status="running_detached"):
         self.soft_timeout_calls = []
         self.monitoring_calls = []
         self.project_name = None
         self._handoff = handoff
+        self._handoff_status = handoff_status
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         if command in ("which mvn", "command -v mvn"):
@@ -368,7 +624,7 @@ class RoutingOrchestrator:
                 "exit_code": None,
                 "output": "still running; poll /tmp/sag_jobs/abc.log",
                 "termination_reason": None,
-                "dispatch_status": "running_detached",
+                "dispatch_status": self._handoff_status,
                 "dispatch": {
                     "pid": 1,
                     "log_path": "/tmp/sag_jobs/abc.log",
@@ -381,7 +637,11 @@ class RoutingOrchestrator:
             "output": "BUILD SUCCESSFUL",
             "termination_reason": None,
             "dispatch_status": "completed_detached",
-            "dispatch": {},
+            "dispatch": {
+                "job_id": "abc",
+                "log_path": "/tmp/sag_jobs/abc.log",
+                "exit_code_path": "/tmp/sag_jobs/abc.log.exit",
+            },
         }
 
 
@@ -395,7 +655,8 @@ def test_gradle_tool_routes_build_through_dispatch_and_returns_handoff():
 
     assert orchestrator.soft_timeout_calls, "gradle build must use dispatch-and-poll"
     assert orchestrator.monitoring_calls == []
-    assert result.success is True
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.metadata["dispatch_status"] == "running_detached"
     assert "/tmp/sag_jobs/abc.log" in result.output
 
@@ -421,8 +682,35 @@ def test_bash_tool_routes_long_command_through_dispatch():
     result = tool.execute(command="mvn verify", timeout=1200)
 
     assert orchestrator.soft_timeout_calls, "mvn verify must use dispatch-and-poll"
-    assert result.success is True
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
     assert result.metadata["dispatch_status"] == "running_detached"
+
+
+@pytest.mark.parametrize("tool_name", ["bash", "maven", "gradle"])
+def test_build_tools_preserve_unknown_liveness_as_pending_handoff(tool_name):
+    orchestrator = RoutingOrchestrator(
+        handoff=True,
+        handoff_status="liveness_unknown_detached",
+    )
+    if tool_name == "bash":
+        from sag.tools.bash import BashTool
+
+        result = BashTool(orchestrator).execute(command="mvn verify", timeout=1200)
+    elif tool_name == "maven":
+        from sag.tools.internal.maven_tool import MavenTool
+
+        result = MavenTool(orchestrator).execute(command="test", working_directory="/workspace/p")
+    else:
+        from sag.tools.internal.gradle_tool import GradleTool
+
+        result = GradleTool(orchestrator).execute(tasks="build", working_directory="/workspace/p")
+
+    assert result.invocation_status is InvocationStatus.PENDING
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
+    assert result.evidence_status is EvidenceStatus.UNKNOWN
+    assert result.poll_ref == "job:abc"
+    assert result.metadata["dispatch_status"] == "liveness_unknown_detached"
 
 
 def test_bash_quick_inspection_commands_not_dispatched():
@@ -453,7 +741,12 @@ def test_repetition_detector_exempts_dispatch_poll_commands():
         "('working_directory', '/workspace')]"
     )
     recent = [
-        {"signature": poll_signature, "success": True, "timestamp": f"ts-{i}"}
+        {
+            "signature": poll_signature,
+            "invocation_status": "completed",
+            "operation_outcome": "success",
+            "timestamp": f"ts-{i}",
+        }
         for i in range(9)
     ]
     orchestrator = ToolOrchestrator(
@@ -462,7 +755,7 @@ def test_repetition_detector_exempts_dispatch_poll_commands():
         recent_tool_executions=recent,
         successful_states={},
         repository_url=None,
-        track_tool_execution=lambda signature, success: None,
+        track_tool_execution=lambda signature, result: None,
         update_successful_states=lambda tool_name, params, result: None,
         add_system_guidance=lambda message, priority=5: None,
         get_timestamp=lambda: "ts",
@@ -485,7 +778,12 @@ def test_heredoc_body_keywords_do_not_trigger_dispatch():
     from sag.tools.bash import BashTool
 
     tool = BashTool(RoutingOrchestrator())
-    assert tool._is_long_running_command("python - <<'PY'\nimport subprocess\nsubprocess.run(['mvn','test'])\nPY") is False
+    assert (
+        tool._is_long_running_command(
+            "python - <<'PY'\nimport subprocess\nsubprocess.run(['mvn','test'])\nPY"
+        )
+        is False
+    )
 
 
 def test_version_probe_flags_are_quick():

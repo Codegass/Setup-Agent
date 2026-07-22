@@ -29,14 +29,14 @@ from types import SimpleNamespace
 
 import pytest
 
+# Reusable fakes from the original suites (pytest prepend import mode).
+from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
+
 from sag.agent.physical_validator import PhysicalValidator
 from sag.testcases.catalog import build_java_test_catalog
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 from sag.tools.internal.python_tool import COLLECTED_JSON
 from sag.tools.report_tool import ReportTool
-
-# Reusable fakes from the original suites (pytest prepend import mode).
-from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
 
 
 # ---------------------------------------------------------------------------
@@ -51,9 +51,7 @@ class LocalShellOrch:
 
     def execute_command(self, command, **kwargs):
         self.commands.append(command)
-        proc = subprocess.run(
-            ["bash", "-c", command], capture_output=True, text=True, timeout=120
-        )
+        proc = subprocess.run(["bash", "-c", command], capture_output=True, text=True, timeout=120)
         return {
             "success": proc.returncode == 0,
             "exit_code": proc.returncode,
@@ -63,9 +61,7 @@ class LocalShellOrch:
 
 
 def _java_test_class(package, class_name, methods):
-    body = "\n".join(
-        f"    @Test\n    public void {m}() {{ }}\n" for m in methods
-    )
+    body = "\n".join(f"    @Test\n    public void {m}() {{ }}\n" for m in methods)
     return (
         f"package {package};\n\nimport org.junit.jupiter.api.Test;\n\n"
         f"public class {class_name} {{\n{body}}}\n"
@@ -88,16 +84,12 @@ def _make_click_shaped_tree(tmp_path, project_files=12, vendored_files=60):
 
     # The environment the setup created inside the project: site-packages
     # ships vendored suites (pytest's own tests, bundled fixtures, ...).
-    site = (
-        project / ".venv" / "lib" / "python3.12" / "site-packages" / "vendorpkg"
-    )
+    site = project / ".venv" / "lib" / "python3.12" / "site-packages" / "vendorpkg"
     vendored_java = site / "src" / "test" / "java" / "com" / "vendor"
     vendored_java.mkdir(parents=True)
     for i in range(vendored_files):
         (vendored_java / f"Vendor{i}Test.java").write_text(
-            _java_test_class(
-                "com.vendor", f"Vendor{i}Test", [f"testV{j}" for j in range(5)]
-            )
+            _java_test_class("com.vendor", f"Vendor{i}Test", [f"testV{j}" for j in range(5)])
         )
     # Python-style vendored test functions too (click's actual pollution).
     vendored_py = site / "tests"
@@ -208,9 +200,7 @@ def test_env_dir_with_virtualenv_signature_is_pruned(tmp_path):
     project = tmp_path / "sigproj"
     own = project / "src" / "test" / "java" / "com" / "example"
     own.mkdir(parents=True)
-    (own / "OwnTest.java").write_text(
-        _java_test_class("com.example", "OwnTest", ["testOwn"])
-    )
+    (own / "OwnTest.java").write_text(_java_test_class("com.example", "OwnTest", ["testOwn"]))
 
     planted = project / "env"
     vendored = planted / "src" / "test" / "java" / "com" / "vendor"
@@ -237,9 +227,7 @@ def test_venv_dir_with_bin_activate_signature_is_pruned(tmp_path):
     project = tmp_path / "actproj"
     own = project / "src" / "test" / "java" / "com" / "example"
     own.mkdir(parents=True)
-    (own / "OwnTest.java").write_text(
-        _java_test_class("com.example", "OwnTest", ["testOwn"])
-    )
+    (own / "OwnTest.java").write_text(_java_test_class("com.example", "OwnTest", ["testOwn"]))
 
     planted = project / "venv"
     (planted / "bin").mkdir(parents=True)
@@ -262,9 +250,7 @@ def test_dist_named_module_tests_are_kept(tmp_path):
     project = tmp_path / "distproj"
     mod = project / "dist" / "src" / "test" / "java" / "com" / "example"
     mod.mkdir(parents=True)
-    (mod / "DistTest.java").write_text(
-        _java_test_class("com.example", "DistTest", ["testDist"])
-    )
+    (mod / "DistTest.java").write_text(_java_test_class("com.example", "DistTest", ["testDist"]))
 
     catalog = build_java_test_catalog(str(project), LocalShellOrch())
 
@@ -295,9 +281,7 @@ class _DenominatorOrch:
         if c.startswith("cat ") and "trunk_" in c:
             return {
                 "exit_code": 0,
-                "output": json.dumps(
-                    {"environment_summary": {"static_test_count": self.static}}
-                ),
+                "output": json.dumps({"environment_summary": {"static_test_count": self.static}}),
             }
         if c == f"cat {COLLECTED_JSON}":
             if self.collected is None:
@@ -315,9 +299,7 @@ def test_collect_only_denominator_outranks_static_count_on_python():
     """python: env-summary static=32927 present AND collected=1927 -> the gate
     denominator is 1927 (ground truth), the static heuristic is preserved as
     evidence only."""
-    validator = PhysicalValidator(
-        docker_orchestrator=_DenominatorOrch(), project_path="/workspace"
-    )
+    validator = PhysicalValidator(docker_orchestrator=_DenominatorOrch(), project_path="/workspace")
 
     result = validator.validate_project_analysis_status("click")
 
@@ -357,10 +339,17 @@ def test_agent_gate_no_partial_cap_with_collected_denominator():
         FakePhysicalValidator(
             build_status={"success": True, "build_complete": True, "reason": "ok"},
             test_status={
-                "has_test_reports": True, "status": "SUCCESS", "reason": "98.7%",
-                "pass_rate": 100.0, "total_tests": 1902, "passed_tests": 1902,
-                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "SUCCESS",
+                "reason": "98.7%",
+                "pass_rate": 100.0,
+                "total_tests": 1902,
+                "passed_tests": 1902,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "test_exclusions": [],
+                "modules_without_tests": [],
             },
             analysis_status={
                 "analyzed": True,
@@ -371,7 +360,7 @@ def test_agent_gate_no_partial_cap_with_collected_denominator():
         )
     )
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
     assert agent.final_verdict == "success"
 
 
@@ -391,18 +380,26 @@ def test_report_snapshot_prefers_collected_denominator_on_python():
             "test_status": {
                 "static_test_count": 1927,
                 "test_stats": {
-                    "discovered": 1927, "executed": 1902, "passed": 1902,
-                    "failed": 0, "skipped": 0, "pass_rate": 100.0,
+                    "discovered": 1927,
+                    "executed": 1902,
+                    "passed": 1902,
+                    "failed": 0,
+                    "skipped": 0,
+                    "pass_rate": 100.0,
                 },
             },
             "test_analysis": {
-                "total_tests": 1902, "passed_tests": 1902, "failed_tests": 0,
-                "error_tests": 0, "skipped_tests": 0, "pass_rate": 100.0,
+                "total_tests": 1902,
+                "passed_tests": 1902,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "pass_rate": 100.0,
             },
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="success",
         report_filename="setup-report-test.md",
         project_info={"build_system": "pip/poetry"},
@@ -413,9 +410,7 @@ def test_report_snapshot_prefers_collected_denominator_on_python():
     status = snapshot["status"]
     assert status["static_test_count"] == 1927
     assert status["execution_rate"] == pytest.approx(1902 / 1927 * 100, abs=0.01)
-    assert "tests_not_fully_executed" not in snapshot["evidence_result"].get(
-        "conflicts", []
-    )
+    assert "tests_not_fully_executed" not in snapshot["evidence_result"].get("conflicts", [])
 
 
 def test_report_snapshot_java_trunk_static_count_unchanged():
@@ -432,14 +427,18 @@ def test_report_snapshot_java_trunk_static_count_unchanged():
         "physical_validation": {
             "test_status": {"static_test_count": 999},
             "test_analysis": {
-                "total_tests": 1122, "passed_tests": 1122, "failed_tests": 0,
-                "error_tests": 0, "skipped_tests": 0, "pass_rate": 100.0,
+                "total_tests": 1122,
+                "passed_tests": 1122,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
+                "pass_rate": 100.0,
                 "unique_tests": 1122,
             },
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="success",
         report_filename="setup-report-test.md",
         project_info={"build_system": "Maven"},

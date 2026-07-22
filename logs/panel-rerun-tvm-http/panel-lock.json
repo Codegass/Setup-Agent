@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "panel": "category3-analyzer-diet",
+  "baseline_sag_sha": "f48a039bfab5ea4ab88116af42ddfdbfefaca1ad",
+  "image_digest_source": "run-pin.json:container_image_digest — the agent stamps the image digest into the host+container run-pin mirrors; the collector's run-probe path re-derives it from the created container (_container_image_digest) and refuses to archive on any disagreement.",
+  "model_config_note": "thinking_model, action_model, sanitized_config, and prompt_bundle_sha256 are recorded per run in each run-pin.json. This panel pins neither model id nor config hash; the run-pin snapshot is authoritative and the collector verifies pin/behavior identity (feature_flags) bit-by-bit before archiving.",
+  "evidence_source_mode": "tool-emitted",
+  "pre_registered_floors": {
+    "bigtop": {
+      "verdict_not_unknown": true,
+      "phantom_green_guard": "NOT(verdict=='success' AND build_evidence.compiled_classes==0)",
+      "compiled_classes_min": 96,
+      "data_generators_build_success": "at least one successful data-generators build invocation in the control record",
+      "unique_executed_min": 50,
+      "unique_failed_max": 0,
+      "note": "compiled_classes_min = floor(0.8 * min(121,121,121)); executed/failed from the archived P baseline (final7 x3) 50/50. judgment/source predicates apply to fresh runs only (final7 predates the oracle fix — judgment/source null there)."
+    },
+    "httpcomponents-client": {
+      "test_phase_workdir_is_project_root": true,
+      "unique_executed_min": 1500,
+      "verdict": "success",
+      "build_evidence_source": "physical",
+      "note": "historical 1,856; the 16-test mis-scope must be impossible."
+    },
+    "tvm": {
+      "build_judgment_failed_physical_or_strictly_better": "build_evidence.judgment=='failed' AND build_evidence.source=='physical', OR verdict in {partial,success} with build_evidence.green",
+      "pytest_node_or_k_filter_while_unbuilt": "every pytest invocation carries a node-id path or -k filter (--maxfail alone does NOT select)",
+      "collected_after_deselection_max": 50,
+      "verdict_not_unknown": true,
+      "note": "collected_after_deselection is the structured python-tool result field; NEVER summary text. Evidence source mode pinned tool-emitted for the whole campaign; it may not switch mid-campaign."
+    },
+    "pyyaml": {
+      "stamped_manifest_exists_despite_skipped_analyze": true,
+      "manifest_python_packages": ["yaml"],
+      "verdict": "success",
+      "unique_executed_min": null,
+      "unique_failed_max": 0,
+      "note": "unique_executed_min is CALIBRATED before the panel: three arm-P calibration runs (excluded from the 24-run panel), each valid only if every non-count anchor passes AND unique.executed>0; floor = max(1, floor(0.8 * min(executed over the three valid runs))); appended to campaign-ledger.jsonl before any panel run."
+    }
+  },
+  "probes": {
+    "bigtop": {
+      "url": "https://github.com/apache/bigtop.git",
+      "ref": "e32423c444a9311b802946d5b695767a9b921e1e",
+      "locked_sha": "e32423c444a9311b802946d5b695767a9b921e1e",
+      "class": "pathological aggregator / archipelago",
+      "arms": ["P", "F"]
+    },
+    "tvm": {
+      "url": "https://github.com/apache/tvm.git",
+      "ref": "3a5b4d4e64707a1528146e28c0fb75f45da99dd7",
+      "locked_sha": "3a5b4d4e64707a1528146e28c0fb75f45da99dd7",
+      "class": "python native-core",
+      "arms": ["P", "F"]
+    },
+    "pyyaml": {
+      "url": "https://github.com/yaml/pyyaml.git",
+      "ref": "49790e73684bebad1df05ef8d828fa12f685bffb",
+      "locked_sha": "49790e73684bebad1df05ef8d828fa12f685bffb",
+      "release": "6.0.3",
+      "class": "skipped-analyze / package_dir layout",
+      "arms": ["P", "F"]
+    },
+    "httpcomponents-client": {
+      "url": "https://github.com/apache/httpcomponents-client.git",
+      "ref": "4f86ca6a5eb528613edb892a4f7161e23dce15d7",
+      "locked_sha": "4f86ca6a5eb528613edb892a4f7161e23dce15d7",
+      "release": "rel/v5.6.1",
+      "class": "healthy reactor scoping",
+      "arms": ["P", "F"]
+    }
+  },
+  "baseline_reds": {
+    "note": "Panel precondition (analyzer-diet.md:536-555): the SIX pre-existing SUITE failures registered in the campaign ledger at panel start; any NEW suite failure BLOCKS the panel. Suite reds, NOT probes. Matched by node-id keyword up to max_count; an accepted red that spreads to a new call site (count overflow) is a NEW regression that blocks.",
+    "accepted": [
+      {"keyword": "test_evidence_ingestion", "max_count": 1},
+      {"keyword": "test_stage1_review_fixes", "max_count": 2},
+      {"keyword": "test_lineage_idempotence_followup", "max_count": 2},
+      {"keyword": "test_packaging_smoke", "max_count": 1}
+    ]
+  }
+}

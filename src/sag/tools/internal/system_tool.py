@@ -104,8 +104,7 @@ class SystemTool(BaseTool):
                 if not java_version:
                     # Just check what Java version is installed
                     java_check = self.docker_orchestrator.execute_command("java -version 2>&1")
-                    return ToolResult(
-                        success=True,
+                    return ToolResult.completed_success(
                         output=java_check.get("output", "Java not installed"),
                         metadata={"exit_code": java_check.get("exit_code", -1)},
                     )
@@ -113,14 +112,12 @@ class SystemTool(BaseTool):
                     # Verify against a specific version
                     verification = self._verify_java_version(java_version)
                     if verification["matches"]:
-                        return ToolResult(
-                            success=True,
+                        return ToolResult.completed_success(
                             output=f"✅ Java {java_version} is installed and active",
                             metadata=verification,
                         )
                     elif verification["installed"]:
-                        return ToolResult(
-                            success=False,
+                        return ToolResult.completed_failure(
                             output=f"❌ Java version mismatch: Required {java_version}, but found {verification['current_version']}",
                             error=f"Java version mismatch",
                             error_code="JAVA_VERSION_MISMATCH",
@@ -131,8 +128,7 @@ class SystemTool(BaseTool):
                             metadata=verification,
                         )
                     else:
-                        return ToolResult(
-                            success=False,
+                        return ToolResult.completed_failure(
                             output="Java is not installed",
                             error="Java not found",
                             error_code="JAVA_NOT_INSTALLED",
@@ -148,8 +144,7 @@ class SystemTool(BaseTool):
         except Exception as e:
             error_msg = f"System operation failed: {str(e)}"
             logger.error(f"System tool error for action '{action}': {error_msg}")
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=error_msg,
                 error_code="SYSTEM_ERROR",
@@ -163,13 +158,13 @@ class SystemTool(BaseTool):
     def _install_packages(self, packages: List[str]) -> ToolResult:
         """Install system packages using apt-get."""
         if not packages:
-            return ToolResult(
-                success=True, output="No packages to install", metadata={"packages": []}
+            return ToolResult.completed_success(
+                output="No packages to install", metadata={"packages": []}
             )
 
         # Update package lists first
         update_result = self._update_packages()
-        if not update_result.success:
+        if not update_result.succeeded:
             logger.warning(f"Failed to update package lists: {update_result.error}")
 
         # Install packages
@@ -181,8 +176,7 @@ class SystemTool(BaseTool):
         result = self.docker_orchestrator.execute_command(command=command)
 
         if result["exit_code"] == 0:
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Successfully installed packages: {packages_str}\n\n{result['output']}",
                 metadata={
                     "packages": packages,
@@ -194,8 +188,7 @@ class SystemTool(BaseTool):
             # Try to provide helpful error analysis
             error_analysis = self._analyze_install_error(result["output"])
 
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=result["output"],
                 error=f"Failed to install packages: {packages_str}",
                 error_code="INSTALL_FAILED",
@@ -217,14 +210,12 @@ class SystemTool(BaseTool):
         result = self.docker_orchestrator.execute_command(command=command)
 
         if result["exit_code"] == 0:
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Successfully updated package lists\n\n{result['output']}",
                 metadata={"exit_code": result["exit_code"], "command": command},
             )
         else:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=result["output"],
                 error="Failed to update package lists",
                 error_code="UPDATE_FAILED",
@@ -275,14 +266,12 @@ class SystemTool(BaseTool):
             for tool_info in missing_tools:
                 output += f"• {tool_info['tool']}: Install with 'apt-get install {' '.join(tool_info['packages'])}'\n"
 
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=output,
                 metadata={"missing_tools": missing_tools, "total_missing": len(missing_tools)},
             )
         else:
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output="All common development tools are available",
                 metadata={"missing_tools": [], "total_missing": 0},
             )
@@ -292,14 +281,13 @@ class SystemTool(BaseTool):
 
         # First detect what's missing
         detect_result = self._detect_missing_tools()
-        if not detect_result.success:
+        if not detect_result.succeeded:
             return detect_result
 
         missing_tools = detect_result.metadata.get("missing_tools", [])
 
         if not missing_tools:
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output="No missing dependencies detected",
                 metadata={"installed_packages": []},
             )
@@ -315,9 +303,8 @@ class SystemTool(BaseTool):
         # Install all missing packages
         install_result = self._install_packages(packages_to_install)
 
-        if install_result.success:
-            return ToolResult(
-                success=True,
+        if install_result.succeeded:
+            return ToolResult.completed_success(
                 output=f"Successfully installed missing dependencies: {', '.join(packages_to_install)}\n\n{install_result.output}",
                 metadata={
                     "missing_tools": missing_tools,
@@ -326,8 +313,7 @@ class SystemTool(BaseTool):
                 },
             )
         else:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=install_result.output,
                 error=f"Failed to install some dependencies: {install_result.error}",
                 error_code="INSTALL_MISSING_FAILED",
@@ -405,15 +391,14 @@ class SystemTool(BaseTool):
         # If the correct version is already installed, just configure it
         if version_check["matches"]:
             logger.info(f"Java {java_version} is already installed and active")
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Java {java_version} is already installed and configured\n\n{version_check['raw_output']}",
                 metadata=version_check,
             )
 
         # Step 2: Update package lists
         update_result = self._update_packages()
-        if not update_result.success:
+        if not update_result.succeeded:
             logger.warning("Failed to update package lists, continuing anyway")
 
         # Step 3: Install OpenJDK
@@ -441,8 +426,7 @@ class SystemTool(BaseTool):
                     java_package = alt_package
                     break
             else:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=install_result["output"],
                     error=f"Failed to install Java {java_version}",
                     error_code="JAVA_INSTALL_FAILED",
@@ -529,8 +513,7 @@ class SystemTool(BaseTool):
                         break
             else:
                 # Could not find Java installation
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=f"Java {java_version} was installed but cannot find the binaries",
                     error="Java binaries not found",
                     error_code="JAVA_BINARIES_NOT_FOUND",
@@ -614,8 +597,7 @@ class SystemTool(BaseTool):
 
         if verify_result["exit_code"] == 0:
             self._register_java_runtime_overlay(java_home, java_version)
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"Successfully installed and configured Java {java_version}\n\n"
                 f"JAVA_HOME: {java_home}\n"
                 f"Verification:\n{verify_result['output']}",
@@ -627,8 +609,7 @@ class SystemTool(BaseTool):
                 },
             )
         else:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output=verify_result["output"],
                 error=f"Java {java_version} installed but verification failed",
                 error_code="JAVA_CONFIG_FAILED",
@@ -729,8 +710,7 @@ class SystemTool(BaseTool):
                 unique_packages.append(pkg)
 
         if not unique_packages:
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output="All requested commands are already available.\n"
                 + "\n".join(search_results),
                 metadata={
@@ -745,14 +725,13 @@ class SystemTool(BaseTool):
         install_result = self._install_packages(unique_packages)
 
         # Enhance the output with search information
-        if install_result.success:
+        if install_result.succeeded:
             enhanced_output = f"Smart installation completed!\n\n"
             enhanced_output += f"Command analysis:\n" + "\n".join(search_results) + "\n\n"
             enhanced_output += f"Installed packages: {', '.join(unique_packages)}\n\n"
             enhanced_output += install_result.output
 
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=enhanced_output,
                 metadata={
                     "commands": commands,

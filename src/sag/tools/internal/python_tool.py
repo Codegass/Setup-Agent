@@ -14,10 +14,16 @@ required for a green verdict.
 import json
 import re
 import shlex
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
+
+from sag.evidence import TestStats
+from sag.testcases.compileall_metrics import (
+    COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
+    compileall_metrics_command,
+    parse_compileall_metrics,
+)
 
 from ..base import BaseTool, ToolResult
 from .build_preflight import (
@@ -44,6 +50,10 @@ COLLECTED_JSON = "/workspace/.setup_agent/pytest_collected.json"
 _PIP_FALLBACK = "{venv}/bin/python -m pip install -e ."
 
 _COLLECTED_RE = re.compile(r"(\d+)\s+tests?\s+collected")
+# The SELECTED count of a filtered collection: the X of pytest's
+# "X/Y tests collected (Z deselected)". The plain _COLLECTED_RE would match
+# Y (the digits touching "tests collected") — the TOTAL, not the selection.
+_SELECTED_RE = re.compile(r"(\d+)/\d+\s+tests?\s+collected")
 _NO_TESTS_RE = re.compile(r"no tests collected|no tests ran")
 
 # Bug #13 defect 2: install-failure signatures that must redden the result
@@ -71,8 +81,11 @@ _SUMMARY_STATS_RE = re.compile(r"\b\d+ (?:passed|failed)\b")
 # band. Applied only when the exit code is unreliable (0/None) and no
 # summary stats line exists.
 _COLLECTION_ERROR_RE = re.compile(
-    r"^_*\s*ERROR collecting\b"
-    r"|!!+\s*Interrupted: \d+ errors? during collection",
+    r"^_*\s*ERROR collecting\b" r"|!!+\s*Interrupted: \d+ errors? during collection",
+    re.MULTILINE,
+)
+_CONFTEST_IMPORT_ERROR_RE = re.compile(
+    r"^(?:STDERR:\s*)?ImportError while loading conftest\b",
     re.MULTILINE,
 )
 _USAGE_ERROR_RE = re.compile(r"^ERROR: usage:", re.MULTILINE)
@@ -92,6 +105,171 @@ _PYTEST_USAGE_HINT = (
 )
 
 _OPERATIONS = ("setup_env", "test", "build", "compile")
+_PYTEST_JUNIT_CONFLICT = "pytest_junit_unavailable"
+_PYTEST_ATTEMPT_ID_CONFLICT = "pytest_attempt_id_unpersisted"
+_PYTEST_JUNIT_MAX_COUNT = (1 << 63) - 1
+_PYTEST_JUNIT_SUMMARY_MAX_BYTES = 512
+_PYTEST_JUNIT_ERROR_REASONS = frozenset(
+    {
+        "missing",
+        "malformed",
+        "unreadable",
+        "unsupported",
+        "invalid_counts",
+        "extract_failed",
+    }
+)
+_PYTEST_JUNIT_EXTRACT_SCRIPT = """\
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+def emit(payload):
+    print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+def unavailable(reason):
+    emit({"error": reason, "ok": False})
+    raise SystemExit(0)
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except FileNotFoundError:
+    unavailable("missing")
+except ET.ParseError:
+    unavailable("malformed")
+except OSError:
+    unavailable("unreadable")
+
+name = root.tag.rsplit("}", 1)[-1]
+if name == "testsuite":
+    suites = [root]
+elif name == "testsuites":
+    suites = [root] if "tests" in root.attrib else [
+        child for child in root if child.tag.rsplit("}", 1)[-1] == "testsuite"
+    ]
+else:
+    unavailable("unsupported")
+
+try:
+    counts = {
+        key: sum(int(suite.attrib.get(key, 0) or 0) for suite in suites)
+        for key in ("tests", "failures", "errors", "skipped")
+    }
+except (TypeError, ValueError, OverflowError):
+    unavailable("invalid_counts")
+
+if (
+    counts["tests"] <= 0
+    or any(value < 0 for value in counts.values())
+    or any(value > 9223372036854775807 for value in counts.values())
+    or counts["failures"] + counts["errors"] + counts["skipped"] > counts["tests"]
+):
+    unavailable("invalid_counts")
+
+emit({"ok": True, **counts})
+"""
+
+_PYTEST_ATTEMPT_TAG_SCRIPT = """\
+import os
+import sys
+import xml.etree.ElementTree as ET
+
+path = sys.argv[1]
+attempt_id = int(sys.argv[2])
+if attempt_id < 1:
+    raise ValueError("attempt_id must be positive")
+
+tree = ET.parse(path)
+root = tree.getroot()
+
+def local_name(element):
+    return element.tag.rsplit("}", 1)[-1]
+
+def child_tag(parent, name):
+    if parent.tag.startswith("{"):
+        namespace = parent.tag.split("}", 1)[0] + "}"
+        return namespace + name
+    return name
+
+suite = root if local_name(root) == "testsuite" else next(
+    element for element in root.iter() if local_name(element) == "testsuite"
+)
+properties = next(
+    (child for child in suite if local_name(child) == "properties"),
+    None,
+)
+if properties is None:
+    properties = ET.Element(child_tag(suite, "properties"))
+    suite.insert(0, properties)
+property_element = next(
+    (
+        child
+        for child in properties
+        if local_name(child) == "property"
+        and child.attrib.get("name") == "sag.attempt_id"
+    ),
+    None,
+)
+if property_element is None:
+    property_element = ET.SubElement(properties, child_tag(properties, "property"))
+property_element.set("name", "sag.attempt_id")
+property_element.set("value", str(attempt_id))
+
+temporary = path + ".attempt.tmp"
+tree.write(temporary, encoding="utf-8", xml_declaration=True)
+os.replace(temporary, path)
+print("SAG_ATTEMPT_TAGGED")
+"""
+
+
+def _parse_pytest_junit_summary(
+    output: str,
+    discovered: Optional[int],
+) -> tuple[Optional[TestStats], Dict[str, int], Optional[str]]:
+    encoded = (output or "").strip().encode("utf-8", errors="replace")
+    if not encoded or len(encoded) > _PYTEST_JUNIT_SUMMARY_MAX_BYTES:
+        return None, {}, "extract_failed"
+    try:
+        payload = json.loads(encoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, {}, "extract_failed"
+    if not isinstance(payload, dict):
+        return None, {}, "extract_failed"
+    if payload.get("ok") is not True:
+        reason = payload.get("error")
+        if reason not in _PYTEST_JUNIT_ERROR_REASONS:
+            reason = "extract_failed"
+        return None, {}, reason
+
+    keys = ("tests", "failures", "errors", "skipped")
+    if any(type(payload.get(key)) is not int for key in keys):
+        return None, {}, "invalid_counts"
+    executed, failures, errors, skipped = (payload[key] for key in keys)
+    if (
+        executed <= 0
+        or min(executed, failures, errors, skipped) < 0
+        or max(executed, failures, errors, skipped) > _PYTEST_JUNIT_MAX_COUNT
+        or failures + errors + skipped > executed
+    ):
+        return None, {}, "invalid_counts"
+
+    counts = {
+        "tests": executed,
+        "failed_tests": failures,
+        "error_tests": errors,
+        "skipped_tests": skipped,
+    }
+    return (
+        TestStats(
+            discovered=discovered,
+            executed=executed,
+            passed=executed - failures - errors - skipped,
+            failed=failures + errors,
+            skipped=skipped,
+        ),
+        counts,
+        None,
+    )
 
 
 def _classify_pytest_result(
@@ -120,7 +298,11 @@ def _classify_pytest_result(
         detail = _snippet(_USAGE_ERROR_RE) or f"pytest exited {exit_code}"
         return False, f"pytest usage error — {detail}", "PYTEST_USAGE_ERROR"
     if exit_code == 2:
-        detail = _snippet(_COLLECTION_ERROR_RE) or f"pytest exited {exit_code}"
+        detail = (
+            _snippet(_COLLECTION_ERROR_RE)
+            or _snippet(_CONFTEST_IMPORT_ERROR_RE)
+            or f"pytest exited {exit_code}"
+        )
         return False, f"pytest collection error — {detail}", "PYTEST_COLLECTION_ERROR"
     if exit_code == 5:
         return (
@@ -144,10 +326,11 @@ def _classify_pytest_result(
                 f"pytest usage error — {_snippet(_USAGE_ERROR_RE)}",
                 "PYTEST_USAGE_ERROR",
             )
-        if _COLLECTION_ERROR_RE.search(text):
+        if _COLLECTION_ERROR_RE.search(text) or _CONFTEST_IMPORT_ERROR_RE.search(text):
             return (
                 False,
-                f"pytest collection error — {_snippet(_COLLECTION_ERROR_RE)}",
+                "pytest collection error — "
+                f"{_snippet(_COLLECTION_ERROR_RE) or _snippet(_CONFTEST_IMPORT_ERROR_RE)}",
                 "PYTEST_COLLECTION_ERROR",
             )
         if _NO_TESTS_RE.search(text):
@@ -182,6 +365,7 @@ class PythonTool(BaseTool):
         )
         self.orchestrator = orchestrator
         self.command_tracker = command_tracker
+        self._test_attempt_counter = 0
 
     def execute(
         self,
@@ -192,8 +376,7 @@ class PythonTool(BaseTool):
     ) -> ToolResult:
         op = (operation or "").strip().lower()
         if op not in _OPERATIONS:
-            return ToolResult(
-                success=False,
+            return ToolResult.completed_failure(
                 output="",
                 error=f"Unknown python operation: {operation!r}",
                 error_code="UNKNOWN_PYTHON_OPERATION",
@@ -214,8 +397,12 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _setup_env(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         # Pre-flight FIRST (narration prepended, same pattern as the ported
         # maven/gradle tools): check-and-fix, never a hard block.
@@ -234,8 +421,7 @@ class PythonTool(BaseTool):
             made = self._run(f"python3 -m venv {venv}", working_directory, timeout)
             if not made.get("success"):
                 return self._finish(
-                    ToolResult(
-                        success=False,
+                    ToolResult.completed_failure(
                         output=self._tail(made.get("output") or ""),
                         error=f"could not create venv at {venv}",
                         error_code="VENV_CREATE_FAILED",
@@ -276,8 +462,7 @@ class PythonTool(BaseTool):
                 preamble.append("[setup] manifest empty — detected installer ladder inline")
             else:
                 return self._finish(
-                    ToolResult(
-                        success=False,
+                    ToolResult.completed_failure(
                         output="",
                         error=(
                             "no python install commands: the manifest is empty and no "
@@ -352,13 +537,11 @@ class PythonTool(BaseTool):
                 break
 
         return self._finish(
-            ToolResult(
-                success=overall_ok,
+            ToolResult.completed(
+                operation_outcome="success" if overall_ok else "failed",
                 output="\n".join(transcript),
                 error=(
-                    None
-                    if overall_ok
-                    else f"dependency installation failed — {failure_detail}"
+                    None if overall_ok else f"dependency installation failed — {failure_detail}"
                 ),
                 error_code=None if overall_ok else "PYTHON_SETUP_FAILED",
                 metadata={
@@ -379,16 +562,12 @@ class PythonTool(BaseTool):
         same extras rules (the strings live ONLY in python_env)."""
         listing = self.orchestrator.execute_command(f"ls -A1 {working_directory}")
         files_present = {
-            line.strip()
-            for line in (listing.get("output") or "").splitlines()
-            if line.strip()
+            line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
         }
         contents: Dict[str, str] = {}
         for name in ("pyproject.toml", "setup.cfg"):
             if name in files_present:
-                read = self.orchestrator.execute_command(
-                    f"cat {working_directory}/{name}"
-                )
+                read = self.orchestrator.execute_command(f"cat {working_directory}/{name}")
                 contents[name] = (read.get("output") or "") if read.get("success") else ""
         return detect_installer(files_present, contents)
 
@@ -416,8 +595,12 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _run_tests(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         python = f"{venv}/bin/python"
         preamble: List[str] = []
@@ -427,12 +610,9 @@ class PythonTool(BaseTool):
         hints = requirements.get("test_hints") or {}
         raw_args = (args or "").strip()
         if raw_args:
-            pytest_args, rejection = self._sanitize_pytest_args(
-                raw_args, working_directory
-            )
+            pytest_args, rejection = self._sanitize_pytest_args(raw_args, working_directory)
             if rejection:
-                return ToolResult(
-                    success=False,
+                return ToolResult.completed_failure(
                     output=f"[test] rejected args {raw_args!r} — {rejection}",
                     error=rejection,
                     error_code="PYTEST_ARGS_REJECTED",
@@ -455,13 +635,29 @@ class PythonTool(BaseTool):
 
         # Detected-tests denominator FIRST (spec Component 3): the verifier
         # compares executed counts against it (tests_not_fully_executed).
-        collect = self._run(
-            f"{python} -m pytest --collect-only -q", working_directory, timeout
-        )
+        collect = self._run(f"{python} -m pytest --collect-only -q", working_directory, timeout)
         collected = self._parse_collected(collect.get("output") or "")
         self._write_collected(collected)
 
-        report = f"{PYTEST_REPORT_DIR}/pytest-{int(time.time())}.xml"
+        # Panel anchor source (Category-3 spec): the SELECTED count for THIS
+        # invocation as a STRUCTURED field — never parsed from the run's
+        # summary text downstream. A filtered invocation gets its own scoped
+        # collect pass; an unfiltered one selects the full denominator.
+        if pytest_args:
+            scoped = self._run(
+                f"{python} -m pytest --collect-only -q {pytest_args}",
+                working_directory,
+                timeout,
+            )
+            collected_after_deselection = self._parse_collected_after_deselection(
+                scoped.get("output") or ""
+            )
+        else:
+            collected_after_deselection = collected
+
+        self._test_attempt_counter += 1
+        attempt_id = self._test_attempt_counter
+        report = f"{PYTEST_REPORT_DIR}/pytest-attempt-{attempt_id:06d}.xml"
         self.orchestrator.execute_command(f"mkdir -p {PYTEST_REPORT_DIR}")
         command = f"{python} -m pytest"
         if pytest_args:
@@ -473,14 +669,37 @@ class PythonTool(BaseTool):
         result = self._run(command, working_directory, timeout)
         exit_code = result.get("exit_code")
         output = result.get("output") or ""
+        attempt_tag_command = (
+            f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_ATTEMPT_TAG_SCRIPT)} "
+            f"{shlex.quote(report)} {attempt_id}"
+        )
+        attempt_tag_result = self.orchestrator.execute_command(attempt_tag_command)
+        attempt_tagged = attempt_tag_result.get("success")
+        if attempt_tagged is None:
+            attempt_tagged = attempt_tag_result.get("exit_code") == 0
         # Bug #13 defect 6: honest mapping — collection/usage errors and zero
         # collected are never green, even when the wrapper showed exit 0.
         success, error, error_code = _classify_pytest_result(exit_code, output)
+        extraction_command = (
+            f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_JUNIT_EXTRACT_SCRIPT)} "
+            f"{shlex.quote(report)}"
+        )
+        report_result = self.orchestrator.execute_command(extraction_command)
+        if report_result.get("success"):
+            test_stats, junit_counts, junit_error = _parse_pytest_junit_summary(
+                report_result.get("output") or "",
+                collected,
+            )
+        else:
+            test_stats, junit_counts, junit_error = None, {}, "extract_failed"
         if self.command_tracker:
             try:
                 self.command_tracker.track_test_command(
-                    command=command, tool="python", working_dir=working_directory,
-                    exit_code=exit_code, output=output,
+                    command=command,
+                    tool="python",
+                    working_dir=working_directory,
+                    exit_code=exit_code,
+                    output=output,
                 )
             except Exception as exc:  # tracking must never mask the honest result
                 logger.debug(f"python test tracking skipped: {exc}")
@@ -490,25 +709,61 @@ class PythonTool(BaseTool):
             "command": command,
             "exit_code": exit_code,
             "report": report,
+            "attempt_id": attempt_id,
             "collected": collected,
+            "collected_after_deselection": collected_after_deselection,
             "collected_json": COLLECTED_JSON,
+            **junit_counts,
         }
+        if junit_error:
+            metadata["junit_extraction"] = {
+                "status": "unavailable",
+                "reason": junit_error,
+            }
+        else:
+            metadata["junit_extraction"] = {
+                "status": "available",
+                "transport": "container_elementtree_json",
+            }
+        metadata["junit_attempt_id"] = {
+            "status": "available" if attempt_tagged else "unavailable",
+            "value": attempt_id,
+        }
+        raw_data = {
+            **junit_counts,
+            "junit_status": junit_error or "available",
+        }
+        result_conflicts = [_PYTEST_JUNIT_CONFLICT] if junit_error else []
+        # A wholly unavailable JUnit report already carries the stronger
+        # pytest_junit_unavailable conflict. Report attempt persistence as a
+        # separate conflict only when the XML was otherwise usable.
+        if not attempt_tagged and not junit_error:
+            result_conflicts.append(_PYTEST_ATTEMPT_ID_CONFLICT)
         tail = self._tail(output)
         if success:
             return self._finish(
-                ToolResult(
-                    success=True, output=tail,
-                    raw_output=output, metadata=metadata,
+                ToolResult.completed_success(
+                    output=tail,
+                    raw_output=output,
+                    raw_data=raw_data,
+                    metadata=metadata,
+                    test_stats=test_stats,
+                    evidence_refs=[report],
+                    conflicts=result_conflicts,
                 ),
                 preamble,
             )
         return self._finish(
-            ToolResult(
-                success=False, output=tail,
+            ToolResult.completed_failure(
+                output=tail,
                 raw_output=output,
                 error=error,
                 error_code=error_code,
+                raw_data=raw_data,
                 metadata=metadata,
+                test_stats=test_stats,
+                evidence_refs=[report],
+                conflicts=result_conflicts,
             ),
             preamble,
         )
@@ -541,14 +796,9 @@ class PythonTool(BaseTool):
                 cleaned.append(token)
                 continue
             if token.startswith("-"):
-                return None, (
-                    f"{token!r} is not an accepted pytest flag. {_PYTEST_USAGE_HINT}"
-                )
+                return None, (f"{token!r} is not an accepted pytest flag. {_PYTEST_USAGE_HINT}")
             path = token.split("::", 1)[0]
-            full = (
-                path if path.startswith("/")
-                else f"{working_directory.rstrip('/')}/{path}"
-            )
+            full = path if path.startswith("/") else f"{working_directory.rstrip('/')}/{path}"
             probe = self.orchestrator.execute_command(
                 f"test -e {shlex.quote(full)} && echo EXISTS || echo MISSING"
             )
@@ -568,13 +818,15 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _build_wheel(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         self._run(f"{venv}/bin/python -m pip install build", working_directory, timeout)
-        result = self._run(
-            f"{venv}/bin/python -m build --wheel", working_directory, timeout
-        )
+        result = self._run(f"{venv}/bin/python -m build --wheel", working_directory, timeout)
         success = bool(result.get("success"))
         metadata = {
             "operation": "build",
@@ -585,12 +837,13 @@ class PythonTool(BaseTool):
         }
         tail = self._tail(result.get("output") or "")
         if success:
-            return ToolResult(
-                success=True, output=tail,
-                raw_output=result.get("output"), metadata=metadata,
+            return ToolResult.completed_success(
+                output=tail,
+                raw_output=result.get("output"),
+                metadata=metadata,
             )
-        return ToolResult(
-            success=False, output=tail,
+        return ToolResult.completed_failure(
+            output=tail,
             raw_output=result.get("output"),
             error="wheel build failed (evidence only — never required for green)",
             error_code="WHEEL_BUILD_FAILED",
@@ -602,31 +855,55 @@ class PythonTool(BaseTool):
     # ------------------------------------------------------------------
 
     def _compileall(
-        self, working_directory: str, args: Optional[str], timeout: int,
-        requirements: Dict[str, Any], venv: str,
+        self,
+        working_directory: str,
+        args: Optional[str],
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
     ) -> ToolResult:
         dirs = self._package_dirs(working_directory, requirements)
-        target = " ".join(dirs)
+        target = " ".join(shlex.quote(directory) for directory in dirs)
         result = self._run(
             f"{venv}/bin/python -m compileall -q {target}", working_directory, timeout
         )
-        py_count = self._count(
-            f"find {target} -name '*.py' -not -path '*/.*' | wc -l", working_directory
+        metric_result = self._run(
+            compileall_metrics_command(f"{venv}/bin/python", dirs),
+            working_directory,
+            timeout,
         )
-        pyc_count = self._count(
-            f"find {target} -path '*/__pycache__/*.pyc' | wc -l", working_directory
-        )
-        failed = (
-            max(py_count - pyc_count, 0)
-            if py_count is not None and pyc_count is not None
-            else None
-        )
-        coverage = (pyc_count / py_count) if py_count else None
-        if py_count == 0:
+        metric = None
+        metric_error = None
+        try:
+            if not metric_result.get("success"):
+                raise ValueError("scanner command failed")
+            metric = parse_compileall_metrics(metric_result.get("output") or "")
+        except (TypeError, ValueError) as exc:
+            metric_error = str(exc)
+
+        if metric is not None:
+            py_count = metric.source_count
+            pyc_count = metric.compiled_source_count
+            failed = metric.missing_source_count
+            coverage = metric.coverage
+            metric_status = metric.status
+            metric_conflicts = list(metric.conflicts)
+            foreign_pyc_count = metric.foreign_pyc_count
+            cache_tag = metric.cache_tag
+        else:
+            py_count = None
+            pyc_count = None
+            failed = None
+            coverage = None
+            metric_status = "unavailable"
+            metric_conflicts = [COMPILEALL_METRICS_UNAVAILABLE_CONFLICT]
+            foreign_pyc_count = None
+            cache_tag = None
+
+        if metric_status == "unavailable" and py_count == 0:
             # Bug #13 defect 8: 0/0 compiled is VACUOUS evidence — say so
             # instead of a misleading green ('0/0 sources compiled').
-            return ToolResult(
-                success=True,
+            return ToolResult.completed_success(
                 output=f"no sources found under {target} — nothing verified",
                 raw_output=result.get("output"),
                 metadata={
@@ -636,21 +913,30 @@ class PythonTool(BaseTool):
                     "pyc_count": pyc_count,
                     "failed": None,
                     "coverage": None,
+                    "compileall_metric_status": metric_status,
+                    "metrics_conflicts": metric_conflicts,
+                    "foreign_pyc_count": foreign_pyc_count,
+                    "cache_tag": cache_tag,
                     "exit_code": result.get("exit_code"),
                     "vacuous": True,
                 },
+                conflicts=metric_conflicts,
             )
         summary = f"compileall over {target}: "
-        if py_count is not None and pyc_count is not None:
+        if metric_status == "invalid":
+            summary += (
+                "invalid (source/PYC basis mismatch; " f"{foreign_pyc_count or 0} foreign pyc)"
+            )
+        elif py_count is not None and pyc_count is not None:
             summary += f"{pyc_count}/{py_count} sources compiled, {failed} failed"
             if coverage is not None:
                 summary += f" (coverage {coverage:.2f})"
         else:
-            summary += "source/bytecode counts unavailable"
+            summary += f"source/bytecode counts unavailable ({metric_error or 'unknown reason'})"
         success = bool(result.get("success"))
         errors = self._tail(result.get("output") or "", lines=20)
-        return ToolResult(
-            success=success,
+        return ToolResult.completed(
+            operation_outcome="success" if success else "failed",
             output=summary + (f"\n{errors}" if errors else ""),
             raw_output=result.get("output"),
             error=None if success else "compileall reported errors",
@@ -662,8 +948,13 @@ class PythonTool(BaseTool):
                 "pyc_count": pyc_count,
                 "failed": failed,
                 "coverage": coverage,
+                "compileall_metric_status": metric_status,
+                "metrics_conflicts": metric_conflicts,
+                "foreign_pyc_count": foreign_pyc_count,
+                "cache_tag": cache_tag,
                 "exit_code": result.get("exit_code"),
             },
+            conflicts=metric_conflicts,
         )
 
     # ------------------------------------------------------------------
@@ -693,9 +984,7 @@ class PythonTool(BaseTool):
         """Package source dirs: manifest packages (src-layout probed first),
         shared discovery as fallback, the project dir as the last resort."""
         root = working_directory.rstrip("/")
-        packages = requirements.get("python_packages") or discover_packages(
-            self.orchestrator, root
-        )
+        packages = requirements.get("python_packages") or discover_packages(self.orchestrator, root)
         dirs: List[str] = []
         for package in packages:
             for candidate in (f"{root}/src/{package}", f"{root}/{package}"):
@@ -707,13 +996,6 @@ class PythonTool(BaseTool):
                     break
         return dirs or [root]
 
-    def _count(self, command: str, workdir: str) -> Optional[int]:
-        result = self.orchestrator.execute_command(command, workdir=workdir)
-        try:
-            return int((result.get("output") or "").strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return None
-
     def _parse_collected(self, output: str) -> Optional[int]:
         """Trailing `N tests collected` from pytest --collect-only -q; a `no
         tests collected` suite records an honest 0 — never invented."""
@@ -724,12 +1006,20 @@ class PythonTool(BaseTool):
             return 0
         return None
 
+    def _parse_collected_after_deselection(self, output: str) -> Optional[int]:
+        """The SELECTED count of a scoped `--collect-only -q` run: the X of
+        `X/Y tests collected (Z deselected)`; a plain `N tests collected`
+        (nothing deselected) IS the selection; `no tests collected` is an
+        honest 0; unparseable is None — never invented."""
+        matches = _SELECTED_RE.findall(output or "")
+        if matches:
+            return int(matches[-1])
+        return self._parse_collected(output)
+
     def _write_collected(self, collected: Optional[int]) -> None:
         body = json.dumps({"collected": collected})
         self.orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
-        self.orchestrator.execute_command(
-            f"cat > {COLLECTED_JSON} <<'SAGEOF'\n{body}\nSAGEOF"
-        )
+        self.orchestrator.execute_command(f"cat > {COLLECTED_JSON} <<'SAGEOF'\n{body}\nSAGEOF")
 
     @staticmethod
     def _tail(output: str, lines: int = 60) -> str:

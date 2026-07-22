@@ -39,7 +39,7 @@ def _snapshot(tool, *, detected, executed, passed, failed, verified_status="part
         accomplishments["physical_validation"]["test_status"] = {
             "static_test_count": detected
         }
-    return tool._build_report_snapshot(
+    return tool._build_legacy_report_snapshot(
         verified_status=verified_status,
         report_filename="setup-report-test.md",
         project_info={"build_system": "pip/poetry"},

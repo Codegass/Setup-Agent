@@ -55,7 +55,7 @@ def assemble_report_metrics(
         "time": build_evidence.get("build_time"),
         "note": build_evidence.get("build_command"),
         "artifact": build_evidence.get("artifact")
-            or (_str_list(build_evidence.get("artifact_samples"), 1) or [None])[0],
+        or (_str_list(build_evidence.get("artifact_samples"), 1) or [None])[0],
     }
 
     test = {
@@ -65,7 +65,13 @@ def assemble_report_metrics(
         "failed": _int_or_none(status.get("tests_failed")),
         "errors": _int_or_none(status.get("tests_errors")),
         "skipped": _int_or_none(status.get("tests_skipped")),
+        "flaky_count": _int_or_none(status.get("tests_flaky")) or 0,
         "pass_rate": _float_or_none(status.get("pass_pct")),
+        "raw_executions": _int_or_none(status.get("tests_total_raw")),
+        "raw_passed": _int_or_none(status.get("tests_passed_raw")),
+        "raw_failed": _int_or_none(status.get("tests_failed_raw")),
+        "raw_errors": _int_or_none(status.get("tests_errors_raw")),
+        "raw_skipped": _int_or_none(status.get("tests_skipped_raw")),
         "report_file_count": _int_or_none(test_analysis.get("report_file_count")),
         "unique_total": _int_or_none(status.get("tests_unique")),
         "unique_passed": _int_or_none(status.get("tests_passed_unique")),

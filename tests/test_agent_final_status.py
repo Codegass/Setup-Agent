@@ -1,8 +1,21 @@
+from io import StringIO
 from types import SimpleNamespace
+
+import pytest
+from rich.console import Console
 
 from sag.agent.agent import SetupAgent
 from sag.agent.physical_validator import PhysicalValidator
+from sag.agent.verdict_finalizer import (
+    BuildEvidenceSnapshot,
+    ReportDeliveryStatus,
+    RunTermination,
+    RunTerminationStatus,
+    RunVerdictSnapshot,
+    SnapshotTestStats,
+)
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
+from sag.evidence import EvidenceStatus, OperationOutcome
 from sag.tools.report_tool import ReportTool
 
 
@@ -43,6 +56,7 @@ def _agent_with_validator(validator):
     agent.project_name = "demo"
     agent.context_manager = SimpleNamespace(project_name="demo")
     agent.physical_validator = validator
+    agent.workflow_mode = "continue"
     return agent
 
 
@@ -79,7 +93,7 @@ def test_verified_final_status_rejects_missing_test_reports_when_tests_expected(
         )
     )
 
-    assert agent._get_verified_final_status(react_engine_success=False) is False
+    assert agent._legacy_get_verified_final_status(react_engine_success=False) is False
 
 
 def test_verified_final_status_allows_build_only_project_without_detected_tests():
@@ -104,7 +118,7 @@ def test_verified_final_status_allows_build_only_project_without_detected_tests(
         )
     )
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
 
 
 def test_verified_final_status_allows_skipped_tests_without_failures():
@@ -132,7 +146,7 @@ def test_verified_final_status_allows_skipped_tests_without_failures():
         )
     )
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
 
 
 def test_verified_final_status_accepts_partial_pass_above_threshold():
@@ -169,7 +183,7 @@ def test_verified_final_status_accepts_partial_pass_above_threshold():
         )
     )
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
 
 
 def test_verified_final_status_rejects_below_threshold_tests():
@@ -198,7 +212,7 @@ def test_verified_final_status_rejects_below_threshold_tests():
         )
     )
 
-    assert agent._get_verified_final_status(react_engine_success=True) is False
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is False
 
 
 def test_verified_final_status_honors_configured_threshold():
@@ -236,8 +250,8 @@ def test_verified_final_status_honors_configured_threshold():
     default_agent = _agent_with_validator(_profile(0.8))
     strict_agent = _agent_with_validator(_profile(0.9))
 
-    assert default_agent._get_verified_final_status(react_engine_success=True) is True
-    assert strict_agent._get_verified_final_status(react_engine_success=True) is False
+    assert default_agent._legacy_get_verified_final_status(react_engine_success=True) is True
+    assert strict_agent._legacy_get_verified_final_status(react_engine_success=True) is False
 
 
 def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatch):
@@ -247,9 +261,7 @@ def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatc
     accomplishments = {
         "repository_cloned": True,
         "build_success": True,
-        "physical_validation": {
-            "test_analysis": {"total_tests": 184, "passed_tests": 177}
-        },
+        "physical_validation": {"test_analysis": {"total_tests": 184, "passed_tests": 177}},
     }
 
     validator = PhysicalValidator(project_path="/workspace")
@@ -265,9 +277,7 @@ def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatc
             "skipped_tests": 0,
             "test_exclusions": [],
             "modules_without_tests": [],
-            "report_files": [
-                "/workspace/commons-vfs/target/surefire-reports/TEST-Vfs.xml"
-            ],
+            "report_files": ["/workspace/commons-vfs/target/surefire-reports/TEST-Vfs.xml"],
             "parsing_errors": [],
         },
     )
@@ -287,7 +297,7 @@ def test_verified_final_status_matches_report_verdict_for_commons_vfs(monkeypatc
     )
 
     agent = _agent_with_validator(validator)
-    run_status = agent._get_verified_final_status(react_engine_success=True)
+    run_status = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     tool = ReportTool(docker_orchestrator=None, physical_validator=validator)
     report_verdict = tool._determine_actual_status(accomplishments)
@@ -316,7 +326,9 @@ def test_failed_test_validation_carries_evidence_state(monkeypatch):
             "report_files": [
                 "/workspace/demo/target/surefire-reports/TEST-com.example.DemoTest.xml"
             ],
-            "parsing_errors": ["Error parsing /workspace/demo/target/surefire-reports/TEST-bad.xml"],
+            "parsing_errors": [
+                "Error parsing /workspace/demo/target/surefire-reports/TEST-bad.xml"
+            ],
         },
     )
 
@@ -467,8 +479,9 @@ def test_verified_final_status_uses_project_metadata_over_docker_label():
     agent.project_name = "commons-vfs-utf8-check"
     agent.context_manager = SimpleNamespace(project_name="commons-vfs-utf8-check")
     agent.physical_validator = validator
+    agent.workflow_mode = "continue"
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
     assert validator.build_project_names == ["commons-vfs"]
     assert validator.test_project_names == ["commons-vfs"]
     assert validator.analysis_project_names == ["commons-vfs"]
@@ -501,7 +514,7 @@ def test_build_green_without_test_evidence_is_partial_not_success():
         )
     )
 
-    result = agent._get_verified_final_status(react_engine_success=False)
+    result = agent._legacy_get_verified_final_status(react_engine_success=False)
 
     assert result is True, "build-green/no-expectation keeps the flow-control bool"
     assert agent.final_verdict == "partial", "but the surfaced verdict must be partial"
@@ -516,7 +529,7 @@ def test_build_green_missing_expected_tests_is_partial_and_false():
         )
     )
 
-    result = agent._get_verified_final_status(react_engine_success=False)
+    result = agent._legacy_get_verified_final_status(react_engine_success=False)
 
     assert result is False
     assert agent.final_verdict == "partial"
@@ -548,7 +561,7 @@ def test_threshold_pass_is_full_success_verdict():
         )
     )
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert result is True
     assert agent.final_verdict == "success"
@@ -562,7 +575,7 @@ def test_build_failure_is_failed_verdict():
         )
     )
 
-    result = agent._get_verified_final_status(react_engine_success=False)
+    result = agent._legacy_get_verified_final_status(react_engine_success=False)
 
     assert result is False
     assert agent.final_verdict == "failed"
@@ -609,29 +622,21 @@ def _attach_phase_machine(agent, block_phase=None):
     return machine
 
 
-def test_machine_failed_outcome_scoped_by_real_build_evidence():
-    """Scoped blocked-build cap (2026-06-24 pyyaml false-red): the agent
-    blocked the build phase, but physical validation found a real build
-    (success=True) — evidence outranks agent belief, so the cap is PARTIAL
-    (the block stays surfaced; never promoted to success), not FAILED.
-    A blocked build WITHOUT physical evidence still fails (see
-    test_machine_success_still_subject_to_physical_validation and
-    tests/test_python_phase_verdict.py)."""
+def test_blocked_phase_termination_does_not_cap_evidence_verdict():
     agent = _agent_with_validator(_all_green_validator())
     _attach_phase_machine(agent, block_phase="build")
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
-    assert agent.final_verdict == "partial"
-    assert "blocked" in agent.final_verdict_reason
-    assert "real build" in agent.final_verdict_reason
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
+    assert agent.final_verdict == "success"
+    assert agent.final_verdict_reason == ""
 
 
-def test_machine_partial_outcome_caps_success_verdict_to_partial():
+def test_blocked_test_phase_does_not_cap_evidence_verdict():
     agent = _agent_with_validator(_all_green_validator())
     _attach_phase_machine(agent, block_phase="test")
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
-    assert agent.final_verdict == "partial"
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
+    assert agent.final_verdict == "success"
 
 
 def test_machine_success_still_subject_to_physical_validation():
@@ -643,7 +648,7 @@ def test_machine_success_still_subject_to_physical_validation():
     )
     _attach_phase_machine(agent)  # all phases done
 
-    assert agent._get_verified_final_status(react_engine_success=True) is False
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is False
     assert agent.final_verdict == "failed"
 
 
@@ -651,7 +656,7 @@ def test_machine_success_keeps_physical_success():
     agent = _agent_with_validator(_all_green_validator())
     _attach_phase_machine(agent)
 
-    assert agent._get_verified_final_status(react_engine_success=True) is True
+    assert agent._legacy_get_verified_final_status(react_engine_success=True) is True
     assert agent.final_verdict == "success"
 
 
@@ -661,15 +666,22 @@ def test_final_verdict_uses_kernel_conflict_cap():
         FakePhysicalValidator(
             build_status={"success": True, "reason": "fingerprints"},
             test_status={
-                "has_test_reports": True, "status": "PARTIAL", "reason": "",
-                "pass_rate": 99.3, "total_tests": 2913, "passed_tests": 2893,
-                "failed_tests": 15, "error_tests": 0, "skipped_tests": 5,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "reason": "",
+                "pass_rate": 99.3,
+                "total_tests": 2913,
+                "passed_tests": 2893,
+                "failed_tests": 15,
+                "error_tests": 0,
+                "skipped_tests": 5,
+                "test_exclusions": [],
+                "modules_without_tests": [],
                 "conflicts": ["test_report_parse_error"],
             },
         )
     )
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
     assert result is True, "flow-control bool unchanged"
     assert agent.final_verdict == "partial", "conflicts must cap the surfaced verdict"
 
@@ -682,15 +694,22 @@ def test_partial_reason_for_conflict_capped_run():
         FakePhysicalValidator(
             build_status={"success": True, "reason": "fingerprints"},
             test_status={
-                "has_test_reports": True, "status": "PARTIAL", "reason": "",
-                "pass_rate": 96.2, "total_tests": 184, "passed_tests": 177,
-                "failed_tests": 3, "error_tests": 0, "skipped_tests": 4,
-                "test_exclusions": [], "modules_without_tests": [],
+                "has_test_reports": True,
+                "status": "PARTIAL",
+                "reason": "",
+                "pass_rate": 96.2,
+                "total_tests": 184,
+                "passed_tests": 177,
+                "failed_tests": 3,
+                "error_tests": 0,
+                "skipped_tests": 4,
+                "test_exclusions": [],
+                "modules_without_tests": [],
                 "conflicts": ["test_report_parse_error"],
             },
         )
     )
-    agent._get_verified_final_status(react_engine_success=True)
+    agent._legacy_get_verified_final_status(react_engine_success=True)
     assert agent.final_verdict == "partial"
     assert "conflict" in agent.final_verdict_reason
     assert "no test reports" not in agent.final_verdict_reason
@@ -701,14 +720,158 @@ def test_partial_reason_for_missing_test_evidence():
         FakePhysicalValidator(
             build_status={"success": True, "reason": "fingerprints"},
             test_status={
-                "has_test_reports": False, "status": "WARNING", "reason": "",
-                "pass_rate": 0.0, "total_tests": 0, "passed_tests": 0,
-                "failed_tests": 0, "error_tests": 0, "skipped_tests": 0,
+                "has_test_reports": False,
+                "status": "WARNING",
+                "reason": "",
+                "pass_rate": 0.0,
+                "total_tests": 0,
+                "passed_tests": 0,
+                "failed_tests": 0,
+                "error_tests": 0,
+                "skipped_tests": 0,
                 "test_exclusions": [],
             },
             analysis_status={"analyzed": False},
         )
     )
-    agent._get_verified_final_status(react_engine_success=False)
+    agent._legacy_get_verified_final_status(react_engine_success=False)
     assert agent.final_verdict == "partial"
     assert "no test reports" in agent.final_verdict_reason
+
+
+# --- sealed setup snapshot surface -------------------------------------------
+
+
+def _snapshot(verdict="partial"):
+    return RunVerdictSnapshot(
+        run_id="agent-status",
+        finalized_at="2026-07-17T12:00:00Z",
+        verdict=verdict,
+        build_evidence=BuildEvidenceSnapshot(
+            observed=True,
+            green=verdict == "success",
+            outcome=(
+                OperationOutcome.SUCCESS if verdict == "success" else OperationOutcome.PARTIAL
+            ),
+            evidence_status=EvidenceStatus.VERIFIED,
+        ),
+        test_stats=SnapshotTestStats(
+            discovered=10,
+            executed=10,
+            passed=10 if verdict == "success" else 8,
+            failed=0 if verdict == "success" else 2,
+        ),
+    )
+
+
+def _termination(delivery=ReportDeliveryStatus.DELIVERED):
+    return RunTermination(
+        termination=RunTerminationStatus.COMPLETED,
+        report_delivery_status=delivery,
+    )
+
+
+def _agent_for_unified_setup(termination):
+    output = StringIO()
+    agent = object.__new__(SetupAgent)
+    agent.config = SimpleNamespace(ui_mode=False)
+    agent.console = Console(file=output, force_terminal=False)
+    agent.max_iterations = 5
+    agent.react_engine = SimpleNamespace(run_setup_loop=lambda **kwargs: termination)
+    return agent, output
+
+
+def _agent_for_summary():
+    output = StringIO()
+    agent = object.__new__(SetupAgent)
+    agent.console = Console(file=output, force_terminal=False)
+    agent.react_engine = SimpleNamespace(
+        get_execution_summary=lambda: {
+            "total_steps": 3,
+            "iterations": 2,
+            "thoughts": 1,
+            "actions": 2,
+            "successful_actions": 1,
+            "failed_actions": 1,
+        }
+    )
+    agent.context_manager = SimpleNamespace(
+        get_current_context_info=lambda: {
+            "context_type": "branch",
+            "context_id": "phase_report",
+            "project_name": "demo",
+        }
+    )
+    return agent, output
+
+
+def test_unified_setup_returns_typed_termination_without_boolean_mirroring():
+    termination = _termination()
+    agent, _ = _agent_for_unified_setup(termination)
+
+    result = agent._run_unified_setup("https://example/demo.git", "demo", "setup")
+
+    assert result is termination
+
+
+def test_setup_summary_renders_literal_snapshot_verdict():
+    agent, output = _agent_for_summary()
+
+    agent._provide_setup_summary(_termination(), _snapshot("partial"))
+
+    rendered = output.getvalue()
+    assert "PARTIAL" in rendered
+    assert "8 / 10 unique tests passed" in rendered
+    assert "Report delivery: delivered" in rendered
+
+
+def test_setup_summary_warns_on_report_failure_without_mutating_verdict():
+    agent, output = _agent_for_summary()
+    snapshot = _snapshot("success")
+
+    agent._provide_setup_summary(
+        _termination(ReportDeliveryStatus.FAILED),
+        snapshot,
+    )
+
+    rendered = output.getvalue()
+    assert "SUCCESS" in rendered
+    assert "report delivery failed" in rendered.lower()
+    assert snapshot.verdict == "success"
+
+
+def test_retired_setup_verdict_authorities_are_absent():
+    assert not hasattr(SetupAgent, "_get_verified_final_status")
+    assert not hasattr(SetupAgent, "_report_snapshot_verdict")
+    assert not hasattr(SetupAgent, "_get_physical_final_status")
+    assert not hasattr(SetupAgent, "_apply_run_termination")
+
+
+def test_legacy_verdict_mapper_is_guarded_from_setup_mode():
+    agent = object.__new__(SetupAgent)
+    agent.workflow_mode = "setup"
+
+    with pytest.raises(RuntimeError, match="unavailable in setup mode"):
+        agent._legacy_get_verified_final_status(True)
+
+
+def test_continue_project_initializes_explicit_legacy_report_mode():
+    agent = object.__new__(SetupAgent)
+    agent.console = Console(file=StringIO(), force_terminal=False)
+    agent.agent_logger = SimpleNamespace(info=lambda *_: None, error=lambda *_: None)
+    agent._ensure_container_running = lambda _project_name: True
+    initialized = {}
+
+    def initialize(*, workflow_mode):
+        initialized["workflow_mode"] = workflow_mode
+        agent.context_manager = SimpleNamespace(
+            load_or_create_trunk_context=lambda **_: SimpleNamespace(add_task=lambda *_: None),
+            get_current_context_info=lambda: {"context_id": "trunk"},
+        )
+
+    agent._initialize_context_and_tools = initialize
+    agent._run_setup_loop = lambda *, interactive: True
+    agent._provide_legacy_setup_summary = lambda _success: None
+
+    assert agent.continue_project("demo") is True
+    assert initialized["workflow_mode"] == "legacy"

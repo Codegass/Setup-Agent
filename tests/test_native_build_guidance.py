@@ -22,9 +22,11 @@ Sections:
      manifest carries has_native_build=True; discovery/install target the
      python subdir. A plain-pyproject repo carries no native signal and its
      recommendation/manifest are byte-identical to the pre-change shape.
-  B. guidance: the build-phase intro of a native repo PREPENDS the native-first
-     block (build the native library first, then install from the detected
-     python root); a plain-python repo's intro is byte-identical to before.
+  B. guidance: dim (e) of the Category-3 analyzer diet DELETED the pre-hoc
+     native-first prose block. The native repo's build intro now carries the
+     python FACTS objective + coordinates only (no "build the native library
+     first" prose, no project brief); a plain-python repo likewise. The native
+     FACT still drives the REACTIVE smoke steer and the validator cap.
   C. validator: has_native_build + no built .so caps the build at PARTIAL with
      the reason "native core not built" (never BLOCKED — pure-python parts may
      still run); with a .so present the ladder is unchanged.
@@ -36,10 +38,7 @@ from types import SimpleNamespace
 
 from sag.agent.physical_validator import PhysicalValidator
 from sag.agent.phase_machine import PhaseMachine
-from sag.agent.react_engine import (
-    PYTHON_BUILD_PHASE_GUIDANCE,
-    ReActEngine,
-)
+from sag.agent.react_engine import ReActEngine
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import ProjectAnalyzerTool
 
@@ -282,70 +281,42 @@ def _engine_at(phase_done_count, environment_summary):
     return engine
 
 
+# dim (e) deleted (Category-3 analyzer diet, 2026-07-20): the PRE-HOC
+# native-first guidance block is a prescription and is gone. The native FACT
+# (has_native_build) is retained on the recommendation/manifest and drives the
+# REACTIVE smoke steer and the validator's PARTIAL cap (sections A and C); it no
+# longer emits a pre-hoc "build the native library FIRST" prose block.
 _NATIVE_FIRST_MARKERS = (
     "NATIVE core",
     "CMakeLists.txt at the repo root",
-    "build the native library FIRST",
+    "Build the native library FIRST",
     "will not import without it",
-    f"{_TVM_ROOT}/python",  # the detected python root, named in the guidance
-    "Long native builds detach; poll with search",
 )
 
 
-def test_native_build_intro_prepends_native_first_block():
+def test_native_build_intro_has_no_prehoc_native_first_block():
     env = _env_from(_analyzed(_TVM_ROOT, _TVM_FILES)[0])
     intro = _engine_at(2, env)._phase_intro_step().content
+    # dim (e) deleted: no pre-hoc native-first prose.
     for marker in _NATIVE_FIRST_MARKERS:
-        assert marker in intro, f"missing native-first marker: {marker!r}"
-    # The native-first block PRECEDES the ordinary python build guidance (it is
-    # a prepend, not a replacement — the deps/compile advice still follows).
-    assert PYTHON_BUILD_PHASE_GUIDANCE in intro
-    assert intro.index("build the native library FIRST") < intro.index(
-        PYTHON_BUILD_PHASE_GUIDANCE
-    )
+        assert marker not in intro, f"native-first prose should be gone: {marker!r}"
+    # The python FACTS objective + coordinates remain (physical substrate).
+    assert "build(action='deps')" in intro
+    assert "build(action='compile')" in intro
+    assert f"Build coordinates: python at {_TVM_ROOT}/python." in intro
 
 
-def test_plain_python_intro_has_no_native_text_and_is_byte_identical():
-    """A plain-python repo must carry ZERO native text and its build intro must
-    be byte-identical to the same repo analyzed with the native path never
-    firing (snapshot below, captured from the plain-repo chain)."""
+def test_plain_python_intro_carries_facts_objective_and_coordinates():
+    """Plain Python keeps its semantics — the FACTS objective and coordinates,
+    no native prose, no project brief."""
     env = _env_from(_analyzed(_PLAIN_ROOT, _PLAIN_FILES)[0])
     intro = _engine_at(2, env)._phase_intro_step().content
     assert "NATIVE core" not in intro
     assert "native library FIRST" not in intro
-    assert intro == _PLAIN_BUILD_INTRO_SNAPSHOT
-
-
-# Captured VERBATIM from the plain-python chain (no native path). If this
-# fails, the plain-python intro changed — out of scope for T5 and must be an
-# intentional, separate change.
-_PLAIN_BUILD_INTRO_SNAPSHOT = (
-    "=== PHASE: BUILD ===\n"
-    "Run picture so far:\n"
-    "✓ provision: repo cloned; toolchain installed\n"
-    "✓ analyze: python project analyzed\n"
-    "→ current: build\n"
-    "\n"
-    "Objective: Set up the environment and install dependencies: "
-    "build(action='deps'), then verify byte-compilation with "
-    "build(action='compile'). A Python project has no Java compile target — "
-    "that is NOT grounds for phase(action='blocked'). Block only when the "
-    "environment or dependency install itself genuinely fails, with that "
-    "evidence. Never run pip/python via bash — build resolves the registered "
-    "toolchain. Long installs detach; poll the job ref with search.\n"
-    "This is a Python project — there is no Java compile target and that is "
-    "NOT grounds for phase(action='blocked'). Do: build(action='deps') to "
-    "create the venv and install dependencies with the project's own tool, "
-    "then build(action='compile') to verify byte-compilation. Never run "
-    "pip/pytest via bash — the build tool resolves the project venv.\n"
-    "Recommended Build: python 'deps' in /workspace/pyproj — Python project "
-    "(pip): create the venv and install with build(action='deps'), verify with "
-    "build(action='compile'), test with build(action='test').\n"
-    "Budget: flexible — up to ~132 iterations available (a small reserve is "
-    "kept for later phases). When finished, call phase(action='done', "
-    "key_results=..., evidence=[refs]). If it cannot be finished, "
-    "phase(action='blocked', reason=..., evidence=[refs])."
-)
+    assert "=== PROJECT BRIEF v1 ===" not in intro  # dim (c) deleted
+    assert "build(action='deps')" in intro
+    assert "build(action='compile')" in intro
+    assert f"Build coordinates: python at {_PLAIN_ROOT}." in intro
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +381,31 @@ class NativeLadderOrch:
                 self.import_ok,
                 "" if self.import_ok else "ImportError: cannot find libtvm.so",
             )
-        if "compileall" in c:
-            return res(True)
+        if "cache_from_source" in c:
+            # The validator's scripted metrics probe (compileall_metrics_command
+            # runs an inline python script — the word 'compileall' never appears
+            # in it) expects a JSON payload; the fixture predated the probe and
+            # its empty default parsed as 'metrics unavailable', capping an
+            # all-green ladder below build_complete.
+            return res(
+                True,
+                json.dumps(
+                    {
+                        "status": "valid",
+                        "source_count": 10,
+                        "compiled_source_count": 10,
+                        "missing_source_count": 0,
+                        "foreign_pyc_count": 0,
+                        "coverage": 1.0,
+                        "missing_sources": [],
+                        "foreign_pycs": [],
+                    }
+                ),
+            )
         if "__pycache__" in c and "wc -l" in c:
             return res(True, "10")
+        if "-m compileall" in c:
+            return res(True)
         if "'*.py'" in c and "wc -l" in c:
             return res(True, "10")
         if "'*.so'" in c or "'*.dylib'" in c:

@@ -1,7 +1,7 @@
 import json
 
-from sag.evidence import EvidenceStatus, TestStats
 from sag.agent.context_manager import Task, TaskStatus, TrunkContext
+from sag.evidence import EvidenceAssessment, EvidenceStatus, TestStats
 from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.report_tool import ReportTool, build_stored_test_analysis
 
@@ -137,7 +137,7 @@ def test_report_tool_returns_full_report_in_raw_data(monkeypatch):
 
     result = tool.execute(action="generate", summary="done", status="success")
 
-    assert result.success is True
+    assert result.succeeded is True
     assert result.output == "condensed"
     assert result.raw_data["full_report"] == "# Full Report"
     assert result.raw_data["report_snapshot"]["status"] == "success"
@@ -187,8 +187,8 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
         evidence_refs=["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
     )
 
-    assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert isinstance(result.test_stats, TestStats)
     assert result.test_stats.pass_rate == 96.3
     assert result.test_stats.failed == 3
@@ -202,6 +202,46 @@ def test_report_tool_accepts_evidence_state_when_generation_is_monkeypatched(mon
     assert result.metadata["evidence_status"] == "partial"
     assert result.raw_data["evidence_status"] == "partial"
     assert result.raw_data["test_stats"]["pass_rate"] == 96.3
+
+
+def test_report_conflict_assessment_sets_canonical_conflict_status(monkeypatch):
+    tool = ReportTool()
+    monkeypatch.setattr(tool, "_validate_context_prerequisites", lambda: {"valid": True})
+    monkeypatch.setattr(
+        tool,
+        "_generate_comprehensive_report",
+        lambda summary, status, details, **kwargs: (
+            "# Full Report",
+            "success",
+            "setup-report-test.md",
+            {"build_success": True, "test_success": True},
+            {
+                "status": "success",
+                "evidence_result": {
+                    "status": "conflict",
+                    "conflicts": ["build_vs_tests"],
+                    "evidence_refs": ["output_report_conflict"],
+                },
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_generate_condensed_log_output",
+        lambda *args, **kwargs: "condensed",
+    )
+
+    result = tool.execute(
+        action="generate",
+        summary="done",
+        status="success",
+        evidence_status="conflict",
+        conflicts=["build_vs_tests"],
+        evidence_refs=["output_report_conflict"],
+    )
+
+    assert result.evidence_assessment is EvidenceAssessment.CONFLICT
+    assert result.evidence_status is EvidenceStatus.CONFLICT
 
 
 def test_real_report_renderer_includes_evidence_result(monkeypatch):
@@ -276,8 +316,8 @@ def test_real_report_renderer_includes_evidence_result(monkeypatch):
         evidence_refs=["/workspace/demo/target/surefire-reports/TEST-demo.xml"],
     )
 
-    assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert "Result: PARTIAL" in result.raw_data["full_report"]
     assert "96.3% pass rate" in result.raw_data["full_report"]
     assert "3 failed" in result.raw_data["full_report"]
@@ -314,8 +354,8 @@ def test_report_failed_legacy_status_maps_to_blocked(monkeypatch):
 
     result = tool.execute(action="generate", summary="blocked", status="fail")
 
-    assert result.success is True
-    assert result.status == EvidenceStatus.BLOCKED
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.BLOCKED
     assert result.metadata["evidence_status"] == "blocked"
     assert result.raw_data["evidence_status"] == "blocked"
 
@@ -391,8 +431,8 @@ def test_report_uses_validator_evidence_defaults_when_kwargs_missing(monkeypatch
 
     result = tool.execute(action="generate", summary="done", status="success")
 
-    assert result.success is True
-    assert result.status == EvidenceStatus.PARTIAL
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.PARTIAL
     assert result.metadata["verified_status"] == "success"
     assert result.metadata["evidence_status"] == "partial"
     assert "Result: PARTIAL" in result.raw_data["full_report"]
@@ -449,8 +489,8 @@ def test_ordinary_success_report_does_not_render_empty_test_stats(monkeypatch):
 
     result = tool.execute(action="generate", summary="done", status="success")
 
-    assert result.success is True
-    assert result.status == EvidenceStatus.SUCCESS
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.SUCCESS
     assert result.raw_data["test_stats"] is None
     assert "0 / 0 passed" not in result.output
     assert "0 / 0 passed" not in result.raw_data["full_report"]
@@ -506,8 +546,8 @@ def test_invalid_explicit_evidence_status_is_unknown_without_success_fallback(mo
         evidence_status="bogus",
     )
 
-    assert result.success is True
-    assert result.status == EvidenceStatus.UNKNOWN
+    assert result.succeeded is True
+    assert result.evidence_assessment == EvidenceAssessment.UNKNOWN
     assert result.metadata["evidence_status"] == "unknown"
     assert result.raw_data["evidence_status"] == "unknown"
 
@@ -547,7 +587,7 @@ def test_report_tool_marks_final_report_task_completed(monkeypatch):
     result = tool.execute(action="generate", summary="done", status="success")
 
     final_task = context_manager.trunk.todo_list[1]
-    assert result.success is True
+    assert result.succeeded is True
     assert final_task.status == TaskStatus.COMPLETED
     assert final_task.completed_at is not None
     assert final_task.notes == "Final setup report generated."
@@ -772,7 +812,7 @@ def test_detailed_test_analysis_distinguishes_runner_and_unique_counts():
     lines = tool._render_detailed_test_analysis(snapshot)
     body = "\n".join(lines)
 
-    assert "| **Tests Executed** | 18839 | Runner XML count |" in body
+    assert "| **Unique Tests Executed** | 18839 | Snapshot-local unique count |" in body
     assert "| **Unique Test Methods** | 9497 | Normalized runtime method count |" in body
     assert "Deduplicated runtime count" not in body
 
@@ -857,14 +897,10 @@ def _all_green_kernel_snapshot():
     }
 
 
-def test_report_result_header_caps_on_blocked_trunk_phase():
-    """The header's kernel call must consume the phase-machine outcome too —
-    a machine-capped run (blocked phase_* trunk task) with green physical
-    evidence rendered '**Result:** ✅ SUCCESS' while the CLI banner said
-    verdict=partial/failed (round-6 review)."""
+def test_report_result_header_ignores_phase_termination_for_verdict():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"test"}))
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "partial"
+    assert tool._legacy_snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
     lines = tool._render_enhanced_header(
         "2026-06-12 12:00:00",
@@ -873,13 +909,13 @@ def test_report_result_header_caps_on_blocked_trunk_phase():
         snapshot=_all_green_kernel_snapshot(),
     )
     result_lines = [l for l in lines if l.startswith("**Result:**")]
-    assert result_lines and "PARTIAL" in result_lines[0].upper(), result_lines
+    assert result_lines and "SUCCESS" in result_lines[0].upper(), result_lines
 
 
-def test_report_result_header_blocked_build_phase_is_failed():
+def test_report_result_header_blocked_build_phase_does_not_imply_failure():
     tool = ReportTool(context_manager=PhaseTrunkContextManager(blocked={"build"}))
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "failed"
+    assert tool._legacy_snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
 
 def test_report_kernel_verdict_abstains_without_phase_tasks():
@@ -887,7 +923,7 @@ def test_report_kernel_verdict_abstains_without_phase_tasks():
     the machine input abstains and physical evidence still rules."""
     tool = ReportTool(context_manager=FakeReportContextManager())
 
-    assert tool._snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
+    assert tool._legacy_snapshot_kernel_verdict(_all_green_kernel_snapshot()) == "success"
 
 
 def test_condensed_log_output_matches_kernel_verdict():
@@ -995,7 +1031,7 @@ def test_build_green_no_tests_maps_to_partial_not_failed():
             "evidence_refs": [],
         },
     }
-    verdict = tool._snapshot_kernel_verdict(snapshot)
+    verdict = tool._legacy_snapshot_kernel_verdict(snapshot)
     assert verdict == "partial", verdict
 
 
@@ -1011,7 +1047,7 @@ def test_build_failed_still_maps_to_failed():
             "evidence_refs": [],
         },
     }
-    assert tool._snapshot_kernel_verdict(snapshot) == "failed"
+    assert tool._legacy_snapshot_kernel_verdict(snapshot) == "failed"
 
 
 def test_console_result_line_uses_kernel_verdict():
@@ -1192,7 +1228,7 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
 
     stored_analysis = build_stored_test_analysis(parser_analysis)
     tool = ReportTool()
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         "success",
         "setup-report-test.md",
         {"directory": "/workspace/demo", "type": "Maven Java Project", "build_system": "Maven"},
@@ -1209,8 +1245,10 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
         {},
     )
 
-    # Runner executions and unique methods are distinct facts in the snapshot.
-    assert snapshot["status"]["tests_total"] == 18839
+    # Canonical unique/latest is the one primary basis. Raw runner executions
+    # stay explicitly diagnostic and are never rendered as Tests: N.
+    assert snapshot["status"]["tests_total"] == 9497
+    assert snapshot["status"]["tests_total_raw"] == 18839
     assert snapshot["status"]["tests_unique"] == 9497
 
     metrics = assemble_report_metrics(
@@ -1222,7 +1260,8 @@ def test_unique_counts_flow_parser_to_metrics_end_to_end():
         generated_at="2026-06-15 00:00:00",
     )
 
-    assert metrics["test"]["total"] == 18839, "runner executions"
+    assert metrics["test"]["total"] == 9497, "canonical latest"
+    assert metrics["test"]["raw_executions"] == 18839, "diagnostic runner rows"
     assert metrics["test"]["unique_total"] == 9497, "unique normalized methods"
     assert metrics["test"]["unique_passed"] == 9470
     assert metrics["test"]["unique_failed"] == 5

@@ -40,6 +40,11 @@ class PromptConfig:
     def __init__(self, data: Mapping[str, Any]):
         self._data = data
 
+    @property
+    def canonical_payload(self) -> Mapping[str, Any]:
+        """Expose the complete loaded bundle for deterministic hashing."""
+        return self._data
+
     def get(self, key: str) -> str:
         value: Any = self._data
         for part in key.split("."):

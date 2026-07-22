@@ -27,6 +27,7 @@ Example Usage:
 import json
 import os
 import re
+import shlex
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -44,8 +45,18 @@ from sag.testcases.catalog import (
     TestCaseCatalog,
     TestCaseDescriptor,
     build_java_test_catalog,
-    merge_testcase_status,
     normalize_testcase_identifier,
+)
+from sag.testcases.compileall_metrics import (
+    COMPILEALL_METRICS_UNAVAILABLE_CONFLICT,
+    compileall_metrics_command,
+    parse_compileall_metrics,
+)
+from sag.testcases.results import (
+    CanonicalTestIdentity,
+    TestResultObservation,
+    aggregate_test_results,
+    canonical_test_identity,
 )
 
 # top_level.txt names that are install tooling, never the project under test —
@@ -94,18 +105,14 @@ def _dist_record_matches(record_dir: str, project_name: str) -> bool:
 # _parse_test_reports_compact_in_container. Kept as a plain module string so
 # the embedded script needs no f-string brace escaping.
 #
-# Aggregation model (live 2026-07-10 requests run):
-# - Maven/Gradle report dirs: RAW accumulation across files with severity-merged
-#   unique statuses — byte-identical to the original parser (surefire re-run
-#   files legitimately add executions).
-# - pytest reports dir: python_tool writes ONE cumulative JUnit XML PER pytest
-#   INVOCATION (pytest-<epoch>.xml). Files are aggregated per test id with the
-#   LATEST invocation winning, so a diagnostic subset re-run updates the tests
-#   it ran but never erases (or double-counts) the rest of the suite. The
-#   primary executed/passed/failed counts are the deduped union.
+# Aggregation model (WS7): every testcase is normalized to the canonical
+# (module_or_file, class, name, param_id) identity. Per-identity histories are
+# ordered only by the explicit sag.attempt_id persisted in JUnit — filenames
+# and mtimes are transport details and never decide which observation is latest.
+# Raw executions remain diagnostics; primary/unique counts use each history's
+# latest status while first/worst/retry/flaky facts remain visible.
 _COMPACT_REPORT_PARSER_BODY = '''
 import json
-import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -127,38 +134,83 @@ def is_report_file(path):
     )
 
 
-def normalize_method_name(method_name):
-    if not method_name:
+def local_name(element):
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def normalized_file_path(value):
+    if not value:
         return ""
-    name = method_name.strip()
-    if "[" in name:
-        name = name.split("[")[0]
+    path = re.sub(r"/+", "/", str(value).strip().replace("\\\\", "/"))
+    while path.startswith("./"):
+        path = path[2:]
+    if path.startswith("/workspace/"):
+        path = path[len("/workspace/"):]
+    return path.rstrip("/")
+
+
+def name_and_param_id(value):
+    name = str(value or "").strip()
+    if not name:
+        return "", ""
+    param_id = ""
+    bracket = re.search(r"\\[([^\\]]*)\\]\\s*$", name)
+    if bracket:
+        param_id = bracket.group(1).strip()
+        name = name[:bracket.start()].rstrip()
     if "(" in name:
-        name = name.split("(")[0]
-    if " #" in name:
-        name = name.split(" #")[0]
-    return name.strip()
+        name = name.split("(", 1)[0].rstrip()
+    spock = re.search(r"\\s+#([^\\s]+)\\s*$", name)
+    if spock:
+        param_id = param_id or spock.group(1).strip()
+        name = name[:spock.start()].rstrip()
+    return name, param_id
 
 
-def normalize_key(classname, name, file_path=None):
-    method_name = normalize_method_name(name)
-    if not method_name:
+def canonical_identity(classname, name, file_path=None):
+    normalized_name, param_id = name_and_param_id(name)
+    if not normalized_name:
         return None
-    if classname:
-        classname = classname.replace("$", ".").strip()
-    elif file_path:
-        classname = file_path.replace("/", ".").replace(".java", "").replace(".class", "").strip(".")
+    normalized_class = str(classname or "").strip().replace("$", ".").strip(".")
+    normalized_file = normalized_file_path(file_path)
+    if normalized_file:
+        module_or_file = normalized_file
+    elif "." in normalized_class:
+        module_or_file = normalized_class.rsplit(".", 1)[0]
     else:
-        return method_name
-    return f"{classname}::{method_name}"
+        module_or_file = normalized_class
+    class_name = normalized_class.rsplit(".", 1)[-1] if normalized_class else ""
+    if not class_name and normalized_file:
+        class_name = normalized_file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return (module_or_file, class_name, normalized_name, param_id)
+
+
+def identity_dict(identity):
+    return {
+        "module_or_file": identity[0],
+        "class_name": identity[1],
+        "name": identity[2],
+        "param_id": identity[3],
+    }
+
+
+def display_name(identity):
+    module_or_file, class_name, name, param_id = identity
+    if "/" in module_or_file or module_or_file.endswith((".py", ".java")):
+        owner = "::".join(part for part in (module_or_file, class_name) if part)
+    else:
+        owner = ".".join(part for part in (module_or_file, class_name) if part)
+    prefix = "::".join(part for part in (owner, name) if part)
+    return f"{prefix}[{param_id}]" if param_id else prefix
 
 
 def testcase_status(testcase):
-    if testcase.find("error") is not None:
+    child_names = {local_name(child) for child in testcase}
+    if "error" in child_names:
         return "error"
-    if testcase.find("failure") is not None:
+    if "failure" in child_names:
         return "failed"
-    if testcase.find("skipped") is not None or testcase.get("status") == "skipped":
+    if "skipped" in child_names or testcase.get("status") == "skipped":
         return "skipped"
     return "passed"
 
@@ -193,19 +245,43 @@ for groovy in root.rglob("src/test/groovy/**/*.groovy"):
     if "@Test" in text:
         groovy_classes.add(groovy.stem)
 
-unique = {}
 parsing_errors = []
+metrics_conflicts = set()
 
 
 def parse_report(report_file):
-    """Return (testcase tuples, None), (None, suite-attr counts) or None."""
+    """Return canonical cases, suite-only counts, and explicit attempt metadata."""
     try:
         tree = ET.parse(report_file)
         xml_root = tree.getroot()
     except Exception as exc:
         parsing_errors.append(f"Error parsing {report_file}: {exc}")
         return None
-    testcases = list(xml_root.iter("testcase"))
+    attempt_values = set()
+    attempt_error = None
+    for element in xml_root.iter():
+        if local_name(element) != "property" or element.get("name") != "sag.attempt_id":
+            continue
+        try:
+            value = int(element.get("value") or "")
+            if value < 1:
+                raise ValueError
+            attempt_values.add(value)
+        except (TypeError, ValueError):
+            attempt_error = "invalid"
+    if len(attempt_values) > 1:
+        attempt_error = "conflicting"
+    attempt_id = (
+        next(iter(attempt_values))
+        if len(attempt_values) == 1 and not attempt_error
+        else None
+    )
+    if attempt_id is None and attempt_error is None:
+        attempt_error = "missing"
+
+    testcases = [
+        element for element in xml_root.iter() if local_name(element) == "testcase"
+    ]
     if testcases:
         cases = []
         for testcase in testcases:
@@ -213,23 +289,38 @@ def parse_report(report_file):
             simple_classname = classname.split(".")[-1] if classname else ""
             if simple_classname in groovy_classes:
                 continue
-            cases.append(
-                (
-                    classname,
-                    testcase.get("name"),
-                    testcase.get("file") or report_file,
-                    testcase_status(testcase),
-                )
+            identity = canonical_identity(
+                classname,
+                testcase.get("name"),
+                testcase.get("file"),
             )
-        return (cases, None)
+            if identity:
+                cases.append((identity, testcase_status(testcase)))
+        return {
+            "cases": cases,
+            "suite_counts": None,
+            "attempt_id": attempt_id,
+            "attempt_error": attempt_error,
+        }
     counts = {"total": 0, "failed": 0, "error": 0, "skipped": 0}
-    suites = [xml_root] if xml_root.tag == "testsuite" else list(xml_root.iter("testsuite"))
+    suites = (
+        [xml_root]
+        if local_name(xml_root) == "testsuite"
+        else [
+            element for element in xml_root.iter() if local_name(element) == "testsuite"
+        ]
+    )
     for suite in suites:
         counts["total"] += int_attr(suite, "tests")
         counts["failed"] += int_attr(suite, "failures")
         counts["error"] += int_attr(suite, "errors")
         counts["skipped"] += int_attr(suite, "skipped")
-    return (None, counts)
+    return {
+        "cases": None,
+        "suite_counts": counts,
+        "attempt_id": attempt_id,
+        "attempt_error": attempt_error,
+    }
 
 
 def bump(counts, status):
@@ -258,99 +349,108 @@ def add_suite_counts(counts, suite_counts):
     )
 
 
-# Maven/Gradle: raw accumulation, severity-merged unique statuses (unchanged).
-jvm = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
-for report_file in (p for p in report_files if not is_pytest_report(p)):
+# Aggregate all reports by canonical identity and explicit attempt. JVM report
+# sets without SAG metadata are one external runner attempt (attempt 1); pytest
+# reports are SAG-produced and therefore missing metadata is a metrics conflict.
+raw = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+suite_only = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+attempts = {}
+sources = {}
+for report_file in report_files:
     parsed = parse_report(report_file)
     if parsed is None:
         continue
-    cases, suite_counts = parsed
+    cases = parsed["cases"]
+    suite_counts = parsed["suite_counts"]
+    attempt_id = parsed["attempt_id"]
+    attempt_error = parsed["attempt_error"]
+    if is_pytest_report(report_file) and attempt_error:
+        metrics_conflicts.add("test_attempt_id_invalid")
+        parsing_errors.append(
+            f"{attempt_error} sag.attempt_id in {report_file}; "
+            "observations kept in attempt 1"
+        )
+    if attempt_id is None:
+        attempt_id = 1
     if cases is None:
-        add_suite_counts(jvm, suite_counts)
+        add_suite_counts(raw, suite_counts)
+        add_suite_counts(suite_only, suite_counts)
+        if suite_counts["total"]:
+            metrics_conflicts.add("test_identity_unavailable")
         continue
-    for classname, name, file_attr, status in cases:
-        bump(jvm, status)
-        key = normalize_key(classname, name, file_attr)
-        if key:
-            unique[key] = merge_status(unique[key], status) if key in unique else status
+    for identity, status in cases:
+        bump(raw, status)
+        identity_attempts = attempts.setdefault(identity, {})
+        identity_attempts[attempt_id] = (
+            merge_status(identity_attempts[attempt_id], status)
+            if attempt_id in identity_attempts
+            else status
+        )
+        sources.setdefault(identity, set()).add(report_file)
 
+latest = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
+histories = []
+failing_test_names = []
+flaky_count = 0
+retried_count = 0
+for identity in sorted(attempts):
+    identity_attempts = attempts[identity]
+    attempt_ids = sorted(identity_attempts)
+    statuses = [identity_attempts[attempt_id] for attempt_id in attempt_ids]
+    first = statuses[0]
+    current_latest = statuses[-1]
+    worst = statuses[0]
+    for status in statuses[1:]:
+        worst = merge_status(worst, status)
+    retries = max(len(attempt_ids) - 1, 0)
+    flaky = current_latest == "passed" and worst in ("failed", "error")
+    bump(latest, current_latest)
+    flaky_count += int(flaky)
+    retried_count += retries
+    if current_latest in ("failed", "error"):
+        failing_test_names.append(display_name(identity))
+    histories.append(
+        {
+            "identity": identity_dict(identity),
+            "first": first,
+            "latest": current_latest,
+            "worst": worst,
+            "retried_count": retries,
+            "attempt_ids": attempt_ids,
+            "flaky": flaky,
+            "sources": sorted(sources.get(identity, set())),
+        }
+    )
 
-def pytest_run_order(path):
-    # Prefer the epoch python_tool embeds in the filename; mtime is the fallback.
-    match = re.search(r"pytest-(\\d+)\\.xml$", path)
-    if match:
-        return (0, int(match.group(1)), path)
-    try:
-        return (0, int(os.path.getmtime(path)), path)
-    except OSError:
-        return (1, 0, path)
-
-
-# pytest: per-test aggregation across invocations, LATEST invocation wins.
-pytest_raw = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
-pytest_suites_only = {"total": 0, "passed": 0, "failed": 0, "error": 0, "skipped": 0}
-pytest_union = {}
-for report_file in sorted((p for p in report_files if is_pytest_report(p)), key=pytest_run_order):
-    parsed = parse_report(report_file)
-    if parsed is None:
-        continue
-    cases, suite_counts = parsed
-    if cases is None:
-        add_suite_counts(pytest_raw, suite_counts)
-        add_suite_counts(pytest_suites_only, suite_counts)
-        continue
-    file_units = {}
-    file_methods = {}
-    for classname, name, file_attr, status in cases:
-        bump(pytest_raw, status)
-        key = normalize_key(classname, name, file_attr)
-        if not key:
-            continue
-        # Execution id keeps the [param] suffix: parameterized invocations stay
-        # distinct so executed totals stay comparable to the collect-only count.
-        unit = key + (name[name.index("["):] if name and "[" in name else "")
-        file_units[unit] = merge_status(file_units[unit], status) if unit in file_units else status
-        file_methods[key] = merge_status(file_methods[key], status) if key in file_methods else status
-    # LATEST invocation wins for the tests it re-ran; everything else persists.
-    pytest_union.update(file_units)
-    unique.update(file_methods)
-
-union_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
-for status in pytest_union.values():
-    union_counts[status] = union_counts.get(status, 0) + 1
-
-raw = {key: jvm[key] + pytest_raw[key] for key in jvm}
-total_tests = jvm["total"] + len(pytest_union) + pytest_suites_only["total"]
-passed_tests = jvm["passed"] + union_counts["passed"] + pytest_suites_only["passed"]
-failed_tests = jvm["failed"] + union_counts["failed"] + pytest_suites_only["failed"]
-error_tests = jvm["error"] + union_counts["error"] + pytest_suites_only["error"]
-skipped_tests = jvm["skipped"] + union_counts["skipped"] + pytest_suites_only["skipped"]
-
-unique_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
-for status in unique.values():
-    unique_counts[status] = unique_counts.get(status, 0) + 1
+for key in latest:
+    latest[key] += suite_only[key]
 
 result = {
     "valid": bool(report_files),
-    "total_tests": total_tests,
-    "passed_tests": passed_tests,
-    "failed_tests": failed_tests,
-    "error_tests": error_tests,
-    "skipped_tests": skipped_tests,
+    "total_tests": latest["total"],
+    "passed_tests": latest["passed"],
+    "failed_tests": latest["failed"],
+    "error_tests": latest["error"],
+    "skipped_tests": latest["skipped"],
     "raw_total_tests": raw["total"],
     "raw_passed_tests": raw["passed"],
     "raw_failed_tests": raw["failed"],
     "raw_error_tests": raw["error"],
     "raw_skipped_tests": raw["skipped"],
-    "unique_tests": len(unique),
-    "unique_passed_tests": unique_counts.get("passed", 0),
-    "unique_failed_tests": unique_counts.get("failed", 0),
-    "unique_error_tests": unique_counts.get("error", 0),
-    "unique_skipped_tests": unique_counts.get("skipped", 0),
-    "test_success": total_tests > 0 and failed_tests == 0 and error_tests == 0,
-    "failing_test_names": sorted(
-        key for key, status in unique.items() if status in ("failed", "error")
-    )[:50],
+    "unique_tests": latest["total"],
+    "unique_passed_tests": latest["passed"],
+    "unique_failed_tests": latest["failed"],
+    "unique_error_tests": latest["error"],
+    "unique_skipped_tests": latest["skipped"],
+    "unique_methods": len({identity[:3] for identity in attempts}),
+    "flaky_count": flaky_count,
+    "retried_count": retried_count,
+    "test_histories": histories,
+    "metrics_conflicts": sorted(metrics_conflicts),
+    "test_success": (
+        latest["total"] > 0 and latest["failed"] == 0 and latest["error"] == 0
+    ),
+    "failing_test_names": sorted(failing_test_names)[:50],
     "report_files": report_files[:200],
     "report_file_count": len(report_files),
     "report_dirs": report_dirs,
@@ -368,22 +468,37 @@ def _is_pytest_report_path(path: str, pytest_reports_dir: str) -> bool:
     """
     s = str(path)
     return (
-        s.startswith(pytest_reports_dir.rstrip("/") + "/")
-        or "/.setup_agent/pytest-reports/" in s
+        s.startswith(pytest_reports_dir.rstrip("/") + "/") or "/.setup_agent/pytest-reports/" in s
     )
 
 
-def _pytest_run_order(path: str) -> Tuple[int, int, str]:
-    """Invocation order for pytest report files (latest wins downstream).
+def _test_report_attempt_id(xml_content: str) -> Tuple[Optional[int], Optional[str]]:
+    """Read the explicit SAG attempt id without inferring transport order."""
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError:
+        return None, "malformed"
 
-    Prefers the epoch python_tool embeds in the filename (pytest-<epoch>.xml),
-    mirroring the compact in-container parser; unrecognized names sort last by
-    path (no cheap mtime is available through the shell fallback).
-    """
-    match = re.search(r"pytest-(\d+)\.xml$", path)
-    if match:
-        return (0, int(match.group(1)), path)
-    return (1, 0, path)
+    values = set()
+    invalid = False
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "property" or element.get("name") != "sag.attempt_id":
+            continue
+        try:
+            value = int(element.get("value") or "")
+            if value < 1:
+                raise ValueError
+            values.add(value)
+        except (TypeError, ValueError):
+            invalid = True
+
+    if invalid:
+        return None, "invalid"
+    if len(values) > 1:
+        return None, "conflicting"
+    if not values:
+        return None, "missing"
+    return next(iter(values)), None
 
 
 def evaluate_run_verdict(
@@ -1112,6 +1227,11 @@ class PhysicalValidator:
             "unique_failed_tests": 0,
             "unique_error_tests": 0,
             "unique_skipped_tests": 0,
+            "unique_methods": 0,
+            "flaky_count": 0,
+            "retried_count": 0,
+            "test_histories": [],
+            "metrics_conflicts": [],
             "test_success": False,
             "failing_test_names": [],
             "report_files": [],
@@ -1226,20 +1346,22 @@ class PhysicalValidator:
                     f"📊 Identified {len(groovy_test_classes)} Groovy test classes to exclude"
                 )
 
-            # Partition: pytest invocation XMLs need per-test aggregation with
-            # the LATEST invocation winning (python_tool writes ONE cumulative
-            # XML per pytest run, so raw sums double-count every test present
-            # in two invocations and a severity merge lets a stale failure
-            # override a later re-run pass). JVM surefire/failsafe/gradle XMLs
-            # keep the legacy raw accumulation + severity merge, unchanged.
-            pytest_report_files = sorted(
-                (f for f in report_files if _is_pytest_report_path(f, PYTEST_REPORT_DIR)),
-                key=_pytest_run_order,
-            )
-            pytest_file_set = set(pytest_report_files)
-            jvm_report_files = [f for f in report_files if f not in pytest_file_set]
+            observations: List[TestResultObservation] = []
+            identity_statuses: Dict[CanonicalTestIdentity, List[str]] = {}
+            identity_times: Dict[CanonicalTestIdentity, float] = {}
+            identity_raw_names: Dict[CanonicalTestIdentity, set] = {}
+            identity_catalog_keys: Dict[CanonicalTestIdentity, str] = {}
+            runtime_catalog_keys = set()
+            metrics_conflicts = set()
+            suite_only = {
+                "executed": 0,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "skipped": 0,
+            }
 
-            for report_file in jvm_report_files:
+            for report_file in report_files:
                 try:
                     xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
                     if xml_result.get("exit_code") != 0:
@@ -1249,100 +1371,6 @@ class PhysicalValidator:
                     xml_content = xml_result.get("output", "")
                     if not xml_content.strip():
                         continue
-
-                    stats = self._parse_single_test_xml(
-                        xml_content, report_file, groovy_test_classes
-                    )
-                    if stats:
-                        test_result["total_tests"] += stats.get("total", 0)
-                        test_result["passed_tests"] += stats.get("passed", 0)
-                        test_result["failed_tests"] += stats.get("failed", 0)
-                        test_result["error_tests"] += stats.get("errors", 0)
-                        test_result["skipped_tests"] += stats.get("skipped", 0)
-
-                        testcases_in_file = stats.get("testcases", [])
-                        if testcases_in_file:
-                            files_with_testcases += 1
-                            total_testcases_found += len(testcases_in_file)
-
-                        for testcase in testcases_in_file:
-                            classname = testcase.get("classname", "")
-
-                            # Skip Groovy test cases - check if the class name matches any Groovy test class
-                            # Extract just the class name without package
-                            simple_classname = classname.split(".")[-1] if classname else ""
-                            if simple_classname in groovy_test_classes:
-                                logger.debug(f"Skipping Groovy test case: {classname}")
-                                continue
-
-                            normalized_key = normalize_testcase_identifier(
-                                classname, testcase.get("name"), testcase.get("file")
-                            )
-                            if not normalized_key:
-                                continue
-
-                            status = testcase.get("status", "passed")
-                            execution_time = testcase.get("time", 0.0)
-
-                            # Try to resolve descriptor from catalog
-                            descriptor = None
-                            if test_catalog:
-                                descriptor_from_catalog = test_catalog.get(normalized_key)
-                                if descriptor_from_catalog:
-                                    descriptor = descriptor_from_catalog
-
-                            # Create or update runtime record
-                            if normalized_key not in test_case_records:
-                                test_case_records[normalized_key] = RuntimeTestCaseRecord(
-                                    descriptor=descriptor,
-                                    key=normalized_key,
-                                    statuses=[status],
-                                    final_status=status,
-                                    execution_time_ms=(
-                                        float(execution_time) * 1000 if execution_time else 0.0
-                                    ),
-                                    sources={report_file},
-                                    raw_names=[testcase.get("name", "")],
-                                )
-                            else:
-                                record = test_case_records[normalized_key]
-                                record.statuses.append(status)
-                                record.final_status = merge_testcase_status(
-                                    record.final_status, status
-                                )
-                                record.execution_time_ms += (
-                                    float(execution_time) * 1000 if execution_time else 0.0
-                                )
-                                record.sources.add(report_file)
-                                if testcase.get("name") not in record.raw_names:
-                                    record.raw_names.append(testcase.get("name", ""))
-                    else:
-                        test_result["parsing_errors"].append(
-                            f"Failed to parse XML structure in {report_file}"
-                        )
-                except Exception as e:
-                    test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
-                    logger.warning(f"Failed to parse test report {report_file}: {e}")
-
-            # pytest reports: per-test aggregation across invocations, latest
-            # invocation winning — mirrors the compact in-container parser. The
-            # execution id keeps the [param] suffix so parameterized runs stay
-            # distinct and the primary executed total remains comparable to the
-            # pytest --collect-only denominator.
-            pytest_raw = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-            pytest_suites_only = {"total": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
-            pytest_union: Dict[str, str] = {}
-            for report_file in pytest_report_files:
-                try:
-                    xml_result = self.docker_orchestrator.execute_command(f"cat '{report_file}'")
-                    if xml_result.get("exit_code") != 0:
-                        test_result["parsing_errors"].append(f"Failed to read {report_file}")
-                        continue
-
-                    xml_content = xml_result.get("output", "")
-                    if not xml_content.strip():
-                        continue
-
                     stats = self._parse_single_test_xml(
                         xml_content, report_file, groovy_test_classes
                     )
@@ -1352,196 +1380,167 @@ class PhysicalValidator:
                         )
                         continue
 
-                    for key in pytest_raw:
-                        pytest_raw[key] += stats.get(key, 0)
+                    attempt_id, attempt_error = _test_report_attempt_id(xml_content)
+                    is_pytest = _is_pytest_report_path(report_file, PYTEST_REPORT_DIR)
+                    if (is_pytest and attempt_error) or (attempt_error not in (None, "missing")):
+                        metrics_conflicts.add("test_attempt_id_invalid")
+                        test_result["parsing_errors"].append(
+                            f"{attempt_error} sag.attempt_id in {report_file}; "
+                            "observations kept in attempt 1"
+                        )
+                    attempt_id = attempt_id or 1
 
                     testcases_in_file = stats.get("testcases", [])
                     if not testcases_in_file:
-                        # Suite-attribute-only XML: nothing to deduplicate, the
-                        # counts flow into the primary totals as-is.
-                        for key in pytest_suites_only:
-                            pytest_suites_only[key] += stats.get(key, 0)
+                        suite_only["executed"] += stats.get("total", 0)
+                        suite_only["passed"] += stats.get("passed", 0)
+                        suite_only["failed"] += stats.get("failed", 0)
+                        suite_only["errors"] += stats.get("errors", 0)
+                        suite_only["skipped"] += stats.get("skipped", 0)
+                        if stats.get("total", 0):
+                            metrics_conflicts.add("test_identity_unavailable")
                         continue
 
                     files_with_testcases += 1
                     total_testcases_found += len(testcases_in_file)
-
-                    file_units: Dict[str, str] = {}
-                    file_methods: Dict[str, str] = {}
                     for testcase in testcases_in_file:
-                        normalized_key = normalize_testcase_identifier(
+                        identity = canonical_test_identity(
                             testcase.get("classname", ""),
                             testcase.get("name"),
-                            testcase.get("file"),
+                            testcase.get("identity_file"),
                         )
-                        if not normalized_key:
+                        if not identity:
                             continue
-
                         status = testcase.get("status", "passed")
-                        raw_name = testcase.get("name") or ""
-                        suffix = raw_name[raw_name.index("[") :] if "[" in raw_name else ""
-                        unit = normalized_key + suffix
-                        file_units[unit] = (
-                            merge_testcase_status(file_units[unit], status)
-                            if unit in file_units
-                            else status
-                        )
-                        file_methods[normalized_key] = (
-                            merge_testcase_status(file_methods[normalized_key], status)
-                            if normalized_key in file_methods
-                            else status
-                        )
-
-                        execution_time = testcase.get("time", 0.0)
-                        if normalized_key not in test_case_records:
-                            test_case_records[normalized_key] = RuntimeTestCaseRecord(
-                                descriptor=(
-                                    test_catalog.get(normalized_key) if test_catalog else None
-                                ),
-                                key=normalized_key,
-                                statuses=[status],
-                                final_status=status,
-                                execution_time_ms=(
-                                    float(execution_time) * 1000 if execution_time else 0.0
-                                ),
-                                sources={report_file},
-                                raw_names=[raw_name],
+                        observations.append(
+                            TestResultObservation(
+                                identity=identity,
+                                attempt_id=attempt_id,
+                                status=status,
+                                source=report_file,
                             )
-                        else:
-                            record = test_case_records[normalized_key]
-                            record.statuses.append(status)
-                            record.execution_time_ms += (
-                                float(execution_time) * 1000 if execution_time else 0.0
+                        )
+                        identity_statuses.setdefault(identity, []).append(status)
+                        identity_times[identity] = identity_times.get(identity, 0.0) + (
+                            float(testcase.get("time") or 0.0) * 1000
+                        )
+                        identity_raw_names.setdefault(identity, set()).add(
+                            testcase.get("name") or ""
+                        )
+                        catalog_key = normalize_testcase_identifier(
+                            testcase.get("classname", ""),
+                            testcase.get("name"),
+                            testcase.get("identity_file"),
+                        )
+                        if catalog_key:
+                            runtime_catalog_keys.add(catalog_key)
+                            identity_catalog_keys.setdefault(identity, catalog_key)
+                except Exception as exc:
+                    test_result["parsing_errors"].append(f"Error parsing {report_file}: {exc}")
+                    logger.warning(f"Failed to parse test report {report_file}: {exc}")
+
+            aggregated = aggregate_test_results(observations)
+            latest = dict(aggregated.latest_counts)
+            raw = dict(aggregated.raw_counts)
+            for key in latest:
+                latest[key] += suite_only[key]
+                raw[key] += suite_only[key]
+
+            for identity, history in aggregated.histories.items():
+                display_key = identity.display_name
+                catalog_key = identity_catalog_keys.get(identity)
+                descriptor = test_catalog.get(catalog_key) if test_catalog and catalog_key else None
+                test_case_records[display_key] = RuntimeTestCaseRecord(
+                    descriptor=descriptor,
+                    key=display_key,
+                    statuses=identity_statuses.get(identity, []),
+                    final_status=history.latest,
+                    execution_time_ms=identity_times.get(identity, 0.0),
+                    sources=set(history.sources),
+                    raw_names=sorted(identity_raw_names.get(identity, set())),
+                )
+
+            test_result.update(
+                {
+                    "total_tests": latest["executed"],
+                    "passed_tests": latest["passed"],
+                    "failed_tests": latest["failed"],
+                    "error_tests": latest["errors"],
+                    "skipped_tests": latest["skipped"],
+                    "raw_total_tests": raw["executed"],
+                    "raw_passed_tests": raw["passed"],
+                    "raw_failed_tests": raw["failed"],
+                    "raw_error_tests": raw["errors"],
+                    "raw_skipped_tests": raw["skipped"],
+                    "unique_tests": latest["executed"],
+                    "unique_passed_tests": latest["passed"],
+                    "unique_failed_tests": latest["failed"],
+                    "unique_error_tests": latest["errors"],
+                    "unique_skipped_tests": latest["skipped"],
+                    "unique_methods": len(
+                        {
+                            (
+                                identity.module_or_file,
+                                identity.class_name,
+                                identity.name,
                             )
-                            record.sources.add(report_file)
-                            if raw_name not in record.raw_names:
-                                record.raw_names.append(raw_name)
-
-                    # LATEST invocation wins for the tests it re-ran; everything
-                    # else persists (never severity-merged across invocations).
-                    pytest_union.update(file_units)
-                    for key, merged_status in file_methods.items():
-                        test_case_records[key].final_status = merged_status
-                except Exception as e:
-                    test_result["parsing_errors"].append(f"Error parsing {report_file}: {str(e)}")
-                    logger.warning(f"Failed to parse test report {report_file}: {e}")
-
-            # Fold the pytest per-test union into the primary counters (the JVM
-            # counters above stay raw accumulation, unchanged). raw_* keeps the
-            # honest execution totals across BOTH kinds of reports.
-            raw_totals = {
-                "total": test_result["total_tests"] + pytest_raw["total"],
-                "passed": test_result["passed_tests"] + pytest_raw["passed"],
-                "failed": test_result["failed_tests"] + pytest_raw["failed"],
-                "errors": test_result["error_tests"] + pytest_raw["errors"],
-                "skipped": test_result["skipped_tests"] + pytest_raw["skipped"],
-            }
-            union_counts = {"passed": 0, "failed": 0, "error": 0, "skipped": 0}
-            for unit_status in pytest_union.values():
-                union_counts[unit_status] = union_counts.get(unit_status, 0) + 1
-            test_result["total_tests"] += len(pytest_union) + pytest_suites_only["total"]
-            test_result["passed_tests"] += union_counts["passed"] + pytest_suites_only["passed"]
-            test_result["failed_tests"] += union_counts["failed"] + pytest_suites_only["failed"]
-            test_result["error_tests"] += union_counts["error"] + pytest_suites_only["errors"]
-            test_result["skipped_tests"] += union_counts["skipped"] + pytest_suites_only["skipped"]
-
-            logger.info(
-                f"📊 Debug: Found {total_testcases_found} total testcases in {files_with_testcases} files"
-            )
-            logger.info(
-                f"📊 Collected {len(test_case_records)} unique test cases from all XML files"
-            )
-
-            if test_case_records:
-                # Preserve raw metrics before overwriting with deduplicated counts
-                test_result["raw_total_tests"] = raw_totals["total"]
-                test_result["raw_passed_tests"] = raw_totals["passed"]
-                test_result["raw_failed_tests"] = raw_totals["failed"]
-                test_result["raw_error_tests"] = raw_totals["errors"]
-                test_result["raw_skipped_tests"] = raw_totals["skipped"]
-
-                # Store runtime records in result
-                test_result["test_case_records"] = {
-                    key: record.to_dict() for key, record in test_case_records.items()
+                            for identity in aggregated.histories
+                        }
+                    ),
+                    "flaky_count": aggregated.flaky_count,
+                    "retried_count": aggregated.retried_count,
+                    "test_histories": aggregated.to_dict()["histories"],
+                    "metrics_conflicts": sorted(metrics_conflicts),
+                    "failing_test_names": sorted(
+                        identity.display_name
+                        for identity, history in aggregated.histories.items()
+                        if history.latest in ("failed", "error")
+                    )[:50],
+                    "test_case_records": {
+                        key: record.to_dict() for key, record in test_case_records.items()
+                    },
                 }
+            )
 
-                # Enumerate the failing/erroring tests (sampled) so callers can
-                # report WHICH tests failed, not just a count. Required to be
-                # populated whenever the run verdict fails on tests.
-                failing_test_names = [
-                    record.key
-                    for record in test_case_records.values()
-                    if record.final_status in ("failed", "error")
-                ]
-                test_result["failing_test_names"] = sorted(failing_test_names)[:50]
-
-                test_result["unique_tests"] = len(test_case_records)
-                for record in test_case_records.values():
-                    if record.final_status == "passed":
-                        test_result["unique_passed_tests"] += 1
-                    elif record.final_status == "failed":
-                        test_result["unique_failed_tests"] += 1
-                    elif record.final_status == "error":
-                        test_result["unique_error_tests"] += 1
-                    elif record.final_status == "skipped":
-                        test_result["unique_skipped_tests"] += 1
-
-                # Log deduplication results
-                logger.info(f"📊 Test deduplication complete:")
-                logger.info(f"   Raw test count: {test_result['raw_total_tests']} (from XML files)")
+            logger.info(
+                f"📊 Debug: Found {total_testcases_found} total testcases "
+                f"in {files_with_testcases} files"
+            )
+            logger.info(
+                f"📊 Collected {test_result['unique_tests']} canonical test cases "
+                "from all XML files"
+            )
+            if test_result["unique_tests"]:
                 logger.info(
-                    f"   Unique test count: {test_result['unique_tests']} (after deduplication)"
-                )
-                logger.info(
-                    f"   Deduplication ratio: {test_result['raw_total_tests'] / test_result['unique_tests']:.1f}x"
-                )
-
-                # Switch primary metrics to deduplicated values for downstream reporting
-                # Keep primary metrics as raw runner XML executions. Unique
-                # method-level metrics remain available under unique_* for UI
-                # and report labeling without hiding parameterized invocations.
-
-                # Recalculate success flag using the primary raw runner metrics.
-                test_result["test_success"] = (
-                    test_result["failed_tests"] == 0
-                    and test_result["error_tests"] == 0
-                    and test_result["total_tests"] > 0
+                    "📊 Test deduplication complete: "
+                    f"{test_result['raw_total_tests']} raw -> "
+                    f"{test_result['unique_tests']} canonical latest"
                 )
 
-                # Detect unexecuted tests by comparing catalog with runtime
-                if test_catalog:
-                    unexecuted_tests = []
-                    catalog_keys = set(test_catalog.get_all().keys())
-                    runtime_keys = set(test_case_records.keys())
-
-                    missing_keys = catalog_keys - runtime_keys
-                    for key in missing_keys:
-                        descriptor = test_catalog.get(key)
-                        if descriptor:
-                            unexecuted_tests.append(
-                                {
-                                    "key": key,
-                                    "package": descriptor.package,
-                                    "class": descriptor.class_name,
-                                    "method": descriptor.method_name,
-                                    "path": descriptor.file_path,
-                                    "module": descriptor.module,
-                                }
-                            )
-
-                    if unexecuted_tests:
-                        test_result["unexecuted_tests"] = unexecuted_tests
-                        test_result["unexecuted_count"] = len(unexecuted_tests)
-                        logger.warning(
-                            f"⚠️ Found {len(unexecuted_tests)} tests that were not executed:"
+            # Detect unexecuted tests by comparing the static catalog with the
+            # legacy method keys observed alongside canonical runtime identities.
+            if test_catalog:
+                unexecuted_tests = []
+                catalog_keys = set(test_catalog.get_all().keys())
+                for key in sorted(catalog_keys - runtime_catalog_keys):
+                    descriptor = test_catalog.get(key)
+                    if descriptor:
+                        unexecuted_tests.append(
+                            {
+                                "key": key,
+                                "package": descriptor.package,
+                                "class": descriptor.class_name,
+                                "method": descriptor.method_name,
+                                "path": descriptor.file_path,
+                                "module": descriptor.module,
+                            }
                         )
-                        for test in unexecuted_tests[:5]:  # Log first 5
-                            logger.warning(f"   - {test['key']}")
-                        if len(unexecuted_tests) > 5:
-                            logger.warning(f"   ... and {len(unexecuted_tests) - 5} more")
 
-                        # Save unexecuted tests to log file
-                        self._save_unexecuted_tests_log(project_dir, unexecuted_tests, test_catalog)
+                if unexecuted_tests:
+                    test_result["unexecuted_tests"] = unexecuted_tests
+                    test_result["unexecuted_count"] = len(unexecuted_tests)
+                    logger.warning(f"⚠️ Found {len(unexecuted_tests)} tests that were not executed")
+                    self._save_unexecuted_tests_log(project_dir, unexecuted_tests, test_catalog)
 
             # Determine test success: only if no failures and no errors
             test_result["test_success"] = (
@@ -1837,7 +1836,8 @@ class PhysicalValidator:
         for testcase in testsuite.findall("testcase"):
             name = (testcase.get("name") or "").strip()
             classname = (testcase.get("classname") or "").strip()
-            file_attr = testcase.get("file") or testsuite.get("file") or file_path
+            identity_file = testcase.get("file") or testsuite.get("file")
+            file_attr = identity_file or file_path
             time_attr = testcase.get("time")
             status = self._determine_testcase_status(testcase)
             cases.append(
@@ -1845,6 +1845,7 @@ class PhysicalValidator:
                     "name": name,
                     "classname": classname,
                     "file": file_attr,
+                    "identity_file": identity_file,
                     "status": status,
                     "time": float(time_attr) if time_attr else 0.0,
                 }
@@ -2265,9 +2266,13 @@ class PhysicalValidator:
         artifacts_result = self._check_build_artifacts_complete(project_dir)
         evidence["has_artifacts"] = artifacts_result["exist"]
         evidence["artifact_count"] = artifacts_result["count"]
-        evidence["artifact_samples"] = self._collect_artifact_samples(
-            project_dir, artifacts_result
-        )
+        # Keep the validator-owned physical count in the structured evidence.
+        # Phase gates persist this scalar into RunEvidenceState before
+        # evidence-close; without it the canonical verdict snapshot can prove a
+        # build happened but cannot reproduce reactor benchmark class counts.
+        evidence["class_count"] = artifacts_result["class_count"]
+        evidence["jar_count"] = artifacts_result["jar_count"]
+        evidence["artifact_samples"] = self._collect_artifact_samples(project_dir, artifacts_result)
         if evidence["has_artifacts"]:
             logger.info(
                 f"✅ Found {artifacts_result['count']} build artifacts (JARs: {artifacts_result['jar_count']}, Classes: {artifacts_result['class_count']})"
@@ -2312,6 +2317,10 @@ class PhysicalValidator:
                     "imports_ok",
                     "import_failures",
                     "compileall_coverage",
+                    "compileall_metric_status",
+                    "compileall_source_count",
+                    "compileall_compiled_source_count",
+                    "compileall_foreign_pyc_count",
                     "ext_modules_ok",
                     "native_artifact_ok",
                 )
@@ -2319,9 +2328,7 @@ class PhysicalValidator:
             # Skipped-rung warnings (e.g. "imports rung skipped: ...") must be
             # VISIBLE in the report, not a silent None in the details.
             evidence["warnings"].extend(python_build.get("warnings") or [])
-            logger.info(
-                f"Python evidence ladder: {evidence['fingerprint_details']}"
-            )
+            logger.info(f"Python evidence ladder: {evidence['fingerprint_details']}")
 
         # Decision logic for BUILD ONLY (no test considerations).
         #
@@ -2356,9 +2363,7 @@ class PhysicalValidator:
         )
         threshold = self.build_coverage_threshold
         class_count = artifacts_result.get("class_count", 0)
-        has_real_output = (
-            evidence["has_build_fingerprints"] or class_count > 0
-        )
+        has_real_output = evidence["has_build_fingerprints"] or class_count > 0
 
         # Hard JVM gate (Part 1 principle, applied to EVERY branch): a maven/gradle
         # build is green only with compiled .class evidence. With zero compiled
@@ -2420,8 +2425,7 @@ class PhysicalValidator:
                 reason = (
                     f"Only {coverage * 100:.0f}% of expected classes built "
                     f"(< {threshold * 100:.0f}% threshold) — missing: "
-                    f"{', '.join(missing[:8])}"
-                    + (" ..." if len(missing) > 8 else "")
+                    f"{', '.join(missing[:8])}" + (" ..." if len(missing) > 8 else "")
                 )
 
         elif evidence["has_build_fingerprints"]:
@@ -2484,6 +2488,8 @@ class PhysicalValidator:
             conflicts = []
 
         conflicts.extend(self._collect_env_conflicts())
+        if python_build is not None:
+            conflicts.extend(python_build.get("metrics_conflicts") or [])
 
         result = {
             "success": success,
@@ -2536,11 +2542,7 @@ class PhysicalValidator:
                     and constraint
                     and resolve_python_version(constraint, [active_py]) == active_py
                 )
-                if (
-                    active_py
-                    and active_py != str(required_python)
-                    and not constraint_satisfied
-                ):
+                if active_py and active_py != str(required_python) and not constraint_satisfied:
                     conflicts.append("python_version_mismatch")
         except Exception as exc:
             logger.debug(f"env conflict check skipped: {exc}")
@@ -2614,6 +2616,11 @@ class PhysicalValidator:
             "imports_ok": None,
             "import_failures": [],
             "compileall_coverage": None,
+            "compileall_metric_status": "unavailable",
+            "compileall_source_count": 0,
+            "compileall_compiled_source_count": 0,
+            "compileall_foreign_pyc_count": 0,
+            "metrics_conflicts": [],
             "ext_modules_ok": None,
             # Native core (root CMakeLists.txt, live TVM): whether a build native
             # artifact (.so/.dylib) is present. None until probed / not
@@ -2625,14 +2632,10 @@ class PhysicalValidator:
             "warnings": [],
         }
 
-        venv_probe = self._execute_command_with_logging(
-            f"test -d {venv}", "checking python venv"
-        )
+        venv_probe = self._execute_command_with_logging(f"test -d {venv}", "checking python venv")
         result["venv_exists"] = venv_probe["success"]
         if not result["venv_exists"]:
-            result["reason"] = (
-                f"No venv at {venv} — the Python environment was never set up"
-            )
+            result["reason"] = f"No venv at {venv} — the Python environment was never set up"
             return result
 
         # Module form ('{venv}/bin/python -m pip check'), never the
@@ -2652,9 +2655,7 @@ class PhysicalValidator:
             # visible skip warning, and — bug-#9 semantics — an unknown rung
             # caps the build at PARTIAL below, never silent green.
             result["pip_check_clean"] = None
-            result["warnings"].append(
-                "pip check rung skipped: pip not present in venv"
-            )
+            result["warnings"].append("pip check rung skipped: pip not present in venv")
         else:
             result["pip_check_clean"] = False
 
@@ -2666,7 +2667,8 @@ class PhysicalValidator:
             junk = sorted(name for name in packages if name not in installed)
             if junk:
                 result["warnings"].append(
-                    "discovered but not installed: " + ", ".join(junk)
+                    "discovered but not installed: "
+                    + ", ".join(junk)
                     + " — skipped by the imports rung (not in the project's "
                     "installed record)"
                 )
@@ -2681,9 +2683,7 @@ class PhysicalValidator:
         # else: nothing of the project installed — keep the manifest packages
         # and today's semantics (their import failure is real evidence).
         if not packages:
-            result["warnings"].append(
-                "imports rung skipped: no importable package detected"
-            )
+            result["warnings"].append("imports rung skipped: no importable package detected")
 
         optional_ext_failures: List[str] = []
         if packages:
@@ -2710,9 +2710,7 @@ class PhysicalValidator:
             # green non-underscore import verified nothing usable — those
             # also keep blocking.
             blocking = [name for name in failures if not name.startswith("_")]
-            if failures and not blocking and any(
-                not name.startswith("_") for name in imported
-            ):
+            if failures and not blocking and any(not name.startswith("_") for name in imported):
                 optional_ext_failures = failures
                 failures = []
             result["imports_ok"] = not failures
@@ -2725,24 +2723,36 @@ class PhysicalValidator:
                 return result
 
         package_dirs = self._python_package_dirs(project_dir, packages)
-        target = " ".join(package_dirs)
         self._execute_command_with_logging(
-            f"{venv}/bin/python -m compileall -q {target}", "compileall"
+            f"{venv}/bin/python -m compileall -q "
+            + " ".join(shlex.quote(path) for path in package_dirs),
+            "compileall",
         )
-        # Source-weighted coverage: .pyc under __pycache__ / .py sources, with
-        # tests/docs/examples and dot-dirs (.venv) excluded on BOTH counts.
-        py_count = self._int_from_count(
-            f"find {target} -name '*.py' -type f -not -path '*/.*' "
-            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
-            f"2>/dev/null | wc -l"
+        metric_result = self._execute_command_with_logging(
+            compileall_metrics_command(f"{venv}/bin/python", package_dirs),
+            "compileall metrics",
         )
-        pyc_count = self._int_from_count(
-            f"find {target} -path '*/__pycache__/*.pyc' -type f -not -path '*/.*' "
-            f"-not -path '*/tests/*' -not -path '*/docs/*' -not -path '*/examples/*' "
-            f"2>/dev/null | wc -l"
-        )
-        if py_count and pyc_count is not None:
-            result["compileall_coverage"] = min(pyc_count / py_count, 1.0)
+        try:
+            if not metric_result["success"]:
+                raise ValueError("scanner command failed")
+            compile_metric = parse_compileall_metrics(metric_result.get("output") or "")
+        except (TypeError, ValueError) as exc:
+            compile_metric = None
+            result["metrics_conflicts"].append(COMPILEALL_METRICS_UNAVAILABLE_CONFLICT)
+            result["warnings"].append(f"compileall metrics unavailable: {exc}")
+
+        if compile_metric is not None:
+            result["compileall_metric_status"] = compile_metric.status
+            result["compileall_source_count"] = compile_metric.source_count
+            result["compileall_compiled_source_count"] = compile_metric.compiled_source_count
+            result["compileall_foreign_pyc_count"] = compile_metric.foreign_pyc_count
+            result["compileall_coverage"] = compile_metric.coverage
+            result["metrics_conflicts"].extend(compile_metric.conflicts)
+            if compile_metric.status == "invalid":
+                result["warnings"].append(
+                    "compileall metric invalid: "
+                    f"{compile_metric.foreign_pyc_count} foreign pyc file(s)"
+                )
 
         so_missing = False
         if manifest.get("has_c_extensions"):
@@ -2775,9 +2785,7 @@ class PhysicalValidator:
                 f"-type f 2>/dev/null | head -1",
                 "native core artifacts",
             )
-            result["native_artifact_ok"] = bool(
-                (native_probe.get("output") or "").strip()
-            )
+            result["native_artifact_ok"] = bool((native_probe.get("output") or "").strip())
             native_missing = not result["native_artifact_ok"]
 
         if optional_ext_failures:
@@ -2798,20 +2806,21 @@ class PhysicalValidator:
             # venv + compileall are real evidence (success stays True), but
             # the strongest rung was never probed — cap at PARTIAL, never a
             # silent SUCCESS on a project whose install was never verified.
-            partial_reasons.append(
-                "imports unverified: no importable package detected"
-            )
+            partial_reasons.append("imports unverified: no importable package detected")
         coverage = result["compileall_coverage"]
+        metric_status = result["compileall_metric_status"]
         threshold = self.build_coverage_threshold
-        if coverage is not None and coverage < threshold:
+        if metric_status == "invalid":
+            partial_reasons.append("compileall metric invalid: source/PYC basis mismatch")
+        elif COMPILEALL_METRICS_UNAVAILABLE_CONFLICT in result["metrics_conflicts"]:
+            partial_reasons.append("compileall metrics unavailable")
+        elif coverage is not None and coverage < threshold:
             partial_reasons.append(
                 f"compileall coverage {coverage * 100:.0f}% below the "
                 f"{threshold * 100:.0f}% threshold"
             )
         if so_missing:
-            partial_reasons.append(
-                "declared C-extensions have no built .so artifact"
-            )
+            partial_reasons.append("declared C-extensions have no built .so artifact")
         if native_missing:
             # Live TVM: root CMakeLists.txt native core with no built .so/.dylib.
             # PARTIAL, never a block — the python package will not fully import,
@@ -2819,8 +2828,7 @@ class PhysicalValidator:
             partial_reasons.append("native core not built")
         if optional_ext_failures:
             partial_reasons.append(
-                "optional extension module(s) not importable: "
-                + ", ".join(optional_ext_failures)
+                "optional extension module(s) not importable: " + ", ".join(optional_ext_failures)
             )
 
         result["success"] = True
@@ -2844,9 +2852,7 @@ class PhysicalValidator:
             )
         return result
 
-    def _installed_top_level_packages(
-        self, venv: str, project_dir: str
-    ) -> List[str]:
+    def _installed_top_level_packages(self, venv: str, project_dir: str) -> List[str]:
         """Import targets from the PROJECT's OWN installed record when the
         manifest declares no packages — never from third-party dependencies
         sharing the same site-packages.
@@ -2876,15 +2882,13 @@ class PhysicalValidator:
             ]
 
         direct = self._execute_command_with_logging(
-            f"grep -Fls 'file://{root}' {site}/*.dist-info/direct_url.json "
-            f"2>/dev/null",
+            f"grep -Fls 'file://{root}' {site}/*.dist-info/direct_url.json " f"2>/dev/null",
             "locating the project's own dist-info (direct_url.json)",
         )
         record_dirs = dist_dirs(direct)
         if not record_dirs:
             local = self._execute_command_with_logging(
-                f"grep -Fls '\"dir_info\"' {site}/*.dist-info/direct_url.json "
-                f"2>/dev/null",
+                f"grep -Fls '\"dir_info\"' {site}/*.dist-info/direct_url.json " f"2>/dev/null",
                 "locating local-directory installs (PEP 610 dir_info)",
             )
             record_dirs = dist_dirs(local)
@@ -2929,14 +2933,6 @@ class PhysicalValidator:
                     break
         return dirs or [root]
 
-    def _int_from_count(self, command: str) -> Optional[int]:
-        """Last line of a `... | wc -l` pipeline as an int, or None."""
-        result = self._execute_command_with_logging(command, "counting files")
-        try:
-            return int((result.get("output") or "").strip().splitlines()[-1])
-        except (ValueError, IndexError):
-            return None
-
     def _build_status_evidence_refs(
         self, project_dir: str, artifacts_result: Dict[str, any]
     ) -> List[str]:
@@ -2965,7 +2961,7 @@ class PhysicalValidator:
 
         prefix = project_dir.rstrip("/") + "/"
         relative = [
-            sample[len(prefix):] if sample.startswith(prefix) else sample
+            sample[len(prefix) :] if sample.startswith(prefix) else sample
             for sample in dict.fromkeys(samples)
         ]
         return relative[:limit]
@@ -3064,6 +3060,7 @@ class PhysicalValidator:
                 "passed": test_metrics.get("passed_tests", 0),
                 "failed": failed_count,
                 "skipped": test_metrics.get("skipped_tests", 0),
+                "flaky_count": test_metrics.get("flaky_count", 0),
                 "pass_rate": round(pass_rate, 1),
             }
         report_files = test_metrics.get("report_files", [])
@@ -3074,6 +3071,8 @@ class PhysicalValidator:
             conflicts.append("test_errors_detected")
         if test_metrics.get("parsing_errors", []):
             conflicts.append("test_report_parse_error")
+        if test_metrics.get("metrics_conflicts", []):
+            conflicts.append("metrics_conflict")
 
         if not test_metrics.get("valid", False):
             evidence_status = "unknown"
@@ -3111,6 +3110,10 @@ class PhysicalValidator:
             "unique_failed_tests": test_metrics.get("unique_failed_tests"),
             "unique_error_tests": test_metrics.get("unique_error_tests"),
             "unique_skipped_tests": test_metrics.get("unique_skipped_tests"),
+            "flaky_count": test_metrics.get("flaky_count", 0),
+            "retried_count": test_metrics.get("retried_count", 0),
+            "test_histories": test_metrics.get("test_histories", []),
+            "metrics_conflicts": test_metrics.get("metrics_conflicts", []),
             "parsing_errors": test_metrics.get("parsing_errors", []),
             "evidence_status": evidence_status,
             "test_stats": test_stats,
@@ -3219,8 +3222,18 @@ class PhysicalValidator:
                             "This is essential for accurate test coverage reporting."
                         )
 
-                    # Check for other analysis markers
-                    if env_summary.get("project_type") or env_summary.get("build_system"):
+                    # Check for other analysis markers. dim (c) deleted
+                    # (Category-3 analyzer diet): the analyzer no longer writes
+                    # project_brief_ref/fingerprint, so the survey facts
+                    # (build system / recommendation) are the readiness markers.
+                    if any(
+                        (
+                            env_summary.get("project_type"),
+                            env_summary.get("build_system"),
+                            env_summary.get("build_recommendation"),
+                            env_summary.get("survey"),
+                        )
+                    ):
                         result["analyzed"] = True  # At least partial analysis was done
 
                 except json.JSONDecodeError as e:
@@ -3255,10 +3268,7 @@ class PhysicalValidator:
         collected = self._python_collected_count(project_name)
         if collected is None:
             return result
-        if (
-            result.get("has_static_test_count")
-            and result.get("static_test_count") != collected
-        ):
+        if result.get("has_static_test_count") and result.get("static_test_count") != collected:
             # Preserve the static-scan number as evidence; it no longer feeds
             # the execution-coverage gate.
             result["static_test_count_static_scan"] = result["static_test_count"]
@@ -3688,7 +3698,7 @@ class PhysicalValidator:
 
         modules: List[Dict[str, any]] = []
         for module_dir in module_dirs:
-            rel = module_dir[len(project_dir):].strip("/") or "."
+            rel = module_dir[len(project_dir) :].strip("/") or "."
             name = "." if rel == "." else rel.replace("/", sep)
 
             class_cmd = (
@@ -3726,19 +3736,73 @@ class PhysicalValidator:
             )
             has_test_sources = "EXISTS" in (tst.get("output") or "")
 
-            modules.append({
+            record = {
                 "path": rel,
                 "name": name,
                 "class_count": class_count,
                 "jar_count": jar_count,
                 "report_dirs": report_dirs,
                 "has_test_sources": has_test_sources,
-            })
+            }
+
+            # Aggregator-shell detection (root record only, in a MULTI-module
+            # scan). Live httpcomponents-client: the reactor root is a Maven
+            # packaging=pom aggregator with zero sources — it produces nothing
+            # by design, yet it was counted as an unbuilt denominator entry,
+            # capping "5/6 built" and folding the verdict to partial while all 5
+            # real modules built and tested. A shell is not an unbuildable
+            # module; it is scaffolding. We mark it here so the summary can
+            # exclude it from the built/total ratio (the row still ships for
+            # display/debug).
+            #
+            # Detected PHYSICALLY, never project-bound: the root must have
+            # submodules AND zero own artifacts (0 classes, 0 jars), then the
+            # missing packaging semantics confirm it — maven: root pom.xml
+            # declares <packaging>pom</packaging>; gradle: the root has no build
+            # sources (no src/main). A root WITH its own sources or artifacts
+            # (commons-chain's 33 classes) never trips this and stays counted
+            # byte-identically. Single-module scans (no submodules) are exempt:
+            # the sole module is the project, not a shell.
+            if (
+                rel == "."
+                and len(module_dirs) > 1
+                and (class_count or 0) == 0
+                and (jar_count or 0) == 0
+                and self._is_aggregator_shell_root(module_dir, build_system)
+            ):
+                record["aggregator_shell"] = True
+
+            modules.append(record)
         return modules
 
-    def parse_module_test_reports(
-        self, module_dir: str, report_dirs: List[str]
-    ) -> Dict[str, any]:
+    def _is_aggregator_shell_root(self, root_dir: str, build_system: str) -> bool:
+        """Probe whether the root is a pure aggregator with no own sources.
+
+        Confirms the missing packaging semantics for a root that already has
+        zero compiled artifacts (the caller guards on that). Maven: the root
+        pom.xml declares ``<packaging>pom</packaging>``. Gradle: the root has no
+        ``src/main`` build sources. Either signal means the root builds nothing
+        of its own and must not count as an unbuilt module. Never raises: an
+        unreadable probe returns False, preserving today's counted behavior.
+        """
+        if build_system == "gradle":
+            # No root build sources -> the root aggregates subprojects only.
+            chk = self._execute_command_with_logging(
+                f"test -d {root_dir}/src/main && echo EXISTS",
+                "checking root gradle sources",
+            )
+            return "EXISTS" not in (chk.get("output") or "")
+
+        # Maven: read <packaging>pom</packaging> from the root pom. grep is
+        # whitespace-tolerant; the shell echo makes a match unambiguous.
+        chk = self._execute_command_with_logging(
+            f"grep -q '<packaging>[[:space:]]*pom[[:space:]]*</packaging>' "
+            f"{root_dir}/pom.xml && echo POM",
+            "reading root maven packaging",
+        )
+        return "POM" in (chk.get("output") or "")
+
+    def parse_module_test_reports(self, module_dir: str, report_dirs: List[str]) -> Dict[str, any]:
         """Parse one module's JUnit XML report dirs into counts + failing names.
 
         Returns {} when the module has no report dirs (test_source -> none).
@@ -3776,47 +3840,47 @@ class PhysicalValidator:
                 ordered_files.append(f)
 
         for xml_file in ordered_files:
-                cat = self._execute_command_with_logging(
-                    f"cat '{xml_file}'", f"reading {xml_file}"
-                )
-                content = cat.get("output") or ""
-                # Parse each <testsuite ...> open tag, reading attributes
-                # independently. Surefire and Gradle emit them in different orders
-                # (Gradle: name, tests, skipped, failures, errors), so a single
-                # positional regex would silently miss one writer's reports.
-                for open_tag in _re.finditer(r"<testsuite\b[^>]*>", content):
-                    tag = open_tag.group(0)
-                    for key, attr in (
-                        ("tests_total", "tests"),
-                        ("tests_failed", "failures"),
-                        ("tests_errors", "errors"),
-                        ("tests_skipped", "skipped"),
-                    ):
-                        m = _re.search(rf'\b{attr}="(\d+)"', tag)
-                        if m:
-                            totals[key] += int(m.group(1))
-                # Failing testcases: match a testcase WITH a body (self-closing
-                # passing cases are skipped), then read name/classname from the
-                # open tag INDEPENDENTLY. Surefire emits name-before-classname,
-                # Gradle classname-before-name -- a positional regex misses one
-                # writer (live commons-vfs: failures counted but no names).
-                # The `[^/]` before `>` excludes self-closing <testcase .../>
-                # (passing cases); otherwise a self-closing tag would be read as
-                # an open tag and swallow the next sibling's <failure> body.
-                for case in _re.finditer(
-                    r"<testcase\b([^>]*[^/])>(.*?)</testcase>", content, _re.DOTALL
+            cat = self._execute_command_with_logging(f"cat '{xml_file}'", f"reading {xml_file}")
+            content = cat.get("output") or ""
+            # Parse each <testsuite ...> open tag, reading attributes
+            # independently. Surefire and Gradle emit them in different orders
+            # (Gradle: name, tests, skipped, failures, errors), so a single
+            # positional regex would silently miss one writer's reports.
+            for open_tag in _re.finditer(r"<testsuite\b[^>]*>", content):
+                tag = open_tag.group(0)
+                for key, attr in (
+                    ("tests_total", "tests"),
+                    ("tests_failed", "failures"),
+                    ("tests_errors", "errors"),
+                    ("tests_skipped", "skipped"),
                 ):
-                    attrs, body = case.group(1), case.group(2)
-                    if "<failure" in body or "<error" in body:
-                        name_m = _re.search(r'\bname="([^"]*)"', attrs)
-                        cls_m = _re.search(r'\bclassname="([^"]*)"', attrs)
-                        nm = name_m.group(1) if name_m else "(unknown)"
-                        cls = cls_m.group(1) if cls_m else ""
-                        failing.append(f"{cls}.{nm}" if cls else nm)
+                    m = _re.search(rf'\b{attr}="(\d+)"', tag)
+                    if m:
+                        totals[key] += int(m.group(1))
+            # Failing testcases: match a testcase WITH a body (self-closing
+            # passing cases are skipped), then read name/classname from the
+            # open tag INDEPENDENTLY. Surefire emits name-before-classname,
+            # Gradle classname-before-name -- a positional regex misses one
+            # writer (live commons-vfs: failures counted but no names).
+            # The `[^/]` before `>` excludes self-closing <testcase .../>
+            # (passing cases); otherwise a self-closing tag would be read as
+            # an open tag and swallow the next sibling's <failure> body.
+            for case in _re.finditer(
+                r"<testcase\b([^>]*[^/])>(.*?)</testcase>", content, _re.DOTALL
+            ):
+                attrs, body = case.group(1), case.group(2)
+                if "<failure" in body or "<error" in body:
+                    name_m = _re.search(r'\bname="([^"]*)"', attrs)
+                    cls_m = _re.search(r'\bclassname="([^"]*)"', attrs)
+                    nm = name_m.group(1) if name_m else "(unknown)"
+                    cls = cls_m.group(1) if cls_m else ""
+                    failing.append(f"{cls}.{nm}" if cls else nm)
 
         passed = max(
-            totals["tests_total"] - totals["tests_failed"]
-            - totals["tests_errors"] - totals["tests_skipped"],
+            totals["tests_total"]
+            - totals["tests_failed"]
+            - totals["tests_errors"]
+            - totals["tests_skipped"],
             0,
         )
         # failing_count is authoritative (failures + errors from the testsuite
@@ -3930,9 +3994,7 @@ class PhysicalValidator:
             without_profiles = re.sub(
                 r"<profiles>.*?</profiles>", "", pom.get("output") or "", flags=re.DOTALL
             )
-            for block in re.findall(
-                r"<modules>(.*?)</modules>", without_profiles, re.DOTALL
-            ):
+            for block in re.findall(r"<modules>(.*?)</modules>", without_profiles, re.DOTALL):
                 for mod in re.findall(r"<module>([^<]+)</module>", block):
                     mod = mod.strip()
                     if mod:
@@ -4087,9 +4149,7 @@ class PhysicalValidator:
         # The user mandate is "all ACTIVE modules" — a module turned off in the
         # pom must not count against the build. (XML-commented modules are already
         # excluded since comments are not <module> elements.)
-        pom_without_profiles = re.sub(
-            r"<profiles>.*?</profiles>", "", pom_content, flags=re.DOTALL
-        )
+        pom_without_profiles = re.sub(r"<profiles>.*?</profiles>", "", pom_content, flags=re.DOTALL)
         modules = []
         for modules_block in re.findall(
             r"<modules>(.*?)</modules>", pom_without_profiles, re.DOTALL

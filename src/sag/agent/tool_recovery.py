@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Set
 from loguru import logger as default_logger
 
 from sag.agent.tool_orchestration import RecoveryDecision
-from sag.tools.base import BaseTool, ToolResult
+from sag.tools.base import ActualToolExecution, BaseTool, OutputPersistenceError, ToolResult
 from sag.tools.build.backends import GradleBackend, MavenBackend
 
 
@@ -44,31 +44,39 @@ class ToolRecoveryHandler:
             self.logger.info(f"Attempting tool recovery for {tool_name}: {error_msg[:100]}")
 
             if tool_name == "manage_context":
-                return self._recover_context_management_error(params, failed_result)
-            if tool_name == "project_setup":
-                return self._recover_project_setup_error(params, failed_result)
-            if tool_name == "project":
+                decision = self._recover_context_management_error(params, failed_result)
+            elif tool_name == "project_setup":
+                decision = self._recover_project_setup_error(params, failed_result)
+            elif tool_name == "project":
                 # Stage-1 surface: only the clone verb has a recovery strategy.
                 if str(params.get("action", "")).lower() == "clone":
-                    return self._recover_project_setup_error(
+                    decision = self._recover_project_setup_error(
                         self._project_clone_params(params), failed_result
                     )
-                return self._recover_generic_error(tool_name, params, failed_result)
-            if tool_name == "maven":
-                return self._recover_maven_error(params, failed_result)
-            if tool_name == "gradle":
-                return self._recover_gradle_error(params, failed_result)
-            if tool_name == "build":
-                return self._recover_build_error(params, failed_result)
-            if tool_name == "bash":
-                return self._recover_bash_error(params, failed_result)
-            if tool_name == "file_io":
-                return self._recover_file_io_error(params, failed_result)
-            return self._recover_generic_error(tool_name, params, failed_result)
+                else:
+                    decision = self._recover_generic_error(tool_name, params, failed_result)
+            elif tool_name == "maven":
+                decision = self._recover_maven_error(params, failed_result)
+            elif tool_name == "gradle":
+                decision = self._recover_gradle_error(params, failed_result)
+            elif tool_name == "build":
+                decision = self._recover_build_error(params, failed_result)
+            elif tool_name == "bash":
+                decision = self._recover_bash_error(params, failed_result)
+            elif tool_name == "file_io":
+                decision = self._recover_file_io_error(params, failed_result)
+            else:
+                decision = self._recover_generic_error(tool_name, params, failed_result)
+        except OutputPersistenceError:
+            raise
         except Exception as exc:
             message = f"Recovery mechanism failed: {exc}"
             self.logger.error(f"Tool recovery itself failed for {tool_name}: {exc}")
             return self._no_strategy("generic_no_strategy", message)
+
+        if decision.replacement_result is not None and decision.replacement_tool_name is None:
+            decision.replacement_tool_name = tool_name
+        return decision
 
     def _delegate_tool(self, name: str) -> Optional[BaseTool]:
         """Resolve a backend/delegate tool by its legacy name.
@@ -110,13 +118,17 @@ class ToolRecoveryHandler:
         """Route consolidated build failures to the backend-specific strategies."""
         system = (getattr(failed_result, "facts", None) or {}).get("system")
         if system == "maven":
-            return self._recover_maven_error(
+            decision = self._recover_maven_error(
                 self._maven_params_from_build(params), failed_result
             )
+            decision.replacement_tool_name = "maven"
+            return decision
         if system == "gradle":
-            return self._recover_gradle_error(
+            decision = self._recover_gradle_error(
                 self._gradle_params_from_build(params), failed_result
             )
+            decision.replacement_tool_name = "gradle"
+            return decision
         return self._no_strategy("build_no_strategy", "No build recovery strategy applicable")
 
     def _maven_params_from_build(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -199,6 +211,8 @@ class ToolRecoveryHandler:
                             result=result,
                             recovery_params=params,
                         )
+            except OutputPersistenceError:
+                raise
             except Exception as exc:
                 self.logger.warning(f"Context recovery failed: {exc}")
 
@@ -217,6 +231,8 @@ class ToolRecoveryHandler:
                             result=result,
                             recovery_params=recovery_params,
                         )
+            except OutputPersistenceError:
+                raise
             except Exception as exc:
                 self.logger.warning(f"Task ID recovery failed: {exc}")
 
@@ -373,17 +389,18 @@ class ToolRecoveryHandler:
             self.logger.warning("System tool not available for Java installation")
             return self._no_strategy("maven_no_strategy", "No Maven recovery strategy applicable")
 
-        verify_result = system_tool.safe_execute(
-            action="verify_java", java_version=required_version
-        )
-        if verify_result.success:
+        verify_params = {"action": "verify_java", "java_version": required_version}
+        verify_result = system_tool.safe_execute(**verify_params)
+        actual_executions = [ActualToolExecution("system", verify_params, verify_result)]
+        if verify_result.succeeded:
             result = maven_tool.safe_execute(**params)
+            actual_executions.append(ActualToolExecution("maven", dict(params), result))
             return self._attempted(
                 strategy="maven_java_version",
                 message=(
                     f"Java {required_version} was already installed, " "retried Maven command"
                 ),
-                result=result,
+                result=result.with_execution_trace(actual_executions),
                 recovery_params=params,
             )
 
@@ -392,20 +409,22 @@ class ToolRecoveryHandler:
             "java_version": required_version,
         }
         install_result = system_tool.safe_execute(**install_params)
+        actual_executions.append(ActualToolExecution("system", install_params, install_result))
 
-        if install_result.success:
+        if install_result.succeeded:
             result = maven_tool.safe_execute(**params)
+            actual_executions.append(ActualToolExecution("maven", dict(params), result))
             return self._attempted(
                 strategy="maven_java_version",
                 message=(f"Recovered by installing Java {required_version} and retrying"),
-                result=result,
+                result=result.with_execution_trace(actual_executions),
                 recovery_params=params,
             )
 
         return self._attempted(
             strategy="maven_java_version",
             message=f"Attempted to install Java {required_version} but failed",
-            result=install_result,
+            result=install_result.with_execution_trace(actual_executions),
             recovery_params=params,
             metadata={"repair_params": install_params},
         )
@@ -452,6 +471,8 @@ class ToolRecoveryHandler:
                     result=result,
                     recovery_params=recovery_params,
                 )
+        except OutputPersistenceError:
+            raise
         except Exception as exc:
             self.logger.warning(f"Automatic pom.xml discovery failed during Maven recovery: {exc}")
 
@@ -543,8 +564,7 @@ class ToolRecoveryHandler:
             priority="high",
         )
 
-        result = ToolResult(
-            success=False,
+        result = ToolResult.completed_failure(
             output=(
                 f"Maven command timed out after {execution_time:.1f}s due to "
                 f"{termination_reason}.\n\nSuggestions:\n"
@@ -689,8 +709,7 @@ class ToolRecoveryHandler:
             priority="high",
         )
 
-        result = ToolResult(
-            success=False,
+        result = ToolResult.completed_failure(
             output=(
                 f"Command timed out after {execution_time:.1f}s due to "
                 f"{termination_reason}.\n\nSuggestions:\n"
@@ -757,7 +776,7 @@ class ToolRecoveryHandler:
         result = self.tools["bash"].safe_execute(**recovery_params)
         message = (
             "Recovered by recreating workspace directory and retrying command"
-            if result.success
+            if result.succeeded
             else "Workspace recreated but command still failed - may be a different issue"
         )
         return self._attempted(
@@ -780,7 +799,7 @@ class ToolRecoveryHandler:
         if bash_tool:
             bash_result = bash_tool.safe_execute(command=command, working_directory="/")
             return {
-                "success": bash_result.success,
+                "success": bash_result.succeeded,
                 "output": bash_result.output,
             }
 
@@ -834,8 +853,7 @@ class ToolRecoveryHandler:
             priority="high",
         )
 
-        result = ToolResult(
-            success=False,
+        result = ToolResult.completed_failure(
             output=(
                 f"Gradle task timed out after {execution_time:.1f}s due to "
                 f"{termination_reason}.\n\nSuggestions:\n"
@@ -912,10 +930,10 @@ class ToolRecoveryHandler:
     ) -> RecoveryDecision:
         recovery_metadata = {
             "attempted": True,
-            "success": result.success,
+            "success": result.succeeded,
             "message": message,
             "strategy": strategy,
-            "replacement_result_success": result.success,
+            "replacement_result_succeeded": result.succeeded,
             "recovery_params": recovery_params,
         }
         if metadata:
@@ -956,7 +974,7 @@ class ToolRecoveryHandler:
             "success": False,
             "message": message,
             "strategy": strategy,
-            "replacement_result_success": result.success,
+            "replacement_result_succeeded": result.succeeded,
             "recovery_params": params,
             "guidance_only": True,
         }

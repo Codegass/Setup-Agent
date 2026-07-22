@@ -6,8 +6,8 @@ import json
 import os
 import re
 import shlex
-import time
 import tempfile
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +16,7 @@ from typing import Any
 from loguru import logger
 
 from sag.ui.state import UIEvidenceRecord
+from sag.agent.verdict_finalizer import VERDICT_SNAPSHOT_PATH, RunVerdictSnapshot
 from sag.web.context_trace import ContextTraceBuilder
 from sag.web.evidence import EvidenceIndex
 from sag.web.file_tracker import FileChangeTracker, FileSnapshot
@@ -37,8 +38,15 @@ from sag.web.models import (
 from sag.web.verdict import compose_verdict
 
 SESSION_INDEX_PATH = "/workspace/.setup_agent/sessions/index.json"
-_EVIDENCE_STATUS_VALUES = {"success", "partial", "blocked", "conflict", "unknown"}
-_EVIDENCE_STATUS_PRECEDENCE = ("blocked", "conflict", "partial", "unknown", "success")
+_EVIDENCE_STATUS_VALUES = {"success", "partial", "failed", "blocked", "conflict", "unknown"}
+_EVIDENCE_STATUS_PRECEDENCE = (
+    "failed",
+    "blocked",
+    "conflict",
+    "partial",
+    "unknown",
+    "success",
+)
 _CONTEXTS_DIR = "/workspace/.setup_agent/contexts"
 # Cap the context trace payload: a huge full_outputs.jsonl (big runs like camel)
 # shipped raw to the browser and rendered can crash the renderer. Skip files over
@@ -379,7 +387,7 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
                 _value_for_keys(test, "execution_rate", "executionRate")
             ),
             errors=_to_int(test.get("errors")),
-            flaky_count=_optional_int(_value_for_keys(test, "flaky_count", "flakyCount")),
+            flaky_count=_to_int(_value_for_keys(test, "flaky_count", "flakyCount")),
             report_file_count=_optional_int(
                 _value_for_keys(test, "report_file_count", "reportFileCount")
             ),
@@ -393,12 +401,17 @@ def _session_summary(item: dict[str, Any], workspace_id: str) -> ExecutionSessio
                 _value_for_keys(test, "method_execution_rate", "methodExecutionRate")
             ),
             failing_names=_value_for_keys(test, "failing_names", "failingNames") or [],
+            raw_executions=_optional_int(_value_for_keys(test, "raw_executions", "rawExecutions")),
             conflicts=test.get("conflicts") or [],
             evidence_refs=test.get("evidence_refs") or [],
         ),
         report=_text(item.get("report"), default="none"),
         files=_to_int(item.get("files")),
         evidence=_to_int(item.get("evidence")),
+        canonical_verdict=_text(item.get("canonical_verdict"), default="unknown"),
+        snapshot_status=_text(item.get("snapshot_status"), default="unavailable"),
+        legacy=item.get("legacy") is True,
+        report_delivery_status=_optional_text(item.get("report_delivery_status")),
     )
 
 
@@ -448,6 +461,8 @@ def _session_detail(
         ),
         outcome=outcome,
         blocker=item.get("blocker"),
+        canonical_verdict=(summary.canonical_verdict if "canonical_verdict" in item else None),
+        verdict_source=_text(item.get("verdict_source"), default="derived"),
     )
 
     return ExecutionSessionDetail(
@@ -476,6 +491,10 @@ def _session_detail(
         model=_optional_text(item.get("model")),
         steps=_optional_int(item.get("steps")),
         step_budget=_optional_int(item.get("step_budget")),
+        canonical_verdict=summary.canonical_verdict,
+        snapshot_status=summary.snapshot_status,
+        legacy=summary.legacy,
+        report_delivery_status=summary.report_delivery_status,
     )
 
 
@@ -581,6 +600,81 @@ def _session_sort_key(row: ExecutionSessionSummary) -> tuple[str, str]:
     return (timestamp or row.finish or row.start or "", row.id)
 
 
+def _read_setup_verdict_snapshot(
+    orchestrator: Any,
+) -> tuple[RunVerdictSnapshot | None, str]:
+    raw = _read_container_file(orchestrator, VERDICT_SNAPSHOT_PATH)
+    if raw is None:
+        return None, "missing"
+    try:
+        return RunVerdictSnapshot.model_validate_json(raw), "valid"
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "corrupt"
+
+
+def _snapshot_test_payload(snapshot: RunVerdictSnapshot) -> dict[str, Any]:
+    tests = snapshot.test_stats
+    return {
+        "state": snapshot.verdict,
+        "pass": tests.passed,
+        "fail": tests.failed,
+        "skip": tests.skipped,
+        "errors": tests.errors,
+        "total": tests.executed,
+        "pass_rate": tests.pass_rate if tests.executed > 0 else None,
+        "execution_rate": tests.execution_rate,
+        "unique_total": tests.executed,
+        "unique_passed": tests.passed,
+        "unique_failed": tests.failed,
+        "unique_errors": tests.errors,
+        "unique_skipped": tests.skipped,
+        "flaky_count": tests.flaky_count,
+        "raw_executions": tests.raw.executed,
+        "declared_total": tests.discovered,
+        "conflicts": list(snapshot.conflicts),
+        "evidence_refs": list(snapshot.input_refs),
+    }
+
+
+def _snapshot_build_payload(
+    snapshot: RunVerdictSnapshot,
+    metrics: dict[str, Any] | None,
+    module_metrics: dict[str, Any] | None,
+    report_raw: str | None,
+) -> dict[str, Any]:
+    build = snapshot.build_evidence
+    details = _merge_build_payloads(
+        _build_payload_from_metrics(metrics), _build_payload_from_report(report_raw)
+    )
+    class_count = build.compiled_classes
+    if class_count is None:
+        class_count = details.get("class_count")
+    jar_count = details.get("jar_count")
+    if jar_count is None:
+        jar_count = _module_artifact_count(module_metrics, "jar_count")
+    return {
+        "state": build.outcome.value,
+        "tool": "sealed snapshot",
+        "time": details.get("time", "—"),
+        "note": details.get("note") or "Canonical build evidence from verdict.json",
+        "artifact": details.get("artifact"),
+        "class_count": class_count,
+        "jar_count": jar_count,
+        "module_output_count": details.get("module_output_count"),
+        "artifact_samples": details.get("artifact_samples") or [],
+        "warnings": details.get("warnings") or [],
+        "evidence_refs": list(build.refs),
+    }
+
+
+def _durable_report_delivery_status(trunk_data: dict[str, Any]) -> str | None:
+    termination = trunk_data.get("run_termination")
+    if not isinstance(termination, dict):
+        return None
+    value = _text(termination.get("report_delivery_status"), default="").lower()
+    return value if value in {"delivered", "failed", "skipped"} else None
+
+
 def _setup_artifact_item(
     orchestrator: Any,
     workspace_id: str,
@@ -591,21 +685,52 @@ def _setup_artifact_item(
         return None
 
     trunk_path, trunk_data = trunk
+    snapshot, snapshot_status = _read_setup_verdict_snapshot(orchestrator)
+    tasks = _raw_task_dicts(trunk_data)
+    legacy = snapshot_status == "missing" and trunk_data.get("legacy") is True
+
     report_path = _latest_setup_report_path(orchestrator)
     report_raw = _read_container_file(orchestrator, report_path) if report_path else None
     created = _text(trunk_data.get("created_at"), default="")
     updated = _text(trunk_data.get("last_updated"), default=created)
-    finish = _report_generated_at(report_raw) or updated
-    tasks = _raw_task_dicts(trunk_data)
+    if snapshot is not None:
+        finish = snapshot.finalized_at
+    else:
+        finish = _report_generated_at(report_raw) or updated
     status = _setup_status(tasks, report_path)
     metrics = _read_report_metrics(orchestrator)
     module_metrics = _read_module_metrics(orchestrator)
-    test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
-    build_payload = _merge_build_payloads(
-        _build_payload_from_metrics(metrics),
-        _build_payload_from_report(report_raw),
-    )
-    evidence_status = _setup_evidence_status(trunk_data, tasks, report_raw)
+    if snapshot is not None:
+        test = _snapshot_test_payload(snapshot)
+        build_payload = _snapshot_build_payload(snapshot, metrics, module_metrics, report_raw)
+        canonical_verdict = snapshot.verdict
+        evidence_status = snapshot.verdict
+        outcome = snapshot.verdict.upper()
+        verdict_source = "snapshot"
+    elif legacy:
+        test = _test_payload_from_metrics(metrics) or _test_payload_from_report(report_raw)
+        build_payload = _merge_build_payloads(
+            _build_payload_from_metrics(metrics), _build_payload_from_report(report_raw)
+        )
+        canonical_verdict = "unknown"
+        evidence_status = "unknown"
+        outcome = _setup_outcome(trunk_data, report_raw, status)
+        verdict_source = "legacy"
+        snapshot_status = "legacy"
+    else:
+        test = {
+            "state": "unknown",
+            "pass": 0,
+            "fail": 0,
+            "skip": 0,
+            "errors": 0,
+            "total": 0,
+        }
+        build_payload = {"state": "unknown", "tool": "—", "note": ""}
+        canonical_verdict = "unknown"
+        evidence_status = "unknown"
+        outcome = "UNKNOWN"
+        verdict_source = "snapshot"
     context_id = _text(trunk_data.get("context_id"), default=Path(trunk_path).stem)
     project_name = _text(
         trunk_data.get("project_name"),
@@ -618,6 +743,11 @@ def _setup_artifact_item(
         "title": _text(trunk_data.get("goal"), default="Project setup"),
         "status": status,
         "evidence_status": evidence_status,
+        "canonical_verdict": canonical_verdict,
+        "snapshot_status": snapshot_status,
+        "legacy": legacy,
+        "verdict_source": verdict_source,
+        "report_delivery_status": _durable_report_delivery_status(trunk_data),
         "entry": "CLI",
         "start": _normalize_timestamp(created) or created or "—",
         "finish": _normalize_timestamp(finish) if status == "completed" else None,
@@ -632,7 +762,7 @@ def _setup_artifact_item(
         "report": "ready" if report_path else "none",
         "files": len(tasks),
         "evidence": len(tasks) + (1 if report_path else 0),
-        "outcome": _setup_outcome(trunk_data, report_raw, status),
+        "outcome": outcome,
         "updated": _normalize_timestamp(finish) or finish or "unknown",
         "report_path": report_path,
         "report_raw": report_raw,
@@ -829,7 +959,7 @@ def _clean_status_label(value: str) -> str:
 
 def _extract_evidence_status(value: Any) -> str | None:
     text = _text(value, default="").lower()
-    match = re.search(r"\b(success|partial|blocked|conflict|unknown)\b", text)
+    match = re.search(r"\b(success|partial|failed|blocked|conflict|unknown)\b", text)
     if match:
         return match.group(1)
     return None
@@ -972,6 +1102,8 @@ def _test_payload_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]
         "unique_failed": test.get("unique_failed"),
         "unique_errors": test.get("unique_errors"),
         "unique_skipped": test.get("unique_skipped"),
+        "flaky_count": _to_int(test.get("flaky_count")),
+        "raw_executions": _to_int(test.get("raw_executions")),
         "declared_total": test.get("declared_total"),
         "method_execution_rate": _to_float_or_none(test.get("method_execution_rate")),
         "failing_names": test.get("failing_names") or [],
@@ -1165,6 +1297,18 @@ def _merge_build_payloads(metrics: dict[str, Any] | None, report: dict[str, Any]
     if merged.get("state") in {None, "", "none", "unknown"}:
         merged["state"] = report.get("state", "none")
     return merged
+
+
+def _module_artifact_count(metrics: dict[str, Any] | None, key: str) -> int | None:
+    if not isinstance(metrics, dict):
+        return None
+    counts = [
+        _optional_int(module.get(key))
+        for module in metrics.get("modules", [])
+        if isinstance(module, dict)
+    ]
+    known = [count for count in counts if count is not None]
+    return sum(known) if known else None
 
 
 def _build_time_from_report(report_raw: str) -> str:
@@ -1502,6 +1646,11 @@ def _duration(start: str, finish: str) -> str:
         finish_time = datetime.fromisoformat(finish)
     except ValueError:
         return "—"
+
+    if start_time.tzinfo is None and finish_time.tzinfo is not None:
+        start_time = start_time.replace(tzinfo=finish_time.tzinfo)
+    elif start_time.tzinfo is not None and finish_time.tzinfo is None:
+        finish_time = finish_time.replace(tzinfo=start_time.tzinfo)
 
     seconds = max(int((finish_time - start_time).total_seconds()), 0)
     if seconds < 60:

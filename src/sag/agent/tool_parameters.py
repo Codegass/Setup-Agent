@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from typing import Any, Dict, Optional
@@ -65,15 +66,29 @@ class ToolParameterNormalizer:
     # when the legacy name is NOT registered, so direct registrations win.
     LEGACY_TOOL_ALIASES = {
         "maven": ("build", _map_legacy_maven_params),
-        "gradle": ("build", lambda p: (
-            {"action": p["tasks"], "working_directory": p.get("working_directory", "/workspace")}
-            if p.get("tasks") in ("deps", "compile", "test", "package")
-            else {"action": "compile", "args": p.get("tasks"),
-                  "working_directory": p.get("working_directory", "/workspace")}
-        )),
+        "gradle": (
+            "build",
+            lambda p: (
+                {
+                    "action": p["tasks"],
+                    "working_directory": p.get("working_directory", "/workspace"),
+                }
+                if p.get("tasks") in ("deps", "compile", "test", "package")
+                else {
+                    "action": "compile",
+                    "args": p.get("tasks"),
+                    "working_directory": p.get("working_directory", "/workspace"),
+                }
+            ),
+        ),
         "web_search": ("search", lambda p: {"target": f"web:{p.get('query', '')}"}),
-        "output_search": ("search", lambda p: {"target": p.get("ref_id", ""),
-                                               "pattern": p.get("grep_pattern", p.get("pattern", "."))}),
+        "output_search": (
+            "search",
+            lambda p: {
+                "target": p.get("ref_id", ""),
+                "pattern": p.get("grep_pattern", p.get("pattern", ".")),
+            },
+        ),
         # Facade verb must win over any legacy sub-action key: ProjectTool routes
         # on `action` and re-derives the delegate's sub-action itself.
         "project_setup": ("project", lambda p: {**p, "action": "clone"}),
@@ -372,6 +387,28 @@ class ToolParameterNormalizer:
         # Handle common parameter naming issues
         fixed_params = self._fix_parameter_names(fixed_params, properties, tool_name, fixes)
 
+        # Aliases are intentionally mapped after the first schema pass. Run a
+        # second type pass so newly canonical fields (for example report
+        # evidence -> evidence_refs and key_results -> details) satisfy the
+        # destination schema before the normalized action envelope is emitted.
+        for param_name, param_value in fixed_params.items():
+            if param_name not in properties or param_value is None:
+                continue
+            expected_type = properties[param_name].get("type")
+            if not expected_type:
+                continue
+            converted_value = self._convert_parameter_type(param_value, expected_type, param_name)
+            if converted_value != param_value:
+                fixed_params[param_name] = converted_value
+                self._add_parameter_fix(
+                    fixes,
+                    field=param_name,
+                    before=param_value,
+                    after=converted_value,
+                    reason=f"Converted aliased parameter '{param_name}' to {expected_type}",
+                    source="safety_fix",
+                )
+
         return fixed_params
 
     def _get_smart_default(
@@ -448,15 +485,34 @@ class ToolParameterNormalizer:
         """Convert parameter to expected type."""
         try:
             if expected_type == "string":
+                # Structured planner values must have one stable string form.
+                # ``str(dict)`` depends on insertion order and uses Python
+                # quoting, which made an actor's semantically identical JSON
+                # string fail the scheduler's exact comparison.
+                if isinstance(value, dict):
+                    converted = json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
                 # Handle list to string conversion properly
-                if isinstance(value, list):
+                elif isinstance(value, list):
                     # If list has one element, return just that element
                     if len(value) == 1:
-                        return str(value[0])
+                        converted = str(value[0])
                     # If multiple elements, join with spaces (common for command-line args)
                     else:
-                        return " ".join(str(v) for v in value)
-                return str(value)
+                        converted = " ".join(str(v) for v in value)
+                else:
+                    converted = str(value)
+                if param_name == "key_results":
+                    # Function-calling actors sometimes render an equivalent
+                    # list as newline-separated text.  The phase contract is a
+                    # narrative scalar, so canonicalize insignificant spacing
+                    # before the scheduler's strict equality check.
+                    return " ".join(converted.split())
+                return converted
             elif expected_type == "integer":
                 if isinstance(value, str):
                     # Try to extract number from string
@@ -486,8 +542,6 @@ class ToolParameterNormalizer:
                 if isinstance(value, str):
                     # Try to parse as JSON array or split by common delimiters
                     try:
-                        import json
-
                         return json.loads(value)
                     except:
                         # Split by common delimiters
@@ -498,8 +552,6 @@ class ToolParameterNormalizer:
             elif expected_type == "object":
                 if isinstance(value, str):
                     try:
-                        import json
-
                         return json.loads(value)
                     except:
                         # CRITICAL FIX: Don't lose the original string value!
@@ -620,6 +672,13 @@ class ToolParameterNormalizer:
                 "commit_hash": "ref",
                 "version_ref": "ref",
             },
+            "project": {
+                "path": "project_path",
+            },
+            "report": {
+                "evidence": "evidence_refs",
+                "key_results": "details",
+            },
             "maven": {
                 # Don't map 'goals' - it's a separate parameter from 'command'
                 "options": "properties",
@@ -658,6 +717,12 @@ class ToolParameterNormalizer:
         if tool_name in tool_specific_mappings:
             tool_mappings = tool_specific_mappings[tool_name]
             for old_name, new_name in tool_mappings.items():
+                if (
+                    tool_name == "project"
+                    and old_name == "path"
+                    and fixed_params.get("action") != "analyze"
+                ):
+                    continue
                 if old_name in fixed_params and new_name in properties:
                     old_value = fixed_params[old_name]
                     # If target parameter exists but old parameter has a non-default value, use the old value
@@ -880,10 +945,24 @@ class ToolParameterNormalizer:
         fixes = parameter_fixes if parameter_fixes is not None else []
         fixed_params = params.copy()
 
+        # The report tool has one verb. Models commonly echo the tool name as
+        # the action; canonicalize that harmless value before execution.
+        if tool_name == "report" and fixed_params.get("action") == "report":
+            fixed_params["action"] = "generate"
+            self._add_parameter_fix(
+                fixes,
+                field="action",
+                before="report",
+                after="generate",
+                reason="Mapped report action to the report tool's generate verb",
+                source="safety_fix",
+            )
+
         # The clone fixes apply to the stage-1 'project' facade (whose clone
         # verb passes parameters through to ProjectSetupTool) and to a directly
         # registered legacy 'project_setup' tool alike.
         if tool_name in ("project_setup", "project"):
+
             def _clone_url(params_dict: Dict[str, Any]) -> Optional[str]:
                 return params_dict.get("repository_url") or params_dict.get("repo_url")
 
@@ -933,9 +1012,7 @@ class ToolParameterNormalizer:
                     if not fixed_params.get("target_directory"):
                         # Extract project name from URL
                         repo_name = (
-                            (_clone_url(fixed_params) or "")
-                            .split("/")[-1]
-                            .replace(".git", "")
+                            (_clone_url(fixed_params) or "").split("/")[-1].replace(".git", "")
                         )
                         before = fixed_params.get("target_directory")
                         if repo_name:
@@ -1004,10 +1081,7 @@ class ToolParameterNormalizer:
             # Prevent duplicate cloning. The facade has no detect_project_type
             # verb — its closest equivalent is analyze.
             cloned_repos = self.successful_states.get("cloned_repos", set())
-            if (
-                fixed_params.get("action") == "clone"
-                and _clone_url(fixed_params) in cloned_repos
-            ):
+            if fixed_params.get("action") == "clone" and _clone_url(fixed_params) in cloned_repos:
                 before = fixed_params.get("action")
                 fallback_action = "analyze" if tool_name == "project" else "detect_project_type"
                 self.logger.warning(
@@ -1125,9 +1199,7 @@ class ToolParameterNormalizer:
                         reason="Inferred working directory from repository URL",
                         source="state_injection",
                     )
-                    self.logger.info(
-                        f"🔧 Inferred working directory from repo: {inferred_workdir}"
-                    )
+                    self.logger.info(f"🔧 Inferred working directory from repo: {inferred_workdir}")
 
         elif tool_name == "bash":
             # Ensure bash has a command

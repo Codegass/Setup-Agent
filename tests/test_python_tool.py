@@ -17,10 +17,14 @@ command recorded. Contract under test:
 """
 
 import json
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
 
 import sag.tools.internal.build_preflight as bp
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.python_tool import (
+    _PYTEST_ATTEMPT_TAG_SCRIPT,
     COLLECTED_JSON,
     PYTEST_REPORT_DIR,
     PythonTool,
@@ -86,6 +90,36 @@ MANIFEST = {
 }
 
 
+def compile_metrics(
+    source_count,
+    compiled_source_count,
+    *,
+    status="valid",
+    foreign_pyc_count=0,
+):
+    coverage = compiled_source_count / source_count if status == "valid" and source_count else None
+    return ok(
+        json.dumps(
+            {
+                "status": status,
+                "source_count": source_count,
+                "compiled_source_count": compiled_source_count,
+                "missing_source_count": max(source_count - compiled_source_count, 0),
+                "foreign_pyc_count": foreign_pyc_count,
+                "coverage": coverage,
+                "cache_tag": "cpython-312",
+                "conflicts": ["metrics_conflict"] if status == "invalid" else [],
+                "missing_sources": [],
+                "foreign_pycs": (
+                    ["/workspace/proj/src/proj/__pycache__/old.cpython-311.pyc"]
+                    if foreign_pyc_count
+                    else []
+                ),
+            }
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # setup_env
 # ---------------------------------------------------------------------------
@@ -94,14 +128,16 @@ MANIFEST = {
 def test_setup_env_runs_preflight_then_install_commands_in_ladder_order():
     orch = Orch(manifest=dict(MANIFEST))
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
-    assert result.success is True
+    assert result.succeeded is True
     preflight = next(i for i, c in enumerate(orch.commands) if "python3 --version" in c)
     first = next(
-        i for i, c in enumerate(orch.commands)
+        i
+        for i, c in enumerate(orch.commands)
         if "/workspace/proj/.venv/bin/python -m pip install -r requirements.txt" in c
     )
     second = next(
-        i for i, c in enumerate(orch.commands)
+        i
+        for i, c in enumerate(orch.commands)
         if "/workspace/proj/.venv/bin/python -m pip install -r requirements-dev.txt" in c
     )
     # Pre-flight first, then the manifest commands in ladder order, with the
@@ -113,8 +149,7 @@ def test_setup_env_creates_missing_venv_before_installing():
     orch = Orch(manifest=dict(MANIFEST))  # no EXISTS rule -> venv missing
     PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     venv_create = next(
-        i for i, c in enumerate(orch.commands)
-        if "-m venv /workspace/proj/.venv" in c
+        i for i, c in enumerate(orch.commands) if "-m venv /workspace/proj/.venv" in c
     )
     first_install = next(
         i for i, c in enumerate(orch.commands) if "pip install -r requirements.txt" in c
@@ -141,7 +176,8 @@ def test_setup_env_poetry_failure_falls_back_to_pip_narrated_as_deviation():
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     attempted = next(i for i, c in enumerate(orch.commands) if "poetry install" in c)
     fallback = next(
-        i for i, c in enumerate(orch.commands)
+        i
+        for i, c in enumerate(orch.commands)
         if "/workspace/proj/.venv/bin/python -m pip install -e ." in c
     )
     assert attempted < fallback  # the project's own tool was tried FIRST
@@ -151,7 +187,7 @@ def test_setup_env_poetry_failure_falls_back_to_pip_narrated_as_deviation():
         "[deviation] poetry install failed; fell back to pip install -e . "
         "— setup docs must list the fallback"
     ) in result.output
-    assert result.success is True
+    assert result.succeeded is True
 
 
 def test_setup_env_mismatch_preflight_narration_is_prepended(monkeypatch):
@@ -175,18 +211,22 @@ def test_version_shaped_install_failure_reprovisions_and_reruns_once(monkeypatch
     }
     orch = Orch(
         manifest=manifest,
-        rules=[(
-            "pip install -e .",
-            FailThenOk("ERROR: Package 'proj' requires a different Python: "
-                       "3.12.4 not in '>=3.13'", times=1),
-        )],
+        rules=[
+            (
+                "pip install -e .",
+                FailThenOk(
+                    "ERROR: Package 'proj' requires a different Python: " "3.12.4 not in '>=3.13'",
+                    times=1,
+                ),
+            )
+        ],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     attempts = [c for c in orch.commands if "pip install -e ." in c]
     assert len(attempts) == 2  # initial + exactly one retry
     assert any("uv python install 3.13" in c for c in orch.commands)  # re-provisioned
     assert "retry 1/1" in result.output
-    assert result.success is True
+    assert result.succeeded is True
 
 
 def test_version_retry_is_bounded_to_exactly_once(monkeypatch):
@@ -199,16 +239,20 @@ def test_version_retry_is_bounded_to_exactly_once(monkeypatch):
     }
     orch = Orch(
         manifest=manifest,
-        rules=[(
-            "pip install -e .",
-            FailThenOk("ERROR: Package 'proj' requires a different Python: "
-                       "3.12.4 not in '>=3.13'", times=99),
-        )],
+        rules=[
+            (
+                "pip install -e .",
+                FailThenOk(
+                    "ERROR: Package 'proj' requires a different Python: " "3.12.4 not in '>=3.13'",
+                    times=99,
+                ),
+            )
+        ],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     attempts = [c for c in orch.commands if "pip install -e ." in c]
     assert len(attempts) == 2  # never more than one retry, even on repeat failure
-    assert result.success is False
+    assert result.succeeded is False
 
 
 # ---------------------------------------------------------------------------
@@ -222,11 +266,12 @@ def test_test_writes_collected_denominator_and_junitxml_report():
         rules=[("--collect-only", ok("tests/test_a.py::test_x\n42 tests collected in 0.12s"))],
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
-    assert result.success is True
+    assert result.succeeded is True
     writes = [c for c in orch.commands if COLLECTED_JSON in c and "<<" in c]
     assert writes and '"collected": 42' in writes[0]
     runs = [
-        c for c in orch.commands
+        c
+        for c in orch.commands
         if "-m pytest" in c and "--collect-only" not in c and "--version" not in c
     ]
     assert len(runs) == 1
@@ -236,6 +281,47 @@ def test_test_writes_collected_denominator_and_junitxml_report():
     collect = next(i for i, c in enumerate(orch.commands) if "--collect-only" in c)
     run = next(i for i, c in enumerate(orch.commands) if "--junitxml" in c)
     assert collect < run
+
+
+def test_test_assigns_monotonic_attempt_ids_and_persists_them_in_junit():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("--collect-only", ok("1 test collected in 0.01s"))],
+    )
+    tool = PythonTool(orch)
+
+    first = tool.execute("test", working_directory="/workspace/proj")
+    second = tool.execute("test", working_directory="/workspace/proj")
+
+    assert first.metadata["attempt_id"] == 1
+    assert second.metadata["attempt_id"] == 2
+    assert first.metadata["report"].endswith("pytest-attempt-000001.xml")
+    assert second.metadata["report"].endswith("pytest-attempt-000002.xml")
+    tag_commands = [command for command in orch.commands if "SAG_ATTEMPT_TAGGED" in command]
+    assert len(tag_commands) == 2
+    assert " 1" in tag_commands[0]
+    assert " 2" in tag_commands[1]
+
+
+def test_attempt_tag_script_writes_suite_property_atomically(tmp_path):
+    report = tmp_path / "report.xml"
+    report.write_text(
+        '<testsuites><testsuite tests="1"><testcase '
+        'classname="tests.test_api" name="test_ok"/></testsuite></testsuites>'
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", _PYTEST_ATTEMPT_TAG_SCRIPT, str(report), "7"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    root = ET.parse(report).getroot()
+    properties = {element.get("name"): element.get("value") for element in root.iter("property")}
+    assert completed.stdout.strip() == "SAG_ATTEMPT_TAGGED"
+    assert properties["sag.attempt_id"] == "7"
+    assert not (tmp_path / "report.xml.attempt.tmp").exists()
 
 
 def test_pytest_failures_are_honest_and_never_rerun():
@@ -248,13 +334,14 @@ def test_pytest_failures_are_honest_and_never_rerun():
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
     runs = [
-        c for c in orch.commands
+        c
+        for c in orch.commands
         if "-m pytest" in c and "--collect-only" not in c and "--version" not in c
     ]
     assert len(runs) == 1  # exit 1 with failures is an HONEST result, not an error to retry
     # Bug #13 defect 6: tests that RAN with failures are an honest green —
     # the result (stats in output) is the deliverable, not an error state.
-    assert result.success is True
+    assert result.succeeded is True
     assert "2 failed, 3 passed" in result.output
     assert result.metadata.get("exit_code") == 1
 
@@ -283,7 +370,7 @@ def test_build_failure_carries_evidence_only_metadata():
         rules=[("-m build --wheel", fail("ERROR Backend subprocess exited"))],
     )
     result = PythonTool(orch).execute("build", working_directory="/workspace/proj")
-    assert result.success is False
+    assert result.succeeded is False
     assert result.metadata.get("evidence_only") is True  # callers must not redden on this
 
 
@@ -291,12 +378,13 @@ def test_build_installs_build_into_the_venv_first():
     orch = Orch(manifest=dict(MANIFEST))
     result = PythonTool(orch).execute("build", working_directory="/workspace/proj")
     installed = next(
-        i for i, c in enumerate(orch.commands)
+        i
+        for i, c in enumerate(orch.commands)
         if "/workspace/proj/.venv/bin/python -m pip install build" in c
     )
     built = next(i for i, c in enumerate(orch.commands) if "-m build --wheel" in c)
     assert installed < built
-    assert result.success is True
+    assert result.succeeded is True
     assert result.metadata.get("evidence_only") is True
 
 
@@ -310,18 +398,45 @@ def test_compile_runs_compileall_over_package_dirs_and_reports_counts():
         manifest=dict(MANIFEST),
         rules=[
             ("test -d /workspace/proj/src/proj", ok("EXISTS")),
-            ("__pycache__", ok("8")),
-            ("-name '*.py'", ok("10")),
+            ("importlib.util", compile_metrics(10, 8)),
         ],
     )
     result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
     compileall = [c for c in orch.commands if "-m compileall -q" in c]
     assert compileall and "/workspace/proj/src/proj" in compileall[0]
-    assert result.success is True
+    assert result.succeeded is True
     assert "8/10" in result.output
     assert result.metadata.get("py_count") == 10
     assert result.metadata.get("pyc_count") == 8
     assert result.metadata.get("failed") == 2
+    assert result.metadata.get("compileall_metric_status") == "valid"
+
+
+def test_compile_foreign_pyc_is_invalid_and_never_clamped_to_full_coverage():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("test -d /workspace/proj/src/proj", ok("EXISTS")),
+            (
+                "importlib.util",
+                compile_metrics(
+                    10,
+                    10,
+                    status="invalid",
+                    foreign_pyc_count=1,
+                ),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    assert "invalid" in result.output
+    assert result.metadata["coverage"] is None
+    assert result.metadata["compileall_metric_status"] == "invalid"
+    assert result.metadata["foreign_pyc_count"] == 1
+    assert "metrics_conflict" in result.conflicts
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +448,7 @@ def test_unknown_operation_is_rejected_with_the_valid_vocabulary():
     result = PythonTool(Orch(manifest=dict(MANIFEST))).execute(
         "frobnicate", working_directory="/workspace/proj"
     )
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "UNKNOWN_PYTHON_OPERATION"
     assert any("setup_env" in s for s in result.suggestions)
 
@@ -357,12 +472,11 @@ def test_setup_env_repairs_pip_less_venv_with_ensurepip():
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     ensurepip = next(i for i, c in enumerate(orch.commands) if "-m ensurepip" in c)
     first_install = next(
-        i for i, c in enumerate(orch.commands)
-        if "pip install -r requirements.txt" in c
+        i for i, c in enumerate(orch.commands) if "pip install -r requirements.txt" in c
     )
     assert ensurepip < first_install  # repaired BEFORE anything installs
     assert "[env] existing venv was missing pip — repaired" in result.output
-    assert result.success is True
+    assert result.succeeded is True
 
 
 def test_setup_env_recreates_venv_when_ensurepip_cannot_restore_pip():
@@ -376,16 +490,16 @@ def test_setup_env_recreates_venv_when_ensurepip_cannot_restore_pip():
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
     recreate = next(
-        i for i, c in enumerate(orch.commands)
+        i
+        for i, c in enumerate(orch.commands)
         if "python3 -m venv --clear /workspace/proj/.venv" in c
     )
     first_install = next(
-        i for i, c in enumerate(orch.commands)
-        if "pip install -r requirements.txt" in c
+        i for i, c in enumerate(orch.commands) if "pip install -r requirements.txt" in c
     )
     assert recreate < first_install
     assert "[env] existing venv was missing pip — recreated" in result.output
-    assert result.success is True
+    assert result.succeeded is True
 
 
 # ---------------------------------------------------------------------------
@@ -410,7 +524,7 @@ def test_deps_install_error_with_zero_exit_is_an_honest_failure():
         ],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
-    assert result.success is False
+    assert result.succeeded is False
     assert "No module named pip" in (result.error or "")
 
 
@@ -426,7 +540,7 @@ def test_failed_install_observation_leads_with_the_failure():
         ],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
-    assert result.success is False
+    assert result.succeeded is False
     # The observation LEADS with the failure — never buried under transcript.
     assert result.output.splitlines()[0].startswith("[setup] dependency install FAILED")
     assert "No module named pip" in (result.error or "")
@@ -449,7 +563,7 @@ def test_setup_env_narrates_missing_test_extras_note():
         rules=[("test -x /workspace/proj/.venv/bin/python", ok("EXISTS"))],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
-    assert result.success is True
+    assert result.succeeded is True
     assert "no test extras declared — test deps may be missing" in result.output
 
 
@@ -468,17 +582,41 @@ def test_setup_env_empty_manifest_detects_installer_ladder_inline():
             ("ls -A1 /workspace/proj", ok("pyproject.toml\nsrc\nREADME.md")),
             (
                 "cat /workspace/proj/pyproject.toml",
-                ok('[project]\nname = "proj"\n\n[project.optional-dependencies]\ntest = ["pytest"]\n'),
+                ok(
+                    '[project]\nname = "proj"\n\n[project.optional-dependencies]\ntest = ["pytest"]\n'
+                ),
             ),
         ],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
-    assert result.success is True
+    assert result.succeeded is True
     assert "[setup] manifest empty — detected installer ladder inline" in result.output
     assert any(
-        "/workspace/proj/.venv/bin/python -m pip install -e '.[test]'" in c
-        for c in orch.commands
+        "/workspace/proj/.venv/bin/python -m pip install -e '.[test]'" in c for c in orch.commands
     )
+
+
+def test_setup_env_empty_manifest_executes_pep735_dev_dependencies_inline():
+    pyproject = """\
+[project]
+name = "paramiko"
+[dependency-groups]
+dev = ["pytest-relaxed>=2", "icecream>=2.1"]
+"""
+    orch = Orch(
+        manifest=None,
+        rules=[
+            ("test -x /workspace/proj/.venv/bin/python", ok("EXISTS")),
+            ("ls -A1 /workspace/proj", ok("pyproject.toml\nparamiko")),
+            ("cat /workspace/proj/pyproject.toml", ok(pyproject)),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    assert any("pip install 'pytest-relaxed>=2' 'icecream>=2.1'" in c for c in orch.commands)
+    assert "no test extras declared" not in result.output
 
 
 def test_setup_env_empty_manifest_and_no_markers_fails_with_analyze_guidance():
@@ -490,7 +628,7 @@ def test_setup_env_empty_manifest_and_no_markers_fails_with_analyze_guidance():
         ],
     )
     result = PythonTool(orch).execute("setup_env", working_directory="/workspace/proj")
-    assert result.success is False  # NEVER a vacuous green no-op
+    assert result.succeeded is False  # NEVER a vacuous green no-op
     assert result.error_code == "PYTHON_NO_INSTALLER_DETECTED"
     assert any("project(action='analyze')" in s for s in result.suggestions)
     assert not any("pip install" in c for c in orch.commands)
@@ -513,7 +651,8 @@ def test_test_bootstraps_pytest_into_the_venv_when_missing():
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
     probe = next(i for i, c in enumerate(orch.commands) if "-m pytest --version" in c)
     install = next(
-        i for i, c in enumerate(orch.commands)
+        i
+        for i, c in enumerate(orch.commands)
         if "/workspace/proj/.venv/bin/python -m pip install pytest" in c
     )
     collect = next(i for i, c in enumerate(orch.commands) if "--collect-only" in c)
@@ -545,9 +684,44 @@ def test_collection_errors_are_never_green_even_with_exit_zero():
         ],
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "PYTEST_COLLECTION_ERROR"
     assert "ERROR collecting tests/test_x.py" in (result.error or "")
+
+
+def test_conftest_import_error_is_never_green_when_stream_exit_is_unknown():
+    # Exact live Paramiko shape: Docker streaming lost the exit status and
+    # reported 0, while pytest aborted before it could emit its usual
+    # "ERROR collecting" header or write JUnit XML.
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            (
+                "--collect-only",
+                ok(
+                    "STDERR: ImportError while loading conftest "
+                    "'/workspace/paramiko/tests/conftest.py'.\n"
+                    "E   ModuleNotFoundError: No module named 'icecream'"
+                ),
+            ),
+            (
+                "--junitxml",
+                ok(
+                    "STDERR: ImportError while loading conftest "
+                    "'/workspace/paramiko/tests/conftest.py'.\n"
+                    "STDERR: tests/conftest.py:8: in <module>\n"
+                    "    from icecream import ic\n"
+                    "E   ModuleNotFoundError: No module named 'icecream'"
+                ),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_COLLECTION_ERROR"
+    assert "ImportError while loading conftest" in (result.error or "")
 
 
 def test_usage_errors_are_never_green():
@@ -566,7 +740,7 @@ def test_usage_errors_are_never_green():
         ],
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "PYTEST_USAGE_ERROR"
 
 
@@ -579,7 +753,7 @@ def test_zero_collected_is_never_green():
         ],
     )
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
-    assert result.success is False
+    assert result.succeeded is False
     assert result.error_code == "PYTEST_NO_TESTS"
 
 
@@ -619,7 +793,7 @@ def test_failing_cli_test_with_captured_argparse_stderr_is_an_honest_result():
     result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
     # The suite RAN and reported honest stats — captured argparse text from
     # the tests under test is NOT a pytest usage error.
-    assert result.success is True
+    assert result.succeeded is True
     assert result.error_code is None
     assert "1 failed, 5 passed" in result.output
 
@@ -682,10 +856,8 @@ def test_pytest_own_usage_error_line_is_still_red_when_the_exit_code_lies():
 def test_non_pytest_args_are_rejected_before_anything_runs():
     for bad in ("make test", "test-python", "-C /workspace/proj test"):
         orch = Orch(manifest=dict(MANIFEST))
-        result = PythonTool(orch).execute(
-            "test", working_directory="/workspace/proj", args=bad
-        )
-        assert result.success is False, bad
+        result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args=bad)
+        assert result.succeeded is False, bad
         assert result.error_code == "PYTEST_ARGS_REJECTED", bad
         # Nothing pytest ran — the bogus args never reach a command line.
         assert not any("-m pytest" in c for c in orch.commands), bad
@@ -711,7 +883,7 @@ def test_pytest_plausible_args_pass_through_sanitizing():
     assert "-x" in run
     assert "--maxfail=2" in run
     assert "tests/test_a.py" in run
-    assert result.success is True
+    assert result.succeeded is True
 
 
 # ---------------------------------------------------------------------------
@@ -725,16 +897,19 @@ def test_compile_zero_sources_is_vacuous_and_says_so():
         manifest=dict(MANIFEST),
         rules=[
             ("test -d /workspace/proj/src/proj", ok("EXISTS")),
-            ("__pycache__", ok("0")),
-            ("-name '*.py'", ok("0")),
+            (
+                "importlib.util",
+                compile_metrics(
+                    0,
+                    0,
+                    status="unavailable",
+                ),
+            ),
         ],
     )
     result = PythonTool(orch).execute("compile", working_directory="/workspace/proj")
-    assert result.success is True  # vacuous, not a failure — but never misleading
-    assert (
-        "no sources found under /workspace/proj/src/proj — nothing verified"
-        in result.output
-    )
+    assert result.succeeded is True  # vacuous, not a failure — but never misleading
+    assert "no sources found under /workspace/proj/src/proj — nothing verified" in result.output
     assert result.metadata.get("vacuous") is True
 
 
@@ -792,3 +967,53 @@ def test_setup_tool_python_branch_issues_the_shared_ladder_commands():
         for c in orch.commands
         if DEFAULT_OVERLAY_JSON not in c
     )
+
+
+# ---- Category-3 panel anchor: structured collected_after_deselection -------
+
+
+def test_filtered_test_records_selected_count_not_total():
+    """Panel spec: the TVM smoke anchor reads collected_after_deselection as
+    a STRUCTURED field of the recorded result — never the summary text. A
+    filtered run gets a scoped collect pass; the X of 'X/Y tests collected'
+    is the selection (the naive regex would read Y, the total)."""
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            (
+                "--collect-only -q -k",
+                ok("tests/test_a.py::test_x\n3/357 tests collected (354 deselected)"),
+            ),
+            ("--collect-only", ok("357 tests collected in 1.2s")),
+        ],
+    )
+    result = PythonTool(orch).execute(
+        "test", working_directory="/workspace/proj", args="-k smoke"
+    )
+    assert result.metadata["collected"] == 357  # denominator unchanged
+    assert result.metadata["collected_after_deselection"] == 3
+
+
+def test_unfiltered_test_selection_equals_denominator_no_extra_collect():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[("--collect-only", ok("42 tests collected in 0.2s"))],
+    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+    assert result.metadata["collected_after_deselection"] == 42
+    collects = [c for c in orch.commands if "--collect-only" in c]
+    assert len(collects) == 1  # no scoped pass without a filter
+
+
+def test_unparseable_scoped_collection_is_none_never_invented():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only -q -k", ok("some garbage the parser does not know")),
+            ("--collect-only", ok("357 tests collected in 1.2s")),
+        ],
+    )
+    result = PythonTool(orch).execute(
+        "test", working_directory="/workspace/proj", args="-k smoke"
+    )
+    assert result.metadata["collected_after_deselection"] is None

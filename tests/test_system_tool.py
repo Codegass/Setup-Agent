@@ -89,7 +89,7 @@ def test_install_java_registers_active_java_overlay_runtime():
 
     result = tool._install_and_configure_java("17")
 
-    assert result.success is True
+    assert result.succeeded is True
     overlay = json.loads(orchestrator.files[DEFAULT_OVERLAY_JSON])
     java_entry = overlay["tools"]["java"]
     assert java_entry["active"] == JAVA_BIN
@@ -104,7 +104,7 @@ def test_install_java_verification_failure_does_not_activate_overlay_runtime():
 
     result = tool._install_and_configure_java("17")
 
-    assert result.success is False
+    assert result.succeeded is False
     assert DEFAULT_OVERLAY_JSON not in orchestrator.files
 
 
@@ -114,5 +114,5 @@ def test_install_java_install_failure_does_not_activate_overlay_runtime():
 
     result = tool._install_and_configure_java("17")
 
-    assert result.success is False
+    assert result.succeeded is False
     assert DEFAULT_OVERLAY_JSON not in orchestrator.files

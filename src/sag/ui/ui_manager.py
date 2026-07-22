@@ -322,6 +322,7 @@ class UIManager:
         test_success = self.report_data.get("test_success", False)
         total_tests = self.report_data.get("total_tests", 0)
         passed_tests = self.report_data.get("passed_tests", 0)
+        flaky_count = self.report_data.get("flaky_count", 0)
         test_pass_rate = self.report_data.get("test_pass_rate", 0)
 
         # Calculate pass rate if not provided or if it's 0 but we have test data
@@ -339,7 +340,11 @@ class UIManager:
 
         if total_tests > 0:
             test_icon = "✅" if test_success else "❌"
-            content += f"    {test_icon} Tests: {passed_tests}/{total_tests} passed ({test_pass_rate:.1f}%)\n"
+            flaky = f", {flaky_count} flaky" if flaky_count else ""
+            content += (
+                f"    {test_icon} Tests: {passed_tests}/{total_tests} passed"
+                f"{flaky} ({test_pass_rate:.1f}%)\n"
+            )
 
         return Panel(
             content,

@@ -329,6 +329,85 @@ def test_assemble_both_found_gradle_row_outside_reactor_survives():
     assert metrics["module_summary"]["modules_total"] == 2
 
 
+def test_assemble_aggregator_shell_excluded_from_summary_keeps_row():
+    """httpcomponents-client shape at the assembler: a packaging=pom reactor root
+    (aggregator_shell=True, 0 classes/jars) keeps its emitted row but is excluded
+    from modules_total/modules_built so 5 real modules read 5/5, not 5/6."""
+    modules = [
+        {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+         "report_dirs": [], "has_test_sources": False, "aggregator_shell": True},
+    ]
+    tests = {}
+    for i in range(1, 6):
+        modules.append({
+            "path": f"m{i}", "name": f"m{i}", "class_count": 100 + i, "jar_count": 1,
+            "report_dirs": [f"/w/m{i}/target/surefire-reports"], "has_test_sources": True,
+        })
+        tests[f"m{i}"] = {"tests_total": 10, "tests_passed": 10, "tests_failed": 0,
+                          "tests_errors": 0, "tests_skipped": 0,
+                          "failing_names": [], "failing_count": 0,
+                          "evidence_refs": [f"/w/m{i}/target/surefire-reports"]}
+    metrics = assemble_module_metrics(
+        modules=modules, reactor_status={}, tests=tests,
+        build_systems=["maven"], build_error_samples={}, generated_at="t",
+    )
+    s = metrics["module_summary"]
+    assert s["modules_total"] == 5      # shell uncounted
+    assert s["modules_built"] == 5      # all real modules built
+    assert s["modules_test_bearing"] == 5
+    assert s["modules_tested"] == 5
+    # the shell row survives for display/debug and never leaks the internal flag
+    by_path = {m["path"]: m for m in metrics["modules"]}
+    assert "." in by_path
+    assert "aggregator_shell" not in json.dumps(metrics)
+
+
+def test_assemble_aggregator_shell_root_via_reactor_uncounted():
+    """When a live reactor names the packaging=pom root 'success', the shell row
+    still carries the reactor verdict but stays out of the built/total ratio."""
+    metrics = assemble_module_metrics(
+        modules=[
+            {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+             "report_dirs": [], "has_test_sources": False, "aggregator_shell": True},
+            {"path": "core", "name": "core", "class_count": 80, "jar_count": 1,
+             "report_dirs": [], "has_test_sources": False},
+        ],
+        reactor_status={".": "success", "core": "success"},
+        tests={}, build_systems=["maven"], build_error_samples={}, generated_at="t",
+    )
+    s = metrics["module_summary"]
+    assert s["modules_total"] == 1 and s["modules_built"] == 1  # only 'core' counts
+    root = {m["path"]: m for m in metrics["modules"]}["."]
+    assert root["build_status"] == "success" and root["build_source"] == "reactor"
+
+
+def test_assemble_real_unbuilt_submodule_still_conflicts_bigtop_shape():
+    """Bigtop shape unchanged: a REAL unbuilt submodule (not a shell) must still
+    count in the denominator, so build_modules_incomplete still fires. The root
+    here is a genuine aggregator shell, uncounted; the shortfall comes from the
+    real unbuilt module, exactly as before this fix."""
+    metrics = assemble_module_metrics(
+        modules=[
+            {"path": ".", "name": ".", "class_count": 0, "jar_count": 0,
+             "report_dirs": [], "has_test_sources": False, "aggregator_shell": True},
+            {"path": "built", "name": "built", "class_count": 40, "jar_count": 1,
+             "report_dirs": [], "has_test_sources": True},
+            {"path": "unbuilt", "name": "unbuilt", "class_count": 0, "jar_count": 0,
+             "report_dirs": [], "has_test_sources": True},  # real, never built
+        ],
+        reactor_status={}, tests={}, build_systems=["gradle"],
+        build_error_samples={}, generated_at="t",
+    )
+    s = metrics["module_summary"]
+    assert s["modules_total"] == 2      # 2 real modules, shell excluded
+    assert s["modules_built"] == 1      # only 'built'
+    assert s["modules_built"] < s["modules_total"]  # coverage conflict still fires
+
+    from sag.agent.module_coverage import coverage_conflicts
+    conflicts = coverage_conflicts({"summary": s, "modules": metrics["modules"]})
+    assert "build_modules_incomplete" in conflicts
+
+
 def _single_system_validator(system, scan, *, with_probe):
     class V:
         def __init__(self):

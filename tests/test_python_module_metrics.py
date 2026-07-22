@@ -142,7 +142,7 @@ def test_python_snapshot_carries_no_module_counts_or_module_conflicts():
     validator = _RecordingValidator(detected="python")
     tool = _tool_with(validator)
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         "partial",
         "setup-report-pyyaml.md",
         _python_project_info(),
@@ -172,7 +172,7 @@ def test_python_snapshot_keeps_honest_build_ladder_conflicts():
     validator = _RecordingValidator(detected="python")
     tool = _tool_with(validator)
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         "partial",
         "setup-report-pyyaml.md",
         _python_project_info(),

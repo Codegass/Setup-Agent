@@ -2,18 +2,16 @@
 """Aggregate pytest JUnit XMLs per test across invocations (live 2026-07-10).
 
 python_tool writes ONE cumulative JUnit XML per pytest invocation into
-PYTEST_REPORT_DIR (pytest-<epoch>.xml). The requests run produced a full-suite
+PYTEST_REPORT_DIR with an explicit sag.attempt_id. The requests run produced a full-suite
 XML and then a diagnostic subset re-run XML; the validator's final read scored
 ONLY the subset (0/8 -> verdict FAILED) while the truth was ~619/635 passing.
 
-Contract under test (FIX A):
+Contract under test (WS7):
 - ALL *.xml files in the pytest-reports dir are parsed;
-- per-test dedupe with the LATEST invocation winning (epoch in the filename,
-  mtime fallback) — a subset re-run updates the tests it ran but never erases
-  tests it did not run;
-- executed/passed/failed = the deduped union;
-- Maven/Gradle per-dir behavior stays byte-identical (raw accumulation,
-  severity-merged statuses).
+- canonical (module_or_file, class, name, param_id) identity is shared;
+- latest means max explicit attempt_id, never filename or mtime;
+- first/latest/worst/retried/flaky history remains visible;
+- primary counts use canonical latest status while raw counts remain diagnostics.
 
 And FIX B: with no static_test_count in the env summary, a python project's
 pytest --collect-only denominator (COLLECTED_JSON) must feed BOTH
@@ -26,6 +24,7 @@ tmp-dir fixtures (same code path as the live container run).
 """
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -56,7 +55,7 @@ class LocalExecOrch:
         }
 
 
-def _junit_xml(cases, suite="pytest"):
+def _junit_xml(cases, suite="pytest", attempt_id=1):
     """Real pytest --junitxml shape: <testsuites> wrapping one <testsuite>."""
     rows = []
     failures = errors = skips = 0
@@ -85,16 +84,69 @@ def _junit_xml(cases, suite="pytest"):
         '<?xml version="1.0" encoding="utf-8"?>\n<testsuites>'
         f'<testsuite name="{suite}" errors="{errors}" failures="{failures}" '
         f'skipped="{skips}" tests="{len(cases)}" time="1.0">'
+        f'<properties><property name="sag.attempt_id" value="{attempt_id}"/></properties>'
         + "".join(rows)
         + "</testsuite></testsuites>"
     )
 
 
-def _full_suite(broken_status):
+def _full_suite(broken_status, attempt_id=1):
     """10 tests: 9 always pass, test_broken carries broken_status."""
     cases = [("tests.test_api", f"test_ok_{i}", "passed") for i in range(9)]
     cases.append(("tests.test_api", "test_broken", broken_status))
-    return _junit_xml(cases)
+    return _junit_xml(cases, attempt_id=attempt_id)
+
+
+def test_explicit_attempt_id_drives_latest_worst_retry_and_flaky_history(workspace):
+    project, reports = workspace
+    paths = [reports / "pytest-zeta.xml", reports / "pytest-alpha.xml", reports / "pytest-mid.xml"]
+    statuses = ((2, "failed"), (1, "failed"), (3, "passed"))
+    for path, (attempt_id, status) in zip(paths, statuses, strict=True):
+        path.write_text(
+            _junit_xml(
+                [("tests.test_api", "test_flaky", status)],
+                attempt_id=attempt_id,
+            )
+        )
+    # Deliberately make mtime order disagree with attempt order too.
+    for timestamp, path in enumerate(reversed(paths), start=100):
+        os.utime(path, (timestamp, timestamp))
+
+    result = _parse(project)
+
+    assert result["total_tests"] == 1
+    assert result["passed_tests"] == 1
+    assert result["failed_tests"] == 0
+    assert result["flaky_count"] == 1
+    assert result["retried_count"] == 2
+    history = result["test_histories"][0]
+    assert history["first"] == "failed"
+    assert history["latest"] == "passed"
+    assert history["worst"] == "failed"
+    assert history["retried_count"] == 2
+    assert history["attempt_ids"] == [1, 2, 3]
+
+
+def test_missing_attempt_id_is_a_conflict_and_never_uses_filename_order(workspace):
+    project, reports = workspace
+    without_attempt = _junit_xml([("tests.test_api", "test_case", "failed")]).replace(
+        '<properties><property name="sag.attempt_id" value="1"/></properties>', ""
+    )
+    later_named_pass = _junit_xml([("tests.test_api", "test_case", "passed")]).replace(
+        '<properties><property name="sag.attempt_id" value="1"/></properties>', ""
+    )
+    (reports / "pytest-1.xml").write_text(without_attempt)
+    (reports / "pytest-999999.xml").write_text(later_named_pass)
+
+    result = _parse(project)
+
+    # Both observations stay in the same conservative attempt and merge to
+    # worst. The epoch-looking filename is never treated as execution order.
+    assert result["total_tests"] == 1
+    assert result["failed_tests"] == 1
+    assert result["passed_tests"] == 0
+    assert result["retried_count"] == 0
+    assert "test_attempt_id_invalid" in result["metrics_conflicts"]
 
 
 @pytest.fixture
@@ -125,7 +177,10 @@ def test_subset_rerun_that_now_passes_updates_only_that_test(workspace):
     project, reports = workspace
     (reports / "pytest-1000.xml").write_text(_full_suite("failed"))
     (reports / "pytest-2000.xml").write_text(
-        _junit_xml([("tests.test_api", "test_broken", "passed")])
+        _junit_xml(
+            [("tests.test_api", "test_broken", "passed")],
+            attempt_id=2,
+        )
     )
 
     result = _parse(project)
@@ -147,7 +202,10 @@ def test_subset_rerun_still_failing_keeps_full_denominator(workspace):
     project, reports = workspace
     (reports / "pytest-1000.xml").write_text(_full_suite("failed"))
     (reports / "pytest-2000.xml").write_text(
-        _junit_xml([("tests.test_api", "test_broken", "failed")])
+        _junit_xml(
+            [("tests.test_api", "test_broken", "failed")],
+            attempt_id=2,
+        )
     )
 
     result = _parse(project)
@@ -159,14 +217,20 @@ def test_subset_rerun_still_failing_keeps_full_denominator(workspace):
     assert result["failing_test_names"] == ["tests.test_api::test_broken"]
 
 
-def test_later_invocation_wins_per_test_by_filename_epoch(workspace):
-    """Ordering follows the epoch in the filename, not lexicographic sorting:
-    pytest-100.xml (epoch 100) is LATER than pytest-99.xml even though it
-    sorts first as a string, so its passing result must win."""
+def test_later_invocation_wins_per_test_by_explicit_attempt_id(workspace):
+    """The explicit attempt id, never the report filename, selects latest."""
     project, reports = workspace
-    (reports / "pytest-99.xml").write_text(_junit_xml([("tests.test_api", "test_flaky", "failed")]))
+    (reports / "pytest-z-last.xml").write_text(
+        _junit_xml(
+            [("tests.test_api", "test_flaky", "failed")],
+            attempt_id=1,
+        )
+    )
     (reports / "pytest-100.xml").write_text(
-        _junit_xml([("tests.test_api", "test_flaky", "passed")])
+        _junit_xml(
+            [("tests.test_api", "test_flaky", "passed")],
+            attempt_id=2,
+        )
     )
 
     result = _parse(project)
@@ -195,7 +259,8 @@ def test_parameterized_invocations_stay_distinct_in_the_union(workspace):
 
     assert result["total_tests"] == 8
     assert result["failed_tests"] == 8
-    assert result["unique_tests"] == 1  # method-level dedupe unchanged
+    assert result["unique_tests"] == 8
+    assert result["unique_methods"] == 1
 
 
 def test_subset_rerun_updates_all_its_parameterized_executions(workspace):
@@ -212,7 +277,8 @@ def test_subset_rerun_updates_all_its_parameterized_executions(workspace):
             [
                 ("tests.test_lowlevel", f"test_use_proxy_from_environment[{p}]", "passed")
                 for p in params
-            ]
+            ],
+            attempt_id=2,
         )
     )
 
@@ -225,14 +291,13 @@ def test_subset_rerun_updates_all_its_parameterized_executions(workspace):
 
 
 # ---------------------------------------------------------------------------
-# FIX A guard: Maven surefire per-dir behavior stays byte-identical
+# Canonical/raw basis also applies to Maven surefire reports
 # ---------------------------------------------------------------------------
 
 
-def test_maven_surefire_raw_accumulation_unchanged(workspace):
-    """Two surefire XMLs (a re-run passing a previously failed test) keep the
-    legacy semantics: primary counts are RAW sums across files and the unique
-    status merge stays severity-based (failed wins over a later pass)."""
+def test_maven_surefire_raw_is_diagnostic_and_primary_is_canonical(workspace):
+    """Without explicit attempt metadata, surefire files share conservative
+    attempt 1: primary counts dedupe canonically while raw keeps every row."""
     project, _reports = workspace
     surefire = project / "target" / "surefire-reports"
     surefire.mkdir(parents=True)
@@ -257,10 +322,13 @@ def test_maven_surefire_raw_accumulation_unchanged(workspace):
     result = _parse(project)
 
     assert result["valid"] is True
-    # Raw accumulation: 4 executions across the two files, 1 failure recorded.
-    assert result["total_tests"] == 4
-    assert result["passed_tests"] == 3
+    # Primary counts use the canonical latest/worst-safe attempt-1 basis;
+    # raw diagnostics retain all 4 testcase observations.
+    assert result["total_tests"] == 3
+    assert result["passed_tests"] == 2
     assert result["failed_tests"] == 1
+    assert result["raw_total_tests"] == 4
+    assert result["raw_passed_tests"] == 3
     assert result["test_success"] is False
     # Severity merge (NOT latest-wins) for JVM reports: testC stays failed.
     assert result["unique_tests"] == 3
@@ -271,9 +339,7 @@ def test_maven_surefire_raw_accumulation_unchanged(workspace):
 # ---------------------------------------------------------------------------
 # FIX A, shell fallback path: when the compact in-container parser is
 # unavailable, the find/cat fallback must apply the SAME pytest per-test
-# aggregation (latest invocation wins) instead of raw-summing XMLs and
-# severity-merging statuses (which double-counted re-run tests and made a
-# re-run pass unable to clear an earlier failure).
+# aggregation instead of inferring retry order from transport filenames.
 # ---------------------------------------------------------------------------
 
 
@@ -302,7 +368,10 @@ def test_fallback_shell_path_subset_rerun_aggregates_per_test(workspace):
     project, reports = workspace
     (reports / "pytest-1000.xml").write_text(_full_suite("failed"))
     (reports / "pytest-2000.xml").write_text(
-        _junit_xml([("tests.test_api", "test_broken", "passed")])
+        _junit_xml(
+            [("tests.test_api", "test_broken", "passed")],
+            attempt_id=2,
+        )
     )
 
     result = _parse_fallback(project)
@@ -318,13 +387,20 @@ def test_fallback_shell_path_subset_rerun_aggregates_per_test(workspace):
     assert result["raw_failed_tests"] == 1
 
 
-def test_fallback_shell_path_latest_invocation_wins_by_epoch(workspace):
-    """pytest-100.xml (epoch 100) is LATER than pytest-99.xml even though it
-    sorts first as a string; its passing result must win in the fallback."""
+def test_fallback_shell_path_latest_invocation_uses_explicit_attempt_id(workspace):
+    """The fallback path also ignores filename order for latest."""
     project, reports = workspace
-    (reports / "pytest-99.xml").write_text(_junit_xml([("tests.test_api", "test_flaky", "failed")]))
+    (reports / "pytest-z-last.xml").write_text(
+        _junit_xml(
+            [("tests.test_api", "test_flaky", "failed")],
+            attempt_id=1,
+        )
+    )
     (reports / "pytest-100.xml").write_text(
-        _junit_xml([("tests.test_api", "test_flaky", "passed")])
+        _junit_xml(
+            [("tests.test_api", "test_flaky", "passed")],
+            attempt_id=2,
+        )
     )
 
     result = _parse_fallback(project)
@@ -337,8 +413,7 @@ def test_fallback_shell_path_latest_invocation_wins_by_epoch(workspace):
 
 
 def test_fallback_shell_path_parameterized_union(workspace):
-    """8 parameterized executions of one method stay 8 primary entries and 1
-    unique method through the fallback (same basis as the compact parser)."""
+    """Parameterized invocations stay distinct canonical test identities."""
     project, reports = workspace
     params = ["http", "https", "all", "mixed", "socks", "env", "noproxy", "cidr"]
     (reports / "pytest-1000.xml").write_text(
@@ -354,13 +429,12 @@ def test_fallback_shell_path_parameterized_union(workspace):
 
     assert result["total_tests"] == 8
     assert result["failed_tests"] == 8
-    assert result["unique_tests"] == 1
+    assert result["unique_tests"] == 8
+    assert result["unique_methods"] == 1
 
 
-def test_fallback_shell_path_maven_raw_accumulation_unchanged(workspace):
-    """Maven surefire semantics through the shell fallback stay byte-identical:
-    RAW sums across files, severity-merged unique statuses (failed wins over a
-    later pass)."""
+def test_fallback_shell_path_maven_uses_the_same_canonical_basis(workspace):
+    """The fallback gives surefire the same canonical/raw split."""
     project, _reports = workspace
     surefire = project / "target" / "surefire-reports"
     surefire.mkdir(parents=True)
@@ -385,9 +459,11 @@ def test_fallback_shell_path_maven_raw_accumulation_unchanged(workspace):
     result = _parse_fallback(project)
 
     assert result["valid"] is True
-    assert result["total_tests"] == 4
-    assert result["passed_tests"] == 3
+    assert result["total_tests"] == 3
+    assert result["passed_tests"] == 2
     assert result["failed_tests"] == 1
+    assert result["raw_total_tests"] == 4
+    assert result["raw_passed_tests"] == 3
     assert result["test_success"] is False
     assert result["unique_tests"] == 3
     assert result["unique_failed_tests"] == 1
@@ -463,7 +539,7 @@ def test_execution_coverage_gate_consumes_collected_fallback(workspace):
     conflict fires and caps the run, instead of a silent 0/8 false red.
 
     The test_analysis fed to the snapshot is the REAL parser's output for the
-    subset XML (total 8, unique 1 — FIX A contract), so the gate is exercised
+    subset XML (total 8, canonical unique 8), so the gate is exercised
     with numbers the live pipeline can actually produce. The collect-only
     denominator is param-EXPANDED, so the coverage numerator must be the
     param-expanded executed union (8), never the stripped method count (1)."""
@@ -471,7 +547,8 @@ def test_execution_coverage_gate_consumes_collected_fallback(workspace):
     (reports / "pytest-1783661384.xml").write_text(_SUBSET_XML)
     parsed = _parse(project)
     assert parsed["total_tests"] == 8
-    assert parsed["unique_tests"] == 1  # parser-faithful: 8 params of ONE method
+    assert parsed["unique_tests"] == 8
+    assert parsed["unique_methods"] == 1
 
     tool = ReportTool()
     accomplishments = {
@@ -490,7 +567,7 @@ def test_execution_coverage_gate_consumes_collected_fallback(workspace):
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="partial",
         report_filename="setup-report-test.md",
         project_info={"build_system": "pip/poetry"},
@@ -505,7 +582,7 @@ def test_execution_coverage_gate_consumes_collected_fallback(workspace):
 
 
 def test_full_green_parameterized_run_keeps_coverage_gate_quiet(workspace):
-    """One full 100%-green pytest run: 50 collected, 50 executed union entries,
+    """One full 100%-green pytest run: 50 collected, 50 canonical executions,
     21 unique methods. The pytest --collect-only denominator counts
     parameterized invocations ([param] expanded), so the coverage numerator
     must share that basis — comparing the param-STRIPPED unique method count
@@ -520,7 +597,8 @@ def test_full_green_parameterized_run_keeps_coverage_gate_quiet(workspace):
     parsed = _parse(project)  # REAL compact parser
     assert parsed["total_tests"] == 50
     assert parsed["passed_tests"] == 50
-    assert parsed["unique_tests"] == 21
+    assert parsed["unique_tests"] == 50
+    assert parsed["unique_methods"] == 21
 
     tool = ReportTool()
     accomplishments = {
@@ -530,7 +608,7 @@ def test_full_green_parameterized_run_keeps_coverage_gate_quiet(workspace):
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="success",
         report_filename="setup-report-test.md",
         project_info={"build_system": "pip/poetry"},
@@ -565,7 +643,7 @@ def test_java_method_denominator_keeps_unique_numerator():
         },
     }
 
-    snapshot = tool._build_report_snapshot(
+    snapshot = tool._build_legacy_report_snapshot(
         verified_status="success",
         report_filename="setup-report-test.md",
         project_info={"build_system": "Maven"},

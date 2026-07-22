@@ -349,6 +349,8 @@ def test_validate_build_status_evidence_populates_metrics_fields_maven():
     assert evidence["tool"] == "maven"
     assert "module_output_count" in evidence
     assert any(sample.endswith(".jar") for sample in evidence["artifact_samples"])
+    assert evidence["class_count"] == 0
+    assert evidence["jar_count"] == 1
     assert evidence["warnings"] == []
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
@@ -11,6 +11,11 @@ from sag.config.prompt_loader import PromptConfig
 from sag.tools.base import BaseTool
 
 from .react_types import ReactModelMode, ReActStep, StepType
+
+if TYPE_CHECKING:
+    from .current_plan import ExecutablePlanStep
+    from .phase_handoff import HandoffProjection
+    from .reasoning_scheduler import ReasoningTrigger
 
 
 def _format_attempt_history(todo_list) -> str:
@@ -24,7 +29,9 @@ def _format_attempt_history(todo_list) -> str:
     lines = ["  🧾 ATTEMPT HISTORY (every task tried so far):"]
     for task in todo_list:
         repeats = counts[norm(task.description)]
-        flag = f" ⚠️ tried ×{repeats} — do NOT repeat; try a different approach" if repeats > 1 else ""
+        flag = (
+            f" ⚠️ tried ×{repeats} — do NOT repeat; try a different approach" if repeats > 1 else ""
+        )
         desc = task.description if len(task.description) <= 100 else task.description[:97] + "..."
         lines.append(f"    - {task.id} [{task.status.value}] {desc}{flag}")
     return "\n".join(lines)
@@ -43,8 +50,8 @@ class ReActPromptBuilder:
         self.prompts = prompts
         self.context_manager = context_manager
         self.tools = tools
-        self._cached_trunk_context = None
-        self._trunk_context_cache_timestamp = None
+        self._cached_trunk_context: Any = None
+        self._trunk_context_cache_timestamp: int | None = None
 
     def build_initial_system_prompt(
         self,
@@ -299,28 +306,89 @@ Current Focus: {context_info.get('focus', 'Not specified')}
         base_prompt: str,
         mode: ReactModelMode,
         workflow_mode: str = "setup",
+        *,
+        planned_step: "ExecutablePlanStep | None" = None,
+        reasoning_reasons: "tuple[ReasoningTrigger, ...]" = (),
+        scheduler_fault: str | None = None,
     ) -> str:
         """Build specialized prompt for a model mode."""
         is_run_task = workflow_mode == "run_task"
         if mode == ReactModelMode.THINKING:
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:417 mode_prompts.run_task_thinking
+                # Prompt: src/sag/config/prompts/react_engine.yaml:408 mode_prompts.run_task_thinking
                 return (
-                    self.prompts.get("mode_prompts.run_task_thinking").rstrip() + "\n" + base_prompt
+                    str(self.prompts.get("mode_prompts.run_task_thinking")).rstrip()
+                    + "\n"
+                    + base_prompt
                 )
+            scheduler_context = ""
+            if reasoning_reasons or scheduler_fault:
+                context_lines = ["SCHEDULER REASONING CONTEXT:"]
+                if reasoning_reasons:
+                    context_lines.append(
+                        "TRIGGERS: "
+                        + ", ".join(
+                            getattr(reason, "value", str(reason)) for reason in reasoning_reasons
+                        )
+                    )
+                if scheduler_fault:
+                    context_lines.append(f"FAULT: {scheduler_fault}")
+                scheduler_context = "\n".join(context_lines).rstrip() + "\n\n"
             # Prompt: src/sag/config/prompts/react_engine.yaml:374 mode_prompts.thinking
-            return self.prompts.get("mode_prompts.thinking").rstrip() + "\n" + base_prompt
+            return (
+                str(self.prompts.get("mode_prompts.thinking")).rstrip()
+                + "\n\n"
+                + scheduler_context
+                + base_prompt
+            )
 
         if mode == ReactModelMode.ACTION:
             if is_run_task:
-                # Prompt: src/sag/config/prompts/react_engine.yaml:480 mode_prompts.run_task_action
+                # Prompt: src/sag/config/prompts/react_engine.yaml:471 mode_prompts.run_task_action
                 return (
-                    self.prompts.get("mode_prompts.run_task_action").rstrip() + "\n" + base_prompt
+                    str(self.prompts.get("mode_prompts.run_task_action")).rstrip()
+                    + "\n"
+                    + base_prompt
                 )
-            # Prompt: src/sag/config/prompts/react_engine.yaml:432 mode_prompts.action
-            return self.prompts.get("mode_prompts.action").rstrip() + "\n" + base_prompt
+            plan_context = ""
+            if planned_step is not None:
+                plan_context = (
+                    "AUTHORITATIVE EXECUTABLE PLAN STEP:\n"
+                    f"STEP: step_{planned_step.plan_index + 1}\n"
+                    f"TOOL: {planned_step.tool}\n"
+                    "EXACT_PARAMS: "
+                    + json.dumps(
+                        planned_step.exact_params,
+                        sort_keys=True,
+                        separators=(", ", ": "),
+                    )
+                    + "\nEXPECTED_EVIDENCE: "
+                    + json.dumps(list(planned_step.expected_evidence))
+                    + "\nSUCCESS_CRITERIA: "
+                    + json.dumps(list(planned_step.success_criteria))
+                    + "\nDo not add, remove, repair, or guess parameters. Emit exactly this tool call.\n\n"
+                )
+            # Prompt: src/sag/config/prompts/react_engine.yaml:423 mode_prompts.action
+            return (
+                str(self.prompts.get("mode_prompts.action")).rstrip()
+                + "\n\n"
+                + plan_context
+                + base_prompt
+            )
 
         raise ValueError(f"Unsupported React model mode: {mode}")
+
+    @staticmethod
+    def build_phase_intro_guidance(
+        *,
+        phase_contract: str,
+        handoff_projection: "HandoffProjection | None",
+    ) -> str:
+        """Join the engine-owned contract to a typed, explicitly untrusted digest."""
+        contract = str(phase_contract).rstrip()
+        if handoff_projection is None:
+            return contract
+        return f"{contract}\n\n{handoff_projection.to_prompt_text()}"
 
     def invalidate_trunk_cache(self) -> None:
         """Invalidate trunk context cache when we know it has changed."""

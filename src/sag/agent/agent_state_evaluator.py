@@ -6,9 +6,12 @@ from typing import Any, Dict, List
 
 from loguru import logger
 
+from sag.evidence import OperationOutcome
+
 from .context_manager import ContextManager
 from .physical_validator import PhysicalValidator
 from .react_types import StepType
+from .tool_orchestration import ToolExecutionRecord
 
 
 class AgentStatus(str, Enum):
@@ -116,7 +119,7 @@ class AgentStateEvaluator:
         self,
         steps: List[Any],
         current_iteration: int,
-        recent_tool_executions: List[Dict],
+        recent_tool_executions: List[ToolExecutionRecord],
         steps_since_context_switch: int,
     ) -> AgentStateAnalysis:
         """
@@ -265,7 +268,7 @@ class AgentStateEvaluator:
                 step.tool_name == "project"
                 and (getattr(step, "tool_params", None) or {}).get("action") == "analyze"
             )
-            if is_analyzer_step and step.tool_result.success:
+            if is_analyzer_step and step.tool_result.succeeded:
                 project_analyzer_used = True
                 break
 
@@ -381,19 +384,21 @@ class AgentStateEvaluator:
 
         return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
-    def _check_repetitive_execution(self, recent_tool_executions: List[Dict]) -> AgentStateAnalysis:
+    def _check_repetitive_execution(
+        self, recent_tool_executions: List[ToolExecutionRecord]
+    ) -> AgentStateAnalysis:
         """Check if agent is stuck in repetitive failed execution."""
         if not recent_tool_executions:
             return AgentStateAnalysis(status=AgentStatus.PROCEEDING)
 
         # Count consecutive failures for the same tool
         if len(recent_tool_executions) >= 3:
-            last_tool = recent_tool_executions[-1].get("signature", "").split(":")[0]
+            last_tool = recent_tool_executions[-1].signature.split(":")[0]
             consecutive_failures = 0
 
             for exec_record in reversed(recent_tool_executions):
-                if exec_record["signature"].startswith(last_tool + ":"):
-                    if not exec_record["success"]:
+                if exec_record.signature.startswith(last_tool + ":"):
+                    if exec_record.operation_outcome is OperationOutcome.FAILED:
                         consecutive_failures += 1
                     else:
                         break
@@ -481,11 +486,13 @@ class AgentStateEvaluator:
                     f"If the current phase's objective is met, record it now:\n\n"
                     f"phase(\n"
                     f"    action='done',\n"
+                    f"    outcome='success|partial|failed|unknown',\n"
                     f"    key_results='[numbers/paths the next phase needs]',\n"
                     f"    evidence=[output refs]\n"
                     f")\n\n"
-                    f"If the objective cannot be finished, phase(action='blocked', "
-                    f"reason=..., evidence=[refs]) — an honest blocked outcome "
+                    f"For an external impediment, phase(action='blocked', "
+                    f"outcome='failed|partial|unknown', reason=..., evidence=[refs]) — "
+                    f"an honest blocked outcome "
                     f"beats drifting into unrecorded work."
                 )
                 return AgentStateAnalysis(
@@ -635,7 +642,7 @@ class AgentStateEvaluator:
     def _is_task_complete(self, steps: List[Any]) -> bool:
         """Check if the overall task is complete."""
         # Machine-driven setup runs end when the report PHASE completes — the
-        # engine consults PhaseMachine.overall_outcome(), not this signal. The
+        # engine consults PhaseMachine.termination_state(), not this signal. The
         # evaluator is still consulted every iteration while the machine is
         # incomplete, so this path must stand down entirely in machine mode.
         if getattr(self, "phase_machine_active", False):
@@ -649,7 +656,7 @@ class AgentStateEvaluator:
                     and step.tool_name == "report"
                     and hasattr(step, "tool_result")
                     and step.tool_result
-                    and step.tool_result.success
+                    and step.tool_result.succeeded
                 ):
                     # Check for completion signal in metadata
                     metadata = getattr(step.tool_result, "metadata", {})
@@ -760,7 +767,7 @@ class AgentStateEvaluator:
             if getattr(step, "tool_name", None) == "manage_context":
                 continue
             result = getattr(step, "tool_result", None)
-            if result and result.success:
+            if result and result.succeeded:
                 logger.info("Run task completion detected after successful tool action")
                 return True
 

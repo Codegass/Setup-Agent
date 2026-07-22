@@ -128,7 +128,7 @@ def _green_run_with_collected(total, collected):
 
 
 def _build(tool, project_info, accomplishments):
-    return tool._build_report_snapshot(
+    return tool._build_legacy_report_snapshot(
         "partial",
         "setup-report.md",
         project_info,

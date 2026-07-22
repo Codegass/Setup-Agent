@@ -6,14 +6,25 @@ state — not the full LLM loop."""
 
 from types import SimpleNamespace
 
-from sag.agent.phase_machine import PhaseMachine
+from sag.agent.evidence_state import RunEvidenceState
+from sag.agent.current_plan import CurrentPlan, PlanStep
+from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
+from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
+from sag.agent.phase_transitions import PhaseTransitionPolicy, RepairRequest
 from sag.agent.react_engine import ReActEngine
 from sag.agent.react_types import StepType
+from sag.agent.reasoning_scheduler import ReasoningScheduler, ReasoningTrigger, SchedulerMode
+from sag.agent.verdict_finalizer import EvidenceCloseReason
+from sag.evidence import OperationOutcome
 
 
-def _engine_with_machine():
+def _engine_with_machine(*, start_phase="provision"):
     engine = ReActEngine.__new__(ReActEngine)
-    engine.phase_machine = PhaseMachine()
+    engine.phase_machine = PhaseMachine(start_phase=start_phase)
+    engine.run_evidence_state = RunEvidenceState(run_id="phase-wiring")
+    engine.transition_policy = PhaseTransitionPolicy()
+    engine._repair_global_remaining = 2
+    engine._repair_phase_remaining = {"test": 1, "build": 1}
     engine.steps = [SimpleNamespace(step_type=None, content="old")] * 7
     engine.context_journal = None
     engine._phase_iterations = 12
@@ -26,20 +37,79 @@ def _engine_with_machine():
         update_task_status=lambda *a, **k: True,
         current_task_id=None,
     )
-    engine.agent_logger = SimpleNamespace(info=lambda *a, **k: None)
+    engine.agent_logger = SimpleNamespace(
+        info=lambda *a, **k: None,
+        warning=lambda *a, **k: None,
+    )
+    engine.finalized_reasons = []
+    engine._finalize_evidence = lambda reason: engine.finalized_reasons.append(reason)
     return engine
 
 
-def test_phase_done_signal_advances_and_resets_window():
-    engine = _engine_with_machine()
-    step = SimpleNamespace(
+def _terminal_step(
+    engine,
+    *,
+    outcome="success",
+    signal="done",
+    key_results="ok",
+    reason="",
+    validated_facts=None,
+):
+    phase = engine.phase_machine.current_phase
+    claimed = PhaseOutcome(outcome)
+    state = {
+        PhaseOutcome.SUCCESS: ValidatorState.GREEN,
+        PhaseOutcome.PARTIAL: ValidatorState.PARTIAL,
+        PhaseOutcome.FAILED: ValidatorState.RED,
+        PhaseOutcome.UNKNOWN: ValidatorState.UNAVAILABLE,
+    }[claimed]
+    facts = dict(validated_facts or {})
+    if validated_facts is None:
+        if phase == "provision":
+            facts["provision.workspace_ready"] = claimed is PhaseOutcome.SUCCESS
+        elif phase == "analyze":
+            facts["analysis.build_entry_ready"] = claimed in {
+                PhaseOutcome.SUCCESS,
+                PhaseOutcome.PARTIAL,
+            }
+        elif phase == "build":
+            facts["build.test_entry_ready"] = claimed in {
+                PhaseOutcome.SUCCESS,
+                PhaseOutcome.PARTIAL,
+            }
+    claim = PhaseClaim(
+        phase=phase,
+        signal=signal,
+        claimed_outcome=claimed,
+        key_results=key_results,
+        reason=reason,
+    )
+    gate = GateResult(
+        accepted=True,
+        validated_outcome=claimed,
+        claim_disposition=ClaimDisposition.CONFIRMED,
+        validator_state=state,
+        reason=reason or "scripted gate",
+        validated_facts=facts,
+        claim=claim,
+    )
+    return SimpleNamespace(
         step_type=SimpleNamespace(value="action"),
         tool_name="phase",
         tool_result=SimpleNamespace(
             success=True,
-            metadata={"phase_signal": "done", "key_results": "cloned + JDK", "evidence": []},
+            metadata={
+                "phase_signal": signal,
+                "phase_claim": claim.to_metadata(),
+                "gate_result": gate.to_metadata(),
+            },
         ),
     )
+
+
+def test_phase_done_signal_advances_and_resets_window():
+    engine = _engine_with_machine()
+    step = _terminal_step(engine, key_results="cloned + JDK")
 
     engine._handle_phase_signals([step])
 
@@ -51,21 +121,184 @@ def test_phase_done_signal_advances_and_resets_window():
     assert engine._phase_iterations == 0
 
 
-def test_phase_blocked_signal_records_and_advances():
+def test_phase_transition_invalidates_current_plan_and_requests_one_fresh_think():
     engine = _engine_with_machine()
+    scheduler = ReasoningScheduler(available_tools={"phase"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                PlanStep(
+                    tool="phase",
+                    exact_params={"action": "done", "outcome": "success"},
+                    expected_evidence=("accepted phase gate",),
+                    success_criteria=("phase advances",),
+                ),
+            )
+        )
+    )
+    engine.reasoning_scheduler = scheduler
+    engine._scheduler_active = True
+
+    engine._handle_phase_signals([_terminal_step(engine, key_results="cloned")])
+
+    turn = scheduler.next_turn()
+    assert turn.mode is SchedulerMode.THINK
+    assert turn.reasons == (ReasoningTrigger.PHASE_CHANGE,)
+
+
+def test_rejected_phase_gate_requests_reasoning_without_advancing():
+    engine = _engine_with_machine()
+    scheduler = ReasoningScheduler(available_tools={"phase"})
+    scheduler.next_turn()
+    scheduler.accept_plan(
+        CurrentPlan(
+            steps=(
+                PlanStep(
+                    tool="phase",
+                    exact_params={"action": "done", "outcome": "success"},
+                    expected_evidence=("accepted phase gate",),
+                    success_criteria=("phase advances",),
+                ),
+            )
+        )
+    )
+    engine.reasoning_scheduler = scheduler
+    engine._scheduler_active = True
+    claim = PhaseClaim(
+        phase="provision",
+        signal="done",
+        claimed_outcome=PhaseOutcome.SUCCESS,
+        key_results="workspace ready",
+    )
+    rejected = GateResult(
+        accepted=False,
+        validated_outcome=PhaseOutcome.UNKNOWN,
+        claim_disposition=ClaimDisposition.CONTRADICTED,
+        validator_state=ValidatorState.UNAVAILABLE,
+        reason="workspace evidence unavailable",
+        claim=claim,
+    )
     step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"),
-        tool_name="phase",
         tool_result=SimpleNamespace(
-            success=True,
-            metadata={"phase_signal": "blocked", "reason": "no network", "evidence": []},
-        ),
+            metadata={
+                "phase_signal": "done",
+                "phase_claim": claim.to_metadata(),
+                "gate_result": rejected.to_metadata(),
+            }
+        )
     )
 
     engine._handle_phase_signals([step])
 
-    assert engine.phase_machine.records[0].status == "blocked"
-    assert engine.phase_machine.current_phase == "analyze"
+    assert engine.phase_machine.current_phase == "provision"
+    turn = scheduler.next_turn()
+    assert turn.mode is SchedulerMode.THINK
+    assert turn.reasons == (ReasoningTrigger.GATE_REJECTION,)
+
+
+def test_phase_blocked_signal_routes_from_prerequisites_not_linear_order():
+    engine = _engine_with_machine()
+    step = _terminal_step(
+        engine,
+        signal="blocked",
+        outcome="failed",
+        reason="no network",
+        validated_facts={"provision.workspace_ready": False},
+    )
+
+    engine._handle_phase_signals([step])
+
+    assert engine.phase_machine.records[0].termination.value == "blocked"
+    assert engine.phase_machine.current_phase == "report"
+    assert [record.phase for record in engine.phase_machine.records[1:]] == [
+        "analyze",
+        "build",
+        "test",
+    ]
+    assert all(record.outcome.value == "skipped" for record in engine.phase_machine.records[1:])
+
+
+def test_failed_build_signal_records_test_skip_before_evidence_close():
+    engine = _engine_with_machine(start_phase="build")
+    step = _terminal_step(
+        engine,
+        outcome="failed",
+        key_results="compiler failed",
+        validated_facts={"build.test_entry_ready": False},
+    )
+
+    engine._handle_phase_signals([step])
+
+    assert [(record.phase, record.outcome.value) for record in engine.phase_machine.records] == [
+        ("build", "failed"),
+        ("test", "skipped"),
+    ]
+    assert engine.run_evidence_state.phase_records == engine.phase_machine.records
+    assert engine.finalized_reasons == [EvidenceCloseReason.DEPENDENTS_SKIPPED]
+    assert engine.phase_machine.current_phase == "report"
+
+
+def test_partial_build_with_validated_test_entry_advances_to_test():
+    engine = _engine_with_machine(start_phase="build")
+    step = _terminal_step(
+        engine,
+        outcome="partial",
+        validated_facts={"build.test_entry_ready": True},
+    )
+
+    engine._handle_phase_signals([step])
+
+    assert engine.phase_machine.current_phase == "test"
+    assert engine.phase_machine.current_attempt_id == "test-1"
+    assert engine.finalized_reasons == []
+
+
+def test_repair_signal_reopens_direct_dependency_with_monotonic_attempt():
+    class RedTestValidator:
+        docker_orchestrator = None
+
+        def validate_test_status(self, project_name=None):
+            return {
+                "has_test_reports": True,
+                "evidence_status": "blocked",
+                "total_tests": 1,
+                "error_tests": 1,
+                "test_stats": {"executed": 1, "discovered": 1},
+                "reason": "missing sibling artifact",
+                "evidence_refs": ["log://test-1/tail"],
+            }
+
+    engine = _engine_with_machine(start_phase="test")
+    engine.physical_validator = RedTestValidator()
+    request = RepairRequest(
+        from_phase="test",
+        target_phase="build",
+        source_attempt_id="test-1",
+        reason_code="missing_sibling_artifact",
+        failure_signature="missing_sibling_artifact:module-a",
+        hypothesis="root install will publish the sibling artifact",
+        evidence_refs=("log://test-1/tail",),
+    )
+    engine.run_evidence_state.record_phase_evidence(
+        request.source_attempt_id,
+        request.evidence_refs,
+    )
+    step = SimpleNamespace(
+        tool_result=SimpleNamespace(
+            metadata={
+                "phase_signal": "repair",
+                "repair_request": request.to_metadata(),
+            }
+        )
+    )
+
+    engine._handle_phase_signals([step])
+
+    assert engine.phase_machine.current_phase == "build"
+    assert engine.phase_machine.current_attempt_id == "build-1"
+    assert engine.phase_machine.records[0].transition == "repair"
+    assert engine.run_evidence_state.repair_records[-1].accepted is True
 
 
 def test_phase_note_signal_persists_without_advancing():
@@ -139,7 +372,7 @@ def test_persist_phase_record_preserves_existing_phase_notes():
     assert task.status.value == "completed"
 
 
-def test_floor_starvation_forces_blocked():
+def test_floor_starvation_closes_unknown_and_skips_unready_dependents():
     engine = _engine_with_machine()
     # 150-iteration run, still in provision, but only 29 iterations remain:
     # analyze+build+test+report floors (4+10+12+8=34) would starve.
@@ -148,9 +381,10 @@ def test_floor_starvation_forces_blocked():
     forced = engine._enforce_phase_floors()
 
     assert forced is True
-    assert engine.phase_machine.records[0].status == "blocked"
-    assert "reserved" in engine.phase_machine.records[0].reason.lower()
-    assert engine.phase_machine.current_phase == "analyze"
+    assert engine.phase_machine.records[0].termination.value == "completed"
+    assert engine.phase_machine.records[0].outcome.value == "unknown"
+    assert "reserved" in engine.phase_machine.records[0].key_results.lower()
+    assert engine.phase_machine.current_phase == "report"
 
 
 def test_hard_phase_may_consume_savings():
@@ -177,14 +411,7 @@ def test_phase_transition_resets_journal_ledger_memory():
     could be wrongly suppressed (round-6 review)."""
     engine = _engine_with_machine()
     engine._journal_last_ledger = "ATTEMPT LEDGER (older work, compacted):\n✗ x"
-    step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"),
-        tool_name="phase",
-        tool_result=SimpleNamespace(
-            success=True,
-            metadata={"phase_signal": "done", "key_results": "ok", "evidence": []},
-        ),
-    )
+    step = _terminal_step(engine)
 
     engine._handle_phase_signals([step])
 
@@ -197,14 +424,7 @@ def test_phase_transition_resets_context_switch_counter():
     never fires; phase transitions are the context switches now."""
     engine = _engine_with_machine()
     engine.steps_since_context_switch = 23
-    step = SimpleNamespace(
-        step_type=SimpleNamespace(value="action"),
-        tool_name="phase",
-        tool_result=SimpleNamespace(
-            success=True,
-            metadata={"phase_signal": "done", "key_results": "ok", "evidence": []},
-        ),
-    )
+    step = _terminal_step(engine)
 
     engine._handle_phase_signals([step])
 
@@ -264,29 +484,42 @@ def test_floor_exhaustion_auto_completes_when_gate_passes():
     gate passes -> auto-done, only gate-fail -> blocked."""
     engine = _engine_with_machine()
     engine.current_iteration = 121  # forces floor starvation in provision
-    engine._phase_gate_check = lambda phase: {"ok": True, "reason": "", "suggestions": []}
+    engine._phase_gate_check = lambda phase: {
+        "ok": True,
+        "reason": "workspace exists",
+        "suggestions": [],
+        "validator_state": "green",
+        "validated_facts": {"provision.workspace_ready": True},
+        "evidence_refs": ["workspace:///demo"],
+    }
 
     forced = engine._enforce_phase_floors()
 
     assert forced is True
     rec = engine.phase_machine.records[0]
-    assert rec.status == "done", "green evidence at floor exhaustion must auto-complete"
-    assert "auto-completed" in rec.key_results.lower()
+    assert rec.termination.value == "completed"
+    assert "floor exhaustion" in rec.key_results.lower()
+    assert engine.phase_machine.current_phase == "analyze"
 
 
-def test_floor_exhaustion_blocks_when_gate_fails():
+def test_floor_exhaustion_records_failed_outcome_when_evidence_is_red():
     engine = _engine_with_machine()
     engine.current_iteration = 121
     engine._phase_gate_check = lambda phase: {
         "ok": False,
         "reason": "no artifacts",
         "suggestions": [],
+        "validator_state": "red",
+        "validated_facts": {"provision.workspace_ready": False},
+        "evidence_refs": ["workspace:///missing"],
     }
 
     forced = engine._enforce_phase_floors()
 
     assert forced is True
-    assert engine.phase_machine.records[0].status == "blocked"
+    assert engine.phase_machine.records[0].termination.value == "completed"
+    assert engine.phase_machine.records[0].outcome.value == "failed"
+    assert engine.phase_machine.current_phase == "report"
 
 
 def test_mid_phase_nudge_when_evidence_green():
@@ -344,7 +577,10 @@ def _action(tool_name, success=True, model="gpt-action"):
     return SimpleNamespace(
         step_type=StepType.ACTION,
         tool_name=tool_name,
-        tool_result=SimpleNamespace(success=success),
+        tool_result=SimpleNamespace(
+            succeeded=success,
+            operation_outcome=(OperationOutcome.SUCCESS if success else OperationOutcome.FAILED),
+        ),
         model_used=model,
         content="",
     )

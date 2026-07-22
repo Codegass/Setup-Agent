@@ -1,6 +1,8 @@
 # tests/test_python_requirements.py
 """requires-python parsing + newest-satisfying resolution (spec Component 1)."""
 
+import shlex
+
 from sag.tools.internal.python_env import (
     SUPPORTED_PYTHONS,
     requires_python_from_pyproject,
@@ -36,7 +38,7 @@ def test_resolution_policy_is_newest_satisfying():
 def test_unresolvable_returns_none():
     assert resolve_python_version(None) is None
     assert resolve_python_version("") is None
-    assert resolve_python_version(">=4.0") is None      # nothing satisfies
+    assert resolve_python_version(">=4.0") is None  # nothing satisfies
     assert resolve_python_version("${py.version}") is None  # templated garbage
 
 
@@ -141,6 +143,22 @@ invoke = ["invoke>=2.0"]
 all = ["pyasn1>=0.1.7", "invoke>=2.0"]
 """
 
+PARAMIKO_PEP735_PYPROJECT = """\
+[project]
+name = "paramiko"
+
+[dependency-groups]
+test-core = [
+    "pytest-relaxed>=2",
+    "icecream>=2.1",
+]
+dev = [
+    "invoke>=2.2.1",
+    {include-group = "test-core"},
+    "pytest-xdist>=3",
+]
+"""
+
 
 def test_declared_extras_reads_pyproject_and_setup_cfg():
     assert declared_extras(PARAMIKO_SHAPED_PYPROJECT, "") == ["gssapi", "invoke", "all"]
@@ -158,13 +176,52 @@ def test_declared_extras_ignores_dependency_pins_inside_arrays():
 
 
 def test_pyproject_rung_without_test_extras_is_plain_editable_with_note():
-    # paramiko shape: extras exist, but none of them are test extras.
+    # Legacy Paramiko shape: extras exist, but none of them are test extras
+    # and there is no PEP 735 dependency group to fall back to.
     result = detect_installer(
         {"pyproject.toml"}, contents={"pyproject.toml": PARAMIKO_SHAPED_PYPROJECT}
     )
     assert result["commands"] == ["{venv}/bin/python -m pip install -e ."]
     assert result["test_extras"] == []
     assert result["note"] == "no test extras declared — test deps may be missing"
+
+
+def test_pyproject_rung_installs_pep735_dev_group_requirements():
+    # Current Paramiko moved its test stack to [dependency-groups].dev. pip
+    # 24 has no --group support, so flatten the declared group into a second,
+    # safely quoted pip command after the editable install.
+    result = detect_installer(
+        {"pyproject.toml"}, contents={"pyproject.toml": PARAMIKO_PEP735_PYPROJECT}
+    )
+
+    assert result["commands"][0] == "{venv}/bin/python -m pip install -e ."
+    assert shlex.split(result["commands"][1]) == [
+        "{venv}/bin/python",
+        "-m",
+        "pip",
+        "install",
+        "invoke>=2.2.1",
+        "pytest-relaxed>=2",
+        "icecream>=2.1",
+        "pytest-xdist>=3",
+    ]
+    assert result["test_extras"] == []
+    assert result["test_dependency_groups"] == ["dev"]
+    assert result.get("note") is None
+
+
+def test_pep735_group_cycles_do_not_duplicate_or_recurse_forever():
+    content = """\
+[project]
+name = "cycle"
+[dependency-groups]
+test = ["pytest", {include-group = "dev"}]
+dev = ["coverage", {include-group = "test"}, "pytest"]
+"""
+    result = detect_installer({"pyproject.toml"}, contents={"pyproject.toml": content})
+
+    assert shlex.split(result["commands"][1])[-2:] == ["pytest", "coverage"]
+    assert result["test_dependency_groups"] == ["test", "dev"]
 
 
 def test_pyproject_rung_combines_the_test_extras_that_exist():
@@ -202,28 +259,31 @@ class LayoutOrch:
         self.commands.append(cmd)
         if cmd.startswith("find "):
             base = cmd.split()[1]
-            return {"success": True, "exit_code": 0,
-                    "output": self.find_outputs.get(base, "")}
+            return {"success": True, "exit_code": 0, "output": self.find_outputs.get(base, "")}
         return {"success": True, "exit_code": 0, "output": ""}
 
 
 def test_discover_packages_src_layout_wins_over_flat():
-    orch = LayoutOrch({
-        "/workspace/proj/src": "/workspace/proj/src/foo/__init__.py\n",
-        "/workspace/proj": "/workspace/proj/stale/__init__.py\n",
-    })
+    orch = LayoutOrch(
+        {
+            "/workspace/proj/src": "/workspace/proj/src/foo/__init__.py\n",
+            "/workspace/proj": "/workspace/proj/stale/__init__.py\n",
+        }
+    )
     assert discover_packages(orch, "/workspace/proj") == ["foo"]
 
 
 def test_discover_packages_flat_layout_excludes_non_packages():
-    orch = LayoutOrch({
-        "/workspace/proj": (
-            "/workspace/proj/bar/__init__.py\n"
-            "/workspace/proj/tests/__init__.py\n"
-            "/workspace/proj/docs/__init__.py\n"
-            "/workspace/proj/examples/__init__.py\n"
-        ),
-    })
+    orch = LayoutOrch(
+        {
+            "/workspace/proj": (
+                "/workspace/proj/bar/__init__.py\n"
+                "/workspace/proj/tests/__init__.py\n"
+                "/workspace/proj/docs/__init__.py\n"
+                "/workspace/proj/examples/__init__.py\n"
+            ),
+        }
+    )
     assert discover_packages(orch, "/workspace/proj") == ["bar"]
 
 
@@ -235,20 +295,20 @@ def test_discover_packages_none_found_is_empty_not_invented():
 # Analyzer wiring -> manifest keys (java keys stay; python keys ride along)
 # ---------------------------------------------------------------------------
 
+
 class PythonProjectOrch:
     """Scripted project filesystem: ls -1 root listing, cat of root files,
     find for package discovery."""
 
     def __init__(self, files, find_outputs=None):
-        self.files = files                       # root name -> content
-        self.find_outputs = find_outputs or {}   # find base -> output
+        self.files = files  # root name -> content
+        self.find_outputs = find_outputs or {}  # find base -> output
         self.commands = []
 
     def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
         if cmd.startswith("ls -1"):
-            return {"success": True, "exit_code": 0,
-                    "output": "\n".join(sorted(self.files))}
+            return {"success": True, "exit_code": 0, "output": "\n".join(sorted(self.files))}
         if cmd.startswith("cat "):
             name = cmd.split("cat ", 1)[1].split()[0].rsplit("/", 1)[-1]
             if name in self.files:
@@ -256,8 +316,7 @@ class PythonProjectOrch:
             return {"success": False, "exit_code": 1, "output": "No such file"}
         if cmd.startswith("find "):
             base = cmd.split()[1]
-            return {"success": True, "exit_code": 0,
-                    "output": self.find_outputs.get(base, "")}
+            return {"success": True, "exit_code": 0, "output": self.find_outputs.get(base, "")}
         return {"success": True, "exit_code": 0, "output": ""}
 
 
@@ -274,7 +333,8 @@ def test_analyzer_persists_python_manifest_keys(monkeypatch):
 
     captured = {}
     monkeypatch.setattr(
-        bp, "write_build_requirements",
+        bp,
+        "write_build_requirements",
         lambda orch, data: (captured.update(data), True)[1],
     )
     orch = PythonProjectOrch(
@@ -286,23 +346,40 @@ def test_analyzer_persists_python_manifest_keys(monkeypatch):
     tool._analyze_python_project("/workspace/proj", analysis)
     tool._persist_build_requirements("/workspace/proj", analysis)
 
-    assert captured["python_version"] == "3.13"      # newest satisfying >=3.9
+    assert captured["python_version"] == "3.13"  # newest satisfying >=3.9
     assert captured["python_constraint"] == ">=3.9"
     assert captured["python_installer"] == "pip"
     # Bug #13 defect 3: no extras declared -> plain editable install, and the
     # missing-test-extras note rides the manifest so setup_env narrates it.
-    assert captured["python_install_commands"] == [
-        "{venv}/bin/python -m pip install -e ."
-    ]
-    assert captured["python_install_note"] == (
-        "no test extras declared — test deps may be missing"
-    )
+    assert captured["python_install_commands"] == ["{venv}/bin/python -m pip install -e ."]
+    assert captured["python_install_note"] == ("no test extras declared — test deps may be missing")
     assert captured["python_packages"] == ["foo"]
     assert captured["python_venv"].endswith("/.venv")
     assert captured["has_c_extensions"] is False
     assert captured["test_hints"] == {"pytest_args": None, "test_deps": []}
     # java keys stay on the same handoff manifest (spec Component 1: same file)
     assert "java_version" in captured
+
+
+def test_analyzer_persists_pep735_test_dependency_command():
+    orch = PythonProjectOrch(
+        files={"pyproject.toml": PARAMIKO_PEP735_PYPROJECT},
+        find_outputs={"/workspace/paramiko": "/workspace/paramiko/paramiko/__init__.py\n"},
+    )
+    tool = _analyzer(orch)
+    analysis = {}
+
+    tool._analyze_python_project("/workspace/paramiko", analysis)
+
+    config = analysis["python_config"]
+    assert config["python_install_commands"][0] == ("{venv}/bin/python -m pip install -e .")
+    assert shlex.split(config["python_install_commands"][1])[-4:] == [
+        "invoke>=2.2.1",
+        "pytest-relaxed>=2",
+        "icecream>=2.1",
+        "pytest-xdist>=3",
+    ]
+    assert config["python_install_note"] is None
 
 
 def test_analyzer_test_hints_are_metadata_only():
@@ -325,11 +402,9 @@ def test_analyzer_test_hints_are_metadata_only():
     config = analysis["python_config"]
     assert config["test_hints"]["test_deps"] == ["pytest", "pytest-cov", "mock"]
     assert config["test_hints"]["pytest_args"] == "-q tests/"  # {posargs} stripped
-    assert config["python_installer"] == "pip"                  # bare setup.py rung
+    assert config["python_installer"] == "pip"  # bare setup.py rung
     # Bug #13 defect 3: the setup.cfg-declared 'test' extra IS real — install it.
-    assert config["python_install_commands"] == [
-        "{venv}/bin/python -m pip install -e '.[test]'"
-    ]
+    assert config["python_install_commands"] == ["{venv}/bin/python -m pip install -e '.[test]'"]
     assert config["python_packages"] == ["legacy"]
     # tox is READ-ONLY metadata (settled decision): never executed
     assert not any(c.strip().startswith(("tox", "nox")) for c in orch.commands)

@@ -2,7 +2,11 @@ import base64
 import re
 from pathlib import Path
 
-from sag.agent.output_storage import OutputStorageManager
+import pytest
+
+from sag.agent.output_storage import OutputStorageManager, attach_durable_output_ref
+from sag.evidence import OperationOutcome
+from sag.tools.base import ToolResult
 from sag.utils.container_io import DEFAULT_MAX_CMD_CHARS
 
 INDEX_PATH = "/workspace/.setup_agent/contexts/output_index.json"
@@ -13,6 +17,7 @@ class FakeOutputStorageOrchestrator:
     def __init__(self):
         self.commands = []
         self.files = {}
+        self.failed_write_paths = set()
 
     def execute_command(self, command):
         self.commands.append(command)
@@ -20,10 +25,11 @@ class FakeOutputStorageOrchestrator:
         if command.startswith("mkdir -p "):
             return {"success": True, "output": "", "exit_code": 0}
 
-        # `test -f <index> && cat <index>` — return current contents so a manager
-        # can (re)load the durable index that another instance wrote.
-        if command.startswith("test -f ") and "output_index.json" in command:
-            contents = self.files.get(INDEX_PATH)
+        # `test -f <path> && cat <path>` supports both the primary index and
+        # content-addressed emergency records.
+        if command.startswith("test -f ") and " && cat " in command:
+            path = command.split()[2]
+            contents = self.files.get(path)
             if contents:
                 return {"success": True, "output": contents, "exit_code": 0}
             return {"success": False, "output": "", "exit_code": 1}
@@ -46,11 +52,27 @@ class FakeOutputStorageOrchestrator:
         if command.startswith("cat >> ") or command.startswith("cat > "):
             operator = ">>" if command.startswith("cat >> ") else ">"
             path = command.split()[2]
+            if path in self.failed_write_paths:
+                return {"success": False, "output": "write failed", "exit_code": 1}
             payload = command.split("\n", 1)[1].rsplit("\n", 1)[0]
             if operator == ">>":
                 self.files[path] = self.files.get(path, "") + payload + "\n"
             else:
                 self.files[path] = payload + "\n"
+            return {"success": True, "output": "", "exit_code": 0}
+
+        if command.startswith("truncate -s -1 "):
+            path = command.split()[-1]
+            if path not in self.files:
+                return {"success": False, "output": "missing", "exit_code": 1}
+            self.files[path] = self.files[path][:-1]
+            return {"success": True, "output": "", "exit_code": 0}
+
+        if command.startswith("mv "):
+            _, source, target = command.split()
+            if source not in self.files:
+                return {"success": False, "output": "missing", "exit_code": 1}
+            self.files[target] = self.files.pop(source)
             return {"success": True, "output": "", "exit_code": 0}
 
         # --- chunked (base64) write path ---
@@ -93,12 +115,14 @@ def test_output_storage_uses_safe_container_writes_for_backticks(tmp_path):
     assert all('echo "' not in command for command in orchestrator.commands)
     assert "/workspace/.setup_agent/contexts/full_outputs.jsonl" in orchestrator.files
     assert "/workspace/.setup_agent/contexts/output_index.json" in orchestrator.files
-    assert "mvn` without arguments" in orchestrator.files[
-        "/workspace/.setup_agent/contexts/full_outputs.jsonl"
-    ]
-    assert "mvn` without arguments" in orchestrator.files[
-        "/workspace/.setup_agent/contexts/output_index.json"
-    ]
+    assert (
+        "mvn` without arguments"
+        in orchestrator.files["/workspace/.setup_agent/contexts/full_outputs.jsonl"]
+    )
+    assert (
+        "mvn` without arguments"
+        in orchestrator.files["/workspace/.setup_agent/contexts/output_index.json"]
+    )
 
 
 def test_retrieve_reloads_index_for_output_stored_by_another_instance():
@@ -137,6 +161,103 @@ def test_retrieve_returns_none_for_genuinely_missing_ref():
     orchestrator = FakeOutputStorageOrchestrator()
     storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
     assert storage.retrieve_output("output_does_not_exist") is None
+
+
+def test_has_output_ref_refreshes_index_without_loading_output_body():
+    orchestrator = FakeOutputStorageOrchestrator()
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    writer = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    ref_id = writer.store_output(
+        task_id="maven_build",
+        tool_name="maven",
+        output="large build log" * 1000,
+    )
+
+    orchestrator.commands.clear()
+    assert reader.has_output_ref(ref_id) is True
+    assert reader.has_output_ref("output_missing") is False
+    assert not any(command.startswith("sed -n ") for command in orchestrator.commands)
+
+
+def test_index_write_failure_recovers_ref_from_durable_jsonl():
+    orchestrator = FakeOutputStorageOrchestrator()
+    orchestrator.failed_write_paths.add(INDEX_PATH)
+    writer = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+
+    ref_id = writer.store_output(
+        task_id="build",
+        tool_name="build",
+        output="durable compile output",
+    )
+
+    assert ref_id.startswith("output_")
+    assert INDEX_PATH not in orchestrator.files
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    assert reader.retrieve_output(ref_id) == "durable compile output"
+    assert reader.has_output_ref(ref_id) is True
+
+
+def test_emergency_output_file_is_deterministic_and_survives_new_manager(tmp_path):
+    storage = OutputStorageManager(tmp_path)
+    payload = "failed compile output\nwith complete diagnostics"
+    metadata = {"operation_outcome": "failed", "error_code": "COMPILE_FAILED"}
+
+    first_ref = storage.store_emergency_output(
+        task_id="build",
+        tool_name="build",
+        output=payload,
+        metadata=metadata,
+    )
+    second_ref = storage.store_emergency_output(
+        task_id="build",
+        tool_name="build",
+        output=payload,
+        metadata=metadata,
+    )
+
+    assert first_ref == second_ref
+    assert first_ref.startswith("output_emergency_")
+    reader = OutputStorageManager(tmp_path)
+    assert reader.retrieve_output(first_ref) == payload
+    assert reader.has_output_ref(first_ref) is True
+
+
+def test_primary_jsonl_failure_gives_partial_result_retrievable_emergency_ref():
+    orchestrator = FakeOutputStorageOrchestrator()
+    orchestrator.failed_write_paths.add(STORAGE_PATH)
+    storage = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    partial = ToolResult.completed(
+        output="partial compile diagnostics",
+        operation_outcome=OperationOutcome.PARTIAL,
+    )
+
+    attached = attach_durable_output_ref(
+        partial,
+        storage,
+        task_id="build",
+        tool_name="build",
+    )
+
+    assert attached.output_ref.startswith("output_emergency_")
+    reader = OutputStorageManager(Path("/workspace/.setup_agent/contexts"), orchestrator)
+    assert reader.retrieve_output(attached.output_ref) == partial.output
+
+
+def test_attach_rejects_syntactic_ref_that_cannot_be_retrieved():
+    class SyntacticOnlyStorage:
+        def store_output(self, **kwargs):
+            return "output_not_retrievable"
+
+        def retrieve_output(self, ref_id):
+            return None
+
+    with pytest.raises(RuntimeError, match="immediately retrievable"):
+        attach_durable_output_ref(
+            ToolResult.completed_success(output="compile output"),
+            SyntacticOnlyStorage(),
+            task_id="build",
+            tool_name="build",
+        )
 
 
 def test_second_writer_does_not_clobber_first_writers_index_entry():

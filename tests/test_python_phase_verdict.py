@@ -29,7 +29,6 @@ from sag.agent.phase_machine import PHASE_NAMES, PhaseMachine
 from sag.agent.react_engine import PHASE_OBJECTIVES, ReActEngine, phase_objective
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 
-
 # ---------------------------------------------------------------------------
 # fakes (pattern mirrors tests/test_agent_final_status.py)
 # ---------------------------------------------------------------------------
@@ -60,6 +59,7 @@ class FakePhysicalValidator:
 
 def _agent_with_validator(validator):
     agent = object.__new__(SetupAgent)
+    agent.workflow_mode = "continue"
     agent.orchestrator = SimpleNamespace(project_name="pyyaml")
     agent.project_name = "pyyaml"
     agent.context_manager = SimpleNamespace(project_name="pyyaml")
@@ -113,11 +113,7 @@ def _python_partial_build_status():
 # ---------------------------------------------------------------------------
 
 
-def test_python_evidence_backed_blocked_build_caps_to_partial_not_failed():
-    """LIVE-RUN REPRODUCTION (pyyaml): build system python, physical evidence
-    success=True/complete=False (ladder PARTIAL), 1287/1287 pytest passed,
-    phase machine says blocked build. Today: FAILED. Required: PARTIAL —
-    evidence outranks agent belief."""
+def test_python_partial_physical_evidence_drives_partial_verdict():
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status=_python_partial_build_status(),
@@ -131,16 +127,13 @@ def test_python_evidence_backed_blocked_build_caps_to_partial_not_failed():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
-    assert agent.final_verdict == "partial", (
-        "an agent-blocked build phase contradicted by real physical build "
-        "evidence must cap at PARTIAL, not FAILED"
-    )
+    assert agent.final_verdict == "partial"
     assert result is True, "flow-control follows the physical evidence"
 
 
-def test_python_blocked_build_reason_records_both_sides():
+def test_python_phase_termination_does_not_leak_into_verdict_reason():
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status=_python_partial_build_status(),
@@ -149,12 +142,11 @@ def test_python_blocked_build_reason_records_both_sides():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    agent._get_verified_final_status(react_engine_success=True)
+    agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert agent.final_verdict == "partial"
     reason = agent.final_verdict_reason
-    assert "blocked" in reason, reason
-    assert "physical evidence" in reason and "real build" in reason, reason
+    assert "blocked" not in reason, reason
 
 
 def test_blocked_build_with_no_physical_evidence_stays_failed():
@@ -181,16 +173,13 @@ def test_blocked_build_with_no_physical_evidence_stays_failed():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert result is False
     assert agent.final_verdict == "failed"
 
 
-def test_java_real_artifacts_blocked_build_caps_to_partial_with_dual_reason():
-    """The scope is the EVIDENCE, not the language: a Java run with real
-    compiled artifacts whose build phase was agent-blocked is the same
-    evidence-contradicted block -> PARTIAL with the dual reason."""
+def test_java_green_evidence_is_not_capped_by_phase_termination():
     agent = _agent_with_validator(
         FakePhysicalValidator(
             build_status={
@@ -215,12 +204,11 @@ def test_java_real_artifacts_blocked_build_caps_to_partial_with_dual_reason():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
-    assert agent.final_verdict == "partial"
+    assert agent.final_verdict == "success"
     assert result is True
-    reason = agent.final_verdict_reason
-    assert "blocked" in reason and "real build" in reason, reason
+    assert agent.final_verdict_reason == ""
 
 
 def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
@@ -246,7 +234,7 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
     )
     _attach_phase_machine(agent, block_phase="build")
 
-    result = agent._get_verified_final_status(react_engine_success=True)
+    result = agent._legacy_get_verified_final_status(react_engine_success=True)
 
     assert result is False
     assert agent.final_verdict == "failed"
@@ -258,13 +246,15 @@ def test_blocked_build_with_evidence_never_promotes_past_physical_failure():
 
 # Byte-identical snapshot of the JAVA build objective (the template source).
 # If this fails, the Java guidance changed — that is out of scope for the
-# Python fix and must be an intentional, separate change.
+# Python fix and must be an intentional, separate change. dim (d) of the
+# Category-3 analyzer diet made this the FACTS wording (survey coordinates,
+# not "Recommended Build"); that is now THE Java build objective.
 _JAVA_BUILD_OBJECTIVE_SNAPSHOT = (
-    "Make the project compile: build(action='compile'). Follow the analyzer's "
-    "Recommended Build when it differs from a plain root compile — an aggregator "
-    "root over Groovy modules needs build(action='package'/'install'), and a "
-    "Gradle-primary project needs the Gradle build. If the analyzer reports NO Java "
-    "compile target (a packaging/meta-project), phase(action='blocked') with that "
+    "Make the project compile: build(action='compile'). Consult the survey facts "
+    "for the build coordinates — an aggregator root can compile nothing at the "
+    "root while the real sources live in island modules. If the survey facts show NO Java "
+    "compile target (a packaging/meta-project), phase(action='blocked', "
+    "outcome='unknown', ...) with that "
     "evidence instead of forcing a compile. If compilation fails on missing "
     "dependencies, build(action='deps') can resolve them — but do not run deps "
     "first by default (multi-module reactors can fail dependency resolution while "
@@ -278,7 +268,7 @@ def test_python_build_objective_forbids_blocking_on_missing_java_target():
     assert "build(action='deps')" in obj
     assert "build(action='compile')" in obj
     assert "no Java compile target" in obj
-    assert "NOT grounds for phase(action='blocked')" in obj
+    assert "NOT grounds for phase(action='blocked', outcome='failed'" in obj
     assert obj != PHASE_OBJECTIVES["build"]
 
 
@@ -332,7 +322,7 @@ def test_build_intro_uses_python_objective_for_python_project():
         }
     )
     intro = engine._phase_intro_step().content
-    assert "NOT grounds for phase(action='blocked')" in intro
+    assert "NOT grounds for phase(action='blocked', outcome='failed'" in intro
     assert "Make the project compile" not in intro
 
 
