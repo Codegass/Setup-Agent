@@ -698,3 +698,38 @@ def test_end_to_end_single_manifest_probe(monkeypatch):
     java_probes = [c for c in orch.commands if "java -version" in c]
     assert len(java_probes) == 1  # facade pre-flight only
     assert (result.output or "").count("[pre-flight]") == 0  # matched: silent
+
+
+class RequirementRecordingManager:
+    def __init__(self):
+        self.specs = []
+
+    def resolve(self, spec, working_directory="/workspace"):
+        self.specs.append((spec, working_directory))
+        return None
+
+
+def test_real_build_and_maven_classes_preserve_requirement_at_resolution_seam():
+    orch = EndToEndOrch(
+        [(True, "BUILD SUCCESS")],
+        java="17",
+        manifest={},
+    )
+    manager = RequirementRecordingManager()
+    internal = MavenTool(orch, toolchain_manager=manager)
+    build = BuildTool(orch, maven_tool=internal)
+
+    result = build.execute(
+        action="compile",
+        working_directory="/workspace/proj",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "MAVEN_VERSION_NOT_RESOLVED"
+    assert len(manager.specs) == 1
+    spec, workdir = manager.specs[0]
+    assert workdir == "/workspace/proj"
+    assert spec.version_requirement is not None
+    assert spec.version_requirement.raw == "[3.9,4.0)"
+    assert spec.version_requirement.kind == "range"

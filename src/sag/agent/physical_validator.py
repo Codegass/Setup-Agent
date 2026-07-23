@@ -26,12 +26,14 @@ Example Usage:
 
 import json
 import os
+import posixpath
 import re
 import shlex
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
@@ -70,6 +72,98 @@ _NON_PROJECT_TOP_LEVEL = {
     "pkg_resources",
     "_distutils_hack",
 }
+
+_MAVEN_REACTOR_MAX_DEPTH = 32
+_MAVEN_REACTOR_MAX_NODES = 256
+_MAVEN_REACTOR_CONFLICT_REASONS = {
+    "maven_reactor_probe_unavailable": "reactor filesystem probes are unavailable",
+    "maven_reactor_root_unverified": "reactor root could not be verified",
+    "maven_module_outside_project": "a declared module escapes the project root",
+    "maven_module_unresolved": "a declared module path could not be resolved",
+    "maven_module_pom_unreadable": "a declared module POM could not be read",
+    "maven_module_pom_outside_project": ("a Maven module POM resolves outside the project root"),
+    "maven_module_pom_invalid": "a declared module POM is not valid XML",
+    "maven_module_artifact_unresolved": (
+        "a verified non-POM Maven leaf has no resolvable artifact expectation"
+    ),
+    "maven_profile_activation_unresolved": (
+        "a module-bearing Maven profile has runtime-dependent activation"
+    ),
+    "maven_profile_selection_unresolved": (
+        "the recorded Maven profile selection could not be parsed exactly"
+    ),
+    "maven_profile_execution_unfinished": (
+        "the newest reactor-bound Maven build or test is still running"
+    ),
+    "maven_config_changes_graph": ("the nearest .mvn/maven.config contains graph-changing options"),
+    "maven_config_outside_project": (
+        "the nearest .mvn configuration resolves outside the project root"
+    ),
+    "maven_config_unreadable": "the nearest .mvn/maven.config could not be read",
+    "maven_module_cycle": "the declared module graph contains a cycle",
+    "maven_module_depth_exceeded": "the declared module graph exceeds the depth limit",
+    "maven_module_cap_exceeded": "the declared module graph exceeds the node limit",
+}
+
+
+class _MavenReactorLimit(Exception):
+    """The validator could not prove a bounded Maven reactor snapshot."""
+
+    def __init__(self, reason_code: str):
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
+
+class _MavenReactorCycle(Exception):
+    """A recursive Maven module edge points back into the active DFS stack."""
+
+    def __init__(self, members: frozenset[str]):
+        super().__init__("maven reactor cycle")
+        self.members = members
+
+
+@dataclass(frozen=True, slots=True)
+class _MavenReactorRecord:
+    module_dir: str
+    pom_content: str
+    has_safe_children: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _MavenProfileSelection:
+    enabled: frozenset[str] = frozenset()
+    disabled: frozenset[str] = frozenset()
+    explicit: bool = False
+    conservative: bool = False
+    conflicts: Tuple[str, ...] = ()
+    working_dir: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MavenReactorSnapshot:
+    records: Tuple[_MavenReactorRecord, ...]
+    complete: bool
+    conflicts: Tuple[str, ...] = ()
+    reason: str = ""
+    profile_selection: _MavenProfileSelection = _MavenProfileSelection()
+
+
+@dataclass(frozen=True, slots=True)
+class _MavenModuleDeclarations:
+    modules: Tuple[str, ...]
+    conflicts: Tuple[str, ...] = ()
+
+
+class _MavenArtifactExpectations(list):
+    """List-compatible expectations carrying their immutable source snapshot."""
+
+    def __init__(
+        self,
+        values: List[Dict[str, str]],
+        reactor_snapshot: _MavenReactorSnapshot,
+    ):
+        super().__init__(values)
+        self.reactor_snapshot = reactor_snapshot
 
 
 def _normalize_dist_name(name: str) -> str:
@@ -2314,6 +2408,8 @@ class PhysicalValidator:
                 for key in (
                     "venv_exists",
                     "pip_check_clean",
+                    "distribution_record_ok",
+                    "distribution_origin_ok",
                     "imports_ok",
                     "import_failures",
                     "compileall_coverage",
@@ -2325,6 +2421,10 @@ class PhysicalValidator:
                     "native_artifact_ok",
                 )
             }
+            if isinstance(python_build.get("test_entry_ready"), bool):
+                evidence["test_entry_ready"] = python_build["test_entry_ready"]
+                if python_build.get("test_entry_candidate"):
+                    evidence["test_entry_candidate"] = python_build["test_entry_candidate"]
             # Skipped-rung warnings (e.g. "imports rung skipped: ...") must be
             # VISIBLE in the report, not a silent None in the details.
             evidence["warnings"].extend(python_build.get("warnings") or [])
@@ -2349,13 +2449,40 @@ class PhysicalValidator:
         # Per-module expectations are authoritative and must be checked even when
         # build fingerprints exist — fingerprints for SOME modules used to
         # short-circuit the whole build to success. Modules disabled in the build
-        # config (profile-gated/commented out) are excluded from the expectations
-        # (see _parse_maven_expected_artifacts), so they never count against us.
+        # config (commented out or in a profile proven inactive without -P) are
+        # excluded; activeByDefault profile modules are included. A declared or
+        # dynamically activated module that cannot be verified is omitted from
+        # unsafe path probes but separately caps the verdict via the immutable
+        # reactor snapshot below.
         expected_artifacts = (
             self._get_expected_artifacts(project_dir, build_system)
             if build_system in ("maven", "gradle")
             else []
         )
+        maven_reactor_snapshot = (
+            getattr(expected_artifacts, "reactor_snapshot", None)
+            if build_system == "maven"
+            else None
+        )
+        if isinstance(maven_reactor_snapshot, _MavenReactorSnapshot):
+            evidence["maven_reactor_complete"] = maven_reactor_snapshot.complete
+            evidence["maven_reactor_modules"] = [
+                record.module_dir for record in maven_reactor_snapshot.records
+            ]
+            evidence["maven_reactor_conflicts"] = list(maven_reactor_snapshot.conflicts)
+            if maven_reactor_snapshot.profile_selection.explicit:
+                evidence["maven_profiles_enabled"] = sorted(
+                    maven_reactor_snapshot.profile_selection.enabled
+                )
+                evidence["maven_profiles_disabled"] = sorted(
+                    maven_reactor_snapshot.profile_selection.disabled
+                )
+            if maven_reactor_snapshot.profile_selection.conservative:
+                evidence["maven_profile_selection_conservative"] = True
+            if not maven_reactor_snapshot.complete:
+                evidence["warnings"].append(
+                    "Maven reactor could not be fully verified: " + maven_reactor_snapshot.reason
+                )
         coverage_info = (
             self._verify_expected_artifacts(project_dir, expected_artifacts)
             if expected_artifacts
@@ -2459,6 +2586,19 @@ class PhysicalValidator:
             success, complete = False, False
             reason = "No build evidence found (no artifacts or build fingerprints)"
 
+        # A rejected Maven module is uncertainty, not permission to shrink the
+        # denominator. Safe records can still prove that a build happened, but
+        # an incomplete reactor snapshot can never produce a full-green build.
+        if (
+            isinstance(maven_reactor_snapshot, _MavenReactorSnapshot)
+            and not maven_reactor_snapshot.complete
+        ):
+            complete = False
+            reactor_reason = (
+                "Maven reactor could not be fully verified: " + maven_reactor_snapshot.reason
+            )
+            reason = f"{reason}; {reactor_reason}" if reason else reactor_reason
+
         # Surface the build command + timed duration (if a command tracker with a
         # recorded build is attached) and the primary artifact for the metrics
         # read model. validate_build_status itself does not execute the build, so
@@ -2488,6 +2628,11 @@ class PhysicalValidator:
             conflicts = []
 
         conflicts.extend(self._collect_env_conflicts())
+        if (
+            isinstance(maven_reactor_snapshot, _MavenReactorSnapshot)
+            and not maven_reactor_snapshot.complete
+        ):
+            conflicts.append("maven_reactor_unverified")
         if python_build is not None:
             conflicts.extend(python_build.get("metrics_conflicts") or [])
 
@@ -2501,6 +2646,8 @@ class PhysicalValidator:
             "conflicts": conflicts,
             "evidence_refs": self._build_status_evidence_refs(project_dir, artifacts_result),
         }
+        if python_build is not None and isinstance(python_build.get("test_entry_ready"), bool):
+            result["test_entry_ready"] = python_build["test_entry_ready"]
 
         logger.info(f"Build validation complete: {evidence_status.upper()} - {reason}")
         return result
@@ -2610,9 +2757,35 @@ class PhysicalValidator:
         manifest = read_build_requirements(self.docker_orchestrator) or {}
         venv = manifest.get("python_venv") or f"{project_dir.rstrip('/')}/.venv"
         packages = manifest.get("python_packages") or []
+        survey = manifest.get("survey")
+        if not isinstance(survey, dict):
+            survey = {}
+        try:
+            facts_version = int(
+                survey.get("analyzer_version") or manifest.get("analyzer_version") or 0
+            )
+        except (TypeError, ValueError):
+            facts_version = 0
+        distribution_name = str(manifest.get("python_distribution_name") or "").strip()
+        strict_distribution = facts_version >= 8
+        survey_root = str(
+            survey.get("project_path")
+            or manifest.get("python_root")
+            or manifest.get("build_root")
+            or project_dir
+        ).rstrip("/")
+        install_root = str(manifest.get("python_root") or survey_root).rstrip("/")
+        normalized_survey_root = posixpath.normpath(survey_root)
+        normalized_install_root = posixpath.normpath(install_root)
+        install_root_is_scoped = normalized_install_root == normalized_survey_root or (
+            normalized_install_root.startswith(f"{normalized_survey_root}/")
+        )
+        package_paths = (manifest.get("python_package_paths") or []) if strict_distribution else []
         result: Dict[str, any] = {
             "venv_exists": False,
             "pip_check_clean": None,
+            "distribution_record_ok": None,
+            "distribution_origin_ok": None,
             "imports_ok": None,
             "import_failures": [],
             "compileall_coverage": None,
@@ -2626,6 +2799,13 @@ class PhysicalValidator:
             # artifact (.so/.dylib) is present. None until probed / not
             # applicable; False caps the build at PARTIAL "native core not built".
             "native_artifact_ok": None,
+            # A venv alone never makes a native project test-ready. Facts-v8
+            # may expose a re-verified smoke coordinate that PythonTool will
+            # collect and bound before executing.
+            "test_entry_ready": (
+                False if strict_distribution and manifest.get("has_native_build") else None
+            ),
+            "test_entry_candidate": None,
             "success": False,
             "complete": False,
             "reason": "",
@@ -2637,6 +2817,35 @@ class PhysicalValidator:
         if not result["venv_exists"]:
             result["reason"] = f"No venv at {venv} — the Python environment was never set up"
             return result
+
+        if strict_distribution and not distribution_name:
+            # A facts-v8 setup.py/setup.cfg project may have no statically
+            # observable distribution name.  Fail CLOSED on exact ownership:
+            # never fall through to the legacy broad record scan, but preserve
+            # the real evidence that a venv exists as PARTIAL rather than
+            # inventing a hard setup failure.
+            result["success"] = True
+            result["reason"] = (
+                "Facts-v8 exact distribution ownership unverifiable: manifest "
+                "is missing python_distribution_name"
+            )
+            result["warnings"].append(result["reason"])
+            return result
+
+        if strict_distribution and not install_root_is_scoped:
+            result["reason"] = (
+                f"Surveyed Python install root {install_root} escapes repository root "
+                f"{survey_root}"
+            )
+            return result
+
+        if strict_distribution and manifest.get("has_native_build"):
+            smoke_candidate = self._verified_smoke_candidate(
+                survey_root,
+                manifest.get("python_smoke_candidates") or [],
+            )
+            result["test_entry_candidate"] = smoke_candidate
+            result["test_entry_ready"] = smoke_candidate is not None
 
         # Module form ('{venv}/bin/python -m pip check'), never the
         # '{venv}/bin/pip' binary a plain `uv venv` does not ship (bug #12).
@@ -2659,10 +2868,44 @@ class PhysicalValidator:
         else:
             result["pip_check_clean"] = False
 
+        # Facts-v8 names the distribution observed by the survey. That exact
+        # record is the only record allowed to prove the root project was
+        # installed. In particular, a local provider such as apache-tvm-ffi
+        # must never stand in for the root apache-tvm distribution.
+        if strict_distribution:
+            strict_record = self._strict_installed_distribution(
+                venv,
+                install_root,
+                distribution_name,
+                survey_root=survey_root,
+            )
+            result["distribution_record_ok"] = strict_record["record_ok"]
+            result["distribution_origin_ok"] = strict_record["origin_ok"]
+            if not strict_record["record_ok"]:
+                result["reason"] = strict_record["reason"]
+                return result
+            installed = strict_record["packages"]
+            declared_path_imports = self._manifest_package_imports(package_paths)
+            if declared_path_imports:
+                packages = declared_path_imports
+                if installed:
+                    unowned = sorted(name for name in packages if name not in installed)
+                    if unowned:
+                        result["reason"] = (
+                            "Survey package path import(s) are absent from the exact "
+                            f"{distribution_name} installed record: {', '.join(unowned)}"
+                        )
+                        return result
+            elif installed:
+                packages = installed
+        else:
+            # Legacy manifest compatibility: keep the historical project-record
+            # ladder for surveys that predate an exact distribution fact.
+            installed = self._installed_top_level_packages(venv, project_dir)
+
         # The PROJECT's own installed top_level.txt record gates the import
         # targets ALWAYS (bug #8, see docstring); still honest — read from
         # disk, never invented, never a dependency's record.
-        installed = self._installed_top_level_packages(venv, project_dir)
         if packages and installed:
             junk = sorted(name for name in packages if name not in installed)
             if junk:
@@ -2675,7 +2918,8 @@ class PhysicalValidator:
             # The FULL installed set, never manifest ∩ installed: discovery's
             # flat-layout ranking can narrow the manifest below the installed
             # record, and a broken installed sibling must still BLOCK.
-            packages = installed
+            if not strict_distribution:
+                packages = installed
         elif not packages:
             # Empty manifest (package_dir layouts, bug #6): the installed
             # record is the fallback source of import targets.
@@ -2722,7 +2966,11 @@ class PhysicalValidator:
                 )
                 return result
 
-        package_dirs = self._python_package_dirs(project_dir, packages)
+        package_dirs = self._python_package_dirs(
+            install_root if strict_distribution else project_dir,
+            packages,
+            package_paths=package_paths,
+        )
         self._execute_command_with_logging(
             f"{venv}/bin/python -m compileall -q "
             + " ".join(shlex.quote(path) for path in package_dirs),
@@ -2757,7 +3005,8 @@ class PhysicalValidator:
         so_missing = False
         if manifest.get("has_c_extensions"):
             so_probe = self._execute_command_with_logging(
-                f"find {project_dir} {venv} -name '*.so' -type f 2>/dev/null | head -1",
+                f"find {install_root if strict_distribution else project_dir} {venv} "
+                "-name '*.so' -type f 2>/dev/null | head -1",
                 "C-extension artifacts",
             )
             result["ext_modules_ok"] = bool((so_probe.get("output") or "").strip())
@@ -2771,22 +3020,55 @@ class PhysicalValidator:
         # parts and tests may still run.
         native_missing = False
         if manifest.get("has_native_build"):
-            # Search the python package (project_dir) and venv — where a copied
-            # libtvm.so lands — PLUS the repo-root build/ tree CMake conventionally
-            # emits into (the python root is a subdir, so its parent is the repo
-            # root). All paths deduped/guarded so a missing build/ dir is silent.
-            search_roots = {project_dir.rstrip("/"), venv.rstrip("/")}
-            repo_root = project_dir.rstrip("/").rsplit("/", 1)[0]
-            if repo_root and repo_root != project_dir.rstrip("/"):
-                search_roots.add(f"{repo_root}/build")
-            native_probe = self._execute_command_with_logging(
-                f"find {' '.join(sorted(search_roots))} "
-                f"\\( -name '*.so' -o -name '*.dylib' \\) "
-                f"-type f 2>/dev/null | head -1",
-                "native core artifacts",
-            )
-            result["native_artifact_ok"] = bool((native_probe.get("output") or "").strip())
+            if strict_distribution:
+                # Facts-v8 records the native output locations actually derived
+                # from the build metadata. Do not scan the repo or venv: a
+                # dependency's numpy/tvm-ffi .so is not root-project evidence.
+                search_roots = self._manifest_relative_roots(
+                    survey_root,
+                    manifest.get("native_artifact_roots") or [],
+                )
+            else:
+                # Legacy manifest compatibility: old surveys had no grounded
+                # native_artifact_roots, so retain their broad best-effort scan.
+                search_roots = {
+                    project_dir.rstrip("/"),
+                    venv.rstrip("/"),
+                }
+                repo_root = project_dir.rstrip("/").rsplit("/", 1)[0]
+                if repo_root and repo_root != project_dir.rstrip("/"):
+                    search_roots.add(f"{repo_root}/build")
+            if search_roots:
+                native_probe = self._execute_command_with_logging(
+                    "find "
+                    + " ".join(shlex.quote(path) for path in sorted(search_roots))
+                    + " \\( -name '*.so' -o -name '*.dylib' \\) "
+                    + "-type f 2>/dev/null"
+                    + ("" if strict_distribution else " | head -1"),
+                    "native core artifacts",
+                )
+                candidates = [
+                    line.strip()
+                    for line in (native_probe.get("output") or "").splitlines()
+                    if line.strip()
+                ]
+                result["native_artifact_ok"] = (
+                    self._verified_native_artifact(
+                        candidates,
+                        search_roots,
+                        survey_root,
+                    )
+                    if strict_distribution
+                    else bool(candidates)
+                )
+            else:
+                result["native_artifact_ok"] = False
+                result["warnings"].append(
+                    "native artifact rung has no safe survey-derived output root"
+                )
             native_missing = not result["native_artifact_ok"]
+            if strict_distribution and result["native_artifact_ok"]:
+                result["test_entry_ready"] = True
 
         if optional_ext_failures:
             # Bug #14: an unimportable optional extension module is
@@ -2851,6 +3133,227 @@ class PhysicalValidator:
                 f"{imported}, {coverage_note}"
             )
         return result
+
+    def _strict_installed_distribution(
+        self,
+        venv: str,
+        project_root: str,
+        distribution_name: str,
+        *,
+        survey_root: Optional[str] = None,
+    ) -> Dict[str, any]:
+        """Return facts-v8 evidence for exactly one installed distribution.
+
+        A PEP 610 record is accepted only when its local file origin resolves
+        to the surveyed Python install root. A different local editable (including a
+        provider dependency) is never a fallback.
+        """
+        site = f"{venv}/lib/python*/site-packages"
+        listing = self._execute_command_with_logging(
+            f"find {site} -maxdepth 1 "
+            f"\\( -name '*.dist-info' -o -name '*.egg-info' \\) "
+            f"2>/dev/null",
+            f"locating exact {distribution_name} distribution record",
+        )
+        matches = sorted(
+            {
+                line.strip()
+                for line in (listing.get("output") or "").splitlines()
+                if line.strip() and _dist_record_matches(line.strip(), distribution_name)
+            }
+        )
+        if len(matches) != 1:
+            detail = "not found" if not matches else f"ambiguous ({len(matches)} records)"
+            return {
+                "record_ok": False,
+                "origin_ok": None,
+                "packages": [],
+                "reason": (
+                    f"Exact installed distribution record for {distribution_name} "
+                    f"{detail} — the root project install is not physically verified"
+                ),
+            }
+
+        record_dir = matches[0]
+        direct = self._execute_command_with_logging(
+            f"cat {shlex.quote(record_dir)}/direct_url.json 2>/dev/null",
+            f"reading {distribution_name} PEP 610 origin",
+        )
+        direct_text = (direct.get("output") or "").strip()
+        if not direct_text:
+            return {
+                "record_ok": False,
+                "origin_ok": False,
+                "packages": [],
+                "reason": (
+                    f"Exact installed distribution {distribution_name} has no PEP 610 "
+                    "local-origin record — project ownership is unverified"
+                ),
+            }
+        try:
+            payload = json.loads(direct_text)
+            parsed = urlparse(str(payload.get("url") or ""))
+            if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+                raise ValueError("origin is not a local file URL")
+            origin = unquote(parsed.path)
+            realpaths = self._execute_command_with_logging(
+                "realpath -m -- "
+                + " ".join(
+                    shlex.quote(path)
+                    for path in (
+                        "/workspace",
+                        origin,
+                        project_root,
+                        survey_root or project_root,
+                    )
+                ),
+                f"confirming {distribution_name} install origin",
+            )
+            resolved = [
+                line.strip()
+                for line in (realpaths.get("output") or "").splitlines()
+                if line.strip()
+            ]
+            origin_ok = (
+                realpaths.get("success") is True
+                and len(resolved) == 4
+                and resolved[0] != "/"
+                and resolved[3].startswith(f"{resolved[0].rstrip('/')}/")
+                and resolved[1] == resolved[2]
+                and (
+                    resolved[2] == resolved[3]
+                    or resolved[2].startswith(f"{resolved[3].rstrip('/')}/")
+                )
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            origin_ok = False
+        if not origin_ok:
+            return {
+                "record_ok": False,
+                "origin_ok": False,
+                "packages": [],
+                "reason": (
+                    f"Installed {distribution_name} PEP 610 origin does not "
+                    f"resolve to surveyed Python install root {project_root}"
+                ),
+            }
+
+        top_level = self._execute_command_with_logging(
+            f"cat {shlex.quote(record_dir)}/top_level.txt 2>/dev/null",
+            f"reading {distribution_name} top_level.txt",
+        )
+        packages = sorted(
+            {
+                name
+                for line in (top_level.get("output") or "").splitlines()
+                if (name := line.strip()) and name not in _NON_PROJECT_TOP_LEVEL
+            }
+        )
+        return {
+            "record_ok": True,
+            "origin_ok": True,
+            "packages": packages,
+            "reason": "",
+        }
+
+    @staticmethod
+    def _manifest_package_imports(package_paths: List[Dict[str, any]]) -> List[str]:
+        """Safe import names declared by facts-v8 wheel package mappings."""
+        names = []
+        for entry in package_paths:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("import_name") or "").strip()
+            if not name or not all(part.isidentifier() for part in name.split(".")):
+                continue
+            if name not in names:
+                names.append(name)
+        return names
+
+    @staticmethod
+    def _manifest_relative_roots(project_root: str, entries: List[str]) -> set[str]:
+        """Join trusted relative survey facts without allowing root escape."""
+        root = posixpath.normpath(project_root)
+        roots: set[str] = set()
+        for entry in entries:
+            relative = str(entry or "").strip()
+            if not relative or relative.startswith("/"):
+                continue
+            normalized = posixpath.normpath(relative)
+            if normalized in ("", ".") or normalized == ".." or normalized.startswith("../"):
+                continue
+            candidate = posixpath.normpath(posixpath.join(root, normalized))
+            if candidate.startswith(f"{root}/"):
+                roots.add(candidate)
+        return roots
+
+    def _verified_smoke_candidate(
+        self,
+        project_root: str,
+        candidates: List[Dict[str, any]],
+    ) -> Optional[str]:
+        """First existing, survey-grounded coordinate PythonTool can bound.
+
+        This validator proves only that the coordinate is current and stays
+        inside the surveyed root. PythonTool owns scoped collection and the
+        1..50 execution bound.
+        """
+        from sag.tools.internal.python_tool import verified_python_smoke_candidate
+
+        verified = verified_python_smoke_candidate(
+            lambda command: self._execute_command_with_logging(
+                command,
+                "verifying bounded native smoke entry",
+            ),
+            project_root,
+            candidates,
+        )
+        return verified["absolute_path"] if verified else None
+
+    def _verified_native_artifact(
+        self,
+        candidates: List[str],
+        roots: set[str],
+        project_root: str,
+    ) -> bool:
+        """Require both lexical and realpath containment for native output."""
+        normalized_roots = {posixpath.normpath(root) for root in roots}
+        for path in candidates:
+            candidate = posixpath.normpath(path)
+            if not any(
+                candidate == root or candidate.startswith(f"{root}/") for root in normalized_roots
+            ):
+                continue
+            ordered_roots = sorted(normalized_roots)
+            probe = self._execute_command_with_logging(
+                "realpath -m -- "
+                + " ".join(
+                    shlex.quote(item)
+                    for item in ("/workspace", candidate, project_root, *ordered_roots)
+                ),
+                "confirming native artifact ownership",
+            )
+            resolved = [
+                line.strip() for line in (probe.get("output") or "").splitlines() if line.strip()
+            ]
+            if not probe.get("success") or len(resolved) != len(ordered_roots) + 3:
+                continue
+            resolved_workspace, resolved_candidate, resolved_project, *resolved_roots = resolved
+            if resolved_workspace == "/" or not resolved_project.startswith(
+                f"{resolved_workspace.rstrip('/')}/"
+            ):
+                continue
+            safe_roots = [
+                root
+                for root in resolved_roots
+                if root == resolved_project or root.startswith(f"{resolved_project}/")
+            ]
+            if any(
+                resolved_candidate == root or resolved_candidate.startswith(f"{root}/")
+                for root in safe_roots
+            ):
+                return True
+        return False
 
     def _installed_top_level_packages(self, venv: str, project_dir: str) -> List[str]:
         """Import targets from the PROJECT's OWN installed record when the
@@ -2918,10 +3421,36 @@ class PhysicalValidator:
                 packages.append(name)
         return sorted(packages)
 
-    def _python_package_dirs(self, project_dir: str, packages: List[str]) -> List[str]:
+    def _python_package_dirs(
+        self,
+        project_dir: str,
+        packages: List[str],
+        *,
+        package_paths: Optional[List[Dict[str, any]]] = None,
+    ) -> List[str]:
         """Package source dirs, src-layout probed before flat layout; the
-        project dir is the honest last resort when nothing is declared."""
+        project dir is the honest last resort when nothing is declared.
+
+        Facts-v8 wheel package mappings are authoritative when present: only
+        their non-escaping source paths enter compileall/coverage.
+        """
         root = project_dir.rstrip("/")
+        declared_dirs: List[str] = []
+        for entry in package_paths or []:
+            if not isinstance(entry, dict):
+                continue
+            relative = str(entry.get("path") or "").strip()
+            if not relative or relative.startswith("/"):
+                continue
+            normalized = posixpath.normpath(relative)
+            if normalized in ("", ".") or normalized == ".." or normalized.startswith("../"):
+                continue
+            candidate = posixpath.normpath(posixpath.join(root, normalized))
+            if candidate.startswith(f"{root}/") and candidate not in declared_dirs:
+                declared_dirs.append(candidate)
+        if declared_dirs:
+            return declared_dirs
+
         dirs: List[str] = []
         for package in packages:
             for candidate in (f"{root}/src/{package}", f"{root}/{package}"):
@@ -3965,61 +4494,806 @@ class PhysicalValidator:
 
         return expected
 
-    def _active_maven_module_dirs(self, project_dir: str) -> List[str]:
-        """Active Maven reactor module dirs: root + the root pom's active
-        ``<modules>`` (recursively), with ``<profiles>`` stripped so profile-gated
-        / pom-disabled modules are excluded.
+    @staticmethod
+    def _path_is_within(path: str, root: str) -> bool:
+        return path == root or path.startswith(root.rstrip("/") + "/")
 
-        This is the "detected" module set the build report falls back to when no
-        live Maven Reactor Summary was captured. It counts only modules that are
-        actually part of the build — never standalone non-reactor poms (e.g.
-        commons-chain's ``apps/*`` examples). Mirrors the module walk in
-        :meth:`_parse_maven_expected_artifacts`.
+    def _existing_container_realpath(self, path: str) -> Optional[str]:
+        """Return one normalized absolute realpath, or ``None`` when unproved."""
+        normalized = posixpath.normpath(str(path or "").strip())
+        if not normalized.startswith("/") or any(char in normalized for char in "\x00\r\n"):
+            return None
+        result = self._execute_command_with_logging(
+            f"realpath -e -- {shlex.quote(normalized)}",
+            "resolving Maven reactor path",
+        )
+        if not result.get("success"):
+            return None
+        lines = (result.get("output") or "").splitlines()
+        if len(lines) != 1:
+            return None
+        resolved = posixpath.normpath(lines[0].strip())
+        if not resolved.startswith("/") or any(char in resolved for char in "\x00\r\n"):
+            return None
+        return resolved
+
+    @staticmethod
+    def _profile_marker_present(command: str) -> bool:
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            tokens = []
+        if any(
+            token in {"-P", "--activate-profiles"}
+            or (token.startswith("-P") and token != "-P")
+            or token.startswith("--activate-profiles=")
+            for token in tokens
+        ):
+            return True
+        return bool(
+            re.search(
+                r"(?<!\S)(?:-P(?:\S*)?|--activate-profiles(?:=\S*|\s|$))",
+                command,
+            )
+        )
+
+    @staticmethod
+    def _parse_maven_profile_values(
+        values: List[str],
+    ) -> Optional[Tuple[frozenset[str], frozenset[str]]]:
+        enabled: set[str] = set()
+        disabled: set[str] = set()
+        for value in values:
+            for raw_item in value.split(","):
+                item = raw_item.strip()
+                if not item:
+                    return None
+                target = enabled
+                if item[0] in {"!", "-"}:
+                    target = disabled
+                    item = item[1:]
+                if (
+                    not item
+                    or item[0] in {"!", "-"}
+                    or any(char.isspace() or char in "\x00\r\n," for char in item)
+                ):
+                    return None
+                target.add(item)
+        if enabled & disabled:
+            return None
+        return frozenset(enabled), frozenset(disabled)
+
+    def _maven_receipt_binding(
+        self,
+        receipt: Dict[str, any],
+        project_dir: str,
+    ) -> Tuple[Optional[bool], Optional[List[str]], Optional[str]]:
+        """Return exact reactor binding plus Maven launcher's ``.mvn`` seed."""
+        command = str(receipt.get("command") or "").strip()
+        tool = str(receipt.get("tool") or "").strip().lower()
+        if not command or (tool and tool != "maven"):
+            return False, None, None
+
+        working_dir = posixpath.normpath(str(receipt.get("working_dir") or "").strip())
+        working_dir = working_dir if working_dir.startswith("/") else None
+        marker = self._profile_marker_present(command)
+
+        def same_existing_path(candidate: str, expected: str) -> Optional[bool]:
+            if candidate == expected:
+                return True
+            if not self.docker_orchestrator:
+                return False
+            candidate_real = self._existing_container_realpath(candidate)
+            expected_real = self._existing_container_realpath(expected)
+            if candidate_real is None or expected_real is None:
+                return None
+            return candidate_real == expected_real
+
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            cwd_binding = (
+                same_existing_path(working_dir, project_dir) if working_dir is not None else False
+            )
+            return (
+                (None if marker and cwd_binding is not False else False),
+                None,
+                working_dir,
+            )
+
+        executable_indexes = [
+            index
+            for index, token in enumerate(tokens)
+            if posixpath.basename(token) in {"mvn", "mvnw"}
+        ]
+        if not executable_indexes:
+            cwd_binding = (
+                same_existing_path(working_dir, project_dir) if working_dir is not None else False
+            )
+            if tool == "maven" and cwd_binding is True:
+                return (None if marker else True), tokens, working_dir
+            if marker and cwd_binding is None:
+                return None, tokens, working_dir
+            return False, tokens, working_dir
+        if len(executable_indexes) != 1:
+            cwd_binding = (
+                same_existing_path(working_dir, project_dir) if working_dir is not None else False
+            )
+            return (
+                (None if marker and cwd_binding is not False else False),
+                tokens,
+                working_dir,
+            )
+
+        pom_values: List[Tuple[str, bool]] = []
+        index = executable_indexes[0] + 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-f", "--file"}:
+                if index + 1 >= len(tokens):
+                    return None, tokens, working_dir
+                pom_values.append((tokens[index + 1], True))
+                index += 2
+                continue
+            if token.startswith("--file="):
+                pom_values.append((token.split("=", 1)[1], False))
+            elif token.startswith("-f") and token not in {"-f", "-fae", "-ff", "-fn"}:
+                pom_values.append((token[2:], False))
+            index += 1
+
+        if pom_values:
+            if working_dir is None:
+                return None, tokens, working_dir
+            normalized_poms: set[str] = set()
+            separated_seeds: set[str] = set()
+            for value, separated in pom_values:
+                if not value or any(char in value for char in "\x00\r\n"):
+                    return None, tokens, working_dir
+                candidate = value if value.startswith("/") else posixpath.join(working_dir, value)
+                candidate = posixpath.normpath(candidate)
+                directory_state = None
+                if self.docker_orchestrator:
+                    probe = self._execute_command_with_logging(
+                        f"test -d {shlex.quote(candidate)}",
+                        "checking Maven -f target type",
+                    )
+                    if probe.get("success"):
+                        directory_state = True
+                    elif probe.get("exit_code") == 1:
+                        directory_state = False
+                    else:
+                        return None, tokens, working_dir
+                if directory_state is None:
+                    directory_state = (
+                        candidate == project_dir
+                        or not posixpath.splitext(posixpath.basename(candidate))[1]
+                    )
+                pom_candidate = (
+                    posixpath.join(candidate, "pom.xml") if directory_state else candidate
+                )
+                normalized_poms.add(pom_candidate)
+                if separated:
+                    separated_seeds.add(
+                        candidate if directory_state else posixpath.dirname(candidate)
+                    )
+            if len(normalized_poms) != 1:
+                return None, tokens, working_dir
+            binding = same_existing_path(
+                next(iter(normalized_poms)),
+                posixpath.join(project_dir, "pom.xml"),
+            )
+            if binding is None:
+                return None, tokens, working_dir
+            if not binding:
+                return False, tokens, working_dir
+            if len(separated_seeds) > 1:
+                return None, tokens, working_dir
+            launcher_basedir = next(iter(separated_seeds)) if separated_seeds else working_dir
+            return (
+                True,
+                tokens,
+                launcher_basedir,
+            )
+
+        if working_dir is None:
+            return (None if marker else False), tokens, working_dir
+        cwd_binding = same_existing_path(working_dir, project_dir)
+        return cwd_binding, tokens, working_dir
+
+    def _tracked_maven_receipts(self) -> List[Dict[str, any]]:
+        command_tracker = getattr(self, "command_tracker", None)
+        if command_tracker is None:
+            return []
+        receipts: List[Dict[str, any]] = []
+        for method_name in (
+            "get_all_execution_receipts",
+            "get_all_build_commands",
+            "get_all_test_commands",
+        ):
+            method = getattr(command_tracker, method_name, None)
+            if not callable(method):
+                continue
+            values = method()
+            if isinstance(values, list):
+                receipts.extend(
+                    value
+                    for value in values
+                    if isinstance(value, dict)
+                    and (
+                        method_name != "get_all_execution_receipts"
+                        or value.get("runner_dispatched") is True
+                    )
+                )
+        if receipts:
+            return receipts
+        for method_name in ("get_last_build_command", "get_last_test_command"):
+            method = getattr(command_tracker, method_name, None)
+            value = method() if callable(method) else None
+            if isinstance(value, dict):
+                receipts.append(value)
+        return receipts
+
+    def _recorded_maven_profile_selection(
+        self,
+        project_dir: str,
+    ) -> _MavenProfileSelection:
+        """Profiles from the newest build/test receipt bound to this reactor."""
+        relevant: List[Tuple[Dict[str, any], List[str], str]] = []
+        ambiguous_binding = False
+        for receipt in self._tracked_maven_receipts():
+            binding, tokens, working_dir = self._maven_receipt_binding(
+                receipt,
+                project_dir,
+            )
+            if binding is None:
+                ambiguous_binding = True
+            elif binding is True:
+                relevant.append(
+                    (
+                        receipt,
+                        tokens or [],
+                        working_dir or project_dir,
+                    )
+                )
+
+        unresolved = _MavenProfileSelection(
+            explicit=True,
+            conflicts=("maven_profile_selection_unresolved",),
+            working_dir=project_dir,
+        )
+        if ambiguous_binding:
+            return unresolved
+        if not relevant:
+            return _MavenProfileSelection(working_dir=project_dir)
+        if len(relevant) > 1:
+            timestamps = [str(item[0].get("timestamp") or "") for item in relevant]
+            if not all(timestamps):
+                if any(
+                    self._profile_marker_present(str(item[0].get("command") or ""))
+                    for item in relevant
+                ):
+                    return unresolved
+                return _MavenProfileSelection(working_dir=project_dir)
+            newest = max(timestamps)
+            latest = [item for item, timestamp in zip(relevant, timestamps) if timestamp == newest]
+            if len(latest) != 1:
+                return unresolved
+            receipt, tokens, working_dir = latest[0]
+        else:
+            receipt, tokens, working_dir = relevant[0]
+
+        command = str(receipt.get("command") or "").strip()
+        dispatch_status = str(receipt.get("dispatch_status") or "").strip()
+        invocation_status = str(receipt.get("invocation_status") or "").strip()
+        unfinished = invocation_status == "pending" or dispatch_status in {
+            "running_detached",
+            "liveness_unknown_detached",
+        }
+        receipt_conflicts = ("maven_profile_execution_unfinished",) if unfinished else ()
+        if not self._profile_marker_present(command):
+            return _MavenProfileSelection(
+                conservative=unfinished,
+                conflicts=receipt_conflicts,
+                working_dir=working_dir,
+            )
+        if any(token in {"&&", "||", ";", "|", "&"} for token in tokens):
+            return unresolved
+        executable_indexes = [
+            index
+            for index, token in enumerate(tokens)
+            if posixpath.basename(token) in {"mvn", "mvnw"}
+        ]
+        if len(executable_indexes) != 1:
+            return unresolved
+
+        values: List[str] = []
+        index = executable_indexes[0] + 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-P", "--activate-profiles"}:
+                if index + 1 >= len(tokens):
+                    return unresolved
+                values.append(tokens[index + 1])
+                index += 2
+                continue
+            if token.startswith("-P") and token != "-P":
+                values.append(token[2:])
+            elif token.startswith("--activate-profiles="):
+                values.append(token.split("=", 1)[1])
+            elif token.startswith("--activate-profiles"):
+                return unresolved
+            index += 1
+
+        parsed = self._parse_maven_profile_values(values) if values else None
+        if parsed is None:
+            return unresolved
+        enabled, disabled = parsed
+        return _MavenProfileSelection(
+            enabled=enabled,
+            disabled=disabled,
+            explicit=True,
+            conservative=unfinished,
+            conflicts=receipt_conflicts,
+            working_dir=working_dir,
+        )
+
+    @staticmethod
+    def _direct_maven_modules(
+        pom_content: str,
+        profile_selection: _MavenProfileSelection,
+    ) -> Optional[_MavenModuleDeclarations]:
+        """Resolve the statically active Maven module declarations.
+
+        Explicit profiles come from the exact last Maven build receipt. Without
+        such a receipt, direct modules and profiles activated *only* by
+        ``activeByDefault=true`` are active. Module-bearing profiles with
+        JDK/OS/property/file (or unknown) activation are runtime-dependent and
+        make the snapshot incomplete.
         """
+        try:
+            root = ET.fromstring(pom_content)
+        except ET.ParseError:
+            return None
+
+        def local_name(element: ET.Element) -> str:
+            return element.tag.rsplit("}", 1)[-1]
+
+        if local_name(root) != "project":
+            return None
+
+        def module_values(block: ET.Element) -> List[str]:
+            values: List[str] = []
+            for module in block:
+                if local_name(module) != "module":
+                    continue
+                value = str(module.text or "").strip()
+                if value:
+                    values.append(value)
+            return values
+
+        modules: List[str] = []
+        conflicts: set[str] = set()
+        for block in root:
+            if local_name(block) == "modules":
+                modules.extend(module_values(block))
+
+        for profiles in root:
+            if local_name(profiles) != "profiles":
+                continue
+            profile_nodes = [profile for profile in profiles if local_name(profile) == "profile"]
+            profile_ids = [
+                str(identifier.text or "").strip()
+                for profile in profile_nodes
+                for identifier in profile
+                if local_name(identifier) == "id" and str(identifier.text or "").strip()
+            ]
+            explicit_in_pom = profile_selection.enabled.intersection(profile_ids)
+            for profile in profile_nodes:
+                identifiers = [
+                    str(child.text or "").strip() for child in profile if local_name(child) == "id"
+                ]
+                profile_modules = [child for child in profile if local_name(child) == "modules"]
+                if not profile_modules:
+                    continue
+                declared = [value for block in profile_modules for value in module_values(block)]
+                if not declared:
+                    continue
+
+                if len(identifiers) != 1 or not identifiers[0]:
+                    conflicts.add("maven_profile_activation_unresolved")
+                    continue
+                profile_id = identifiers[0]
+                if profile_id in profile_selection.disabled and not profile_selection.conservative:
+                    continue
+                if profile_id in profile_selection.enabled:
+                    modules.extend(declared)
+                    continue
+
+                activations = [child for child in profile if local_name(child) == "activation"]
+                if not activations:
+                    # No matching -P selector was recorded by this physical judge.
+                    continue
+                if len(activations) != 1:
+                    conflicts.add("maven_profile_activation_unresolved")
+                    continue
+
+                activation_children = list(activations[0])
+                dynamic = [
+                    child for child in activation_children if local_name(child) != "activeByDefault"
+                ]
+                defaults = [
+                    child for child in activation_children if local_name(child) == "activeByDefault"
+                ]
+                if dynamic or len(defaults) > 1:
+                    conflicts.add("maven_profile_activation_unresolved")
+                    continue
+                if not defaults:
+                    # An empty activation block does not activate the profile.
+                    continue
+                active_text = str(defaults[0].text or "").strip().lower()
+                if active_text == "true":
+                    # Maven disables activeByDefault when another profile in
+                    # the same POM was explicitly activated.
+                    if not explicit_in_pom or profile_selection.conservative:
+                        modules.extend(declared)
+                elif active_text != "false":
+                    conflicts.add("maven_profile_activation_unresolved")
+
+        return _MavenModuleDeclarations(
+            modules=tuple(modules),
+            conflicts=tuple(sorted(conflicts)),
+        )
+
+    @staticmethod
+    def _maven_module_lexical_path(module_dir: str, raw_module: str) -> Optional[str]:
+        value = str(raw_module or "").strip()
+        value = value.replace("${project.basedir}", module_dir)
+        value = value.replace("${basedir}", module_dir)
+        if not value or "${" in value or any(char in value for char in "\x00\r\n"):
+            return None
+        if not value.startswith("/"):
+            value = posixpath.join(module_dir, value)
+        return posixpath.normpath(value)
+
+    def _maven_config_conflicts(
+        self,
+        project_real: str,
+        profile_selection: _MavenProfileSelection,
+    ) -> set[str]:
+        """Check the nearest Maven launcher config without following symlinks out."""
+        basedir = profile_selection.working_dir or project_real
+        basedir_real = self._existing_container_realpath(basedir)
+        if basedir_real is None:
+            return {"maven_config_unreadable"}
+
+        current = basedir_real
+        while True:
+            maven_dir = posixpath.join(current, ".mvn")
+            directory = self._execute_command_with_logging(
+                f"test -d {shlex.quote(maven_dir)}",
+                "checking Maven launcher directory",
+            )
+            if directory.get("success"):
+                maven_dir_real = self._existing_container_realpath(maven_dir)
+                if maven_dir_real is None:
+                    return {"maven_config_unreadable"}
+                if not self._path_is_within(maven_dir_real, project_real):
+                    return {"maven_config_outside_project"}
+
+                config_path = posixpath.join(maven_dir, "maven.config")
+                config_exists = self._execute_command_with_logging(
+                    f"test -f {shlex.quote(config_path)}",
+                    "checking Maven launcher config",
+                )
+                if not config_exists.get("success"):
+                    if config_exists.get("exit_code") != 1:
+                        return {"maven_config_unreadable"}
+                    return set()
+                config_real = self._existing_container_realpath(config_path)
+                if config_real is None:
+                    return {"maven_config_unreadable"}
+                if not self._path_is_within(config_real, project_real):
+                    return {"maven_config_outside_project"}
+                config = self._execute_command_with_logging(
+                    f"cat {shlex.quote(config_real)}",
+                    "reading Maven launcher config",
+                )
+                if not config.get("success"):
+                    return {"maven_config_unreadable"}
+                try:
+                    from sag.agent.forced_build_graph import (
+                        _maven_config_changes_graph,
+                    )
+
+                    changes_graph = _maven_config_changes_graph(str(config.get("output") or ""))
+                except Exception:
+                    return {"maven_config_unreadable"}
+                return {"maven_config_changes_graph"} if changes_graph else set()
+
+            if directory.get("exit_code") != 1:
+                return {"maven_config_unreadable"}
+            parent = posixpath.dirname(current)
+            if parent == current:
+                return set()
+            current = parent
+
+    def _bounded_maven_reactor(
+        self,
+        project_dir: str,
+    ) -> _MavenReactorSnapshot:
+        """Build one boundary-checked snapshot for all Maven evidence consumers.
+
+        Unsafe/unreadable child branches are omitted from ``records`` but make
+        ``complete`` false. Consumers can therefore inspect safe evidence while
+        the build verdict remains non-green: rejecting a module must never
+        silently shrink the expected-artifact denominator.
+        """
+        normalized_project = posixpath.normpath(str(project_dir or "").strip())
+        normalized_workspace = posixpath.normpath(str(self.project_path or "").strip())
+        profile_selection = self._recorded_maven_profile_selection(
+            normalized_project,
+        )
+        selection_conflicts = set(profile_selection.conflicts)
         if not self.docker_orchestrator:
-            return [project_dir]
-
-        seen: List[str] = []
-
-        def walk(module_dir: str) -> None:
-            module_dir = module_dir.rstrip("/")
-            if module_dir in seen:
-                return
-            seen.append(module_dir)
-            pom = self._execute_command_with_logging(
-                f"cat {module_dir}/pom.xml 2>/dev/null", "reading pom.xml for modules"
+            return self._maven_reactor_snapshot(
+                [
+                    _MavenReactorRecord(
+                        normalized_project.rstrip("/") or "/",
+                        "",
+                        False,
+                    )
+                ],
+                {
+                    *selection_conflicts,
+                    "maven_reactor_probe_unavailable",
+                },
+                profile_selection,
             )
-            if not pom.get("success"):
-                return
-            without_profiles = re.sub(
-                r"<profiles>.*?</profiles>", "", pom.get("output") or "", flags=re.DOTALL
+        if (
+            not normalized_project.startswith("/")
+            or not normalized_workspace.startswith("/")
+            or not self._path_is_within(normalized_project, normalized_workspace)
+        ):
+            logger.warning("Maven reactor root is outside the validator workspace")
+            return self._maven_reactor_snapshot(
+                [],
+                {
+                    *selection_conflicts,
+                    "maven_reactor_root_unverified",
+                },
+                profile_selection,
             )
-            for block in re.findall(r"<modules>(.*?)</modules>", without_profiles, re.DOTALL):
-                for mod in re.findall(r"<module>([^<]+)</module>", block):
-                    mod = mod.strip()
-                    if mod:
-                        walk(f"{module_dir}/{mod}")
 
-        walk(project_dir)
-        return seen
+        workspace_real = self._existing_container_realpath(normalized_workspace)
+        project_real = self._existing_container_realpath(normalized_project)
+        if (
+            workspace_real is None
+            or project_real is None
+            or not self._path_is_within(project_real, workspace_real)
+        ):
+            logger.warning("Maven reactor root realpath could not be verified")
+            return self._maven_reactor_snapshot(
+                [],
+                {
+                    *selection_conflicts,
+                    "maven_reactor_root_unverified",
+                },
+                profile_selection,
+            )
 
-    def _parse_maven_expected_artifacts(self, project_dir: str) -> List[Dict[str, str]]:
+        probed: set[str] = set()
+        cache: Dict[str, List[_MavenReactorRecord]] = {}
+        stack: List[str] = []
+        root_pom = ""
+        graph_conflicts: set[str] = set(selection_conflicts)
+        graph_conflicts.update(
+            self._maven_config_conflicts(
+                project_real,
+                profile_selection,
+            )
+        )
+
+        def read_pom(module_real: str) -> Tuple[Optional[str], Optional[str]]:
+            pom_path = posixpath.join(module_real, "pom.xml")
+            pom_real = self._existing_container_realpath(pom_path)
+            if pom_real is None:
+                return None, "maven_module_pom_unreadable"
+            if not self._path_is_within(pom_real, project_real):
+                return None, "maven_module_pom_outside_project"
+            result = self._execute_command_with_logging(
+                f"cat {shlex.quote(pom_real)} 2>/dev/null",
+                "reading pom.xml for modules",
+            )
+            if not result.get("success"):
+                return None, "maven_module_pom_unreadable"
+            return str(result.get("output") or ""), None
+
+        def walk(module_path: str, depth: int) -> List[_MavenReactorRecord]:
+            nonlocal root_pom
+            if depth > _MAVEN_REACTOR_MAX_DEPTH:
+                raise _MavenReactorLimit("maven_module_depth_exceeded")
+
+            lexical = posixpath.normpath(module_path)
+            if not self._path_is_within(lexical, project_real):
+                logger.warning(f"Ignoring Maven module outside project: {lexical}")
+                graph_conflicts.add("maven_module_outside_project")
+                return []
+            module_real = self._existing_container_realpath(lexical)
+            if module_real and module_real.endswith("/pom.xml"):
+                module_real = posixpath.dirname(module_real)
+            if module_real is None or not self._path_is_within(module_real, project_real):
+                logger.warning(f"Ignoring unverified Maven module: {lexical}")
+                graph_conflicts.add("maven_module_unresolved")
+                return []
+
+            if module_real in stack:
+                cycle_start = stack.index(module_real)
+                raise _MavenReactorCycle(frozenset(stack[cycle_start:]))
+            if module_real in cache:
+                return cache[module_real]
+            if module_real not in probed:
+                if len(probed) >= _MAVEN_REACTOR_MAX_NODES:
+                    raise _MavenReactorLimit("maven_module_cap_exceeded")
+                probed.add(module_real)
+
+            pom_content, pom_conflict = read_pom(module_real)
+            if pom_content is None:
+                graph_conflicts.add(pom_conflict or "maven_module_pom_unreadable")
+                return (
+                    [_MavenReactorRecord(module_real, "", False)]
+                    if module_real == project_real
+                    else []
+                )
+            if module_real == project_real:
+                root_pom = pom_content
+
+            stack.append(module_real)
+            children: List[_MavenReactorRecord] = []
+            try:
+                declarations = self._direct_maven_modules(
+                    pom_content,
+                    profile_selection,
+                )
+                if declarations is None:
+                    graph_conflicts.add("maven_module_pom_invalid")
+                    declarations = _MavenModuleDeclarations(())
+                graph_conflicts.update(declarations.conflicts)
+                for raw_module in declarations.modules:
+                    child_lexical = self._maven_module_lexical_path(module_real, raw_module)
+                    if child_lexical is None:
+                        logger.warning(f"Ignoring unresolved Maven module: {raw_module!r}")
+                        graph_conflicts.add("maven_module_unresolved")
+                        continue
+                    try:
+                        children.extend(walk(child_lexical, depth + 1))
+                    except _MavenReactorCycle as exc:
+                        graph_conflicts.add("maven_module_cycle")
+                        if module_real in exc.members:
+                            raise
+                        logger.warning("Ignoring cyclic Maven module branch")
+            finally:
+                stack.pop()
+
+            records = [
+                _MavenReactorRecord(
+                    module_real,
+                    pom_content,
+                    bool(children),
+                ),
+                *children,
+            ]
+            cache[module_real] = records
+            return records
+
+        try:
+            records = walk(project_real, 0)
+        except _MavenReactorCycle as exc:
+            graph_conflicts.add("maven_module_cycle")
+            logger.warning(f"Discarding unsafe Maven reactor branches: {exc}")
+            records = [_MavenReactorRecord(project_real, root_pom, False)] if root_pom else []
+        except _MavenReactorLimit as exc:
+            graph_conflicts.add(exc.reason_code)
+            logger.warning(f"Discarding unsafe Maven reactor branches: {exc}")
+            records = [_MavenReactorRecord(project_real, root_pom, False)] if root_pom else []
+
+        deduped: List[_MavenReactorRecord] = []
+        seen_realpaths: set[str] = set()
+        for record in records:
+            if record.module_dir in seen_realpaths:
+                continue
+            seen_realpaths.add(record.module_dir)
+            deduped.append(record)
+        return self._maven_reactor_snapshot(
+            deduped,
+            graph_conflicts,
+            profile_selection,
+        )
+
+    @staticmethod
+    def _maven_reactor_snapshot(
+        records: List[_MavenReactorRecord],
+        conflicts: set[str],
+        profile_selection: _MavenProfileSelection,
+    ) -> _MavenReactorSnapshot:
+        ordered_conflicts = tuple(sorted(conflicts))
+        reason = "; ".join(
+            _MAVEN_REACTOR_CONFLICT_REASONS.get(conflict, conflict)
+            for conflict in ordered_conflicts
+        )
+        return _MavenReactorSnapshot(
+            records=tuple(records),
+            complete=not ordered_conflicts,
+            conflicts=ordered_conflicts,
+            reason=reason,
+            profile_selection=profile_selection,
+        )
+
+    def _active_maven_module_dirs(self, project_dir: str) -> List[str]:
+        """Return the shared, bounded reactor snapshot's verified directories."""
+        snapshot = self._bounded_maven_reactor(project_dir)
+        return [record.module_dir for record in snapshot.records]
+
+    def _parse_maven_expected_artifacts(
+        self,
+        project_dir: str,
+        *,
+        snapshot: Optional[_MavenReactorSnapshot] = None,
+    ) -> List[Dict[str, str]]:
+        """Parse expected artifacts from the shared, verified reactor snapshot."""
+        snapshot = snapshot or self._bounded_maven_reactor(project_dir)
+        expected: List[Dict[str, str]] = []
+        artifact_conflicts = set(snapshot.conflicts)
+        for record in snapshot.records:
+            # Preserve the historical rule: aggregator nodes with active modules
+            # contribute no direct artifact expectation; their safe leaves do.
+            if not record.has_safe_children:
+                module_expected = self._parse_single_maven_expected_artifacts(
+                    record.module_dir,
+                    record.pom_content,
+                )
+                expected.extend(module_expected)
+                packaging = self._maven_pom_packaging(record.pom_content)
+                if not module_expected and packaging not in {None, "pom"}:
+                    # Inherited/effective versions can make a real JAR leaf
+                    # impossible to name statically. Silence would shrink the
+                    # denominator; fail closed until pom.properties or a
+                    # matching built artifact makes the expectation concrete.
+                    artifact_conflicts.add("maven_module_artifact_unresolved")
+        if artifact_conflicts != set(snapshot.conflicts):
+            snapshot = self._maven_reactor_snapshot(
+                list(snapshot.records),
+                artifact_conflicts,
+                snapshot.profile_selection,
+            )
+        return _MavenArtifactExpectations(expected, snapshot)
+
+    @staticmethod
+    def _maven_pom_packaging(pom_content: str) -> Optional[str]:
+        """Return one verified leaf packaging, defaulting as Maven does to JAR."""
+        try:
+            root = ET.fromstring(pom_content)
+        except ET.ParseError:
+            return None
+        if root.tag.rsplit("}", 1)[-1] != "project":
+            return None
+        values = [
+            str(child.text or "").strip().lower()
+            for child in root
+            if child.tag.rsplit("}", 1)[-1] == "packaging"
+        ]
+        if len(values) > 1 or (values and not values[0]):
+            return None
+        return values[0] if values else "jar"
+
+    def _parse_single_maven_expected_artifacts(
+        self,
+        project_dir: str,
+        pom_content: str,
+    ) -> List[Dict[str, str]]:
         """
-        Parse pom.xml to determine expected Maven artifacts including .class files.
-        Enhanced with multiple fallback strategies for robustness.
+        Parse one already-verified Maven module without following module edges.
         """
-        expected = []
-
-        # Read main pom.xml
-        pom_cmd = f"cat {project_dir}/pom.xml 2>/dev/null"
-        pom_result = self._execute_command_with_logging(pom_cmd, "reading pom.xml")
-
-        if not pom_result["success"]:
-            return expected
-
-        pom_content = pom_result["output"]
-
-        import re
+        expected: List[Dict[str, str]] = []
 
         # Initialize variables
         artifact_id = None
@@ -4143,72 +5417,47 @@ class PhysicalValidator:
                     version = version_match.group(1)
                     logger.debug(f"Inferred version {version} from existing JAR: {jar_name}")
 
-        # Check for modules (multi-module project). Only count modules that are
-        # active by default: strip <profiles> blocks first so profile-gated
-        # modules (disabled in the build config) are NOT treated as expected.
-        # The user mandate is "all ACTIVE modules" — a module turned off in the
-        # pom must not count against the build. (XML-commented modules are already
-        # excluded since comments are not <module> elements.)
-        pom_without_profiles = re.sub(r"<profiles>.*?</profiles>", "", pom_content, flags=re.DOTALL)
-        modules = []
-        for modules_block in re.findall(
-            r"<modules>(.*?)</modules>", pom_without_profiles, re.DOTALL
-        ):
-            modules.extend(re.findall(r"<module>([^<]+)</module>", modules_block))
+        if packaging == "pom":
+            # Parent POM doesn't produce artifacts but might coordinate compilation.
+            return expected
 
-        if modules:
-            # Multi-module project (active modules only)
-            for module in modules:
-                module = module.strip()
-                if not module:
-                    continue
-                module_dir = f"{project_dir}/{module}"
-                # Recursively get expected artifacts for each active module
-                module_expected = self._parse_maven_expected_artifacts(module_dir)
-                expected.extend(module_expected)
-        else:
-            # Single module project
-            if packaging == "pom":
-                # Parent POM doesn't produce artifacts but might coordinate compilation
-                pass
-            else:
-                # Expected .class files
-                # Check if src/main/java exists
-                src_main_check = f"test -d {project_dir}/src/main/java && echo EXISTS"
-                src_main_result = self._execute_command_with_logging(
-                    src_main_check, "checking src/main/java"
-                )
+        # Expected .class files
+        src_main_check = f"test -d {project_dir}/src/main/java && echo EXISTS"
+        src_main_result = self._execute_command_with_logging(
+            src_main_check, "checking src/main/java"
+        )
 
-                if src_main_result["success"] and "EXISTS" in src_main_result.get("output", ""):
-                    # Count Java source files to expect corresponding class files
-                    java_count_cmd = f"find {project_dir}/src/main/java -name '*.java' -type f 2>/dev/null | wc -l"
-                    java_count_result = self._execute_command_with_logging(
-                        java_count_cmd, "counting Java sources"
-                    )
+        if src_main_result["success"] and "EXISTS" in src_main_result.get("output", ""):
+            # Count Java source files to expect corresponding class files.
+            java_count_cmd = (
+                f"find {project_dir}/src/main/java -name '*.java' " "-type f 2>/dev/null | wc -l"
+            )
+            java_count_result = self._execute_command_with_logging(
+                java_count_cmd, "counting Java sources"
+            )
 
-                    if java_count_result["success"]:
-                        java_count = int(java_count_result["output"].strip() or 0)
-                        if java_count > 0:
-                            # Expect classes in target/classes
-                            expected.append(
-                                {
-                                    "path": f"{project_dir}/target/classes",
-                                    "type": "classes",
-                                    "artifact": f"compiled classes (from {java_count} source files)",
-                                    "min_count": java_count,  # At least one .class per .java
-                                }
-                            )
-
-                # Expected JAR/WAR artifact
-                if artifact_id and version:
-                    expected_path = f"{project_dir}/target/{artifact_id}-{version}.{packaging}"
+            if java_count_result["success"]:
+                java_count = int(java_count_result["output"].strip() or 0)
+                if java_count > 0:
                     expected.append(
                         {
-                            "path": expected_path,
-                            "type": packaging,
-                            "artifact": f"{artifact_id}-{version}.{packaging}",
+                            "path": f"{project_dir}/target/classes",
+                            "type": "classes",
+                            "artifact": (f"compiled classes (from {java_count} source files)"),
+                            "min_count": java_count,
                         }
                     )
+
+        # Expected JAR/WAR artifact
+        if artifact_id and version:
+            expected_path = f"{project_dir}/target/{artifact_id}-{version}.{packaging}"
+            expected.append(
+                {
+                    "path": expected_path,
+                    "type": packaging,
+                    "artifact": f"{artifact_id}-{version}.{packaging}",
+                }
+            )
 
         return expected
 

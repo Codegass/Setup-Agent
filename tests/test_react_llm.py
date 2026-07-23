@@ -316,6 +316,24 @@ def test_gpt5_action_tool_call_request_omits_reasoning_effort(monkeypatch):
     assert captured["tool_choice"] == "auto"
 
 
+def test_default_config_reaches_action_request_with_zero_temperature(monkeypatch):
+    captured = {}
+
+    def fake_completion(**params):
+        captured.update(params)
+        return make_response('ACTION: example\nPARAMETERS: {"command": "pwd"}')
+
+    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
+    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
+    monkeypatch.setattr("litellm.completion", fake_completion)
+    client = make_client(Config())
+
+    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
+
+    assert response == 'ACTION: example\nPARAMETERS: {"command": "pwd"}'
+    assert captured["temperature"] == pytest.approx(0.0)
+
+
 def test_claude_tool_call_response_normalizes_to_react_text(monkeypatch):
     monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
     monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)

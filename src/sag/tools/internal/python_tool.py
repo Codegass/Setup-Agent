@@ -12,9 +12,10 @@ required for a green verdict.
 """
 
 import json
+import posixpath
 import re
 import shlex
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from loguru import logger
 
@@ -36,6 +37,7 @@ from .python_env import (
     detect_installer,
     discover_packages,
     ensure_venv_pip,
+    project_name_from_pyproject,
     venv_repair_note,
 )
 
@@ -65,6 +67,12 @@ _INSTALL_ERROR_RE = re.compile(
     r"|ERROR: No matching distribution found"
     r"|ERROR: Could not find a version"
     r"|ERROR: Could not install"
+)
+_MISSING_DISTRIBUTION_RE = re.compile(
+    r"(?:Could not find a version that satisfies the requirement|"
+    r"No matching distribution found for)\s+"
+    r"(?P<requirement>[A-Za-z0-9][A-Za-z0-9._-]*(?:[<>=!~].*)?)",
+    re.IGNORECASE,
 )
 
 # Bug #13 defect 6: honest pytest outcome classification.
@@ -103,6 +111,109 @@ _PYTEST_USAGE_HINT = (
     "Pass pytest-style args only: existing test paths and flags like "
     "-k EXPR, -m MARK, -x, -q, -v, -s, --maxfail=N, --lf, --ff, --tb=STYLE"
 )
+
+# Survey provenance is executable only when it comes from one of the two
+# descriptive discovery paths.  Keep this as the single allowlist consumed by
+# both PythonTool and PhysicalValidator so an unknown/model-authored source
+# cannot be accepted by one side and rejected by the other.
+PYTHON_SMOKE_CANDIDATE_SOURCES = frozenset(
+    {
+        "pyproject.toml:tool.cibuildwheel.test-command",
+        "filesystem:test-file",
+    }
+)
+
+
+def verify_project_owned_path(
+    execute_command: Callable[[str], Dict[str, Any]],
+    project_root: str,
+    candidate: str,
+) -> Tuple[bool, Optional[str]]:
+    """Re-verify that an existing absolute path is a real child of the project.
+
+    Lexical containment alone is insufficient because a path inside the
+    checkout can be a symlink to a host/shared tree.  Callers get a stable
+    reason so the model can recover without being shown a runnable unsafe
+    selector.
+    """
+    root = posixpath.normpath(str(project_root or "").strip())
+    path = posixpath.normpath(str(candidate or "").strip())
+    if not root.startswith("/workspace/"):
+        return False, "the surveyed project root is not a scoped /workspace path"
+    if not path.startswith("/") or not path.startswith(f"{root}/"):
+        return False, "the path is outside the surveyed project"
+
+    realpath = execute_command(
+        "realpath -m -- " f"{shlex.quote('/workspace')} {shlex.quote(root)} {shlex.quote(path)}"
+    )
+    resolved = [
+        line.strip() for line in (realpath.get("output") or "").splitlines() if line.strip()
+    ]
+    if not realpath.get("success") or len(resolved) != 3:
+        return False, "the path could not be resolved for project ownership"
+    workspace_real, root_real, path_real = resolved
+    if workspace_real == "/" or not root_real.startswith(workspace_real.rstrip("/") + "/"):
+        return False, "the surveyed project root real path escapes resolved /workspace"
+    if not path_real.startswith(root_real.rstrip("/") + "/"):
+        return False, "the path real path escapes the surveyed project"
+
+    exists = execute_command(f"test -e {shlex.quote(path)} && echo EXISTS || echo MISSING")
+    if "EXISTS" not in (exists.get("output") or ""):
+        return False, "the path does not currently exist"
+    return True, None
+
+
+def verify_path_within_smoke_boundary(
+    execute_command: Callable[[str], Dict[str, Any]],
+    smoke_boundary: str,
+    candidate: str,
+) -> Tuple[bool, Optional[str]]:
+    """Require a pytest coordinate to be no broader than the surveyed smoke."""
+    boundary = posixpath.normpath(str(smoke_boundary or "").strip())
+    path = posixpath.normpath(str(candidate or "").strip())
+    if path != boundary and not path.startswith(f"{boundary}/"):
+        return False, "the path is broader than the verified survey smoke coordinate"
+
+    realpath = execute_command("realpath -m -- " f"{shlex.quote(boundary)} {shlex.quote(path)}")
+    resolved = [
+        line.strip() for line in (realpath.get("output") or "").splitlines() if line.strip()
+    ]
+    if not realpath.get("success") or len(resolved) != 2:
+        return False, "the smoke-bounded path could not be resolved"
+    if resolved[1] != resolved[0] and not resolved[1].startswith(resolved[0].rstrip("/") + "/"):
+        return False, "the path real path escapes the verified survey smoke coordinate"
+    return True, None
+
+
+def verified_python_smoke_candidate(
+    execute_command: Callable[[str], Dict[str, Any]],
+    project_root: str,
+    candidates: List[Dict[str, Any]],
+) -> Optional[Dict[str, str]]:
+    """Return the first allowlisted, current, realpath-contained smoke fact."""
+    root = posixpath.normpath(str(project_root or "").strip())
+    if not root.startswith("/workspace/"):
+        return None
+    for entry in candidates:
+        if not isinstance(entry, dict) or entry.get("source") not in PYTHON_SMOKE_CANDIDATE_SOURCES:
+            continue
+        relative = str(entry.get("path") or "").strip()
+        if not relative or relative.startswith("/"):
+            continue
+        normalized = posixpath.normpath(relative)
+        if normalized in ("", ".") or normalized == ".." or normalized.startswith("../"):
+            continue
+        full = posixpath.normpath(posixpath.join(root, normalized))
+        owned, _ = verify_project_owned_path(execute_command, root, full)
+        if not owned:
+            continue
+        return {
+            "path": normalized,
+            "source": str(entry["source"]),
+            "absolute_path": full,
+        }
+    return None
+
 
 _OPERATIONS = ("setup_env", "test", "build", "compile")
 _PYTEST_JUNIT_CONFLICT = "pytest_junit_unavailable"
@@ -219,6 +330,77 @@ temporary = path + ".attempt.tmp"
 tree.write(temporary, encoding="utf-8", xml_declaration=True)
 os.replace(temporary, path)
 print("SAG_ATTEMPT_TAGGED")
+"""
+
+_NATIVE_PROJECT_READY_SCRIPT = """\
+import importlib
+import importlib.metadata as metadata
+import json
+import os
+import re
+import sys
+from urllib.parse import unquote, urlsplit
+
+def normalized(value):
+    return re.sub(r"[-_.]+", "-", value or "").lower()
+
+distribution_name, install_root, survey_root, package_json, artifact_json, workspace_root = (
+    sys.argv[1:7]
+)
+install_root = os.path.realpath(install_root)
+survey_root = os.path.realpath(survey_root)
+workspace_root = os.path.realpath(workspace_root)
+try:
+    if (
+        workspace_root == os.path.sep
+        or os.path.commonpath((workspace_root, survey_root)) != workspace_root
+        or survey_root == workspace_root
+    ):
+        raise RuntimeError("surveyed checkout escapes workspace")
+    if os.path.commonpath((survey_root, install_root)) != survey_root:
+        raise RuntimeError("python install root escapes surveyed checkout")
+    distribution = metadata.distribution(distribution_name)
+    if normalized(distribution.metadata.get("Name", "")) != normalized(distribution_name):
+        raise RuntimeError("distribution name mismatch")
+    direct_url = json.loads(distribution.read_text("direct_url.json") or "{}")
+    parsed = urlsplit(str(direct_url.get("url") or ""))
+    if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+        raise RuntimeError("distribution is not project-owned")
+    if os.path.realpath(unquote(parsed.path)) != install_root:
+        raise RuntimeError("distribution belongs to another checkout")
+    packages = json.loads(package_json)
+    if not packages:
+        raise RuntimeError("no surveyed import package")
+    for package in packages:
+        importlib.import_module(package)
+    artifact_found = False
+    for relative in json.loads(artifact_json):
+        candidate = os.path.realpath(os.path.join(survey_root, relative))
+        if os.path.commonpath((survey_root, candidate)) != survey_root:
+            continue
+        if not os.path.isdir(candidate):
+            continue
+        for directory, _, files in os.walk(candidate):
+            for name in files:
+                if not name.endswith((".so", ".dylib", ".dll", ".pyd")):
+                    continue
+                artifact = os.path.realpath(os.path.join(directory, name))
+                if (
+                    os.path.isfile(artifact)
+                    and os.path.commonpath((survey_root, artifact)) == survey_root
+                    and os.path.commonpath((candidate, artifact)) == candidate
+                ):
+                    artifact_found = True
+                    break
+            if artifact_found:
+                break
+        if artifact_found:
+            break
+    if not artifact_found:
+        raise RuntimeError("no project-owned native artifact")
+except Exception:
+    raise SystemExit(1)
+print("SAG_NATIVE_PROJECT_READY")
 """
 
 
@@ -487,11 +669,19 @@ class PythonTool(BaseTool):
         transcript: List[str] = []
         deviation: Optional[str] = None
         retry_meta: Optional[Dict[str, str]] = None
+        provider_recovery_meta: Optional[Dict[str, Any]] = None
+        provider_recovery_attempted = False
         retried = False
         overall_ok = True
         failure_detail: Optional[str] = None
+        install_timeout = (
+            max(timeout, 2400)
+            if requirements.get("native_build_mode") == "pep517-integrated"
+            else timeout
+        )
         for cmd in commands:
-            result = self._run(cmd, working_directory, timeout)
+            result_already_recorded = False
+            result = self._run(cmd, working_directory, install_timeout)
 
             # Bounded retry (spec: exactly once): pip's Requires-Python
             # rejection is authoritative; re-provision from it and rerun ONCE.
@@ -509,7 +699,32 @@ class PythonTool(BaseTool):
                             f"re-provisioned, retry 1/1"
                         )
                         retry_meta = {"from": active or "unknown", "to": needed}
-                        result = self._run(cmd, working_directory, timeout)
+                        result = self._run(cmd, working_directory, install_timeout)
+
+            if not result.get("success") and not provider_recovery_attempted:
+                recovery = self._recover_local_provider(
+                    result.get("output") or "",
+                    command=cmd,
+                    working_directory=working_directory,
+                    timeout=install_timeout,
+                    requirements=requirements,
+                    venv=venv,
+                )
+                if recovery is not None:
+                    provider_recovery_attempted = True
+                    provider_recovery_meta = recovery["metadata"]
+                    transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
+                    transcript.append(
+                        f"$ {recovery['provider_command']}\n"
+                        f"{self._tail(recovery['provider_result'].get('output') or '')}"
+                    )
+                    preamble.append(recovery["narration"])
+                    if recovery["provider_result"].get("success"):
+                        result = self._run(cmd, working_directory, install_timeout)
+                        provider_recovery_meta["root_retry"] = True
+                    else:
+                        result = recovery["provider_result"]
+                        result_already_recorded = True
 
             # Faithfulness deviation (spec Component 3): the project's own
             # tool failed; the pip rung keeps setup moving, NARRATED so the
@@ -523,8 +738,10 @@ class PythonTool(BaseTool):
                 transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
                 cmd = _PIP_FALLBACK.replace("{venv}", venv)
                 result = self._run(cmd, working_directory, timeout)
+                result_already_recorded = False
 
-            transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
+            if not result_already_recorded:
+                transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
             # Bug #13 defect 2: honest failure — a non-zero exit OR an
             # install-error signature in the output (a wrapper reporting
             # exit 0 while stderr said "No module named pip") is a FAILURE,
@@ -551,10 +768,123 @@ class PythonTool(BaseTool):
                     "install_commands": commands,
                     **({"deviation": deviation} if deviation else {}),
                     **({"python_retry": retry_meta} if retry_meta else {}),
+                    **(
+                        {"local_provider_recovery": provider_recovery_meta}
+                        if provider_recovery_meta
+                        else {}
+                    ),
                 },
             ),
             preamble,
         )
+
+    @staticmethod
+    def _normalized_distribution_name(value: str) -> str:
+        return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
+
+    @classmethod
+    def _missing_distribution_name(cls, output: str) -> Optional[str]:
+        match = _MISSING_DISTRIBUTION_RE.search(output or "")
+        if not match:
+            return None
+        requirement = match.group("requirement")
+        name = re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement)
+        return cls._normalized_distribution_name(name.group(0)) if name else None
+
+    def _recover_local_provider(
+        self,
+        output: str,
+        *,
+        command: str,
+        working_directory: str,
+        timeout: int,
+        requirements: Dict[str, Any],
+        venv: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Install one exact in-repo provider, then let the caller retry once."""
+        missing = self._missing_distribution_name(output)
+        if missing is None or " install " not in f" {command} ":
+            return None
+        declared = {
+            self._normalized_distribution_name(match.group(0))
+            for requirement in requirements.get("python_declared_dependencies") or ()
+            if (
+                match := re.match(
+                    r"[A-Za-z0-9][A-Za-z0-9._-]*",
+                    str(requirement or "").strip(),
+                )
+            )
+        }
+        if missing not in declared:
+            return None
+        providers = [
+            provider
+            for provider in requirements.get("python_local_providers") or ()
+            if isinstance(provider, dict)
+            and self._normalized_distribution_name(provider.get("distribution_name")) == missing
+        ]
+        if len(providers) != 1:
+            return None
+        provider = providers[0]
+        project_root = str(
+            (requirements.get("survey") or {}).get("project_path")
+            or requirements.get("python_root")
+            or working_directory
+        ).rstrip("/")
+        relative_root = posixpath.normpath(str(provider.get("root") or "").strip())
+        if (
+            not project_root.startswith("/workspace/")
+            or not relative_root
+            or relative_root.startswith("../")
+            or relative_root.startswith("/")
+        ):
+            return None
+        provider_root = posixpath.normpath(f"{project_root}/{relative_root}")
+        if not provider_root.startswith(project_root + "/"):
+            return None
+
+        provider_owned, _ = verify_project_owned_path(
+            self.orchestrator.execute_command,
+            project_root,
+            provider_root,
+        )
+        if not provider_owned:
+            return None
+
+        metadata_path = f"{provider_root}/pyproject.toml"
+        exists = self.orchestrator.execute_command(
+            f"test -f {shlex.quote(metadata_path)} && echo EXISTS || echo MISSING"
+        )
+        if "EXISTS" not in (exists.get("output") or ""):
+            return None
+        read = self.orchestrator.execute_command(
+            f"cat {shlex.quote(metadata_path)}",
+            truncate_output=False,
+        )
+        actual_name = project_name_from_pyproject(
+            (read.get("output") or "") if read.get("success") else ""
+        )
+        if self._normalized_distribution_name(actual_name or "") != missing:
+            return None
+
+        provider_command = f"{venv}/bin/python -m pip install -e {shlex.quote(provider_root)}"
+        provider_result = self._run(provider_command, working_directory, timeout)
+        return {
+            "provider_command": provider_command,
+            "provider_result": provider_result,
+            "narration": (
+                f"[recovery] index lacked {missing}; installed the exact surveyed "
+                f"local provider at {relative_root}, then retried the original "
+                "root install at most once"
+            ),
+            "metadata": {
+                "distribution_name": missing,
+                "provider_root": relative_root,
+                "provider_command": provider_command,
+                "provider_succeeded": bool(provider_result.get("success")),
+                "root_retry": False,
+            },
+        }
 
     def _detect_ladder_inline(self, working_directory: str) -> Dict[str, Any]:
         """Bug #13 defect 4: run the shared installer detection against the
@@ -604,26 +934,102 @@ class PythonTool(BaseTool):
     ) -> ToolResult:
         python = f"{venv}/bin/python"
         preamble: List[str] = []
+        native_unready = bool(requirements.get("has_native_build")) and not (
+            self._native_project_ready(
+                python=python,
+                working_directory=working_directory,
+                requirements=requirements,
+            )
+        )
+        native_smoke = (
+            self._verified_native_smoke_candidate(
+                working_directory=working_directory,
+                requirements=requirements,
+            )
+            if native_unready
+            else None
+        )
+        native_selection_mode: Optional[str] = None
 
         # Bug #13 defect 7: allowlist-sanitize the args BEFORE anything runs —
         # 'make test' was pasted verbatim into 'pytest make test' in the live run.
         hints = requirements.get("test_hints") or {}
         raw_args = (args or "").strip()
         if raw_args:
-            pytest_args, rejection = self._sanitize_pytest_args(raw_args, working_directory)
+            native_project_root = (
+                str(
+                    (requirements.get("survey") or {}).get("project_path")
+                    or requirements.get("python_root")
+                    or working_directory
+                ).rstrip("/")
+                if native_unready
+                else None
+            )
+            pytest_args, rejection = self._sanitize_pytest_args(
+                raw_args,
+                working_directory,
+                required_project_root=native_project_root,
+                required_smoke_boundary=(native_smoke["absolute_path"] if native_smoke else None),
+            )
             if rejection:
+                replacement_args = native_smoke["args"] if native_smoke else None
                 return ToolResult.completed_failure(
                     output=f"[test] rejected args {raw_args!r} — {rejection}",
                     error=rejection,
                     error_code="PYTEST_ARGS_REJECTED",
+                    failure_signature="pytest_args_rejected:invalid_selector",
                     suggestions=[
                         _PYTEST_USAGE_HINT,
+                        *(
+                            [
+                                "Use the verified native smoke instead: "
+                                f"build(action='test', args={replacement_args!r})"
+                            ]
+                            if replacement_args
+                            else []
+                        ),
                         "For make targets or shell commands use the bash tool instead",
                     ],
-                    metadata={"operation": "test", "rejected_args": raw_args},
+                    metadata={
+                        "operation": "test",
+                        "rejected_args": raw_args,
+                        **({"replacement_args": replacement_args} if replacement_args else {}),
+                    },
                 )
+            if native_unready:
+                pytest_args = self._bounded_native_pytest_args(pytest_args or "")
+                native_selection_mode = "explicit"
         else:
-            pytest_args = (hints.get("pytest_args") or "").strip()
+            if native_unready:
+                if native_smoke is None:
+                    return ToolResult.completed_failure(
+                        output=(
+                            "[test] native core is not ready and the survey has no "
+                            "current, project-owned smoke target"
+                        ),
+                        error=(
+                            "native smoke unavailable — refusing to guess a path or "
+                            "collect the full suite"
+                        ),
+                        error_code="NATIVE_SMOKE_UNAVAILABLE",
+                        suggestions=[
+                            "Rerun project(action='analyze') to refresh verified smoke targets",
+                            "Build the native root, then retry bare build(action='test')",
+                        ],
+                        metadata={
+                            "operation": "test",
+                            "native_unready": True,
+                            "selection_mode": "none",
+                        },
+                    )
+                pytest_args = native_smoke["args"]
+                native_selection_mode = "survey_candidate"
+                preamble.append(
+                    "[test] native core not ready — selected the surveyed, "
+                    "project-owned bounded smoke target"
+                )
+            else:
+                pytest_args = (hints.get("pytest_args") or "").strip()
 
         # Bug #13 defect 5: pytest bootstrap — ensure pytest is importable in
         # the venv first; live evidence: 5 test calls failed with 'No module
@@ -633,27 +1039,80 @@ class PythonTool(BaseTool):
             self._run(f"{python} -m pip install pytest", working_directory, timeout)
             preamble.append("[test] pytest not in venv — installed for the run")
 
-        # Detected-tests denominator FIRST (spec Component 3): the verifier
-        # compares executed counts against it (tests_not_fully_executed).
-        collect = self._run(f"{python} -m pytest --collect-only -q", working_directory, timeout)
-        collected = self._parse_collected(collect.get("output") or "")
-        self._write_collected(collected)
-
         # Panel anchor source (Category-3 spec): the SELECTED count for THIS
         # invocation as a STRUCTURED field — never parsed from the run's
-        # summary text downstream. A filtered invocation gets its own scoped
-        # collect pass; an unfiltered one selects the full denominator.
+        # summary text downstream. A filtered invocation gets ONLY its scoped
+        # collect pass: an initial unfiltered collect can itself trigger the
+        # native full-suite failure this guard exists to prevent.
         if pytest_args:
-            scoped = self._run(
-                f"{python} -m pytest --collect-only -q {pytest_args}",
+            collect_command = f"{python} -m pytest --collect-only -q {pytest_args}"
+            collect = self._run(
+                collect_command,
                 working_directory,
                 timeout,
             )
             collected_after_deselection = self._parse_collected_after_deselection(
-                scoped.get("output") or ""
+                collect.get("output") or ""
             )
+            collected = None
+            collection_scope = "filtered"
         else:
+            collect_command = f"{python} -m pytest --collect-only -q"
+            collect = self._run(collect_command, working_directory, timeout)
+            collected = self._parse_collected(collect.get("output") or "")
             collected_after_deselection = collected
+            collection_scope = "full"
+        self._write_collected(
+            collected,
+            scope=collection_scope,
+            selected=collected_after_deselection,
+        )
+
+        if native_unready and (
+            collected_after_deselection is None or not 1 <= collected_after_deselection <= 50
+        ):
+            if collected_after_deselection is None:
+                code = "NATIVE_SMOKE_COUNT_UNKNOWN"
+                detail = "the scoped collection count could not be parsed"
+            elif collected_after_deselection == 0:
+                code = "NATIVE_SMOKE_EMPTY"
+                detail = "the verified target currently selects zero tests"
+            else:
+                code = "NATIVE_SMOKE_TOO_BROAD"
+                detail = (
+                    f"the verified target selects {collected_after_deselection} tests; "
+                    "the native-unready safety limit is 50"
+                )
+            return self._finish(
+                ToolResult.completed_failure(
+                    output=self._tail(collect.get("output") or ""),
+                    raw_output=collect.get("output"),
+                    error=f"{detail} — test execution was not started",
+                    error_code=code,
+                    suggestions=[
+                        "Refresh the survey or provide a narrower existing pytest selector",
+                        "Build the native root before attempting a broader suite",
+                    ],
+                    metadata={
+                        "operation": "test",
+                        "native_unready": True,
+                        "selection_mode": native_selection_mode,
+                        "collection_scope": collection_scope,
+                        "collection_command": collect_command,
+                        "collected": collected,
+                        "collected_after_deselection": collected_after_deselection,
+                        **(
+                            {
+                                "smoke_candidate": native_smoke["path"],
+                                "smoke_candidate_source": native_smoke["source"],
+                            }
+                            if native_smoke and native_selection_mode == "survey_candidate"
+                            else {}
+                        ),
+                    },
+                ),
+                preamble,
+            )
 
         self._test_attempt_counter += 1
         attempt_id = self._test_attempt_counter
@@ -707,12 +1166,30 @@ class PythonTool(BaseTool):
         metadata = {
             "operation": "test",
             "command": command,
+            "runner_dispatched": result.get("runner_dispatched") is True,
             "exit_code": exit_code,
             "report": report,
             "attempt_id": attempt_id,
             "collected": collected,
             "collected_after_deselection": collected_after_deselection,
+            "collection_scope": collection_scope,
             "collected_json": COLLECTED_JSON,
+            **(
+                {
+                    "native_unready": True,
+                    "selection_mode": native_selection_mode,
+                }
+                if native_unready
+                else {}
+            ),
+            **(
+                {
+                    "smoke_candidate": native_smoke["path"],
+                    "smoke_candidate_source": native_smoke["source"],
+                }
+                if native_smoke and native_selection_mode == "survey_candidate"
+                else {}
+            ),
             **junit_counts,
         }
         if junit_error:
@@ -769,18 +1246,47 @@ class PythonTool(BaseTool):
         )
 
     def _sanitize_pytest_args(
-        self, raw: str, working_directory: str
+        self,
+        raw: str,
+        working_directory: str,
+        *,
+        required_project_root: Optional[str] = None,
+        required_smoke_boundary: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         """Bug #13 defect 7: simple allowlist heuristic — pytest-plausible
         flags and EXISTING test paths pass; everything else is rejected with
         the correct usage named. Returns (cleaned_args, None) on acceptance,
-        (None, reason) on rejection."""
+        (None, reason) on rejection.
+
+        A native-unready invocation is stricter: selectors such as ``-k`` and
+        ``-m`` refine a concrete project-owned coordinate, but can never
+        replace one.  The path is checked through realpath so a symlink below
+        the checkout cannot redirect collection outside the project.
+        """
         try:
             tokens = shlex.split(raw)
         except ValueError as exc:
             return None, f"args are not shell-parseable: {exc}"
+        project_root = posixpath.normpath(required_project_root) if required_project_root else None
+        smoke_boundary = (
+            posixpath.normpath(required_smoke_boundary) if required_smoke_boundary else None
+        )
+        normalized_workdir = posixpath.normpath(working_directory)
+        if project_root and not (
+            normalized_workdir == project_root or normalized_workdir.startswith(f"{project_root}/")
+        ):
+            return None, (
+                f"working directory {working_directory!r} is outside the surveyed "
+                f"project {project_root!r}"
+            )
+        if project_root and smoke_boundary is None:
+            return None, (
+                "native-unready explicit args require a current allowlisted, "
+                "project-owned survey smoke coordinate"
+            )
         cleaned: List[str] = []
         pending_flag: Optional[str] = None
+        concrete_path_seen = False
         for token in tokens:
             if pending_flag is not None:
                 if pending_flag == "--maxfail" and not token.isdigit():
@@ -798,20 +1304,163 @@ class PythonTool(BaseTool):
             if token.startswith("-"):
                 return None, (f"{token!r} is not an accepted pytest flag. {_PYTEST_USAGE_HINT}")
             path = token.split("::", 1)[0]
-            full = path if path.startswith("/") else f"{working_directory.rstrip('/')}/{path}"
-            probe = self.orchestrator.execute_command(
-                f"test -e {shlex.quote(full)} && echo EXISTS || echo MISSING"
-            )
-            if "EXISTS" not in (probe.get("output") or ""):
+            if project_root and posixpath.normpath(path) == ".":
                 return None, (
-                    f"{token!r} is not an existing test path under "
-                    f"{working_directory} — this is not a make/shell command line. "
-                    f"{_PYTEST_USAGE_HINT}"
+                    f"{token!r} is not a concrete native smoke path. " f"{_PYTEST_USAGE_HINT}"
                 )
+            full = posixpath.normpath(
+                path if path.startswith("/") else posixpath.join(normalized_workdir, path)
+            )
+            if project_root:
+                owned, reason = verify_project_owned_path(
+                    self.orchestrator.execute_command,
+                    project_root,
+                    full,
+                )
+                if not owned:
+                    return None, f"{token!r} is unsafe: {reason}. {_PYTEST_USAGE_HINT}"
+                bounded, reason = verify_path_within_smoke_boundary(
+                    self.orchestrator.execute_command,
+                    smoke_boundary,
+                    full,
+                )
+                if not bounded:
+                    return None, f"{token!r} is unsafe: {reason}. {_PYTEST_USAGE_HINT}"
+                concrete_path_seen = True
+            else:
+                probe = self.orchestrator.execute_command(
+                    f"test -e {shlex.quote(full)} && echo EXISTS || echo MISSING"
+                )
+                if "EXISTS" not in (probe.get("output") or ""):
+                    return None, (
+                        f"{token!r} is not an existing test path under "
+                        f"{working_directory} — this is not a make/shell command line. "
+                        f"{_PYTEST_USAGE_HINT}"
+                    )
             cleaned.append(shlex.quote(token))
         if pending_flag is not None:
             return None, f"{pending_flag} requires a value"
+        if project_root and not concrete_path_seen:
+            return None, (
+                "native-unready pytest args must include a concrete existing path "
+                "inside the surveyed project; selector-only -k/-m args are unsafe"
+            )
         return " ".join(cleaned), None
+
+    def _native_project_ready(
+        self,
+        *,
+        python: str,
+        working_directory: str,
+        requirements: Dict[str, Any],
+    ) -> bool:
+        """Conservative project-owned native readiness probe.
+
+        An arbitrary dependency distribution or shared library must not disable
+        the bounded-smoke guard. Readiness requires the exact surveyed
+        distribution, a PEP 610 origin resolving to its Python install root,
+        all surveyed imports, and a native artifact below a repository-rooted
+        surveyed artifact boundary.
+        """
+        distribution_name = str(requirements.get("python_distribution_name") or "").strip()
+        survey_root = str(
+            (requirements.get("survey") or {}).get("project_path")
+            or requirements.get("python_root")
+            or working_directory
+        ).rstrip("/")
+        install_root = str(
+            requirements.get("python_root") or survey_root or working_directory
+        ).rstrip("/")
+        package_names = [
+            str(item.get("import_name") or "").strip()
+            for item in requirements.get("python_package_paths") or ()
+            if (
+                isinstance(item, dict)
+                and str(item.get("import_name") or "").strip()
+                and all(
+                    part.isidentifier()
+                    for part in str(item.get("import_name") or "").strip().split(".")
+                )
+            )
+        ]
+        if not package_names:
+            package_names = [
+                str(name).strip()
+                for name in requirements.get("python_packages") or ()
+                if str(name).strip()
+                and all(part.isidentifier() for part in str(name).strip().split("."))
+            ]
+        artifact_roots = []
+        for path in requirements.get("native_artifact_roots") or ():
+            raw = str(path or "").strip()
+            normalized = posixpath.normpath(raw)
+            if (
+                not raw
+                or raw.startswith("/")
+                or normalized in (".", "..")
+                or normalized.startswith("../")
+            ):
+                continue
+            artifact_roots.append(normalized)
+        if (
+            not survey_root.startswith("/workspace/")
+            or not (install_root == survey_root or install_root.startswith(f"{survey_root}/"))
+            or not distribution_name
+            or not package_names
+            or not artifact_roots
+        ):
+            return False
+        command = (
+            f"{shlex.quote(python)} -c {shlex.quote(_NATIVE_PROJECT_READY_SCRIPT)} "
+            f"{shlex.quote(distribution_name)} {shlex.quote(install_root)} "
+            f"{shlex.quote(survey_root)} "
+            f"{shlex.quote(json.dumps(package_names))} "
+            f"{shlex.quote(json.dumps(artifact_roots))} "
+            f"{shlex.quote('/workspace')}"
+        )
+        result = self.orchestrator.execute_command(command, workdir=working_directory)
+        return bool(result.get("success")) and "SAG_NATIVE_PROJECT_READY" in (
+            result.get("output") or ""
+        )
+
+    def _verified_native_smoke_candidate(
+        self,
+        *,
+        working_directory: str,
+        requirements: Dict[str, Any],
+    ) -> Optional[Dict[str, str]]:
+        """Return the first current, realpath-contained surveyed smoke target."""
+        project_root = str(
+            (requirements.get("survey") or {}).get("project_path")
+            or requirements.get("python_root")
+            or working_directory
+        ).rstrip("/")
+        verified = verified_python_smoke_candidate(
+            self.orchestrator.execute_command,
+            project_root,
+            requirements.get("python_smoke_candidates") or [],
+        )
+        if verified is None:
+            return None
+        pytest_path = (
+            verified["path"]
+            if working_directory.rstrip("/") == posixpath.normpath(project_root)
+            else verified["absolute_path"]
+        )
+        return {
+            "path": verified["path"],
+            "source": verified["source"],
+            "absolute_path": verified["absolute_path"],
+            "args": f"{shlex.quote(pytest_path)} --maxfail=1",
+        }
+
+    @staticmethod
+    def _bounded_native_pytest_args(pytest_args: str) -> str:
+        """Force fail-fast on a native-unready explicit smoke selector."""
+        tokens = shlex.split(pytest_args or "")
+        if "-x" not in tokens and "--maxfail=1" not in tokens:
+            return f"{pytest_args} --maxfail=1".strip()
+        return pytest_args
 
     # ------------------------------------------------------------------
     # build (wheel — extra evidence, never required for green)
@@ -984,17 +1633,45 @@ class PythonTool(BaseTool):
         """Package source dirs: manifest packages (src-layout probed first),
         shared discovery as fallback, the project dir as the last resort."""
         root = working_directory.rstrip("/")
-        packages = requirements.get("python_packages") or discover_packages(self.orchestrator, root)
+        package_root = str(requirements.get("python_root") or root).rstrip("/")
+        surveyed_dirs: List[str] = []
+        for item in requirements.get("python_package_paths") or ():
+            if not isinstance(item, dict):
+                continue
+            relative = posixpath.normpath(str(item.get("path") or "").strip())
+            if (
+                not relative
+                or relative == "."
+                or relative.startswith("../")
+                or relative.startswith("/")
+            ):
+                continue
+            candidate = posixpath.normpath(f"{package_root}/{relative}")
+            if not candidate.startswith(package_root + "/"):
+                continue
+            probe = self.orchestrator.execute_command(
+                f"test -d {shlex.quote(candidate)} && echo EXISTS || echo MISSING"
+            )
+            if "EXISTS" in (probe.get("output") or ""):
+                surveyed_dirs.append(candidate)
+        if surveyed_dirs:
+            return list(dict.fromkeys(surveyed_dirs))
+        packages = requirements.get("python_packages") or discover_packages(
+            self.orchestrator, package_root
+        )
         dirs: List[str] = []
         for package in packages:
-            for candidate in (f"{root}/src/{package}", f"{root}/{package}"):
+            for candidate in (
+                f"{package_root}/src/{package}",
+                f"{package_root}/{package}",
+            ):
                 probe = self.orchestrator.execute_command(
                     f"test -d {candidate} && echo EXISTS || echo MISSING"
                 )
                 if "EXISTS" in (probe.get("output") or ""):
                     dirs.append(candidate)
                     break
-        return dirs or [root]
+        return dirs or [package_root]
 
     def _parse_collected(self, output: str) -> Optional[int]:
         """Trailing `N tests collected` from pytest --collect-only -q; a `no
@@ -1016,8 +1693,20 @@ class PythonTool(BaseTool):
             return int(matches[-1])
         return self._parse_collected(output)
 
-    def _write_collected(self, collected: Optional[int]) -> None:
-        body = json.dumps({"collected": collected})
+    def _write_collected(
+        self,
+        collected: Optional[int],
+        *,
+        scope: str,
+        selected: Optional[int],
+    ) -> None:
+        body = json.dumps(
+            {
+                "collected": collected,
+                "scope": scope,
+                "selected": selected,
+            }
+        )
         self.orchestrator.execute_command("mkdir -p /workspace/.setup_agent")
         self.orchestrator.execute_command(f"cat > {COLLECTED_JSON} <<'SAGEOF'\n{body}\nSAGEOF")
 

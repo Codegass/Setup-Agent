@@ -59,6 +59,7 @@ class BuildTool(BaseTool):
         args: Optional[str] = None,
         working_directory: str = "/workspace",
         timeout: Optional[int] = None,
+        maven_version_requirement: Optional[str] = None,
     ) -> ToolResult:
         verb = (action or "").strip().lower()
         if verb not in ("deps", "compile", "test", "package", "install"):
@@ -149,7 +150,18 @@ class BuildTool(BaseTool):
                     "unresolved; tests outside this module will not run"
                 )
 
-        actual_executions = [backend.execute(verb, args, working_directory, timeout)]
+        def _execute_backend():
+            if system == "maven":
+                return backend.execute(
+                    verb,
+                    args,
+                    working_directory,
+                    timeout,
+                    maven_version_requirement=maven_version_requirement,
+                )
+            return backend.execute(verb, args, working_directory, timeout)
+
+        actual_executions = [_execute_backend()]
         inner = actual_executions[-1].result
 
         # Bounded retry (spec §1c): a version-shaped failure means the JDK in
@@ -169,9 +181,7 @@ class BuildTool(BaseTool):
                         "re-provisioned, retry 1/1"
                     )
                     jdk_retry_meta = {"from": active, "to": needed}
-                    actual_executions.append(
-                        backend.execute(verb, args, working_directory, timeout)
-                    )
+                    actual_executions.append(_execute_backend())
                     inner = actual_executions[-1].result
 
         return self._envelope(
@@ -285,6 +295,13 @@ class BuildTool(BaseTool):
                 "timeout": {
                     "type": "integer",
                     "description": "Soft window in seconds; long builds detach, never killed",
+                },
+                "maven_version_requirement": {
+                    "type": "string",
+                    "description": (
+                        "Maven-only constraint preserved across registration and retry "
+                        "(for example '[3.9,)'). Never omit a detected requirement."
+                    ),
                 },
             },
             "required": ["action"],

@@ -24,6 +24,7 @@ from sag.agent.tool_parameters import ToolParameterNormalizer
 from sag.agent.tool_recovery import ToolRecoveryHandler
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.bash import BashTool
+from sag.tools.build.backends import MavenBackend
 from sag.tools.build.build_tool import BuildTool
 from sag.tools.internal.build_utils import detached_handoff_tool_result
 from sag.tools.project_tool import ProjectTool
@@ -413,7 +414,12 @@ def test_build_failure_routes_to_maven_java_version_recovery():
         {"action": "verify_java", "java_version": "17"},
         {"action": "install_java", "java_version": "17"},
     ]
-    assert maven.calls == [{"command": "test", "working_directory": "/workspace/app"}]
+    assert maven.calls == [
+        {
+            "command": MavenBackend.VERBS["test"],
+            "working_directory": "/workspace/app",
+        }
+    ]
     assert decision.replacement_result.succeeded is True
 
 
@@ -457,7 +463,12 @@ def test_build_failure_routes_to_maven_known_working_directory():
 
     assert decision.should_recover is True
     assert decision.strategy == "maven_known_working_directory"
-    assert maven.calls == [{"command": "test", "working_directory": "/workspace/app"}]
+    assert maven.calls == [
+        {
+            "command": MavenBackend.VERBS["test"],
+            "working_directory": "/workspace/app",
+        }
+    ]
 
 
 def test_project_clone_failure_recovers_with_injected_repository_url():

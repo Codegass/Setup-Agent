@@ -32,6 +32,7 @@ from sag.tools.base import (
     UnpersistedToolResult,
     canonical_full_output_source,
 )
+from sag.tools.build.backends import MavenBackend
 
 PYTHON_312 = shutil.which("python3.12")
 DRAFT_CAP_BYTES = 32 * 1024
@@ -198,7 +199,7 @@ def test_build_facade_recovery_persistence_error_keeps_original_and_draft(tmp_pa
     assert storage.emergency_failures == 1
     assert raised.value.tool_name == "maven"
     assert raised.value.params == {
-        "command": "test",
+        "command": MavenBackend.VERBS["test"],
         "working_directory": "/workspace/good",
     }
     assert raised.value.draft is not None
@@ -211,7 +212,7 @@ def test_build_facade_recovery_persistence_error_keeps_original_and_draft(tmp_pa
     assert [observation.tool_name for observation in observations] == ["maven", "maven"]
     assert [observation.roles for observation in observations] == [
         (EvidenceRole.TEST,),
-        (EvidenceRole.TEST,),
+        (EvidenceRole.BUILD, EvidenceRole.TEST),
     ]
     assert len({observation.execution_id for observation in observations}) == 2
     assert observations[0].result.test_stats == _stats(passed=3, failed=2)
@@ -268,8 +269,9 @@ def test_build_facade_recovery_uses_backend_replacement_identity(tmp_path, syste
     assert execution.result.succeeded is True
     assert [actual.tool_name for actual in execution.actual_executions] == [system, system]
     expected_key = "command" if system == "maven" else "tasks"
+    expected_value = MavenBackend.VERBS["test"] if system == "maven" else "test"
     assert execution.actual_executions[1].params == {
-        expected_key: "test",
+        expected_key: expected_value,
         "working_directory": "/workspace/good",
     }
 
@@ -321,6 +323,8 @@ def test_state_dump_load_replay_is_idempotent_by_execution_id():
         provenance="output_source",
         roles=[EvidenceRole.TEST],
         execution_id="execution_replayed",
+        source_phase="test",
+        source_attempt_id="test-1",
     )
     dumped = state.model_dump(mode="json")
     loaded = ToolObservation.model_validate(dumped["tool_observations"][0])
@@ -334,10 +338,26 @@ def test_state_dump_load_replay_is_idempotent_by_execution_id():
             loaded.provenance,
             roles=loaded.roles,
             execution_id=loaded.execution_id,
+            source_phase=loaded.source_phase,
+            source_attempt_id=loaded.source_attempt_id,
+        )
+
+    with pytest.raises(ValueError, match="conflicting observation"):
+        replayed.ingest_tool_result(
+            loaded.scope,
+            loaded.tool_name,
+            loaded.result,
+            loaded.provenance,
+            roles=loaded.roles,
+            execution_id=loaded.execution_id,
+            source_phase="test",
+            source_attempt_id="test-2",
         )
 
     assert len(replayed.tool_observations) == 1
     assert replayed.tool_observations[0].execution_id == "execution_replayed"
+    assert replayed.tool_observations[0].source_phase == "test"
+    assert replayed.tool_observations[0].source_attempt_id == "test-1"
     assert replayed.model_dump(mode="json")["tool_observations"][0]["execution_id"] == (
         "execution_replayed"
     )

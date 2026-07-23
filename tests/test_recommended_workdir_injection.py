@@ -6,6 +6,8 @@ fell back to a blind /workspace and under-scoped the reactor. The orchestrator n
 injects the recommended root when (and only when) the model omits one.
 """
 
+import pytest
+
 from sag.agent.tool_orchestration import ToolCall, ToolOrchestrator
 from sag.tools.base import BaseTool, ToolResult
 
@@ -88,6 +90,62 @@ def test_explicit_working_directory_is_respected():
         )
     )
     assert _workdir(execution) == "/workspace/other"
+
+
+@pytest.mark.parametrize(
+    "alias",
+    ["cwd", "workdir", "working_dir", "work_dir", "dir", "directory"],
+)
+def test_build_workdir_alias_is_normalized_before_recommendation_injection(alias):
+    orch = _orchestrator(_REC)
+
+    execution = orch.execute(
+        ToolCall(
+            name="build",
+            raw_params={"action": "deps", alias: "/workspace/tvm"},
+        )
+    )
+
+    assert execution.status == "success"
+    assert execution.executed_params == {
+        "action": "deps",
+        "working_directory": "/workspace/tvm",
+    }
+    assert any(
+        fix.source == "schema_alias"
+        and fix.field == "working_directory"
+        and fix.after == "/workspace/tvm"
+        for fix in execution.parameter_fixes
+    )
+    assert not any(
+        fix.reason == "analyzer-recommended reactor root (model omitted working_directory)"
+        for fix in execution.parameter_fixes
+    )
+
+
+def test_canonical_build_workdir_wins_over_conflicting_alias():
+    orch = _orchestrator(_REC)
+
+    execution = orch.execute(
+        ToolCall(
+            name="build",
+            raw_params={
+                "action": "test",
+                "working_directory": "/workspace/canonical",
+                "cwd": "/workspace/alias-that-must-not-win",
+            },
+        )
+    )
+
+    assert execution.status == "success"
+    assert _workdir(execution) == "/workspace/canonical"
+    assert any(
+        fix.source == "schema_alias"
+        and fix.field == "cwd"
+        and fix.before == "/workspace/alias-that-must-not-win"
+        and fix.after is None
+        for fix in execution.parameter_fixes
+    )
 
 
 def test_no_recommendation_falls_back_to_state_default():

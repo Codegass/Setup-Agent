@@ -585,8 +585,9 @@ failure beyond them blocks the panel.
 
 - No change to verdict semantics, the physical validator's judge role, or the
   phase machine.
-- No new prose guidance anywhere — this whole effort is subtraction plus
-  coordinates.
+- Category 3 adds no project-specific or pre-hoc prose guidance. A later
+  evidence-triggered operational safeguard may state a generic tool contract,
+  as bounded below, but cannot restore a deleted prescription.
 
 ## Category 3 — executed (2026-07-20)
 
@@ -622,7 +623,8 @@ dimension:
 - **(e) python_prehoc_guidance** — the pre-hoc python/native-first block
   (`_python_phase_guidance`, `PYTHON_BUILD/TEST_PHASE_GUIDANCE`,
   `NATIVE_FIRST_BUILD_GUIDANCE`). KEPT: the reactive `NATIVE_NOT_BUILT_TEST_GUIDANCE`
-  smoke steer with its invocation coordinates (allowlisted corrective loop).
+  smoke steer with its tool-owned bare invocation contract (allowlisted
+  corrective loop).
 
 **Switch machinery.** The runtime-gating functions (`prescription_flags`,
 `prescription_feature_flags`, `reset_prescription_flags_cache`) and all their
@@ -644,3 +646,178 @@ adjusted to the facts-only rendering. Full suite: 2158 passed, 1 skipped, 6
 failed — exactly the registered baseline reds (test_evidence_ingestion×1,
 test_stage1_review_fixes×2, test_lineage_idempotence_followup×2,
 test_packaging_smoke×1); no new failures.
+
+## Post-panel operational reliability for weaker models
+
+The Category 3 panel and ordinary-run readiness answer different questions.
+The pinned A/B panel supplied **causal deletion authorization**: at the
+registered revisions and pins, did removing prescription dimensions (a–e)
+cause a measured regression? Its answer remains authoritative and is not
+reopened by a later normal run.
+
+An ordinary run asks an additional **operational reliability** question: can
+the current repository revision be completed when the planning model is
+weaker, stochastic, or unfamiliar with project-specific layout drift? A panel
+pass does not prove that every future repository head exposes enough facts,
+that every bare tool call has a safe default, or that the state machine will
+force an evidence-producing attempt before accepting phase closure.
+
+The July 22 normal-run failures separate those causes instead of assigning
+every miss to "the model":
+
+| probe | prompt contribution | harness/tool contribution | model contribution | dominant diagnosis |
+| --- | --- | --- | --- | --- |
+| commons-cli | The generic recovery wording made the right public call discoverable. | `project(action='env')` reported success after registering Maven 3.9.9 but did not make that executable the effective runtime; the next build still recorded `/usr/bin/mvn` 3.8.7. | The model found, downloaded, unpacked, and registered a compatible Maven on its own. | **Harness/API contract.** A successful public runtime registration must verify compatibility and atomically activate the runtime actually consumed by later commands. |
+| bigtop | Survey output already exposed exact test islands and marked the entry ready. More prose would merely repeat facts already present. | The phase machine accepted closure with no terminal test-runner receipt, so one stochastic omission became terminal. | The same model/revision/prompt family had previously produced the expected 50/50 run; this run built artifacts but never dispatched a test. | **Model variance exposed by a harness gap.** The harness, not the model, must own mandatory evidence-producing attempts. |
+| TVM | A placeholder-style smoke instruction encouraged path invention instead of a structured bare call. | Survey/tooling omitted the PEP 517 install root, local `tvm-ffi` provider, native readiness, artifact roots, and verified bounded smoke coordinate; rejected guesses consumed the phase without a runner receipt. | The model guessed three obsolete/nonexistent test locations, a predictable response to missing exact facts. | **Facts/tool contract, aggravated by prompt ambiguity.** Discover relationships mechanically and make the safe bare action select or refuse. |
+
+This attribution matters for a weak-model framework. Prompt changes reduce
+ambiguity but cannot repair a false-success API or establish physical
+evidence. Model upgrades may reduce the frequency of an omission but cannot
+make termination safe. The durable remedy is therefore a layered contract:
+the survey supplies current facts, tools own safe deterministic mappings, the
+controller owns mandatory transitions, and the model is left with choices
+that genuinely require reasoning.
+
+Operational hardening therefore sits below the deleted prescription layer:
+
+1. **Generic facts.** Survey the files and relationships the tools actually
+   need, such as the declared build backend, local package providers, package
+   roots, and bounded test coordinates. Facts describe the checkout; they do
+   not recommend a project-specific sequence.
+2. **Tool-owned safety and defaults.** A bare structured call must either map
+   observed facts to a bounded action or refuse before an unsafe sweep. The
+   model must not be asked to manufacture a path placeholder.
+3. **State-machine safeguards.** When a phase requires an execution receipt,
+   the controller must require and track that receipt, consolidate equivalent
+   pre-execution failures, and prevent prose-only completion. After a concrete
+   terminal refusal or at the phase floor, the harness dispatches the exact
+   survey-grounded test/poll action itself; it does not ask the action model to
+   serialize a forced step. The action and its current phase, attempt,
+   coordinate, backend, parent poll lineage, and candidate snapshot are
+   recorded as a separate control event and checked during replay. Model
+   narration is never physical evidence. Before dispatch, the controller also
+   probes the facade's marker-order backend and requires it to equal the
+   survey backend; an unknown or stale backend gets one re-survey and zero
+   backend executions. A rendered runner command is only intent: a terminal or
+   pending execution receipt additionally requires a backend-propagated
+   `runner_dispatched=true` set after Docker accepted the exec. Schema,
+   preflight, sanitizer, `dispatch_failed`, and pre-exec Docker exceptions are
+   bounded refusals, never tests, even if their error result echoes a command.
+   Detached polling preserves the original dispatch lineage. A process proved
+   finished or vanished without an exit file terminates as unknown/crashed with
+   an explicit conflict instead of reverting to pending and polling forever.
+4. **Minimal reactive contracts.** An evidence-triggered prompt may tell the
+   model which bare tool call to make and what the tool guarantees. It may not
+   encode a repository name, a pinned SHA, a guessed path, or a pre-hoc recipe.
+5. **Stable model configuration.** Thinking and action temperatures should
+   minimize avoidable variance; the action role is deterministic
+   serialization, not a second planner. The action request therefore uses
+   temperature 0.0 on providers that accept it. GPT-5 thinking requests use
+   `reasoning_effort` on the primary path; the 0.1 thinking temperature applies
+   to traditional/provider-supported requests and GPT-5 fallback, not as a
+   fictitious control over an unsupported parameter.
+6. **Measured runtime activation.** A public environment mutation succeeds
+   only when the exact registered executable is re-probed for identity and
+   version, the JSON registration and shell overlay are written as one
+   read-back-verified transaction, and the later container command profile
+   sources the overlay last. An initial failed write removes newly created
+   files; a replacement failure restores byte-identical prior files. Runtime
+   requirements are append-only observed facts scoped by path intersection:
+   a child requirement constrains its child and parent reactor, while an
+   unrelated sibling does not inherit it. Registration must satisfy every
+   applicable observation, and a later bare build inherits the intersection
+   instead of trusting a model-supplied or omitted version. A persisted Maven
+   constraint must come from Maven-specific Enforcer evidence (`Detected Maven
+   Version` and its range in the same diagnostic context); the identical
+   `RequireJavaVersion` range vocabulary belongs only to the bounded JDK
+   recovery path and must never block or register a Maven executable. Public
+   Maven registration accepts only an absolute, existing canonical executable
+   under a trusted runtime root; workspace symlinks may not escape that root.
+   The `mvn` spelling canonicalizes to the single `maven` registration, and the
+   active executable's directory is placed first in `PATH`, ahead of stale
+   caller prefixes, so shell lookup and the Build facade consume the identical
+   measured binary across working directories.
+7. **Checkout and build-graph containment.** Every survey root, nested package
+   root, provider, PEP 610 origin, native artifact, smoke coordinate, and
+   controller-selected test candidate is checked lexically and by `realpath`
+   against the resolved workspace/checkout before use. The controller's forced
+   Maven/Gradle attempt additionally parses the statically declared graph
+   surfaces the bare launcher consults: backend markers, Maven's nearest
+   `.mvn` basedir/config plus local parent/module POM chains, and Gradle's
+   nearest settings file plus includes/relocations. Cycle/depth/node bounds,
+   external parents/modules/settings, file or directory symlink escapes,
+   graph-changing Maven config, Gradle settings `apply`, dynamic relocations,
+   unreadable graphs, and ambiguous settings fail closed.
+   One fresh survey may repair stale coordinates; the controller never
+   dispatches an unresolved forced graph. This additional graph rule is
+   intentionally limited to the harness-owned forced lane and does not silently
+   redefine normal model-initiated build semantics. It proves the declared
+   graph boundary, not that arbitrary project plugins or build-script code are
+   sandboxed. Physical validation uses
+   the same containment and recursion bounds when choosing Maven denominator
+   modules. Rejected reactor edges are evidence conflicts, never denominator
+   subtraction: expected artifacts and verdict completeness derive from one
+   immutable snapshot, so an unsafe/incomplete reactor cannot become green by
+   making the denominator smaller. Profile-sensitive denominators bind to the
+   newest exact current-reactor Maven build/test dispatch receipt, including
+   detached and timeout paths. The parser accepts Maven's exact `-P` and
+   `--activate-profiles` forms, applies same-POM `activeByDefault` suppression,
+   and treats ambiguous or unfinished selection conservatively. The nearest
+   `.mvn` search starts at the launcher basedir selected by the bound POM
+   (including `mvn -f child/pom.xml`), not blindly at the caller's cwd; an
+   external/unreadable config, escaped POM symlink, dynamic profile activation,
+   or non-`pom` leaf with no resolvable artifact expectation caps the verdict.
+8. **Recorded weak-model aliases.** The public tool schema remains canonical,
+   but the orchestration boundary normalizes common serialized equivalents:
+   `cwd`/`workdir` forms become `working_directory` for execution tools, and
+   report `content`/`outcome` become `summary`/`status`. If both forms are
+   present, the canonical field always wins. Each rename or removal is recorded
+   as a `ParameterFix`; compatibility must not be silent or use string length
+   to overrule an explicit canonical value.
+
+This layer does **not** restore any Category 3 dimension. In particular, it
+must not recreate an execution-plan pipeline, recommendation fields,
+`project_brief`, prescriptive objectives, or pre-hoc Python/native-first
+guidance. The dividing line is causal and observable: prescriptions tell the
+model what a project ought to do before failure evidence exists; operational
+safeguards expose current facts, make tool defaults safe, and enforce receipts
+after a concrete state requires correction.
+
+Weak-model run readiness is evaluated separately from the sealed panel:
+
+- no rendered prompt contains a path placeholder or asks the model to choose a
+  smoke-test file;
+- an unparameterized native-project `build(action='test')` uses only
+  survey-verified bounded coordinates, or refuses safely;
+- repeated invalid selectors cannot consume the phase while never reaching a
+  runner receipt;
+- a command string returned after `dispatch_failed` or a pre-exec exception is
+  not a runner receipt, while a nonzero exit or post-dispatch observation error
+  remains an honest physical attempt;
+- a controller-forced Maven or Gradle test is never dispatched when the
+  statically declared launcher/reactor graph would cross the verified checkout
+  through a parent/module POM, Maven config, settings ancestor, included build,
+  relocation, symlink, or recursive graph;
+- an observed Maven version constraint survives a weak model omitting it from
+  later calls: the incompatible exact runtime is blocked, a replacement's
+  identity/version is measured, public registration activates it
+  transactionally, and a later bare build inherits the harness-owned
+  constraint;
+- the weak-model parameter shapes observed in the July 22 transcripts execute
+  through the production orchestrator without spending a failure/replan turn,
+  while canonical fields remain authoritative;
+- phase completion and the final verdict remain grounded in persisted physical
+  evidence; and
+- repeated cold normal runs at the current project revisions are recorded as
+  an operational regression suite, not retroactively counted as Category 3
+  treatment-arm evidence.
+
+For the native-not-built recovery path, the prompt contract is consequently:
+call bare `build(action='test')` with no args; the tool owns the verified
+bounded smoke selection; never invent or substitute a path. An explicit
+selector is accepted only when it contains a current, allowlisted,
+realpath-contained survey coordinate (or narrows below that coordinate), and
+the scoped collection must remain within the 1–50 bound before pytest
+execution. This is generic corrective-loop plumbing and preserves the panel's
+deletion result.

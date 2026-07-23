@@ -717,6 +717,43 @@ def test_maven_tool_extracts_version_requirement_from_enforcer_output():
     assert requirement.kind == "range"
 
 
+def test_maven_tool_does_not_extract_java_enforcer_range_as_maven_requirement():
+    requirement = MavenTool.extract_version_requirement_from_output(
+        "[ERROR] RequireJavaVersion failed: Detected JDK Version: "
+        "11.0.2 is not in the allowed range [17,)."
+    )
+
+    assert requirement is None
+
+
+def test_java_enforcer_failure_does_not_persist_or_block_maven_runtime():
+    output = (
+        "[ERROR] BUILD FAILURE\n"
+        "[ERROR] Rule 0: RequireJavaVersion failed: Detected JDK Version: "
+        "11.0.2 is not in the allowed range [17,)."
+    )
+    orchestrator = FakeBuildToolOrchestrator({"output": output, "exit_code": 1})
+    tool = MavenTool(
+        orchestrator,
+        toolchain_manager=FakeToolchainManager(
+            path="/usr/bin/mvn",
+            version="3.8.7",
+            source="system",
+        ),
+    )
+    tool._record_test_summary = lambda *args, **kwargs: None
+
+    result = tool.execute(command="compile", working_directory="/workspace/project")
+
+    assert result.succeeded is False
+    assert result.error_code == "JAVA_VERSION_ERROR"
+    assert "maven_version_requirement" not in result.metadata
+    assert "runtime_contract_persisted" not in result.metadata
+    assert not any(
+        "env_overlay" in command for command, _workdir, _timeout in orchestrator.commands
+    )
+
+
 def test_maven_tool_failed_result_metadata_includes_detected_maven_requirement():
     orchestrator = FakeBuildToolOrchestrator(
         {

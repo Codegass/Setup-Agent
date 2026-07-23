@@ -162,6 +162,7 @@ class SetupAgent:
             verdict_finalizer=self.verdict_finalizer,
             control_event_sink=self.control_event_sink,
             target_repo_sha_callback=self._record_target_repo_sha,
+            orchestrator=self.orchestrator,
         )
         self._initialize_run_pin_template()
 
@@ -407,6 +408,7 @@ class SetupAgent:
                 orchestrator=self.orchestrator,
                 project_name=getattr(self, "project_name", None)
                 or getattr(self.orchestrator, "project_name", None),
+                run_evidence_state=getattr(self, "run_evidence_state", None),
             )
         else:
             lifecycle_tool = ContextTool(self.context_manager)
@@ -428,7 +430,12 @@ class SetupAgent:
                 system_tool=system_tool,
                 env_tool=env_tool,
             ),
-            SearchTool(self.orchestrator, output_search=output_search, web_search=WebSearchTool()),
+            SearchTool(
+                self.orchestrator,
+                output_search=output_search,
+                web_search=WebSearchTool(),
+                command_tracker=self.command_tracker,
+            ),
             ReportTool(
                 self.orchestrator,
                 execution_history_callback=self._get_execution_history,

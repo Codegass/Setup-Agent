@@ -199,16 +199,18 @@ def test_reactive_smoke_steer_is_allowlisted_not_a_dimension():
         assert engine._native_smoke_guidance("test") == NATIVE_NOT_BUILT_TEST_GUIDANCE
 
 
-def test_native_smoke_steer_carries_the_args_invocation_form():
-    # The smoke steer must show the STRUCTURED invocation coordinates —
-    # build(action='test', args=...) with a bounded --maxfail=1 — not just
-    # prose. The TVM 357-sweep root cause was a steer that read as pure prose,
-    # so the agent fell back to a bare full-suite build(action='test') sweep.
+def test_native_smoke_steer_delegates_bounded_target_to_the_tool():
+    # Weak models must not fill a path placeholder. The bare call is safe
+    # because the tool owns the survey-verified bounded selector (or refuses).
     from sag.agent.react_engine import NATIVE_NOT_BUILT_TEST_GUIDANCE
 
-    assert "args=" in NATIVE_NOT_BUILT_TEST_GUIDANCE
-    assert "--maxfail=1" in NATIVE_NOT_BUILT_TEST_GUIDANCE
-    assert "action='test'" in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "bare build(action='test')" in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "NO args" in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "survey-verified bounded smoke target" in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "Never invent, guess, or substitute a test path" in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "<that file>" not in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "args=" not in NATIVE_NOT_BUILT_TEST_GUIDANCE
+    assert "--maxfail=1" not in NATIVE_NOT_BUILT_TEST_GUIDANCE
 
 
 # ---- shared machinery: retained coordinates + gates -------------------------

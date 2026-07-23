@@ -9,13 +9,22 @@ from typing import Any, Dict, List, Optional
 
 from sag.agent.phase_gates import ClaimDisposition, check_phase_claim
 from sag.agent.phase_machine import PhaseClaim, PhaseOutcome
+from sag.agent.attempt_policy import required_test_attempt
 from sag.agent.phase_transitions import RepairRequest
 
 from .base import BaseTool, ToolResult
 
 
 class PhaseTool(BaseTool):
-    def __init__(self, machine, validator, orchestrator, project_name, gate_fn=check_phase_claim):
+    def __init__(
+        self,
+        machine,
+        validator,
+        orchestrator,
+        project_name,
+        gate_fn=check_phase_claim,
+        run_evidence_state=None,
+    ):
         super().__init__(
             name="phase",
             description=(
@@ -32,6 +41,7 @@ class PhaseTool(BaseTool):
         self.orchestrator = orchestrator
         self.project_name = project_name
         self.gate_fn = gate_fn
+        self.run_evidence_state = run_evidence_state
 
     def execute(
         self,
@@ -78,6 +88,28 @@ class PhaseTool(BaseTool):
                     output="repair proposals do not accept a phase outcome",
                     error="outcome is forbidden for repair",
                     error_code="phase_repair_outcome_forbidden",
+                )
+            required_attempt = required_test_attempt(
+                self.run_evidence_state,
+                self.orchestrator,
+                phase=phase,
+                attempt_id=getattr(self.machine, "current_attempt_id", None),
+            )
+            if required_attempt is not None:
+                action_text = required_attempt.action_text()
+                return ToolResult.completed_failure(
+                    output=(
+                        "Test repair requires evidence from a real test runner. "
+                        f"NEXT REQUIRED ACTION: {action_text}"
+                    ),
+                    error="test repair has no terminal test execution receipt",
+                    error_code="TEST_ATTEMPT_REQUIRED",
+                    suggestions=[action_text],
+                    metadata={
+                        "phase": phase,
+                        "test_execution_receipts": 0,
+                        **required_attempt.to_metadata(),
+                    },
                 )
             try:
                 request = RepairRequest(
@@ -146,6 +178,32 @@ class PhaseTool(BaseTool):
                 output="blocked requires a concrete external impediment and evidence refs",
                 error="missing reason",
                 error_code="phase_blocker_reason_required",
+            )
+
+        required_attempt = required_test_attempt(
+            self.run_evidence_state,
+            self.orchestrator,
+            phase=phase,
+            attempt_id=getattr(self.machine, "current_attempt_id", None),
+        )
+        if required_attempt is not None:
+            action_text = required_attempt.action_text()
+            return ToolResult.completed_failure(
+                output=(
+                    "Test phase cannot terminate before one real terminal test "
+                    f"execution receipt. NEXT REQUIRED ACTION: {action_text}"
+                ),
+                error="test-ready project has no terminal test execution receipt",
+                error_code="TEST_ATTEMPT_REQUIRED",
+                suggestions=[
+                    action_text,
+                    "Do not call phase(done|blocked) until that runner reaches a terminal result",
+                ],
+                metadata={
+                    "phase": phase,
+                    "test_execution_receipts": 0,
+                    **required_attempt.to_metadata(),
+                },
             )
 
         claim = PhaseClaim(

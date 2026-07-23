@@ -17,6 +17,7 @@ from sag.tools.internal.build_utils import (
     classify_detached_completion,
     detached_handoff_tool_result,
 )
+from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.search_tool import SearchTool
 
 
@@ -372,6 +373,29 @@ def test_missing_exit_code_preserves_pending_unknown_with_poll_ref(tmp_path):
     assert result.succeeded is False
 
 
+@pytest.mark.parametrize(
+    "invocation_status",
+    [InvocationStatus.COMPLETED, InvocationStatus.CRASHED],
+)
+def test_terminal_detached_observation_without_exit_status_does_not_repoll(
+    invocation_status,
+):
+    result = classify_detached_completion(
+        exit_code=None,
+        tail="the process ended but no exit file was recorded",
+        poll_ref="job:detached",
+        invocation_status=invocation_status,
+        terminal_observation=True,
+    )
+
+    assert result.invocation_status is invocation_status
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
+    assert result.evidence_status is EvidenceStatus.UNKNOWN
+    assert result.error_code == "DETACHED_EXIT_STATUS_MISSING"
+    assert result.poll_ref == "job:detached"
+    assert result.is_terminal
+
+
 def test_detached_completion_rejects_shape_valid_unpersisted_output_ref():
     with pytest.raises(ValueError, match="persisted.*OutputStorage"):
         classify_detached_completion(
@@ -538,6 +562,47 @@ def test_search_job_poll_reports_observed_vanish_as_crashed(tmp_path):
     assert result.poll_ref == "job:abc"
 
 
+@pytest.mark.parametrize(
+    ("state", "invocation_status"),
+    [
+        ("finished", InvocationStatus.COMPLETED),
+        ("vanished", InvocationStatus.CRASHED),
+    ],
+)
+def test_search_terminal_job_without_exit_file_stays_terminal(
+    tmp_path,
+    state,
+    invocation_status,
+):
+    orchestrator = PollingJobOrchestrator(
+        {
+            "finished": state == "finished",
+            "running": False,
+            "exit_code": None,
+            "tail": "the exit file is missing",
+            "log_size": 24,
+            "probe_success": True,
+            "state": state,
+        },
+        {
+            "exit_code": None,
+            "output": "the exit file is missing",
+            "full_output": "the exit file is missing",
+            "dispatch_status": "completed_detached",
+        },
+    )
+    storage = OutputStorageManager(tmp_path)
+
+    with bind_tool_result_output_storage(storage, task_id="detached", tool_name="search"):
+        result = SearchTool(orchestrator).execute(target="job:abc", pattern=".")
+
+    assert result.invocation_status is invocation_status
+    assert result.operation_outcome is OperationOutcome.UNKNOWN
+    assert result.error_code == "DETACHED_EXIT_STATUS_MISSING"
+    assert result.poll_ref == "job:abc"
+    assert result.is_terminal
+
+
 # --- review fixes: spoof-proof poll parsing, atomic exit file ----------------
 
 
@@ -621,6 +686,7 @@ class RoutingOrchestrator:
         if self._handoff:
             return {
                 "success": True,
+                "runner_dispatched": True,
                 "exit_code": None,
                 "output": "still running; poll /tmp/sag_jobs/abc.log",
                 "termination_reason": None,
@@ -633,6 +699,7 @@ class RoutingOrchestrator:
             }
         return {
             "success": True,
+            "runner_dispatched": True,
             "exit_code": 0,
             "output": "BUILD SUCCESSFUL",
             "termination_reason": None,
@@ -671,6 +738,268 @@ def test_maven_tool_routes_test_through_dispatch():
 
     assert orchestrator.soft_timeout_calls, "maven test must use dispatch-and-poll"
     assert result.metadata["dispatch_status"] == "running_detached"
+    assert result.metadata["runner_dispatched"] is True
+
+
+def test_maven_pending_profile_receipt_survives_terminal_search_poll():
+    from sag.tools.internal.maven_tool import MavenTool
+
+    tracker = CommandTracker()
+    tool = MavenTool(
+        RoutingOrchestrator(handoff=True),
+        command_tracker=tracker,
+    )
+
+    pending = tool.execute(
+        command="package",
+        profiles="foo",
+        working_directory="/workspace/p",
+    )
+
+    assert pending.invocation_status is InvocationStatus.PENDING
+    assert tracker.get_all_build_commands() == []
+    receipts = tracker.get_all_execution_receipts()
+    assert len(receipts) == 1
+    assert receipts[0]["command"] == "/usr/bin/mvn -Pfoo package"
+    assert receipts[0]["working_dir"] == "/workspace/p"
+    assert receipts[0]["dispatch_status"] == "running_detached"
+    assert receipts[0]["poll_ref"] == "job:abc"
+    assert receipts[0]["invocation_status"] == "pending"
+
+    poll_orchestrator = PollingJobOrchestrator(
+        {
+            "finished": True,
+            "running": False,
+            "exit_code": 0,
+            "tail": "BUILD SUCCESS",
+            "log_size": 13,
+            "probe_success": True,
+            "state": "finished",
+        },
+        {
+            "exit_code": 0,
+            "output": "BUILD SUCCESS",
+            "full_output": "BUILD SUCCESS",
+            "dispatch_status": "completed_detached",
+        },
+    )
+    completed = SearchTool(
+        poll_orchestrator,
+        command_tracker=tracker,
+    ).execute(target="job:abc", pattern=".")
+
+    assert completed.invocation_status is InvocationStatus.COMPLETED
+    assert receipts[0]["invocation_status"] == "completed"
+    assert receipts[0]["dispatch_status"] == "completed_detached"
+    assert receipts[0]["operation_outcome"] == "success"
+
+
+def test_maven_timeout_still_records_profile_graph_receipt():
+    from sag.tools.internal.maven_tool import MavenTool
+
+    class TimeoutOrchestrator(RoutingOrchestrator):
+        def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+            self.soft_timeout_calls.append(command)
+            return {
+                "success": False,
+                "runner_dispatched": True,
+                "exit_code": 124,
+                "output": "timed out while packaging",
+                "termination_reason": "absolute_timeout",
+                "execution_time": 300,
+            }
+
+    tracker = CommandTracker()
+    result = MavenTool(
+        TimeoutOrchestrator(),
+        command_tracker=tracker,
+    ).execute(
+        command="package",
+        profiles="foo",
+        working_directory="/workspace/p",
+    )
+
+    assert result.invocation_status is InvocationStatus.TIMEOUT
+    assert result.metadata["runner_dispatched"] is True
+    receipts = tracker.get_all_execution_receipts()
+    assert len(receipts) == 1
+    assert receipts[0]["command"] == "/usr/bin/mvn -Pfoo package"
+    assert receipts[0]["termination_reason"] == "absolute_timeout"
+    assert receipts[0]["invocation_status"] == "timeout"
+
+
+def test_maven_preflight_refusal_does_not_record_execution_receipt():
+    from sag.tools.internal.maven_tool import MavenTool
+
+    class MissingPomOrchestrator(RoutingOrchestrator):
+        def execute_command(self, command, workdir=None, timeout=None, **kwargs):
+            if "pom.xml && echo 'EXISTS'" in command:
+                return {
+                    "success": True,
+                    "output": "MISSING",
+                    "exit_code": 0,
+                }
+            return super().execute_command(
+                command,
+                workdir=workdir,
+                timeout=timeout,
+                **kwargs,
+            )
+
+    tracker = CommandTracker()
+    result = MavenTool(
+        MissingPomOrchestrator(),
+        command_tracker=tracker,
+    ).execute(
+        command="package",
+        profiles="foo",
+        working_directory="/workspace/p",
+    )
+
+    assert tracker.get_all_execution_receipts() == []
+    assert tracker.get_all_build_commands() == []
+    assert result.metadata.get("runner_dispatched") is not True
+
+
+def test_maven_dispatch_failure_does_not_record_execution_receipt():
+    from sag.tools.internal.maven_tool import MavenTool
+
+    class DispatchFailedOrchestrator(RoutingOrchestrator):
+        def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+            self.soft_timeout_calls.append(command)
+            return {
+                "success": False,
+                "runner_dispatched": False,
+                "exit_code": 1,
+                "output": "detached launcher failed",
+                "termination_reason": None,
+                "dispatch_status": "dispatch_failed",
+            }
+
+    tracker = CommandTracker()
+    result = MavenTool(
+        DispatchFailedOrchestrator(),
+        command_tracker=tracker,
+    ).execute(
+        command="package",
+        profiles="foo",
+        working_directory="/workspace/p",
+    )
+
+    assert tracker.get_all_execution_receipts() == []
+    assert tracker.get_all_build_commands() == []
+    assert result.metadata["dispatch_status"] == "dispatch_failed"
+    assert result.metadata["runner_dispatched"] is False
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "output", "expected_outcome"),
+    [
+        (0, "[INFO] BUILD SUCCESS", OperationOutcome.SUCCESS),
+        (1, "[INFO] BUILD FAILURE", OperationOutcome.FAILED),
+    ],
+)
+def test_maven_terminal_result_propagates_real_runner_dispatch(
+    exit_code,
+    output,
+    expected_outcome,
+):
+    from sag.tools.internal.maven_tool import MavenTool
+
+    class TerminalOrchestrator(RoutingOrchestrator):
+        def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+            self.soft_timeout_calls.append(command)
+            return {
+                "success": exit_code == 0,
+                "runner_dispatched": True,
+                "exit_code": exit_code,
+                "output": output,
+                "termination_reason": None,
+            }
+
+    tracker = CommandTracker()
+    result = MavenTool(
+        TerminalOrchestrator(),
+        command_tracker=tracker,
+    ).execute(
+        command="package",
+        profiles="foo",
+        working_directory="/workspace/p",
+        raw_output=True,
+    )
+
+    assert result.operation_outcome is expected_outcome
+    assert result.metadata["runner_dispatched"] is True
+    assert len(tracker.get_all_execution_receipts()) == 1
+    assert len(tracker.get_all_build_commands()) == 1
+
+
+def test_maven_retry_dispatch_failure_preserves_first_real_dispatch(
+    monkeypatch,
+):
+    from sag.tools.internal.maven_tool import MavenTool
+
+    class RetryOrchestrator(RoutingOrchestrator):
+        def __init__(self):
+            super().__init__()
+            self.results = [
+                {
+                    "success": False,
+                    "runner_dispatched": True,
+                    "exit_code": 1,
+                    "output": (
+                        "RequireJavaVersion failed: version 11 is not in "
+                        "the allowed range [17,) BUILD FAILURE"
+                    ),
+                    "termination_reason": None,
+                },
+                {
+                    "success": False,
+                    "runner_dispatched": False,
+                    "exit_code": 1,
+                    "output": "detached launcher failed",
+                    "termination_reason": None,
+                    "dispatch_status": "dispatch_failed",
+                },
+            ]
+
+        def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+            self.soft_timeout_calls.append(command)
+            return self.results.pop(0)
+
+    def preflight(_self, required, source):
+        if source == "build-error":
+            return SimpleNamespace(
+                provisioned=True,
+                active_version="17",
+                narration="",
+            )
+        return SimpleNamespace(
+            provisioned=False,
+            active_version="11",
+            narration="",
+        )
+
+    monkeypatch.setattr(
+        "sag.tools.internal.maven_tool.JdkPreflight.run",
+        preflight,
+    )
+    tracker = CommandTracker()
+    result = MavenTool(
+        RetryOrchestrator(),
+        command_tracker=tracker,
+    ).execute(
+        command="compile",
+        profiles="foo",
+        working_directory="/workspace/p",
+    )
+
+    assert result.metadata["runner_dispatched"] is True
+    assert result.metadata["final_runner_dispatched"] is False
+    assert result.metadata["dispatch_status"] == "dispatch_failed"
+    assert result.metadata["jdk_retry"] == {"from": "11", "to": "17"}
+    assert len(tracker.get_all_execution_receipts()) == 1
+    assert tracker.get_all_build_commands() == []
 
 
 def test_bash_tool_routes_long_command_through_dispatch():

@@ -134,9 +134,11 @@ def test_initial_system_prompt_includes_env_overlay_runtime_guidance():
 
     assert "Use bash to install missing runtimes" in prompt
     assert "project(action='env'" in prompt
+    assert "env: Validate, register, and activate" in prompt
     assert "build, bash, validation, and report flows" in prompt
     assert "exact executable/version" in prompt
     assert "Do not use project(action='env') to rewrite project build configuration" in prompt
+    assert "Runtime Recovery Guardrails" not in prompt
 
 
 def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():

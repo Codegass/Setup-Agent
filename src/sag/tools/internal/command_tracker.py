@@ -35,6 +35,11 @@ class CommandTracker:
         # Command storage
         self.build_commands: List[Dict[str, Any]] = []
         self.test_commands: List[Dict[str, Any]] = []
+        # Dispatch receipts are provenance, not success claims. Maven records
+        # one as soon as a physical build/test process has been launched so a
+        # detached handoff or timeout cannot hide graph-changing selectors
+        # (for example ``-Pfoo``) from the physical validator.
+        self.execution_receipts: List[Dict[str, Any]] = []
         self.command_results: Dict[str, Any] = {}
 
         # Track last successful commands
@@ -235,6 +240,77 @@ class CommandTracker:
         """Get all test commands executed."""
         return self.test_commands
 
+    def track_execution_receipt(
+        self,
+        *,
+        command: str,
+        tool: str,
+        working_dir: str,
+        command_kind: str,
+        dispatch_status: str | None = None,
+        poll_ref: str | None = None,
+        invocation_status: str = "completed",
+        exit_code: int | None = None,
+        termination_reason: str | None = None,
+        lifecycle_state: str | None = None,
+        duration: float | None = None,
+    ) -> Dict[str, Any]:
+        """Record exact launch provenance without treating it as build evidence."""
+        timestamp = datetime.now().isoformat()
+        entry = {
+            "receipt_id": poll_ref or f"{tool}:{command_kind}:{timestamp}",
+            "command": command,
+            "tool": tool,
+            "working_dir": working_dir,
+            "command_kind": command_kind,
+            "timestamp": timestamp,
+            "runner_dispatched": True,
+            "dispatch_status": dispatch_status,
+            "poll_ref": poll_ref,
+            "invocation_status": invocation_status,
+            "exit_code": exit_code,
+            "termination_reason": termination_reason,
+            "lifecycle_state": lifecycle_state,
+            "duration": duration,
+        }
+        self.execution_receipts.append(entry)
+        logger.debug(
+            "Tracked execution receipt "
+            f"{entry['receipt_id']} ({invocation_status}, {command[:100]}...)"
+        )
+        return entry
+
+    def update_execution_receipt(
+        self,
+        poll_ref: str,
+        *,
+        invocation_status: str,
+        dispatch_status: str,
+        exit_code: int | None,
+        operation_outcome: str | None = None,
+        lifecycle_state: str | None = None,
+    ) -> bool:
+        """Attach a terminal poll to the launch receipt with the same identity."""
+        for entry in reversed(self.execution_receipts):
+            if entry.get("poll_ref") != poll_ref:
+                continue
+            entry.update(
+                {
+                    "invocation_status": invocation_status,
+                    "dispatch_status": dispatch_status,
+                    "exit_code": exit_code,
+                    "operation_outcome": operation_outcome,
+                    "lifecycle_state": lifecycle_state,
+                    "completed_timestamp": datetime.now().isoformat(),
+                }
+            )
+            return True
+        return False
+
+    def get_all_execution_receipts(self) -> List[Dict[str, Any]]:
+        """Return launch provenance, including nonterminal detached commands."""
+        return self.execution_receipts
+
     def replay_last_build(self) -> Dict[str, Any]:
         """
         Replay the last build command and return actual result.
@@ -337,6 +413,7 @@ class CommandTracker:
             "timestamp": datetime.now().isoformat(),
             "build_commands": self.build_commands,
             "test_commands": self.test_commands,
+            "execution_receipts": self.execution_receipts,
             "last_successful_build": self.last_successful_build,
             "last_successful_test": self.last_successful_test,
         }
@@ -362,6 +439,7 @@ class CommandTracker:
             self.project_name = data.get("project")
             self.build_commands = data.get("build_commands", [])
             self.test_commands = data.get("test_commands", [])
+            self.execution_receipts = data.get("execution_receipts", [])
             self.last_successful_build = data.get("last_successful_build")
             self.last_successful_test = data.get("last_successful_test")
 

@@ -15,7 +15,6 @@ from sag.evidence import EvidenceStatus, InvocationStatus, OperationOutcome
 
 from ..base import ToolResult, require_persisted_output_storage_ref
 
-
 DETACHED_HANDOFF_STATUSES = frozenset({"running_detached", "liveness_unknown_detached"})
 
 
@@ -55,6 +54,7 @@ def detached_handoff_tool_result(
         refs=[poll_ref],
         metadata={
             "dispatch_status": result.get("dispatch_status", "running_detached"),
+            "runner_dispatched": result.get("runner_dispatched") is True,
             "tool": tool_name,
             "command": command,
             "job_id": job_id,
@@ -76,6 +76,7 @@ def classify_detached_completion(
     poll_ref: str | None = None,
     output_ref_storage: Any = None,
     invocation_status: InvocationStatus | str = InvocationStatus.COMPLETED,
+    terminal_observation: bool = False,
 ) -> ToolResult:
     """Classify a terminal detached observation, preferring fatal evidence."""
     terminal_status = InvocationStatus(invocation_status)
@@ -114,6 +115,19 @@ def classify_detached_completion(
             storage=output_ref_storage,
         )
     if exit_code is None:
+        if terminal_observation:
+            return ToolResult(
+                invocation_status=terminal_status,
+                operation_outcome=OperationOutcome.UNKNOWN,
+                evidence_status=EvidenceStatus.UNKNOWN,
+                poll_ref=poll_ref,
+                output=tail,
+                raw_output=full_output or tail,
+                error="Detached operation ended without a recorded exit status",
+                error_code="DETACHED_EXIT_STATUS_MISSING",
+                output_ref=full_output_ref,
+                refs=[poll_ref] if poll_ref else [],
+            )
         if not poll_ref:
             raise ValueError("inconclusive detached completion requires a stable poll_ref")
         return ToolResult(

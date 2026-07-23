@@ -53,10 +53,55 @@ def test_analyze_routes_to_analyzer():
 
 def test_env_routes_to_env_tool():
     tool, *_, env = _tool()
-    tool.execute(action="env", env={"JAVA_HOME": "/usr/lib/jvm/x"})
+    tool.execute(
+        action="env",
+        tool="maven",
+        executable="/opt/apache-maven-3.9.9/bin/mvn",
+    )
     assert env.calls
     # EnvTool's real "set env vars/executables" verb is register.
     assert env.calls[0]["action"] == "register"
+    assert env.calls[0]["activate"] is True
+
+
+def test_env_facade_rejects_explicit_inactive_registration():
+    tool, *_, env = _tool()
+
+    result = tool.execute(
+        action="env",
+        tool="maven",
+        executable="/opt/apache-maven-3.9.9/bin/mvn",
+        activate=False,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PROJECT_ENV_ACTIVATION_REQUIRED"
+    assert env.calls == []
+
+
+def test_env_facade_safe_execute_cannot_bypass_activation_requirement():
+    tool, *_, env = _tool()
+
+    result = tool.safe_execute(
+        action="env",
+        tool="maven",
+        executable="/opt/apache-maven-3.9.9/bin/mvn",
+        activate=False,
+    )
+
+    assert result.succeeded is False
+    assert env.calls == []
+
+
+def test_env_schema_describes_atomic_activation_default():
+    tool, *_ = _tool()
+
+    schema = tool.get_parameter_schema()
+
+    assert schema["properties"]["activate"]["default"] is True
+    assert schema["properties"]["activate"]["enum"] == [True]
+    assert "activate" in schema["properties"]["executable"]["description"]
+    assert "requirement" in schema["properties"]
 
 
 def test_provision_routes_to_system():

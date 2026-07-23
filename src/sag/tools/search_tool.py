@@ -15,7 +15,13 @@ from .internal.build_utils import classify_detached_completion
 
 
 class SearchTool(BaseTool):
-    def __init__(self, docker_orchestrator, output_search=None, web_search=None):
+    def __init__(
+        self,
+        docker_orchestrator,
+        output_search=None,
+        web_search=None,
+        command_tracker=None,
+    ):
         super().__init__(
             name="search",
             description=(
@@ -27,6 +33,7 @@ class SearchTool(BaseTool):
         self.docker_orchestrator = docker_orchestrator
         self.output_search = output_search
         self.web_search = web_search
+        self.command_tracker = command_tracker
 
     def execute(self, target: str, pattern: str = "", max_results: int = 50) -> ToolResult:
         target = (target or "").strip()
@@ -93,6 +100,7 @@ class SearchTool(BaseTool):
                     if poll.get("state") == "vanished"
                     else InvocationStatus.COMPLETED
                 ),
+                terminal_observation=True,
             )
             result.metadata.update(
                 {
@@ -103,6 +111,20 @@ class SearchTool(BaseTool):
                 }
             )
             result.refs.append(poll_ref)
+            update_receipt = getattr(
+                self.command_tracker,
+                "update_execution_receipt",
+                None,
+            )
+            if callable(update_receipt):
+                update_receipt(
+                    poll_ref,
+                    invocation_status=result.invocation_status.value,
+                    dispatch_status="completed_detached",
+                    exit_code=completed.get("exit_code"),
+                    operation_outcome=result.operation_outcome.value,
+                    lifecycle_state=poll.get("state"),
+                )
             return result
 
         return classify_detached_completion(

@@ -16,6 +16,9 @@ exists specifically so a false "shell" verdict redirects into it — a correct
 detector leaves the root alone.
 """
 
+import shlex
+
+from sag.agent.physical_survey import _scikit_build_package_paths
 from sag.tools.internal.project_analyzer import detect_python_package_root
 from tests.test_native_build_guidance import _ScriptedRepo
 
@@ -78,8 +81,7 @@ def test_dynamic_dependencies_root_is_not_shell():
     build backend). Named package at the root — no redirect."""
     files = {
         "pyproject.toml": (
-            '[project]\nname = "proj"\nrequires-python = ">=3.9"\n'
-            'dynamic = ["dependencies"]\n'
+            '[project]\nname = "proj"\nrequires-python = ">=3.9"\n' 'dynamic = ["dependencies"]\n'
         ),
         "proj/__init__.py": "",
         **_SUBDIR_TRAP,
@@ -149,3 +151,97 @@ def test_bare_pyproject_shell_with_no_package_still_redirects():
     result = _detect(_ROOT, files)
     assert result["python_root"] == f"{_ROOT}/python"
     assert result["has_native_build"] is False
+
+
+class _MappedWorkspaceOrch:
+    """Run ownership probes against a real temporary workspace tree."""
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self.commands = []
+
+    def physical_path(self, logical):
+        assert logical == "/workspace" or logical.startswith("/workspace/")
+        suffix = logical.removeprefix("/workspace").lstrip("/")
+        return self.workspace / suffix if suffix else self.workspace
+
+    def execute_command(self, command, **kwargs):
+        self.commands.append(command)
+        tokens = shlex.split(command)
+        if tokens[:3] == ["realpath", "-m", "--"]:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "\n".join(
+                    str(self.physical_path(path).resolve(strict=False)) for path in tokens[3:]
+                ),
+            }
+        if tokens[:2] == ["test", "-e"]:
+            exists = self.physical_path(tokens[2]).exists()
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "yes" if exists else "no",
+            }
+        raise AssertionError(f"unexpected command: {command}")
+
+
+def test_python_subdir_symlink_escape_does_not_become_install_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    project = workspace / "proj"
+    outside_python = tmp_path / "outside" / "python"
+    project.mkdir(parents=True)
+    outside_python.mkdir(parents=True)
+    (outside_python / "setup.py").write_text(
+        "from setuptools import setup\nsetup(name='outside')\n",
+        encoding="utf-8",
+    )
+    (project / "python").symlink_to(outside_python, target_is_directory=True)
+    orch = _MappedWorkspaceOrch(workspace)
+
+    result = detect_python_package_root(
+        orch,
+        "/workspace/proj",
+        {"CMakeLists.txt", "pyproject.toml"},
+        (
+            "[build-system]\n"
+            'requires = ["setuptools"]\n'
+            'build-backend = "setuptools.build_meta"\n'
+        ),
+    )
+
+    assert result == {
+        "python_root": "/workspace/proj",
+        "has_native_build": True,
+    }
+    assert not any(
+        command.startswith("test -e /workspace/proj/python") for command in orch.commands
+    )
+
+
+def test_scikit_package_dir_symlink_escape_is_not_persisted(tmp_path):
+    workspace = tmp_path / "workspace"
+    project = workspace / "proj"
+    outside_package = tmp_path / "outside" / "native_pkg"
+    (project / "src").mkdir(parents=True)
+    outside_package.mkdir(parents=True)
+    (outside_package / "__init__.py").write_text("", encoding="utf-8")
+    (project / "src" / "native_pkg").symlink_to(
+        outside_package,
+        target_is_directory=True,
+    )
+    orch = _MappedWorkspaceOrch(workspace)
+    parsed = {
+        "tool": {
+            "scikit-build": {
+                "wheel": {
+                    "packages": ["src/native_pkg"],
+                }
+            }
+        }
+    }
+
+    assert _scikit_build_package_paths(orch, "/workspace/proj", parsed) == []
+    assert not any(
+        command.startswith("test -e /workspace/proj/src/native_pkg") for command in orch.commands
+    )

@@ -338,6 +338,41 @@ class ToolParameterNormalizer:
         properties = schema.get("properties", {})
         required = schema.get("required", [])
 
+        # Normalize the two report aliases observed in weak-model transcripts
+        # before required-field defaults are inserted.  Presence of a
+        # canonical field means the caller chose it, even if its value is
+        # empty; generated defaults must not masquerade as that choice.
+        if tool_name == "report":
+            for old_name, new_name in {
+                "content": "summary",
+                "outcome": "status",
+            }.items():
+                if old_name not in fixed_params or new_name not in properties:
+                    continue
+                old_value = fixed_params.pop(old_name)
+                if new_name in fixed_params:
+                    self._add_parameter_fix(
+                        fixes,
+                        field=old_name,
+                        before=old_value,
+                        after=None,
+                        reason=(
+                            f"Removed alias '{old_name}' because "
+                            f"'{new_name}' already had a value"
+                        ),
+                        source="schema_alias",
+                    )
+                    continue
+                fixed_params[new_name] = old_value
+                self._add_parameter_fix(
+                    fixes,
+                    field=new_name,
+                    before=None,
+                    after=old_value,
+                    reason=f"Renamed parameter '{old_name}' to '{new_name}'",
+                    source="schema_alias",
+                )
+
         # Fix missing required parameters
         for param_name in required:
             if param_name not in fixed_params or fixed_params[param_name] is None:
@@ -642,12 +677,6 @@ class ToolParameterNormalizer:
                 "execute": "command",
                 "bash_command": "command",
                 "shell_command": "command",
-                "dir": "working_directory",
-                "cwd": "working_directory",
-                "working_dir": "working_directory",
-                "workdir": "working_directory",  # Map old workdir to working_directory
-                "work_dir": "working_directory",
-                "directory": "working_directory",
                 "path": "working_directory",  # Path should also map to working_directory for bash
             },
             "file_io": {
@@ -682,7 +711,6 @@ class ToolParameterNormalizer:
             "maven": {
                 # Don't map 'goals' - it's a separate parameter from 'command'
                 "options": "properties",
-                "dir": "working_directory",
                 "project_dir": "working_directory",
                 "cmd": "command",  # Common mistake
                 "maven_command": "command",
@@ -712,6 +740,46 @@ class ToolParameterNormalizer:
                 "results": "summary",
             },
         }
+
+        # Weak models commonly serialize a cwd alias even when the tool schema
+        # says ``working_directory``. Normalize this before state defaults are
+        # considered by the orchestrator. If both are present, the documented
+        # canonical field always wins; string length is not a precedence rule.
+        if tool_name in {"build", "python", "maven", "gradle", "bash"}:
+            for old_name in (
+                "cwd",
+                "workdir",
+                "working_dir",
+                "work_dir",
+                "dir",
+                "directory",
+            ):
+                if old_name not in fixed_params or "working_directory" not in properties:
+                    continue
+                old_value = fixed_params[old_name]
+                if "working_directory" in fixed_params:
+                    self._add_parameter_fix(
+                        fixes,
+                        field=old_name,
+                        before=old_value,
+                        after=None,
+                        reason=(
+                            f"Removed alias '{old_name}' because "
+                            "'working_directory' already had a value"
+                        ),
+                        source="schema_alias",
+                    )
+                else:
+                    fixed_params["working_directory"] = old_value
+                    self._add_parameter_fix(
+                        fixes,
+                        field="working_directory",
+                        before=None,
+                        after=old_value,
+                        reason=f"Renamed parameter '{old_name}' to 'working_directory'",
+                        source="schema_alias",
+                    )
+                del fixed_params[old_name]
 
         # Apply tool-specific mappings first (higher priority)
         if tool_name in tool_specific_mappings:

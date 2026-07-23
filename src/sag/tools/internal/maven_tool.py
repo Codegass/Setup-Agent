@@ -12,6 +12,7 @@ from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, TestStats
+from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
 from .build_preflight import (
@@ -232,18 +233,35 @@ class MavenTool(BaseTool):
                 )
         preamble = ("\n".join(preamble_lines) + "\n") if preamble_lines else ""
 
-        required_version = ToolVersionRequirement.from_raw(
+        requested_version = ToolVersionRequirement.from_raw(
             maven_version_requirement, source="tool_parameter"
         )
+        observed_versions = []
+        observed_requirements = getattr(self.toolchain_manager, "observed_requirements", None)
+        if callable(observed_requirements):
+            observed_versions = observed_requirements(
+                "maven",
+                working_directory=working_directory,
+            )
+        else:
+            observed_requirement = getattr(self.toolchain_manager, "observed_requirement", None)
+            if callable(observed_requirement):
+                inherited = observed_requirement("maven")
+                if inherited:
+                    observed_versions = [inherited]
+        resolution_requirement = requested_version or (
+            observed_versions[0] if observed_versions else None
+        )
+        contract_requirement = observed_versions[0] if observed_versions else requested_version
         resolved_maven = self._resolve_maven_executable(
             working_directory=working_directory,
-            version_requirement=required_version,
+            version_requirement=resolution_requirement,
             prefer_wrapper=use_wrapper,
         )
 
-        if required_version and not resolved_maven:
+        if contract_requirement and not resolved_maven:
             return self._maven_version_not_resolved_result(
-                required_version=required_version,
+                required_version=contract_requirement,
                 working_directory=working_directory,
             )
 
@@ -255,7 +273,7 @@ class MavenTool(BaseTool):
                     return install_result
                 resolved_maven = self._resolve_maven_executable(
                     working_directory=working_directory,
-                    version_requirement=required_version,
+                    version_requirement=resolution_requirement,
                     prefer_wrapper=use_wrapper,
                 )
                 if not resolved_maven:
@@ -271,7 +289,9 @@ class MavenTool(BaseTool):
             else ("./mvnw" if use_wrapper else "mvn")
         )
         maven_runtime = self._maven_runtime_metadata(resolved_maven, maven_executable)
-        requested_requirement_metadata = self._maven_version_requirement_metadata(required_version)
+        requested_requirement_metadata = self._maven_version_requirement_metadata(
+            contract_requirement
+        )
 
         version_command = self._normalize_maven_version_command(command)
         if version_command:
@@ -418,6 +438,14 @@ class MavenTool(BaseTool):
 
             _build_t0 = time.monotonic()
             result = _run_build()
+            runner_dispatched_any = result.get("runner_dispatched") is True
+            self._record_execution_receipt(
+                command,
+                maven_cmd,
+                working_directory,
+                result,
+                duration=time.monotonic() - _build_t0,
+            )
 
             # Bounded retry: a version-shaped failure means the requirement in
             # the error text is authoritative; re-provision from it and rerun
@@ -443,11 +471,28 @@ class MavenTool(BaseTool):
                             f"re-provisioned, retry 1/1\n"
                         )
                         jdk_retry_meta = {"from": active, "to": needed}
+                        retry_t0 = time.monotonic()
                         result = _run_build()
+                        self._record_execution_receipt(
+                            command,
+                            maven_cmd,
+                            working_directory,
+                            result,
+                            duration=time.monotonic() - retry_t0,
+                        )
+                        final_runner_dispatched = result.get("runner_dispatched") is True
+                        runner_dispatched_any = runner_dispatched_any or final_runner_dispatched
             _build_elapsed = time.monotonic() - _build_t0
+            final_runner_dispatched = result.get("runner_dispatched") is True
+            result["final_runner_dispatched"] = final_runner_dispatched
+            # Public semantics: at least one Maven runner physically launched
+            # during this tool attempt. The final retry state remains separate.
+            result["runner_dispatched"] = runner_dispatched_any
 
             if result.get("dispatch_status") in DETACHED_HANDOFF_STATUSES:
-                return detached_handoff_tool_result("maven", maven_cmd, result)
+                handoff = detached_handoff_tool_result("maven", maven_cmd, result)
+                handoff.metadata["final_runner_dispatched"] = final_runner_dispatched
+                return handoff
 
             if result.get("termination_reason"):
                 return self._timeout_result_from_command(
@@ -495,15 +540,17 @@ class MavenTool(BaseTool):
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
                     invocation_status=(
-                        "crashed"
-                        if result.get("lifecycle_state") == "vanished"
-                        else "completed"
+                        "crashed" if result.get("lifecycle_state") == "vanished" else "completed"
                     ),
+                    terminal_observation=True,
                 )
                 if not detached_result.succeeded:
                     detached_result.metadata.update(
                         {
                             "command": maven_cmd,
+                            "runner_dispatched": result.get("runner_dispatched") is True,
+                            "final_runner_dispatched": result.get("final_runner_dispatched")
+                            is True,
                             "exit_code": result.get("exit_code"),
                             "analysis": analysis,
                             "dispatch_status": "completed_detached",
@@ -518,7 +565,11 @@ class MavenTool(BaseTool):
                     )
 
             # Track command for fact-based validation
-            if self.command_tracker:
+            if (
+                self.command_tracker
+                and result.get("runner_dispatched") is True
+                and result.get("dispatch_status") != "dispatch_failed"
+            ):
                 # Determine if this is a build or test command
                 is_test_command = any(
                     test_word in command.lower() for test_word in ["test", "verify"]
@@ -557,6 +608,9 @@ class MavenTool(BaseTool):
                             **evidence_fields,
                             metadata={
                                 "command": maven_cmd,
+                                "runner_dispatched": result.get("runner_dispatched") is True,
+                                "final_runner_dispatched": result.get("final_runner_dispatched")
+                                is True,
                                 "exit_code": result["exit_code"],
                                 "analysis": analysis,
                                 "maven_runtime": maven_runtime,
@@ -578,12 +632,17 @@ class MavenTool(BaseTool):
                     maven_cmd,
                     analysis,
                     maven_runtime,
+                    runner_dispatched=result.get("runner_dispatched") is True,
+                    final_runner_dispatched=(result.get("final_runner_dispatched") is True),
                     output_ref_id=ref_id,
+                    working_directory=working_directory,
                 )
                 error_result.output = result["output"]
                 error_result.raw_output = result["output"]
                 if ref_id:
                     error_result.metadata["output_ref_id"] = ref_id
+                if result.get("dispatch_status"):
+                    error_result.metadata["dispatch_status"] = result["dispatch_status"]
                 return self._finalize_main_result(error_result, preamble, jdk_retry_meta)
 
             # Use analysis result to determine success, not just exit code
@@ -632,7 +691,12 @@ class MavenTool(BaseTool):
                                     maven_cmd,
                                     analysis,
                                     maven_runtime,
+                                    runner_dispatched=(result.get("runner_dispatched") is True),
+                                    final_runner_dispatched=(
+                                        result.get("final_runner_dispatched") is True
+                                    ),
                                     output_ref_id=ref_id,
+                                    working_directory=working_directory,
                                 ),
                                 preamble,
                                 jdk_retry_meta,
@@ -647,6 +711,9 @@ class MavenTool(BaseTool):
                         **evidence_fields,
                         metadata={
                             "command": maven_cmd,
+                            "runner_dispatched": result.get("runner_dispatched") is True,
+                            "final_runner_dispatched": result.get("final_runner_dispatched")
+                            is True,
                             "exit_code": result["exit_code"],
                             "analysis": analysis,
                             "validation": validation_result,
@@ -671,15 +738,21 @@ class MavenTool(BaseTool):
                         working_directory, analysis, result["exit_code"], maven_cmd
                     )
                 # Build failed - use error handler even if exit code was 0
+                error_result = self._handle_maven_error(
+                    result["output"],
+                    result["exit_code"],
+                    maven_cmd,
+                    analysis,
+                    maven_runtime,
+                    runner_dispatched=result.get("runner_dispatched") is True,
+                    final_runner_dispatched=(result.get("final_runner_dispatched") is True),
+                    output_ref_id=ref_id,
+                    working_directory=working_directory,
+                )
+                if result.get("dispatch_status"):
+                    error_result.metadata["dispatch_status"] = result["dispatch_status"]
                 return self._finalize_main_result(
-                    self._handle_maven_error(
-                        result["output"],
-                        result["exit_code"],
-                        maven_cmd,
-                        analysis,
-                        maven_runtime,
-                        output_ref_id=ref_id,
-                    ),
+                    error_result,
                     preamble,
                     jdk_retry_meta,
                 )
@@ -716,6 +789,65 @@ class MavenTool(BaseTool):
         if jdk_retry:
             tool_result.metadata["jdk_retry"] = jdk_retry
         return tool_result
+
+    def _record_execution_receipt(
+        self,
+        requested_command: str,
+        maven_command: str,
+        working_directory: str,
+        result: Dict[str, Any],
+        *,
+        duration: float,
+    ) -> None:
+        """Record graph provenance immediately after a physical Maven dispatch."""
+        tracker = self.command_tracker
+        record = getattr(tracker, "track_execution_receipt", None)
+        if not callable(record) or result.get("runner_dispatched") is not True:
+            return
+
+        normalized = str(requested_command or "").lower()
+        if any(goal in normalized for goal in ("test", "verify")):
+            command_kind = "test"
+        elif any(goal in normalized for goal in ("compile", "package", "install", "deploy")):
+            command_kind = "build"
+        else:
+            return
+
+        dispatch_status = result.get("dispatch_status")
+        poll_ref = None
+        if dispatch_status in {
+            *DETACHED_HANDOFF_STATUSES,
+            "completed_detached",
+        }:
+            poll_ref = detached_poll_ref(result)
+        elif result.get("dispatch"):
+            try:
+                poll_ref = detached_poll_ref(result)
+            except ValueError:
+                poll_ref = None
+
+        invocation_status = (
+            "pending"
+            if dispatch_status in DETACHED_HANDOFF_STATUSES
+            else (
+                "crashed"
+                if result.get("lifecycle_state") == "vanished"
+                else ("timeout" if result.get("termination_reason") else "completed")
+            )
+        )
+        record(
+            command=maven_command,
+            tool="maven",
+            working_dir=working_directory,
+            command_kind=command_kind,
+            dispatch_status=dispatch_status,
+            poll_ref=poll_ref,
+            invocation_status=invocation_status,
+            exit_code=result.get("exit_code"),
+            termination_reason=result.get("termination_reason"),
+            lifecycle_state=result.get("lifecycle_state"),
+            duration=duration,
+        )
 
     def _build_maven_command(
         self,
@@ -872,7 +1004,10 @@ class MavenTool(BaseTool):
                     "Use bash to inspect candidates: "
                     "find /workspace /tmp /opt /usr/local -path '*/apache-maven-*/bin/mvn' -type f"
                 ),
-                "If the project can use system Maven, omit maven_version_requirement on the next call.",
+                (
+                    "Keep the same maven_version_requirement on every retry; do not fall back "
+                    "to an unverified system Maven."
+                ),
             ],
             metadata={
                 "working_directory": working_directory,
@@ -899,7 +1034,20 @@ class MavenTool(BaseTool):
 
     @staticmethod
     def extract_version_requirement_from_output(output: str) -> ToolVersionRequirement | None:
-        match = re.search(r"allowed range\s+([\[\(][^\]\)]+[\]\)])", output or "")
+        # Maven Enforcer uses the same "allowed range" wording for
+        # RequireMavenVersion and RequireJavaVersion.  A free-floating range
+        # match turns "Detected JDK Version ... [17,)" into a Maven 17
+        # requirement, persists it to the runtime overlay, and blocks the
+        # otherwise-correct JDK retry.  Require the Maven identity and its
+        # range to occur in the same diagnostic line; a wrapped/ambiguous
+        # message is safer to leave unclassified than to poison runtime state.
+        normalized = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output or "")
+        match = re.search(
+            r"(?im)^.*Detected\s+Maven\s+Version\s*:?"
+            r"[^\r\n]*?\ballowed\s+range\s+"
+            r"([\[\(][^\]\)\r\n]+[\]\)])",
+            normalized,
+        )
         if not match:
             return None
         return ToolVersionRequirement(raw=match.group(1), source="build_error", kind="range")
@@ -959,6 +1107,8 @@ class MavenTool(BaseTool):
             "termination_reason": reason,
             "execution_time": execution_time,
             "command": maven_cmd,
+            "runner_dispatched": result.get("runner_dispatched") is True,
+            "final_runner_dispatched": result.get("final_runner_dispatched") is True,
             "requested_command": command,
             "exit_code": result.get("exit_code"),
             "tool_type": "maven",
@@ -1686,7 +1836,10 @@ class MavenTool(BaseTool):
         command: str,
         analysis: Dict[str, Any],
         maven_runtime: Dict[str, Any] | None = None,
+        runner_dispatched: bool = False,
+        final_runner_dispatched: bool = False,
         output_ref_id: Optional[str] = None,
+        working_directory: Optional[str] = None,
     ) -> ToolResult:
         """Enhanced error handling with specific suggestions based on error type."""
         """Handle Maven build errors with detailed analysis."""
@@ -1855,11 +2008,18 @@ class MavenTool(BaseTool):
             documentation_links.append("https://maven.apache.org/pom.html#Quick_Overview")
 
         # Check for Java version issues (including Maven Enforcer plugin)
+        runtime_contract_persisted = None
         if analysis.get("maven_version_requirement"):
             requirement = analysis["maven_version_requirement"]
             raw_requirement = requirement.get("raw", "the required range")
             runtime_executable = (maven_runtime or {}).get("executable", "the current mvn")
             runtime_version = (maven_runtime or {}).get("version", "unknown")
+            runtime_contract_persisted = self._persist_maven_requirement_failure(
+                requirement=requirement,
+                maven_runtime=maven_runtime,
+                output=output,
+                working_directory=working_directory,
+            )
             error_code = "MAVEN_VERSION_ERROR"
             error_suggestions.extend(
                 [
@@ -1874,9 +2034,12 @@ class MavenTool(BaseTool):
                     (
                         "Register the new executable on the runtime overlay, e.g. "
                         "project(action='env', tool='maven', executable='/workspace/apache-maven-<version>/bin/mvn', "
-                        "version='<version>', activate=True)"
+                        f"requirement='{raw_requirement}')"
                     ),
-                    (f"Retry with build(action='{command}')"),
+                    (
+                        f"Retry with build(action='{command}', "
+                        f"maven_version_requirement='{raw_requirement}')"
+                    ),
                     (
                         "If an exact Maven executable is proven incompatible, note that "
                         "executable/version finding and register a compatible one instead"
@@ -2013,6 +2176,8 @@ class MavenTool(BaseTool):
 
         metadata = {
             "command": command,
+            "runner_dispatched": runner_dispatched,
+            "final_runner_dispatched": final_runner_dispatched,
             "exit_code": exit_code,
             "analysis": analysis,
             "key_errors_extracted": True,
@@ -2027,6 +2192,7 @@ class MavenTool(BaseTool):
         if analysis.get("maven_version_requirement"):
             metadata["maven_version_requirement"] = analysis["maven_version_requirement"]
             metadata["compatible_maven_candidate"] = None
+            metadata["runtime_contract_persisted"] = bool(runtime_contract_persisted)
 
         evidence_fields = self._maven_evidence_fields(analysis, output_ref_id)
         return ToolResult.completed_failure(
@@ -2039,6 +2205,46 @@ class MavenTool(BaseTool):
             metadata=metadata,
             **evidence_fields,
         )
+
+    def _persist_maven_requirement_failure(
+        self,
+        *,
+        requirement: Dict[str, Any],
+        maven_runtime: Optional[Dict[str, Any]],
+        output: str,
+        working_directory: Optional[str],
+    ) -> bool:
+        """Persist the Enforcer fact so later env/build calls need no model relay."""
+        raw_requirement = str(requirement.get("raw") or "").strip()
+        if not raw_requirement:
+            return False
+
+        executable = (maven_runtime or {}).get("executable")
+        if executable and not str(executable).startswith("/"):
+            probe = self.orchestrator.execute_command(f"command -v {shlex.quote(str(executable))}")
+            resolved_path = (probe.get("output") or "").strip()
+            executable = resolved_path if probe.get("exit_code") == 0 and resolved_path else None
+
+        version_match = re.search(
+            r"Detected Maven Version:\s*([0-9]+(?:\.[0-9]+){0,3})\b",
+            output or "",
+        )
+        version = version_match.group(1) if version_match else (maven_runtime or {}).get("version")
+
+        try:
+            EnvOverlayStore(self.orchestrator).record_requirement_failure(
+                "maven",
+                requirement=raw_requirement,
+                executable=str(executable) if executable else None,
+                version=str(version) if version else None,
+                reason="Maven Enforcer rejected this runtime",
+                source="build_error",
+                working_directory=working_directory,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(f"Failed to persist Maven runtime requirement: {exc}")
+            return False
 
     def _record_test_summary(
         self, working_directory: str, analysis: Dict[str, Any], exit_code: int, command: str

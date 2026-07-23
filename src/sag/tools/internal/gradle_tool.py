@@ -336,15 +336,15 @@ class GradleTool(BaseTool):
                     poll_ref=detached_poll_ref(result),
                     output_ref_storage=self.output_storage,
                     invocation_status=(
-                        "crashed"
-                        if result.get("lifecycle_state") == "vanished"
-                        else "completed"
+                        "crashed" if result.get("lifecycle_state") == "vanished" else "completed"
                     ),
+                    terminal_observation=True,
                 )
                 if not detached_result.succeeded:
                     detached_result.metadata.update(
                         {
                             "command": gradle_cmd,
+                            "runner_dispatched": result.get("runner_dispatched") is True,
                             "exit_code": result.get("exit_code"),
                             "analysis": analysis,
                             "dispatch_status": "completed_detached",
@@ -367,6 +367,7 @@ class GradleTool(BaseTool):
                         **evidence_fields,
                         metadata={
                             "command": gradle_cmd,
+                            "runner_dispatched": result.get("runner_dispatched") is True,
                             "exit_code": result["exit_code"],
                             "analysis": analysis,
                             "output_ref_id": ref_id,
@@ -385,6 +386,7 @@ class GradleTool(BaseTool):
                         **evidence_fields,
                         metadata={
                             "command": gradle_cmd,
+                            "runner_dispatched": result.get("runner_dispatched") is True,
                             "exit_code": result["exit_code"],
                             "analysis": analysis,
                             "output_ref_id": ref_id,
@@ -400,6 +402,7 @@ class GradleTool(BaseTool):
                         result["exit_code"],
                         gradle_cmd,
                         analysis,
+                        runner_dispatched=result.get("runner_dispatched") is True,
                         output_ref_id=ref_id,
                     ),
                     preamble,
@@ -648,6 +651,7 @@ class GradleTool(BaseTool):
                 "termination_reason": reason,
                 "execution_time": execution_time,
                 "command": gradle_cmd,
+                "runner_dispatched": result.get("runner_dispatched") is True,
                 "task": task_name,
                 "exit_code": result.get("exit_code"),
                 "tool_type": "gradle",
@@ -874,6 +878,7 @@ class GradleTool(BaseTool):
         exit_code: int,
         command: str,
         analysis: Dict[str, Any],
+        runner_dispatched: bool = False,
         output_ref_id: Optional[str] = None,
     ) -> ToolResult:
         """Handle Gradle execution errors with detailed analysis."""
@@ -965,6 +970,7 @@ class GradleTool(BaseTool):
         metadata = {
             "exit_code": exit_code,
             "command": command,
+            "runner_dispatched": runner_dispatched,
             "analysis": analysis,
             "error_snippet": error_snippet,
         }

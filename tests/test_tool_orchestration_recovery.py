@@ -26,6 +26,7 @@ class ResultTool(BaseTool):
                 "properties": {"type": ["string", "array"]},
                 "fail_at_end": {"type": "boolean"},
                 "timeout": {"type": "integer"},
+                "maven_version_requirement": {"type": "string"},
             },
             "required": [],
         }
@@ -803,6 +804,51 @@ def test_maven_version_error_returns_env_overlay_guidance_without_retry():
     assert guidance[0][1] == "high"
     assert "MAVEN VERSION REQUIREMENT" in guidance[0][0]
     assert "project(action='env'" in guidance[0][0]
+    assert "requirement='[3.9,)'" in guidance[0][0]
+    assert "maven_version_requirement='[3.9,)'" in guidance[0][0]
+
+
+def test_build_maven_version_recovery_preserves_requirement_in_structured_guidance():
+    guidance = []
+    build = ResultTool(
+        "build",
+        [
+            ToolResult.completed_failure(
+                output="Detected Maven Version: 3.8.7 is not in the allowed range [3.9,).",
+                error="Maven build failed",
+                error_code="MAVEN_VERSION_ERROR",
+                facts={"system": "maven"},
+                metadata={
+                    "maven_version_requirement": {
+                        "raw": "[3.9,)",
+                        "source": "build_error",
+                        "kind": "range",
+                    },
+                    "maven_runtime": {
+                        "executable": "/usr/bin/mvn",
+                        "version": "3.8.7",
+                        "source": "system",
+                    },
+                },
+            )
+        ],
+    )
+    orchestrator = _orchestrator(tools={"build": build}, guidance=guidance)
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="build",
+            raw_params={"action": "compile", "working_directory": "/workspace/app"},
+            validated_params={"action": "compile", "working_directory": "/workspace/app"},
+        )
+    )
+
+    assert execution.status == "recovery_attempted"
+    assert execution.recovery_strategy == "maven_version_contract_guidance"
+    assert len(guidance) == 1
+    assert "project(action='env'" in guidance[0][0]
+    assert "requirement='[3.9,)'" in guidance[0][0]
+    assert "build(action='compile', maven_version_requirement='[3.9,)')" in guidance[0][0]
 
 
 def test_maven_timeout_returns_guidance_without_retry():

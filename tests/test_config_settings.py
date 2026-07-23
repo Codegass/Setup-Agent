@@ -21,6 +21,24 @@ def test_from_env_uses_gpt54_mini_thinking_default_without_env(monkeypatch, tmp_
     assert config.thinking_provider == "openai"
 
 
+def test_default_temperatures_are_stable_for_weak_model_control():
+    config = Config()
+
+    assert config.thinking_temperature == 0.1
+    assert config.action_temperature == 0.0
+
+
+def test_from_env_uses_stable_temperature_defaults_without_env(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SAG_THINKING_TEMPERATURE", raising=False)
+    monkeypatch.delenv("SAG_ACTION_TEMPERATURE", raising=False)
+
+    config = Config.from_env()
+
+    assert config.thinking_temperature == 0.1
+    assert config.action_temperature == 0.0
+
+
 def test_default_docker_base_image_is_ubuntu_2404():
     config = Config()
 

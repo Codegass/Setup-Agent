@@ -16,6 +16,9 @@ mode puts the tests dir on sys.path); the small fakes our tests introduced live 
 
 import json as _json
 import re
+import shlex
+
+import pytest
 
 from test_agent_final_status import FakePhysicalValidator, _agent_with_validator
 from test_build_tool import FakeBackendTool, _tool
@@ -24,12 +27,14 @@ from test_build_tool import FakeBackendTool, _tool
 from test_physical_validator import FakeBuildOrchestrator, _coverage_validator
 from test_physical_validator_modules import FakeOrch
 
+import sag.agent.physical_validator as physical_validator_module
 from sag.agent.physical_validator import PhysicalValidator
 from sag.config.settings import (
     DEFAULT_TEST_EXECUTION_THRESHOLD,
     Config,
 )
 from sag.tools.internal.maven_tool import MavenTool
+from sag.tools.internal.command_tracker import CommandTracker
 from sag.tools.module_metrics import assemble_module_metrics
 from sag.tools.report_tool import ReportTool
 from sag.verdict import run_verdict
@@ -44,20 +49,52 @@ class FakeMavenPomOrchestrator:
     Records commands so a test can assert WHICH module poms were visited.
     """
 
-    def __init__(self, poms):
+    def __init__(self, poms, realpaths=None, files=None, dirs=None):
         self.poms = dict(poms)
+        self.files = {**self.poms, **dict(files or {})}
+        self.dirs = set(dirs or ())
+        self.realpaths = dict(realpaths or {})
         self.commands = []
 
     def execute_command(self, command):
         self.commands.append(command)
         c = command.strip()
+        if c.startswith("realpath -e -- "):
+            path = shlex.split(c)[-1]
+            resolved = self.realpaths.get(path, path)
+            if resolved is None:
+                return {"exit_code": 1, "output": ""}
+            return {"exit_code": 0, "output": resolved}
+        if c.startswith("test -d "):
+            path = shlex.split(c)[2]
+            return {"exit_code": 0 if path in self.dirs else 1, "output": ""}
+        if c.startswith("test -f "):
+            path = shlex.split(c)[2]
+            return {"exit_code": 0 if path in self.files else 1, "output": ""}
         if c.startswith("cat "):
-            m = re.search(r"cat (\S+)", c)
-            path = m.group(1) if m else ""
-            if path in self.poms:
-                return {"exit_code": 0, "output": self.poms[path]}
+            path = shlex.split(c)[1] if len(shlex.split(c)) > 1 else ""
+            if path in self.files:
+                return {"exit_code": 0, "output": self.files[path]}
             return {"exit_code": 1, "output": ""}
         return {"exit_code": 1, "output": ""}
+
+
+class FakeReceiptTracker:
+    def __init__(self, build=(), test=()):
+        self.build = list(build)
+        self.test = list(test)
+
+    def get_all_build_commands(self):
+        return self.build
+
+    def get_all_test_commands(self):
+        return self.test
+
+    def get_last_build_command(self):
+        return self.build[-1] if self.build else None
+
+    def get_last_test_command(self):
+        return self.test[-1] if self.test else None
 
 
 class _CapturingOrch:
@@ -188,6 +225,22 @@ def test_validate_build_status_zero_classes_no_artifacts_blocked_despite_trivial
 # ===========================================================================
 # 2. Active-module set: profile-gated modules are NOT counted
 # ===========================================================================
+def _receipt(
+    command,
+    *,
+    working_dir="/w/p",
+    tool="maven",
+    timestamp="2026-07-23T12:00:00",
+):
+    return {
+        "command": command,
+        "working_dir": working_dir,
+        "tool": tool,
+        "timestamp": timestamp,
+        "duration": 1.0,
+    }
+
+
 def test_parse_maven_expected_artifacts_excludes_profile_gated_modules():
     """A module declared only inside a <profiles> block is disabled in the build
     config and must NOT be counted as an active/expected module."""
@@ -213,6 +266,7 @@ def test_parse_maven_expected_artifacts_excludes_profile_gated_modules():
 
     validator._parse_maven_expected_artifacts("/workspace/proj")
 
+    assert validator._bounded_maven_reactor("/workspace/proj").complete is True
     cats = [c for c in orch.commands if c.startswith("cat ")]
     assert any("active-mod/pom.xml" in c for c in cats), "active module must be visited"
     assert not any("profiled-mod" in c for c in cats), "profile-gated module must be skipped"
@@ -235,8 +289,1142 @@ def test_active_maven_module_dirs_excludes_profile_gated():
 
     dirs = v._active_maven_module_dirs("/w/p")
 
+    assert v._bounded_maven_reactor("/w/p").complete is True
     assert "/w/p" in dirs and "/w/p/core" in dirs
     assert not any("profiled" in d for d in dirs)
+
+
+def test_active_by_default_profile_modules_enter_reactor_and_artifacts():
+    root_pom = """
+    <project><packaging>pom</packaging><profiles>
+      <profile><id>default-modules</id>
+        <activation><activeByDefault>true</activeByDefault></activation>
+        <modules><module>defaulted</module></modules>
+      </profile>
+      <profile><id>manual-only</id>
+        <modules><module>manual</module></modules>
+      </profile>
+    </profiles></project>
+    """
+    leaf_pom = "<project><artifactId>defaulted</artifactId><version>1</version></project>"
+    orch = FakeMavenPomOrchestrator(
+        {
+            "/w/p/pom.xml": root_pom,
+            "/w/p/defaulted/pom.xml": leaf_pom,
+            "/w/p/manual/pom.xml": (
+                "<project><artifactId>manual</artifactId><version>1</version></project>"
+            ),
+        }
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/w")
+
+    snapshot = validator._bounded_maven_reactor("/w/p")
+    artifacts = validator._parse_maven_expected_artifacts(
+        "/w/p",
+        snapshot=snapshot,
+    )
+
+    assert snapshot.complete is True
+    assert [record.module_dir for record in snapshot.records] == [
+        "/w/p",
+        "/w/p/defaulted",
+    ]
+    assert [item["path"] for item in artifacts] == ["/w/p/defaulted/target/defaulted-1.jar"]
+    assert not any(
+        command.startswith("cat ") and "/manual/pom.xml" in command for command in orch.commands
+    )
+
+
+@pytest.mark.parametrize(
+    ("command", "enabled", "disabled"),
+    [
+        ("mvn -Pfoo,bar,!old,-legacy package", {"foo", "bar"}, {"old", "legacy"}),
+        ("mvn -P foo,!old package", {"foo"}, {"old"}),
+        ("mvn --activate-profiles foo,bar package", {"foo", "bar"}, set()),
+        ("mvn --activate-profiles=foo,!old package", {"foo"}, {"old"}),
+    ],
+)
+def test_recorded_maven_profile_syntax(command, enabled, disabled):
+    validator = PhysicalValidator(project_path="/w")
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt(command)])
+
+    selection = validator._recorded_maven_profile_selection("/w/p")
+
+    assert selection.conflicts == ()
+    assert selection.enabled == frozenset(enabled)
+    assert selection.disabled == frozenset(disabled)
+
+
+def test_profile_receipt_selection_ignores_later_non_maven_and_other_reactor():
+    validator = PhysicalValidator(project_path="/w")
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt("mvn -Pfoo package", timestamp="2026-07-23T12:00:00"),
+            _receipt(
+                "mvn -Pother package",
+                working_dir="/w/other",
+                timestamp="2026-07-23T12:01:00",
+            ),
+            _receipt(
+                "gradle build",
+                tool="gradle",
+                timestamp="2026-07-23T12:02:00",
+            ),
+        ]
+    )
+
+    selection = validator._recorded_maven_profile_selection("/w/p")
+
+    assert selection.enabled == frozenset({"foo"})
+    assert selection.conflicts == ()
+
+
+def test_newer_relevant_maven_test_receipt_supersedes_build_receipt():
+    validator = PhysicalValidator(project_path="/w")
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt("mvn package", timestamp="2026-07-23T12:00:00"),
+        ],
+        test=[
+            _receipt("mvn -Pfoo verify", timestamp="2026-07-23T12:01:00"),
+        ],
+    )
+
+    selection = validator._recorded_maven_profile_selection("/w/p")
+
+    assert selection.enabled == frozenset({"foo"})
+    assert selection.conflicts == ()
+
+
+def test_profile_receipt_file_selector_binds_only_exact_reactor():
+    validator = PhysicalValidator(project_path="/w")
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt(
+                "mvn -f /w/p/pom.xml -Pfoo package",
+                working_dir="/w",
+                timestamp="2026-07-23T12:00:00",
+            ),
+            _receipt(
+                "mvn --file ../other/pom.xml -Pother package",
+                working_dir="/w/p",
+                timestamp="2026-07-23T12:01:00",
+            ),
+        ]
+    )
+
+    selection = validator._recorded_maven_profile_selection("/w/p")
+
+    assert selection.enabled == frozenset({"foo"})
+    assert selection.working_dir == "/w/p"
+    assert selection.conflicts == ()
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_launcher_basedir"),
+    [
+        ("mvn -f /w/p/pom.xml -Pfoo package", "/w/p"),
+        ("mvn --file /w/p/pom.xml -Pfoo package", "/w/p"),
+        ("mvn -f/w/p/pom.xml -Pfoo package", "/w"),
+        ("mvn --file=/w/p/pom.xml -Pfoo package", "/w"),
+    ],
+)
+def test_profile_receipt_file_forms_keep_exact_launcher_basedir_semantics(
+    command,
+    expected_launcher_basedir,
+):
+    validator = PhysicalValidator(project_path="/w")
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt(command, working_dir="/w")])
+
+    selection = validator._recorded_maven_profile_selection("/w/p")
+
+    assert selection.enabled == frozenset({"foo"})
+    assert selection.working_dir == expected_launcher_basedir
+    assert selection.conflicts == ()
+
+
+def test_maven_reactor_snapshot_excludes_lexical_and_symlink_escapes():
+    root_pom = """
+    <project>
+      <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>
+      <modules>
+        <module>safe</module>
+        <module>../outside</module>
+        <module>linked-outside</module>
+      </modules>
+    </project>
+    """
+    safe_pom = """
+    <project>
+      <artifactId>safe</artifactId><version>1</version><packaging>pom</packaging>
+      <modules><module>nested</module></modules>
+    </project>
+    """
+    nested_pom = "<project><artifactId>nested</artifactId><version>1</version></project>"
+    orch = FakeMavenPomOrchestrator(
+        {
+            "/w/p/pom.xml": root_pom,
+            "/w/p/safe/pom.xml": safe_pom,
+            "/w/p/safe/nested/pom.xml": nested_pom,
+            # These must remain unread even though the fake can serve them.
+            "/w/outside/pom.xml": "<project><artifactId>outside</artifactId></project>",
+            "/w/p/linked-outside/pom.xml": ("<project><artifactId>linked</artifactId></project>"),
+        },
+        realpaths={"/w/p/linked-outside": "/w/outside"},
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/w")
+
+    snapshot = validator._bounded_maven_reactor("/w/p")
+    assert snapshot.complete is False
+    assert set(snapshot.conflicts) == {
+        "maven_module_outside_project",
+        "maven_module_unresolved",
+    }
+    assert validator._active_maven_module_dirs("/w/p") == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/safe/nested",
+    ]
+    artifacts = validator._parse_maven_expected_artifacts("/w/p")
+
+    assert [item["path"] for item in artifacts] == ["/w/p/safe/nested/target/nested-1.jar"]
+    cat_commands = [command for command in orch.commands if command.startswith("cat ")]
+    assert not any("/w/outside/pom.xml" in command for command in cat_commands)
+    assert not any("/linked-outside/pom.xml" in command for command in cat_commands)
+
+
+def test_maven_reactor_snapshot_drops_two_node_cycle_branch():
+    root_pom = """
+    <project><packaging>pom</packaging><modules>
+      <module>a</module><module>safe</module>
+    </modules></project>
+    """
+    a_pom = """
+    <project><packaging>pom</packaging>
+      <modules><module>b</module></modules>
+    </project>
+    """
+    b_pom = """
+    <project><packaging>pom</packaging>
+      <modules><module>..</module></modules>
+    </project>
+    """
+    safe_pom = "<project><artifactId>safe</artifactId><version>1</version></project>"
+    orch = FakeMavenPomOrchestrator(
+        {
+            "/w/p/pom.xml": root_pom,
+            "/w/p/a/pom.xml": a_pom,
+            "/w/p/a/b/pom.xml": b_pom,
+            "/w/p/safe/pom.xml": safe_pom,
+        }
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/w")
+
+    snapshot = validator._bounded_maven_reactor("/w/p")
+    assert snapshot.complete is False
+    assert snapshot.conflicts == ("maven_module_cycle",)
+    assert validator._active_maven_module_dirs("/w/p") == ["/w/p", "/w/p/safe"]
+    assert [item["path"] for item in validator._parse_maven_expected_artifacts("/w/p")] == [
+        "/w/p/safe/target/safe-1.jar"
+    ]
+    assert len(orch.commands) < 75
+
+
+def test_maven_reactor_snapshot_self_cycle_and_caps_fail_closed(monkeypatch):
+    root_pom = """
+    <project><packaging>pom</packaging>
+      <modules><module>.</module><module>safe</module></modules>
+    </project>
+    """
+    safe_pom = "<project><artifactId>safe</artifactId><version>1</version></project>"
+    orch = FakeMavenPomOrchestrator({"/w/p/pom.xml": root_pom, "/w/p/safe/pom.xml": safe_pom})
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/w")
+
+    assert validator._bounded_maven_reactor("/w/p").conflicts == ("maven_module_cycle",)
+    assert validator._active_maven_module_dirs("/w/p") == ["/w/p"]
+    assert validator._parse_maven_expected_artifacts("/w/p") == []
+    assert len(orch.commands) < 40
+
+    capped_pom = """
+    <project><packaging>pom</packaging><modules>
+      <module>one</module><module>two</module>
+    </modules></project>
+    """
+    capped = FakeMavenPomOrchestrator(
+        {
+            "/w/capped/pom.xml": capped_pom,
+            "/w/capped/one/pom.xml": safe_pom,
+            "/w/capped/two/pom.xml": safe_pom,
+        }
+    )
+    capped_validator = PhysicalValidator(docker_orchestrator=capped, project_path="/w")
+    monkeypatch.setattr(physical_validator_module, "_MAVEN_REACTOR_MAX_NODES", 2)
+
+    assert capped_validator._bounded_maven_reactor("/w/capped").conflicts == (
+        "maven_module_cap_exceeded",
+    )
+    assert capped_validator._active_maven_module_dirs("/w/capped") == ["/w/capped"]
+
+    depth_root = """
+    <project><packaging>pom</packaging>
+      <modules><module>one</module></modules>
+    </project>
+    """
+    depth_one = """
+    <project><packaging>pom</packaging>
+      <modules><module>two</module></modules>
+    </project>
+    """
+    depth_limited = FakeMavenPomOrchestrator(
+        {
+            "/w/depth/pom.xml": depth_root,
+            "/w/depth/one/pom.xml": depth_one,
+            "/w/depth/one/two/pom.xml": safe_pom,
+        }
+    )
+    depth_validator = PhysicalValidator(
+        docker_orchestrator=depth_limited,
+        project_path="/w",
+    )
+    monkeypatch.setattr(physical_validator_module, "_MAVEN_REACTOR_MAX_NODES", 256)
+    monkeypatch.setattr(physical_validator_module, "_MAVEN_REACTOR_MAX_DEPTH", 1)
+
+    assert depth_validator._bounded_maven_reactor("/w/depth").conflicts == (
+        "maven_module_depth_exceeded",
+    )
+    assert depth_validator._active_maven_module_dirs("/w/depth") == ["/w/depth"]
+
+
+@pytest.mark.parametrize(
+    ("module_value", "expected_conflict"),
+    [
+        ("${dynamic.module}", "maven_module_unresolved"),
+        ("missing", "maven_module_pom_unreadable"),
+    ],
+)
+def test_maven_reactor_unverifiable_declared_child_is_incomplete(
+    module_value,
+    expected_conflict,
+):
+    root_pom = f"""
+    <project><packaging>pom</packaging>
+      <modules><module>{module_value}</module></modules>
+    </project>
+    """
+    validator = PhysicalValidator(
+        docker_orchestrator=FakeMavenPomOrchestrator({"/w/p/pom.xml": root_pom}),
+        project_path="/w",
+    )
+
+    snapshot = validator._bounded_maven_reactor("/w/p")
+
+    assert [record.module_dir for record in snapshot.records] == ["/w/p"]
+    assert snapshot.complete is False
+    assert expected_conflict in snapshot.conflicts
+
+
+def _maven_reactor_verdict_validator(root_pom, extra_poms):
+    safe_pom = "<project><artifactId>safe</artifactId><version>1</version></project>"
+    orch = FakeMavenPomOrchestrator(
+        {
+            "/w/p/pom.xml": root_pom,
+            "/w/p/safe/pom.xml": safe_pom,
+            **extra_poms,
+        }
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/w")
+    validator._detect_build_system = lambda _project_dir: "maven"
+    validator._check_build_artifacts_complete = lambda _project_dir: {
+        "exist": True,
+        "count": 11,
+        "class_count": 10,
+        "jar_count": 1,
+    }
+    validator._collect_artifact_samples = lambda *_args, **_kwargs: ["safe/target/safe-1.jar"]
+    validator._validate_maven_fingerprints = lambda _project_dir: {
+        "valid": True,
+        "details": {"classes": True},
+        "modules": ["safe"],
+    }
+    validator._verify_expected_artifacts = lambda _project_dir, expected: {
+        "all_present": bool(expected),
+        "found": [item["path"] for item in expected],
+        "missing": [],
+        "classes_expected": 10,
+        "classes_found": 10,
+        "class_coverage": 1.0,
+    }
+    validator._check_class_files = lambda _project_dir: {
+        "paths": ["/w/p/safe/target/classes/Foo.class"]
+    }
+    validator._check_jar_files = lambda _project_dir: {"paths": ["/w/p/safe/target/safe-1.jar"]}
+    validator._collect_env_conflicts = lambda: []
+    return validator
+
+
+def test_unverified_maven_reactor_caps_otherwise_complete_build():
+    root_pom = """
+    <project><packaging>pom</packaging><modules>
+      <module>safe</module><module>../outside</module>
+    </modules></project>
+    """
+    validator = _maven_reactor_verdict_validator(
+        root_pom,
+        {
+            "/w/outside/pom.xml": (
+                "<project><artifactId>outside</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    original_resolver = validator._bounded_maven_reactor
+    resolver_calls = 0
+
+    def counted_resolver(project_dir):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return original_resolver(project_dir)
+
+    validator._bounded_maven_reactor = counted_resolver
+
+    result = validator.validate_build_status("p")
+
+    assert resolver_calls == 1
+    assert result["success"] is True  # real safe-module build evidence exists
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "maven_reactor_unverified" in result["conflicts"]
+    assert result["evidence"]["maven_reactor_complete"] is False
+    assert "maven_module_outside_project" in result["evidence"]["maven_reactor_conflicts"]
+    assert "could not be fully verified" in result["reason"]
+
+
+def test_active_by_default_maven_reactor_keeps_complete_build_green():
+    root_pom = """
+    <project><packaging>pom</packaging><profiles><profile>
+      <id>default</id>
+      <activation><activeByDefault>true</activeByDefault></activation>
+      <modules><module>safe</module></modules>
+    </profile></profiles>
+    </project>
+    """
+    validator = _maven_reactor_verdict_validator(root_pom, {})
+
+    result = validator.validate_build_status("p")
+
+    assert result["success"] is True
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert "maven_reactor_unverified" not in result["conflicts"]
+    assert result["evidence"]["maven_reactor_complete"] is True
+    assert result["evidence"]["maven_reactor_modules"] == ["/w/p", "/w/p/safe"]
+
+
+def test_dynamic_profile_module_caps_otherwise_complete_build():
+    root_pom = """
+    <project><packaging>pom</packaging>
+      <modules><module>safe</module></modules>
+      <profiles><profile>
+        <id>dynamic</id>
+        <activation><property><name>with.extra</name></property></activation>
+        <modules><module>dynamic</module></modules>
+      </profile></profiles>
+    </project>
+    """
+    validator = _maven_reactor_verdict_validator(
+        root_pom,
+        {
+            "/w/p/dynamic/pom.xml": (
+                "<project><artifactId>dynamic</artifactId><version>1</version></project>"
+            )
+        },
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert "maven_reactor_unverified" in result["conflicts"]
+    assert result["evidence"]["maven_reactor_modules"] == ["/w/p", "/w/p/safe"]
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_profile_activation_unresolved"]
+
+
+def test_inherited_version_resource_leaf_cannot_disappear_from_denominator():
+    root_pom = """
+    <project><packaging>pom</packaging><modules>
+      <module>safe</module><module>resources-only</module>
+    </modules></project>
+    """
+    inherited_leaf = """
+    <project>
+      <parent>
+        <groupId>example</groupId><artifactId>parent</artifactId><version>1</version>
+      </parent>
+      <artifactId>resources-only</artifactId>
+      <build><resources><resource><directory>src/main/resources</directory></resource></resources></build>
+    </project>
+    """
+    validator = _maven_reactor_verdict_validator(
+        root_pom,
+        {"/w/p/resources-only/pom.xml": inherited_leaf},
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["success"] is True
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/resources-only",
+    ]
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_module_artifact_unresolved"]
+
+
+def _explicit_profile_root():
+    return """
+    <project><packaging>pom</packaging>
+      <modules><module>safe</module></modules>
+      <profiles><profile><id>foo</id>
+        <modules><module>foo</module></modules>
+      </profile></profiles>
+    </project>
+    """
+
+
+def test_explicit_profile_missing_artifact_cannot_green():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt("mvn -Pfoo package")])
+
+    def missing_foo(_project_dir, expected):
+        paths = [item["path"] for item in expected]
+        foo_path = "/w/p/foo/target/foo-1.jar"
+        assert foo_path in paths
+        return {
+            "all_present": False,
+            "found": [path for path in paths if path != foo_path],
+            "missing": [foo_path],
+            "classes_expected": 20,
+            "classes_found": 10,
+            "class_coverage": 0.5,
+        }
+
+    validator._verify_expected_artifacts = missing_foo
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_profiles_enabled"] == ["foo"]
+
+
+def test_pending_profile_dispatch_is_conservative_and_terminal_poll_keeps_denominator():
+    tracker = CommandTracker()
+    receipt = tracker.track_execution_receipt(
+        command="mvn -Pfoo package",
+        tool="maven",
+        working_dir="/w/p",
+        command_kind="build",
+        dispatch_status="running_detached",
+        poll_ref="job:profile-build",
+        invocation_status="pending",
+    )
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = tracker
+
+    pending = validator.validate_build_status("p")
+
+    assert pending["build_complete"] is False
+    assert pending["evidence_status"] == "partial"
+    assert pending["evidence"]["maven_profile_selection_conservative"] is True
+    assert pending["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/foo",
+    ]
+    assert pending["evidence"]["maven_reactor_conflicts"] == ["maven_profile_execution_unfinished"]
+
+    assert tracker.update_execution_receipt(
+        receipt["poll_ref"],
+        invocation_status="completed",
+        dispatch_status="completed_detached",
+        exit_code=0,
+        operation_outcome="success",
+        lifecycle_state="finished",
+    )
+
+    def missing_foo(_project_dir, expected):
+        paths = [item["path"] for item in expected]
+        foo_path = "/w/p/foo/target/foo-1.jar"
+        assert foo_path in paths
+        return {
+            "all_present": False,
+            "found": [path for path in paths if path != foo_path],
+            "missing": [foo_path],
+            "classes_expected": 20,
+            "classes_found": 10,
+            "class_coverage": 0.5,
+        }
+
+    validator._verify_expected_artifacts = missing_foo
+    completed = validator.validate_build_status("p")
+
+    assert completed["build_complete"] is False
+    assert completed["evidence_status"] == "partial"
+    assert completed["evidence"]["maven_profiles_enabled"] == ["foo"]
+    assert completed["evidence"]["maven_reactor_conflicts"] == []
+
+
+def test_pending_receipt_without_artifacts_is_not_build_success_evidence():
+    tracker = CommandTracker()
+    tracker.track_execution_receipt(
+        command="mvn -Pfoo package",
+        tool="maven",
+        working_dir="/w/p",
+        command_kind="build",
+        dispatch_status="running_detached",
+        poll_ref="job:no-artifacts",
+        invocation_status="pending",
+    )
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = tracker
+    validator._check_build_artifacts_complete = lambda _project_dir: {
+        "exist": False,
+        "count": 0,
+        "class_count": 0,
+        "jar_count": 0,
+    }
+    validator._validate_maven_fingerprints = lambda _project_dir: {
+        "valid": False,
+        "details": {},
+        "modules": [],
+    }
+    validator._verify_expected_artifacts = lambda _project_dir, expected: {
+        "all_present": False,
+        "found": [],
+        "missing": [item["path"] for item in expected],
+        "classes_expected": 0,
+        "classes_found": 0,
+        "class_coverage": 0.0,
+    }
+    validator._check_class_files = lambda _project_dir: {"paths": []}
+    validator._check_jar_files = lambda _project_dir: {"paths": []}
+
+    result = validator.validate_build_status("p")
+
+    assert result["success"] is False
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "blocked"
+
+
+def test_timed_out_profile_dispatch_still_enters_expected_denominator():
+    tracker = CommandTracker()
+    tracker.track_execution_receipt(
+        command="mvn -Pfoo package",
+        tool="maven",
+        working_dir="/w/p",
+        command_kind="build",
+        invocation_status="timeout",
+        exit_code=124,
+        termination_reason="absolute_timeout",
+    )
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = tracker
+
+    def missing_foo(_project_dir, expected):
+        paths = [item["path"] for item in expected]
+        assert "/w/p/foo/target/foo-1.jar" in paths
+        return {
+            "all_present": False,
+            "found": ["/w/p/safe/target/safe-1.jar"],
+            "missing": ["/w/p/foo/target/foo-1.jar"],
+            "classes_expected": 20,
+            "classes_found": 10,
+            "class_coverage": 0.5,
+        }
+
+    validator._verify_expected_artifacts = missing_foo
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_profiles_enabled"] == ["foo"]
+    assert result["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/foo",
+    ]
+
+
+def test_symlinked_receipt_workdir_still_binds_profile_to_current_reactor():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.docker_orchestrator.realpaths["/w/current"] = "/w/p"
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt(
+                "mvn -Pfoo package",
+                working_dir="/w/current",
+            )
+        ]
+    )
+
+    def missing_foo(_project_dir, expected):
+        paths = [item["path"] for item in expected]
+        assert "/w/p/foo/target/foo-1.jar" in paths
+        return {
+            "all_present": False,
+            "found": ["/w/p/safe/target/safe-1.jar"],
+            "missing": ["/w/p/foo/target/foo-1.jar"],
+            "classes_expected": 20,
+            "classes_found": 10,
+            "class_coverage": 0.5,
+        }
+
+    validator._verify_expected_artifacts = missing_foo
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_profiles_enabled"] == ["foo"]
+    assert result["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/foo",
+    ]
+
+
+def test_unprovable_file_selected_reactor_fails_closed_without_profile_flag():
+    validator = _maven_reactor_verdict_validator(
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>",
+        {},
+    )
+    validator.docker_orchestrator.realpaths["/w/alias-pom.xml"] = None
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt(
+                "mvn -f /w/alias-pom.xml package",
+                working_dir="/w",
+            )
+        ]
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_profile_selection_unresolved"]
+
+
+def test_explicit_profile_complete_artifacts_can_green():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(
+        build=[_receipt("mvn --activate-profiles foo package")]
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/foo",
+    ]
+
+
+def test_file_selected_profile_receipt_from_parent_can_verify_exact_reactor():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt(
+                "mvn -f /w/p/pom.xml -Pfoo package",
+                working_dir="/w",
+            )
+        ]
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_profiles_enabled"] == ["foo"]
+    assert result["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/safe",
+        "/w/p/foo",
+    ]
+
+
+def test_explicit_profile_disables_active_by_default_in_same_pom():
+    root_pom = """
+    <project><packaging>pom</packaging><profiles>
+      <profile><id>default</id>
+        <activation><activeByDefault>true</activeByDefault></activation>
+        <modules><module>defaulted</module></modules>
+      </profile>
+      <profile><id>foo</id><modules><module>foo</module></modules></profile>
+    </profiles></project>
+    """
+    validator = _maven_reactor_verdict_validator(
+        root_pom,
+        {
+            "/w/p/defaulted/pom.xml": (
+                "<project><artifactId>defaulted</artifactId><version>1</version></project>"
+            ),
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            ),
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt("mvn -Pfoo package")])
+
+    result = validator.validate_build_status("p")
+
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_reactor_modules"] == ["/w/p", "/w/p/foo"]
+    assert not any(
+        command.startswith("cat ") and "/defaulted/pom.xml" in command
+        for command in validator.docker_orchestrator.commands
+    )
+
+
+def test_explicit_profile_disable_keeps_unrelated_active_by_default_module():
+    root_pom = """
+    <project><packaging>pom</packaging><profiles>
+      <profile><id>default</id>
+        <activation><activeByDefault>true</activeByDefault></activation>
+        <modules><module>defaulted</module></modules>
+      </profile>
+      <profile><id>foo</id><modules><module>foo</module></modules></profile>
+    </profiles></project>
+    """
+    validator = _maven_reactor_verdict_validator(
+        root_pom,
+        {
+            "/w/p/defaulted/pom.xml": (
+                "<project><artifactId>defaulted</artifactId><version>1</version></project>"
+            ),
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            ),
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt("mvn -P!foo package")])
+
+    result = validator.validate_build_status("p")
+
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_profiles_disabled"] == ["foo"]
+    assert result["evidence"]["maven_reactor_modules"] == [
+        "/w/p",
+        "/w/p/defaulted",
+    ]
+
+
+def test_ambiguous_explicit_profile_selection_cannot_green():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt("mvn -Pfoo,!foo package")])
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_profile_selection_unresolved"]
+
+
+def test_maven_config_profile_selection_cannot_silently_green():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    orch = validator.docker_orchestrator
+    orch.dirs.add("/w/p/.mvn")
+    orch.files["/w/p/.mvn/maven.config"] = "-Pfoo"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_config_changes_graph"]
+
+
+def test_non_graph_maven_config_keeps_complete_reactor_green():
+    validator = _maven_reactor_verdict_validator(
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>",
+        {},
+    )
+    orch = validator.docker_orchestrator
+    orch.dirs.add("/w/p/.mvn")
+    orch.files["/w/p/.mvn/maven.config"] = "-DskipTests"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_reactor_conflicts"] == []
+
+
+def test_empty_maven_directory_above_project_cannot_silently_green():
+    validator = _maven_reactor_verdict_validator(
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>",
+        {},
+    )
+    validator.docker_orchestrator.dirs.add("/w/.mvn")
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_config_outside_project"]
+
+
+def test_profile_maven_config_above_project_cannot_shrink_reactor_green():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    orch = validator.docker_orchestrator
+    orch.dirs.add("/w/.mvn")
+    orch.files["/w/.mvn/maven.config"] = "-Pfoo"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_config_outside_project"]
+
+
+def test_empty_project_maven_directory_shadows_unsafe_parent_config():
+    validator = _maven_reactor_verdict_validator(
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>",
+        {},
+    )
+    orch = validator.docker_orchestrator
+    orch.dirs.update({"/w/p/.mvn", "/w/.mvn"})
+    orch.files["/w/.mvn/maven.config"] = "-Pfoo"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_reactor_conflicts"] == []
+    assert not any(
+        command.startswith("cat ") and "/w/.mvn/maven.config" in command
+        for command in orch.commands
+    )
+
+
+def test_separated_file_selector_uses_child_maven_config_seed():
+    validator = _maven_reactor_verdict_validator(
+        _explicit_profile_root(),
+        {
+            "/w/p/foo/pom.xml": (
+                "<project><artifactId>foo</artifactId><version>1</version></project>"
+            )
+        },
+    )
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt(
+                "mvn -f /w/p/pom.xml package",
+                working_dir="/w",
+            )
+        ]
+    )
+    orch = validator.docker_orchestrator
+    orch.dirs.add("/w/p/.mvn")
+    orch.files["/w/p/.mvn/maven.config"] = "-Pfoo"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_config_changes_graph"]
+
+
+def test_separated_file_selector_child_empty_maven_dir_shadows_parent():
+    validator = _maven_reactor_verdict_validator(
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>",
+        {},
+    )
+    validator.command_tracker = FakeReceiptTracker(
+        build=[
+            _receipt(
+                "mvn --file /w/p/pom.xml package",
+                working_dir="/w",
+            )
+        ]
+    )
+    orch = validator.docker_orchestrator
+    orch.dirs.update({"/w/p/.mvn", "/w/.mvn"})
+    orch.files["/w/.mvn/maven.config"] = "-Pfoo"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is True
+    assert result["evidence_status"] == "success"
+    assert result["evidence"]["maven_reactor_conflicts"] == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "mvn -f/w/p/pom.xml package",
+        "mvn --file=/w/p/pom.xml package",
+    ],
+)
+def test_attached_file_selector_keeps_cwd_maven_config_seed(command):
+    validator = _maven_reactor_verdict_validator(
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>",
+        {},
+    )
+    validator.command_tracker = FakeReceiptTracker(build=[_receipt(command, working_dir="/w")])
+    orch = validator.docker_orchestrator
+    orch.dirs.update({"/w/p/.mvn", "/w/.mvn"})
+    orch.files["/w/.mvn/maven.config"] = "-Pfoo"
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_config_outside_project"]
+
+
+def test_maven_launcher_probe_error_fails_closed_instead_of_claiming_absence():
+    class BrokenMavenProbeOrchestrator(FakeMavenPomOrchestrator):
+        def execute_command(self, command):
+            if command.strip() == "test -d /w/.mvn":
+                self.commands.append(command)
+                return {"exit_code": 2, "output": "probe unavailable"}
+            return super().execute_command(command)
+
+    root_pom = (
+        "<project><packaging>pom</packaging><modules>" "<module>safe</module></modules></project>"
+    )
+    orch = BrokenMavenProbeOrchestrator(
+        {
+            "/w/p/pom.xml": root_pom,
+            "/w/p/safe/pom.xml": (
+                "<project><artifactId>safe</artifactId><version>1</version></project>"
+            ),
+        }
+    )
+    validator = _maven_reactor_verdict_validator(root_pom, {})
+    validator.docker_orchestrator = orch
+
+    result = validator.validate_build_status("p")
+
+    assert result["build_complete"] is False
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_config_unreadable"]
+
+
+def test_module_pom_symlink_outside_caps_build_without_reading_target():
+    root_pom = """
+    <project><packaging>pom</packaging><modules>
+      <module>safe</module><module>escaped</module>
+    </modules></project>
+    """
+    validator = _maven_reactor_verdict_validator(root_pom, {})
+    orch = validator.docker_orchestrator
+    orch.realpaths["/w/p/escaped/pom.xml"] = "/outside/escaped.xml"
+    orch.files["/outside/escaped.xml"] = (
+        "<project><artifactId>escaped</artifactId><version>1</version></project>"
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_module_pom_outside_project"]
+    assert not any(
+        command.startswith("cat ") and "/outside/escaped.xml" in command
+        for command in orch.commands
+    )
+
+
+def test_root_pom_symlink_outside_caps_build_without_reading_target():
+    validator = _maven_reactor_verdict_validator(
+        "<project><artifactId>root</artifactId><version>1</version></project>",
+        {},
+    )
+    orch = validator.docker_orchestrator
+    orch.realpaths["/w/p/pom.xml"] = "/outside/root.xml"
+    orch.files["/outside/root.xml"] = (
+        "<project><artifactId>outside</artifactId><version>1</version></project>"
+    )
+
+    result = validator.validate_build_status("p")
+
+    assert result["evidence_status"] == "partial"
+    assert result["evidence"]["maven_reactor_conflicts"] == ["maven_module_pom_outside_project"]
+    assert not any(
+        command.startswith("cat ") and "/outside/root.xml" in command for command in orch.commands
+    )
 
 
 # ===========================================================================

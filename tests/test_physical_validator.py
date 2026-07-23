@@ -330,8 +330,10 @@ def test_validate_build_status_evidence_populates_metrics_fields_gradle():
     # artifact_samples lists real build outputs (never the wrapper jar)
     assert evidence["artifact_samples"], "expected at least one artifact sample"
     assert all("gradle/wrapper" not in sample for sample in evidence["artifact_samples"])
-    assert any(sample.endswith(".jar") or sample.endswith(".class")
-               for sample in evidence["artifact_samples"])
+    assert any(
+        sample.endswith(".jar") or sample.endswith(".class")
+        for sample in evidence["artifact_samples"]
+    )
     # warnings is an explicit list (honest empty when nothing was collected)
     assert evidence["warnings"] == []
 
@@ -343,6 +345,9 @@ def test_validate_build_status_evidence_populates_metrics_fields_maven():
         dirs={"/workspace/mvn/target/classes"},
     )
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+    # This metrics-shape unit fake does not emulate container realpath/POM
+    # reads. Reactor completeness has dedicated end-to-end coverage.
+    validator._get_expected_artifacts = lambda *_args, **_kwargs: []
 
     evidence = validator.validate_build_status("mvn")["evidence"]
 
@@ -427,9 +432,7 @@ def test_validate_build_status_command_without_duration():
         dirs={"/workspace/mvn/target/classes"},
     )
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
-    validator.command_tracker = _StubCommandTracker(
-        {"command": "mvn install", "duration": None}
-    )
+    validator.command_tracker = _StubCommandTracker({"command": "mvn install", "duration": None})
 
     evidence = validator.validate_build_status("mvn")["evidence"]
 
@@ -501,9 +504,24 @@ def test_verify_expected_artifacts_reports_source_weighted_coverage():
     validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
 
     expected = [
-        {"type": "classes", "path": "/workspace/p/big/target/classes", "min_count": 95, "artifact": "big"},
-        {"type": "classes", "path": "/workspace/p/small/target/classes", "min_count": 5, "artifact": "small"},
-        {"type": "classes", "path": "/workspace/p/missing/target/classes", "min_count": 100, "artifact": "missing"},
+        {
+            "type": "classes",
+            "path": "/workspace/p/big/target/classes",
+            "min_count": 95,
+            "artifact": "big",
+        },
+        {
+            "type": "classes",
+            "path": "/workspace/p/small/target/classes",
+            "min_count": 5,
+            "artifact": "small",
+        },
+        {
+            "type": "classes",
+            "path": "/workspace/p/missing/target/classes",
+            "min_count": 100,
+            "artifact": "missing",
+        },
     ]
     result = validator._verify_expected_artifacts("/workspace/p", expected)
 

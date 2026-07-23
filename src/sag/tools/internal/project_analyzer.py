@@ -54,7 +54,10 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # v7: the layout listing is SORTED before digesting (find order is
 # unspecified) and a probe that fails to execute makes the fingerprint
 # CANNOT COMPARE instead of masquerading as an empty layout.
-SURVEY_FACTS_VERSION = 7
+# v8: Python distribution/backend/package paths, direct local providers,
+# native artifact roots and grounded smoke coordinates become survey facts;
+# .gitmodules and Python test-path layout join the fingerprint domain.
+SURVEY_FACTS_VERSION = 8
 
 
 def _strip_recommendation_prescriptions(rec):
@@ -138,9 +141,7 @@ class ProjectAnalyzerTool(BaseTool):
             if (
                 existing_stamp.get("analyzer_version") == SURVEY_FACTS_VERSION
                 and existing_stamp.get("project_path") == validated
-                and self._trunk_survey_current(
-                    validated, existing_stamp.get("config_fingerprint")
-                )
+                and self._trunk_survey_current(validated, existing_stamp.get("config_fingerprint"))
                 and not self._config_changed_since(orchestrator, existing_stamp, validated)
             ):
                 # Current survey for THIS project, on BOTH persisted ends,
@@ -511,6 +512,12 @@ class ProjectAnalyzerTool(BaseTool):
             # setup_env narrates the hole instead of failing silently.
             "python_install_note": installer.get("note"),
             "python_packages": meta["python_packages"],
+            "python_distribution_name": meta.get("python_distribution_name"),
+            "python_build_backend": meta.get("python_build_backend"),
+            "python_declared_dependencies": meta.get("python_declared_dependencies") or [],
+            "python_package_paths": meta.get("python_package_paths") or [],
+            "python_local_providers": meta.get("python_local_providers") or [],
+            "python_smoke_candidates": meta.get("python_smoke_candidates") or [],
             "python_venv": f"{python_root.rstrip('/')}/.venv",
             "has_c_extensions": meta["has_c_extensions"],
             # The directory the python package actually installs from (the repo
@@ -518,6 +525,8 @@ class ProjectAnalyzerTool(BaseTool):
             # and whether a native library must be built before it imports.
             "python_root": python_root,
             "has_native_build": meta["has_native_build"],
+            "native_build_mode": meta.get("native_build_mode"),
+            "native_artifact_roots": meta.get("native_artifact_roots") or [],
             "test_hints": meta["test_hints"],
         }
 
@@ -952,9 +961,7 @@ class ProjectAnalyzerTool(BaseTool):
         # the trunk env-summary via _record_environment_metrics (the fast path
         # requires agreement — a manifest-only fingerprint let a stale trunk
         # pass on version+path alone).
-        analysis["config_fingerprint"] = config_fingerprint(
-            self.docker_orchestrator, project_path
-        )
+        analysis["config_fingerprint"] = config_fingerprint(self.docker_orchestrator, project_path)
 
         data = {
             "survey": {
@@ -998,12 +1005,24 @@ class ProjectAnalyzerTool(BaseTool):
                     "python_install_note": python_config.get("python_install_note"),
                     "python_install_source": python_config.get("python_install_source"),
                     "python_packages": python_config.get("python_packages") or [],
+                    "python_distribution_name": python_config.get("python_distribution_name"),
+                    "python_build_backend": python_config.get("python_build_backend"),
+                    "python_declared_dependencies": python_config.get(
+                        "python_declared_dependencies"
+                    )
+                    or [],
+                    "python_package_paths": python_config.get("python_package_paths") or [],
+                    "python_local_providers": python_config.get("python_local_providers") or [],
+                    "python_smoke_candidates": python_config.get("python_smoke_candidates") or [],
                     "python_venv": python_config.get("python_venv"),
+                    "python_root": python_config.get("python_root"),
                     "has_c_extensions": bool(python_config.get("has_c_extensions")),
                     # Native core (root CMakeLists.txt) that must be built before
                     # the python package imports — read by the validator's native
                     # evidence rung.
                     "has_native_build": bool(python_config.get("has_native_build")),
+                    "native_build_mode": python_config.get("native_build_mode"),
+                    "native_artifact_roots": python_config.get("native_artifact_roots") or [],
                     "test_hints": python_config.get("test_hints") or {},
                 }
             )
@@ -1125,10 +1144,7 @@ class ProjectAnalyzerTool(BaseTool):
                 f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
             )
             return f"\n🏝️ Build coordinates (independent islands): {coords}\n"
-        return (
-            f"\n📍 Build coordinates: {rec.get('build_system')} at "
-            f"{rec.get('build_root')}\n"
-        )
+        return f"\n📍 Build coordinates: {rec.get('build_system')} at " f"{rec.get('build_root')}\n"
 
     def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
         """格式化分析输出"""
@@ -1404,4 +1420,3 @@ OUTPUT:
         from sag.agent.physical_survey import redetect_build_files
 
         return redetect_build_files(self.docker_orchestrator, project_path)
-

@@ -19,6 +19,14 @@ from .control_events import (
     action_envelope_sha256,
     canonical_json,
     canonical_sha256,
+    forced_action_sha256,
+)
+from .attempt_policy import (
+    TestCandidateResolution,
+    forced_test_refusal_receipts,
+    has_test_candidate_refresh_receipt,
+    required_test_attempt,
+    terminal_test_receipts,
 )
 from .current_plan import CurrentPlan
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
@@ -51,6 +59,23 @@ class ReplayMismatchError(ReplayValidationError):
     """A valid transcript no longer reproduces its frozen expectations."""
 
 
+def _recorded_test_dispatch(tool: str, params: Mapping[str, Any]) -> bool:
+    if tool == "build":
+        return str(params.get("action") or "").strip().lower() == "test"
+    if tool == "python":
+        return str(params.get("operation") or "").strip().lower() == "test"
+    if tool == "gradle":
+        tasks = str(params.get("tasks") or "").strip().lower().split()
+        return any(task == "test" or task.endswith(":test") for task in tasks)
+    if tool == "maven":
+        command = str(params.get("command") or "").strip().lower().split()
+        return any(
+            token in {"test", "verify"} or token.endswith(":test") or token.endswith(":verify")
+            for token in command
+        )
+    return False
+
+
 class InitialFact(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -75,7 +100,7 @@ class ReplayInitialState(BaseModel):
 class ReplayHeader(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal[1]
+    schema_version: Literal[1, 2]
     fixture_kind: Literal["recorded_tool_transcript"]
     probe: Literal["tvm", "bigtop", "paramiko", "cassandra-java-driver"]
     run_id: str = Field(min_length=1)
@@ -115,6 +140,8 @@ class ReplayTranscript(BaseModel):
                 raise ReplayValidationError(
                     f"event sequence must be monotonic: expected {expected}, got {event.sequence}"
                 )
+            if header.schema_version == 1 and event.kind == "forced_action":
+                raise ReplayValidationError("forced_action requires control-event schema version 2")
         manifest_paths = {item.path for item in header.source_manifest}
         for event in events:
             if event.source is None:
@@ -268,6 +295,7 @@ class ControlReplayRunner:
         repairs: list[RepairRouteResult] = []
         planner_response_count = 0
         envelope_count = 0
+        forced_attempt_ids: set[str] = set()
         snapshot: RunVerdictSnapshot | None = None
 
         for event in transcript.events:
@@ -342,6 +370,62 @@ class ControlReplayRunner:
                     ):
                         raise ReplayMismatchError("production scheduler rejected recorded envelope")
                     active_envelope = dict(payload)
+                    active_envelope["_harness_forced"] = False
+                    envelope_count += 1
+                elif event.kind == "forced_action":
+                    if active_envelope is not None:
+                        raise ReplayValidationError(
+                            "forced action cannot replace an active action envelope"
+                        )
+                    if machine.current_phase != payload["phase"]:
+                        raise ReplayValidationError(
+                            "forced action targets a phase that is not open"
+                        )
+                    if machine.current_attempt_id != payload["source_attempt_id"]:
+                        raise ReplayValidationError("forced action targets a stale phase attempt")
+                    calculated_hash = forced_action_sha256(
+                        policy=payload["policy"],
+                        trigger=payload["trigger"],
+                        phase=payload["phase"],
+                        source_attempt_id=payload["source_attempt_id"],
+                        reason_code=payload["reason_code"],
+                        tool=payload["tool"],
+                        exact_params=payload["exact_params"],
+                        candidate_root=payload.get("candidate_root"),
+                        candidate_system=payload.get("candidate_system"),
+                        parent_execution_id=payload.get("parent_execution_id"),
+                        candidate_resolution=payload["candidate_resolution"],
+                    )
+                    if calculated_hash != payload["action_sha256"]:
+                        raise ReplayValidationError("forced action hash mismatch")
+                    resolution = TestCandidateResolution.from_snapshot(
+                        payload["candidate_resolution"]
+                    )
+                    expected = required_test_attempt(
+                        state,
+                        None,
+                        phase=machine.current_phase,
+                        attempt_id=machine.current_attempt_id,
+                        resolution=resolution,
+                    )
+                    if expected is None:
+                        raise ReplayValidationError(
+                            "forced action has no missing must-attempt requirement"
+                        )
+                    if (
+                        payload["tool"] != expected.required_action["tool"]
+                        or payload["exact_params"] != expected.required_action["params"]
+                        or payload.get("candidate_root") != expected.root
+                        or payload.get("candidate_system") != expected.system
+                        or payload.get("parent_execution_id") != expected.parent_execution_id
+                        or payload["reason_code"] != expected.reason_code
+                    ):
+                        raise ReplayValidationError(
+                            "forced action differs from the production must-attempt policy"
+                        )
+                    active_envelope = dict(payload)
+                    active_envelope["_harness_forced"] = True
+                    forced_attempt_ids.add(payload["source_attempt_id"])
                     envelope_count += 1
                 elif event.kind == "tool_result":
                     if active_envelope is None:
@@ -355,6 +439,41 @@ class ControlReplayRunner:
                         raise ReplayValidationError(
                             "tool result differs from its normalized action envelope"
                         )
+                    forced_result = bool(active_envelope["_harness_forced"])
+                    source_phase = str(payload.get("source_phase") or "")
+                    source_attempt_id = str(payload.get("source_attempt_id") or "")
+                    if forced_result and (
+                        source_phase != active_envelope["phase"]
+                        or source_attempt_id != active_envelope["source_attempt_id"]
+                    ):
+                        raise ReplayValidationError(
+                            "forced result requires the exact forced phase attempt lineage"
+                        )
+                    current_schema = header.schema_version >= 2
+                    test_dispatch = _recorded_test_dispatch(
+                        payload["tool"],
+                        payload["params"],
+                    )
+                    if (
+                        not forced_result
+                        and test_dispatch
+                        and current_schema
+                        and (
+                            source_phase != machine.current_phase
+                            or source_attempt_id != machine.current_attempt_id
+                        )
+                    ):
+                        raise ReplayValidationError(
+                            "schema-v2 test result requires the open phase attempt lineage"
+                        )
+                    if (
+                        not forced_result
+                        and test_dispatch
+                        and not current_schema
+                        and source_attempt_id
+                        and source_attempt_id != machine.current_attempt_id
+                    ):
+                        raise ReplayValidationError("tool result targets a stale phase attempt")
                     result_payload = dict(payload["result"])
                     output_ref = result_payload.get("output_ref")
                     if output_ref:
@@ -363,19 +482,77 @@ class ControlReplayRunner:
                         )
                     with bind_tool_result_output_storage(output_storage):
                         result = ToolResult.model_validate(result_payload)
-                    scheduler.observe_result(result)
-                    state.ingest_tool_result(
-                        StateScope(payload["scope"]),
-                        payload["tool"],
-                        result,
-                        provenance=result.output_ref
-                        or next(iter(result.evidence_refs or result.refs), None),
-                        roles=tuple(EvidenceRole(role) for role in payload["roles"]),
-                        execution_id=payload["execution_id"],
-                        params=payload["params"],
-                        source_phase=payload["source_phase"] or None,
-                        source_attempt_id=payload["source_attempt_id"] or None,
+                    if not forced_result:
+                        scheduler.observe_result(result)
+                    actual_executions = tuple(payload.get("actual_executions") or ())
+                    facade_only_forced_build = bool(
+                        forced_result
+                        and active_envelope["tool"] == "build"
+                        and not actual_executions
                     )
+                    if actual_executions:
+                        for actual in actual_executions:
+                            actual_payload = dict(actual["result"])
+                            actual_output_ref = actual_payload.get("output_ref")
+                            if actual_output_ref:
+                                output_storage.register(
+                                    str(actual_output_ref),
+                                    str(actual_payload.get("output", "")),
+                                )
+                            with bind_tool_result_output_storage(output_storage):
+                                actual_result = ToolResult.model_validate(actual_payload)
+                            state.ingest_tool_result(
+                                StateScope(actual["scope"]),
+                                actual["tool"],
+                                actual_result,
+                                provenance=actual_result.output_ref
+                                or next(
+                                    iter(actual_result.evidence_refs or actual_result.refs),
+                                    None,
+                                ),
+                                roles=tuple(EvidenceRole(role) for role in actual["roles"]),
+                                execution_id=actual["execution_id"],
+                                params=actual["params"],
+                                source_phase=payload.get("source_phase") or None,
+                                source_attempt_id=payload.get("source_attempt_id") or None,
+                            )
+                    else:
+                        state.ingest_tool_result(
+                            StateScope(payload["scope"]),
+                            payload["tool"],
+                            result,
+                            provenance=result.output_ref
+                            or next(iter(result.evidence_refs or result.refs), None),
+                            roles=tuple(EvidenceRole(role) for role in payload["roles"]),
+                            execution_id=payload["execution_id"],
+                            params=payload["params"],
+                            source_phase=payload.get("source_phase") or None,
+                            source_attempt_id=payload.get("source_attempt_id") or None,
+                        )
+                    if facade_only_forced_build:
+                        resolution = TestCandidateResolution.from_snapshot(
+                            active_envelope["candidate_resolution"]
+                        )
+                        refusals = forced_test_refusal_receipts(
+                            state,
+                            attempt_id=machine.current_attempt_id,
+                            candidates=resolution.candidates,
+                        )
+                        if (
+                            not result.is_terminal
+                            or (result.metadata or {}).get("runner_dispatched") is True
+                            or not refusals
+                        ):
+                            raise ReplayValidationError(
+                                "facade-only forced build is allowed only for a "
+                                "complete terminal no-runner control receipt"
+                            )
+                    if forced_result:
+                        # Live forced actions invalidate any remaining model plan
+                        # after their observation. Reproduce that scheduler
+                        # transition so the next recorded THINK reasons remain
+                        # deterministic.
+                        scheduler.request_reasoning(ReasoningTrigger.PLAN_EXHAUSTED)
                     active_envelope = None
                 elif event.kind == "validator_observation":
                     evidence_ref = next(iter(payload["evidence_refs"]), None)
@@ -387,6 +564,81 @@ class ControlReplayRunner:
                 elif event.kind == "gate_decision":
                     if payload["phase"] != machine.current_phase:
                         raise ReplayValidationError("gate decision targets the wrong open phase")
+                    source_attempt_id = payload.get("source_attempt_id")
+                    current_forced_contract = str(machine.current_attempt_id) in forced_attempt_ids
+                    if (
+                        payload["phase"] == "test"
+                        and payload["expected_accepted"]
+                        and (current_forced_contract or header.schema_version >= 2)
+                        and source_attempt_id != machine.current_attempt_id
+                    ):
+                        raise ReplayValidationError(
+                            "accepted test gate requires the current attempt id"
+                        )
+                    if (
+                        source_attempt_id is not None
+                        and source_attempt_id != machine.current_attempt_id
+                    ):
+                        raise ReplayValidationError("gate decision targets a stale phase attempt")
+                    resolution_payload = payload.get("test_candidate_resolution")
+                    if (
+                        payload["phase"] == "test"
+                        and payload["expected_accepted"]
+                        and (current_forced_contract or header.schema_version >= 2)
+                        and resolution_payload is None
+                    ):
+                        raise ReplayValidationError(
+                            "accepted test gate requires candidate resolution"
+                        )
+                    if (
+                        payload["phase"] == "test"
+                        and payload["expected_accepted"]
+                        and resolution_payload is not None
+                    ):
+                        resolution = TestCandidateResolution.from_snapshot(resolution_payload)
+                        requirement = required_test_attempt(
+                            state,
+                            None,
+                            phase=machine.current_phase,
+                            attempt_id=machine.current_attempt_id,
+                            resolution=resolution,
+                        )
+                        if requirement is not None:
+                            raise ReplayValidationError(
+                                "accepted test gate has no candidate-bound terminal receipt"
+                            )
+                        validator_state = ValidatorState(payload["validator_state"])
+                        if (
+                            resolution.status != "available"
+                            and has_test_candidate_refresh_receipt(
+                                state,
+                                attempt_id=machine.current_attempt_id,
+                            )
+                            and validator_state is not ValidatorState.UNAVAILABLE
+                        ):
+                            raise ReplayValidationError(
+                                "unresolved refreshed test coordinates require a non-green gate"
+                            )
+                        if resolution.status == "available":
+                            receipts = terminal_test_receipts(
+                                state,
+                                attempt_id=machine.current_attempt_id,
+                                candidates=resolution.candidates,
+                            )
+                            refusals = forced_test_refusal_receipts(
+                                state,
+                                attempt_id=machine.current_attempt_id,
+                                candidates=resolution.candidates,
+                            )
+                            if (
+                                refusals
+                                and not receipts
+                                and validator_state
+                                not in {ValidatorState.RED, ValidatorState.UNAVAILABLE}
+                            ):
+                                raise ReplayValidationError(
+                                    "forced pre-execution refusal requires a non-green gate"
+                                )
                     claim = PhaseClaim(
                         phase=payload["phase"],
                         signal=payload["signal"],

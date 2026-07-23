@@ -16,18 +16,24 @@ command recorded. Contract under test:
   callers never redden a verdict on it.
 """
 
+import importlib.metadata
 import json
+import shlex
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+import pytest
+
 import sag.tools.internal.build_preflight as bp
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.python_tool import (
+    _NATIVE_PROJECT_READY_SCRIPT,
     _PYTEST_ATTEMPT_TAG_SCRIPT,
     COLLECTED_JSON,
     PYTEST_REPORT_DIR,
     PythonTool,
+    verify_project_owned_path,
 )
 
 
@@ -62,7 +68,7 @@ class Orch:
         self.python_output = python_output
         self.commands = []
 
-    def execute_command(self, cmd, workdir=None):
+    def execute_command(self, cmd, workdir=None, **kwargs):
         self.commands.append(cmd)
         if "python3 --version" in cmd:
             return ok(self.python_output)
@@ -74,6 +80,34 @@ class Orch:
             if substring in cmd:
                 return result(cmd) if callable(result) else dict(result)
         return ok("")
+
+
+class MonitoringOrch(Orch):
+    """Orchestrator double that exposes the long-running monitored path."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.monitored_calls = []
+
+    def execute_command_with_monitoring(
+        self,
+        cmd,
+        *,
+        workdir=None,
+        silent_timeout=None,
+        absolute_timeout=None,
+        optimize_for_maven=None,
+    ):
+        self.monitored_calls.append(
+            {
+                "command": cmd,
+                "workdir": workdir,
+                "silent_timeout": silent_timeout,
+                "absolute_timeout": absolute_timeout,
+                "optimize_for_maven": optimize_for_maven,
+            }
+        )
+        return self.execute_command(cmd, workdir=workdir)
 
 
 MANIFEST = {
@@ -88,6 +122,145 @@ MANIFEST = {
     "python_packages": ["proj"],
     "test_hints": {"pytest_args": None, "test_deps": []},
 }
+
+
+TVM_NATIVE_MANIFEST = {
+    **MANIFEST,
+    "python_venv": "/workspace/tvm/.venv",
+    "python_install_commands": [
+        "/workspace/tvm/.venv/bin/python -m pip install -e .",
+    ],
+    "python_distribution_name": "apache-tvm",
+    "python_declared_dependencies": ["apache-tvm-ffi>=0.1.13"],
+    "python_local_providers": [
+        {
+            "distribution_name": "apache-tvm-ffi",
+            "root": "3rdparty/tvm-ffi",
+        }
+    ],
+    "python_root": "/workspace/tvm",
+    "native_build_mode": "pep517-integrated",
+    "survey": {"project_path": "/workspace/tvm"},
+}
+
+TVM_NATIVE_TEST_MANIFEST = {
+    **TVM_NATIVE_MANIFEST,
+    "has_native_build": True,
+    "python_packages": ["tvm"],
+    "python_package_paths": [
+        {
+            "import_name": "tvm",
+            "path": "python/tvm",
+            "source": "pyproject.toml:tool.scikit-build.wheel.packages",
+        }
+    ],
+    "native_artifact_roots": ["build", "python/tvm/lib"],
+    "python_smoke_candidates": [
+        {
+            "path": "tests/python/all-platform-minimal-test",
+            "source": "pyproject.toml:tool.cibuildwheel.test-command",
+        }
+    ],
+}
+TVM_SMOKE_PATH = "tests/python/all-platform-minimal-test"
+TVM_SMOKE_REALPATH = f"/workspace/tvm/{TVM_SMOKE_PATH}"
+
+SUBDIR_NATIVE_TEST_MANIFEST = {
+    **MANIFEST,
+    "survey": {"project_path": "/workspace/tvm"},
+    "python_root": "/workspace/tvm/python",
+    "python_venv": "/workspace/tvm/python/.venv",
+    "python_distribution_name": "native-pkg",
+    "python_packages": ["native_pkg"],
+    "python_package_paths": [
+        {
+            "import_name": "native_pkg",
+            "path": "src/native_pkg",
+            "source": "pyproject.toml:tool.scikit-build.wheel.packages",
+        }
+    ],
+    "has_native_build": True,
+    "native_build_mode": "pep517-integrated",
+    "native_artifact_roots": [
+        "python/_native-build",
+        "python/src/native_pkg/lib",
+    ],
+    "python_smoke_candidates": [
+        {
+            "path": "python/tests/smoke",
+            "source": "pyproject.toml:tool.cibuildwheel.test-command",
+        }
+    ],
+}
+SUBDIR_SMOKE_PATH = "python/tests/smoke"
+SUBDIR_SMOKE_REALPATH = f"/workspace/tvm/{SUBDIR_SMOKE_PATH}"
+
+TVM_ROOT_INSTALL = "/workspace/tvm/.venv/bin/python -m pip install -e ."
+TVM_PROVIDER_ROOT = "/workspace/tvm/3rdparty/tvm-ffi"
+TVM_PROVIDER_INSTALL = (
+    "/workspace/tvm/.venv/bin/python -m pip install -e /workspace/tvm/3rdparty/tvm-ffi"
+)
+TVM_MISSING_PROVIDER = (
+    "ERROR: Could not find a version that satisfies the requirement "
+    "apache-tvm-ffi>=0.1.13 (from apache-tvm)\n"
+    "ERROR: No matching distribution found for apache-tvm-ffi>=0.1.13"
+)
+
+
+def tvm_provider_rules(*, provider_name="apache-tvm-ffi", provider_install=None):
+    """Exact provider probes; root-install behavior is supplied by each test."""
+    return [
+        (
+            "realpath -m -- /workspace /workspace/tvm " "/workspace/tvm/3rdparty/tvm-ffi",
+            ok("/workspace\n/workspace/tvm\n/workspace/tvm/3rdparty/tvm-ffi\n"),
+        ),
+        (f"test -e {TVM_PROVIDER_ROOT}", ok("EXISTS")),
+        (f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml", ok("EXISTS")),
+        (
+            f"cat {TVM_PROVIDER_ROOT}/pyproject.toml",
+            ok(f'[project]\nname = "{provider_name}"\nversion = "0.1.13"\n'),
+        ),
+        (
+            TVM_PROVIDER_INSTALL,
+            provider_install if provider_install is not None else ok("provider installed"),
+        ),
+    ]
+
+
+def tvm_native_smoke_rules(collection_output, *, native_ready=False, target_exists=True):
+    return [
+        (
+            "SAG_NATIVE_PROJECT_READY",
+            ok("SAG_NATIVE_PROJECT_READY") if native_ready else fail("not ready"),
+        ),
+        (
+            f"realpath -m -- /workspace /workspace/tvm {TVM_SMOKE_REALPATH}",
+            ok(f"/workspace\n/workspace/tvm\n{TVM_SMOKE_REALPATH}\n"),
+        ),
+        (
+            f"test -e {TVM_SMOKE_REALPATH}",
+            ok("EXISTS") if target_exists else ok("MISSING"),
+        ),
+        (
+            f"--collect-only -q {TVM_SMOKE_PATH} --maxfail=1",
+            ok(collection_output),
+        ),
+    ]
+
+
+def subdir_native_smoke_rules(collection_output):
+    return [
+        ("SAG_NATIVE_PROJECT_READY", fail("not ready")),
+        (
+            f"realpath -m -- /workspace /workspace/tvm {SUBDIR_SMOKE_REALPATH}",
+            ok(f"/workspace\n/workspace/tvm\n{SUBDIR_SMOKE_REALPATH}\n"),
+        ),
+        (f"test -e {SUBDIR_SMOKE_REALPATH}", ok("EXISTS")),
+        (
+            f"--collect-only -q {SUBDIR_SMOKE_REALPATH} --maxfail=1",
+            ok(collection_output),
+        ),
+    ]
 
 
 def compile_metrics(
@@ -255,6 +428,268 @@ def test_version_retry_is_bounded_to_exactly_once(monkeypatch):
     assert result.succeeded is False
 
 
+def test_native_setup_recovers_exact_local_provider_then_retries_root_command():
+    root_install = FailThenOk(TVM_MISSING_PROVIDER)
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, root_install),
+            *tvm_provider_rules(),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is True
+    assert [command for command in orch.commands if command == TVM_ROOT_INSTALL] == [
+        TVM_ROOT_INSTALL,
+        TVM_ROOT_INSTALL,
+    ]
+    assert [command for command in orch.commands if command == TVM_PROVIDER_INSTALL] == [
+        TVM_PROVIDER_INSTALL
+    ]
+    first_root = orch.commands.index(TVM_ROOT_INSTALL)
+    provider = orch.commands.index(TVM_PROVIDER_INSTALL)
+    second_root = len(orch.commands) - 1 - orch.commands[::-1].index(TVM_ROOT_INSTALL)
+    assert first_root < provider < second_root
+    assert result.metadata["local_provider_recovery"] == {
+        "distribution_name": "apache-tvm-ffi",
+        "provider_root": "3rdparty/tvm-ffi",
+        "provider_command": TVM_PROVIDER_INSTALL,
+        "provider_succeeded": True,
+        "root_retry": True,
+    }
+    install_commands = [
+        command for command in orch.commands if " -m pip install " in f" {command} "
+    ]
+    assert all("SETUPTOOLS_SCM_PRETEND_VERSION" not in command for command in install_commands)
+    assert all("--no-deps" not in command for command in install_commands)
+
+
+def test_native_setup_does_not_preinstall_provider_when_root_install_succeeds():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[(TVM_ROOT_INSTALL, ok("root installed"))],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is True
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any(TVM_PROVIDER_ROOT in command for command in orch.commands)
+    assert "local_provider_recovery" not in result.metadata
+
+
+def test_native_setup_rejects_provider_whose_pyproject_name_does_not_match():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER)),
+            *tvm_provider_rules(provider_name="not-apache-tvm-ffi"),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert TVM_PROVIDER_INSTALL not in orch.commands
+    assert "local_provider_recovery" not in result.metadata
+
+
+def test_native_setup_rejects_manifest_provider_name_mismatch_without_probing():
+    manifest = {
+        **TVM_NATIVE_MANIFEST,
+        "python_local_providers": [
+            {
+                "distribution_name": "some-other-ffi",
+                "root": "3rdparty/tvm-ffi",
+            }
+        ],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any("realpath -m" in command for command in orch.commands)
+    assert not any(TVM_PROVIDER_ROOT in command for command in orch.commands)
+
+
+def test_native_setup_rejects_provider_not_declared_by_root_project():
+    manifest = {
+        **TVM_NATIVE_MANIFEST,
+        "python_declared_dependencies": ["numpy>=2"],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any("realpath -m" in command for command in orch.commands)
+    assert TVM_PROVIDER_INSTALL not in orch.commands
+
+
+def test_native_setup_rejects_ambiguous_matching_providers_without_probing():
+    manifest = {
+        **TVM_NATIVE_MANIFEST,
+        "python_local_providers": [
+            {
+                "distribution_name": "apache-tvm-ffi",
+                "root": "3rdparty/tvm-ffi",
+            },
+            {
+                "distribution_name": "apache_tvm_ffi",
+                "root": "vendor/tvm-ffi",
+            },
+        ],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any("realpath -m" in command for command in orch.commands)
+    assert TVM_PROVIDER_INSTALL not in orch.commands
+
+
+def test_native_setup_rejects_provider_path_escape_without_probing():
+    manifest = {
+        **TVM_NATIVE_MANIFEST,
+        "python_local_providers": [
+            {
+                "distribution_name": "apache-tvm-ffi",
+                "root": "../outside/tvm-ffi",
+            }
+        ],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[(TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER))],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any("realpath -m" in command for command in orch.commands)
+    assert not any("outside/tvm-ffi" in command for command in orch.commands)
+
+
+def test_native_setup_rejects_provider_symlink_that_resolves_outside_project():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER)),
+            (
+                "realpath -m -- /workspace /workspace/tvm " "/workspace/tvm/3rdparty/tvm-ffi",
+                ok("/workspace\n/workspace/tvm\n/opt/shared/tvm-ffi\n"),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any("test -f" in command for command in orch.commands)
+    assert TVM_PROVIDER_INSTALL not in orch.commands
+
+
+def test_native_setup_rejects_provider_when_checkout_root_resolves_outside_workspace():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER)),
+            (
+                "realpath -m -- /workspace /workspace/tvm " "/workspace/tvm/3rdparty/tvm-ffi",
+                ok("/workspace\n" "/opt/shared/tvm\n" "/opt/shared/tvm/3rdparty/tvm-ffi\n"),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert not any("test -f" in command for command in orch.commands)
+    assert TVM_PROVIDER_INSTALL not in orch.commands
+
+
+def test_native_setup_provider_install_failure_does_not_retry_root():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, fail(TVM_MISSING_PROVIDER)),
+            *tvm_provider_rules(provider_install=fail("provider build failed")),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 1
+    assert orch.commands.count(TVM_PROVIDER_INSTALL) == 1
+    assert result.metadata["local_provider_recovery"]["provider_succeeded"] is False
+    assert result.metadata["local_provider_recovery"]["root_retry"] is False
+    assert "provider build failed" in (result.error or "")
+
+
+def test_native_setup_root_retry_is_bounded_to_once_after_provider_success():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, FailThenOk(TVM_MISSING_PROVIDER, times=99)),
+            *tvm_provider_rules(),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 2
+    assert orch.commands.count(TVM_PROVIDER_INSTALL) == 1
+    assert result.metadata["local_provider_recovery"]["root_retry"] is True
+
+
+def test_native_pep517_setup_uses_extended_monitored_timeout():
+    orch = MonitoringOrch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            ("test -x /workspace/tvm/.venv/bin/python", ok("EXISTS")),
+            (TVM_ROOT_INSTALL, ok("root installed")),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "setup_env",
+        working_directory="/workspace/tvm",
+        timeout=37,
+    )
+
+    assert result.succeeded is True
+    root_call = next(call for call in orch.monitored_calls if call["command"] == TVM_ROOT_INSTALL)
+    assert root_call == {
+        "command": TVM_ROOT_INSTALL,
+        "workdir": "/workspace/tvm",
+        "silent_timeout": 2400,
+        "absolute_timeout": 2400,
+        "optimize_for_maven": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # test
 # ---------------------------------------------------------------------------
@@ -281,6 +716,56 @@ def test_test_writes_collected_denominator_and_junitxml_report():
     collect = next(i for i, c in enumerate(orch.commands) if "--collect-only" in c)
     run = next(i for i, c in enumerate(orch.commands) if "--junitxml" in c)
     assert collect < run
+
+
+def test_test_marks_docker_dispatch_failure_as_no_runner_execution():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", ok("1 test collected in 0.01s")),
+            (
+                "--junitxml",
+                {
+                    "success": False,
+                    "exit_code": -1,
+                    "output": "docker exec was never accepted",
+                    "dispatch_status": "dispatch_failed",
+                    "runner_dispatched": False,
+                },
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+
+    assert result.succeeded is False
+    assert result.metadata["command"].endswith(
+        "--junitxml=/workspace/.setup_agent/pytest-reports/pytest-attempt-000001.xml"
+    )
+    assert result.metadata["runner_dispatched"] is False
+
+
+def test_test_nonzero_exit_remains_a_physical_runner_execution():
+    orch = Orch(
+        manifest=dict(MANIFEST),
+        rules=[
+            ("--collect-only", ok("1 test collected in 0.01s")),
+            (
+                "--junitxml",
+                {
+                    "success": False,
+                    "exit_code": 1,
+                    "output": "1 failed in 0.01s",
+                    "runner_dispatched": True,
+                },
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj")
+
+    assert result.succeeded is True
+    assert result.metadata["runner_dispatched"] is True
 
 
 def test_test_assigns_monotonic_attempt_ids_and_persists_them_in_junit():
@@ -322,6 +807,135 @@ def test_attempt_tag_script_writes_suite_property_atomically(tmp_path):
     assert completed.stdout.strip() == "SAG_ATTEMPT_TAGGED"
     assert properties["sag.attempt_id"] == "7"
     assert not (tmp_path / "report.xml.attempt.tmp").exists()
+
+
+def test_native_ready_script_rejects_external_symlinked_artifact(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    build = project / "build"
+    outside = tmp_path / "outside"
+    build.mkdir(parents=True)
+    outside.mkdir()
+    external_artifact = outside / "libnative.so"
+    external_artifact.write_bytes(b"not project owned")
+    (build / "libnative.so").symlink_to(external_artifact)
+
+    class Distribution:
+        metadata = {"Name": "demo-native"}
+
+        @staticmethod
+        def read_text(name):
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": project.as_uri(),
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.setattr(
+        importlib.metadata,
+        "distribution",
+        lambda name: Distribution(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "native-ready",
+            "demo-native",
+            str(project),
+            str(project),
+            json.dumps(["json"]),
+            json.dumps(["build"]),
+            str(tmp_path),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(_NATIVE_PROJECT_READY_SCRIPT, {"__name__": "__main__"})
+
+    assert exc_info.value.code == 1
+
+
+def test_native_ready_script_rejects_symlinked_checkout_with_owned_artifact(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    outside_project = tmp_path / "outside" / "project"
+    artifact = outside_project / "build" / "libnative.so"
+    workspace.mkdir()
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"native")
+    checkout = workspace / "tvm"
+    checkout.symlink_to(outside_project, target_is_directory=True)
+
+    class Distribution:
+        metadata = {"Name": "demo-native"}
+
+        @staticmethod
+        def read_text(name):
+            assert name == "direct_url.json"
+            return json.dumps(
+                {
+                    "url": outside_project.as_uri(),
+                    "dir_info": {"editable": True},
+                }
+            )
+
+    monkeypatch.setattr(
+        importlib.metadata,
+        "distribution",
+        lambda name: Distribution(),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "native-ready",
+            "demo-native",
+            str(checkout),
+            str(checkout),
+            json.dumps(["json"]),
+            json.dumps(["build"]),
+            str(workspace),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(_NATIVE_PROJECT_READY_SCRIPT, {"__name__": "__main__"})
+
+    assert exc_info.value.code == 1
+
+
+def test_project_owned_path_rejects_checkout_root_symlink_escape(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside" / "shared"
+    candidate = outside / "tests" / "test_runtime.py"
+    workspace.mkdir()
+    candidate.parent.mkdir(parents=True)
+    candidate.write_text("def test_runtime(): pass\n", encoding="utf-8")
+    (workspace / "tvm").symlink_to(outside, target_is_directory=True)
+
+    def physical_path(logical):
+        assert logical == "/workspace" or logical.startswith("/workspace/")
+        suffix = logical.removeprefix("/workspace").lstrip("/")
+        return workspace / suffix if suffix else workspace
+
+    def execute(command):
+        tokens = shlex.split(command)
+        if tokens[:3] == ["realpath", "-m", "--"]:
+            resolved = [str(physical_path(logical).resolve(strict=False)) for logical in tokens[3:]]
+            return ok("\n".join(resolved) + "\n")
+        if tokens[:2] == ["test", "-e"]:
+            return ok("EXISTS" if physical_path(tokens[2]).exists() else "MISSING")
+        raise AssertionError(f"unexpected command: {command}")
+
+    owned, reason = verify_project_owned_path(
+        execute,
+        "/workspace/tvm",
+        "/workspace/tvm/tests/test_runtime.py",
+    )
+
+    assert owned is False
+    assert "project root real path escapes" in (reason or "")
 
 
 def test_pytest_failures_are_honest_and_never_rerun():
@@ -859,6 +1473,7 @@ def test_non_pytest_args_are_rejected_before_anything_runs():
         result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args=bad)
         assert result.succeeded is False, bad
         assert result.error_code == "PYTEST_ARGS_REJECTED", bad
+        assert result.failure_signature == "pytest_args_rejected:invalid_selector", bad
         # Nothing pytest ran — the bogus args never reach a command line.
         assert not any("-m pytest" in c for c in orch.commands), bad
         # The message names the correct usage.
@@ -987,11 +1602,14 @@ def test_filtered_test_records_selected_count_not_total():
             ("--collect-only", ok("357 tests collected in 1.2s")),
         ],
     )
-    result = PythonTool(orch).execute(
-        "test", working_directory="/workspace/proj", args="-k smoke"
-    )
-    assert result.metadata["collected"] == 357  # denominator unchanged
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args="-k smoke")
+    # Filtered runs never launch an unfiltered collection first: that probe
+    # can itself be the forbidden native full-suite sweep.
+    assert result.metadata["collected"] is None
     assert result.metadata["collected_after_deselection"] == 3
+    assert result.metadata["collection_scope"] == "filtered"
+    collects = [command for command in orch.commands if "--collect-only" in command]
+    assert len(collects) == 1
 
 
 def test_unfiltered_test_selection_equals_denominator_no_extra_collect():
@@ -1013,7 +1631,416 @@ def test_unparseable_scoped_collection_is_none_never_invented():
             ("--collect-only", ok("357 tests collected in 1.2s")),
         ],
     )
-    result = PythonTool(orch).execute(
-        "test", working_directory="/workspace/proj", args="-k smoke"
-    )
+    result = PythonTool(orch).execute("test", working_directory="/workspace/proj", args="-k smoke")
     assert result.metadata["collected_after_deselection"] is None
+
+
+# ---- Weak-model native smoke grounding -------------------------------------
+
+
+def test_native_unready_bare_test_uses_surveyed_bounded_smoke_without_full_collect():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=tvm_native_smoke_rules(
+            "tests/python/all-platform-minimal-test/test_runtime.py::test_load\n"
+            "3 tests collected in 0.2s"
+        ),
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
+
+    assert result.succeeded is True
+    assert result.metadata["native_unready"] is True
+    assert result.metadata["selection_mode"] == "survey_candidate"
+    assert result.metadata["smoke_candidate"] == TVM_SMOKE_PATH
+    assert result.metadata["collected"] is None
+    assert result.metadata["collected_after_deselection"] == 3
+    collects = [command for command in orch.commands if "--collect-only" in command]
+    assert collects == [
+        f"/workspace/tvm/.venv/bin/python -m pytest --collect-only -q "
+        f"{TVM_SMOKE_PATH} --maxfail=1"
+    ]
+    runs = [
+        command for command in orch.commands if "--junitxml" in command and "-m pytest" in command
+    ]
+    assert len(runs) == 1
+    assert f"{TVM_SMOKE_PATH} --maxfail=1" in runs[0]
+    writes = [command for command in orch.commands if COLLECTED_JSON in command and "<<" in command]
+    assert '"scope": "filtered"' in writes[0]
+    assert '"selected": 3' in writes[0]
+
+
+def test_subdir_native_test_uses_survey_root_for_smoke_and_install_root_for_origin():
+    orch = Orch(
+        manifest=dict(SUBDIR_NATIVE_TEST_MANIFEST),
+        rules=subdir_native_smoke_rules("2 tests collected in 0.2s"),
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm/python",
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["smoke_candidate"] == SUBDIR_SMOKE_PATH
+    collect = next(command for command in orch.commands if "--collect-only" in command)
+    assert SUBDIR_SMOKE_REALPATH in collect
+    ready_probe = next(
+        command for command in orch.commands if "SAG_NATIVE_PROJECT_READY" in command
+    )
+    # The readiness script compares PEP 610 against the Python install root,
+    # but resolves native artifact roots from the repository survey root.
+    assert "native-pkg /workspace/tvm/python /workspace/tvm" in ready_probe
+    assert '["python/_native-build", "python/src/native_pkg/lib"]' in ready_probe
+
+
+@pytest.mark.parametrize(
+    ("collection_output", "error_code", "selected"),
+    [
+        ("51 tests collected in 0.2s", "NATIVE_SMOKE_TOO_BROAD", 51),
+        ("no tests collected in 0.2s", "NATIVE_SMOKE_EMPTY", 0),
+        ("collection output changed shape", "NATIVE_SMOKE_COUNT_UNKNOWN", None),
+    ],
+)
+def test_native_unready_unsafe_smoke_count_never_starts_test_run(
+    collection_output, error_code, selected
+):
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=tvm_native_smoke_rules(collection_output),
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert result.error_code == error_code
+    assert result.metadata["collected_after_deselection"] == selected
+    assert not any("--junitxml" in command for command in orch.commands)
+
+
+def test_native_unready_invalid_model_path_returns_verified_replacement_without_collect():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=tvm_native_smoke_rules("3 tests collected in 0.2s"),
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args="tests/python/unittest/test_runtime.py",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert result.metadata["replacement_args"] == f"{TVM_SMOKE_PATH} --maxfail=1"
+    assert not any("--collect-only" in command for command in orch.commands)
+    assert not any("--junitxml" in command for command in orch.commands)
+
+
+def test_native_unready_stale_survey_candidate_refuses_to_guess_or_collect():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=tvm_native_smoke_rules(
+            "3 tests collected in 0.2s",
+            target_exists=False,
+        ),
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert result.error_code == "NATIVE_SMOKE_UNAVAILABLE"
+    assert not any("--collect-only" in command for command in orch.commands)
+    assert not any("--junitxml" in command for command in orch.commands)
+
+
+def test_native_ready_bare_test_keeps_full_suite_behavior():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            *tvm_native_smoke_rules(
+                "3 tests collected in 0.2s",
+                native_ready=True,
+            ),
+            ("--collect-only", ok("357 tests collected in 1.2s")),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
+
+    assert result.succeeded is True
+    assert "native_unready" not in result.metadata
+    assert result.metadata["collection_scope"] == "full"
+    assert result.metadata["collected"] == 357
+    collects = [command for command in orch.commands if "--collect-only" in command]
+    assert len(collects) == 1
+    assert TVM_SMOKE_PATH not in collects[0]
+    ready_probe = next(
+        command for command in orch.commands if "SAG_NATIVE_PROJECT_READY" in command
+    )
+    assert "apache-tvm" in ready_probe
+    assert "/workspace/tvm" in ready_probe
+    assert '["build", "python/tvm/lib"]' in ready_probe
+    assert ".venv/lib" not in ready_probe
+
+
+def test_native_unready_selector_only_explicit_filter_is_rejected_before_collection():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=tvm_native_smoke_rules("3 tests collected in 0.2s"),
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args="-k runtime",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert "concrete" in (result.error or "")
+    assert result.metadata["replacement_args"] == f"{TVM_SMOKE_PATH} --maxfail=1"
+    assert not any("--collect-only" in command for command in orch.commands)
+    assert not any("--junitxml" in command for command in orch.commands)
+
+
+def test_native_unready_explicit_project_path_with_filter_is_scoped_and_bounded():
+    explicit = f"{TVM_SMOKE_PATH}/test_runtime.py"
+    explicit_full = f"/workspace/tvm/{explicit}"
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            (
+                f"realpath -m -- /workspace /workspace/tvm {explicit_full}",
+                ok(f"/workspace\n/workspace/tvm\n{explicit_full}\n"),
+            ),
+            (
+                f"realpath -m -- {TVM_SMOKE_REALPATH} {explicit_full}",
+                ok(f"{TVM_SMOKE_REALPATH}\n{explicit_full}\n"),
+            ),
+            (f"test -e {explicit_full}", ok("EXISTS")),
+            *tvm_native_smoke_rules("3 tests collected in 0.2s"),
+            (
+                f"--collect-only -q {explicit} -k runtime --maxfail=1",
+                ok("2/357 tests collected (355 deselected)"),
+            ),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args=f"{explicit} -k runtime",
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["selection_mode"] == "explicit"
+    assert result.metadata["collected_after_deselection"] == 2
+    collects = [command for command in orch.commands if "--collect-only" in command]
+    assert len(collects) == 1
+    assert f"{explicit} -k runtime --maxfail=1" in collects[0]
+
+
+def test_native_unready_explicit_exact_survey_candidate_is_allowed():
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            (
+                f"realpath -m -- {TVM_SMOKE_REALPATH} {TVM_SMOKE_REALPATH}",
+                ok(f"{TVM_SMOKE_REALPATH}\n{TVM_SMOKE_REALPATH}\n"),
+            ),
+            *tvm_native_smoke_rules("3 tests collected in 0.2s"),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args=TVM_SMOKE_PATH,
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["selection_mode"] == "explicit"
+    assert result.metadata["collected_after_deselection"] == 3
+
+
+def test_native_unready_explicit_absolute_path_outside_project_is_rejected():
+    outside = "/opt/shared/test_runtime.py"
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            (f"test -e {outside}", ok("EXISTS")),
+            *tvm_native_smoke_rules("3 tests collected in 0.2s"),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args=outside,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert "outside the surveyed project" in (result.error or "")
+    assert not any("--collect-only" in command for command in orch.commands)
+
+
+def test_native_unready_broader_project_tests_dir_is_rejected_before_collection():
+    broader = "tests"
+    broader_full = "/workspace/tvm/tests"
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            (
+                f"realpath -m -- /workspace /workspace/tvm {broader_full}",
+                ok(f"/workspace\n/workspace/tvm\n{broader_full}\n"),
+            ),
+            (f"test -e {broader_full}", ok("EXISTS")),
+            *tvm_native_smoke_rules("3 tests collected in 0.2s"),
+            (f"--collect-only -q {broader}", ok("357 tests collected in 1.2s")),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args=broader,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert "broader than the verified survey smoke" in (result.error or "")
+    assert not any("--collect-only" in command for command in orch.commands)
+    assert not any("--junitxml" in command for command in orch.commands)
+
+
+def test_native_unready_explicit_symlink_escape_is_rejected():
+    relative = "tests/python/escape/test_runtime.py"
+    full = f"/workspace/tvm/{relative}"
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            (
+                f"realpath -m -- /workspace /workspace/tvm {full}",
+                ok("/workspace\n/workspace/tvm\n/opt/shared/test_runtime.py\n"),
+            ),
+            (f"test -e {full}", ok("EXISTS")),
+            *tvm_native_smoke_rules("3 tests collected in 0.2s"),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args=relative,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert "real path escapes" in (result.error or "")
+    assert not any("--collect-only" in command for command in orch.commands)
+
+
+def test_native_unready_subdir_dot_is_not_a_concrete_smoke_path():
+    orch = Orch(
+        manifest=dict(SUBDIR_NATIVE_TEST_MANIFEST),
+        rules=[
+            (
+                "realpath -m -- /workspace /workspace/tvm /workspace/tvm/python",
+                ok("/workspace\n/workspace/tvm\n/workspace/tvm/python\n"),
+            ),
+            ("test -e /workspace/tvm/python", ok("EXISTS")),
+            *subdir_native_smoke_rules("2 tests collected in 0.2s"),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm/python",
+        args=".",
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "PYTEST_ARGS_REJECTED"
+    assert "concrete native smoke path" in (result.error or "")
+    assert not any("--collect-only" in command for command in orch.commands)
+
+
+def test_native_unready_unknown_survey_source_is_not_an_executable_coordinate():
+    manifest = {
+        **TVM_NATIVE_TEST_MANIFEST,
+        "python_smoke_candidates": [
+            {
+                "path": TVM_SMOKE_PATH,
+                "source": "model:guessed-path",
+            }
+        ],
+    }
+    orch = Orch(
+        manifest=manifest,
+        rules=[
+            ("SAG_NATIVE_PROJECT_READY", fail("not ready")),
+            (
+                f"realpath -m -- /workspace /workspace/tvm {TVM_SMOKE_REALPATH}",
+                ok(f"/workspace\n/workspace/tvm\n{TVM_SMOKE_REALPATH}\n"),
+            ),
+            (f"test -e {TVM_SMOKE_REALPATH}", ok("EXISTS")),
+        ],
+    )
+
+    result = PythonTool(orch).execute("test", working_directory="/workspace/tvm")
+
+    assert result.succeeded is False
+    assert result.error_code == "NATIVE_SMOKE_UNAVAILABLE"
+    assert not any("realpath -m" in command for command in orch.commands)
+    assert not any("--collect-only" in command for command in orch.commands)
+
+
+def test_native_unready_real_pytest_collection_accepts_owned_concrete_path(tmp_path):
+    """Exercise the parser/guard against pytest's real collection output.
+
+    The orchestrator remains a container double, but the collection transcript
+    it returns comes from an actual pytest subprocess rather than a hand-written
+    summary string.
+    """
+    test_file = tmp_path / "test_runtime.py"
+    test_file.write_text("def test_runtime():\n    assert True\n", encoding="utf-8")
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", str(test_file)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    collection_output = collected.stdout + collected.stderr
+    assert collected.returncode == 0, collection_output
+
+    explicit = f"{TVM_SMOKE_PATH}/test_runtime.py"
+    explicit_full = f"/workspace/tvm/{explicit}"
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_TEST_MANIFEST),
+        rules=[
+            (
+                f"realpath -m -- /workspace /workspace/tvm {explicit_full}",
+                ok(f"/workspace\n/workspace/tvm\n{explicit_full}\n"),
+            ),
+            (
+                f"realpath -m -- {TVM_SMOKE_REALPATH} {explicit_full}",
+                ok(f"{TVM_SMOKE_REALPATH}\n{explicit_full}\n"),
+            ),
+            (f"test -e {explicit_full}", ok("EXISTS")),
+            *tvm_native_smoke_rules(collection_output),
+            (f"--collect-only -q {explicit} --maxfail=1", ok(collection_output)),
+        ],
+    )
+
+    result = PythonTool(orch).execute(
+        "test",
+        working_directory="/workspace/tvm",
+        args=explicit,
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["selection_mode"] == "explicit"
+    assert result.metadata["collected_after_deselection"] == 1

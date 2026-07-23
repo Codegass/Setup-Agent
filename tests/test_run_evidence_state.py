@@ -297,13 +297,21 @@ def test_ingest_tool_result_preserves_the_observation_and_only_registers_verifie
         refs=["output_2"],
     )
 
-    verified_delta = state.ingest_tool_result(StateScope.ENVIRONMENT, "system", verified)
+    verified_delta = state.ingest_tool_result(
+        StateScope.ENVIRONMENT,
+        "system",
+        verified,
+        source_phase="provision",
+        source_attempt_id="provision-1",
+    )
     unknown_delta = state.ingest_tool_result(StateScope.ENVIRONMENT, "system", unknown)
 
     assert verified_delta.changed is True
     assert unknown_delta.changed is False
     assert len(state.tool_observations) == 2
     assert state.tool_observations[0].result is not verified
+    assert state.tool_observations[0].source_phase == "provision"
+    assert state.tool_observations[0].source_attempt_id == "provision-1"
     assert state.state_vector([StateScope.ENVIRONMENT]) == {"environment": 1}
 
 

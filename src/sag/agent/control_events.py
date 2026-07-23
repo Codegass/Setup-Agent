@@ -20,11 +20,12 @@ from typing import Any, Callable, Literal, Mapping, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-CONTROL_EVENT_SCHEMA_VERSION = 1
+CONTROL_EVENT_SCHEMA_VERSION = 2
 CONTROL_EVENT_KINDS = (
     "planner_response",
     "scheduler_decision",
     "action_envelope",
+    "forced_action",
     "tool_result",
     "validator_observation",
     "gate_decision",
@@ -36,6 +37,7 @@ ControlEventKind = Literal[
     "planner_response",
     "scheduler_decision",
     "action_envelope",
+    "forced_action",
     "tool_result",
     "validator_observation",
     "gate_decision",
@@ -264,6 +266,99 @@ class ActionEnvelopePayload(_StrictPayload):
     envelope_sha256: str
 
 
+class TestCandidatePayload(_StrictPayload):
+    root: str = Field(min_length=1)
+    system: str = Field(min_length=1)
+
+
+class TestCandidateResolutionPayload(_StrictPayload):
+    status: Literal[
+        "available",
+        "manifest_unreadable",
+        "coordinates_missing",
+        "unsafe_coordinates",
+    ]
+    workspace_root: str | None = None
+    project_root: str | None = None
+    candidates: tuple[TestCandidatePayload, ...] = ()
+
+    @model_validator(mode="after")
+    def _status_matches_candidates(self) -> "TestCandidateResolutionPayload":
+        if self.status == "available" and (
+            not self.workspace_root
+            or not self.project_root
+            or not self.candidates
+        ):
+            raise ValueError(
+                "available test-candidate resolution requires roots and candidates"
+            )
+        if self.status != "available" and self.candidates:
+            raise ValueError("failed test-candidate resolution cannot contain coordinates")
+        return self
+
+
+class ForcedActionPayload(_StrictPayload):
+    """Harness-owned action emitted without a planner/scheduler step."""
+
+    envelope_id: str = Field(min_length=1)
+    policy: Literal["test_attempt_required"]
+    trigger: Literal[
+        "termination_refusal",
+        "repair_refusal",
+        "terminal_metadata",
+        "phase_floor",
+        "loop_close",
+    ]
+    phase: Literal["test"]
+    source_attempt_id: str = Field(min_length=1)
+    reason_code: str = Field(min_length=1)
+    tool: Literal["build", "search", "project"]
+    exact_params: dict[str, Any]
+    candidate_root: str | None = None
+    candidate_system: str | None = None
+    parent_execution_id: str | None = None
+    candidate_resolution: TestCandidateResolutionPayload
+    action_sha256: str
+
+    @model_validator(mode="after")
+    def _valid_action_digest(self) -> "ForcedActionPayload":
+        if forced_action_sha256(
+            policy=self.policy,
+            trigger=self.trigger,
+            phase=self.phase,
+            source_attempt_id=self.source_attempt_id,
+            reason_code=self.reason_code,
+            tool=self.tool,
+            exact_params=self.exact_params,
+            candidate_root=self.candidate_root,
+            candidate_system=self.candidate_system,
+            parent_execution_id=self.parent_execution_id,
+            candidate_resolution=self.candidate_resolution.model_dump(mode="json"),
+        ) != self.action_sha256:
+            raise ValueError("forced action hash mismatch")
+        return self
+
+
+class ActualExecutionPayload(_StrictPayload):
+    execution_id: str = Field(min_length=1)
+    tool: str = Field(min_length=1)
+    params: dict[str, Any]
+    scope: Literal[
+        "environment",
+        "dependencies",
+        "artifacts",
+        "test_runtime",
+        "project_analysis",
+    ]
+    roles: tuple[Literal["build", "test"], ...] = ()
+    result: dict[str, Any]
+
+    @model_validator(mode="after")
+    def _no_full_output_body(self) -> "ActualExecutionPayload":
+        _validate_control_result_projection(self.result)
+        return self
+
+
 class ToolResultPayload(_StrictPayload):
     envelope_id: str = Field(min_length=1)
     execution_id: str = Field(min_length=1)
@@ -280,16 +375,12 @@ class ToolResultPayload(_StrictPayload):
     result: dict[str, Any]
     source_phase: str = ""
     source_attempt_id: str = ""
+    actual_executions: tuple[ActualExecutionPayload, ...] = ()
     output_sha256: str | None = None
 
     @model_validator(mode="after")
     def _no_full_output_body(self) -> "ToolResultPayload":
-        forbidden = {"raw_output", "full_output", "prompt"}.intersection(self.result)
-        if forbidden:
-            raise ValueError("control events must reference full output, not embed it")
-        output = self.result.get("output")
-        if output is not None and len(str(output)) > 512:
-            raise ValueError("control-event result summaries are limited to 512 characters")
+        _validate_control_result_projection(self.result)
         return self
 
 
@@ -312,6 +403,8 @@ class GateDecisionPayload(_StrictPayload):
     key_results: str = ""
     evidence_refs: tuple[str, ...] = ()
     validated_facts: dict[str, Any] = Field(default_factory=dict)
+    source_attempt_id: str | None = None
+    test_candidate_resolution: TestCandidateResolutionPayload | None = None
 
 
 class PhaseTransitionPayload(_StrictPayload):
@@ -342,6 +435,7 @@ _PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
     "planner_response": PlannerResponsePayload,
     "scheduler_decision": SchedulerDecisionPayload,
     "action_envelope": ActionEnvelopePayload,
+    "forced_action": ForcedActionPayload,
     "tool_result": ToolResultPayload,
     "validator_observation": ValidatorObservationPayload,
     "gate_decision": GateDecisionPayload,
@@ -366,7 +460,13 @@ class ControlEvent(BaseModel):
     @model_validator(mode="after")
     def _validate_payload(self) -> "ControlEvent":
         model = _PAYLOAD_MODELS[self.kind].model_validate(self.payload)
-        object.__setattr__(self, "payload", model.model_dump(mode="json"))
+        # Preserve legacy fixture shape while retaining every field explicitly
+        # recorded by new live runs.
+        object.__setattr__(
+            self,
+            "payload",
+            model.model_dump(mode="json", exclude_unset=True),
+        )
         return self
 
     @property
@@ -378,6 +478,47 @@ def action_envelope_sha256(*, plan_index: int, tool: str, exact_params: Mapping[
     return canonical_sha256(
         {"plan_index": int(plan_index), "tool": str(tool), "exact_params": dict(exact_params)}
     )
+
+
+def forced_action_sha256(
+    *,
+    policy: str,
+    trigger: str,
+    phase: str,
+    source_attempt_id: str,
+    reason_code: str,
+    tool: str,
+    exact_params: Mapping[str, Any],
+    candidate_root: str | None,
+    candidate_system: str | None,
+    parent_execution_id: str | None,
+    candidate_resolution: Mapping[str, Any],
+) -> str:
+    """Digest the complete harness-owned action contract."""
+    return canonical_sha256(
+        {
+            "policy": policy,
+            "trigger": trigger,
+            "phase": phase,
+            "source_attempt_id": source_attempt_id,
+            "reason_code": reason_code,
+            "tool": tool,
+            "exact_params": dict(exact_params),
+            "candidate_root": candidate_root,
+            "candidate_system": candidate_system,
+            "parent_execution_id": parent_execution_id,
+            "candidate_resolution": dict(candidate_resolution),
+        }
+    )
+
+
+def _validate_control_result_projection(result: Mapping[str, Any]) -> None:
+    forbidden = {"raw_output", "full_output", "prompt"}.intersection(result)
+    if forbidden:
+        raise ValueError("control events must reference full output, not embed it")
+    output = result.get("output")
+    if output is not None and len(str(output)) > 512:
+        raise ValueError("control-event result summaries are limited to 512 characters")
 
 
 class ControlEventSink:
@@ -485,5 +626,6 @@ __all__ = [
     "canonical_json",
     "canonical_sha256",
     "compact_control_value",
+    "forced_action_sha256",
     "sanitize_config",
 ]

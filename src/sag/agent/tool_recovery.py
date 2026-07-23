@@ -143,6 +143,8 @@ class ToolRecoveryHandler:
             translated["working_directory"] = params["working_directory"]
         if params.get("timeout"):
             translated["timeout"] = params["timeout"]
+        if params.get("maven_version_requirement"):
+            translated["maven_version_requirement"] = params["maven_version_requirement"]
         return translated
 
     @staticmethod
@@ -352,9 +354,10 @@ class ToolRecoveryHandler:
             "MAVEN VERSION REQUIREMENT: The current Maven runtime does not satisfy "
             f"{raw_requirement}. Current executable: {executable}; version: {version}. "
             "Do not retry the same Maven executable. Use bash to download or unpack a "
-            "compatible Maven distribution, then register its bin/mvn via "
-            "project(action='env', tool='maven', executable=...), "
-            f"and retry build(action='{command}')."
+            "compatible Maven distribution, then atomically register and activate its bin/mvn via "
+            "project(action='env', tool='maven', executable=..., "
+            f"requirement='{raw_requirement}'), and retry build(action='{command}', "
+            f"maven_version_requirement='{raw_requirement}')."
         )
 
         self.add_system_guidance(guidance, priority="high")

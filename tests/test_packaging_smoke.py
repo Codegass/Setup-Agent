@@ -1,6 +1,6 @@
+import shutil
 import subprocess
 import sys
-import venv
 from pathlib import Path
 
 
@@ -18,11 +18,19 @@ def test_wheel_installs_and_cli_loads(tmp_path):
     assert len(wheels) == 1
 
     venv_dir = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=True).create(venv_dir)
+    uv = shutil.which("uv")
+    assert uv is not None, "the repository test environment is managed by uv"
+    subprocess.run(
+        [uv, "venv", "--python", sys.executable, str(venv_dir)],
+        check=True,
+    )
     python = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     sag_bin = venv_dir / ("Scripts/sag.exe" if sys.platform == "win32" else "bin/sag")
 
-    subprocess.run([str(python), "-m", "pip", "install", str(wheels[0])], check=True)
+    subprocess.run(
+        [uv, "pip", "install", "--python", str(python), str(wheels[0])],
+        check=True,
+    )
     subprocess.run(
         [str(python), "-c", "import sag; import sag.main; assert hasattr(sag.main, 'cli')"],
         check=True,

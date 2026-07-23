@@ -47,7 +47,12 @@ class MavenBackend:
         self.maven_tool = maven_tool
 
     def execute(
-        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+        self,
+        verb: str,
+        args: Optional[str],
+        working_directory: str,
+        timeout: Optional[int],
+        maven_version_requirement: Optional[str] = None,
     ) -> ActualToolExecution:
         kwargs: Dict[str, Any] = {
             "command": self.VERBS[verb],
@@ -69,6 +74,8 @@ class MavenBackend:
             kwargs["extra_args"] = args
         if timeout:
             kwargs["timeout"] = timeout
+        if maven_version_requirement:
+            kwargs["maven_version_requirement"] = maven_version_requirement
         try:
             result = self.maven_tool.execute(**kwargs)
         except OutputPersistenceError as exc:
@@ -76,9 +83,20 @@ class MavenBackend:
         return ActualToolExecution("maven", kwargs, result)
 
     def run(
-        self, verb: str, args: Optional[str], working_directory: str, timeout: Optional[int]
+        self,
+        verb: str,
+        args: Optional[str],
+        working_directory: str,
+        timeout: Optional[int],
+        maven_version_requirement: Optional[str] = None,
     ) -> ToolResult:
-        return self.execute(verb, args, working_directory, timeout).result
+        return self.execute(
+            verb,
+            args,
+            working_directory,
+            timeout,
+            maven_version_requirement=maven_version_requirement,
+        ).result
 
 
 class PythonBackend:

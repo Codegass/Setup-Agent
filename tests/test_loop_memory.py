@@ -72,6 +72,38 @@ def test_same_repair_across_attempts_is_one_recurrence_key(loop_memory):
     assert decision.prior_attempt_ids == ("build-1",)
 
 
+def test_different_invalid_pytest_paths_share_one_recurrence(loop_memory):
+    first = event(
+        phase="test",
+        attempt_id="test-1",
+        tool="build",
+        args={
+            "action": "test",
+            "working_directory": "/workspace/tvm",
+            "args": "tests/python/unittest/test_a.py",
+        },
+        failure="pytest_args_rejected:invalid_selector",
+        error_code="PYTEST_ARGS_REJECTED",
+    )
+    second = event(
+        phase="test",
+        attempt_id="test-1",
+        tool="build",
+        args={
+            "action": "test",
+            "working_directory": "/workspace/tvm",
+            "args": "tests/python/unittest/test_b.py",
+        },
+        failure="pytest_args_rejected:invalid_selector",
+        error_code="PYTEST_ARGS_REJECTED",
+    )
+
+    assert loop_memory.observe(first).decision == "continue"
+    decision = loop_memory.observe(second)
+    assert decision.decision == "guide"
+    assert decision.recurrence_count == 2
+
+
 def test_same_action_after_relevant_progress_is_not_a_loop(loop_memory):
     action = event(
         tool="poll_command",

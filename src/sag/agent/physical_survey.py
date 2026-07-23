@@ -19,6 +19,8 @@ recommendations) stays at the tool layer until Category 3's A/B gate.
 from __future__ import annotations
 
 import re
+import posixpath
+import shlex
 import zlib
 from typing import Any, Dict, List, Optional
 
@@ -27,6 +29,7 @@ from loguru import logger
 # Enforcer version accepts range syntax ([1.8,), [11,17)); capture the lower
 # bound including a legacy "1.x" form (the old \d+ captured "1" from "1.8").
 ENFORCER_JAVA_PATTERN = r"<requireJavaVersion>.*?<version>\s*\[?\s*(\d+(?:\.\d+)?)"
+WORKSPACE_ROOT = "/workspace"
 
 
 def normalize_java_version(raw) -> Optional[str]:
@@ -48,8 +51,57 @@ def normalize_java_version(raw) -> Optional[str]:
 
 
 def path_exists(orch, path: str) -> bool:
-    result = orch.execute_command(f"test -e {path} && echo yes || echo no")
+    result = orch.execute_command(f"test -e {shlex.quote(path)} && echo yes || echo no")
     return "yes" in (result.get("output") or "")
+
+
+def _is_workspace_owned_path(
+    orch,
+    path: str,
+    *,
+    parent: Optional[str] = None,
+) -> bool:
+    """Prove a root/nested path stays inside the resolved workspace boundary."""
+    candidate = posixpath.normpath(str(path or "").strip())
+    if (
+        not candidate.startswith("/")
+        or candidate == WORKSPACE_ROOT
+        or not candidate.startswith(f"{WORKSPACE_ROOT}/")
+    ):
+        return False
+
+    paths = [WORKSPACE_ROOT]
+    if parent is not None:
+        parent_path = posixpath.normpath(str(parent or "").strip())
+        if (
+            parent_path == WORKSPACE_ROOT
+            or not parent_path.startswith(f"{WORKSPACE_ROOT}/")
+            or not candidate.startswith(f"{parent_path}/")
+        ):
+            return False
+        paths.append(parent_path)
+    paths.append(candidate)
+
+    probe = orch.execute_command("realpath -m -- " + " ".join(shlex.quote(item) for item in paths))
+    resolved = [line.strip() for line in (probe.get("output") or "").splitlines() if line.strip()]
+    if (
+        probe.get("success") is False
+        or probe.get("exit_code", 0) != 0
+        or len(resolved) != len(paths)
+    ):
+        return False
+
+    workspace_real = resolved[0].rstrip("/") or "/"
+    if workspace_real == "/":
+        return False
+    if parent is None:
+        return resolved[1].startswith(f"{workspace_real}/")
+
+    parent_real = resolved[1]
+    candidate_real = resolved[2]
+    return parent_real.startswith(f"{workspace_real}/") and candidate_real.startswith(
+        f"{parent_real.rstrip('/')}/"
+    )
 
 
 # Subdirectories a python-primary repo conventionally uses to hold the real
@@ -132,6 +184,8 @@ def detect_python_package_root(
     if root_is_shell:
         for candidate in PYTHON_SUBDIR_CANDIDATES:
             sub = f"{root}/{candidate}"
+            if not _is_workspace_owned_path(orch, sub, parent=root):
+                continue
             if path_exists(orch, f"{sub}/setup.py") or path_exists(orch, f"{sub}/pyproject.toml"):
                 python_root = sub
                 break
@@ -151,6 +205,8 @@ def python_subdir_package(orch, project_path: str) -> bool:
     root = project_path.rstrip("/")
     for candidate in PYTHON_SUBDIR_CANDIDATES:
         sub = f"{root}/{candidate}"
+        if not _is_workspace_owned_path(orch, sub, parent=root):
+            continue
         if path_exists(orch, f"{sub}/setup.py") or path_exists(orch, f"{sub}/pyproject.toml"):
             return True
     return False
@@ -379,6 +435,219 @@ def analyze_build_configuration(orch, project_path: str, project_type: str) -> D
     return config
 
 
+def _parse_pyproject(content: str) -> Dict[str, Any]:
+    if not content.strip():
+        return {}
+    try:
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - Python 3.10 runtime
+            import tomli as tomllib
+
+        parsed = tomllib.loads(content)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _normalize_distribution_name(value: Any) -> str:
+    return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
+
+
+def _requirement_distribution_name(value: Any) -> str:
+    match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", str(value or ""))
+    return _normalize_distribution_name(match.group(1)) if match else ""
+
+
+def _scikit_build_package_paths(
+    orch,
+    project_path: str,
+    parsed: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    tool = parsed.get("tool") if isinstance(parsed.get("tool"), dict) else {}
+    scikit = tool.get("scikit-build") if isinstance(tool.get("scikit-build"), dict) else {}
+    wheel = scikit.get("wheel") if isinstance(scikit.get("wheel"), dict) else {}
+    packages = wheel.get("packages") or ()
+    if isinstance(packages, str):
+        packages = (packages,)
+    result: List[Dict[str, str]] = []
+    for value in packages if isinstance(packages, (list, tuple)) else ():
+        raw = str(value or "").strip()
+        if not raw or raw.startswith("/"):
+            continue
+        relative = posixpath.normpath(raw)
+        if relative in (".", "..") or relative.startswith("../"):
+            continue
+        package_path = f"{project_path.rstrip('/')}/{relative}"
+        if not _is_workspace_owned_path(orch, package_path, parent=project_path):
+            continue
+        if not path_exists(orch, package_path):
+            continue
+        import_name = posixpath.basename(relative)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", import_name):
+            continue
+        result.append(
+            {
+                "import_name": import_name,
+                "path": relative,
+                "source": "pyproject.toml:tool.scikit-build.wheel.packages",
+            }
+        )
+    return result
+
+
+def _local_python_providers(
+    orch,
+    project_path: str,
+    *,
+    dependencies: List[str],
+) -> List[Dict[str, Any]]:
+    requirements = {
+        _requirement_distribution_name(requirement): str(requirement)
+        for requirement in dependencies
+        if _requirement_distribution_name(requirement)
+    }
+    if not requirements:
+        return []
+    root = project_path.rstrip("/")
+    command = (
+        f"find {root} -maxdepth 6 "
+        "\\( -name .git -o -name .venv -o -name build -o -name dist "
+        "-o -name target -o -name node_modules \\) -prune -o "
+        "-type f -name pyproject.toml -print 2>/dev/null"
+    )
+    found = orch.execute_command(command)
+    providers: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for line in (found.get("output") or "").splitlines():
+        metadata_path = posixpath.normpath(line.strip())
+        if (
+            not metadata_path
+            or metadata_path == f"{root}/pyproject.toml"
+            or not metadata_path.startswith(root + "/")
+        ):
+            continue
+        read = orch.execute_command(f"cat {shlex.quote(metadata_path)}", truncate_output=False)
+        if not read.get("success"):
+            continue
+        parsed = _parse_pyproject(read.get("output") or "")
+        project = parsed.get("project") if isinstance(parsed.get("project"), dict) else {}
+        distribution_name = str(project.get("name") or "").strip()
+        normalized_name = _normalize_distribution_name(distribution_name)
+        requirement = requirements.get(normalized_name)
+        if not requirement:
+            continue
+        provider_root = posixpath.dirname(metadata_path)
+        if not _is_workspace_owned_path(orch, provider_root, parent=root):
+            continue
+        relative_root = posixpath.relpath(provider_root, root)
+        key = (normalized_name, relative_root)
+        if key in seen:
+            continue
+        seen.add(key)
+        build_system = (
+            parsed.get("build-system") if isinstance(parsed.get("build-system"), dict) else {}
+        )
+        providers.append(
+            {
+                "distribution_name": distribution_name,
+                "root": relative_root,
+                "requirement": requirement,
+                "build_backend": build_system.get("build-backend"),
+            }
+        )
+    return providers
+
+
+def _smoke_candidates_from_pyproject(
+    orch,
+    project_path: str,
+    parsed: Dict[str, Any],
+    *,
+    metadata_root: Optional[str] = None,
+) -> List[Dict[str, str]]:
+    """Return smoke coordinates relative to the surveyed repository root.
+
+    ``pyproject.toml`` may live below that root (for example ``python/`` in a
+    native-core repository).  Cibuildwheel's ``{project}`` and relative paths
+    are interpreted from the metadata-bearing Python project, while persisted
+    coordinates always use the survey root.  That single coordinate system is
+    what the validator and Python tool consume.
+    """
+    root = project_path.rstrip("/")
+    config_root = (metadata_root or project_path).rstrip("/")
+    tool = parsed.get("tool") if isinstance(parsed.get("tool"), dict) else {}
+    cibw = tool.get("cibuildwheel") if isinstance(tool.get("cibuildwheel"), dict) else {}
+    commands = cibw.get("test-command") or ()
+    if isinstance(commands, str):
+        commands = (commands,)
+    candidates: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for command in commands if isinstance(commands, (list, tuple)) else ():
+        try:
+            tokens = shlex.split(str(command))
+        except ValueError:
+            continue
+        for token in tokens:
+            if token.startswith("-"):
+                continue
+            candidate = token.replace("{project}", config_root)
+            if candidate.startswith(root + "/"):
+                relative = posixpath.relpath(candidate, root)
+            elif candidate.startswith("/"):
+                continue
+            else:
+                candidate = posixpath.normpath(posixpath.join(config_root, candidate))
+                if candidate == root or not candidate.startswith(root + "/"):
+                    continue
+                relative = posixpath.relpath(candidate, root)
+            if (
+                not relative
+                or relative.startswith("../")
+                or "test" not in relative.lower()
+                or relative in seen
+            ):
+                continue
+            if not path_exists(orch, f"{root}/{relative}"):
+                continue
+            seen.add(relative)
+            candidates.append(
+                {
+                    "path": relative,
+                    "source": "pyproject.toml:tool.cibuildwheel.test-command",
+                }
+            )
+
+    if candidates:
+        return candidates
+
+    command = (
+        f"find {root} -maxdepth 8 "
+        "\\( -name .git -o -name .venv -o -name build -o -name dist "
+        "-o -name target -o -name node_modules \\) -prune -o "
+        "-type f \\( -name 'test_*.py' -o -name '*_test.py' \\) -print 2>/dev/null"
+    )
+    found = orch.execute_command(command)
+    paths = []
+    for line in (found.get("output") or "").splitlines():
+        absolute = posixpath.normpath(line.strip())
+        if not absolute.startswith(root + "/"):
+            continue
+        paths.append(posixpath.relpath(absolute, root))
+
+    def score(path: str) -> tuple[int, int, str]:
+        lowered = path.lower()
+        priority = (
+            0 if "smoke" in lowered or "minimal" in lowered else 1 if "runtime" in lowered else 2
+        )
+        return priority, len(path), path
+
+    return [
+        {"path": path, "source": "filesystem:test-file"}
+        for path in sorted(set(paths), key=score)[:5]
+    ]
+
+
 def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
     """Python survey depth, DESCRIPTIVELY: interpreter constraint -> concrete
     version (newest satisfying — a derived fact, not an action), native-core
@@ -404,9 +673,7 @@ def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
 
     def list_dir(directory: str) -> set:
         listing = orch.execute_command(f"ls -1 {directory} 2>/dev/null")
-        return {
-            line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()
-        }
+        return {line.strip() for line in (listing.get("output") or "").splitlines() if line.strip()}
 
     def read_from(directory: str, name: str, present: set) -> str:
         if name not in present:
@@ -440,6 +707,99 @@ def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
     setup_py = read("setup.py")
     setup_cfg = read("setup.cfg")
     tox_ini = read("tox.ini")
+    parsed_pyproject = _parse_pyproject(pyproject)
+    project_table = (
+        parsed_pyproject.get("project") if isinstance(parsed_pyproject.get("project"), dict) else {}
+    )
+    build_system_table = (
+        parsed_pyproject.get("build-system")
+        if isinstance(parsed_pyproject.get("build-system"), dict)
+        else {}
+    )
+    declared_dependencies = [
+        str(item) for item in project_table.get("dependencies") or () if isinstance(item, str)
+    ]
+    python_distribution_name = str(project_table.get("name") or "").strip() or None
+    python_build_backend = build_system_table.get("build-backend")
+    package_paths = _scikit_build_package_paths(orch, python_root, parsed_pyproject)
+    local_providers = _local_python_providers(
+        orch,
+        project_path,
+        dependencies=declared_dependencies,
+    )
+    smoke_candidates = _smoke_candidates_from_pyproject(
+        orch,
+        project_path,
+        parsed_pyproject,
+        metadata_root=python_root,
+    )
+    scikit = (
+        (parsed_pyproject.get("tool") or {}).get("scikit-build") or {}
+        if isinstance(parsed_pyproject.get("tool"), dict)
+        else {}
+    )
+    build_dir = (
+        str(scikit.get("build-dir") or "build").strip() if isinstance(scikit, dict) else "build"
+    )
+    native_build_mode = (
+        "pep517-integrated"
+        if has_native_build and str(python_build_backend or "").startswith("scikit_build_core.")
+        else "cmake" if has_native_build else None
+    )
+    native_artifact_roots: List[str] = []
+    if has_native_build:
+        survey_root = posixpath.normpath(project_path)
+        install_root = posixpath.normpath(python_root)
+        install_prefix = (
+            ""
+            if install_root == survey_root
+            else (
+                posixpath.relpath(install_root, survey_root)
+                if install_root.startswith(f"{survey_root}/")
+                else None
+            )
+        )
+
+        def relative_to_survey(relative: str) -> Optional[str]:
+            normalized = posixpath.normpath(relative)
+            if (
+                install_prefix is None
+                or not relative
+                or relative.startswith("/")
+                or normalized in (".", "..")
+                or normalized.startswith("../")
+            ):
+                return None
+            return (
+                posixpath.normpath(posixpath.join(install_prefix, normalized))
+                if install_prefix
+                else normalized
+            )
+
+        normalized_build_dir = posixpath.normpath(build_dir)
+        if (
+            build_dir
+            and not build_dir.startswith("/")
+            and normalized_build_dir not in (".", "..")
+            and not normalized_build_dir.startswith("../")
+        ):
+            # scikit-build's build-dir is itself the observed output boundary;
+            # assuming an extra lib/ segment misses projects (including TVM)
+            # that emit shared libraries directly below build/. A PEP 517
+            # backend resolves it from the Python install root; a standalone
+            # root CMake build resolves the conventional build/ from the
+            # surveyed repository root.
+            build_root = (
+                relative_to_survey(normalized_build_dir)
+                if native_build_mode == "pep517-integrated"
+                else normalized_build_dir
+            )
+            if build_root:
+                native_artifact_roots.append(build_root)
+        for item in package_paths:
+            artifact_root = relative_to_survey(f"{item['path'].rstrip('/')}/lib")
+            if artifact_root:
+                native_artifact_roots.append(artifact_root)
 
     # Constraint precedence mirrors packaging reality: pyproject is
     # authoritative when present, setup.py/setup.cfg are the legacy forms.
@@ -470,13 +830,26 @@ def read_python_metadata(orch, project_path: str) -> Optional[Dict[str, Any]]:
         or re.search(r"(?i)\bcython\b", pyproject + setup_py)
     )
 
+    discovered_packages = discover_packages(orch, python_root)
+    for package_path in package_paths:
+        if package_path["import_name"] not in discovered_packages:
+            discovered_packages.append(package_path["import_name"])
+
     return {
         # The CONSTRAINT is the observed fact; picking a concrete version
         # that satisfies it (from our supported list) is a policy decision
         # and composes at the tool layer (final Category-2 review).
         "python_constraint": constraint,
         "python_constraint_source": constraint_source,
-        "python_packages": discover_packages(orch, python_root),
+        "python_packages": discovered_packages,
+        "python_distribution_name": python_distribution_name,
+        "python_build_backend": python_build_backend,
+        "python_declared_dependencies": declared_dependencies,
+        "python_package_paths": package_paths,
+        "python_local_providers": local_providers,
+        "python_smoke_candidates": smoke_candidates,
+        "native_build_mode": native_build_mode,
+        "native_artifact_roots": list(dict.fromkeys(native_artifact_roots)),
         "has_c_extensions": has_c_extensions,
         # The directory the python package actually installs from (the repo
         # root for a plain project; a python/ subdir for a native-core repo)
@@ -1058,9 +1431,9 @@ def enumerate_build_islands(
         elif existing.get("system") is None and info["system"]:
             existing["system"] = info["system"]
             # System resolved late -> the publish fact becomes knowable now.
-            existing["applies_maven_publish"] = (
-                info["system"] == "gradle" and island_applies_maven_publish(orch, root)
-            )
+            existing["applies_maven_publish"] = info[
+                "system"
+            ] == "gradle" and island_applies_maven_publish(orch, root)
 
     return islands
 
@@ -1201,11 +1574,12 @@ def validate_and_discover_project_path(orch, initial_path: str) -> Optional[str]
 
     # Check each candidate path for project indicators
     for path in candidate_paths:
-        if is_valid_project_directory(orch, path):
-            logger.info(f"✅ Found valid project at: {path}")
-            return path
+        normalized = posixpath.normpath(str(path or "").strip())
+        if is_valid_project_directory(orch, normalized):
+            logger.info(f"✅ Found valid project at: {normalized}")
+            return normalized
         else:
-            logger.debug(f"❌ No project found at: {path}")
+            logger.debug(f"❌ No project found at: {normalized}")
 
     return None
 
@@ -1214,11 +1588,15 @@ def is_valid_project_directory(orch, path: str) -> bool:
     """Check if a directory contains valid project indicators."""
     if not orch:
         return False
+    normalized = posixpath.normpath(str(path or "").strip())
+    if not _is_workspace_owned_path(orch, normalized):
+        logger.debug(f"Rejected project path outside resolved workspace: {path}")
+        return False
 
     # Check if directory exists
-    result = orch.execute_command(f"test -d {path}")
+    result = orch.execute_command(f"test -d {shlex.quote(normalized)}")
     if result.get("exit_code") != 0:
-        logger.debug(f"Directory does not exist: {path}")
+        logger.debug(f"Directory does not exist: {normalized}")
         return False
 
     # Check for common project files
@@ -1238,22 +1616,27 @@ def is_valid_project_directory(orch, path: str) -> bool:
     ]
 
     for indicator in project_indicators:
-        result = orch.execute_command(f"test -f {path}/{indicator}")
+        indicator_path = posixpath.join(normalized, indicator)
+        result = orch.execute_command(f"test -f {shlex.quote(indicator_path)}")
         if result.get("exit_code") == 0:
-            logger.debug(f"Found project indicator {indicator} in {path}")
+            logger.debug(f"Found project indicator {indicator} in {normalized}")
             return True
 
     # Check for source code directories as secondary indicators
     source_dirs = ["src", "lib", "app", "source"]
     for src_dir in source_dirs:
-        result = orch.execute_command(f"test -d {path}/{src_dir}")
+        source_path = posixpath.join(normalized, src_dir)
+        result = orch.execute_command(f"test -d {shlex.quote(source_path)}")
         if result.get("exit_code") == 0:
             # Check if it contains actual source files
             result = orch.execute_command(
-                f"find {path}/{src_dir} -name '*.java' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.go' -o -name '*.rs' | head -1"
+                f"find {shlex.quote(source_path)} "
+                "\\( -name '*.java' -o -name '*.py' -o -name '*.js' "
+                "-o -name '*.ts' -o -name '*.go' -o -name '*.rs' \\) "
+                "| head -1"
             )
             if result.get("success") and result.get("output", "").strip():
-                logger.debug(f"Found source files in {path}/{src_dir}")
+                logger.debug(f"Found source files in {source_path}")
                 return True
 
     return False
@@ -1292,6 +1675,7 @@ SURVEY_FINGERPRINT_SOURCES = (
     "poetry.lock",
     "Pipfile",
     "Pipfile.lock",
+    ".gitmodules",
     "CMakeLists.txt",
     "Cargo.toml",
     "go.mod",
@@ -1317,7 +1701,8 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
     """Digest of everything the survey READS under (and beside)
     ``project_path``, or None.
 
-    One container command, four file sections plus a dir section, all
+    One container command, four checksummed file sections plus two path
+    layout sections, all
     order-fixed by sort (Category-2 reviews — the domain must cover every
     input a surveyed fact derives from):
 
@@ -1332,6 +1717,8 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
     * the module-layout dir LISTING as text (source/test scans key off dir
       existence: a new src/main/java changes island facts with no file
       content change);
+    * the Python test-path LISTING as text (grounded smoke candidates derive
+      from path existence and stable ordering, not test contents);
     * the python package LAYOUT — via the SAME scan machinery
       ``discover_packages`` uses (``python_env.package_layout_listing``:
       identical bases including an arbitrary-depth declared package_dir,
@@ -1366,6 +1753,8 @@ def config_fingerprint(orch, project_path: str) -> Optional[str]:
         f"find . \\( {prunes} \\) -prune -o -type f \\( {test_dirs} \\) -print ; }} "
         f"| sort -u | xargs -r cksum ; "
         f"find . \\( {prunes} \\) -prune -o -type d \\( {module_dirs} \\) -print | sort ; "
+        f"find . \\( {prunes} \\) -prune -o -type f "
+        f"\\( -name 'test_*.py' -o -name '*_test.py' \\) -print | sort ; "
         f"}} 2>/dev/null | cksum"
     )
     try:
@@ -1408,9 +1797,7 @@ def _surveyed_python_root(orch, project_path: str) -> str:
     if "pyproject.toml" in root_files:
         result = orch.execute_command(f"cat {project_path}/pyproject.toml", truncate_output=False)
         root_pyproject = result.get("output", "") if result.get("success") else ""
-    return detect_python_package_root(orch, project_path, root_files, root_pyproject)[
-        "python_root"
-    ]
+    return detect_python_package_root(orch, project_path, root_files, root_pyproject)["python_root"]
 
 
 def redetect_build_files(orch, project_path: str) -> List[str]:

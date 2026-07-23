@@ -63,15 +63,16 @@ initial_system:
       • note: record a lasting working note for the current phase
       • Example: phase(action="done", outcome="success", key_results="Compiled 115 classes with JDK 17; Maven 3.9.9 registered", evidence=["output_42"])
       • When an approach fails, record it with phase(action="note", ...) and try a DIFFERENT approach - never repeat a failed attempt unchanged.
-    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle)
+    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle/python)
       • ✅ USE THIS for: resolving deps, compiling, running tests, packaging
-      • ✅ Multi-module support: build(action='test') tests ALL modules (fail-at-end is automatic)
+      • ✅ Maven/Gradle multi-module support: bare build(action='test') tests all detected modules (fail-at-end is automatic)
+      • ✅ Native-unready Python safety: bare build(action='test') selects only a survey-verified bounded smoke target, or refuses before collection
       • ❌ DO NOT use bash(command='mvn ...') - use build(action=...) instead!
       • Long builds run detached and hand back a job log ref - inspect it with search(target='job:<id>')
     - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
       • clone: Clone the repository (repo_url, optional ref)
       • provision: Install system packages and JDKs (java_version for a JDK, packages for apt)
-      • env: Register installed/proven executables on the runtime overlay so build, bash, validation, and report flows share the same runtime path
+      • env: Validate, register, and activate installed/proven executables atomically so build, bash, validation, and report flows share the same runtime path
         - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime instead
         - Do not use project(action='env') to rewrite project build configuration; follow project build files as source of truth
       • analyze: 🆕 AUTOMATIC PROJECT ANALYSIS - MUST be called immediately after every successful clone
@@ -97,15 +98,16 @@ initial_system:
       • CRITICAL: complete_with_results is an ACTION, not a separate tool!
       • Example: manage_context(action="complete_with_results", summary="Task completed successfully", key_results="Built project, all tests pass")
       • When a build/test step fails or you discover a more specific next step, pass next_tasks=["<concrete, specific action>"] to complete_with_results to plan your own follow-up. Make each task DIFFERENT from anything in ATTEMPT HISTORY — never restate a task you already tried.
-    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle)
+    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle/python)
       • ✅ USE THIS for: resolving deps, compiling, running tests, packaging
-      • ✅ Multi-module support: build(action='test') tests ALL modules (fail-at-end is automatic)
+      • ✅ Maven/Gradle multi-module support: bare build(action='test') tests all detected modules (fail-at-end is automatic)
+      • ✅ Native-unready Python safety: bare build(action='test') selects only a survey-verified bounded smoke target, or refuses before collection
       • ❌ DO NOT use bash(command='mvn ...') - use build(action=...) instead!
       • Long builds run detached and hand back a job log ref - inspect it with search(target='job:<id>')
     - project: Project lifecycle - action= clone | provision | analyze | env (NOT git_clone or system)
       • clone: Clone the repository (repo_url, optional ref)
       • provision: Install system packages and JDKs (java_version for a JDK, packages for apt)
-      • env: Register installed/proven executables on the runtime overlay so build, bash, validation, and report flows share the same runtime path
+      • env: Validate, register, and activate installed/proven executables atomically so build, bash, validation, and report flows share the same runtime path
         - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime instead
         - Do not use project(action='env') to rewrite project build configuration; follow project build files as source of truth
       • analyze: Analyze project structure and build configuration when the TASK needs it
@@ -173,12 +175,6 @@ initial_system:
     - If no reports exist, the tests didn't run - investigate why
     - Document the number of tests run vs skipped in key_results
 
-    ### 6. Runtime Recovery Guardrails
-    When Maven or Gradle cannot run because a runtime is missing or incompatible:
-    - Use bash to install missing runtimes or unpack a compatible runtime distribution.
-    - After installation, use project(action='env', tool=..., executable=...) so build, bash, validation, and report flows share the same runtime path.
-    - If a concrete executable is proven incompatible, record that exact executable/version finding and register a compatible runtime via project(action='env') before retrying.
-    - Do not use project(action='env') to rewrite project build configuration; it only records runtime paths and related environment.
   maven_multimodule_testing: |
     ## Handling Multi-Module Maven Test Execution
 
@@ -330,8 +326,9 @@ next_prompt:
     - bash: Execute shell commands
     - file_io: Read and write files
     - build: Execute builds and tests (action= deps | compile | test | package)
-      • auto-selects maven or gradle from project files
-      • use project(action='env') to register runtime overlay entries after installs
+      • auto-selects maven, gradle, or python from project files
+      • native-unready Python bare tests use a survey-verified bounded smoke or refuse safely
+      • use project(action='env') to validate, register, and activate runtime overlay entries after installs
     - search: Search stored refs, container files, job logs, or the web (target='web:<query>')
     - report: Generate the final setup report
   run_task_stuck_function_calling_guidance: |
@@ -447,11 +444,12 @@ mode_prompts:
     AVAILABLE TOOLS AND THEIR PURPOSE:
     - project: Clone repositories, provision toolchains, analyze projects (action= clone|provision|analyze|env)
     - bash: Execute shell commands for system operations (NOT for mvn/gradle commands!)
-    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle)
-      • ✅ USE for multi-module projects: build(action='test') runs ALL modules (fail-at-end automatic)
+    - build: 🔥 PREFERRED for builds - action= deps|compile|test|package (auto-selects maven/gradle/python)
+      • ✅ Maven/Gradle multi-module projects: bare build(action='test') runs all detected modules (fail-at-end automatic)
+      • ✅ Native-unready Python projects: bare build(action='test') selects a survey-verified bounded smoke or refuses safely
       • ❌ DO NOT use bash for mvn/gradle commands!
     - search: Search stored refs, container files, job logs, or the web (target='web:<query>')
-    - project(action='env'): Register and activate installed runtime paths; never rewrite project build configuration
+    - project(action='env'): Validate, register, and activate installed runtime paths atomically; success confirms the requested executable is active; never rewrite project build configuration
     - file_io: Read and write files
     - phase: Submit an explicit done/blocked outcome claim or a direct-dependency repair proposal for the CURRENT phase; the evidence gate and transition policy decide
 

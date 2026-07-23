@@ -417,7 +417,10 @@ def test_failed_build_validation_uses_stable_conflict_and_project_fallback(monke
     # compiled-evidence gate (no phantom green); the conflict + project-fallback
     # evidence_refs remain stable.
     assert "No compiled .class files" in result["reason"]
-    assert result["conflicts"] == ["build_validation_failed"]
+    assert result["conflicts"] == [
+        "build_validation_failed",
+        "maven_reactor_unverified",
+    ]
     assert result["evidence_refs"] == ["/workspace/demo"]
 
 

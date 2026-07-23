@@ -33,6 +33,7 @@ from .control_events import (
     action_envelope_sha256,
     canonical_sha256,
     compact_control_value,
+    forced_action_sha256,
 )
 from .current_plan import CurrentPlan, PlanFault, PlanFaultCode
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
@@ -69,6 +70,16 @@ from .reasoning_scheduler import (
     ReasoningTrigger,
     SchedulerMode,
     SchedulerTurn,
+)
+from .attempt_policy import (
+    TestAttemptRequirement,
+    TestCandidateResolution,
+    forced_test_refusal_receipts,
+    has_test_candidate_refresh_receipt,
+    required_test_attempt,
+    resolve_survey_test_candidates,
+    test_execution_binding,
+    test_execution_matches_candidate,
 )
 from .token_tracker import TokenTracker
 from .tool_orchestration import (
@@ -203,6 +214,7 @@ def kickoff_phase_objectives() -> dict:
     select between."""
     return KICKOFF_PHASE_OBJECTIVES
 
+
 # dim (e) deleted: the PRE-HOC python/native-first guidance block
 # (PYTHON_BUILD_PHASE_GUIDANCE, PYTHON_TEST_PHASE_GUIDANCE, and the
 # NATIVE_FIRST_BUILD_GUIDANCE prepend) is gone — pre-hoc advice is a
@@ -216,11 +228,12 @@ def kickoff_phase_objectives() -> dict:
 NATIVE_NOT_BUILT_TEST_GUIDANCE = (
     "The NATIVE core was not built in the build phase. Do NOT sweep the full "
     "suite — without the native library it only repeats hundreds of identical "
-    "collection errors. Run a small targeted smoke first: pick ONE small test "
-    "file and call build(action='test', args='<that file> --maxfail=1') — a "
-    "bare build(action='test') collects the WHOLE suite and is exactly the "
-    "sweep to avoid. Report the smoke result honestly and only expand if it "
-    "passes."
+    "collection errors. Call bare build(action='test') with NO args first. "
+    "The build tool will use a survey-verified bounded smoke target, or refuse "
+    "safely when no verified target exists. Never invent, guess, or substitute "
+    "a test path. Report the bounded smoke result honestly. While the native "
+    "core remains unready, do not broaden the test scope merely because that "
+    "smoke passed."
 )
 
 # Build-system labels the analyzer emits for Python projects: structure
@@ -322,6 +335,7 @@ class ReActEngine(UIEventEmitter):
         transition_policy: Optional[PhaseTransitionPolicy] = None,
         control_event_sink: Optional[ControlEventSink] = None,
         target_repo_sha_callback=None,
+        orchestrator=None,
     ):
         super().__init__()  # Initialize UIEventEmitter
         self.context_manager = context_manager
@@ -334,6 +348,7 @@ class ReActEngine(UIEventEmitter):
         self._scheduler_active = False
         self._scheduled_turn: SchedulerTurn | None = None
         self.control_event_sink = control_event_sink
+        self.orchestrator = orchestrator or getattr(context_manager, "orchestrator", None)
         self._target_repo_sha_callback = target_repo_sha_callback
         self._active_control_envelope_id: str | None = None
 
@@ -1014,6 +1029,335 @@ class ReActEngine(UIEventEmitter):
         remaining = max_iter - getattr(self, "current_iteration", 0)
         return max_iter, reserved, remaining
 
+    def _missing_required_test_attempt(self) -> TestAttemptRequirement | None:
+        machine = getattr(self, "phase_machine", None)
+        if machine is None or machine.is_complete:
+            return None
+        resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+        self._last_test_candidate_resolution = resolution
+        return required_test_attempt(
+            getattr(self, "run_evidence_state", None),
+            getattr(self, "orchestrator", None),
+            phase=machine.current_phase,
+            attempt_id=machine.current_attempt_id,
+            resolution=resolution,
+        )
+
+    def _unresolved_test_coordinates_after_refresh(
+        self,
+    ) -> TestCandidateResolution | None:
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if (
+            machine is None
+            or state is None
+            or machine.current_phase != "test"
+            or not has_test_candidate_refresh_receipt(
+                state,
+                attempt_id=machine.current_attempt_id,
+            )
+        ):
+            return None
+        resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+        return resolution if resolution.status != "available" else None
+
+    def _forced_test_refusals(self):
+        machine = getattr(self, "phase_machine", None)
+        state = getattr(self, "run_evidence_state", None)
+        if machine is None or state is None or machine.current_phase != "test":
+            return ()
+        resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+        if resolution.status != "available":
+            return ()
+        return forced_test_refusal_receipts(
+            state,
+            attempt_id=machine.current_attempt_id,
+            candidates=resolution.candidates,
+        )
+
+    def _cap_unresolved_test_gate(
+        self,
+        claim: PhaseClaim,
+        gate: GateResult,
+    ) -> GateResult:
+        """An unresolved coordinate may close honestly, but can never be green."""
+        resolution = self._unresolved_test_coordinates_after_refresh()
+        refusals = self._forced_test_refusals()
+        if resolution is None and not refusals:
+            return gate
+        capped_state = (
+            ValidatorState.RED
+            if refusals and gate.validator_state is ValidatorState.RED
+            else ValidatorState.UNAVAILABLE
+        )
+        reason = (
+            "test coordinates remained unavailable after the one bounded "
+            f"survey refresh ({resolution.status})"
+            if resolution is not None
+            else "the harness-owned test action produced no candidate-bound runner receipt"
+        )
+        return validate_phase_claim(
+            claim,
+            capped_state,
+            reason=reason,
+            evidence_refs=gate.evidence_refs,
+            suggestions=("close as unknown/partial/failed with the survey refresh evidence",),
+            code=(
+                "test_candidate_resolution_unavailable"
+                if resolution is not None
+                else "forced_test_attempt_nonreceipt"
+            ),
+            validated_facts=gate.validated_facts,
+        )
+
+    @staticmethod
+    def _mark_forced_test_refusal(
+        result: ToolResult,
+        requirement: TestAttemptRequirement,
+        *,
+        attempt_id: str,
+        tool_name: str,
+        params: Mapping[str, Any],
+        disposition: str,
+        add_conflict: bool,
+    ) -> ToolResult:
+        metadata = dict(result.metadata or {})
+        if not result.is_terminal:
+            return result
+        reason_code = str(
+            result.error_code
+            or (
+                "FORCED_TEST_CANDIDATE_MISMATCH"
+                if disposition == "candidate_mismatch"
+                else "FORCED_TEST_NO_RUNNER_DISPATCH"
+            )
+        )
+        actual_root, actual_system = test_execution_binding(
+            tool_name,
+            params,
+            result,
+        )
+        metadata["harness_forced_test_attempt"] = {
+            "phase": "test",
+            "source_attempt_id": attempt_id,
+            "root": requirement.root,
+            "system": requirement.system,
+            "actual_root": actual_root,
+            "actual_system": actual_system,
+            "disposition": disposition,
+            "reason_code": reason_code,
+        }
+        conflicts = list(result.conflicts)
+        if add_conflict:
+            conflicts.append(
+                "forced_test_attempt_nonreceipt:"
+                f"{attempt_id}:{requirement.root}:{requirement.system}:"
+                f"{disposition}:{reason_code}"
+            )
+        return result.model_copy(
+            update={
+                "metadata": metadata,
+                "conflicts": list(dict.fromkeys(conflicts)),
+            }
+        )
+
+    def _mark_forced_test_refusals(
+        self,
+        execution: ToolExecution,
+        requirement: TestAttemptRequirement,
+    ) -> None:
+        """Stamp deterministic pre-run refusals without promoting them to tests."""
+        attempt_id = str(self.phase_machine.current_attempt_id)
+        if execution.actual_executions:
+            if any(
+                test_execution_matches_candidate(
+                    actual.tool_name,
+                    actual.params,
+                    actual.result,
+                    requirement,
+                )
+                and (actual.result.metadata or {}).get("runner_dispatched") is True
+                and str((actual.result.metadata or {}).get("command") or "").strip()
+                and (
+                    actual.result.is_terminal
+                    or (actual.result.poll_ref and not actual.result.is_terminal)
+                )
+                for actual in execution.actual_executions
+            ):
+                return
+            marked_conflict = False
+            updated: list[ActualToolExecution] = []
+            for actual in execution.actual_executions:
+                original = actual.result
+                runner_dispatched = (original.metadata or {}).get("runner_dispatched") is True
+                command_present = bool(str((original.metadata or {}).get("command") or "").strip())
+                marked = self._mark_forced_test_refusal(
+                    original,
+                    requirement,
+                    attempt_id=attempt_id,
+                    tool_name=actual.tool_name,
+                    params=actual.params,
+                    disposition=(
+                        "candidate_mismatch"
+                        if runner_dispatched and command_present
+                        else "no_runner_dispatch"
+                    ),
+                    add_conflict=not marked_conflict,
+                )
+                if marked is not original:
+                    marked_conflict = True
+                updated.append(
+                    ActualToolExecution(
+                        tool_name=actual.tool_name,
+                        params=actual.params,
+                        result=marked,
+                        execution_id=actual.execution_id,
+                    )
+                )
+                if original is execution.result:
+                    execution.result = marked
+            execution.actual_executions = updated
+            return
+        execution.result = self._mark_forced_test_refusal(
+            execution.result,
+            requirement,
+            attempt_id=attempt_id,
+            tool_name=execution.call.name,
+            params=execution.validated_params or execution.call.raw_params,
+            disposition=(
+                "candidate_mismatch"
+                if (
+                    (execution.result.metadata or {}).get("runner_dispatched") is True
+                    and str((execution.result.metadata or {}).get("command") or "").strip()
+                )
+                else "no_runner_dispatch"
+            ),
+            add_conflict=True,
+        )
+
+    def _force_required_test_attempt(
+        self,
+        requirement: TestAttemptRequirement,
+        *,
+        trigger: str,
+    ) -> bool:
+        """Execute a must-attempt action in the harness, never through a model plan."""
+        if getattr(self, "_forcing_required_test_attempt", False):
+            return False
+        machine = getattr(self, "phase_machine", None)
+        if machine is None or machine.current_phase != "test":
+            return False
+        resolution = getattr(self, "_last_test_candidate_resolution", None)
+        if not isinstance(resolution, TestCandidateResolution):
+            resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+
+        action = requirement.required_action
+        tool, exact_params = self._canonicalize_scheduler_action(
+            str(action["tool"]),
+            dict(action["params"]),
+        )
+        sink = getattr(self, "control_event_sink", None)
+        envelope_id = f"forced-{sink.sequence + 1:06d}" if sink is not None else None
+        resolution_snapshot = resolution.to_snapshot()
+        forced_payload = {
+            "envelope_id": envelope_id or "forced-unrecorded",
+            "policy": "test_attempt_required",
+            "trigger": trigger,
+            "phase": "test",
+            "source_attempt_id": str(machine.current_attempt_id),
+            "reason_code": requirement.reason_code,
+            "tool": tool,
+            "exact_params": compact_control_value(exact_params),
+            "candidate_root": requirement.root,
+            "candidate_system": requirement.system,
+            "parent_execution_id": requirement.parent_execution_id,
+            "candidate_resolution": resolution_snapshot,
+        }
+        forced_payload["action_sha256"] = forced_action_sha256(
+            policy="test_attempt_required",
+            trigger=trigger,
+            phase="test",
+            source_attempt_id=str(machine.current_attempt_id),
+            reason_code=requirement.reason_code,
+            tool=tool,
+            exact_params=forced_payload["exact_params"],
+            candidate_root=requirement.root,
+            candidate_system=requirement.system,
+            parent_execution_id=requirement.parent_execution_id,
+            candidate_resolution=resolution_snapshot,
+        )
+
+        self._forcing_required_test_attempt = True
+        self._suppress_control_action_envelope = True
+        try:
+            if envelope_id is not None:
+                self._emit_control_event("forced_action", forced_payload)
+            call = ToolCall(
+                name=tool,
+                raw_params=dict(exact_params),
+                raw_action_text=f"HARNESS FORCED: {requirement.action_text()}",
+                source_step_index=getattr(self, "current_iteration", 0),
+                model_used="harness",
+            )
+            execution = self._execute_tool_call(call)
+            if tool == "build":
+                self._mark_forced_test_refusals(execution, requirement)
+            if tool == "project":
+                refreshed = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
+                self._last_test_candidate_resolution = refreshed
+                if refreshed.status != "available":
+                    conflict = (
+                        "test_candidate_resolution_unresolved:"
+                        f"{machine.current_attempt_id}:{refreshed.status}"
+                    )
+                    execution.result = execution.result.model_copy(
+                        update={
+                            "metadata": {
+                                **dict(execution.result.metadata or {}),
+                                "test_candidate_refresh_status": refreshed.status,
+                            },
+                            "conflicts": list(
+                                dict.fromkeys([*execution.result.conflicts, conflict])
+                            ),
+                        }
+                    )
+                    execution.observation_text = format_tool_result(
+                        call.name,
+                        execution.result,
+                    )
+            result, execution_id, actual_executions = self._record_execution_bundle(
+                execution,
+                call,
+            )
+            action_step = ReActStep(
+                step_type=StepType.ACTION,
+                content=f"HARNESS FORCED: {requirement.action_text()}",
+                tool_name=tool,
+                tool_params=dict(exact_params),
+                tool_result=result,
+                timestamp=self._get_timestamp(),
+                model_used="harness",
+            )
+            self.steps.append(action_step)
+            self._emit_control_tool_result(
+                envelope_id=envelope_id,
+                execution_id=execution_id,
+                tool=tool,
+                params=dict(execution.validated_params or call.validated_params or exact_params),
+                result=result,
+                actual_executions=actual_executions,
+            )
+            # Invalidate the model-owned plan before LoopMemory contributes any
+            # additional reason. Replay observes the same deterministic order
+            # from the forced tool_result followed by loop_decision events.
+            self._request_scheduler_reasoning(ReasoningTrigger.PLAN_EXHAUSTED)
+            self._apply_tool_execution_loop_effects(execution)
+            self._add_observation_step(execution.observation_text)
+            return True
+        finally:
+            self._suppress_control_action_envelope = False
+            self._forcing_required_test_attempt = False
+
     def _phase_intro_step(self) -> ReActStep:
         """The clean-window digest that opens every phase (GTD reset): goal
         picture so far, the new phase's objective (tools, never raw commands),
@@ -1262,6 +1606,19 @@ class ReActEngine(UIEventEmitter):
         ):
             self.agent_logger.warning("Rejected repair proposal for a stale phase attempt")
             return None
+        required_attempt = self._missing_required_test_attempt()
+        if required_attempt is not None:
+            self._force_required_test_attempt(
+                required_attempt,
+                trigger="repair_refusal",
+            )
+            self._add_system_guidance(
+                "TEST_ATTEMPT_REQUIRED: a test repair must be grounded in a "
+                "terminal runner receipt. The harness executed the required "
+                f"action: {required_attempt.action_text()}",
+                priority=9,
+            )
+            return None
 
         claim = PhaseClaim(
             phase=request.from_phase,
@@ -1277,6 +1634,7 @@ class ReActEngine(UIEventEmitter):
             getattr(getattr(self, "physical_validator", None), "docker_orchestrator", None),
             self._project_name_for_gate(),
         )
+        gate = self._cap_unresolved_test_gate(claim, gate)
         self._emit_control_gate(claim, gate)
         if not gate.accepted:
             self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
@@ -1330,11 +1688,26 @@ class ReActEngine(UIEventEmitter):
             if claim.phase != machine.current_phase or claim.signal != signal:
                 self.agent_logger.warning("Ignoring a stale or mismatched phase claim")
                 return None
-            self._emit_control_gate(claim, gate)
+            gate = self._cap_unresolved_test_gate(claim, gate)
             if not gate.accepted:
+                self._emit_control_gate(claim, gate)
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
                 self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
                 return None
+            required_attempt = self._missing_required_test_attempt()
+            if required_attempt is not None:
+                self._force_required_test_attempt(
+                    required_attempt,
+                    trigger="terminal_metadata",
+                )
+                self._add_system_guidance(
+                    "TEST_ATTEMPT_REQUIRED: terminal phase metadata cannot bypass "
+                    "the missing runner receipt. The harness executed the required "
+                    f"action: {required_attempt.action_text()}",
+                    priority=9,
+                )
+                return None
+            self._emit_control_gate(claim, gate)
             self._record_gate_facts(claim.phase, gate)
             record = machine.close_attempt(gate)
             state = getattr(self, "run_evidence_state", None)
@@ -1500,12 +1873,50 @@ class ReActEngine(UIEventEmitter):
             return False
         phase = machine.current_phase
         _, reserved, remaining = self._phase_budget_numbers(phase)
+
+        required_attempt = self._missing_required_test_attempt()
+        # Install the deterministic dispatch/poll while two turns remain
+        # outside downstream floors: one to dispatch and one to poll.  Waiting
+        # until remaining == reserved would consume the report guarantee.
+        if required_attempt is not None and remaining <= reserved + 2:
+            self._force_required_test_attempt(
+                required_attempt,
+                trigger="phase_floor",
+            )
+            guidance_key = (
+                str(machine.current_attempt_id),
+                required_attempt.action_text(),
+            )
+            if getattr(self, "_test_attempt_floor_guidance_key", None) != guidance_key:
+                self._test_attempt_floor_guidance_key = guidance_key
+                self.steps.append(
+                    ReActStep(
+                        step_type=StepType.SYSTEM_GUIDANCE,
+                        content=(
+                            "TEST_ATTEMPT_REQUIRED: the test phase floor cannot close "
+                            "without a terminal runner receipt. The harness executed "
+                            f"the required action: {required_attempt.action_text()}"
+                        ),
+                        timestamp=self._get_timestamp(),
+                    )
+                )
+            return False
         if remaining > reserved:
             return False
 
         probe = self._phase_gate_check(phase)
-        validator_state = ValidatorState(
-            probe.get("validator_state", ValidatorState.UNAVAILABLE.value)
+        unresolved = self._unresolved_test_coordinates_after_refresh()
+        refusals = self._forced_test_refusals()
+        validator_state = (
+            (
+                ValidatorState.RED
+                if refusals
+                and ValidatorState(probe.get("validator_state", ValidatorState.UNAVAILABLE.value))
+                is ValidatorState.RED
+                else ValidatorState.UNAVAILABLE
+            )
+            if unresolved is not None or refusals
+            else ValidatorState(probe.get("validator_state", ValidatorState.UNAVAILABLE.value))
         )
         claimed_outcome = {
             ValidatorState.GREEN: PhaseOutcome.SUCCESS,
@@ -1525,10 +1936,27 @@ class ReActEngine(UIEventEmitter):
         gate = validate_phase_claim(
             claim,
             validator_state,
-            reason=str(probe.get("reason") or "phase budget exhausted"),
+            reason=(
+                "test coordinates remained unavailable after the one bounded "
+                f"survey refresh ({unresolved.status})"
+                if unresolved is not None
+                else (
+                    "the harness-owned test action produced no candidate-bound runner receipt"
+                    if refusals
+                    else str(probe.get("reason") or "phase budget exhausted")
+                )
+            ),
             evidence_refs=tuple(probe.get("evidence_refs") or ()),
             suggestions=tuple(probe.get("suggestions") or ()),
-            code=str(probe.get("code") or "phase_floor_exhausted"),
+            code=(
+                "test_candidate_resolution_unavailable"
+                if unresolved is not None
+                else (
+                    "forced_test_attempt_nonreceipt"
+                    if refusals
+                    else str(probe.get("code") or "phase_floor_exhausted")
+                )
+            ),
             validated_facts=dict(probe.get("validated_facts") or {}),
         )
         self._emit_control_gate(claim, gate)
@@ -2045,6 +2473,8 @@ class ReActEngine(UIEventEmitter):
         tool: str,
         params: Dict[str, Any],
     ) -> str | None:
+        if getattr(self, "_suppress_control_action_envelope", False):
+            return None
         sink = getattr(self, "control_event_sink", None)
         if sink is None or self._active_reasoning_scheduler() is None:
             return None
@@ -2125,6 +2555,7 @@ class ReActEngine(UIEventEmitter):
         tool: str,
         params: Dict[str, Any],
         result: ToolResult,
+        actual_executions: List[ActualToolExecution] | None = None,
     ) -> None:
         if not envelope_id:
             return
@@ -2143,6 +2574,27 @@ class ReActEngine(UIEventEmitter):
                 "result": self._control_result_projection(result),
                 "source_phase": getattr(machine, "current_phase", "") or "",
                 "source_attempt_id": getattr(machine, "current_attempt_id", "") or "",
+                "actual_executions": [
+                    {
+                        "execution_id": actual.execution_id,
+                        "tool": actual.tool_name,
+                        "params": compact_control_value(actual.params),
+                        "scope": self._tool_evidence_scope(
+                            actual.tool_name,
+                            actual.params,
+                        ).value,
+                        "roles": [
+                            role.value
+                            for role in self._tool_evidence_roles(
+                                actual.tool_name,
+                                actual.params,
+                                actual.result,
+                            )
+                        ],
+                        "result": self._control_result_projection(actual.result),
+                    }
+                    for actual in (actual_executions or ())
+                ],
                 "output_sha256": hashlib.sha256(
                     str(output_source or "").encode("utf-8", errors="replace")
                 ).hexdigest(),
@@ -2159,6 +2611,24 @@ class ReActEngine(UIEventEmitter):
 
     def _emit_control_gate(self, claim: PhaseClaim, gate: GateResult) -> None:
         validated_facts = compact_control_value(dict(gate.validated_facts))
+        machine = getattr(self, "phase_machine", None)
+        gate_payload: Dict[str, Any] = {
+            "phase": claim.phase,
+            "signal": claim.signal,
+            "claimed_outcome": claim.claimed_outcome.value,
+            "validator_state": gate.validator_state.value,
+            "expected_accepted": gate.accepted,
+            "expected_outcome": gate.validated_outcome.value,
+            "reason": gate.reason,
+            "key_results": claim.key_results,
+            "evidence_refs": list(gate.evidence_refs),
+            "validated_facts": validated_facts,
+            "source_attempt_id": getattr(machine, "current_attempt_id", None),
+        }
+        if claim.phase == "test":
+            gate_payload["test_candidate_resolution"] = resolve_survey_test_candidates(
+                getattr(self, "orchestrator", None)
+            ).to_snapshot()
         self._emit_control_event(
             "validator_observation",
             {
@@ -2169,21 +2639,7 @@ class ReActEngine(UIEventEmitter):
                 "validated_facts": validated_facts,
             },
         )
-        self._emit_control_event(
-            "gate_decision",
-            {
-                "phase": claim.phase,
-                "signal": claim.signal,
-                "claimed_outcome": claim.claimed_outcome.value,
-                "validator_state": gate.validator_state.value,
-                "expected_accepted": gate.accepted,
-                "expected_outcome": gate.validated_outcome.value,
-                "reason": gate.reason,
-                "key_results": claim.key_results,
-                "evidence_refs": list(gate.evidence_refs),
-                "validated_facts": validated_facts,
-            },
-        )
+        self._emit_control_event("gate_decision", gate_payload)
 
     def _emit_control_phase_transition(
         self,
@@ -2519,6 +2975,7 @@ class ReActEngine(UIEventEmitter):
                     ),
                 )
                 if exc.draft is not None:
+                    machine = getattr(self, "phase_machine", None)
                     state.ingest_unpersisted_result(
                         scope,
                         tool_name,
@@ -2527,9 +2984,63 @@ class ReActEngine(UIEventEmitter):
                         roles=self._tool_evidence_roles(tool_name, params, exc.draft),
                         execution_id=exc.execution_id or exc.draft.execution_id,
                         params=params,
+                        source_phase=getattr(machine, "current_phase", None),
+                        source_attempt_id=getattr(machine, "current_attempt_id", None),
                     )
                 state.record_conflict("output_storage_failed")
             raise
+
+    def _record_execution_bundle(
+        self,
+        execution: ToolExecution,
+        call: ToolCall,
+    ) -> tuple[ToolResult, str, list[ActualToolExecution]]:
+        """Record backend leaves once and return their control-event projection."""
+        if execution.actual_executions:
+            result = execution.result
+            recorded_executions: list[ActualToolExecution] = []
+            control_execution_id: str | None = None
+            for actual in execution.actual_executions:
+                recorded = self._record_tool_execution(
+                    actual.tool_name,
+                    actual.params,
+                    actual.result,
+                    attempted_execution=True,
+                    execution_id=actual.execution_id,
+                )
+                recorded_executions.append(
+                    ActualToolExecution(
+                        tool_name=actual.tool_name,
+                        params=actual.params,
+                        result=recorded,
+                        execution_id=actual.execution_id,
+                    )
+                )
+                if actual.result is execution.result:
+                    result = recorded
+                    control_execution_id = actual.execution_id
+            execution.actual_executions = recorded_executions
+            if result is not execution.result:
+                execution.result = result
+                execution.observation_text = format_tool_result(call.name, result)
+            return (
+                result,
+                control_execution_id or new_execution_id(),
+                recorded_executions,
+            )
+
+        execution_id = new_execution_id()
+        result = self._record_tool_execution(
+            call.name,
+            call.validated_params or call.raw_params,
+            execution.result,
+            attempted_execution=execution.attempted_execution,
+            execution_id=execution_id,
+        )
+        if result is not execution.result:
+            execution.result = result
+            execution.observation_text = format_tool_result(call.name, result)
+        return result, execution_id, []
 
     def _loop_event_for_execution(self, execution: ToolExecution) -> LoopEvent:
         result = execution.result
@@ -2668,6 +3179,15 @@ class ReActEngine(UIEventEmitter):
         attempts = ", ".join(decision.prior_attempt_ids) or "current run"
         scopes = ", ".join(decision.missing_progress_scopes) or "declared scopes"
         untried = self._untried_island_targets()
+        outcome_key = getattr(decision, "outcome_key", None)
+        error_code = str(getattr(outcome_key, "error_code", "") or "").lower()
+        if error_code == "pytest_args_rejected":
+            return (
+                "PYTEST SELECTOR REJECTED: changing one invented path to another is "
+                "the same pre-execution failure. Do not guess another test path. "
+                "Call build(action='test') without args; the Python tool will use "
+                "surveyed coordinates or refuse an unsafe sweep."
+            )
         if decision.decision == "diversity_advisory":
             return (
                 "ACTION DIVERSITY ADVISORY: many distinct actions have been tried in this "
@@ -2755,6 +3275,19 @@ class ReActEngine(UIEventEmitter):
         machine = getattr(self, "phase_machine", None)
         state = getattr(self, "run_evidence_state", None)
         if machine is None or state is None or state.sealed or machine.is_complete:
+            return False
+        required_attempt = self._missing_required_test_attempt()
+        if required_attempt is not None:
+            self._force_required_test_attempt(
+                required_attempt,
+                trigger="loop_close",
+            )
+            self._add_system_guidance(
+                "TEST_ATTEMPT_REQUIRED: repeated pre-execution failures cannot close "
+                "a test-ready phase. The harness executed the required action: "
+                f"{required_attempt.action_text()}",
+                priority=9,
+            )
             return False
         refs = tuple(
             self._dedupe_strings(
@@ -2857,42 +3390,9 @@ class ReActEngine(UIEventEmitter):
                     execution = self._refused_report_execution(call)
                 else:
                     execution = self._execute_tool_call(call)
-                control_execution_id: str | None = None
-                if execution.actual_executions:
-                    result = execution.result
-                    recorded_executions = []
-                    for actual in execution.actual_executions:
-                        recorded = self._record_tool_execution(
-                            actual.tool_name,
-                            actual.params,
-                            actual.result,
-                            attempted_execution=True,
-                            execution_id=actual.execution_id,
-                        )
-                        recorded_executions.append(
-                            ActualToolExecution(
-                                tool_name=actual.tool_name,
-                                params=actual.params,
-                                result=recorded,
-                                execution_id=actual.execution_id,
-                            )
-                        )
-                        if actual.result is execution.result:
-                            result = recorded
-                            control_execution_id = actual.execution_id
-                    execution.actual_executions = recorded_executions
-                else:
-                    control_execution_id = new_execution_id()
-                    result = self._record_tool_execution(
-                        call.name,
-                        call.validated_params or call.raw_params,
-                        execution.result,
-                        attempted_execution=execution.attempted_execution,
-                        execution_id=control_execution_id,
-                    )
-                if result is not execution.result:
-                    execution.result = result
-                    execution.observation_text = format_tool_result(call.name, result)
+                result, control_execution_id, actual_executions = self._record_execution_bundle(
+                    execution, call
+                )
                 step.tool_result = result
                 control_envelope_id = (
                     str(execution.metadata.get("control_envelope_id") or "") or None
@@ -2914,6 +3414,7 @@ class ReActEngine(UIEventEmitter):
                     tool=call.name,
                     params=control_params,
                     result=result,
+                    actual_executions=actual_executions,
                 )
                 loop_decision = self._apply_tool_execution_loop_effects(execution)
 
@@ -2952,6 +3453,14 @@ class ReActEngine(UIEventEmitter):
                         # one thinking step, never two consecutive forced turns.
                         self._force_thinking_after_success = False
                         self._force_thinking_next = True
+
+                if result.error_code == "TEST_ATTEMPT_REQUIRED":
+                    required_attempt = self._missing_required_test_attempt()
+                    if required_attempt is not None:
+                        self._force_required_test_attempt(
+                            required_attempt,
+                            trigger="termination_refusal",
+                        )
 
                 # Log to branch context if we're in one
                 if branch_task_id:

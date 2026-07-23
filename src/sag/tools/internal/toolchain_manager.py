@@ -98,17 +98,32 @@ class ToolchainManager:
     def resolve(
         self, spec: ToolchainSpec, working_directory: str = "/workspace"
     ) -> Optional[ResolvedToolExecutable]:
-        candidates = self.discover(spec, working_directory)
+        overlay = self._env_overlay_snapshot()
+        candidates = self._discover_with_overlay(spec, working_directory, overlay)
+        observed_requirements = self._observed_requirements_from_overlay(
+            spec.name,
+            overlay,
+            working_directory=working_directory,
+        )
+        requirements = []
+        for requirement in [spec.version_requirement, *observed_requirements]:
+            if requirement is not None and requirement.raw not in {
+                item.raw for item in requirements
+            }:
+                requirements.append(requirement)
         compatible = [
             candidate
             for candidate in candidates
-            if self._matches_requirement(candidate.version, spec.version_requirement)
+            if all(
+                self._matches_requirement(candidate.version, requirement)
+                for requirement in requirements
+            )
         ]
         if not compatible:
             logger.info(
                 "No compatible %s executable found for requirement %s",
                 spec.executable,
-                spec.version_requirement.raw if spec.version_requirement else "<none>",
+                " and ".join(requirement.raw for requirement in requirements) or "<none>",
             )
             return None
 
@@ -118,8 +133,46 @@ class ToolchainManager:
         )[0]
         return ResolvedToolExecutable(
             candidate=selected,
-            reason=self._resolution_reason(selected, spec.version_requirement),
+            reason=self._resolution_reason(
+                selected,
+                spec.version_requirement
+                or (observed_requirements[0] if observed_requirements else None),
+            ),
         )
+
+    def matches_requirement(
+        self,
+        version: Optional[str],
+        requirement: Optional[ToolVersionRequirement],
+    ) -> bool:
+        """Public compatibility check shared by discovery and env registration."""
+        return self._matches_requirement(version, requirement)
+
+    def observed_requirements(
+        self,
+        name: str,
+        *,
+        working_directory: Optional[str] = None,
+    ) -> List[ToolVersionRequirement]:
+        """Return all applicable persisted constraints for one build root."""
+        return self._observed_requirements_from_overlay(
+            name,
+            self._env_overlay_snapshot(),
+            working_directory=working_directory,
+        )
+
+    def observed_requirement(
+        self,
+        name: str,
+        *,
+        working_directory: Optional[str] = None,
+    ) -> Optional[ToolVersionRequirement]:
+        """Backward-compatible first applicable persisted constraint."""
+        requirements = self.observed_requirements(
+            name,
+            working_directory=working_directory,
+        )
+        return requirements[0] if requirements else None
 
     def register(self, candidate: ToolExecutableCandidate) -> None:
         registry = self._load_registry()
@@ -138,9 +191,16 @@ class ToolchainManager:
     def discover(
         self, spec: ToolchainSpec, working_directory: str = "/workspace"
     ) -> List[ToolExecutableCandidate]:
-        candidates: List[ToolExecutableCandidate] = []
         overlay = self._env_overlay_snapshot()
+        return self._discover_with_overlay(spec, working_directory, overlay)
 
+    def _discover_with_overlay(
+        self,
+        spec: ToolchainSpec,
+        working_directory: str,
+        overlay: Optional[Dict[str, Any]],
+    ) -> List[ToolExecutableCandidate]:
+        candidates: List[ToolExecutableCandidate] = []
         overlay_candidate = self._env_overlay_candidate(spec, overlay)
         if overlay_candidate:
             candidates.append(overlay_candidate)
@@ -160,6 +220,32 @@ class ToolchainManager:
             candidates.append(path_candidate)
 
         return self._filter_blocked_candidates(self._dedupe_candidates(candidates), spec, overlay)
+
+    def _observed_requirements_from_overlay(
+        self,
+        name: str,
+        overlay: Optional[Dict[str, Any]],
+        *,
+        working_directory: Optional[str],
+    ) -> List[ToolVersionRequirement]:
+        if self.env_overlay is None or overlay is None:
+            return []
+        tool_name = self.env_overlay._normalize_tool(name)
+        raw_records = overlay.get("tools", {}).get(tool_name, {}).get("requirements", [])
+        requirements = []
+        for raw_record in raw_records:
+            if not isinstance(raw_record, dict) or not self.env_overlay._requirement_applies(
+                raw_record,
+                working_directory,
+            ):
+                continue
+            requirement = ToolVersionRequirement.from_raw(
+                raw_record.get("raw"),
+                source="registered_state",
+            )
+            if requirement and requirement.raw not in {item.raw for item in requirements}:
+                requirements.append(requirement)
+        return requirements
 
     def ensure_path(self, candidate: ToolExecutableCandidate) -> None:
         directory = candidate.path.rsplit("/", 1)[0]

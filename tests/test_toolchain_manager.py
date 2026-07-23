@@ -155,6 +155,139 @@ def test_resolve_compound_requirement_respects_upper_bound():
     assert resolved.candidate.version == "3.9.6"
 
 
+def test_public_requirement_matcher_uses_same_range_semantics_as_resolution():
+    manager = ToolchainManager(FakeToolchainOrchestrator())
+    requirement = ToolVersionRequirement.from_raw("[3.9,4.0)")
+
+    assert manager.matches_requirement("3.9.9", requirement) is True
+    assert manager.matches_requirement("4.0.0", requirement) is False
+
+
+def test_bare_resolution_inherits_observed_overlay_requirement():
+    orchestrator = FakeToolchainOrchestrator(
+        {
+            "/opt/apache-maven-3.9.9/bin/mvn": "Apache Maven 3.9.9",
+            "/usr/bin/mvn": "Apache Maven 3.8.7",
+        },
+        path_executable="/usr/bin/mvn",
+    )
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+        {
+            "version": 1,
+            "tools": {
+                "maven": {
+                    "requirements": [
+                        {
+                            "raw": "[3.9,)",
+                            "source": "build_error",
+                            "working_directory": "/workspace/project",
+                        }
+                    ],
+                    "candidates": {},
+                    "blocked": [],
+                }
+            },
+        }
+    )
+    manager = ToolchainManager(orchestrator)
+
+    resolved = manager.resolve(ToolchainSpec(name="maven", executable="mvn"))
+
+    assert resolved is not None
+    assert resolved.candidate.path == "/opt/apache-maven-3.9.9/bin/mvn"
+    assert manager.observed_requirement("maven").raw == "[3.9,)"
+
+
+def test_bare_resolution_intersects_same_root_history_without_polluting_sibling():
+    orchestrator = FakeToolchainOrchestrator(
+        {
+            "/opt/apache-maven-3.8.8/bin/mvn": "Apache Maven 3.8.8",
+            "/opt/apache-maven-3.9.9/bin/mvn": "Apache Maven 3.9.9",
+        }
+    )
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+        {
+            "version": 1,
+            "tools": {
+                "maven": {
+                    "requirements": [
+                        {
+                            "raw": ">=3.9",
+                            "source": "build_error",
+                            "working_directory": "/workspace/project/island-a",
+                        },
+                        {
+                            "raw": ">=3.8",
+                            "source": "build_error",
+                            "working_directory": "/workspace/project/island-a",
+                        },
+                        {
+                            "raw": "[3.8,3.9)",
+                            "source": "build_error",
+                            "working_directory": "/workspace/project/island-b",
+                        },
+                    ],
+                    "candidates": {},
+                    "blocked": [],
+                }
+            },
+        }
+    )
+    manager = ToolchainManager(orchestrator)
+    spec = ToolchainSpec(name="maven", executable="mvn")
+
+    island_a = manager.resolve(spec, working_directory="/workspace/project/island-a")
+    island_b = manager.resolve(spec, working_directory="/workspace/project/island-b")
+
+    assert island_a is not None
+    assert island_a.candidate.version == "3.9.9"
+    assert island_b is not None
+    assert island_b.candidate.version == "3.8.8"
+
+
+def test_parent_reactor_inherits_constraint_observed_in_child_module():
+    orchestrator = FakeToolchainOrchestrator(
+        {
+            "/opt/apache-maven-3.8.8/bin/mvn": "Apache Maven 3.8.8",
+            "/opt/apache-maven-3.9.9/bin/mvn": "Apache Maven 3.9.9",
+        }
+    )
+    orchestrator.files[DEFAULT_OVERLAY_JSON] = json.dumps(
+        {
+            "version": 1,
+            "tools": {
+                "maven": {
+                    "requirements": [
+                        {
+                            "raw": ">=3.9",
+                            "source": "build_error",
+                            "working_directory": "/workspace/project/module",
+                        }
+                    ],
+                    "candidates": {},
+                    "blocked": [],
+                }
+            },
+        }
+    )
+    manager = ToolchainManager(orchestrator)
+
+    resolved = manager.resolve(
+        ToolchainSpec(name="maven", executable="mvn"),
+        working_directory="/workspace/project",
+    )
+
+    assert resolved is not None
+    assert resolved.candidate.version == "3.9.9"
+    assert [
+        item.raw
+        for item in manager.observed_requirements(
+            "maven",
+            working_directory="/workspace/project",
+        )
+    ] == [">=3.9"]
+
+
 def test_resolve_without_requirement_prefers_path_over_unregistered_standalone():
     manager = ToolchainManager(
         FakeToolchainOrchestrator(

@@ -124,6 +124,43 @@ def test_parameter_alias_default_and_state_injection_are_recorded():
     assert len(state_updates) == 1
 
 
+@pytest.mark.parametrize("tool_name", ["python", "maven", "gradle"])
+def test_direct_build_backend_cwd_alias_normalizes_to_working_directory(tool_name):
+    properties = {
+        "working_directory": {"type": "string"},
+    }
+    if tool_name == "maven":
+        properties["command"] = {"type": "string"}
+    tool = SchemaLikeTool(
+        tool_name,
+        properties,
+    )
+    orchestrator, _events, _tracking, _updates = _orchestrator(
+        tools={tool_name: tool},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name=tool_name,
+            raw_params={"cwd": "/workspace/project"},
+        )
+    )
+
+    assert execution.status == "success"
+    expected = {
+        "working_directory": "/workspace/project",
+    }
+    if tool_name == "maven":
+        expected["command"] = "compile"
+    assert execution.executed_params == expected
+    assert any(
+        fix.source == "schema_alias"
+        and fix.field == "working_directory"
+        and fix.after == "/workspace/project"
+        for fix in execution.parameter_fixes
+    )
+
+
 def test_normalized_action_envelope_is_emitted_before_tool_execution():
     trace = []
 
@@ -402,6 +439,94 @@ def test_report_parameter_normalizer_repairs_live_model_aliases_and_action():
         "evidence_refs": ["/workspace/paramiko/.setup_agent/report.json"],
     }
     assert {fix.source for fix in fixes} >= {"schema_alias", "safety_fix"}
+
+
+def test_report_live_content_and_outcome_aliases_execute_through_orchestrator():
+    report = SchemaLikeTool(
+        "report",
+        {
+            "action": {"type": "string", "enum": ["generate"]},
+            "summary": {"type": "string"},
+            "status": {"type": "string"},
+        },
+        required=["action", "summary", "status"],
+    )
+    orchestrator, _events, _tracking, _updates = _orchestrator(
+        tools={"report": report},
+    )
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="report",
+            raw_params={
+                "action": "report",
+                "content": "TVM native smoke remained bounded.",
+                "outcome": "partial",
+            },
+        )
+    )
+
+    assert execution.status == "success"
+    assert execution.executed_params == {
+        "action": "generate",
+        "summary": "TVM native smoke remained bounded.",
+        "status": "partial",
+    }
+    assert {
+        (fix.source, fix.field, fix.before, fix.after)
+        for fix in execution.parameter_fixes
+    } >= {
+        ("schema_alias", "summary", None, "TVM native smoke remained bounded."),
+        ("schema_alias", "status", None, "partial"),
+    }
+
+
+def test_report_canonical_fields_win_over_live_aliases():
+    fixes = []
+    report = SchemaLikeTool(
+        "report",
+        {
+            "action": {"type": "string", "enum": ["generate"]},
+            "summary": {"type": "string"},
+            "status": {"type": "string"},
+        },
+        required=["action", "summary", "status"],
+    )
+    normalizer = ToolParameterNormalizer(
+        tools={"report": report},
+        successful_states={},
+        repository_url=None,
+    )
+
+    params = normalizer.validate_and_fix(
+        "report",
+        {
+            "action": "generate",
+            "summary": "canonical",
+            "status": "partial",
+            "content": "a much longer alias must not replace canonical",
+            "outcome": "failed",
+        },
+        fixes,
+    )
+
+    assert params == {
+        "action": "generate",
+        "summary": "canonical",
+        "status": "partial",
+    }
+    assert {
+        (fix.source, fix.field, fix.before, fix.after)
+        for fix in fixes
+    } >= {
+        (
+            "schema_alias",
+            "content",
+            "a much longer alias must not replace canonical",
+            None,
+        ),
+        ("schema_alias", "outcome", "failed", None),
+    }
 
 
 def test_bash_parameter_normalizer_appends_fail_at_end_to_compound_maven_segment():

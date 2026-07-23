@@ -120,6 +120,8 @@ class ToolObservation(BaseModel):
     roles: tuple[EvidenceRole, ...] = ()
     result: ToolResult | UnpersistedToolResult
     provenance: str
+    source_phase: str | None = None
+    source_attempt_id: str | None = None
 
 
 class StateEpochDelta(BaseModel):
@@ -286,9 +288,7 @@ class RunEvidenceState(BaseModel):
     ) -> tuple[str, tuple[str, ...]]:
         refs = tuple(
             dict.fromkeys(
-                str(ref).strip()
-                for ref in evidence_refs
-                if ref is not None and str(ref).strip()
+                str(ref).strip() for ref in evidence_refs if ref is not None and str(ref).strip()
             )
         )
         if provenance and source_ref and str(provenance) != str(source_ref):
@@ -327,9 +327,7 @@ class RunEvidenceState(BaseModel):
             status=FactStatus.VERIFIED,
             provenance=resolved_ref,
             source_phase=str(source_phase).strip() if source_phase else None,
-            source_attempt_id=(
-                str(source_attempt_id).strip() if source_attempt_id else None
-            ),
+            source_attempt_id=(str(source_attempt_id).strip() if source_attempt_id else None),
             evidence_refs=normalized_refs or (resolved_ref,),
         )
         before = self._state_epochs[scope]
@@ -380,9 +378,7 @@ class RunEvidenceState(BaseModel):
             status=FactStatus.CLAIMED,
             provenance=resolved_ref,
             source_phase=str(source_phase).strip() if source_phase else None,
-            source_attempt_id=(
-                str(source_attempt_id).strip() if source_attempt_id else None
-            ),
+            source_attempt_id=(str(source_attempt_id).strip() if source_attempt_id else None),
             evidence_refs=normalized_refs,
         )
         before = self._state_epochs[scope]
@@ -476,9 +472,7 @@ class RunEvidenceState(BaseModel):
             failure_signature=normalized_signature,
             evidence_refs=normalized_refs,
             source_phase=str(source_phase).strip() if source_phase else None,
-            source_attempt_id=(
-                str(source_attempt_id).strip() if source_attempt_id else None
-            ),
+            source_attempt_id=(str(source_attempt_id).strip() if source_attempt_id else None),
         )
         self._blockers.append(blocker)
         self._blocker_events.append(_snapshot(blocker))
@@ -560,9 +554,7 @@ class RunEvidenceState(BaseModel):
             raise ValueError("phase evidence event requires an attempt id")
         normalized = tuple(
             dict.fromkeys(
-                str(ref).strip()
-                for ref in evidence_refs
-                if ref is not None and str(ref).strip()
+                str(ref).strip() for ref in evidence_refs if ref is not None and str(ref).strip()
             )
         )
         if not normalized:
@@ -639,6 +631,12 @@ class RunEvidenceState(BaseModel):
         execution_id = execution_id or new_execution_id()
         normalized_roles = tuple(dict.fromkeys(EvidenceRole(role) for role in roles))
         normalized_params = copy.deepcopy(dict(params or {}))
+        normalized_source_phase = (
+            str(source_phase).strip() if source_phase is not None else ""
+        ) or None
+        normalized_source_attempt_id = (
+            str(source_attempt_id).strip() if source_attempt_id is not None else ""
+        ) or None
         existing = next(
             (
                 observation
@@ -654,6 +652,8 @@ class RunEvidenceState(BaseModel):
                 or existing.params != normalized_params
                 or existing.roles != normalized_roles
                 or existing.result != result
+                or existing.source_phase != normalized_source_phase
+                or existing.source_attempt_id != normalized_source_attempt_id
             ):
                 raise ValueError(f"conflicting observation for execution_id {execution_id}")
             before = self._state_epochs[scope]
@@ -680,6 +680,8 @@ class RunEvidenceState(BaseModel):
             roles=normalized_roles,
             result=result.model_copy(deep=True),
             provenance=source,
+            source_phase=normalized_source_phase,
+            source_attempt_id=normalized_source_attempt_id,
         )
         self._tool_observations.append(observation)
         self._observation_execution_ids.add(execution_id)
@@ -696,8 +698,8 @@ class RunEvidenceState(BaseModel):
                     key,
                     value,
                     source,
-                    source_phase=source_phase,
-                    source_attempt_id=source_attempt_id,
+                    source_phase=normalized_source_phase,
+                    source_attempt_id=normalized_source_attempt_id,
                 )
                 latest_fact = delta.fact
                 changed = changed or delta.changed

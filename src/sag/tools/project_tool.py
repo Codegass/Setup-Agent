@@ -16,7 +16,8 @@ class ProjectTool(BaseTool):
                 "Project lifecycle: action = clone (repo_url[, ref]) | "
                 "provision (install toolchain: java_version for a JDK, packages for apt) | "
                 "analyze (survey the project; persist build facts) | "
-                "env (register env vars/executables; tool + executable [+ env])."
+                "env (validate, register, and activate a runtime executable; "
+                "tool + executable [+ env])."
             ),
         )
         self.setup_tool = setup_tool
@@ -69,7 +70,23 @@ class ProjectTool(BaseTool):
             return delegate.execute(**kwargs)
         # env: EnvTool's vocabulary is inspect|register|activate|block|clear;
         # register is its "set env vars/executables" verb (there is no "set").
+        # The public facade is the one-step recovery surface taught to the
+        # model, so a proven runtime must become active atomically.  Direct
+        # EnvTool callers retain its conservative activate=False default; the
+        # public facade deliberately has no inactive-registration escape hatch.
+        if kwargs.get("activate") is False:
+            return ToolResult.completed_failure(
+                output="",
+                error="project(action='env') requires atomic runtime activation",
+                error_code="PROJECT_ENV_ACTIVATION_REQUIRED",
+                suggestions=[
+                    "Remove activate=false; a successful project env call always activates "
+                    "the validated executable."
+                ],
+                raw_data={"action": "env", "activation_required": True},
+            )
         kwargs.setdefault("action", "register")
+        kwargs["activate"] = True
         return delegate.execute(**kwargs)
 
     def _get_parameters_schema(self) -> Dict[str, Any]:
@@ -87,10 +104,32 @@ class ProjectTool(BaseTool):
                 "packages": {"type": "array", "description": "provision: apt packages to install"},
                 "tool": {
                     "type": "string",
-                    "description": "env: tool name to register (e.g. 'java')",
+                    "description": "env: tool name to register and activate (e.g. 'maven')",
                 },
-                "executable": {"type": "string", "description": "env: executable path to register"},
+                "executable": {
+                    "type": "string",
+                    "description": (
+                        "env: absolute container executable path to validate, canonicalize, "
+                        "register, and activate"
+                    ),
+                },
                 "env": {"type": "object", "description": "env: variables to set"},
+                "activate": {
+                    "type": "boolean",
+                    "enum": [True],
+                    "default": True,
+                    "description": (
+                        "env: must be true; a successful public env call atomically "
+                        "activates the validated executable"
+                    ),
+                },
+                "requirement": {
+                    "type": "string",
+                    "description": (
+                        "env: version requirement the measured executable must satisfy "
+                        "(for example '[3.9,)' for Maven)"
+                    ),
+                },
             },
             "required": ["action"],
             # The delegates accept more than the documented surface

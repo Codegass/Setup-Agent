@@ -1569,8 +1569,13 @@ def test_setup_agent_injects_one_session_owned_state_and_finalizer(monkeypatch):
     agent.context_journal = SimpleNamespace()
     agent.run_evidence_state = RunEvidenceState(run_id="session-owned")
     agent.verdict_finalizer = VerdictFinalizer(agent.orchestrator)
+    agent.control_event_sink = None
+    agent._run_pin_host_path = None
     agent.ui_manager = None
-    agent.agent_logger = SimpleNamespace(info=lambda *args, **kwargs: None)
+    agent.agent_logger = SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+    )
     agent._initialize_tools = lambda workflow_mode: []
 
     agent._initialize_context_and_tools(workflow_mode="setup")

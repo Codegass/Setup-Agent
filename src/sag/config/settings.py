@@ -51,7 +51,7 @@ class Config(BaseModel):
 
     action_model: str = Field(default="gpt-4o")
     action_provider: str = Field(default="openai")
-    action_temperature: float = Field(default=0.3)
+    action_temperature: float = Field(default=0.0)
     action_max_tokens: int = Field(default=2000)
 
     # API Keys (will be loaded from environment)
@@ -136,7 +136,7 @@ class Config(BaseModel):
             # Action model config
             action_model=os.getenv("SAG_ACTION_MODEL", "gpt-4o"),
             action_provider=os.getenv("SAG_ACTION_PROVIDER", "openai"),
-            action_temperature=float(os.getenv("SAG_ACTION_TEMPERATURE", "0.3")),
+            action_temperature=float(os.getenv("SAG_ACTION_TEMPERATURE", "0.0")),
             action_max_tokens=int(os.getenv("SAG_MAX_ACTION_TOKENS", "10000")),
             # API Keys
             openai_api_key=os.getenv("OPENAI_API_KEY"),

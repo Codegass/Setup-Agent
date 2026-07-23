@@ -135,7 +135,8 @@ def test_format_tool_result_surfaces_maven_version_contract():
     assert "Current Maven executable: /usr/bin/mvn" in formatted
     assert "Current Maven version: 3.6.3" in formatted
     assert "Compatible Maven candidate: none" in formatted
-    assert "via project(action='env'), then retry the build" in formatted
+    assert "requirement='[3.9,)'" in formatted
+    assert "maven_version_requirement='[3.9,)'" in formatted
     # The consolidated build facade surfaces the same contract.
     assert "Maven version requirement: [3.9,) (source: build_error)" in formatted_for_build
 

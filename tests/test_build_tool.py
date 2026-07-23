@@ -143,6 +143,19 @@ def test_maven_test_runs_the_full_verify_lifecycle():
     assert maven.calls[0]["fail_at_end"] is True
 
 
+def test_maven_requirement_propagates_through_build_backend():
+    maven = FakeBackendTool()
+    tool = _tool({"pom.xml"}, maven=maven)
+
+    tool.execute(
+        action="compile",
+        working_directory="/w",
+        maven_version_requirement="[3.9,4.0)",
+    )
+
+    assert maven.calls[0]["maven_version_requirement"] == "[3.9,4.0)"
+
+
 def test_args_passthrough():
     maven = FakeBackendTool()
     tool = _tool({"pom.xml"}, maven=maven)

@@ -137,8 +137,11 @@ def _format_maven_version_contract(result: ToolResult) -> str:
     raw_requirement = requirement.get("raw")
     if raw_requirement:
         lines.append(
-            "Next action: provide or register a Maven executable that satisfies "
-            f"{raw_requirement} via project(action='env'), then retry the build"
+            "Next action: provide, register, and activate a Maven executable that satisfies "
+            f"{raw_requirement} via project(action='env', tool='maven', executable=..., "
+            f"requirement='{raw_requirement}'), then retry the build with "
+            f"maven_version_requirement='{raw_requirement}'; a successful project env result "
+            "confirms the measured executable is active"
         )
 
     return "\n".join(lines)
@@ -385,9 +388,19 @@ class ToolOrchestrator:
 
     def _execute(self, call: ToolCall) -> ToolExecution:
         started_at = time.perf_counter()
-        model_omitted_workdir = not str(
-            (call.raw_params or {}).get("working_directory") or ""
-        ).strip()
+        raw_params = call.raw_params or {}
+        workdir_fields = (
+            "working_directory",
+            "cwd",
+            "workdir",
+            "working_dir",
+            "work_dir",
+            "dir",
+            "directory",
+        )
+        model_omitted_workdir = not any(
+            str(raw_params.get(field) or "").strip() for field in workdir_fields
+        )
         if call.name not in self.tools:
             # Legacy tool names (model drift) map onto their stage-1 successors
             # before any lookup, so old names execute instead of failing.

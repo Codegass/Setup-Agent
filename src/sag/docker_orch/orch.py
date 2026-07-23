@@ -16,7 +16,6 @@ from loguru import logger
 from sag.config import get_config
 from sag.runtime.exec_env import DEFAULT_UTF8_ENVIRONMENT, default_utf8_environment
 
-
 ENV_OVERLAY_SCRIPT_PATH = "/workspace/.setup_agent/env_overlay.sh"
 UNKNOWN_EXIT_FAILURE_MARKERS = (
     "BUILD FAILURE",
@@ -37,8 +36,7 @@ def _has_unknown_exit_failure_marker(output: str) -> bool:
         return True
 
     return all(
-        marker.casefold() in normalized_output
-        for marker in MAVEN_ENFORCER_VERSION_RANGE_MARKERS
+        marker.casefold() in normalized_output for marker in MAVEN_ENFORCER_VERSION_RANGE_MARKERS
     )
 
 
@@ -274,9 +272,9 @@ class DockerOrchestrator:
         return (
             "export LANG=${LANG:-C.UTF-8}; "
             "export LC_ALL=${LC_ALL:-C.UTF-8}; "
-            f"source {ENV_OVERLAY_SCRIPT_PATH} 2>/dev/null || true; "
             "source /etc/profile 2>/dev/null || true; "
-            "source ~/.bashrc 2>/dev/null || true"
+            "source ~/.bashrc 2>/dev/null || true; "
+            f"source {ENV_OVERLAY_SCRIPT_PATH} 2>/dev/null || true"
         )
 
     def _default_exec_environment(
@@ -546,6 +544,7 @@ class DockerOrchestrator:
         if workdir:
             logger.info(f"Working directory: {workdir}")
 
+        runner_dispatched = False
         try:
             # Prepare environment
             exec_env = self._default_exec_environment(environment)
@@ -562,6 +561,7 @@ class DockerOrchestrator:
                 demux=capture_stderr,  # Separate stdout/stderr when True
                 environment=exec_env,
             )
+            runner_dispatched = True
 
             # Handle output based on whether demux was used
             if capture_stderr and isinstance(result.output, tuple):
@@ -674,10 +674,22 @@ class DockerOrchestrator:
                 "termination_reason": termination_reason,
                 "monitoring_info": monitoring_info,
                 "timeout": timeout_seconds if timeout_seconds and timeout_seconds > 0 else None,
+                # A returned command is not proof that Docker accepted it.
+                # This bit is set only after ``container.exec_run`` returned a
+                # real execution object and is propagated into runner receipts.
+                "runner_dispatched": True,
             }
         except Exception as e:
             logger.error(f"Failed to execute command '{command}': {e}")
-            return {"success": False, "exit_code": -1, "output": str(e)}
+            return {
+                "success": False,
+                "exit_code": -1,
+                "output": str(e),
+                "dispatch_status": (
+                    "execution_observation_failed" if runner_dispatched else "dispatch_failed"
+                ),
+                "runner_dispatched": runner_dispatched,
+            }
 
     def execute_command_with_monitoring(
         self,
@@ -765,6 +777,7 @@ class DockerOrchestrator:
             "command_fragment": command[:60],
         }
 
+        runner_dispatched = False
         try:
             # Start the command execution
             # NOTE: We don't use Docker's workdir parameter here because we handle it
@@ -776,6 +789,7 @@ class DockerOrchestrator:
                 demux=True,  # Separate stdout/stderr
                 environment=self._default_exec_environment(),
             )
+            runner_dispatched = True
 
             # Start CPU monitoring thread if enabled
             cpu_monitor_thread = None
@@ -794,6 +808,9 @@ class DockerOrchestrator:
             result = self._monitor_execution_with_timeouts(
                 exec_result, monitoring_state, silent_timeout, absolute_timeout
             )
+            # ``exec_run`` returned before monitoring began, so even a later
+            # stream failure or timeout is a physical dispatch receipt.
+            result["runner_dispatched"] = runner_dispatched
 
             # Clean up monitoring thread
             monitoring_state["process_terminated"] = True
@@ -810,6 +827,10 @@ class DockerOrchestrator:
                 "exit_code": -1,
                 "output": f"Execution failed: {str(e)}",
                 "termination_reason": "exception",
+                "dispatch_status": (
+                    "execution_observation_failed" if runner_dispatched else "dispatch_failed"
+                ),
+                "runner_dispatched": runner_dispatched,
                 "monitoring_info": monitoring_state,
             }
 
@@ -952,9 +973,7 @@ class DockerOrchestrator:
             f'pid=$!; printf \'%s\\n\' "$pid" > {shlex.quote(pid_path)}; echo "$pid")'
         )
 
-        result = self.execute_command(
-            launcher, workdir=None, environment=environment, timeout=60
-        )
+        result = self.execute_command(launcher, workdir=None, environment=environment, timeout=60)
 
         pid: Optional[int] = None
         for token in reversed((result.get("output") or "").split()):
@@ -1109,6 +1128,7 @@ class DockerOrchestrator:
                 "output": f"Failed to dispatch command: {handle.get('launch_output', '')}",
                 "termination_reason": None,
                 "dispatch_status": "dispatch_failed",
+                "runner_dispatched": False,
                 "dispatch": handle,
             }
 
@@ -1169,6 +1189,7 @@ class DockerOrchestrator:
             "output": handoff_output,
             "termination_reason": None,
             "dispatch_status": dispatch_status,
+            "runner_dispatched": True,
             "lifecycle_state": "pending",
             "liveness_state": final_state,
             "dispatch": {
@@ -1215,6 +1236,7 @@ class DockerOrchestrator:
             "full_output": full_output,
             "termination_reason": None,
             "dispatch_status": "completed_detached",
+            "runner_dispatched": True,
             "dispatch": handle,
             "lifecycle_state": state,
         }

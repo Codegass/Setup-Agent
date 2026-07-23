@@ -11,8 +11,10 @@ on disk; and the survey must run BEFORE the phase objective is selected, or a
 Python repo gets the Java objective in the same intro as Python guidance.
 """
 
+import shlex
 from types import SimpleNamespace
 
+from sag.agent.physical_survey import validate_and_discover_project_path
 from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.project_analyzer import SURVEY_FACTS_VERSION, ProjectAnalyzerTool
 from sag.tools.internal.python_env import LAYOUT_SCAN_SENTINEL
@@ -38,6 +40,12 @@ class SurveyOrch:
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         self.commands.append(command)
+        if command.startswith("realpath -m -- "):
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "\n".join(shlex.split(command)[3:]),
+            }
         if "| cksum" in command:
             if not self.config_seed:  # empty seed simulates a broken probe
                 return {"success": False, "exit_code": 1, "output": ""}
@@ -82,6 +90,76 @@ class SurveyOrch:
         if command.startswith("ls /workspace/proj") or command.startswith("ls -la /workspace"):
             return {"success": True, "exit_code": 0, "output": "pyproject.toml\nsrc\n"}
         return {"success": True, "exit_code": 0, "output": ""}
+
+
+class SymlinkWorkspaceSurveyOrch:
+    """Map logical /workspace paths onto a real temporary symlink tree."""
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+        self.commands = []
+
+    def physical_path(self, logical):
+        assert logical == "/workspace" or logical.startswith("/workspace/")
+        suffix = logical.removeprefix("/workspace").lstrip("/")
+        return self.workspace / suffix if suffix else self.workspace
+
+    def execute_command(self, command, **kwargs):
+        self.commands.append(command)
+        tokens = shlex.split(command)
+        if tokens[:3] == ["realpath", "-m", "--"]:
+            resolved = [
+                str(self.physical_path(logical).resolve(strict=False)) for logical in tokens[3:]
+            ]
+            return {"success": True, "exit_code": 0, "output": "\n".join(resolved)}
+        if command == "find /workspace -maxdepth 1 -type d":
+            # Exercise validation even when discovery reports a symlinked
+            # directory as a candidate.
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "/workspace\n/workspace/escape\n",
+            }
+        if tokens[:2] == ["test", "-d"]:
+            return {
+                "success": self.physical_path(tokens[2]).is_dir(),
+                "exit_code": 0 if self.physical_path(tokens[2]).is_dir() else 1,
+                "output": "",
+            }
+        if tokens[:2] == ["test", "-f"]:
+            return {
+                "success": self.physical_path(tokens[2]).is_file(),
+                "exit_code": 0 if self.physical_path(tokens[2]).is_file() else 1,
+                "output": "",
+            }
+        raise AssertionError(f"unexpected command: {command}")
+
+
+def _symlink_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside" / "project"
+    workspace.mkdir()
+    outside.mkdir(parents=True)
+    (outside / "pyproject.toml").write_text(
+        '[project]\nname = "outside"\n',
+        encoding="utf-8",
+    )
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    return workspace
+
+
+def test_explicit_project_symlink_escape_is_rejected_before_indicator_probe(tmp_path):
+    orch = SymlinkWorkspaceSurveyOrch(_symlink_workspace(tmp_path))
+
+    assert validate_and_discover_project_path(orch, "/workspace/escape") is None
+    assert not any(command.startswith(("test -d ", "test -f ")) for command in orch.commands)
+
+
+def test_workspace_discovery_rejects_symlink_child_before_indicator_probe(tmp_path):
+    orch = SymlinkWorkspaceSurveyOrch(_symlink_workspace(tmp_path))
+
+    assert validate_and_discover_project_path(orch, "/workspace") is None
+    assert not any(command.startswith(("test -d ", "test -f ")) for command in orch.commands)
 
 
 def test_ensure_facts_works_through_the_production_constructor():
@@ -311,6 +389,7 @@ def test_fingerprint_command_covers_everything_the_survey_reads():
         "requirements*.txt",
         "poetry.lock",
         "Pipfile.lock",
+        ".gitmodules",
         "CMakeLists.txt",
         "Cargo.toml",
         "go.mod",
@@ -326,6 +405,8 @@ def test_fingerprint_command_covers_everything_the_survey_reads():
     assert "*/src/test/java/*" in cmd
     # Module-layout dirs ride as a listing: existence changes island facts.
     assert "-type d" in cmd and "*/src/main/java" in cmd
+    # Grounded Python smoke candidates derive from test-path existence/order.
+    assert "-name 'test_*.py'" in cmd and "-name '*_test.py'" in cmd
     # The python package layout does NOT ride this command: it flows through
     # discovery's own shared scan (asserted in the rename tests).
     assert "__init__.py" not in cmd
@@ -494,6 +575,13 @@ class StrictSurveyOrch(SurveyOrch):
 
     def execute_command(self, command, workdir=None, timeout=None, **kwargs):
         stripped = command.strip()
+        if stripped == "find /workspace -maxdepth 1 -type d":
+            self.commands.append(command)
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": "/workspace\n/workspace/proj\n",
+            }
         if stripped.startswith("test -d "):
             self.commands.append(command)
             return {"success": True, "exit_code": 0, "output": ""}  # dirs exist
