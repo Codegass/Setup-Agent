@@ -96,6 +96,50 @@ def test_split_root_test_hint_is_coordinates_only():
     assert "Recommended Build" not in out
 
 
+def test_python_fact_projection_is_bounded_and_ignores_prescriptive_fields():
+    tool = ProjectAnalyzerTool(SurveyOrch())
+    analysis = {
+        "project_path": "/workspace/native",
+        "project_type": "Python",
+        "build_system": "python",
+        "existing_files": ["pyproject.toml"],
+        "python_config": {
+            "python_distribution_name": "native-dist",
+            "python_build_backend": "scikit_build_core.build",
+            "python_root": "/workspace/native",
+            "python_local_providers": [
+                {
+                    "distribution_name": f"provider-{index}",
+                    "root": f"vendor/provider-{index}",
+                    "goal": "install this first",
+                }
+                for index in range(5)
+            ],
+            "native_artifact_roots": [f"build/root-{index}" for index in range(5)],
+            "python_smoke_candidates": [
+                {
+                    "path": f"tests/smoke-{index}",
+                    "source": "pyproject.toml",
+                    "rationale": "run this next",
+                }
+                for index in range(5)
+            ],
+        },
+    }
+
+    output = tool._format_analysis_output(analysis)
+
+    assert "provider-0 at vendor/provider-0" in output
+    assert "provider-2 at vendor/provider-2" in output
+    assert "provider-3" not in output
+    assert "tests/smoke-2 (pyproject.toml)" in output
+    assert "tests/smoke-3" not in output
+    assert "build/root-3" not in output
+    assert "(+2 more in /workspace/.setup_agent/build_requirements.json)" in output
+    assert "install this first" not in output
+    assert "run this next" not in output
+
+
 # ---- dim (b): recommendation is coordinates only ----------------------------
 
 
@@ -246,7 +290,10 @@ def test_loop_redirect_reads_island_goals_from_the_shared_manifest():
 
     class ManifestOrch:
         def execute_command(self, command, **kwargs):
-            if command == f"cat {REQUIREMENTS_PATH}":
+            if command in (
+                f"cat {REQUIREMENTS_PATH}",
+                f"cat -- {REQUIREMENTS_PATH}",
+            ):
                 return {"success": True, "exit_code": 0, "output": json.dumps(manifest)}
             return {"success": True, "exit_code": 0, "output": ""}
 

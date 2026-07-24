@@ -1146,6 +1146,75 @@ class ProjectAnalyzerTool(BaseTool):
             return f"\n🏝️ Build coordinates (independent islands): {coords}\n"
         return f"\n📍 Build coordinates: {rec.get('build_system')} at " f"{rec.get('build_root')}\n"
 
+    @staticmethod
+    def _fact_atom(value: Any, *, limit: int = 160) -> str:
+        """Render one project-controlled fact as a bounded single line."""
+        text = " ".join(str(value or "").split())
+        if len(text) <= limit:
+            return text
+        return text[: limit - 1] + "…"
+
+    def _render_python_facts(self, analysis: Dict[str, Any]) -> str:
+        """Project a bounded, descriptive subset of Python survey facts."""
+        config = analysis.get("python_config") or {}
+        if not config:
+            return ""
+
+        from .build_preflight import REQUIREMENTS_PATH
+
+        lines: List[str] = []
+
+        def scalar(label: str, key: str) -> None:
+            value = self._fact_atom(config.get(key))
+            if value:
+                lines.append(f"   • {label}: {value}")
+
+        def bounded(label: str, values: List[str], *, limit: int = 3) -> None:
+            clean = [value for value in values if value]
+            if not clean:
+                return
+            rendered = ", ".join(clean[:limit])
+            if len(clean) > limit:
+                rendered += (
+                    f" (+{len(clean) - limit} more in {REQUIREMENTS_PATH})"
+                )
+            lines.append(f"   • {label}: {rendered}")
+
+        scalar("Distribution", "python_distribution_name")
+        scalar("Build backend", "python_build_backend")
+        scalar("Install root", "python_root")
+
+        providers: List[str] = []
+        for provider in config.get("python_local_providers") or []:
+            if not isinstance(provider, dict):
+                continue
+            name = self._fact_atom(provider.get("distribution_name"))
+            root = self._fact_atom(provider.get("root"))
+            if name and root:
+                providers.append(f"{name} at {root}")
+        bounded("Local providers", providers)
+
+        artifact_roots = [
+            self._fact_atom(root) for root in config.get("native_artifact_roots") or []
+        ]
+        bounded("Native artifact roots", artifact_roots)
+
+        smoke_coordinates: List[str] = []
+        for candidate in config.get("python_smoke_candidates") or []:
+            if not isinstance(candidate, dict):
+                continue
+            path = self._fact_atom(candidate.get("path"))
+            source = self._fact_atom(candidate.get("source"))
+            if path:
+                smoke_coordinates.append(
+                    f"{path} ({source})" if source else path
+                )
+        bounded("Verified smoke coordinates", smoke_coordinates)
+
+        if not lines:
+            return ""
+        return "\n🐍 Python facts (observed):\n" + "\n".join(lines) + "\n"
+
     def _format_analysis_output(self, analysis: Dict[str, Any]) -> str:
         """格式化分析输出"""
         output = "🔍 PROJECT ANALYSIS COMPLETED\n\n"
@@ -1179,6 +1248,8 @@ class ProjectAnalyzerTool(BaseTool):
                 )
             ):
                 output += f"🧪 Test coordinates: {rec.get('test_system')} at {test_root}\n"
+
+        output += self._render_python_facts(analysis)
 
         # 显示发现的文件
         existing_files = analysis.get("existing_files", [])

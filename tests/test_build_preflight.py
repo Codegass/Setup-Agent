@@ -110,6 +110,20 @@ def test_mismatch_provisions_and_narrates(monkeypatch):
     assert "Active: Java 11" in outcome.narration
 
 
+def test_jdk_install_without_durable_overlay_is_not_reported_as_provisioned(monkeypatch):
+    orch = ProvisionOrch('openjdk version "11.0.2"')
+    import sag.tools.internal.build_preflight as bp
+
+    monkeypatch.setattr(bp, "_register_overlay", lambda *a, **k: False)
+
+    outcome = JdkPreflight(orch).run("17", source="maven-enforcer")
+
+    assert outcome.provisioned is False
+    assert outcome.mismatch is True
+    assert "overlay registration failed" in outcome.narration
+    assert "overlay registered" not in outcome.narration
+
+
 def test_unprovisionable_degrades_to_mismatch_note_never_raises(monkeypatch):
     orch = ProvisionOrch('openjdk version "11.0.2"', apt_ok=False, temurin_ok=False)
     import sag.tools.internal.build_preflight as bp

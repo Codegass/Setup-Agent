@@ -1,6 +1,7 @@
 """Tool executable resolution and persistence for runtime toolchains."""
 
 import json
+import posixpath
 import re
 import shlex
 from dataclasses import asdict, dataclass
@@ -10,6 +11,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 from loguru import logger
 
 from sag.runtime.env_overlay import EnvOverlayStore
+from sag.tools.internal.build_preflight import read_build_requirements
 
 RequirementSource = Literal[
     "tool_parameter",
@@ -206,9 +208,22 @@ class ToolchainManager:
             candidates.append(overlay_candidate)
 
         if spec.prefer_wrapper:
-            wrapper = f"{working_directory.rstrip('/')}/mvnw"
-            if spec.executable == "mvn" and self._is_executable(wrapper):
-                candidates.append(self._candidate_from_path(spec, wrapper, source="wrapper"))
+            if spec.executable == "mvn":
+                wrapper = f"{working_directory.rstrip('/')}/mvnw"
+                if self._is_executable(wrapper):
+                    candidates.append(
+                        self._candidate_from_path(spec, wrapper, source="wrapper")
+                    )
+            elif spec.executable == "gradle":
+                gradle_wrapper = self._checkout_gradle_wrapper(working_directory)
+                if gradle_wrapper:
+                    candidates.append(
+                        self._candidate_from_path(
+                            spec,
+                            gradle_wrapper,
+                            source="wrapper",
+                        )
+                    )
 
         candidates.extend(self._registered_candidates(spec))
 
@@ -350,6 +365,60 @@ class ToolchainManager:
             f"test -x {shlex.quote(path)} && echo EXISTS || echo MISSING"
         )
         return result.get("exit_code") == 0 and "EXISTS" in (result.get("output") or "")
+
+    def _is_file(self, path: str) -> bool:
+        result = self.orchestrator.execute_command(
+            f"test -f {shlex.quote(path)} && echo EXISTS || echo MISSING"
+        )
+        return result.get("exit_code") == 0 and "EXISTS" in (result.get("output") or "")
+
+    def _realpath(self, path: str) -> Optional[str]:
+        result = self.orchestrator.execute_command(
+            f"realpath -e -- {shlex.quote(path)}"
+        )
+        resolved = (result.get("output") or "").strip().splitlines()
+        if result.get("exit_code") != 0 or not resolved:
+            return None
+        candidate = resolved[-1].strip()
+        return candidate if candidate.startswith("/") else None
+
+    @staticmethod
+    def _path_within(path: str, root: str) -> bool:
+        try:
+            return posixpath.commonpath((path, root)) == root
+        except ValueError:
+            return False
+
+    def _checkout_gradle_wrapper(self, working_directory: str) -> Optional[str]:
+        """Find the nearest ancestor gradlew without crossing the surveyed checkout.
+
+        Both the working directory and every wrapper target are realpath
+        checked. This rejects a lexically in-tree symlink that escapes the
+        checkout and never searches above the survey's persisted project root.
+        Without a survey stamp, discovery is intentionally limited to the
+        working directory itself.
+        """
+        manifest = read_build_requirements(self.orchestrator) or {}
+        survey_root = str((manifest.get("survey") or {}).get("project_path") or "").strip()
+        lexical_root = survey_root or working_directory
+        root = self._realpath(lexical_root)
+        current = self._realpath(working_directory)
+        if not root or not current or not self._path_within(current, root):
+            return None
+
+        while True:
+            wrapper = posixpath.join(current, "gradlew")
+            if self._is_file(wrapper):
+                wrapper_target = self._realpath(wrapper)
+                if wrapper_target and self._path_within(wrapper_target, root):
+                    return wrapper
+            if current == root:
+                break
+            parent = posixpath.dirname(current)
+            if parent == current or not self._path_within(parent, root):
+                break
+            current = parent
+        return None
 
     def _probe_version(self, path: str) -> Optional[str]:
         result = self.orchestrator.execute_command(f"{shlex.quote(path)} -version")

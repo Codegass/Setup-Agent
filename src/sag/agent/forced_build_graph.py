@@ -19,6 +19,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping
 
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
 from sag.tools.build.backends import BUILD_MARKERS
 
 GraphBoundaryStatus = Literal["verified", "unavailable"]
@@ -82,10 +83,13 @@ def _realpath(orchestrator: Any, path: str) -> str:
 
 
 def _read_required(orchestrator: Any, path: str) -> str:
-    result = _execute(orchestrator, f"cat -- {shlex.quote(path)}")
-    if not result.get("success"):
+    try:
+        content = read_container_text(orchestrator, path)
+    except ContainerFileReadError as exc:
+        raise _GraphUnavailable("graph_file_unreadable") from exc
+    if content is None:
         raise _GraphUnavailable("graph_file_unreadable")
-    return str(result.get("output") or "")
+    return content
 
 
 def _file_state(orchestrator: Any, path: str) -> Literal["file", "absent"]:

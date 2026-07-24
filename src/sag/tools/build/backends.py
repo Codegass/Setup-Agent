@@ -7,6 +7,7 @@ later ecosystems (python/node) add a module here, never a schema change.
 
 from typing import Any, Dict, Optional
 
+from sag.runtime.container_io import read_container_text
 from sag.tools.base import ActualToolExecution, OutputPersistenceError, ToolResult
 
 # Marker files probed (in priority order) to select a backend.
@@ -171,10 +172,10 @@ class GradleBackend:
         root = working_directory.rstrip("/")
         for name in self._GRADLE_BUILD_FILES:
             try:
-                result = orch.execute_command(f"cat {root}/{name} 2>/dev/null")
+                content = read_container_text(orch, f"{root}/{name}")
             except Exception:
                 continue
-            if result.get("success") and "maven-publish" in (result.get("output") or ""):
+            if content is not None and "maven-publish" in content:
                 return "publishToMavenLocal"
         return "assemble"
 

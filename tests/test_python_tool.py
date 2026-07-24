@@ -466,6 +466,37 @@ def test_native_setup_recovers_exact_local_provider_then_retries_root_command():
     assert all("--no-deps" not in command for command in install_commands)
 
 
+def test_native_setup_recovers_provider_when_wrapper_masks_pip_failure_as_success():
+    root_calls = 0
+
+    def masked_failure_then_success(_command):
+        nonlocal root_calls
+        root_calls += 1
+        if root_calls == 1:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": TVM_MISSING_PROVIDER,
+            }
+        return ok("root installed")
+
+    orch = Orch(
+        manifest=dict(TVM_NATIVE_MANIFEST),
+        rules=[
+            (TVM_ROOT_INSTALL, masked_failure_then_success),
+            *tvm_provider_rules(),
+        ],
+    )
+
+    result = PythonTool(orch).execute("setup_env", working_directory="/workspace/tvm")
+
+    assert result.succeeded is True
+    assert orch.commands.count(TVM_ROOT_INSTALL) == 2
+    assert orch.commands.count(TVM_PROVIDER_INSTALL) == 1
+    assert result.metadata["local_provider_recovery"]["provider_succeeded"] is True
+    assert result.metadata["local_provider_recovery"]["root_retry"] is True
+
+
 def test_native_setup_does_not_preinstall_provider_when_root_install_succeeds():
     orch = Orch(
         manifest=dict(TVM_NATIVE_MANIFEST),
@@ -604,7 +635,10 @@ def test_native_setup_rejects_provider_symlink_that_resolves_outside_project():
 
     assert result.succeeded is False
     assert orch.commands.count(TVM_ROOT_INSTALL) == 1
-    assert not any("test -f" in command for command in orch.commands)
+    assert not any(
+        f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml" in command
+        for command in orch.commands
+    )
     assert TVM_PROVIDER_INSTALL not in orch.commands
 
 
@@ -624,7 +658,10 @@ def test_native_setup_rejects_provider_when_checkout_root_resolves_outside_works
 
     assert result.succeeded is False
     assert orch.commands.count(TVM_ROOT_INSTALL) == 1
-    assert not any("test -f" in command for command in orch.commands)
+    assert not any(
+        f"test -f {TVM_PROVIDER_ROOT}/pyproject.toml" in command
+        for command in orch.commands
+    )
     assert TVM_PROVIDER_INSTALL not in orch.commands
 
 

@@ -483,6 +483,21 @@ class CommandOnlyFailingOverlayOrchestrator:
         del workdir, timeout
         if command.startswith("mkdir -p "):
             return {"success": True, "output": "", "exit_code": 0}
+        if command.startswith("if test -f ") and "base64 -w 0 --" in command:
+            encoded_path = command.split("base64 -w 0 --", 1)[1].split(";", 1)[0].strip()
+            path = shlex.split(encoded_path)[0]
+            if path not in self.storage:
+                return {
+                    "success": False,
+                    "output": "__SAG_FILE_MISSING__",
+                    "exit_code": 44,
+                }
+            payload = base64.b64encode(self.storage[path].encode("utf-8")).decode("ascii")
+            return {
+                "success": True,
+                "output": f"__SAG_FILE_BASE64__{payload}",
+                "exit_code": 0,
+            }
         if command.startswith("cat "):
             path = shlex.split(command)[1]
             if path not in self.storage:
@@ -524,6 +539,73 @@ def test_initial_fallback_write_failure_restores_missing_overlay_pair():
         )
 
     assert orchestrator.storage == {}
+
+
+class ProductionStrippingOverlayOrchestrator:
+    """Mirror DockerOrchestrator's text `.strip()` while supporting raw transport."""
+
+    def __init__(self):
+        self.storage = {}
+
+    def execute_command(self, command, workdir=None, timeout=None, truncate_output=True):
+        del workdir, timeout, truncate_output
+        if command.startswith("mkdir -p "):
+            return {"success": True, "output": "", "exit_code": 0}
+        if command.startswith("cat "):
+            path = shlex.split(command)[1]
+            if path not in self.storage:
+                return {"success": False, "output": "", "exit_code": 1}
+            # This is the production defect: ordinary command output loses the
+            # shell script's terminal LF.
+            return {
+                "success": True,
+                "output": self.storage[path].strip(),
+                "exit_code": 0,
+            }
+        if command.startswith("if test -f ") and "base64 -w 0 --" in command:
+            encoded_path = command.split("base64 -w 0 --", 1)[1].split(";", 1)[0].strip()
+            path = shlex.split(encoded_path)[0]
+            if path not in self.storage:
+                return {
+                    "success": False,
+                    "output": "__SAG_FILE_MISSING__",
+                    "exit_code": 44,
+                }
+            payload = base64.b64encode(self.storage[path].encode("utf-8")).decode("ascii")
+            return {
+                "success": True,
+                "output": f"__SAG_FILE_BASE64__{payload}",
+                "exit_code": 0,
+            }
+        if command.startswith("printf %s ") and " | base64 -d > " in command:
+            tokens = shlex.split(command)
+            path = tokens[-1]
+            self.storage[path] = base64.b64decode(tokens[2]).decode("utf-8")
+            return {"success": True, "output": "", "exit_code": 0}
+        if command.startswith("rm -f "):
+            path = shlex.split(command)[2]
+            self.storage.pop(path, None)
+            return {"success": True, "output": "", "exit_code": 0}
+        raise AssertionError(f"unexpected command: {command}")
+
+
+def test_command_fallback_readback_preserves_terminal_newline_byte_for_byte():
+    orchestrator = ProductionStrippingOverlayOrchestrator()
+    store = EnvOverlayStore(orchestrator)
+
+    overlay = store.register(
+        "java",
+        "/usr/lib/jvm/java-8/bin/java",
+        version="8",
+        env={"JAVA_HOME": "/usr/lib/jvm/java-8"},
+        activate=True,
+    )
+
+    assert overlay["tools"]["java"]["active"] == "/usr/lib/jvm/java-8/bin/java"
+    assert orchestrator.storage[DEFAULT_OVERLAY_SCRIPT].endswith("\n")
+    assert json.loads(orchestrator.storage[DEFAULT_OVERLAY_JSON])["tools"]["java"]["active"] == (
+        "/usr/lib/jvm/java-8/bin/java"
+    )
 
 
 def test_requirement_failure_atomically_records_constraint_and_exact_block():

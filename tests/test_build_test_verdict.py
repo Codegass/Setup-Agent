@@ -72,11 +72,29 @@ class FakeMavenPomOrchestrator:
             path = shlex.split(c)[2]
             return {"exit_code": 0 if path in self.files else 1, "output": ""}
         if c.startswith("cat "):
-            path = shlex.split(c)[1] if len(shlex.split(c)) > 1 else ""
+            path = shlex.split(c)[-1] if len(shlex.split(c)) > 1 else ""
             if path in self.files:
                 return {"exit_code": 0, "output": self.files[path]}
             return {"exit_code": 1, "output": ""}
         return {"exit_code": 1, "output": ""}
+
+
+class PresentationTruncatingMavenPomOrchestrator(FakeMavenPomOrchestrator):
+    def execute_command(self, command, truncate_output=True):
+        c = command.strip()
+        if c.startswith("cat ") and truncate_output:
+            path = shlex.split(c)[-1]
+            if path in self.files:
+                content = self.files[path]
+                return {
+                    "exit_code": 0,
+                    "output": (
+                        content[:500]
+                        + "\n... [SMART XML TRUNCATION: presentation only] ...\n"
+                        + content[-200:]
+                    ),
+                }
+        return super().execute_command(command)
 
 
 class FakeReceiptTracker:
@@ -270,6 +288,34 @@ def test_parse_maven_expected_artifacts_excludes_profile_gated_modules():
     cats = [c for c in orch.commands if c.startswith("cat ")]
     assert any("active-mod/pom.xml" in c for c in cats), "active module must be visited"
     assert not any("profiled-mod" in c for c in cats), "profile-gated module must be skipped"
+
+
+def test_physical_reactor_reads_large_poms_without_presentation_truncation():
+    filler = "\n".join(f"<property{i}>value{i}</property{i}>" for i in range(700))
+    root_pom = (
+        "<project><modelVersion>4.0.0</modelVersion>"
+        f"<properties>{filler}</properties>"
+        "<packaging>pom</packaging>"
+        "<modules><module>child</module></modules>"
+        "</project>"
+    )
+    child_pom = "<project><artifactId>child</artifactId><version>1</version></project>"
+    orch = PresentationTruncatingMavenPomOrchestrator(
+        {
+            "/workspace/proj/pom.xml": root_pom,
+            "/workspace/proj/child/pom.xml": child_pom,
+        }
+    )
+    validator = PhysicalValidator(docker_orchestrator=orch, project_path="/workspace")
+
+    snapshot = validator._bounded_maven_reactor("/workspace/proj")
+
+    assert len(root_pom) > 10_000
+    assert snapshot.complete is True
+    assert [record.module_dir for record in snapshot.records] == [
+        "/workspace/proj",
+        "/workspace/proj/child",
+    ]
 
 
 def test_active_maven_module_dirs_excludes_profile_gated():

@@ -22,7 +22,7 @@ class ConflictOrch:
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0,
                     "output": f'openjdk version "{self.java}.0.1"'}
-        if cmd == f"cat {REQUIREMENTS_PATH}":
+        if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}

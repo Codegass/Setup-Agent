@@ -132,7 +132,7 @@ class TopLevelOrch:
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
 
         c = cmd.strip()
-        if c == f"cat {REQUIREMENTS_PATH}":
+        if c in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             return res(True, json.dumps(self.manifest))
         if "python3 --version" in c:
             return res(True, "Python 3.12.0")

@@ -22,6 +22,10 @@ UNKNOWN_EXIT_FAILURE_MARKERS = (
     "BUILD FAILED",
     "Compilation failure",
     "[ERROR] Could not resolve",
+    "ERROR: No matching distribution found",
+    "ERROR: Could not find a version that satisfies the requirement",
+    "ERROR: Could not install",
+    "error: subprocess-exited-with-error",
 )
 MAVEN_ENFORCER_VERSION_RANGE_MARKERS = (
     "Detected Maven Version:",
@@ -966,7 +970,17 @@ class DockerOrchestrator:
         # created-but-empty exit file.
         quoted_exit = shlex.quote(exit_code_path)
         quoted_exit_tmp = shlex.quote(exit_code_path + ".tmp")
-        wrapped = f"{inner}; echo $? > {quoted_exit_tmp} && mv {quoted_exit_tmp} {quoted_exit}"
+        # Run the user command in a subshell: runtime profiles (or the command
+        # itself) may enable `set -e`, but that must never prevent the outer
+        # launcher from recording the terminal status. Preserve the original
+        # command exit code after atomically publishing the marker; only a
+        # marker-write failure is allowed to replace it.
+        wrapped = (
+            f"set +e; ( {inner} ); rc=$?; "
+            f'printf \'%s\\n\' "$rc" > {quoted_exit_tmp} && mv {quoted_exit_tmp} {quoted_exit}; '
+            'marker_rc=$?; if [ "$marker_rc" -ne 0 ]; then exit "$marker_rc"; fi; '
+            'exit "$rc"'
+        )
         launcher = (
             f"mkdir -p {self.DISPATCH_DIR} && "
             f"(nohup bash -c {shlex.quote(wrapped)} > {shlex.quote(log_path)} 2>&1 & "
@@ -1338,7 +1352,9 @@ class DockerOrchestrator:
             full_output = "".join(output_buffer)
 
             # Get final execution result
-            exit_code = exec_result.exit_code
+            observed_exit_code = exec_result.exit_code
+            exit_code = observed_exit_code
+            exit_code_inferred = observed_exit_code is None
 
             # For streaming execution, Docker can leave exit_code unknown after the stream ends.
             if exit_code is None:
@@ -1382,6 +1398,8 @@ class DockerOrchestrator:
             return {
                 "success": success,
                 "exit_code": exit_code or 0,
+                "observed_exit_code": observed_exit_code,
+                "exit_code_inferred": exit_code_inferred,
                 "output": full_output,
                 "termination_reason": monitoring_state["termination_reason"],
                 "monitoring_info": monitoring_info,

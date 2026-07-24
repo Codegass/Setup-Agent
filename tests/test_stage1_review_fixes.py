@@ -242,6 +242,29 @@ def test_update_successful_states_records_build_success_directory():
     assert engine.successful_states["maven_success"] is True
 
 
+def test_update_successful_states_does_not_label_gradle_build_as_maven():
+    engine = _engine()
+    engine.successful_states["maven_success"] = False
+
+    engine._update_successful_states(
+        "build",
+        {"action": "compile", "working_directory": "/workspace/gradle-app"},
+        ToolResult.completed_success(
+            output="BUILD SUCCESSFUL",
+            facts={
+                "system": "gradle",
+                "requested_action": "compile",
+                "effective_action": "install",
+            },
+            metadata={"working_directory": "/workspace/gradle-app"},
+        ),
+    )
+
+    assert engine.successful_states["working_directory"] == "/workspace/gradle-app"
+    assert engine.successful_states["gradle_success"] is True
+    assert engine.successful_states["maven_success"] is False
+
+
 # --- finding: legacy maven alias rejects common invocations -------------------
 
 

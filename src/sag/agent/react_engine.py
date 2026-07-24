@@ -411,6 +411,9 @@ class ReActEngine(UIEventEmitter):
             "cloned_repos": set(),  # Set of successfully cloned repo URLs
             "project_type": None,  # Detected project type
             "maven_success": False,  # Whether maven operations succeeded
+            "gradle_success": False,  # Whether gradle operations succeeded
+            "python_success": False,  # Whether python build operations succeeded
+            "build_success": False,  # Whether any consolidated build succeeded
             "excluded_modules": set(),
             "excluded_tests": set(),
             "report_snapshot": None,
@@ -3648,29 +3651,57 @@ class ReActEngine(UIEventEmitter):
                     self.successful_states["working_directory"] = actual_working_dir
                     logger.debug(f"Updated successful working directory: {actual_working_dir}")
 
-            elif tool_name in ("maven", "build") and params.get("working_directory"):
+            elif tool_name in ("maven", "build"):
                 # Remember successful build working directory. The legacy maven
                 # tool needed the output marker; the consolidated build tool's
-                # success already reflects the backend verdict.
+                # success already reflects the backend verdict. Do not label
+                # every facade success as Maven: the backend identity is an
+                # explicit result fact.
                 build_succeeded = (
                     result.succeeded
                     if tool_name == "build"
                     else "BUILD SUCCESS" in (result.output or "")
                 )
                 if build_succeeded:
-                    # Get working_directory parameter (standardized across all tools)
-                    maven_workdir = params.get("working_directory", "/workspace")
-                    self.successful_states["working_directory"] = maven_workdir
-                    self.successful_states["maven_success"] = True
+                    result_facts = getattr(result, "facts", None) or {}
+                    result_metadata = getattr(result, "metadata", None) or {}
+                    build_system = (
+                        "maven"
+                        if tool_name == "maven"
+                        else str(
+                            result_facts.get("system")
+                            or result_metadata.get("system")
+                            or "maven"
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    build_workdir = str(
+                        result_metadata.get("working_directory")
+                        or result_facts.get("island_root")
+                        or params.get("working_directory")
+                        or "/workspace"
+                    )
+                    self.successful_states["working_directory"] = build_workdir
+                    self.successful_states["build_success"] = True
+                    if build_system in {"maven", "gradle", "python"}:
+                        self.successful_states[f"{build_system}_success"] = True
 
-                    # Check if Maven is working outside workspace (concerning)
-                    if not maven_workdir.startswith("/workspace"):
-                        logger.warning(f"⚠️ Maven succeeded outside workspace: {maven_workdir}")
+                    # Check if the backend is working outside workspace (concerning)
+                    if not build_workdir.startswith("/workspace"):
+                        logger.warning(
+                            f"⚠️ {build_system.title()} succeeded outside workspace: "
+                            f"{build_workdir}"
+                        )
                         logger.warning(f"⚠️ This may indicate workspace issues")
                     else:
-                        logger.info(f"✅ Maven success in workspace: {maven_workdir}")
+                        logger.info(
+                            f"✅ {build_system.title()} success in workspace: {build_workdir}"
+                        )
 
-                    logger.info(f"Maven success recorded for directory: {maven_workdir}")
+                    logger.info(
+                        f"{build_system.title()} success recorded for directory: {build_workdir}"
+                    )
 
             elif tool_name in ("project_setup", "project"):
                 # Remember cloned repositories and project type. The project

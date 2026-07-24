@@ -320,7 +320,7 @@ def _loop_engine(islands, observed_workdirs):
 
     class ManifestOrch:
         def execute_command(self, command, **kwargs):
-            if command == f"cat {REQUIREMENTS_PATH}":
+            if command in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
                 return {
                     "success": True,
                     "exit_code": 0,

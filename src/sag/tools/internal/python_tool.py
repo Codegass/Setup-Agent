@@ -682,10 +682,11 @@ class PythonTool(BaseTool):
         for cmd in commands:
             result_already_recorded = False
             result = self._run(cmd, working_directory, install_timeout)
+            install_failed = self._effective_install_failure(result)
 
             # Bounded retry (spec: exactly once): pip's Requires-Python
             # rejection is authoritative; re-provision from it and rerun ONCE.
-            if not result.get("success") and not retried:
+            if install_failed and not retried:
                 needed = classify_python_version_error(result.get("output") or "")
                 active = outcome.active_version or active_python_version(self.orchestrator)
                 if needed and needed != active:
@@ -700,8 +701,9 @@ class PythonTool(BaseTool):
                         )
                         retry_meta = {"from": active or "unknown", "to": needed}
                         result = self._run(cmd, working_directory, install_timeout)
+                        install_failed = self._effective_install_failure(result)
 
-            if not result.get("success") and not provider_recovery_attempted:
+            if install_failed and not provider_recovery_attempted:
                 recovery = self._recover_local_provider(
                     result.get("output") or "",
                     command=cmd,
@@ -719,17 +721,21 @@ class PythonTool(BaseTool):
                         f"{self._tail(recovery['provider_result'].get('output') or '')}"
                     )
                     preamble.append(recovery["narration"])
-                    if recovery["provider_result"].get("success"):
+                    provider_failed = self._effective_install_failure(
+                        recovery["provider_result"]
+                    )
+                    if not provider_failed:
                         result = self._run(cmd, working_directory, install_timeout)
                         provider_recovery_meta["root_retry"] = True
                     else:
                         result = recovery["provider_result"]
                         result_already_recorded = True
+                    install_failed = self._effective_install_failure(result)
 
             # Faithfulness deviation (spec Component 3): the project's own
             # tool failed; the pip rung keeps setup moving, NARRATED so the
             # generated setup docs reflect what actually ran.
-            if not result.get("success") and installer in ("poetry", "pipenv"):
+            if install_failed and installer in ("poetry", "pipenv"):
                 deviation = (
                     f"[deviation] {installer} install failed; fell back to "
                     f"pip install -e . — setup docs must list the fallback"
@@ -739,6 +745,7 @@ class PythonTool(BaseTool):
                 cmd = _PIP_FALLBACK.replace("{venv}", venv)
                 result = self._run(cmd, working_directory, timeout)
                 result_already_recorded = False
+                install_failed = self._effective_install_failure(result)
 
             if not result_already_recorded:
                 transcript.append(f"$ {cmd}\n{self._tail(result.get('output') or '')}")
@@ -747,7 +754,7 @@ class PythonTool(BaseTool):
             # exit 0 while stderr said "No module named pip") is a FAILURE,
             # and the observation leads with it instead of burying it.
             masked = self._install_error_line(result.get("output") or "")
-            if not result.get("success") or masked:
+            if install_failed:
                 overall_ok = False
                 failure_detail = masked or self._failure_tail_line(result)
                 preamble.insert(0, f"[setup] dependency install FAILED — {failure_detail}")
@@ -881,7 +888,7 @@ class PythonTool(BaseTool):
                 "distribution_name": missing,
                 "provider_root": relative_root,
                 "provider_command": provider_command,
-                "provider_succeeded": bool(provider_result.get("success")),
+                "provider_succeeded": not self._effective_install_failure(provider_result),
                 "root_retry": False,
             },
         }
@@ -911,6 +918,19 @@ class PythonTool(BaseTool):
             if match.group(0) in line:
                 return line.strip()
         return match.group(0)
+
+    @classmethod
+    def _effective_install_failure(cls, result: Dict[str, Any]) -> bool:
+        """Classify one installer result once for every recovery/final branch.
+
+        Some execution wrappers can report a zero/unknown exit while pip
+        printed an explicit terminal error.  Treat that observation
+        consistently: it cannot be success while choosing recovery and failure
+        only later while rendering the result.
+        """
+        return not bool(result.get("success")) or bool(
+            cls._install_error_line(result.get("output") or "")
+        )
 
     @staticmethod
     def _failure_tail_line(result: Dict[str, Any]) -> str:

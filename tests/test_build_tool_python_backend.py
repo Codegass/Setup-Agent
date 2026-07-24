@@ -64,7 +64,7 @@ class ScriptedOrch:
         self.commands.append(command)
         if "java -version" in command:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
-        if command == f"cat {REQUIREMENTS_PATH}":
+        if command in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}

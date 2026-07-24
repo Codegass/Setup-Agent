@@ -55,6 +55,26 @@ class GraphOrchestrator:
         raise AssertionError(f"unexpected graph probe: {command}")
 
 
+class PresentationTruncatingGraphOrchestrator(GraphOrchestrator):
+    """Return invalid presentation text unless the caller requests machine output."""
+
+    def execute_command(self, command, workdir=None, timeout=None, truncate_output=True):
+        if command.startswith("cat -- ") and truncate_output:
+            path = shlex.split(command)[-1]
+            if path not in self.files:
+                return {"success": False, "exit_code": 1, "output": ""}
+            return {
+                "success": True,
+                "exit_code": 0,
+                "output": (
+                    self.files[path][:500]
+                    + "\n... [SMART XML TRUNCATION: presentation only] ...\n"
+                    + self.files[path][-200:]
+                ),
+            }
+        return super().execute_command(command, workdir=workdir, timeout=timeout)
+
+
 def _path_parents(path):
     parts = path.rstrip("/").split("/")
     return {"/".join(parts[:index]) or "/" for index in range(1, len(parts))}
@@ -93,6 +113,33 @@ def _pom(
     )
 
 
+def test_large_valid_maven_graph_uses_untruncated_machine_poms():
+    root = "/workspace/reactor"
+    filler = "\n".join(f"<property{i}>value{i}</property{i}>" for i in range(700))
+    root_pom = (
+        '<project xmlns="http://maven.apache.org/POM/4.0.0">'
+        "<modelVersion>4.0.0</modelVersion>"
+        f"<properties>{filler}</properties>"
+        "<modules><module>child</module></modules>"
+        "</project>"
+    )
+    orch = PresentationTruncatingGraphOrchestrator(
+        {
+            f"{root}/pom.xml": root_pom,
+            f"{root}/child/pom.xml": _pom(),
+        }
+    )
+
+    result = verify_forced_candidate_build_graph(
+        orch,
+        project_root=root,
+        candidate_root=root,
+        system="maven",
+    )
+
+    assert len(root_pom) > 10_000
+    assert result.status == "verified"
+    assert result.visited_roots == (root, f"{root}/child")
 def test_maven_reactor_rejects_parent_relative_module_outside_project():
     root = "/workspace/reactor"
     orch = GraphOrchestrator(

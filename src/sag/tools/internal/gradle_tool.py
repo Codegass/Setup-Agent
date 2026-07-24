@@ -2,6 +2,7 @@
 
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -462,6 +463,22 @@ class GradleTool(BaseTool):
         """Determine which Gradle executable to use."""
         if resolved_gradle and resolved_gradle.candidate.source == "env_overlay":
             return resolved_gradle.candidate.path
+
+        if (
+            use_wrapper
+            and resolved_gradle
+            and resolved_gradle.candidate.source == "wrapper"
+        ):
+            wrapper = resolved_gradle.candidate.path
+            chmod = self.orchestrator.execute_command(
+                f"chmod +x {shlex.quote(wrapper)}",
+                workdir=working_directory,
+            )
+            if chmod.get("exit_code") == 0:
+                logger.info(f"Found checkout Gradle wrapper: {wrapper}")
+                return wrapper
+            logger.warning(f"Checkout Gradle wrapper is not executable: {wrapper}")
+            resolved_gradle = None
 
         if use_wrapper:
             # Check for gradlew wrapper

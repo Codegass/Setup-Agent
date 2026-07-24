@@ -9,6 +9,7 @@ from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
 from sag.tools.base import BaseTool, ToolResult
 from sag.tools.internal.build_preflight import (
     JdkPreflight,
+    REQUIREMENTS_PATH,
     active_java_major,
     classify_version_error,
     read_build_requirements,
@@ -110,6 +111,14 @@ class BuildTool(BaseTool):
                 error="backend unavailable",
             )
 
+        requirements = read_build_requirements(self.docker_orchestrator)
+        effective_verb, island_context = self._effective_island_action(
+            requested_verb=verb,
+            system=system,
+            working_directory=working_directory,
+            requirements=requirements,
+        )
+
         # --- JDK pre-flight (spec §1b): check-and-fix, never a hard block ---
         # Routing by system: python skips the JDK pre-flight entirely.
         # PythonPreflight already runs inside python_tool.setup_env (the deps
@@ -120,8 +129,13 @@ class BuildTool(BaseTool):
         preamble_lines: List[str] = []
         jdk_retry_meta: Optional[Dict[str, Optional[str]]] = None
         outcome = None
-        if verb in _PREFLIGHT_VERBS and system != "python":
-            requirements = read_build_requirements(self.docker_orchestrator)
+        if effective_verb != verb:
+            preamble_lines.append(
+                "[island] "
+                f"requested {verb}; surveyed goal {island_context['manifest_goal']} "
+                f"at {island_context['island_root']}; executing install"
+            )
+        if effective_verb in _PREFLIGHT_VERBS and system != "python":
             outcome = JdkPreflight(self.docker_orchestrator).run(
                 requirements.get("java_version"),
                 source=requirements.get("java_version_source") or "unknown",
@@ -153,13 +167,13 @@ class BuildTool(BaseTool):
         def _execute_backend():
             if system == "maven":
                 return backend.execute(
-                    verb,
+                    effective_verb,
                     args,
                     working_directory,
                     timeout,
                     maven_version_requirement=maven_version_requirement,
                 )
-            return backend.execute(verb, args, working_directory, timeout)
+            return backend.execute(effective_verb, args, working_directory, timeout)
 
         actual_executions = [_execute_backend()]
         inner = actual_executions[-1].result
@@ -188,6 +202,9 @@ class BuildTool(BaseTool):
             inner,
             system,
             verb,
+            effective_verb,
+            working_directory,
+            island_context,
             preamble_lines,
             jdk_retry_meta,
         ).with_execution_trace(actual_executions)
@@ -207,15 +224,79 @@ class BuildTool(BaseTool):
                     return system, checked
         return None, checked
 
+    @staticmethod
+    def _effective_island_action(
+        *,
+        requested_verb: str,
+        system: str,
+        working_directory: str,
+        requirements: Dict[str, Any],
+    ) -> tuple[str, Dict[str, str]]:
+        """Apply the manifest's exact-island local-artifact policy.
+
+        Only compile/package may be promoted, and only on a pathological
+        aggregator at an exact surveyed island root. Tests and dependency
+        probes retain the caller's action.
+        """
+        if requirements.get("root_shape") != "pathological_aggregator":
+            return requested_verb, {}
+
+        survey_root = str(
+            ((requirements.get("survey") or {}).get("project_path") or "")
+        ).strip()
+
+        def normalized(path: Any) -> str:
+            value = str(path or "").strip()
+            if value and not value.startswith("/") and survey_root:
+                value = posixpath.join(survey_root, value)
+            return posixpath.normpath(value) if value else ""
+
+        requested_root = normalized(working_directory)
+        for raw_island in requirements.get("build_islands") or []:
+            if not isinstance(raw_island, dict):
+                continue
+            island_root = normalized(raw_island.get("root"))
+            island_system = str(raw_island.get("system") or "").strip().lower()
+            goal = str(raw_island.get("goal") or "").strip()
+            if island_root != requested_root or island_system != system:
+                continue
+            context = {
+                "island_root": island_root,
+                "manifest_goal": goal,
+                "action_source": f"{REQUIREMENTS_PATH}#build_islands",
+            }
+            if requested_verb in {"compile", "package"} and goal.lower() in {
+                "install",
+                "publishtomavenlocal",
+            }:
+                return "install", context
+            return requested_verb, context
+        return requested_verb, {}
+
     def _envelope(
         self,
         inner: ToolResult,
         system: str,
-        verb: str,
+        requested_verb: str,
+        effective_verb: str,
+        working_directory: str,
+        island_context: Optional[Dict[str, str]] = None,
         preamble_lines: Optional[List[str]] = None,
         jdk_retry: Optional[Dict[str, Optional[str]]] = None,
     ) -> ToolResult:
-        facts: Dict[str, Any] = {"system": system, "action": verb}
+        facts: Dict[str, Any] = {
+            "system": system,
+            "action": effective_verb,
+            "requested_action": requested_verb,
+            "effective_action": effective_verb,
+        }
+        if island_context:
+            facts.update(
+                {
+                    "island_root": island_context["island_root"],
+                    "manifest_goal": island_context["manifest_goal"],
+                }
+            )
         operation_outcome = inner.operation_outcome
         stats = inner.test_stats
         if stats is not None:
@@ -240,6 +321,16 @@ class BuildTool(BaseTool):
             output = preamble + (output or "")
             raw_output = preamble + (raw_output or "")
         metadata = dict(inner.metadata)
+        metadata.update(
+            {
+                "system": system,
+                "working_directory": working_directory,
+                "requested_action": requested_verb,
+                "effective_action": effective_verb,
+            }
+        )
+        if island_context:
+            metadata.update(island_context)
         if jdk_retry:
             metadata["jdk_retry"] = jdk_retry
         payload = {

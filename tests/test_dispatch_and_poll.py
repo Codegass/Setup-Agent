@@ -637,6 +637,53 @@ def test_detached_launcher_writes_exit_code_atomically():
     launcher = orchestrator.command_log[0]
     assert ".exit.tmp" in launcher
     assert "&& mv" in launcher
+    assert "set +e" in launcher
+    assert 'rc=$?' in launcher
+    assert 'exit "$rc"' in launcher
+
+
+def test_completed_detached_maven_enforcer_failure_uses_domain_handler(tmp_path):
+    from sag.tools.internal.maven_tool import MavenTool
+
+    output = (
+        "[ERROR] BUILD FAILURE\n"
+        "Rule 0: org.apache.maven.enforcer.rules.version.RequireMavenVersion failed\n"
+        "Detected Maven Version: 3.8.7 is not in the allowed range [3.9,)."
+    )
+
+    class CompletedVersionFailureOrchestrator(RoutingOrchestrator):
+        def execute_command_with_soft_timeout(self, command, workdir=None, **kwargs):
+            self.soft_timeout_calls.append(command)
+            return {
+                "success": False,
+                "runner_dispatched": True,
+                "exit_code": 1,
+                "output": output,
+                "full_output": output,
+                "termination_reason": None,
+                "dispatch_status": "completed_detached",
+                "lifecycle_state": "finished",
+                "dispatch": {
+                    "job_id": "maven-version",
+                    "log_path": "/tmp/sag_jobs/maven-version.log",
+                    "exit_code_path": "/tmp/sag_jobs/maven-version.log.exit",
+                },
+            }
+
+    persisted = []
+    tool = MavenTool(CompletedVersionFailureOrchestrator())
+    tool.output_storage = OutputStorageManager(tmp_path)
+    tool._persist_maven_requirement_failure = lambda **kwargs: persisted.append(kwargs) or True
+
+    result = tool.execute(command="compile", working_directory="/workspace/p")
+
+    assert result.succeeded is False
+    assert result.error_code == "MAVEN_VERSION_ERROR"
+    assert result.metadata["dispatch_status"] == "completed_detached"
+    assert result.metadata["maven_version_requirement"]["raw"] == "[3.9,)"
+    assert result.metadata["runtime_contract_persisted"] is True
+    assert result.poll_ref == "job:maven-version"
+    assert persisted and persisted[0]["working_directory"] == "/workspace/p"
 
 
 # --- review fixes: tools actually route long commands through dispatch ------

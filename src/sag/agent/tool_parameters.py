@@ -31,16 +31,27 @@ _MAVEN_COMMAND_TO_BUILD_ACTION = {
 
 
 def _map_legacy_maven_params(p: Dict[str, Any]) -> Dict[str, Any]:
-    """maven(command=...) -> build(action=...).
+    """maven(command=...|goals=...) -> build(action=...).
 
     Mirrors the gradle alias: known lifecycle phases map onto the build verbs;
     anything else falls back to compile with the raw command as args.
     Properties ride along as args so they are not silently dropped.
     """
-    command = str(p.get("command") or "compile").strip()
+    raw_command = p.get("command")
+    raw_goals = p.get("goals")
+    selected = raw_command if str(raw_command or "").strip() else raw_goals
+    if isinstance(selected, (list, tuple)):
+        command = " ".join(str(item) for item in selected if item is not None).strip()
+    else:
+        command = str(selected or "").strip()
     action = _MAVEN_COMMAND_TO_BUILD_ACTION.get(command.lower())
     arg_parts = []
-    if action is None:
+    if not command:
+        # Preserve the invalid/missing state so BuildTool can reject it.  The
+        # previous invented "compile" turned a malformed test request into a
+        # convincing but irrelevant successful compile.
+        action = ""
+    elif action is None:
         action = "compile"
         arg_parts.append(command)
     if p.get("extra_args"):
@@ -97,12 +108,45 @@ class ToolParameterNormalizer:
         "env": ("project", lambda p: {**p, "action": "env"}),
     }
 
-    def resolve_legacy_alias(self, tool_name, params):
+    def resolve_legacy_alias(self, tool_name, params, parameter_fixes=None):
         """Map a legacy tool name (model drift) to its stage-1 successor."""
         if tool_name in self.tools or tool_name not in self.LEGACY_TOOL_ALIASES:
             return tool_name, params
+        raw_params = dict(params or {})
         new_name, mapper = self.LEGACY_TOOL_ALIASES[tool_name]
-        mapped = {k: v for k, v in mapper(dict(params or {})).items() if v is not None}
+        mapped = {k: v for k, v in mapper(raw_params).items() if v is not None}
+        fixes = parameter_fixes
+        if fixes is not None:
+            self._add_parameter_fix(
+                fixes,
+                field="tool",
+                before=tool_name,
+                after=new_name,
+                reason=f"Mapped legacy tool '{tool_name}' to '{new_name}'",
+                source="schema_alias",
+            )
+            if tool_name == "maven" and "goals" in raw_params:
+                self._add_parameter_fix(
+                    fixes,
+                    field="goals",
+                    before=raw_params.get("goals"),
+                    after=None,
+                    reason=(
+                        "Removed legacy Maven goals alias after canonical command won"
+                        if str(raw_params.get("command") or "").strip()
+                        else "Renamed legacy Maven goals to build action"
+                    ),
+                    source="schema_alias",
+                )
+                if not str(raw_params.get("command") or "").strip():
+                    self._add_parameter_fix(
+                        fixes,
+                        field="action",
+                        before=None,
+                        after=mapped.get("action"),
+                        reason="Mapped legacy Maven goals to canonical build action",
+                        source="schema_alias",
+                    )
         return new_name, mapped
 
     def __init__(
@@ -249,7 +293,11 @@ class ToolParameterNormalizer:
         """Validate and fix tool parameters with self-healing capability."""
         fixes = parameter_fixes if parameter_fixes is not None else []
         if tool_name not in self.tools:
-            tool_name, params = self.resolve_legacy_alias(tool_name, params)
+            tool_name, params = self.resolve_legacy_alias(
+                tool_name,
+                params,
+                parameter_fixes=fixes,
+            )
         if tool_name not in self.tools:
             self.logger.error(f"Unknown tool: {tool_name}")
             return params

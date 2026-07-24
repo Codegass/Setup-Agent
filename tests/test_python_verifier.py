@@ -69,7 +69,7 @@ class LadderOrch:
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
 
         c = cmd.strip()
-        if c == f"cat {REQUIREMENTS_PATH}":
+        if c in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             return res(True, json.dumps(self.manifest))
         if "python3 --version" in c:
             return res(True, f"Python {self.active}.0")
@@ -438,7 +438,7 @@ class EnvOrch:
                     "output": f'openjdk version "{self.java}.0.1"',
                 }
             return {"success": False, "exit_code": 127, "output": "java: command not found"}
-        if cmd == f"cat {REQUIREMENTS_PATH}":
+        if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}

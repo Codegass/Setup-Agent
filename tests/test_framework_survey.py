@@ -73,7 +73,7 @@ class SurveyOrch:
                 body = command.split("<<'SAGEOF'\n", 1)[1].rsplit("\nSAGEOF", 1)[0]
                 self.files[REQUIREMENTS_PATH] = body
             return {"success": True, "exit_code": 0, "output": ""}
-        if command == f"cat {REQUIREMENTS_PATH}":
+        if command in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if REQUIREMENTS_PATH in self.files:
                 return {"success": True, "exit_code": 0, "output": self.files[REQUIREMENTS_PATH]}
             return {"success": False, "exit_code": 1, "output": ""}

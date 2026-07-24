@@ -43,11 +43,21 @@ class ScriptedOrch:
         self.project_name = project_name
         self.commands = []
 
+    def read_file(self, path):
+        self.commands.append(f"read_file {path}")
+        if path == REQUIREMENTS_PATH and self.manifest:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "content": json.dumps(self.manifest),
+            }
+        return {"success": False, "exit_code": 1, "content": ""}
+
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
-        if cmd == f"cat {REQUIREMENTS_PATH}":
+        if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
@@ -101,6 +111,7 @@ def _patch_provision(monkeypatch, ok=True):
         "_provision",
         (lambda self, v: f"/usr/lib/jvm/java-{v}-openjdk-arm64") if ok else (lambda self, v: None),
     )
+    monkeypatch.setattr(bp, "_register_overlay", lambda orchestrator, home, version: True)
 
 
 def test_matching_jdk_no_narration():
@@ -319,11 +330,21 @@ class MavenScriptedOrch:
         self.commands = []
         self.project_name = project_name
 
+    def read_file(self, path):
+        self.commands.append(f"read_file {path}")
+        if path == REQUIREMENTS_PATH and self.manifest:
+            return {
+                "success": True,
+                "exit_code": 0,
+                "content": json.dumps(self.manifest),
+            }
+        return {"success": False, "exit_code": 1, "content": ""}
+
     def execute_command(self, cmd, workdir=None, timeout=None):
         self.commands.append(cmd)
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
-        if cmd == f"cat {REQUIREMENTS_PATH}":
+        if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}
@@ -508,7 +529,7 @@ class GradleScriptedOrch(MavenScriptedOrch):
         self.commands.append(cmd)
         if "java -version" in cmd:
             return {"success": True, "exit_code": 0, "output": f'openjdk version "{self.java}.0.1"'}
-        if cmd == f"cat {REQUIREMENTS_PATH}":
+        if cmd in (f"cat {REQUIREMENTS_PATH}", f"cat -- {REQUIREMENTS_PATH}"):
             if self.manifest:
                 return {"success": True, "exit_code": 0, "output": json.dumps(self.manifest)}
             return {"success": False, "exit_code": 1, "output": ""}

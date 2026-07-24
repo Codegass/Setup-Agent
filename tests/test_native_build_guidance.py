@@ -343,6 +343,28 @@ def test_current_tvm_pep517_facts_are_grounded_in_the_root_pyproject():
         assert manifest[key] == python[key]
 
 
+def test_current_tvm_analyze_output_projects_compact_observed_python_facts():
+    analysis, _ = _analyzed(_TVM_ROOT, _CURRENT_TVM_FILES)
+
+    output = ProjectAnalyzerTool(
+        docker_orchestrator=None,
+        context_manager=None,
+    )._format_analysis_output(analysis)
+
+    assert "🐍 Python facts (observed):" in output
+    assert "Distribution: apache-tvm" in output
+    assert "Build backend: scikit_build_core.build" in output
+    assert f"Install root: {_TVM_ROOT}" in output
+    assert "apache-tvm-ffi at 3rdparty/tvm-ffi" in output
+    assert "Native artifact roots: build, python/tvm/lib" in output
+    assert (
+        "Verified smoke coordinates: tests/python/all-platform-minimal-test "
+        "(pyproject.toml:tool.cibuildwheel.test-command)"
+    ) in output
+    assert "build(action=" not in output
+    assert "Recommended" not in output
+
+
 def test_subdir_pep517_facts_keep_install_and_repository_coordinates_distinct():
     """Package paths are install-root relative; smoke/artifact paths are
     repository-root relative. A subdir PEP 517 project therefore must prefix
@@ -519,7 +541,10 @@ class NativeLadderOrch:
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
 
         c = cmd.strip()
-        if c == f"cat {REQUIREMENTS_PATH}":
+        if c in (
+            f"cat {REQUIREMENTS_PATH}",
+            f"cat -- {REQUIREMENTS_PATH}",
+        ):
             return res(True, json.dumps(self.manifest))
         if "python3 --version" in c:
             return res(True, "Python 3.12.0")
@@ -718,7 +743,10 @@ class StrictNativeLadderOrch:
             return {"success": ok, "exit_code": 0 if ok else 1, "output": output}
 
         c = cmd.strip()
-        if c == f"cat {REQUIREMENTS_PATH}":
+        if c in (
+            f"cat {REQUIREMENTS_PATH}",
+            f"cat -- {REQUIREMENTS_PATH}",
+        ):
             return res(True, json.dumps(self.manifest))
         if "python3 --version" in c:
             return res(True, "Python 3.12.0")

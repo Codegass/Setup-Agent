@@ -315,6 +315,35 @@ def test_execute_command_with_monitoring_treats_unknown_exit_ordinary_output_as_
 
     assert result["success"] is True
     assert result["exit_code"] == 0
+    assert result["observed_exit_code"] is None
+    assert result["exit_code_inferred"] is True
+
+
+def test_execute_command_with_monitoring_treats_unknown_exit_pip_terminal_failure_as_failure():
+    container = FakeContainer(
+        FakeStreamingExecResult(
+            exit_code=None,
+            output=[
+                (
+                    b"ERROR: No matching distribution found for "
+                    b"apache-tvm-ffi>=0.1.13\n",
+                    b"",
+                )
+            ],
+        )
+    )
+    orchestrator = build_orchestrator(container)
+
+    result = orchestrator.execute_command_with_monitoring(
+        "/workspace/tvm/.venv/bin/python -m pip install -e .",
+        use_timeout_wrapper=False,
+        enable_cpu_monitoring=False,
+    )
+
+    assert result["success"] is False
+    assert result["exit_code"] == 1
+    assert result["observed_exit_code"] is None
+    assert result["exit_code_inferred"] is True
 
 
 def test_execute_command_with_monitoring_keeps_unknown_exit_could_not_resolve_narrative_success():

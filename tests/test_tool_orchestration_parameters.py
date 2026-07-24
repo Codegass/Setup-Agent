@@ -161,6 +161,43 @@ def test_direct_build_backend_cwd_alias_normalizes_to_working_directory(tool_nam
     )
 
 
+def test_legacy_maven_goals_alias_executes_test_and_records_compatibility_fix():
+    build = SchemaLikeTool(
+        "build",
+        {
+            "action": {
+                "type": "string",
+                "enum": ["deps", "compile", "test", "package", "install"],
+            },
+            "working_directory": {"type": "string"},
+        },
+        required=["action"],
+    )
+    orchestrator, events, _tracking, _updates = _orchestrator(tools={"build": build})
+
+    execution = orchestrator.execute(
+        ToolCall(
+            name="maven",
+            raw_params={"goals": "test", "working_directory": "/workspace/project"},
+        )
+    )
+
+    assert execution.status == "success"
+    assert execution.call.name == "build"
+    assert execution.executed_params == {
+        "action": "test",
+        "working_directory": "/workspace/project",
+    }
+    assert any(
+        fix.source == "schema_alias"
+        and fix.field == "goals"
+        and fix.before == "test"
+        and fix.after is None
+        for fix in execution.parameter_fixes
+    )
+    assert any(event.event_type == "tool_parameters_fixed" for event in events)
+
+
 def test_normalized_action_envelope_is_emitted_before_tool_execution():
     trace = []
 

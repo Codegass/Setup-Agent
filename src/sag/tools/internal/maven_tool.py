@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 from loguru import logger
 
 from sag.agent.output_storage import OutputStorageManager
-from sag.evidence import EvidenceAssessment, TestStats
+from sag.evidence import EvidenceAssessment, OperationOutcome, TestStats
 from sag.runtime.env_overlay import EnvOverlayStore
 
 from ..base import BaseTool, ToolError, ToolResult
@@ -545,6 +545,67 @@ class MavenTool(BaseTool):
                     terminal_observation=True,
                 )
                 if not detached_result.succeeded:
+                    # A normally terminated Maven process with a recorded
+                    # non-zero exit is a Maven-domain failure, even though it
+                    # travelled through the detached transport. Re-enter the
+                    # domain handler so Enforcer/runtime constraints and other
+                    # Maven recovery facts are not discarded by the generic
+                    # detached classifier. Vanished processes and missing exit
+                    # markers remain transport/lifecycle failures below.
+                    domain_failure = (
+                        result.get("exit_code") is not None
+                        and result.get("exit_code") != 0
+                        and result.get("lifecycle_state") != "vanished"
+                        and detached_result.operation_outcome is OperationOutcome.FAILED
+                    )
+                    if domain_failure:
+                        detached_analysis = self._analyze_maven_output(
+                            str(full_output),
+                            result["exit_code"],
+                        )
+                        if (
+                            auto_ignore_test_failures
+                            and detached_analysis.get("test_failure_count", 0) > 0
+                        ):
+                            detached_analysis["build_success"] = False
+                            detached_analysis["error_type"] = (
+                                detached_analysis.get("error_type") or "TEST_FAILURE"
+                            )
+                            detached_analysis["ignored_test_failures_detected"] = True
+                        if requested_requirement_metadata and not detached_analysis.get(
+                            "maven_version_requirement"
+                        ):
+                            detached_analysis["maven_version_requirement"] = (
+                                requested_requirement_metadata
+                            )
+
+                        error_result = self._handle_maven_error(
+                            str(full_output),
+                            result["exit_code"],
+                            maven_cmd,
+                            detached_analysis,
+                            maven_runtime,
+                            runner_dispatched=result.get("runner_dispatched") is True,
+                            final_runner_dispatched=(
+                                result.get("final_runner_dispatched") is True
+                            ),
+                            output_ref_id=ref_id,
+                            working_directory=working_directory,
+                            poll_ref=detached_result.poll_ref,
+                        )
+                        error_result.metadata.update(
+                            {
+                                "dispatch_status": "completed_detached",
+                                "analysis": detached_analysis,
+                                "output_ref_id": ref_id,
+                            }
+                        )
+                        return self._finalize_main_result(
+                            error_result,
+                            preamble,
+                            jdk_retry_meta,
+                        )
+
                     detached_result.metadata.update(
                         {
                             "command": maven_cmd,
@@ -1840,6 +1901,7 @@ class MavenTool(BaseTool):
         final_runner_dispatched: bool = False,
         output_ref_id: Optional[str] = None,
         working_directory: Optional[str] = None,
+        poll_ref: Optional[str] = None,
     ) -> ToolResult:
         """Enhanced error handling with specific suggestions based on error type."""
         """Handle Maven build errors with detailed analysis."""
@@ -2203,6 +2265,8 @@ class MavenTool(BaseTool):
             documentation_links=documentation_links,
             raw_output=output,
             metadata=metadata,
+            poll_ref=poll_ref,
+            refs=[poll_ref] if poll_ref else [],
             **evidence_fields,
         )
 

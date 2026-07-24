@@ -37,6 +37,8 @@ from urllib.parse import quote, unquote, urlparse
 
 from loguru import logger
 
+from sag.runtime.container_io import ContainerFileReadError, read_container_text
+
 from sag.config.settings import (
     DEFAULT_BUILD_COVERAGE_THRESHOLD,
     DEFAULT_TEST_EXECUTION_THRESHOLD,
@@ -5100,13 +5102,13 @@ class PhysicalValidator:
                 return None, "maven_module_pom_unreadable"
             if not self._path_is_within(pom_real, project_real):
                 return None, "maven_module_pom_outside_project"
-            result = self._execute_command_with_logging(
-                f"cat {shlex.quote(pom_real)} 2>/dev/null",
-                "reading pom.xml for modules",
-            )
-            if not result.get("success"):
+            try:
+                content = read_container_text(self.docker_orchestrator, pom_real)
+            except ContainerFileReadError:
                 return None, "maven_module_pom_unreadable"
-            return str(result.get("output") or ""), None
+            if content is None:
+                return None, "maven_module_pom_unreadable"
+            return content, None
 
         def walk(module_path: str, depth: int) -> List[_MavenReactorRecord]:
             nonlocal root_pom

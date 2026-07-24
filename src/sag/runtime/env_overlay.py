@@ -10,6 +10,8 @@ import shlex
 from copy import deepcopy
 from typing import Any, Optional
 
+from sag.runtime.container_io import read_container_text
+
 DEFAULT_OVERLAY_JSON = "/workspace/.setup_agent/env_overlay.json"
 DEFAULT_OVERLAY_SCRIPT = "/workspace/.setup_agent/env_overlay.sh"
 
@@ -389,26 +391,11 @@ class EnvOverlayStore:
         return "\n".join(lines) + "\n"
 
     def _read_file(self, path: str) -> Optional[str]:
-        if hasattr(self.orchestrator, "read_file"):
-            result = self.orchestrator.read_file(path)
-            if isinstance(result, dict):
-                if result.get("exit_code", 0) != 0 or result.get("success") is False:
-                    return None
-                return result.get("content") or result.get("output") or ""
-            return str(result)
-
-        files = getattr(self.orchestrator, "files", None)
-        if isinstance(files, dict):
-            return files.get(path)
-
-        # Preserve the distinction between a missing file and a present empty
-        # file.  Rollback needs that distinction on the first transaction:
-        # treating ENOENT as "" would "restore" two corrupt empty overlay
-        # files after a failed initial publish.
-        result = self.orchestrator.execute_command(f"cat {shlex.quote(path)}")
-        if result.get("exit_code", 0) != 0 or result.get("success") is False:
-            return None
-        return result.get("output", "")
+        # Exact transport preserves the terminal LF in the generated shell
+        # script. DockerOrchestrator's ordinary text output calls `.strip()`,
+        # which made every real overlay transaction fail its byte-for-byte
+        # readback even though the persisted files were correct.
+        return read_container_text(self.orchestrator, path, exact_bytes=True)
 
     def _write_file(self, path: str, content: str) -> None:
         if hasattr(self.orchestrator, "write_file"):

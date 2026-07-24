@@ -43,6 +43,74 @@ def test_legacy_maven_call_aliases_to_build():
     assert params["action"] == "test"
 
 
+def test_legacy_maven_goals_only_call_preserves_test_action():
+    from sag.agent.tool_parameters import ToolParameterNormalizer
+
+    class FakeBuild:
+        def _get_parameters_schema(self):
+            return {
+                "type": "object",
+                "properties": {
+                    "action": {},
+                    "args": {},
+                    "working_directory": {},
+                },
+            }
+
+    mgr = ToolParameterNormalizer(
+        tools={"build": FakeBuild()},
+        successful_states={},
+        repository_url=None,
+        logger=SimpleNamespace(
+            warning=lambda *a, **k: None,
+            info=lambda *a, **k: None,
+            error=lambda *a, **k: None,
+        ),
+    )
+
+    name, params = mgr.resolve_legacy_alias(
+        "maven",
+        {"goals": "test", "working_directory": "/w"},
+    )
+
+    assert name == "build"
+    assert params["action"] == "test"
+
+
+def test_legacy_maven_missing_lifecycle_does_not_invent_compile():
+    from sag.agent.tool_parameters import ToolParameterNormalizer
+
+    mgr = ToolParameterNormalizer(
+        tools={"build": object()},
+        successful_states={},
+        repository_url=None,
+    )
+
+    name, params = mgr.resolve_legacy_alias("maven", {"working_directory": "/w"})
+
+    assert name == "build"
+    assert params["action"] == ""
+    assert params["action"] != "compile"
+
+
+def test_legacy_maven_canonical_command_wins_over_goals_alias():
+    from sag.agent.tool_parameters import ToolParameterNormalizer
+
+    mgr = ToolParameterNormalizer(
+        tools={"build": object()},
+        successful_states={},
+        repository_url=None,
+    )
+
+    name, params = mgr.resolve_legacy_alias(
+        "maven",
+        {"command": "verify", "goals": "test", "working_directory": "/w"},
+    )
+
+    assert name == "build"
+    assert params["action"] == "package"
+
+
 # ---------------------------------------------------------------------------
 # Stage-2 contract (plan Task 8): mode-aware registration. Setup runs register
 # the `phase` lifecycle tool and NOT `manage_context`; `sag run --task` keeps

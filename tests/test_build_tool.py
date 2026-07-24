@@ -6,19 +6,22 @@ from project evidence; verbs that don't apply return verdict=skipped.
 Stage 1: backends DELEGATE to the existing MavenTool/GradleTool.
 """
 
+import json
 import shlex
 from types import SimpleNamespace
 
 from sag.tools.base import ToolResult
 from sag.tools.build.build_tool import BuildTool
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 
 
 class FakeBackendTool:
     """Stands in for MavenTool/GradleTool: records calls, returns a scripted result."""
 
-    def __init__(self, result=None):
+    def __init__(self, result=None, orchestrator=None):
         self.calls = []
         self.result = result or ToolResult.completed_success(output="BUILD SUCCESS")
+        self.orchestrator = orchestrator
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
@@ -28,8 +31,14 @@ class FakeBackendTool:
 class MarkerOrchestrator:
     """Answers build-marker probes: which marker files exist."""
 
-    def __init__(self, markers):
+    def __init__(self, markers, files=None):
         self.markers = set(markers)
+        self.files = dict(files or {})
+
+    def read_file(self, path):
+        if path not in self.files:
+            return {"success": False, "content": "", "exit_code": 1}
+        return {"success": True, "content": self.files[path], "exit_code": 0}
 
     def execute_command(self, command, **kwargs):
         for m in self.markers:
@@ -165,3 +174,85 @@ def test_args_passthrough():
     assert maven.calls[0].get("extra_args") == "-Dtest=FooTest" or "-Dtest=FooTest" in str(
         maven.calls[0]
     )
+
+
+def test_pathological_gradle_island_promotes_compile_to_manifest_install_goal():
+    root = "/workspace/bigtop"
+    island = f"{root}/bigtop-data-generators"
+    manifest = {
+        "survey": {"project_path": root},
+        "root_shape": "pathological_aggregator",
+        "build_islands": [
+            {
+                "root": island,
+                "system": "gradle",
+                "goal": "publishToMavenLocal",
+            }
+        ],
+    }
+    orchestrator = MarkerOrchestrator(
+        {"build.gradle"},
+        files={
+            REQUIREMENTS_PATH: json.dumps(manifest),
+            f"{island}/build.gradle": (
+                "// enough content that a presentation read would be unsafe\n"
+                + ("x" * 12000)
+                + "\nsubprojects { apply plugin: 'maven-publish' }\n"
+            ),
+        },
+    )
+    gradle = FakeBackendTool(orchestrator=orchestrator)
+    tool = BuildTool(orchestrator, gradle_tool=gradle)
+
+    result = tool.execute(action="compile", working_directory=island)
+
+    assert result.succeeded
+    assert gradle.calls[0]["tasks"] == "publishToMavenLocal"
+    assert result.facts == {
+        "system": "gradle",
+        "action": "install",
+        "requested_action": "compile",
+        "effective_action": "install",
+        "island_root": island,
+        "manifest_goal": "publishToMavenLocal",
+    }
+    assert result.metadata["action_source"] == (
+        "/workspace/.setup_agent/build_requirements.json#build_islands"
+    )
+    assert result.metadata["working_directory"] == island
+    assert "[island]" in result.output
+
+
+def test_pathological_island_promotion_never_replaces_test():
+    root = "/workspace/bigtop"
+    island = f"{root}/bigtop-data-generators"
+    orchestrator = MarkerOrchestrator(
+        {"build.gradle"},
+        files={
+            REQUIREMENTS_PATH: json.dumps(
+                {
+                    "survey": {"project_path": root},
+                    "root_shape": "pathological_aggregator",
+                    "build_islands": [
+                        {
+                            "root": island,
+                            "system": "gradle",
+                            "goal": "publishToMavenLocal",
+                        }
+                    ],
+                }
+            ),
+            f"{island}/build.gradle": "apply plugin: 'maven-publish'\n",
+        },
+    )
+    gradle = FakeBackendTool(orchestrator=orchestrator)
+
+    result = BuildTool(orchestrator, gradle_tool=gradle).execute(
+        action="test",
+        working_directory=island,
+    )
+
+    assert result.succeeded
+    assert gradle.calls[0]["tasks"] == "test"
+    assert result.facts["requested_action"] == "test"
+    assert result.facts["effective_action"] == "test"

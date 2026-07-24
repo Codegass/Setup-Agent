@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 
 from loguru import logger
 
+from sag.runtime.container_io import read_container_text
 from sag.tools.internal.python_env import (
     _REPAIR_ACTION_PHRASE,
     ensure_venv_pip,
@@ -45,10 +46,10 @@ def write_build_requirements(orchestrator, data: Dict[str, Any]) -> bool:
 def read_build_requirements(orchestrator) -> Dict[str, Any]:
     """Read the manifest; {} when absent or corrupt (callers degrade gracefully)."""
     try:
-        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
-        if not result.get("success"):
+        content = read_container_text(orchestrator, REQUIREMENTS_PATH, exact_bytes=True)
+        if content is None:
             return {}
-        return json.loads(result.get("output") or "")
+        return json.loads(content)
     except Exception:
         return {}
 
@@ -132,7 +133,20 @@ class JdkPreflight:
         )
         java_home = self._provision(required)
         if java_home:
-            _register_overlay(self.orchestrator, java_home, required)
+            registered = _register_overlay(self.orchestrator, java_home, required)
+            if not registered:
+                return PreflightOutcome(
+                    matched=False,
+                    active_version=active,
+                    required_version=required,
+                    provisioned=False,
+                    mismatch=True,
+                    narration=(
+                        f"{header}\n→ installed JDK {required} at {java_home}, but "
+                        "overlay registration failed; the new runtime is not "
+                        "durably active"
+                    ),
+                )
             return PreflightOutcome(
                 matched=False, active_version=active, required_version=required,
                 provisioned=True,
@@ -315,7 +329,20 @@ class PythonPreflight:
         rung = self._provision(required, venv)
         if rung:
             pip_note = self._ensure_venv_pip(venv, required)
-            _register_python_overlay(self.orchestrator, venv, required)
+            registered = _register_python_overlay(self.orchestrator, venv, required)
+            if not registered:
+                return PreflightOutcome(
+                    matched=False,
+                    active_version=active,
+                    required_version=required,
+                    provisioned=False,
+                    mismatch=True,
+                    narration=(
+                        f"{header}\n→ {rung}-provisioned {required} at {venv}, "
+                        "but overlay registration failed; the interpreter is "
+                        "not durably active"
+                    ),
+                )
             narration = (
                 f"{header}\n→ {rung}-provisioned {required}, "
                 f"venv at {venv} (overlay registered)"
@@ -394,10 +421,23 @@ class PythonPreflight:
                 self.orchestrator._python_ensurepip_ok = True
             except Exception:
                 pass
-        _register_python_overlay(self.orchestrator, venv, required)
+        registered = _register_python_overlay(self.orchestrator, venv, required)
         narration = header
         if pip_note:
             narration += f"\n{pip_note}"
+        if not registered:
+            narration += (
+                "\n→ overlay registration failed; the repaired interpreter is "
+                "not durably active"
+            )
+            return PreflightOutcome(
+                matched=False,
+                active_version=active,
+                required_version=required,
+                provisioned=False,
+                mismatch=True,
+                narration=narration,
+            )
         return PreflightOutcome(
             matched=True, active_version=active, required_version=required,
             provisioned=True, mismatch=False, narration=narration,

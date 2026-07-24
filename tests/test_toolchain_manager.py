@@ -1,6 +1,8 @@
 import json
+import shlex
 
 from sag.runtime.env_overlay import DEFAULT_OVERLAY_JSON
+from sag.tools.internal.build_preflight import REQUIREMENTS_PATH
 from sag.tools.internal.toolchain_manager import (
     ToolchainManager,
     ToolchainSpec,
@@ -10,9 +12,18 @@ from sag.tools.internal.toolchain_manager import (
 
 
 class FakeToolchainOrchestrator:
-    def __init__(self, executables=None, path_executable=None):
+    def __init__(
+        self,
+        executables=None,
+        path_executable=None,
+        *,
+        realpaths=None,
+        regular_files=None,
+    ):
         self.executables = executables or {}
         self.path_executable = path_executable
+        self.realpaths = realpaths or {}
+        self.regular_files = set(regular_files or ())
         self.files = {}
         self.commands = []
         self.reads = []
@@ -29,9 +40,25 @@ class FakeToolchainOrchestrator:
     def execute_command(self, command, workdir=None, timeout=None):
         self.commands.append((command, workdir, timeout))
 
+        if command.startswith("realpath -e -- "):
+            path = shlex.split(command)[3]
+            resolved = self.realpaths.get(path)
+            if resolved:
+                return {"success": True, "output": resolved, "exit_code": 0}
+            return {"success": False, "output": "", "exit_code": 1}
+
         if command.startswith("test -x "):
             path = command.split("test -x ", 1)[1].split(" && ", 1)[0].strip("'")
             exists = path in self.executables
+            return {
+                "success": True,
+                "output": "EXISTS" if exists else "MISSING",
+                "exit_code": 0,
+            }
+
+        if command.startswith("test -f "):
+            path = command.split("test -f ", 1)[1].split(" && ", 1)[0].strip("'")
+            exists = path in self.regular_files or path in self.files
             return {
                 "success": True,
                 "output": "EXISTS" if exists else "MISSING",
@@ -53,7 +80,7 @@ class FakeToolchainOrchestrator:
             ]
             return {"success": True, "output": "\n".join(paths), "exit_code": 0}
 
-        if command == "command -v mvn":
+        if command in ("command -v mvn", "command -v gradle"):
             if self.path_executable:
                 return {"success": True, "output": self.path_executable, "exit_code": 0}
             return {"success": False, "output": "", "exit_code": 1}
@@ -71,6 +98,97 @@ class FakeToolchainOrchestrator:
             return {"success": True, "output": "", "exit_code": 0}
 
         return {"success": True, "output": "", "exit_code": 0}
+
+
+def test_nested_gradle_island_prefers_checkout_ancestor_wrapper():
+    root = "/workspace/repo"
+    island = f"{root}/islands/data"
+    wrapper = f"{root}/gradlew"
+    orchestrator = FakeToolchainOrchestrator(
+        {
+            wrapper: "Gradle 8.7",
+            "/usr/bin/gradle": "Gradle 4.4.1",
+        },
+        path_executable="/usr/bin/gradle",
+        realpaths={
+            root: root,
+            island: island,
+            f"{root}/islands": f"{root}/islands",
+            wrapper: wrapper,
+        },
+        regular_files={wrapper},
+    )
+    orchestrator.files[REQUIREMENTS_PATH] = json.dumps(
+        {"survey": {"project_path": root}}
+    )
+
+    resolved = ToolchainManager(orchestrator).resolve(
+        ToolchainSpec(name="gradle", executable="gradle"),
+        working_directory=island,
+    )
+
+    assert resolved is not None
+    assert resolved.candidate.path == wrapper
+    assert resolved.candidate.source == "wrapper"
+
+
+def test_gradle_wrapper_discovery_rejects_escape_and_stops_at_survey_root():
+    root = "/workspace/repo"
+    island = f"{root}/island"
+    system_gradle = "/usr/bin/gradle"
+    cases = (
+        # The working directory itself resolves outside the surveyed checkout.
+        {
+            "realpaths": {
+                root: root,
+                island: "/outside/island",
+                "/outside/island": "/outside/island",
+            },
+            "wrappers": {"/outside/gradlew"},
+        },
+        # The wrapper is a symlink whose target escapes the checkout.
+        {
+            "realpaths": {
+                root: root,
+                island: island,
+                f"{root}/gradlew": "/outside/gradlew",
+            },
+            "wrappers": {f"{root}/gradlew"},
+        },
+        # A wrapper above the surveyed checkout must never be considered.
+        {
+            "realpaths": {
+                root: root,
+                island: island,
+                "/workspace/gradlew": "/workspace/gradlew",
+            },
+            "wrappers": {"/workspace/gradlew"},
+        },
+    )
+
+    for case in cases:
+        executables = {
+            system_gradle: "Gradle 8.5",
+            **{path: "Gradle 8.7" for path in case["wrappers"]},
+        }
+        orchestrator = FakeToolchainOrchestrator(
+            executables,
+            path_executable=system_gradle,
+            realpaths=case["realpaths"],
+            regular_files=case["wrappers"],
+        )
+        orchestrator.files[REQUIREMENTS_PATH] = json.dumps(
+            {"survey": {"project_path": root}}
+        )
+
+        resolved = ToolchainManager(orchestrator).resolve(
+            ToolchainSpec(name="gradle", executable="gradle"),
+            working_directory=island,
+        )
+
+        assert resolved is not None
+        assert resolved.candidate.path == system_gradle
+        assert resolved.candidate.source == "system"
 
 
 def test_resolve_exact_requirement_does_not_upgrade_to_newer_version():

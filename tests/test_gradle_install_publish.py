@@ -12,6 +12,8 @@ maven-publish plugin (probed from the working directory's gradle build files),
 else assemble (publishToMavenLocal would fail without the plugin).
 """
 
+import shlex
+
 from sag.tools.build.backends import GradleBackend
 
 
@@ -21,15 +23,19 @@ class FakeGradleTool:
     def __init__(self, files: dict):
         self.files = files  # path -> content
         self.calls = []
+        self.probe_calls = []
 
     class _Orch:
-        def __init__(self, files):
+        def __init__(self, files, probe_calls):
             self.files = files
+            self.probe_calls = probe_calls
 
         def execute_command(self, cmd, workdir=None, timeout=None, **_):
             # Answer `cat <path>` probes for gradle build files.
+            self.probe_calls.append((cmd, dict(_)))
             if cmd.startswith("cat "):
-                path = cmd.split("cat ", 1)[1].split(" ", 1)[0].strip()
+                tokens = shlex.split(cmd)
+                path = tokens[-1]
                 if path in self.files:
                     return {"success": True, "exit_code": 0, "output": self.files[path]}
                 return {"success": False, "exit_code": 1, "output": ""}
@@ -37,7 +43,7 @@ class FakeGradleTool:
 
     @property
     def orchestrator(self):
-        return self._Orch(self.files)
+        return self._Orch(self.files, self.probe_calls)
 
     def execute(self, **kwargs):
         self.calls.append(kwargs)
@@ -73,6 +79,24 @@ def test_install_detects_plugin_in_subprojects_block_of_root_build():
     })
     GradleBackend(tool).run("install", None, "/workspace/proj", None)
     assert tool.calls[0]["tasks"] == "publishToMavenLocal"
+
+
+def test_install_reads_the_island_build_file_without_presentation_truncation():
+    tool = FakeGradleTool(
+        {
+            "/workspace/proj/build.gradle": (
+                ("// generated preamble\n" + ("x" * 12000))
+                + "\nsubprojects { apply plugin: 'maven-publish' }\n"
+            ),
+        }
+    )
+
+    GradleBackend(tool).run("install", None, "/workspace/proj", None)
+
+    assert tool.calls[0]["tasks"] == "publishToMavenLocal"
+    assert any(
+        kwargs.get("truncate_output") is False for _command, kwargs in tool.probe_calls
+    )
 
 
 def test_install_falls_back_to_assemble_without_plugin():

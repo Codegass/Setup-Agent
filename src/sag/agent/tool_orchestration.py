@@ -405,7 +405,9 @@ class ToolOrchestrator:
             # Legacy tool names (model drift) map onto their stage-1 successors
             # before any lookup, so old names execute instead of failing.
             resolved_name, resolved_params = self.parameter_normalizer.resolve_legacy_alias(
-                call.name, call.raw_params
+                call.name,
+                call.raw_params,
+                parameter_fixes=call.parameter_fixes,
             )
             if resolved_name != call.name:
                 self.logger.info(f"Legacy tool alias resolved: {call.name} -> {resolved_name}")
