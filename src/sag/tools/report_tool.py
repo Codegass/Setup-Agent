@@ -21,7 +21,12 @@ from sag.evidence import (
 )
 from sag.reporting import format_percentage, render_condensed_summary, truncate_list
 from sag.runtime.env_overlay import EnvOverlayStore
-from sag.tools.module_metrics import MODULE_METRICS_PATH, assemble_module_metrics
+from sag.tools.module_metrics import (
+    MODULE_METRICS_CSV_PATH,
+    MODULE_METRICS_PATH,
+    assemble_module_metrics,
+    module_metrics_to_csv,
+)
 
 # Sentinel for memoizing _build_module_metrics (the result can legitimately be
 # None, so None cannot double as "not computed yet").
@@ -1170,6 +1175,7 @@ class ReportTool(BaseTool, UIEventEmitter):
             )
             if module_metrics:
                 self._persist_module_metrics(module_metrics)
+                self._persist_module_metrics_csv(module_metrics)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"module metrics step skipped: {exc}")
 
@@ -3934,6 +3940,21 @@ class ReportTool(BaseTool, UIEventEmitter):
             self.docker_orchestrator.execute_command(cmd)
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"Failed to persist module metrics: {exc}")
+
+    def _persist_module_metrics_csv(self, metrics: dict) -> None:
+        """Best-effort flat CSV mirror of module_metrics.json (never blocks)."""
+        if not metrics or not self.docker_orchestrator:
+            return
+        try:
+            payload = module_metrics_to_csv(metrics)
+            delimiter = "SAG_MODULE_METRICS_CSV_EOF"
+            cmd = (
+                f"mkdir -p /workspace/.setup_agent && "
+                f"cat > {MODULE_METRICS_CSV_PATH} <<'{delimiter}'\n{payload}{delimiter}"
+            )
+            self.docker_orchestrator.execute_command(cmd)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Failed to persist module metrics CSV: {exc}")
 
     def _render_submodule_breakdown(self, module_metrics: dict) -> List[str]:
         """Markdown 'Submodule Breakdown' section; [] for single-module projects."""

@@ -3736,11 +3736,36 @@ class PhysicalValidator:
             )
             has_test_sources = "EXISTS" in (tst.get("output") or "")
 
+            # Source + report file counts for the flat CSV mirror. Two extra
+            # finds per module (~40% more execs on this scan); cheap relative to
+            # the build itself. ponytail: fold into the class/jar finds if scan
+            # latency ever matters.
+            jf = self._execute_command_with_logging(
+                f"find '{module_dir}/src' -name '*.java' -type f 2>/dev/null | wc -l",
+                f"counting java sources in {rel}",
+            )
+            java_file_count = (
+                int((jf.get("output") or "0").strip() or 0) if jf.get("success") else None
+            )
+
+            report_file_count = 0
+            if report_dirs:
+                joined = " ".join(f"'{d}'" for d in report_dirs)
+                rf = self._execute_command_with_logging(
+                    f"find {joined} -name '*.xml' -type f 2>/dev/null | wc -l",
+                    f"counting report files in {rel}",
+                )
+                report_file_count = (
+                    int((rf.get("output") or "0").strip() or 0) if rf.get("success") else 0
+                )
+
             record = {
                 "path": rel,
                 "name": name,
                 "class_count": class_count,
                 "jar_count": jar_count,
+                "java_file_count": java_file_count,
+                "report_file_count": report_file_count,
                 "report_dirs": report_dirs,
                 "has_test_sources": has_test_sources,
             }
