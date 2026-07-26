@@ -277,16 +277,39 @@ Files: `src/sag/tools/build/backends.py`, `src/sag/tools/build/build_tool.py`,
 
 ## Stage E — P0-D: native capability state
 
-Replace the binary "native ready/not built" with
-`native_artifacts_present` + named capabilities (llvm/cuda:
-present/absent/unknown) + `package_integrity`. Delete
-`NATIVE_NOT_BUILT_TEST_GUIDANCE`'s phase-outcome trigger; native-state text is
-projected from an artifact probe, never from build-phase outcome. Add a typed
-native build affordance (`build(action='native', features=[...],
-definitions={...}, provenance=[...])`) usable only with surveyed project-owned
-provenance (CI/docs pins). Advisor digest carries the capability facts.
 Matrix rows: ".so exists while integrity partial → no layer may say 'not
-built'", "no project-owned policy → report unknown, don't invent flags".
+built'", "all-skipped smoke projects its skip reasons", "no project-owned
+policy → report unknown, don't invent flags".
+
+### Binding notes (Stage E, bound after Stage D merges; single lane)
+
+Files: `src/sag/agent/react_engine.py`, `src/sag/tools/internal/python_tool.py`
+(+ NEW test file). The typed `build(action='native', ...)` affordance is
+DEFERRED to P1 together with the CI-policy survey (P1-C) that alone can feed
+it provenance — an affordance no signal ever points to is dead weight, and
+inventing flags without provenance is exactly what the review forbids.
+
+1. **Artifact probe replaces the phase-outcome proxy.** Delete
+   `_build_phase_lacked_success` as the trigger for
+   `NATIVE_NOT_BUILT_TEST_GUIDANCE`. New trigger: one orchestrator probe for
+   native shared objects under the surveyed native root (`find <root> -name
+   "*.so" ...` bounded). Artifacts ABSENT → the existing "not built" steer
+   (now true). Artifacts PRESENT → new guidance text stating the facts:
+   "Native artifacts are present (<n> shared objects). The build phase
+   closed '<outcome>' for packaging-integrity reasons — that does NOT mean
+   the native core is missing. Run the bounded smoke; if it skips, the skip
+   reasons name the missing capability." No layer may render "not built"
+   when the probe saw artifacts.
+2. **Skip reasons are model-visible facts.** When the bounded smoke ends
+   all-skipped, python_tool appends up to 3 distinct junit skip messages
+   (truncated to one line each) after the capability-unproven line:
+   `[test] skip reasons: need llvm; ...` — projecting the exact fact chain
+   the ground truth showed the model never saw (live TVM: `need llvm`).
+3. **Advisor digest carries native state.** `_advisor_evidence_digest`
+   gains, for native projects only: artifacts present/absent (probe fact),
+   `smoke_capability_unproven` when set, and the skip reasons — so the
+   advisor corrects from independent facts instead of echoing the phase
+   outcome (review §P1-E direction, minimal form).
 
 ---
 
