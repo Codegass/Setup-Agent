@@ -770,6 +770,18 @@ def has_build_attempt_receipt(
     return False
 
 
+def _read_requirements_manifest(orchestrator: Any) -> Mapping[str, Any] | None:
+    """Read the survey manifest; ``None`` when absent, unreadable, or malformed."""
+    manifest: Any = None
+    try:
+        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
+        if isinstance(result, Mapping) and result.get("success"):
+            manifest = json.loads(str(result.get("output") or ""))
+    except Exception:
+        manifest = None
+    return manifest if isinstance(manifest, Mapping) else None
+
+
 def build_attempt_requirement(
     state: RunEvidenceState | None,
     orchestrator: Any,
@@ -785,14 +797,8 @@ def build_attempt_requirement(
         return None
     if has_build_attempt_receipt(state, attempt_id=attempt_id):
         return None
-    manifest: Any = None
-    try:
-        result = orchestrator.execute_command(f"cat {REQUIREMENTS_PATH}")
-        if isinstance(result, Mapping) and result.get("success"):
-            manifest = json.loads(str(result.get("output") or ""))
-    except Exception:
-        manifest = None
-    if isinstance(manifest, Mapping) and manifest:
+    manifest = _read_requirements_manifest(orchestrator)
+    if manifest:
         islands = manifest.get("build_islands") or ()
         build_system = manifest.get("build_system") or (
             (manifest.get("build_recommendation") or {}).get("build_system")
@@ -808,10 +814,155 @@ def build_attempt_requirement(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class UntriedIslandsRequirement:
+    """Surveyed build islands a closure claim would abandon unattempted.
+
+    Spec §3.4 dropped the mechanical "island attempt queue" and moved its
+    guarantee into the gate: closing the build phase while surveyed
+    independent islands are untried is rejected, naming the islands (§3.3).
+    """
+
+    roots: tuple[str, ...]
+    systems: tuple[str | None, ...] = ()
+
+    def action_text(self, index: int = 0) -> str:
+        return f"build(action='compile', working_directory={self.roots[index]!r})"
+
+    def suggestions(self) -> list[str]:
+        return [self.action_text(index) for index in range(len(self.roots))]
+
+    def message(self) -> str:
+        plural = "" if len(self.roots) == 1 else "s"
+        return (
+            f"Build phase cannot close while {len(self.roots)} surveyed build "
+            f"island{plural} carry no build attempt receipt: "
+            f"{', '.join(self.roots)}. "
+            f"NEXT REQUIRED ACTION: {self.action_text()}. "
+            "Each island builds independently, so one island's failure says "
+            "nothing about the others; a failed attempt is a receipt, an "
+            "untried island is not."
+        )
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "reason_code": "untried_build_islands",
+            "untried_island_roots": list(self.roots),
+            "untried_island_systems": list(self.systems),
+            "required_action": {
+                "tool": "build",
+                "params": {"action": "compile", "working_directory": self.roots[0]},
+            },
+        }
+
+
+def _manifest_build_islands(
+    manifest: Mapping[str, Any],
+) -> tuple[tuple[str, str | None], ...]:
+    """Island (root, system) coordinates, deduped, roots normalized absolute."""
+    survey = manifest.get("survey")
+    project_path = (
+        _normalized_absolute_path(survey.get("project_path"))
+        if isinstance(survey, Mapping)
+        else None
+    )
+    raw_islands = manifest.get("build_islands")
+    if not isinstance(raw_islands, (list, tuple)):
+        return ()
+    islands: list[tuple[str, str | None]] = []
+    seen: set[str] = set()
+    for item in raw_islands:
+        if not isinstance(item, Mapping):
+            continue
+        root = _normalized_root(
+            item.get("root"),
+            project_path,
+            enforce_project_boundary=False,
+            workspace_root=None,
+        )
+        if root is None or root in seen:
+            continue
+        seen.add(root)
+        islands.append((root, str(item.get("system") or "").strip().lower() or None))
+    return tuple(islands)
+
+
+def _build_attempt_directories(state: RunEvidenceState) -> tuple[str, ...]:
+    """Resolved working directories of every real build-runner dispatch.
+
+    The receipt shape is ``has_build_attempt_receipt``'s (dispatched runner
+    plus a rendered command), so a pre-dispatch refusal never counts as an
+    attempted island.  The RESOLVED directory is read from result metadata
+    first: a bare ``build(action='compile')`` carries no ``working_directory``
+    parameter, and only the envelope knows where it actually ran.  Attempts
+    are read across phases and attempts because cross-phase repair is legal
+    (spec §3.5) — the question is whether the island was ever tried at all.
+    """
+    directories: list[str] = []
+    for observation in state.tool_observations:
+        if observation.tool_name not in _BUILD_RUNNER_TOOLS:
+            continue
+        metadata = getattr(observation.result, "metadata", None) or {}
+        if metadata.get("runner_dispatched") is not True:
+            continue
+        if not str(metadata.get("command") or "").strip():
+            continue
+        directory = _normalized_absolute_path(
+            metadata.get("working_directory")
+            or (observation.params or {}).get("working_directory")
+        )
+        if directory is not None:
+            directories.append(directory)
+    return tuple(directories)
+
+
+def untried_islands_requirement(
+    state: RunEvidenceState | None,
+    orchestrator: Any,
+    *,
+    phase: str | None,
+    signal: str | None,
+    outcome: str | None,
+) -> UntriedIslandsRequirement | None:
+    """Reject giving-up closure while surveyed islands were never attempted.
+
+    Exemptions: no islands surveyed; every island bound to a receipt (success
+    or failure — attempted is the bar); and a ``done``/``success`` claim,
+    which the physical gate already checks.  An unreadable manifest raises no
+    island requirement: Plan 1's attempt gate owns the no-attempt case.
+    """
+    if state is None or phase != "build":
+        return None
+    if (
+        str(signal or "").strip().lower() == "done"
+        and str(outcome or "").strip().lower() == "success"
+    ):
+        return None
+    manifest = _read_requirements_manifest(orchestrator)
+    if manifest is None:
+        return None
+    islands = _manifest_build_islands(manifest)
+    if not islands:
+        return None
+    attempted = _build_attempt_directories(state)
+    untried = tuple(
+        (root, system)
+        for root, system in islands
+        if not any(_is_contained(directory, root) for directory in attempted)
+    )
+    if not untried:
+        return None
+    return UntriedIslandsRequirement(
+        roots=tuple(root for root, _ in untried),
+        systems=tuple(system for _, system in untried),
+    )
+
+
 __all__ = [
     "CandidateResolutionStatus",
     "TestAttemptRequirement",
     "TestCandidateResolution",
+    "UntriedIslandsRequirement",
     "build_attempt_requirement",
     "has_build_attempt_receipt",
     "local_prerequisite_signature",
@@ -823,4 +974,5 @@ __all__ = [
     "test_execution_binding",
     "test_execution_matches_candidate",
     "terminal_test_receipts",
+    "untried_islands_requirement",
 ]
