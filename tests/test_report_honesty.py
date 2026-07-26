@@ -17,6 +17,16 @@ B. The recommendations section printed generic ecosystem prose
    surveyed facts exist the report must quote them; when a survey source is
    reachable but recorded nothing, the report must name that evidence gap
    instead of inventing commands.
+
+C. (SAG v2 Plan 4, Task 3 — 2026-07-26 post-acceptance audit) The TVM
+   report presented 28 pytest *collection* error nodes plus their 28 paired
+   skip nodes as "56 tests executed", never quoted the structured
+   ``RuntimeError`` that caused every collection to fail, and never named
+   the scope (``full``, 11,702 collected) of the attempt it was describing.
+   When the sealed evidence carries ``collection_errors``, the test section
+   must state that collection failed and how many tests actually executed,
+   quote ``collection_error_summary`` verbatim as the root cause, derive a
+   blocker from it, and name the latest attempt's scope and command.
 """
 
 import json
@@ -265,3 +275,173 @@ def test_recommendations_without_survey_facts_name_the_evidence_gap():
     assert "mvn clean test" not in text
     assert "no surveyed" in text.lower()
     assert "project(action='analyze')" in text
+
+
+# ---------------------------------------------------------------------------
+# C. Collection failures are the root cause, never executed tests (Plan 4 T3)
+# ---------------------------------------------------------------------------
+
+# The first line of the dominant collection error in the live TVM artifact
+# (`pytest-attempt-000001.xml`, session_20260726_132903_18116) — the fact the
+# audit found nowhere in the report that was describing it.
+TVM_COLLECTION_ROOT_CAUSE = (
+    "RuntimeError: None of the following targets are supported by this build "
+    "of TVM: ['llvm', 'llvm -keys=cpu -num-cores=8']"
+)
+
+
+def _collection_failure_snapshot(
+    *,
+    collection_errors=28,
+    collection_errors_skipped=28,
+    summary=TVM_COLLECTION_ROOT_CAUSE,
+):
+    """A sealed TVM-shaped snapshot: every pytest node was a collection node.
+
+    Post-Plan-4-Task-2 seal shape: the 28 collection errors and their 28
+    paired empty-classname skips are OUT of executed/errors/skipped and in
+    ``collection_errors`` / ``collection_errors_skipped`` on the sealed
+    ``test_stats``, which carries the dominant error's first line.
+    """
+    snapshot = _sealed_snapshot(
+        verdict="failed",
+        # TVM's build DID run (libtvm_ffi.so exists) — the wall is a
+        # toolchain capability, so build evidence stays green here and the
+        # collection failure must stand on its own as the root cause.
+        build_green=True,
+        build_judgment="success",
+        phase_records=[
+            {
+                "phase": "test",
+                "outcome": "failed",
+                "validated_outcome": "failed",
+                "termination": "blocked",
+                "reason": "pytest exited 2",
+                "evidence_refs": ["obs:test:4"],
+            }
+        ],
+    )
+    snapshot["status"].update(
+        {
+            "tests_total": 0,
+            "tests_passed": 0,
+            "tests_failed": 0,
+            "tests_errors": 0,
+            "tests_skipped": 0,
+            "pass_pct": None,
+            "static_test_count": None,
+        }
+    )
+    zero = {"executed": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+    snapshot["canonical_snapshot"]["test_stats"] = {
+        "discovered": None,
+        "unique": dict(zero),
+        "raw": dict(zero),
+        "flaky_count": 0,
+        "judgment": "failed",
+        "collection_errors": collection_errors,
+        "collection_errors_skipped": collection_errors_skipped,
+        "collection_error_summary": summary,
+    }
+    return snapshot
+
+
+def _render_tests(tool, snapshot):
+    return "\n".join(tool._render_detailed_test_analysis(snapshot))
+
+
+def test_collection_failure_section_states_zero_executed_and_quotes_root_cause():
+    """The test section reports the collection failure and its structured cause."""
+    text = _render_tests(_tool(), _collection_failure_snapshot())
+
+    assert "Test collection failed for 28 files — 0 tests executed" in text
+    # Verbatim — the report quotes the structured error, it does not paraphrase.
+    assert TVM_COLLECTION_ROOT_CAUSE in text
+
+
+def test_collection_nodes_are_never_rendered_as_executed_tests():
+    """28 errors + 28 skips are collection artifacts, not a 56-test run."""
+    text = _render_tests(_tool(), _collection_failure_snapshot())
+
+    assert "56" not in text
+    assert "28 tests executed" not in text
+    # Nothing executed: the executed-test metrics tables must not render at all.
+    assert "Unique Tests Executed" not in text
+    assert "Test Execution Breakdown" not in text
+    # The counts stay visible, explicitly labelled as collection artifacts.
+    assert "28 collection errors" in text
+    assert "28 collection-artifact skips" in text
+
+
+def test_collection_failure_derives_a_blocker_quoting_the_structured_error():
+    """The blockers section derives its blocker from the collection evidence."""
+    text = _render(_tool(), _collection_failure_snapshot())
+
+    assert "Blockers (0)" not in text
+    assert "No blocking issues" not in text
+    assert _blocker_count(text) >= 1
+    matching = [line for line in text.splitlines() if "Test collection failed for 28 files" in line]
+    assert len(matching) == 1, text
+    assert "0 tests executed" in matching[0]
+    assert TVM_COLLECTION_ROOT_CAUSE in matching[0]
+
+
+def test_report_names_the_latest_test_attempt_scope_and_command():
+    """The report names the scope/command of the attempt it is describing."""
+    from sag.tools.internal.python_tool import COLLECTED_JSON
+
+    orch = FakeOrch()
+    orch.files[COLLECTED_JSON] = json.dumps(
+        {"collected": 11702, "scope": "full", "selected": 11702}
+    )
+    snapshot = _collection_failure_snapshot()
+    snapshot["last_command"] = {
+        "command": "/workspace/.venv/bin/python -m pytest --junitxml=/workspace/"
+        ".setup_agent/pytest-reports/pytest-attempt-000001.xml",
+        "tool": "python",
+        "workdir": "/workspace/tvm",
+    }
+
+    text = _render_tests(_tool(docker_orchestrator=orch), snapshot)
+
+    assert "scope=full" in text
+    assert "collected=11702" in text
+    assert "/workspace/.venv/bin/python -m pytest" in text
+
+
+def test_collection_facts_are_read_from_the_evidence_result_projection():
+    """The same facts are honoured wherever the seal projects them."""
+    snapshot = _sealed_snapshot(verdict="failed")
+    snapshot["status"]["tests_total"] = 0
+    snapshot["evidence_result"]["test_stats"] = {
+        "discovered": None,
+        "executed": 0,
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "collection_errors": 3,
+        "collection_error_summary": "ImportError: libtvm_ffi.so: cannot open shared object file",
+    }
+
+    text = _render_tests(_tool(), snapshot)
+
+    assert "Test collection failed for 3 files — 0 tests executed" in text
+    assert "ImportError: libtvm_ffi.so: cannot open shared object file" in text
+
+
+def test_run_without_collection_errors_renders_the_ordinary_test_section():
+    """Regression lock: a clean executed run is rendered exactly as before."""
+    snapshot = _sealed_snapshot(verdict="success")
+    snapshot["status"].update({"tests_total": 982, "tests_passed": 921, "pass_pct": 93.8})
+
+    text = _render_tests(_tool(), snapshot)
+
+    assert "Test collection failed" not in text
+    assert "Latest test attempt" not in text
+    assert "| **Unique Tests Executed** | 982 |" in text
+
+
+def test_no_tests_and_no_collection_facts_renders_no_test_section():
+    """Regression lock: silence stays silence when there is nothing to say."""
+    assert _tool()._render_detailed_test_analysis(_sealed_snapshot(verdict="failed")) == []
