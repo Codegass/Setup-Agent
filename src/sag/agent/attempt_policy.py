@@ -815,16 +815,36 @@ def build_attempt_requirement(
 
 
 @dataclass(frozen=True, slots=True)
+class IncompatibleDomainEdge:
+    """One ``version_incompatible`` domain edge (Stage C schema v1) as a fact.
+
+    Independence is a conclusion of the coordinate graph, never a directory
+    fact, so the only edges this policy carries are the ones that already
+    BLOCK a consumer before any attempt.  ``detail`` is the analyzer's
+    rendered mismatch and is reproduced verbatim — the policy never re-derives
+    or paraphrases a coordinate.
+    """
+
+    consumer: str
+    producer: str
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class UntriedIslandsRequirement:
     """Surveyed build islands a closure claim would abandon unattempted.
 
     Spec §3.4 dropped the mechanical "island attempt queue" and moved its
     guarantee into the gate: closing the build phase while surveyed
-    independent islands are untried is rejected, naming the islands (§3.3).
+    islands are untried is rejected, naming the islands (§3.3).
     """
 
     roots: tuple[str, ...]
     systems: tuple[str | None, ...] = ()
+    # Plan 5 Task C2 (P0-B): incompatible graph edges whose CONSUMER is one of
+    # these untried roots. Empty means "the caller supplied no edge info",
+    # which is not the same as "the islands are independent" — see message().
+    edges: tuple[IncompatibleDomainEdge, ...] = ()
 
     def action_text(self, index: int = 0) -> str:
         return f"build(action='compile', working_directory={self.roots[index]!r})"
@@ -832,15 +852,40 @@ class UntriedIslandsRequirement:
     def suggestions(self) -> list[str]:
         return [self.action_text(index) for index in range(len(self.roots))]
 
+    def blocker_lines(self) -> tuple[str, ...]:
+        lines: list[str] = []
+        for edge in self.edges:
+            line = f"{edge.consumer} <- {edge.producer}"
+            detail = edge.detail.strip()
+            lines.append(f"{line}: {detail}" if detail else line)
+        return tuple(lines)
+
     def message(self) -> str:
+        """Name the untried islands, and name what already blocks them.
+
+        Ground-truth review 2026-07-26 (§"Unproved independence"): this message
+        used to assert "each island builds independently, so one island's
+        failure says nothing about the others". Bigtop falsified that — its
+        producer builds 3.7.0-SNAPSHOT while two consumers require 3.5/3.6.
+        The harness derives independence from the coordinate graph or says
+        nothing about it; with edges in hand it names them as blockers instead.
+        """
         plural = "" if len(self.roots) == 1 else "s"
+        blockers = self.blocker_lines()
+        graph_text = (
+            "Surveyed dependency edges already name blockers for these "
+            f"islands ({'; '.join(blockers)}) — record the mismatch, do not "
+            "silently alias. "
+            if blockers
+            else ""
+        )
         return (
             f"Build phase cannot close while {len(self.roots)} surveyed build "
             f"island{plural} carry no build attempt receipt: "
             f"{', '.join(self.roots)}. "
             f"NEXT REQUIRED ACTION: {self.action_text()}. "
-            "Each island builds independently, so one island's failure says "
-            "nothing about the others; a failed attempt is a receipt, an "
+            f"{graph_text}"
+            "Closure needs receipts: a failed attempt is a receipt, an "
             "untried island is not."
         )
 
@@ -885,6 +930,44 @@ def _manifest_build_islands(
         seen.add(root)
         islands.append((root, str(item.get("system") or "").strip().lower() or None))
     return tuple(islands)
+
+
+def _manifest_incompatible_edges(
+    manifest: Mapping[str, Any],
+    roots: tuple[str, ...],
+) -> tuple[IncompatibleDomainEdge, ...]:
+    """``version_incompatible`` edges whose consumer is one of ``roots``.
+
+    Read the way the manifest exposes every other recommendation fact: the
+    projected top-level key first, the nested recommendation as the fallback
+    (same dual read as ``build_system`` above). Absent graph facts stay absent.
+    """
+    raw = manifest.get("domain_edges")
+    if raw is None:
+        recommendation = manifest.get("build_recommendation")
+        if isinstance(recommendation, Mapping):
+            raw = recommendation.get("domain_edges")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    wanted = set(roots)
+    edges: list[IncompatibleDomainEdge] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("status") or "").strip().lower() != "version_incompatible":
+            continue
+        consumer = _normalized_absolute_path(item.get("consumer"))
+        if consumer is None or consumer not in wanted:
+            continue
+        producer = _normalized_absolute_path(item.get("producer"))
+        edges.append(
+            IncompatibleDomainEdge(
+                consumer=consumer,
+                producer=producer or "",
+                detail=str(item.get("detail") or "").strip(),
+            )
+        )
+    return tuple(edges)
 
 
 def _build_attempt_directories(state: RunEvidenceState) -> tuple[str, ...]:
@@ -952,14 +1035,17 @@ def untried_islands_requirement(
     )
     if not untried:
         return None
+    roots = tuple(root for root, _ in untried)
     return UntriedIslandsRequirement(
-        roots=tuple(root for root, _ in untried),
+        roots=roots,
         systems=tuple(system for _, system in untried),
+        edges=_manifest_incompatible_edges(manifest, roots),
     )
 
 
 __all__ = [
     "CandidateResolutionStatus",
+    "IncompatibleDomainEdge",
     "TestAttemptRequirement",
     "TestCandidateResolution",
     "UntriedIslandsRequirement",

@@ -161,6 +161,20 @@ class BuildEvidenceSnapshot(BaseModel):
     evidence_status: EvidenceStatus = EvidenceStatus.UNKNOWN
     refs: tuple[str, ...] = ()
     compiled_classes: int | None = None
+    # Plan 5 Task C2 (P0-F): per-domain build states, sealed WITH the build
+    # evidence they describe — {"<root>": {"state": ..., "blocker": "<detail>"?}}.
+    # None = no multi-domain decomposition was surveyed (single-domain
+    # projects), which is why the serializer below drops the key entirely.
+    domain_states: dict[str, dict[str, str]] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unsurveyed_domain_states(self, handler):
+        """Absent facts serialize as absent keys, so recorded replay fixtures
+        (and their exact-dict assertions) keep verifying unchanged."""
+        data = handler(self)
+        if data.get("domain_states") is None:
+            data.pop("domain_states", None)
+        return data
 
 
 class PhaseClaimSnapshot(BaseModel):
@@ -298,6 +312,38 @@ def _module_coverage_conflicts(validator, project_name) -> tuple[str, ...]:
     return coverage_conflicts(module_coverage(validator, project_name))
 
 
+_DOMAIN_STATES = frozenset({"success", "failed", "blocked", "untried"})
+
+
+def _sealed_domain_states(state: RunEvidenceState) -> dict[str, dict[str, str]] | None:
+    """Per-domain build states exactly as the gate validated them (Task C2).
+
+    The BUILD fact is authoritative; a run that only reached the test gate
+    still seals what its rollup carried. Unrecognized state values are dropped
+    rather than sealed — the rollup contract is schema v1's four states, and an
+    unparseable domain fact is an absent fact, never an invented one.
+    """
+    value = state.fact_value("build.domain_states")
+    if not isinstance(value, Mapping):
+        rollup = state.fact_value("test.stats")
+        value = rollup.get("domain_states") if isinstance(rollup, Mapping) else None
+    if not isinstance(value, Mapping):
+        return None
+    sealed: dict[str, dict[str, str]] = {}
+    for root, entry in value.items():
+        if not isinstance(entry, Mapping):
+            continue
+        domain_state = str(entry.get("state") or "").strip().lower()
+        if domain_state not in _DOMAIN_STATES:
+            continue
+        sealed_entry = {"state": domain_state}
+        blocker = str(entry.get("blocker") or "").strip()
+        if blocker:
+            sealed_entry["blocker"] = blocker
+        sealed[str(root)] = sealed_entry
+    return sealed or None
+
+
 def _physical_build_status(validator, project_name) -> dict[str, Any] | None:
     """One authoritative physical scan at evidence-close; never raises."""
     if validator is None:
@@ -405,6 +451,7 @@ def _fold_build_evidence(
     observation_refs = _dedupe(
         ref for observation in observations for ref in _result_refs(observation)
     )
+    domain_states = _sealed_domain_states(state)
 
     physical = _physical_build_status(validator, project_name)
     judgment = _physical_judgment(physical) if physical is not None else None
@@ -444,12 +491,13 @@ def _fold_build_evidence(
                 evidence_status=evidence_status,
                 refs=_dedupe([*physical_refs, *observation_refs]),
                 compiled_classes=compiled,
+                domain_states=domain_states,
             ),
             conflicts,
         )
 
     if not observations:
-        return BuildEvidenceSnapshot(), ()
+        return BuildEvidenceSnapshot(domain_states=domain_states), ()
 
     judgment = _aggregate_observation_judgment(observations)
     latest = observations[-1]
@@ -473,6 +521,7 @@ def _fold_build_evidence(
             evidence_status=latest.result.evidence_status,
             refs=observation_refs,
             compiled_classes=_nonnegative_int(state.fact_value("build.compiled_classes")),
+            domain_states=domain_states,
         ),
         (),
     )
