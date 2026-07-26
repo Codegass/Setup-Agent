@@ -210,12 +210,13 @@ def kickoff_phase_objectives() -> dict:
 # (PYTHON_BUILD_PHASE_GUIDANCE, PYTHON_TEST_PHASE_GUIDANCE, and the
 # NATIVE_FIRST_BUILD_GUIDANCE prepend) is gone — pre-hoc advice is a
 # prescription. The REACTIVE native smoke steer below stays: it is
-# evidence-triggered (fires only when the build phase left the native core
-# unbuilt) and is part of the corrective-loop allowlist, not a dimension.
+# evidence-triggered (the artifact probe decides which state it reports) and is
+# part of the corrective-loop allowlist, not a dimension.
 
-# Rendered before the test guidance when the build phase did NOT get the native
-# core built (live TVM 2026-07-18: the agent swept the full suite without
+# Rendered before the test guidance when the native artifact PROBE found no
+# shared objects (live TVM 2026-07-18: the agent swept the full suite without
 # libtvm — 356 identical collection errors, pure waste of the phase budget).
+# P0-D: the phase outcome is NOT the trigger — see _native_smoke_guidance.
 NATIVE_NOT_BUILT_TEST_GUIDANCE = (
     "The NATIVE core was not built in the build phase. Do NOT sweep the full "
     "suite — without the native library it only repeats hundreds of identical "
@@ -225,6 +226,35 @@ NATIVE_NOT_BUILT_TEST_GUIDANCE = (
     "a test path. Report the bounded smoke result honestly. While the native "
     "core remains unready, do not broaden the test scope merely because that "
     "smoke passed."
+)
+
+# The same bounded-smoke discipline, minus the "not built" claim: the shared
+# tail of the two honest states the artifact probe can report (P0-D).
+_NATIVE_BOUNDED_SMOKE_TAIL = (
+    "Do NOT sweep the full suite. Call bare build(action='test') with NO args "
+    "first. The build tool will use a survey-verified bounded smoke target, or "
+    "refuse safely when no verified target exists. Never invent, guess, or "
+    "substitute a test path. If that smoke skips, the skip reasons name the "
+    "missing capability — report them as the honest result."
+)
+
+# Rendered when the probe SAW native shared objects while the build phase closed
+# non-success (live TVM 2026-07-26: five .so files existed — libtvm_compiler.so
+# among them — yet every layer asserted the native core was never built, because
+# a `pip check` packaging warning had capped the phase outcome).
+NATIVE_ARTIFACTS_PRESENT_TEST_GUIDANCE = (
+    "Native artifacts are present ({artifacts}). The build phase closed "
+    "'{outcome}' for packaging-integrity reasons — that does NOT mean the "
+    "native core is missing. " + _NATIVE_BOUNDED_SMOKE_TAIL
+)
+
+# Rendered when the probe itself could not run: an unverified absence is not a
+# fact, so no layer may downgrade it to "not built" — and with no artifact
+# evidence the phase outcome gets no cause attributed to it either.
+NATIVE_ARTIFACTS_UNKNOWN_TEST_GUIDANCE = (
+    "The native artifact probe could not verify native artifacts under "
+    "{root} — the native state is UNKNOWN, not missing. The build phase closed "
+    "'{outcome}'. " + _NATIVE_BOUNDED_SMOKE_TAIL
 )
 
 # Build-system labels the analyzer emits for Python projects: structure
@@ -2858,26 +2888,123 @@ class ReActEngine(UIEventEmitter):
             return "failed"
 
     def _native_smoke_guidance(self, phase: str) -> Optional[str]:
-        """The native-not-built smoke steer for the test phase, or None.
+        """The bounded-smoke steer for the test phase, or None.
 
-        Fires only for python-system repos flagged has_native_build whose build
-        phase ended without a success outcome.
+        Eligible only for python-system repos flagged has_native_build whose
+        build phase ended without a success outcome. WHICH text renders is then
+        decided by the native artifact PROBE, never by that outcome (P0-D,
+        ground-truth review 2026-07-26: five .so files existed while every
+        layer said the native core was not built, because a packaging-integrity
+        warning had capped the phase at partial):
+
+          absent  -> the "not built" steer, now a true statement;
+          present -> the facts text (artifacts + why the phase closed as it
+                     did), which never claims the core is missing;
+          unknown -> the same honest text WITHOUT a count claim; an unverified
+                     absence is not a fact.
         """
         if phase != "test":
             return None
         if not is_python_build_system(self._detected_build_system()):
             return None
         rec = self._build_recommendation()
-        if rec.get("has_native_build") and self._build_phase_lacked_success():
+        if not rec.get("has_native_build") or not self._build_phase_lacked_success():
+            return None
+        fact = self._native_artifact_fact(rec=rec, phase=phase)
+        if fact["status"] == "absent":
             return NATIVE_NOT_BUILT_TEST_GUIDANCE
-        return None
+        outcome = self._build_phase_outcome() or "unknown"
+        if fact["status"] == "present":
+            return NATIVE_ARTIFACTS_PRESENT_TEST_GUIDANCE.format(
+                artifacts=self._native_artifact_count_text(fact),
+                outcome=outcome,
+            )
+        return NATIVE_ARTIFACTS_UNKNOWN_TEST_GUIDANCE.format(
+            root=fact["root"] or "the surveyed native root",
+            outcome=outcome,
+        )
 
-    def _build_phase_lacked_success(self) -> bool:
-        """True when the build phase's recorded outcome is anything but success.
+    # One bounded probe per phase: enough paths to state a count, few enough to
+    # never flood the container output.
+    _NATIVE_ARTIFACT_PROBE_LIMIT = 20
 
-        Read from the phase machine's records (validated outcome first, the
-        legacy outcome as fallback). No build record yet -> False.
+    def _native_artifact_fact(
+        self, *, rec: Optional[Dict] = None, phase: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Whether project-owned native shared objects exist, as one fact dict:
+        ``{"status": "present"|"absent"|"unknown", "count": int|None, "root": str}``.
+
+        Probed ONCE per phase with a single bounded command and cached on the
+        engine, so the advisor digest reads the same fact the steer rendered
+        instead of paying for a second probe.
         """
+        recommendation = self._build_recommendation() if rec is None else rec
+        root = str(recommendation.get("build_root") or recommendation.get("test_root") or "")
+        phase_key = str(
+            phase
+            if phase is not None
+            else (getattr(getattr(self, "phase_machine", None), "current_phase", "") or "")
+        )
+        cache = getattr(self, "_native_artifact_probe_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._native_artifact_probe_cache = cache
+        cached = cache.get((phase_key, root))
+        if cached is None:
+            cached = self._probe_native_artifacts(root)
+            cache[(phase_key, root)] = cached
+        return cached
+
+    def _probe_native_artifacts(self, root: str) -> Dict[str, Any]:
+        """The single bounded find behind `_native_artifact_fact`.
+
+        The `test -d` prefix is what makes an "absent" verdict a real scan: a
+        pipeline's exit status is head's, so a find over a missing directory
+        would otherwise look exactly like a directory with no artifacts.
+        """
+        unknown = {"status": "unknown", "count": None, "root": root}
+        orchestrator = getattr(
+            getattr(self, "physical_validator", None), "docker_orchestrator", None
+        )
+        if not root or orchestrator is None:
+            return unknown
+        quoted = shlex.quote(root)
+        command = (
+            f"test -d {quoted} && find {quoted} -name '*.so' -type f "
+            f"-not -path '*/.git/*' | head -{self._NATIVE_ARTIFACT_PROBE_LIMIT}"
+        )
+        try:
+            result = orchestrator.execute_command(command) or {}
+        except Exception as exc:
+            logger.debug(f"native artifact probe unavailable: {exc}")
+            return unknown
+        if not result.get("success"):
+            return unknown
+        paths = list(
+            dict.fromkeys(
+                line.strip()
+                for line in str(result.get("output") or "").splitlines()
+                if line.strip()
+            )
+        )
+        return {
+            "status": "present" if paths else "absent",
+            "count": len(paths),
+            "root": root,
+        }
+
+    @classmethod
+    def _native_artifact_count_text(cls, fact: Dict[str, Any]) -> str:
+        """The probe's count as a claim it can actually support — the find is
+        capped, so a full page of hits is "at least N", never exactly N."""
+        count = int(fact.get("count") or 0)
+        if count >= cls._NATIVE_ARTIFACT_PROBE_LIMIT:
+            return f"at least {count} shared objects"
+        return f"{count} shared object{'' if count == 1 else 's'}"
+
+    def _build_phase_outcome(self) -> Optional[str]:
+        """The build phase's recorded outcome (validated first, the legacy
+        outcome as fallback), or None when there is no build record yet."""
         machine = getattr(self, "phase_machine", None)
         for record in getattr(machine, "records", ()) or ():
             if str(getattr(record, "phase", "")) != "build":
@@ -2886,8 +3013,14 @@ class ReActEngine(UIEventEmitter):
             outcome = getattr(validated, "value", validated) or getattr(
                 getattr(record, "outcome", None), "value", getattr(record, "outcome", None)
             )
-            return str(outcome or "unknown") != "success"
-        return False
+            return str(outcome or "unknown")
+        return None
+
+    def _build_phase_lacked_success(self) -> bool:
+        """True when the build phase's recorded outcome is anything but success.
+        No build record yet -> False."""
+        outcome = self._build_phase_outcome()
+        return outcome is not None and outcome != "success"
 
     def _untried_island_targets(self, *, limit: int = 4) -> str:
         """Recommended build islands with NO observed work yet, as one line.
@@ -3367,28 +3500,56 @@ class ReActEngine(UIEventEmitter):
         actually RAN. Before this line, a run whose every attempt died in
         collection looked to the advisor exactly like a run that executed
         tests and failed them (live TVM: 28 collection errors, 0 executed)."""
+        metadata = self._last_pytest_metadata()
+        if not metadata:
+            return ""
+        command = str(metadata.get("command") or metadata.get("collection_command") or "").strip()
+        return (
+            f"Last test attempt: {command or 'unknown'} — "
+            f"scope={metadata.get('collection_scope') or 'unknown'}, "
+            f"collected={self._advisor_count(metadata.get('collected'))}, "
+            f"selected={self._advisor_count(metadata.get('collected_after_deselection'))}, "
+            f"executed={self._advisor_count(metadata.get('executed'))}, "
+            f"collection_errors={self._advisor_count(metadata.get('collection_errors'))}"
+        )
+
+    def _last_pytest_metadata(self) -> Dict[str, Any]:
+        """The newest pytest attempt's metadata, or {} when none ran."""
         state = getattr(self, "run_evidence_state", None)
         for observation in reversed(tuple(getattr(state, "tool_observations", ()) or ())):
             metadata = dict(getattr(getattr(observation, "result", None), "metadata", None) or {})
-            if "collection_scope" not in metadata:
-                continue
-            command = str(
-                metadata.get("command") or metadata.get("collection_command") or ""
-            ).strip()
-            return (
-                f"Last test attempt: {command or 'unknown'} — "
-                f"scope={metadata.get('collection_scope') or 'unknown'}, "
-                f"collected={self._advisor_count(metadata.get('collected'))}, "
-                f"selected={self._advisor_count(metadata.get('collected_after_deselection'))}, "
-                f"executed={self._advisor_count(metadata.get('executed'))}, "
-                f"collection_errors={self._advisor_count(metadata.get('collection_errors'))}"
-            )
-        return ""
+            if "collection_scope" in metadata:
+                return metadata
+        return {}
+
+    def _native_state_line(self) -> str:
+        """The native project's independent capability facts, for native-build
+        projects only: the probed artifact state plus the last bounded smoke's
+        verdict and its junit skip reasons.
+
+        P0-D/§P1-E: the advisor repeated the phase outcome's "native core was
+        not built" verbatim. It now reads the artifact probe and the skip
+        reasons, so it can CORRECT that reading instead of echoing it."""
+        rec = self._build_recommendation()
+        if not rec.get("has_native_build"):
+            return ""
+        fact = self._native_artifact_fact(rec=rec)
+        artifacts = fact["status"]
+        if artifacts == "present":
+            artifacts = f"present ({self._native_artifact_count_text(fact)})"
+        parts = [f"artifacts={artifacts}"]
+        metadata = self._last_pytest_metadata()
+        if metadata.get("smoke_capability_unproven"):
+            parts.append("last bounded smoke=capability_unproven")
+            reasons = [str(reason) for reason in metadata.get("smoke_skip_reasons") or ()]
+            if reasons:
+                parts.append(f"skip reasons: {'; '.join(reasons)}")
+        return f"Native state: {', '.join(parts)}"
 
     def _advisor_evidence_digest(self) -> str:
         """The deterministic evidence section: handoff projection, untried
-        islands, the armed recurrence guidance, and the last test attempt's
-        collection facts."""
+        islands, the armed recurrence guidance, the last test attempt's
+        collection facts, and (native projects only) the native state."""
         parts: List[str] = []
         handoff = getattr(self, "phase_handoff", None)
         if handoff is not None:
@@ -3413,6 +3574,14 @@ class ReActEngine(UIEventEmitter):
             last_test = ""
         if last_test:
             parts.append(last_test)
+        try:
+            native_state = self._native_state_line()
+        except Exception as exc:
+            # A digest gap must not cost the run its advice.
+            logger.warning(f"Advisor native-state digest unavailable: {exc}")
+            native_state = ""
+        if native_state:
+            parts.append(native_state)
         if not parts:
             return ""
         return "\n".join([f"{self._ADVISOR_DIGEST_HEADER}:", *parts])
