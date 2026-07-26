@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import litellm
@@ -12,6 +13,30 @@ from sag.config import create_verbose_logger
 from sag.tools.base import BaseTool
 
 from .react_types import ReactModelCapabilities, ReactModelMode
+
+
+@dataclass(frozen=True)
+class NativeToolCall:
+    """One tool call requested by the executor, with its provider id intact.
+
+    The id is what lets a later ``{"role": "tool", "tool_call_id": ...}`` message
+    be correlated back to this call, so it is never empty: a synthetic
+    ``call_<index>`` stands in when the provider omits one.
+    """
+
+    id: str
+    name: str
+    arguments: dict  # parsed JSON object; {} when unparseable (see raw_arguments)
+    raw_arguments: str
+
+
+@dataclass(frozen=True)
+class NativeTurn:
+    """One assistant turn: prose plus the tool calls it requested."""
+
+    text: str  # "" when the model emitted no prose
+    tool_calls: tuple  # tuple[NativeToolCall, ...]
+    model_used: str
 
 
 class ReactLLMClient:
@@ -176,6 +201,133 @@ class ReactLLMClient:
             if self.config.verbose:
                 self._log_llm_error(exc)
             return None
+
+    def get_native_turn(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        include_tools: bool = True,
+    ) -> NativeTurn:
+        """One native multi-turn executor call: full message history in,
+        structured (text, tool_calls) out.
+
+        Unlike `get_response`, nothing is flattened into ReAct text and no
+        tool-call id is discarded, so each `{"role": "tool", "tool_call_id": ...}`
+        reply can be correlated back to the call that produced it (spec §3.1).
+        Model and request parameters resolve exactly as ACTION mode does today.
+        """
+        capabilities = self.capabilities_for(ReactModelMode.ACTION)
+        params = self._build_native_request_params(messages, capabilities, include_tools)
+        response = litellm.completion(**params)
+        self._track_native_usage(response, capabilities.model)
+        return self._native_turn_from_response(response, capabilities)
+
+    def _build_native_request_params(
+        self,
+        messages: list[dict[str, Any]],
+        capabilities: ReactModelCapabilities,
+        include_tools: bool,
+    ) -> dict[str, Any]:
+        model_type = self._model_type_for(ReactModelMode.ACTION)
+        params: dict[str, Any] = {
+            "model": capabilities.model,
+            "messages": list(messages),
+        }
+
+        tools_schema: list[dict[str, Any]] = []
+        if include_tools and capabilities.supports_function_calling:
+            tools_schema = self.build_tools_schema(ReactModelMode.ACTION)
+
+        is_gpt5 = self.config.is_gpt5_model(model_type)
+        use_traditional_tool_params = is_gpt5 and bool(tools_schema)
+
+        if is_gpt5 and not use_traditional_tool_params:
+            params["reasoning_effort"] = self.config.gpt5_reasoning_effort
+            params["drop_params"] = True
+        else:
+            params["temperature"] = self._temperature_for(ReactModelMode.ACTION)
+            params["max_tokens"] = self._max_tokens_for(ReactModelMode.ACTION)
+            if use_traditional_tool_params:
+                params["drop_params"] = True
+
+        self._add_ollama_api_base(params, capabilities.model)
+
+        if tools_schema:
+            params["tools"] = tools_schema
+            params["tool_choice"] = (
+                {"type": "auto"} if capabilities.tool_call_format == "anthropic" else "auto"
+            )
+
+        return params
+
+    def _track_native_usage(self, response: Any, model: str) -> None:
+        if self.token_tracker is None:
+            return
+
+        try:
+            self.token_tracker.track_token_usage(response, model, "executor")
+        except Exception as exc:  # pragma: no cover - defensive accounting path
+            self.logger.debug(f"Could not track executor token usage: {exc}")
+
+    def _native_turn_from_response(
+        self,
+        response: Any,
+        capabilities: ReactModelCapabilities,
+    ) -> NativeTurn:
+        message = response.choices[0].message
+        raw_calls = getattr(message, "tool_calls", None) or ()
+
+        return NativeTurn(
+            text=getattr(message, "content", None) or "",
+            tool_calls=tuple(
+                self._native_tool_call(raw_call, index) for index, raw_call in enumerate(raw_calls)
+            ),
+            model_used=getattr(response, "model", None) or capabilities.model,
+        )
+
+    def _native_tool_call(self, raw_call: Any, index: int) -> NativeToolCall:
+        """Read one wire tool call. litellm normalizes both providers to the
+        OpenAI `function` shape; the anthropic-native `name`/`input` pair is
+        still accepted as a fallback."""
+        function = self._get_tool_call_value(raw_call, "function")
+        if function is None:
+            name = self._get_tool_call_value(raw_call, "name")
+            arguments = self._get_tool_call_value(raw_call, "input")
+        else:
+            name = self._get_tool_call_value(function, "name")
+            arguments = self._get_tool_call_value(function, "arguments")
+
+        name = name if isinstance(name, str) else ""
+        if name.startswith("functions."):
+            name = name[len("functions.") :]
+
+        parsed_arguments, raw_arguments = self._normalize_tool_arguments(arguments)
+
+        return NativeToolCall(
+            id=self._get_tool_call_value(raw_call, "id") or f"call_{index}",
+            name=name,
+            arguments=parsed_arguments,
+            raw_arguments=raw_arguments,
+        )
+
+    def _normalize_tool_arguments(self, arguments: Any) -> tuple[dict[str, Any], str]:
+        """Return the parsed argument object plus the exact wire text.
+
+        Never raises: a malformed call still has to round-trip so the paired
+        tool reply can quote back what the model actually sent.
+        """
+        if isinstance(arguments, dict):
+            return arguments, json.dumps(arguments)
+        if not isinstance(arguments, str):
+            return {}, ""
+
+        try:
+            parsed = json.loads(arguments) if arguments else {}
+        except (ValueError, TypeError):
+            self.logger.warning(f"Failed to parse tool call arguments: {arguments}")
+            return {}, arguments
+
+        return (parsed if isinstance(parsed, dict) else {}), arguments
 
     def _model_type_for(self, mode: ReactModelMode) -> str:
         return "thinking" if mode == ReactModelMode.THINKING else "action"
