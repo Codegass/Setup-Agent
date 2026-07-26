@@ -240,13 +240,40 @@ Files: `src/sag/agent/attempt_policy.py`, `src/sag/agent/phase_gates.py`,
 
 ## Stage D — P0-C: semantic action conservation
 
-Action contracts across the build facade: compile compiles only; NO-SOURCE
-cannot close a source-bearing domain; language-aware Gradle task selection
-(Scala/Kotlin/Groovy); package/install skips unit+integration tests by
-default using documented lifecycle args retained with provenance;
-requested action, effective action, actual argv, and semantic delta are
-model-visible with the first result. Matrix rows: Scala NO-SOURCE, packaging
-skips environment tests, README args survive survey→execution.
+Action contracts across the build facade. Matrix rows: Scala NO-SOURCE,
+packaging skips environment tests, requested/effective visible.
+
+### Binding notes (Stage D, bound on `1de43e2`, single lane)
+
+Files: `src/sag/tools/build/backends.py`, `src/sag/tools/build/build_tool.py`,
+`src/sag/tools/internal/gradle_tool.py`, `src/sag/tools/internal/maven_tool.py`
+(+ NEW test file). Four contracts:
+
+1. **Language-aware Gradle compile.** `GradleBackend.VERBS["compile"]` stops
+   being a hardcoded `compileJava`: probe `src/main/scala|kotlin|groovy`
+   under the working directory (plus subproject dirs when a settings file
+   exists) via the orchestrator; run the union of the needed `compileX`
+   tasks (`compileScala` when Scala sources exist, etc., `compileJava`
+   always included). Facts only — no guessing beyond directory existence.
+2. **NO-SOURCE cannot close a source-bearing compile.** When the executed
+   Gradle compile tasks ALL report `NO-SOURCE` while the probe found
+   sources in any compile language, the analysis marks the build NOT
+   successful with an explicit error naming the mismatch ("scala sources
+   present; executed tasks reported NO-SOURCE — the compile did not cover
+   the sources").
+3. **install/package never run tests.** Maven `install`/`package` argv gains
+   `-DskipTests` (Bigtop ground truth: naked `mvn install` ran
+   environment-dependent tests during the build phase and manufactured a
+   failure); Gradle install/publish paths gain `-x test`. The `test` verb
+   is the only test owner. No phase special-casing — the verb itself
+   carries the contract.
+4. **Visible semantic delta.** Whenever the effective action differs
+   semantically from the requested verb (compile→install promotion, verb
+   substitutions, added skip flags), the ToolResult output begins with
+   `[build] requested '<verb>' → executing '<argv-fragment>' (<reason>)`.
+   Same-name task translation (compile→compileJava alone) needs no line.
+   Stage B receipts already record requested/effective/argv — this makes
+   the delta model-visible BEFORE the model reasons about the result.
 
 ## Stage E — P0-D: native capability state
 
