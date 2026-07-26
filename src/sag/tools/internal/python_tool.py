@@ -295,6 +295,30 @@ if (
 emit({"ok": True, **counts})
 """
 
+_PYTEST_JUNIT_SKIP_REASONS_SCRIPT = """\
+import json
+import sys
+import xml.etree.ElementTree as ET
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    print("[]")
+    raise SystemExit(0)
+
+reasons = []
+for element in root.iter():
+    name = element.tag.rsplit("}", 1)[-1]
+    if name != "skipped":
+        continue
+    message = " ".join((element.attrib.get("message") or element.text or "").split())
+    if message and message not in reasons:
+        reasons.append(message)
+    if len(reasons) >= 3:
+        break
+print(json.dumps(reasons, separators=(",", ":")))
+"""
+
 _PYTEST_ATTEMPT_TAG_SCRIPT = """\
 import os
 import sys
@@ -1489,6 +1513,14 @@ class PythonTool(BaseTool):
                 "capability NOT proven; no receipt written; the next bare test call "
                 "remains bounded"
             )
+            # Stage E (P0-D): the live TVM smoke showed the model three bare
+            # SKIPPED labels, so it never saw `need llvm` — the fact that names
+            # the missing capability. The reasons the run already wrote to its
+            # own junit XML are now model-visible.
+            skip_reasons = self._junit_skip_reasons(python, report)
+            if skip_reasons:
+                metadata["smoke_skip_reasons"] = skip_reasons
+                preamble.append(f"[test] skip reasons: {'; '.join(skip_reasons)}")
         tail = self._tail(output)
         if success:
             return self._finish(
@@ -1778,6 +1810,44 @@ class PythonTool(BaseTool):
             f"{rendered(selected)} selected, {rendered(executed)} executed, "
             f"{rendered(collection_errors)} collection errors"
         )
+
+    # Up to three reasons, each short enough that the whole projection stays one
+    # model-visible line.
+    _SKIP_REASON_LIMIT = 3
+    _SKIP_REASON_MAX_CHARS = 120
+
+    def _junit_skip_reasons(self, python: str, report: str) -> List[str]:
+        """Distinct skip messages from THIS attempt's junit XML, or [].
+
+        Read from the report the run just wrote, so the reasons are the
+        project's own words. An unreadable/messageless report yields no
+        reasons — never an invented one.
+        """
+        command = (
+            f"{shlex.quote(python)} -c {shlex.quote(_PYTEST_JUNIT_SKIP_REASONS_SCRIPT)} "
+            f"{shlex.quote(report)}"
+        )
+        try:
+            result = self.orchestrator.execute_command(command) or {}
+        except Exception as exc:  # a missing fact must never mask the result
+            logger.debug(f"junit skip-reason extraction unavailable: {exc}")
+            return []
+        if not result.get("success"):
+            return []
+        try:
+            payload = json.loads((result.get("output") or "").strip() or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(payload, list):
+            return []
+        reasons: List[str] = []
+        for item in payload:
+            message = " ".join(str(item).split())[: self._SKIP_REASON_MAX_CHARS]
+            if message and message not in reasons:
+                reasons.append(message)
+            if len(reasons) >= self._SKIP_REASON_LIMIT:
+                break
+        return reasons
 
     def _target_sha(self, project_root: Optional[str]) -> Optional[str]:
         """The current checkout SHA of `project_root`, or None when unknown."""

@@ -388,12 +388,24 @@ def _native_env():
 
 def test_test_phase_suggests_smoke_when_native_core_not_built():
     """Live TVM (twice): the agent swept the full suite without libtvm — 356
-    identical collection errors. The REACTIVE smoke steer fires whenever the
-    build phase left the native core unbuilt — evidence-triggered, on every
-    intro (there is no brief projection to hide behind after the analyzer
-    diet)."""
+    identical collection errors. The REACTIVE smoke steer fires on every intro
+    (there is no brief projection to hide behind after the analyzer diet).
+
+    Plan 5 Stage E: the "not built" wording is now gated on the ARTIFACT PROBE,
+    so this case scripts a probe that finds no shared objects — the one state
+    where the claim is a fact (probe-present/probe-failed states live in
+    tests/test_native_capability_state.py)."""
     env = _native_env()
     engine = _engine_at(3, env)  # mark_done -> legacy outcome unknown
+    engine.physical_validator = SimpleNamespace(
+        docker_orchestrator=SimpleNamespace(
+            execute_command=lambda command, **kwargs: {
+                "success": True,
+                "exit_code": 0,
+                "output": "",
+            }
+        )
+    )
     intro = engine._phase_intro_step().content
     assert "smoke" in intro.lower()
     assert "collection errors" in intro
