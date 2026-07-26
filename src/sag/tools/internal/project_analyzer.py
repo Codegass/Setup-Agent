@@ -57,7 +57,12 @@ PROJECT_ANALYZER_VERSION = "project-analyzer-v1"
 # v8: Python distribution/backend/package paths, direct local providers,
 # native artifact roots and grounded smoke coordinates become survey facts;
 # .gitmodules and Python test-path layout join the fingerprint domain.
-SURVEY_FACTS_VERSION = 8
+# v9: the survey types each build island as a DOMAIN with the coordinates it
+# produces/requires and derives the coordinate edges between them (P0-B), and
+# gradle.properties joins the fingerprint domain (a gradle domain's produced
+# version is read there). A v8 manifest carries no domains at all, so reusing
+# it would hide the very graph the gate now judges independence by.
+SURVEY_FACTS_VERSION = 9
 
 
 def _strip_recommendation_prescriptions(rec):
@@ -724,6 +729,16 @@ class ProjectAnalyzerTool(BaseTool):
                     rec["build_islands"] = self._enumerate_build_islands(
                         project_path, source_modules, preferred["dir"]
                     )
+                    # P0-B: an island is a DIRECTORY fact and calling it
+                    # independent was never grounded (bigtop: data-generators
+                    # publishes 3.7.0-SNAPSHOT while transaction-queue/spark
+                    # require 3.5.0/3.6.0-SNAPSHOT — 13 attempts died on an
+                    # unresolvable dependency). Type each island with the
+                    # coordinates it produces/requires and derive the edges, so
+                    # independence is a conclusion of the graph. Both keys ride
+                    # BESIDE build_islands (untouched) and stay ABSENT on a
+                    # single-domain project — there is no graph to speak of.
+                    self._attach_build_domains(rec, project_path, source_modules, preferred["dir"])
                 rec.update(build_system="maven", build_root=build_root, goal=goal)
                 rec["rationale"] = (
                     f"Aggregator root over {len(source_modules)} source module(s) "
@@ -825,6 +840,35 @@ class ProjectAnalyzerTool(BaseTool):
         # Preferred module's island leads (matches build_root).
         islands.sort(key=lambda i: 0 if i["root"] == preferred_island_root else 1)
         return islands
+
+    def _attach_build_domains(
+        self,
+        rec: Dict[str, Any],
+        project_path: str,
+        source_modules: List[Dict[str, Any]],
+        preferred_dir: str,
+    ) -> None:
+        """Store the typed build domains and their coordinate edges on the
+        recommendation (domain schema v1), in the same order as build_islands.
+
+        Facts only — the domains are the surveyor's coordinate reading and the
+        edges are derived from them. A single domain is no graph: both keys stay
+        ABSENT (not empty) so single-module/healthy-reactor recommendations,
+        manifests and intros are byte-identical to before.
+        """
+        from sag.agent.physical_survey import derive_domain_edges, enumerate_build_domains
+
+        domains = enumerate_build_domains(self.docker_orchestrator, project_path, source_modules)
+        if len(domains) < 2:
+            return
+        preferred_root = self._island_root_for(project_path, preferred_dir)["root"]
+        # Same lead as build_islands (island #1 == build_root) so the two lists
+        # stay index-aligned for their readers.
+        domains.sort(key=lambda d: 0 if d["root"] == preferred_root else 1)
+        rec["build_domains"] = domains
+        edges = derive_domain_edges(domains)
+        if edges:
+            rec["domain_edges"] = edges
 
     def _recommend_test_approach(self, project_path: str, build_rec: Dict[str, Any]) -> None:
         """Recommend WHERE to run tests — they often live in different modules (and
@@ -990,6 +1034,15 @@ class ProjectAnalyzerTool(BaseTool):
             "test_islands": rec.get("test_islands") or [],
         }
 
+        # P0-B: the typed domains and their coordinate edges ride the SAME
+        # handoff manifest, so every reader downstream judges independence from
+        # the graph instead of the directory layout. Absent — not empty — when
+        # the survey found no multi-domain decomposition, which keeps
+        # single-module and healthy-reactor manifests byte-identical.
+        for key in ("build_domains", "domain_edges"):
+            if rec.get(key):
+                data[key] = rec[key]
+
         # Python requirements ride along on the SAME handoff manifest (spec
         # Component 1): java keys stay, python keys are added when the
         # analyzer's Python branch ran.
@@ -1143,8 +1196,42 @@ class ProjectAnalyzerTool(BaseTool):
             coords = "; ".join(
                 f"{isl.get('system') or 'unknown'} in {isl.get('root')}" for isl in islands
             )
-            return f"\n🏝️ Build coordinates (independent islands): {coords}\n"
+            # P0-B: "independent" is a claim about COORDINATES. It survives only
+            # while the graph has no edges between these roots; once one root
+            # consumes another's artifact they are linked, and a version
+            # mismatch is a blocker the model must see BEFORE its first attempt
+            # (bigtop: 13 attempts against a dependency that cannot resolve).
+            edges = rec.get("domain_edges") or []
+            label = "independent islands" if not edges else "coordinate-linked domains"
+            return (
+                self._render_domain_mismatches(edges)
+                + f"\n🏝️ Build coordinates ({label}): {coords}\n"
+            )
         return f"\n📍 Build coordinates: {rec.get('build_system')} at " f"{rec.get('build_root')}\n"
+
+    @staticmethod
+    def _render_domain_mismatches(edges: List[Dict[str, str]]) -> str:
+        """Name every version-incompatible coordinate edge, before the
+        coordinates the model would act on.
+
+        The fact phrasing comes from the survey substrate; the instruction is
+        the tool layer's prescription. It says "do not silently alias" because
+        the ground-truth review's diagnostic 3.7-as-3.6 alias proved only that
+        staleness blocks the path — the aliased Spark build still failed on a
+        missing API — so the mismatch must be REPORTED, never papered over.
+        """
+        from sag.agent.physical_survey import domain_mismatch_clause
+
+        clauses = [clause for clause in map(domain_mismatch_clause, edges or []) if clause]
+        if not clauses:
+            return ""
+        lines = "\n".join(
+            f"   • {clause} — record the mismatch, do not silently alias" for clause in clauses
+        )
+        return (
+            "\n⚠️ Coordinate mismatch between build domains "
+            f"({len(clauses)} observed, before any attempt):\n{lines}\n"
+        )
 
     @staticmethod
     def _fact_atom(value: Any, *, limit: int = 160) -> str:
