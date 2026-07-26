@@ -6,6 +6,7 @@ selects the next phase; routing belongs to ``PhaseTransitionPolicy``.
 
 from __future__ import annotations
 
+import json
 import shlex
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -13,6 +14,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 from loguru import logger
 
+from .invocation_receipts import RECEIPT_DIR
 from .phase_machine import PhaseClaim, PhaseOutcome
 
 
@@ -43,6 +45,20 @@ _OUTCOME_RANK = {
     PhaseOutcome.PARTIAL: 1,
     PhaseOutcome.SUCCESS: 2,
 }
+
+# Plan 5 Stage C (P0-F). The one validator state each terminal claim maps to,
+# so an upgrade can be capped AT the claim without inventing a state the
+# claim/outcome invariant would reject.
+_CLAIM_VALIDATOR_STATE = {
+    PhaseOutcome.FAILED: ValidatorState.RED,
+    PhaseOutcome.PARTIAL: ValidatorState.PARTIAL,
+    PhaseOutcome.SUCCESS: ValidatorState.GREEN,
+}
+
+# Domain rollup contract (plan §"Binding notes (Stage C)"): the sealed value is
+# ``{"<root>": {"state": ..., "blocker": "<detail>"?}}``. A domain in any of
+# these states has NOT closed, so no gate may refine a claim upward past it.
+_UNCLOSED_DOMAIN_STATES = frozenset({"failed", "blocked", "untried"})
 
 
 @dataclass(frozen=True)
@@ -129,6 +145,29 @@ class GateResult:
         )
 
 
+def _unclosed_domains(validated_facts: Mapping[str, Any]) -> tuple[str, ...]:
+    """``<root>=<state>`` for every surveyed domain that has not closed.
+
+    Reads the rollup the gate sealed: the build fact first, the test rollup as
+    the fallback for a run that only reached the test gate. No surveyed
+    domains means an empty tuple, which is the single-domain (cli/tvm) path and
+    keeps the claim ladder byte-identical to its pre-Stage-C behavior.
+    """
+    states = validated_facts.get("build.domain_states")
+    if not isinstance(states, Mapping):
+        rollup = validated_facts.get("test.stats")
+        states = rollup.get("domain_states") if isinstance(rollup, Mapping) else None
+    if not isinstance(states, Mapping):
+        return ()
+    unclosed: list[str] = []
+    for root, entry in states.items():
+        raw = entry.get("state") if isinstance(entry, Mapping) else entry
+        state = str(raw or "").strip().lower()
+        if state in _UNCLOSED_DOMAIN_STATES:
+            unclosed.append(f"{root}={state}")
+    return tuple(unclosed)
+
+
 @dataclass(frozen=True)
 class _ValidatorObservation:
     state: ValidatorState
@@ -157,6 +196,34 @@ def validate_phase_claim(
         phase_claim = PhaseClaim(phase="", claimed_outcome=PhaseOutcome(claim))
     claimed = PhaseOutcome(phase_claim.claimed_outcome)
     validated = _VALIDATED_OUTCOMES[state]
+
+    # Domain truth table (Plan 5 Stage C, P0-F). Ground-truth review 2026-07-26
+    # (§"Partial claims are upgraded"): a global artifact-presence check turned
+    # Bigtop's truthful 2/4 partial into validated success, and the per-domain
+    # facts were gone before sealing. While ANY surveyed domain is
+    # failed/blocked/untried the validated outcome may confirm or downgrade the
+    # claim, never refine it upward — a classified blocker is not a green
+    # waiver. The cap stops AT the claim: it never manufactures a contradiction
+    # the physical oracle did not observe.
+    facts = dict(validated_facts or {})
+    blocking_domains = _unclosed_domains(facts)
+    if (
+        blocking_domains
+        and claimed in _OUTCOME_RANK
+        and validated in _OUTCOME_RANK
+        and _OUTCOME_RANK[claimed] < _OUTCOME_RANK[validated]
+    ):
+        state = _CLAIM_VALIDATOR_STATE[claimed]
+        validated = _VALIDATED_OUTCOMES[state]
+        reason = " · ".join(
+            part
+            for part in (
+                reason,
+                "no refinement above the claim while surveyed build domains are "
+                f"unclosed: {', '.join(blocking_domains)}",
+            )
+            if part
+        )
 
     if claimed is PhaseOutcome.UNKNOWN:
         disposition = (
@@ -191,7 +258,7 @@ def validate_phase_claim(
         evidence_refs=tuple(evidence_refs),
         suggestions=tuple(suggestions),
         code=code,
-        validated_facts=dict(validated_facts or {}),
+        validated_facts=facts,
         claim=phase_claim,
     )
 
@@ -250,7 +317,7 @@ def _inspect_phase(phase, validator, orchestrator, project_name) -> _ValidatorOb
         if phase == "build":
             return _inspect_build(validator, project_name, orchestrator=orchestrator)
         if phase == "test":
-            return _inspect_test(validator, project_name)
+            return _inspect_test(validator, project_name, orchestrator=orchestrator)
         if phase == "report":
             return _inspect_report(orchestrator)
         return _ValidatorObservation(
@@ -453,6 +520,187 @@ def _auxiliary_counts(value: Any) -> dict[str, int] | None:
     }
 
 
+def _normalized_domain_root(value: Any) -> str:
+    raw = str(value or "").strip()
+    return raw.rstrip("/") or raw
+
+
+def _recommendation_fact(requirements: Mapping[str, Any] | None, key: str) -> Any:
+    """One recommendation fact, read the way every other rec fact is read.
+
+    The survey manifest projects the recommendation's keys at top level; a
+    manifest written before that projection existed carries only the nested
+    ``build_recommendation`` (same dual read as ``attempt_policy``'s
+    ``build_system`` lookup).
+    """
+    if not isinstance(requirements, Mapping):
+        return None
+    value = requirements.get(key)
+    if value is None:
+        recommendation = requirements.get("build_recommendation")
+        if isinstance(recommendation, Mapping):
+            value = recommendation.get(key)
+    return value
+
+
+def _surveyed_domain_roots(requirements: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """``build_domains`` roots in survey order (Stage C schema v1)."""
+    raw = _recommendation_fact(requirements, "build_domains")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    roots: list[str] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        root = _normalized_domain_root(item.get("root"))
+        if root and root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _domain_blockers(requirements: Mapping[str, Any] | None) -> dict[str, str]:
+    """Consumer root -> the incompatible edge's detail, sealed before any attempt."""
+    raw = _recommendation_fact(requirements, "domain_edges")
+    if not isinstance(raw, (list, tuple)):
+        return {}
+    blockers: dict[str, str] = {}
+    for edge in raw:
+        if not isinstance(edge, Mapping):
+            continue
+        if str(edge.get("status") or "").strip().lower() != "version_incompatible":
+            continue
+        consumer = _normalized_domain_root(edge.get("consumer"))
+        if not consumer or consumer in blockers:
+            continue
+        blockers[consumer] = str(edge.get("detail") or "").strip()
+    return blockers
+
+
+def _receipt_order(receipt: Mapping[str, Any]) -> tuple[int, str]:
+    """Invocation order from the receipt id's process-monotonic sequence."""
+    receipt_id = str(receipt.get("receipt_id") or "")
+    tail = receipt_id.rsplit("-", 1)[-1]
+    try:
+        sequence = int(tail)
+    except ValueError:
+        sequence = -1
+    return (sequence, receipt_id)
+
+
+def _read_invocation_receipts(orchestrator) -> tuple[Mapping[str, Any], ...]:
+    """Every Stage B invocation receipt, one shell round-trip.
+
+    ``write_receipt`` persists single-line JSON per file, so one ``cat`` of the
+    directory yields one receipt per line. Evidence collection never breaks a
+    gate: unreadable transport yields no receipts (absent facts stay absent),
+    and the caller then reports the domains as untried rather than guessing.
+    """
+    if orchestrator is None:
+        return ()
+    try:
+        probe = orchestrator.execute_command(
+            f"cat {shlex.quote(RECEIPT_DIR)}/*.json 2>/dev/null",
+            workdir=None,
+            timeout=30,
+        )
+    except Exception as exc:
+        logger.debug(f"invocation receipts unavailable at the gate: {exc}")
+        return ()
+    receipts: list[Mapping[str, Any]] = []
+    for line in str((probe or {}).get("output") or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            payload = json.loads(stripped)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, Mapping) and payload.get("working_directory"):
+            receipts.append(payload)
+    return tuple(receipts)
+
+
+def _domain_states(
+    requirements: Mapping[str, Any] | None,
+    receipts: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[str, str]] | None:
+    """Per-domain state from the coordinate graph plus Stage B receipts.
+
+    ``None`` when no build domains were surveyed — the single-domain (cli, tvm)
+    path, where the rollups keep their pre-Stage-C shape exactly.
+
+    Precedence, strictest first: a FAILED receipt outranks a classified blocker
+    (accurate classification never erases an observed failure), a blocker
+    outranks both a success receipt and untried (P0-F: "required + blocked
+    forbids global success" — a disposition is not success by itself), and a
+    domain with neither a receipt nor an edge is untried.
+
+    One invocation belongs to ONE domain: a receipt binds to the NEAREST
+    containing domain root. Crediting an aggregator because a nested domain
+    built is the overclaim this stage exists to remove.
+    """
+    roots = _surveyed_domain_roots(requirements)
+    if not roots:
+        return None
+    blockers = _domain_blockers(requirements)
+    attempted: dict[str, str] = {}
+    for receipt in sorted(receipts, key=_receipt_order):
+        outcome = str(receipt.get("outcome") or "").strip().lower()
+        if outcome not in {"completed", "failed"}:
+            continue
+        directory = _normalized_domain_root(receipt.get("working_directory"))
+        if not directory:
+            continue
+        containing = [
+            root for root in roots if directory == root or directory.startswith(f"{root}/")
+        ]
+        if containing:
+            # Retry semantics (same rule the finalizer's observation aggregate
+            # uses): the LATEST receipt at a root is that domain's current
+            # attempt state.
+            nearest = max(containing, key=len)
+            attempted[nearest] = "success" if outcome == "completed" else "failed"
+    states: dict[str, dict[str, str]] = {}
+    for root in roots:
+        blocker = blockers.get(root)
+        attempt = attempted.get(root)
+        if attempt == "failed":
+            state = "failed"
+        elif blocker is not None:
+            state = "blocked"
+        elif attempt is not None:
+            state = attempt
+        else:
+            state = "untried"
+        entry = {"state": state}
+        if blocker:
+            entry["blocker"] = blocker
+        states[root] = entry
+    return states
+
+
+def _gate_domain_states(
+    orchestrator,
+    requirements: Mapping[str, Any] | None = None,
+) -> dict[str, dict[str, str]] | None:
+    """Domain states for one gate pass; never raises, never blocks the gate.
+
+    ``requirements`` lets a caller that already read the survey manifest reuse
+    it instead of paying a second container round-trip.
+    """
+    if orchestrator is None:
+        return None
+    try:
+        if requirements is None:
+            from sag.tools.internal.build_preflight import read_build_requirements
+
+            requirements = read_build_requirements(orchestrator) or {}
+        return _domain_states(requirements, _read_invocation_receipts(orchestrator))
+    except Exception as exc:
+        logger.debug(f"domain states unavailable at the gate: {exc}")
+        return None
+
+
 def _inspect_analyze(validator, project_name) -> _ValidatorObservation:
     method = getattr(validator, "validate_project_analysis_status", None)
     if method is None:
@@ -516,13 +764,16 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     # mid-run guidance can never disagree with the sealed verdict.
     from sag.agent.module_coverage import coverage_checklist_line, module_coverage
 
+    requirements: Mapping[str, Any] | None = None
     islands = None
     if orchestrator is not None:
         try:
             from sag.tools.internal.build_preflight import read_build_requirements
 
-            islands = (read_build_requirements(orchestrator) or {}).get("build_islands")
+            requirements = read_build_requirements(orchestrator) or {}
+            islands = requirements.get("build_islands")
         except Exception:
+            requirements = None
             islands = None
     checklist = coverage_checklist_line(
         module_coverage(validator, project_name), islands=islands
@@ -560,6 +811,12 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     )
     if compiled_classes is not None:
         validated_facts["build.compiled_classes"] = compiled_classes
+    # Plan 5 Task C2 (P0-B/P0-F): per-domain outcomes ride WITH the build
+    # rollup they scope. Absent when no build domains were surveyed, so
+    # single-domain projects seal the pre-Stage-C shape byte-identically.
+    domain_states = _gate_domain_states(orchestrator, requirements)
+    if domain_states is not None:
+        validated_facts["build.domain_states"] = domain_states
     return _ValidatorObservation(
         state,
         reason=reason,
@@ -570,7 +827,7 @@ def _inspect_build(validator, project_name, orchestrator=None) -> _ValidatorObse
     )
 
 
-def _inspect_test(validator, project_name) -> _ValidatorObservation:
+def _inspect_test(validator, project_name, orchestrator=None) -> _ValidatorObservation:
     if validator is None:
         raise RuntimeError("no physical validator available")
     status = validator.validate_test_status(project_name)
@@ -622,6 +879,13 @@ def _inspect_test(validator, project_name) -> _ValidatorObservation:
             "If an external impediment prevents tests, claim blocked with evidence refs",
         )
     rollup = _validated_test_rollup(status)
+    if rollup is not None:
+        # Plan 5 Task C2: the domain decomposition scopes the test rollup the
+        # same way it scopes the build one. Key absent when no domains were
+        # surveyed (established absent-when-inapplicable pattern above).
+        domain_states = _gate_domain_states(orchestrator)
+        if domain_states is not None:
+            rollup["domain_states"] = domain_states
     return _ValidatorObservation(
         state,
         reason=reason,
