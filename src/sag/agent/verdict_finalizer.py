@@ -9,7 +9,7 @@ from enum import Enum
 from typing import Any, Literal, cast
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 from sag.agent.physical_validator import evaluate_run_verdict
 from sag.config.settings import DEFAULT_TEST_PASS_THRESHOLD
@@ -68,6 +68,25 @@ class SnapshotTestStats(BaseModel):
     raw: SnapshotTestCounts = Field(default_factory=SnapshotTestCounts)
     flaky_count: int = 0
     judgment: Literal["success", "failed", "unknown"] = "unknown"
+    # Plan 4 audit fix: pytest collection failures are first-class sealed
+    # facts, never laundered into executed-test counts (None = not observed).
+    collection_errors: int | None = None
+    collection_errors_skipped: int | None = None
+    collection_error_summary: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_unobserved_collection_fields(self, handler):
+        """Byte-compat with pre-Plan-4 snapshots: absent facts serialize as
+        absent keys, so recorded replay fixtures keep verifying unchanged."""
+        data = handler(self)
+        for key in (
+            "collection_errors",
+            "collection_errors_skipped",
+            "collection_error_summary",
+        ):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
     @model_validator(mode="before")
     @classmethod
@@ -570,6 +589,15 @@ def _fold_test_stats(
                 raw=validated_raw,
                 flaky_count=_nonnegative_int(validated_rollup.get("flaky_count")) or 0,
                 judgment=validated_judgment,
+                collection_errors=_nonnegative_int(validated_rollup.get("collection_errors")),
+                collection_errors_skipped=_nonnegative_int(
+                    validated_rollup.get("collection_errors_skipped")
+                ),
+                collection_error_summary=(
+                    str(validated_rollup.get("collection_error_summary")).strip() or None
+                    if validated_rollup.get("collection_error_summary")
+                    else None
+                ),
             ),
             conflicts,
         )

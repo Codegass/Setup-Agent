@@ -394,6 +394,9 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
         conflicts.append("test_errors_detected")
     if status.get("parsing_errors"):
         conflicts.append("test_report_parse_error")
+    collection_summary = str(
+        status.get("collection_error_summary") or test_stats.get("collection_error_summary") or ""
+    ).strip()
     return {
         "discovered": _first_nonnegative_int(
             test_stats.get("discovered"), status.get("static_test_count")
@@ -402,6 +405,24 @@ def _validated_test_rollup(status: Mapping[str, Any]) -> dict[str, Any] | None:
         "raw": raw,
         "flaky_count": _first_nonnegative_int(status.get("flaky_count"), 0) or 0,
         "conflicts": list(dict.fromkeys(str(item) for item in conflicts if item)),
+        # Plan 4 audit fix: collection facts must survive into the sealed
+        # snapshot — dropping them here recreated the projection failure the
+        # 2026-07-26 audit diagnosed. Absent facts stay absent keys so
+        # pre-Plan-4 rollup shapes (and their exact-dict tests) are unchanged.
+        **{
+            key: value
+            for key, value in {
+                "collection_errors": _first_nonnegative_int(
+                    status.get("collection_errors"), test_stats.get("collection_errors")
+                ),
+                "collection_errors_skipped": _first_nonnegative_int(
+                    status.get("collection_errors_skipped"),
+                    test_stats.get("collection_errors_skipped"),
+                ),
+                "collection_error_summary": collection_summary or None,
+            }.items()
+            if value is not None
+        },
     }
 
 
