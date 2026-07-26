@@ -1,5 +1,32 @@
 # Plan 4 Machine-Verified Acceptance — Fact Projection Closed
 
+> **⚠️ SECOND CORRECTION (2026-07-26, post ground-truth review).** The
+> ground-truth review (`2026-07-26-three-project-harness-ground-truth-review.md`)
+> falsifies two gradings below; both were verified against live evidence:
+>
+> 1. **"TVM harness-gate PASS" was too strong.** Full-sweep prevention PASS
+>    stands (the bounded smoke demonstrably ran). But the all-skipped smoke
+>    (`executed=3, skipped=3`) **minted a capability receipt**
+>    (`native_smoke_receipt.json`, verified byte-identical to the review's
+>    quote) — `python_tool.py`'s `executed >= 1` counts skipped nodes, so a
+>    second bare call would have escaped the bounded gate on zero positive
+>    evidence. The 7/7 verifier result is real but the assertion set is
+>    incomplete: it never asserts all-skipped ⇒ no receipt. Re-grade:
+>    full-sweep prevention **PASS**, capability receipt **FAIL**.
+> 2. **Bigtop "54/54 primary-coordinate" was mislabeled.** The validator's
+>    recursive XML scan (`physical_validator.py` `rglob("*.xml")`) aggregates
+>    without invocation scope; manual container ground truth shows the
+>    primary coordinate is exactly **50/50**, with 4 auxiliary
+>    test-framework passes leaked in. The verifier's `>=50` anchor held by
+>    luck, not by scoped semantics.
+>
+> Additionally verified from this review: the test-phase steer
+> `NATIVE_NOT_BUILT_TEST_GUIDANCE` (react_engine.py) asserts "the NATIVE
+> core was not built" from *build-phase outcome alone* — five native `.so`
+> files existed in the container. The claim below that TVM's verdict was
+> "honest" is therefore wrong at the root-cause layer: the skip facts were
+> honest, the projected native-state diagnosis was false.
+
 **Date:** 2026-07-26
 **Code under test:** main @ `4b5ad6f` (Plan 4 complete: Tasks 1–5 + sealed-chain reviewer fix + verifier)
 **Verifier:** `scripts/verify_native_test_policy.py` — every claim below is a
