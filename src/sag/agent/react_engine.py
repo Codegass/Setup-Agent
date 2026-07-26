@@ -1335,7 +1335,11 @@ class ReActEngine(UIEventEmitter):
                 actual_executions=actual_executions,
             )
             self._apply_tool_execution_loop_effects(execution)
-            self._append_native_observation(forced_call_id, execution.observation_text)
+            self._append_native_observation(
+                forced_call_id,
+                execution.observation_text,
+                source_tool=tool,
+            )
             return True
         finally:
             self._suppress_control_action_envelope = False
@@ -3138,8 +3142,13 @@ class ReActEngine(UIEventEmitter):
         if self.config.verbose:
             self._log_tool_result_verbose(step.tool_name, result)
 
-        # Add observation step with improved formatting
-        self._append_native_observation(native_call_id, execution.observation_text)
+        # Add observation step with improved formatting; the executing tool is
+        # what decides physical-evidence enrichment.
+        self._append_native_observation(
+            native_call_id,
+            execution.observation_text,
+            source_tool=call.name,
+        )
 
         if result.error_code == "TEST_ATTEMPT_REQUIRED":
             required_attempt = self._missing_required_test_attempt()
@@ -3244,10 +3253,21 @@ class ReActEngine(UIEventEmitter):
         self,
         tool_call_id: Optional[str],
         observation: str,
+        source_tool: Optional[str] = None,
     ) -> Optional[ReActStep]:
         """Append an observation through the preserved enrichment path, stamped
-        with the tool_call it answers (None for the legacy protocol)."""
-        step = self._add_observation_step(observation)
+        with the tool_call it answers (None for the legacy protocol).
+
+        `source_tool` is the tool whose execution produced this observation —
+        the physical-evidence trigger. It is published on the engine rather
+        than passed down, because `_add_observation_step` is a one-argument
+        seam that callers (and tests) substitute."""
+        previous_source_tool = getattr(self, "_observation_source_tool", None)
+        self._observation_source_tool = source_tool
+        try:
+            step = self._add_observation_step(observation)
+        finally:
+            self._observation_source_tool = previous_source_tool
         if step is not None and tool_call_id:
             step.tool_call_id = tool_call_id
         return step
@@ -3552,17 +3572,29 @@ class ReActEngine(UIEventEmitter):
         if len(self.recent_tool_executions) > self.max_recent_executions:
             self.recent_tool_executions.pop(0)
 
-    def _add_observation_step(self, observation: str) -> ReActStep:
+    def _add_observation_step(
+        self, observation: str, source_tool: Optional[str] = None
+    ) -> ReActStep:
         """Add an observation step, enriched with physical validation state.
+
+        Enrichment is triggered by evidence, never by wording: the probe runs
+        iff this observation answers a build-family execution. `source_tool`
+        names that tool; when it is omitted the engine falls back to the tool
+        `_execute_action_step` is currently answering, so the one-argument
+        call shape of this seam is preserved.
 
         Returns the appended step so a native caller can stamp the
         `tool_call_id` it answers."""
-        # Get physical validation state if relevant
-        physical_state = self._get_physical_validation_state(observation)
+        if source_tool is None:
+            source_tool = getattr(self, "_observation_source_tool", None)
+        if source_tool in self._BUILD_EVIDENCE_TOOLS:
+            physical_state = self._get_physical_validation_state(observation)
 
-        # Enrich observation with physical state if available
-        if physical_state:
-            observation = self._enrich_observation_with_physical_state(observation, physical_state)
+            # Enrich observation with physical state if available
+            if physical_state:
+                observation = self._enrich_observation_with_physical_state(
+                    observation, physical_state
+                )
 
         obs_step = ReActStep(
             step_type=StepType.OBSERVATION, content=observation, timestamp=self._get_timestamp()
@@ -3611,7 +3643,11 @@ class ReActEngine(UIEventEmitter):
 
     def _get_physical_validation_state(self, observation: str) -> Optional[Dict[str, any]]:
         """
-        Get physical validation state for build/test related observations.
+        Get physical validation state for a build-family observation.
+
+        Callers gate this probe on the executing tool (`_add_observation_step`),
+        so the observation text is never screened for keywords here: a build
+        that reports neutrally is still build evidence.
 
         Args:
             observation: The observation text
@@ -3619,13 +3655,7 @@ class ReActEngine(UIEventEmitter):
         Returns:
             Physical validation state dict or None
         """
-        # Only validate for build/test related observations
         obs_lower = observation.lower()
-        if not any(
-            keyword in obs_lower
-            for keyword in ["build", "compile", "test", "maven", "gradle", "success", "fail"]
-        ):
-            return None
 
         try:
             # Get project name from context or use default
