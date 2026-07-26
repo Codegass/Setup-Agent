@@ -8,7 +8,11 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from sag.agent.invocation_receipts import record_invocation, snapshot_reports
+from sag.agent.invocation_receipts import (
+    mark_semantic_failure,
+    record_invocation,
+    snapshot_reports,
+)
 from sag.agent.output_storage import OutputStorageManager
 from sag.evidence import EvidenceAssessment, TestStats
 
@@ -345,6 +349,23 @@ class GradleTool(BaseTool):
                 compile_source_languages=_compile_source_languages,
             )
             compile_mismatch = analysis.get("compile_source_mismatch")
+            if compile_mismatch is None and _compile_source_languages is None:
+                # P0-C follow-up (live p5v-bigtop-r1): the recovery path re-ran
+                # spark's compile with a bare static task list, so no probe
+                # accompanied the call and an all-NO-SOURCE run scored green.
+                # The guard cannot depend on WHO invoked it: when every executed
+                # compile task found nothing, probe the source dirs ourselves.
+                compiled = [
+                    t for t in analysis.get("tasks_executed") or [] if self._is_compile_task(t)
+                ]
+                no_source = [
+                    t for t in analysis.get("no_source_tasks") or [] if self._is_compile_task(t)
+                ]
+                if compiled and set(no_source) == set(compiled):
+                    self_probed = self._probe_compile_source_dirs(working_directory)
+                    compile_mismatch = self._compile_coverage_error(analysis, self_probed)
+                    if compile_mismatch:
+                        analysis["compile_source_mismatch"] = compile_mismatch
 
             # Store full output if large. Detached builds hand back a complete
             # `full_output` (untruncated log) next to the bounded inline `output`;
@@ -422,7 +443,14 @@ class GradleTool(BaseTool):
             evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
             if result["exit_code"] == 0 and compile_mismatch:
                 # Gradle's own exit code says SUCCESS; the task outcomes say the
-                # compile never touched the sources. The narrower fact wins.
+                # compile never touched the sources. The narrower fact wins —
+                # and the invocation receipt must carry the same verdict, or
+                # the domain gate would score this domain green from exit 0.
+                mark_semantic_failure(
+                    self.orchestrator.execute_command,
+                    self._pending_invocation_receipt,
+                    compile_mismatch,
+                )
                 return self._finalize_main_result(
                     ToolResult.completed_failure(
                         output=self._format_compile_coverage_failure(
@@ -793,6 +821,19 @@ class GradleTool(BaseTool):
     def _is_compile_task(task: str) -> bool:
         """A compile task, whatever project path qualifies it (:sub:compileScala)."""
         return task.rsplit(":", 1)[-1].startswith("compile")
+
+    def _probe_compile_source_dirs(self, working_directory: str) -> List[str]:
+        """Compile languages whose src/main/<lang> exists under the root —
+        the same directory facts the backend probes, self-served so the
+        NO-SOURCE guard holds on EVERY invocation path (recovery included)."""
+        root = working_directory.rstrip("/")
+        probe = self.orchestrator.execute_command(
+            f"for lang in scala kotlin groovy; do "
+            f'test -d {shlex.quote(root)}/src/main/"$lang" && echo "$lang"; done; true'
+        )
+        if not probe.get("success"):
+            return []
+        return [line.strip() for line in (probe.get("output") or "").splitlines() if line.strip()]
 
     def _compile_coverage_error(
         self, analysis: Dict[str, Any], compile_source_languages: Optional[List[str]]

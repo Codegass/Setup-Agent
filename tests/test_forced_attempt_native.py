@@ -171,3 +171,58 @@ def test_forced_attempt_renders_as_a_valid_native_exchange(forced_engine):
         "content": "50 tests passed",
     }
     assert "cancelled by harness" not in str(messages)
+
+
+def test_forced_action_event_accepts_a_primary_candidate():
+    """Live p5v-bigtop-r1: to_snapshot() gained `primary` (Plan 4) and the
+    strict control-event payload silently dropped every forced_action event,
+    orphaning the forced tool_result in the pairing walk."""
+    from sag.agent.control_events import ControlEvent, forced_action_sha256
+
+    resolution = {
+        "status": "available",
+        "workspace_root": "/workspace",
+        "project_root": "/workspace/bigtop",
+        "candidates": [
+            {"root": "/workspace/bigtop/bigtop-data-generators", "system": "gradle"}
+        ],
+        "primary": {
+            "root": "/workspace/bigtop/bigtop-data-generators",
+            "system": "gradle",
+        },
+    }
+    digest = forced_action_sha256(
+        policy="test_attempt_required",
+        trigger="phase_floor",
+        phase="test",
+        source_attempt_id="test-1",
+        reason_code="TEST_ATTEMPT_REQUIRED",
+        tool="build",
+        exact_params={"action": "test"},
+        candidate_root="/workspace/bigtop/bigtop-data-generators",
+        candidate_system="gradle",
+        parent_execution_id=None,
+        candidate_resolution=resolution,
+    )
+    event = ControlEvent(
+        event_id="control-000082",
+        kind="forced_action",
+        sequence=82,
+        timestamp="2026-07-26T23:36:19.075685Z",
+        payload={
+            "envelope_id": "forced-000082",
+            "policy": "test_attempt_required",
+            "trigger": "phase_floor",
+            "phase": "test",
+            "source_attempt_id": "test-1",
+            "reason_code": "TEST_ATTEMPT_REQUIRED",
+            "tool": "build",
+            "exact_params": {"action": "test"},
+            "candidate_root": "/workspace/bigtop/bigtop-data-generators",
+            "candidate_system": "gradle",
+            "parent_execution_id": None,
+            "action_sha256": digest,
+            "candidate_resolution": resolution,
+        },
+    )
+    assert event.payload["candidate_resolution"]["primary"]["system"] == "gradle"

@@ -18,7 +18,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 CONTROL_EVENT_SCHEMA_VERSION = 2
 # `planner_response` and `scheduler_decision` are HISTORICAL kinds: the engine
@@ -303,6 +310,21 @@ class TestCandidateResolutionPayload(_StrictPayload):
     workspace_root: str | None = None
     project_root: str | None = None
     candidates: tuple[TestCandidatePayload, ...] = ()
+    # Plan 4 primary-coordinate follow-up (live p5v-bigtop-r1): to_snapshot()
+    # gained `primary`, and this strict model silently killed every
+    # forced_action / gate_decision event that carried it.
+    primary: TestCandidatePayload | None = None
+
+    @model_serializer(mode="wrap")
+    def _primary_absent_stays_absent(self, handler):
+        """Hash stability across schema generations: the action digest is
+        recomputed from this dump, so an event recorded WITHOUT `primary`
+        (pre-Plan-4 fixtures) must keep dumping without it, while an event
+        that carried it (even as null) keeps it."""
+        data = handler(self)
+        if "primary" not in self.model_fields_set:
+            data.pop("primary", None)
+        return data
 
     @model_validator(mode="after")
     def _status_matches_candidates(self) -> "TestCandidateResolutionPayload":

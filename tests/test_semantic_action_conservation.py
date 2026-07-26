@@ -522,3 +522,67 @@ def test_skip_flags_on_test_commands_still_flagged():
     exclusions = _detect_exclusions("mvn test -DskipTests\ngradle test -x test\n")
     assert "ALL_TESTS_SKIPPED" in exclusions
     assert "GRADLE_TESTS_EXCLUDED" in exclusions
+
+
+class SelfProbingGradleOrchestrator(GradleLogOrchestrator):
+    """Answers the NO-SOURCE self-probe and receipt reads like a container."""
+
+    def __init__(self, output, exit_code=0, probe_languages="scala\n"):
+        super().__init__(output, exit_code=exit_code)
+        self.probe_languages = probe_languages
+        self.receipts = {}
+
+    def execute_command(self, command, workdir=None, timeout=None):
+        self.commands.append(command)
+        if "for lang in scala kotlin groovy" in command:
+            return {"success": True, "output": self.probe_languages, "exit_code": 0}
+        if command.startswith("cat ") and "invocation_receipts" in command:
+            for receipt_id, body in self.receipts.items():
+                if receipt_id in command:
+                    return {"success": True, "output": body, "exit_code": 0}
+            return {"success": False, "output": "", "exit_code": 1}
+        if "invocation_receipts" in command and "mv -f" in command:
+            import re as _re
+
+            match = _re.search(r"invocation_receipts/(inv-[^./]+)\.json\.tmp", command)
+            body = command.split("\n", 1)[1].rsplit("\n", 1)[0]
+            if match:
+                self.receipts[match.group(1)] = body
+            return {"success": True, "output": "", "exit_code": 0}
+        return super().execute_command(command, workdir=workdir, timeout=timeout)
+
+
+def test_no_source_guard_holds_without_a_caller_probe():
+    """Live p5v-bigtop-r1: the recovery path re-ran spark's compile with a bare
+    static task list (no language probe) and the all-NO-SOURCE run scored
+    green. The guard must self-probe when no probe accompanied the call."""
+    orchestrator = SelfProbingGradleOrchestrator(
+        "> Task :compileJava NO-SOURCE\nBUILD SUCCESSFUL in 3s\n"
+    )
+    result = GradleTool(orchestrator).execute(
+        tasks="compileJava",
+        working_directory="/workspace/p",
+        use_wrapper=False,
+    )
+    assert result.succeeded is False
+    assert result.error == NO_SOURCE_MISMATCH
+
+
+def test_semantic_failure_downgrades_the_invocation_receipt():
+    """The receipt must carry the classifier's verdict, not the raw exit 0 —
+    otherwise the domain gate scores a NO-SOURCE domain green."""
+    orchestrator = SelfProbingGradleOrchestrator(
+        "> Task :compileJava NO-SOURCE\nBUILD SUCCESSFUL in 3s\n"
+    )
+    result = GradleTool(orchestrator).execute(
+        tasks="compileJava",
+        working_directory="/workspace/p",
+        use_wrapper=False,
+    )
+    assert result.succeeded is False
+    import json as _json
+
+    receipts = [_json.loads(body) for body in orchestrator.receipts.values()]
+    assert len(receipts) == 1
+    assert receipts[0]["outcome"] == "failed"
+    assert "NO-SOURCE" in receipts[0]["semantic_failure"]

@@ -92,7 +92,11 @@ class Verifier:
         hash_bad = 0
         for event in _events(self.session):
             kind, payload = event.get("kind"), event.get("payload", {})
-            if kind == "action_envelope":
+            if kind == "forced_action":
+                # Harness-forced attempts pair forced_action <-> tool_result
+                # (their provenance rides action_sha256, not an envelope).
+                envelopes[payload.get("envelope_id")] = payload
+            elif kind == "action_envelope":
                 envelopes[payload["envelope_id"]] = payload
                 recomputed = action_envelope_sha256(
                     plan_index=payload.get("plan_index"),
@@ -236,12 +240,29 @@ class Verifier:
                 int(passed or 0) == 50,
                 f"passed={passed} (auxiliary leaked into the primary count)",
             )
+        # The stale consumers (spark 3.6, transaction 3.5) can never close
+        # green on this checkout — blocked when a literal incompatibility was
+        # derivable, otherwise honestly failed at attempt time. Producer
+        # coordinates are Groovy-derived (nothing literal), so the graph seals
+        # name-only "unverified" edges rather than inventing blockers.
         domain_states = (verdict.get("build_evidence") or {}).get("domain_states") or {}
-        blocked = [r for r, s in domain_states.items() if (s or {}).get("state") == "blocked"]
+        states = {r: (s or {}).get("state") for r, s in domain_states.items()}
+        not_success = [r for r, s in states.items() if s in ("failed", "blocked")]
         self.check(
-            "bigtop.domains.blocked_sealed",
-            len(blocked) >= 1,
-            f"domain_states={ {r: (s or {}).get('state') for r, s in domain_states.items()} }",
+            "bigtop.domains.stale_consumers_not_green",
+            len(not_success) >= 2,
+            f"domain_states={states}",
+        )
+        requirements_path = os.path.join(self.session, ".setup_agent", "build_requirements.json")
+        edges = []
+        if os.path.exists(requirements_path):
+            with open(requirements_path) as handle:
+                edges = json.load(handle).get("domain_edges") or []
+        named = [e for e in edges if "bigpetstore-data-generator" in str(e.get("detail") or "")]
+        self.check(
+            "bigtop.edges.data_generator_linked",
+            len(named) >= 2,
+            f"domain_edges={[(e.get('status'), (e.get('detail') or '')[:60]) for e in edges]}",
         )
 
     def assert_cli(self) -> None:

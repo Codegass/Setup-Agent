@@ -754,3 +754,59 @@ def test_enumerate_build_domains_matches_the_island_grouping():
     domains = enumerate_build_domains(orch, BIG, modules)
     assert [d["root"] for d in domains] == [i["root"] for i in islands]
     assert [d["system"] for d in domains] == [i["system"] for i in islands]
+
+
+def test_name_only_match_yields_unverified_edge_never_a_blocker():
+    """Live p5v-bigtop-r1: data-generators derives group/version from the
+    parent pom in Groovy — nothing literal. The subproject NAME still links
+    the consumer to the producer, but only as an 'unverified' edge."""
+    domains = [
+        {
+            "root": "/workspace/bigtop/bigtop-data-generators",
+            "system": "gradle",
+            "produces": [{"name": "bigpetstore-data-generator"}],
+        },
+        {
+            "root": "/workspace/bigtop/bigtop-bigpetstore/bigpetstore-spark",
+            "system": "gradle",
+            "requires": [
+                {
+                    "group": "org.apache.bigtop",
+                    "name": "bigpetstore-data-generator",
+                    "version": "3.6.0-SNAPSHOT",
+                }
+            ],
+        },
+    ]
+
+    edges = derive_domain_edges(domains)
+
+    assert len(edges) == 1
+    edge = edges[0]
+    assert edge["status"] == "unverified"
+    assert edge["consumer"].endswith("bigpetstore-spark")
+    assert edge["producer"].endswith("bigtop-data-generators")
+    assert "not literally declared" in edge["detail"]
+    assert "org.apache.bigtop:bigpetstore-data-generator 3.6.0-SNAPSHOT" in edge["detail"]
+
+
+def test_literal_group_match_still_wins_over_name_only():
+    domains = [
+        {
+            "root": "/p/producer",
+            "system": "gradle",
+            "produces": [
+                {"group": "org.example", "name": "lib", "version": "2.0"}
+            ],
+        },
+        {
+            "root": "/p/consumer",
+            "system": "gradle",
+            "requires": [{"group": "org.example", "name": "lib", "version": "1.0"}],
+        },
+    ]
+
+    edges = derive_domain_edges(domains)
+
+    assert len(edges) == 1
+    assert edges[0]["status"] == "version_incompatible"

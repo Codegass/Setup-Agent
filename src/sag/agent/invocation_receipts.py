@@ -143,6 +143,37 @@ def build_receipt(
     return receipt
 
 
+def mark_semantic_failure(
+    execute: Callable[..., Optional[Mapping[str, Any]]],
+    receipt_metadata: Optional[Mapping[str, Any]],
+    reason: str,
+) -> bool:
+    """Downgrade this invocation's OWN receipt to a semantic failure.
+
+    A zero exit code is a command fact; the tool's classifier may still rule
+    the run a failure (live p5v-bigtop-r1: spark's compileJava exited 0 with
+    every task NO-SOURCE, and the completed receipt scored the domain a
+    success). The invocation that wrote the receipt completes its own record
+    before phase validation reads it — this is finishing a receipt, never
+    rewriting history. Never raises.
+    """
+    receipt_id = str(((receipt_metadata or {}).get("receipt_id")) or "").strip()
+    if not receipt_id or not reason:
+        return False
+    path = f"{RECEIPT_DIR}/{receipt_id}.json"
+    try:
+        current = execute(f"cat {shlex.quote(path)}") or {}
+        payload = json.loads((current.get("output") or "").strip())
+    except Exception as exc:
+        logger.debug(f"invocation receipt {receipt_id} unreadable for semantic mark: {exc}")
+        return False
+    if not isinstance(payload, dict):
+        return False
+    payload["outcome"] = "failed"
+    payload["semantic_failure"] = str(reason)[:200]
+    return write_receipt(execute, payload)
+
+
 def write_receipt(
     execute: Callable[..., Optional[Mapping[str, Any]]],
     receipt: Mapping[str, Any],

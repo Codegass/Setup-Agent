@@ -1746,34 +1746,55 @@ def derive_domain_edges(domains: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     edge: an unmatched dependency is somebody else's artifact.
     """
     produced: Dict[tuple, tuple] = {}
+    produced_by_name: Dict[str, tuple] = {}
     for domain in domains or ():
         for coordinate in domain.get("produces") or ():
-            key = (coordinate.get("group"), coordinate.get("name"))
-            if not all(key):
-                continue
-            produced.setdefault(key, (domain.get("root"), coordinate.get("version")))
+            name = coordinate.get("name")
+            key = (coordinate.get("group"), name)
+            if all(key):
+                produced.setdefault(key, (domain.get("root"), coordinate.get("version")))
+            elif name:
+                # Live bigtop: data-generators derives group/version from the
+                # parent pom AT BUILD TIME (Groovy code, nothing literal to
+                # read). The subproject NAME is still a literal fact.
+                produced_by_name.setdefault(name, (domain.get("root"), None))
 
     edges: List[Dict[str, str]] = []
     for domain in domains or ():
         consumer = domain.get("root")
         for coordinate in domain.get("requires") or ():
-            match = produced.get((coordinate.get("group"), coordinate.get("name")))
+            name = coordinate.get("name")
+            match = produced.get((coordinate.get("group"), name))
+            unverified = False
+            if not match and name in produced_by_name:
+                # Name-only match: a sibling domain builds an artifact of this
+                # exact name but never literally declares group/version. The
+                # link is real enough to surface, too weak to call a blocker.
+                match = produced_by_name[name]
+                unverified = True
             if not match:
                 continue
             producer, producer_version = match
             if producer == consumer:
                 continue  # a domain consuming its own artifact is not an edge
             version = coordinate.get("version")
-            status = (
-                "version_incompatible"
-                if producer_version and version and version != producer_version
-                else "compatible"
-            )
+            if unverified:
+                status = "unverified"
+            elif producer_version and version and version != producer_version:
+                status = "version_incompatible"
+            else:
+                status = "compatible"
             edge = {
                 "consumer": consumer,
                 "producer": producer,
                 "status": status,
-                "detail": _edge_detail(coordinate, producer_version),
+                "detail": (
+                    f"requires {coordinate.get('group')}:{name} {version or '?'}; "
+                    "sibling builds an artifact of this name whose group/version "
+                    "are not literally declared"
+                    if unverified
+                    else _edge_detail(coordinate, producer_version)
+                ),
             }
             if edge not in edges:
                 edges.append(edge)
