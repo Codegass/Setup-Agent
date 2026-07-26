@@ -619,6 +619,26 @@ git commit -m "feat: action envelopes keyed by tool_call_id, scheduler gate remo
 
 ### Task 4: The native executor loop (flag-gated)
 
+> **INTERFACE CORRECTIONS FROM STAGE A (binding, discovered against real code):**
+> 1. `ReActStep` is a pydantic model; the params field is **`tool_params`**, not
+>    `tool_parameters` (assigning an undeclared field raises). Construction
+>    requires `timestamp: str`.
+> 2. `get_native_turn` **propagates provider exceptions** (no swallow-to-None
+>    like `get_response`). Wrap the call: on exception,
+>    `return self.abort(f"LLM response unavailable: {exc}")`.
+> 3. Envelope identity needs zero wiring if the dispatcher appends the ACTION
+>    step (with `tool_call_id`) BEFORE `_execute_tool_call` — the emitter
+>    tail-scans `self.steps`. `self._active_native_tool_call_id` is the
+>    explicit override for out-of-tail executions.
+> 4. The renderer merges consecutive ACTION steps into one assistant message
+>    only when their `native_text` matches — set `step.native_text = turn.text`
+>    on every call of the same turn.
+> 5. A tool call with `name==""` is delivered (not dropped): route it through
+>    the orchestrator's unknown-tool feedback so the pairing invariant holds.
+> 6. Post-Stage-A full-suite baseline: 2,497 passed / 1 skipped (env-dependent
+>    ±1 skip); re-measure your own clean baseline before claiming deltas.
+> The sketch below is amended for (1); apply the rest during implementation.
+
 **Files:**
 - Modify: `src/sag/config.py` (or wherever `max_iterations` etc. live — grep `max_wall_clock_seconds`) — add `native_executor_loop: bool = False`
 - Modify: `src/sag/agent/react_engine.py` — new `_run_native_loop(...)` + dispatch in `run_setup_loop`/`_run_react_loop` entry
@@ -725,7 +745,7 @@ The dispatcher — the pairing-invariant owner:
                 content=f"{call.name}",
                 tool_name=call.name,
             )
-            step.tool_parameters = dict(call.arguments)
+            step.tool_params = dict(call.arguments)
             step.tool_call_id = call.id
             step.native_text = turn.text
             self.steps.append(step)
