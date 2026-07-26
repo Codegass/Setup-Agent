@@ -56,8 +56,6 @@ def forced_engine():
         engine.tools = {}
         engine.current_iteration = 7
         engine.config = SimpleNamespace(verbose=False)
-        engine._scheduler_active = False
-        engine.reasoning_scheduler = None
         engine.orchestrator = None
         engine._last_test_candidate_resolution = _resolution(requirement)
         engine._get_timestamp = lambda: "2026-07-26T00:00:00Z"

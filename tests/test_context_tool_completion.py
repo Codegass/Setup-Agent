@@ -17,7 +17,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from sag.agent.agent_state_evaluator import AgentStateEvaluator
 from sag.agent.context_manager import TaskStatus
 from sag.agent.react_types import StepType
 from sag.tools.base import ToolError
@@ -301,69 +300,6 @@ def test_completion_gate_probes_trunk_project_name():
 # --- 3.3 run-success gate (state evaluator) --------------------------------
 
 
-def _report_completion_steps(status=None):
-    metadata = {"completion_signal": True}
-    if status is not None:
-        metadata["status"] = status
-    return [
-        SimpleNamespace(
-            step_type=StepType.ACTION,
-            tool_name="report",
-            tool_result=SimpleNamespace(succeeded=True, metadata=metadata),
-        )
-    ]
-
-
-def _state_cm(build_task="Compile with Gradle"):
-    trunk = FakeTrunk([FakeTask("task_5", build_task)], project_name="demo")
-    return SimpleNamespace(
-        current_task_id=None,
-        load_trunk_context=lambda: trunk,
-    )
-
-
-def test_run_success_false_when_build_task_has_no_artifacts():
-    validator = FakeValidator(build_success=False, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-
-    assert evaluator._is_task_complete(_report_completion_steps()) is False
-
-
-def test_run_success_true_when_build_task_has_artifacts():
-    validator = FakeValidator(build_success=True, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-
-    assert evaluator._is_task_complete(_report_completion_steps()) is True
-
-
-def test_run_gate_probes_trunk_project_name():
-    validator = FakeValidator(build_success=True, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-
-    evaluator._is_task_complete(_report_completion_steps())
-
-    assert validator.build_calls == ["demo"]
-
-
-def test_run_gate_lets_failed_report_end_run():
-    """An honest status='fail' report must end the run (otherwise it spins to
-    max_iterations); only success claims are gated on build evidence."""
-    validator = FakeValidator(build_success=False, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-
-    assert evaluator._is_task_complete(_report_completion_steps(status="fail")) is True
-
-
-def test_run_gate_withholds_explicit_success_claim_without_artifacts():
-    validator = FakeValidator(build_success=False, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-
-    assert evaluator._is_task_complete(_report_completion_steps(status="success")) is False
-
-
-# --- 3.2 unresolved-requirement / remediation gate -------------------------
-
-
 def test_compile_task_rejected_when_requirement_unmet_and_no_remediation():
     validator = FakeValidator(build_success=False, build_system="gradle")
     history = [
@@ -505,78 +441,6 @@ def test_detached_handoff_is_not_build_execution_evidence():
 # report-tool completion_signal path must be gated off.
 
 
-def test_report_signal_does_not_end_run_when_phase_machine_active():
-    validator = FakeValidator(build_success=True, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-    evaluator.phase_machine_active = True
-
-    assert evaluator._is_task_complete(_report_completion_steps()) is False
-    # Even an honest fail report no longer ends the run by itself in machine
-    # mode (contrast: test_run_gate_lets_failed_report_end_run); the report
-    # phase's done/blocked signal carries the honest outcome instead.
-    assert evaluator._is_task_complete(_report_completion_steps(status="fail")) is False
-    assert validator.build_calls == [], "machine mode must not probe build evidence here"
-
-
-def test_phase_machine_gate_defaults_off():
-    validator = FakeValidator(build_success=True, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-
-    assert evaluator.phase_machine_active is False
-    assert evaluator._is_task_complete(_report_completion_steps()) is True
-
-
-def test_evaluate_never_reports_complete_in_phase_mode():
-    validator = FakeValidator(build_success=True, build_system="gradle")
-    evaluator = AgentStateEvaluator(_state_cm(), physical_validator=validator)
-    evaluator.phase_machine_active = True
-
-    analysis = evaluator.evaluate(
-        steps=_report_completion_steps(),
-        current_iteration=5,
-        recent_tool_executions=[],
-        steps_since_context_switch=1,
-    )
-
-    assert analysis.is_task_complete is False
-
-
-class _EngineDummyCM:
-    """Minimal context manager for full ReActEngine construction."""
-
-    contexts_dir = "/workspace/.setup_agent/contexts"
-    orchestrator = None
-    current_task_id = None
-
-    def load_trunk_context(self):
-        return None
-
-    def get_current_context_info(self):
-        return {"context_type": "trunk", "context_id": "trunk"}
-
-
-def test_engine_arms_phase_gate_for_machine_runs(monkeypatch):
-    """The engine, not the evaluator, knows whether a phase machine drives
-    the run; it must arm the evaluator's gate at construction."""
-    from sag.agent.phase_machine import PhaseMachine
-    from sag.agent.react_engine import ReActEngine
-    from sag.agent.react_llm import ReactLLMClient
-
-    monkeypatch.setattr(ReactLLMClient, "setup", lambda self: None)
-
-    machine_engine = ReActEngine(_EngineDummyCM(), [], phase_machine=PhaseMachine())
-    assert machine_engine.state_evaluator.phase_machine_active is True
-
-    legacy_engine = ReActEngine(_EngineDummyCM(), [])
-    assert legacy_engine.state_evaluator.phase_machine_active is False
-
-
-# --- Stage 2: report tool compatibility with phase_* trunk task ids ---------
-# Phase trunk tasks are plain Task entries with ids like phase_build; the
-# report tool's task-progress rendering and final-report matcher must keep
-# working over them (descriptions are the one-line phase objectives).
-
-
 class PhaseTask:
     def __init__(self, name, description, status="completed", key_results=""):
         self.id = f"phase_{name}"
@@ -707,3 +571,6 @@ def test_analyze_task_rejected_without_persisted_survey_facts():
     )
     assert result["valid"] is False
     assert "survey facts" in result["reason"]
+
+
+# Plan 2 Task 8: old protocol removed

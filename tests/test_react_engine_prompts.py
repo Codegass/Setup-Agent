@@ -109,7 +109,6 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
 
     prompt = engine.prompt_builder.build_initial_system_prompt(
         repository_url=engine.repository_url,
-        tool_calling_enabled=engine.supports_function_calling,
     )
 
     assert "You are SAG (Setup-Agent)" in prompt
@@ -120,7 +119,7 @@ def test_initial_system_prompt_preserves_core_markers_with_repository_url():
     assert "Usage: dummy()" in prompt
     assert "Handling Maven POM Parsing Errors" in prompt
     assert "Handling Multi-Module Maven Test Execution" in prompt
-    assert "RESPONSE FORMAT" in prompt
+    assert "HOW YOU ACT" in prompt
     assert "REMEMBER THE PHASE CYCLE" in prompt
 
 
@@ -129,7 +128,6 @@ def test_initial_system_prompt_includes_env_overlay_runtime_guidance():
 
     prompt = engine.prompt_builder.build_initial_system_prompt(
         repository_url=engine.repository_url,
-        tool_calling_enabled=engine.supports_function_calling,
     )
 
     assert "Use bash to install missing runtimes" in prompt
@@ -146,7 +144,6 @@ def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():
 
     prompt = engine.prompt_builder.build_initial_system_prompt(
         repository_url=engine.repository_url,
-        tool_calling_enabled=True,
         workflow_mode="run_task",
     )
 
@@ -163,110 +160,4 @@ def test_initial_system_prompt_uses_run_task_contract_without_setup_workflow():
     assert "first action should be to clone" not in prompt
 
 
-def test_initial_system_prompt_uses_prompt_based_branch_when_function_calling_disabled():
-    engine = make_engine(supports_function_calling=False)
-
-    prompt = engine.prompt_builder.build_initial_system_prompt(
-        repository_url=engine.repository_url,
-        tool_calling_enabled=engine.supports_function_calling,
-    )
-
-    assert "Always respond in this exact format" in prompt
-    assert "ACTION: [tool_name]" in prompt
-
-
-def test_next_prompt_preserves_history_and_stuck_guidance():
-    engine = make_engine(repository_url="https://example.test/repo.git")
-    engine.steps = [
-        ReActStep(step_type=StepType.THOUGHT, content="thought 1", timestamp="t1"),
-        ReActStep(step_type=StepType.THOUGHT, content="thought 2", timestamp="t2"),
-        ReActStep(step_type=StepType.THOUGHT, content="thought 3", timestamp="t3"),
-    ]
-
-    prompt = engine.prompt_builder.build_next_prompt(
-        steps=engine.steps,
-        repository_url=engine.repository_url,
-        tool_calling_enabled=engine.supports_function_calling,
-        successful_states=engine.successful_states,
-    )
-
-    assert "CONVERSATION HISTORY" in prompt
-    assert "THOUGHT: thought 1" in prompt
-    assert "IMPORTANT: You have been thinking without taking action" in prompt
-    assert "https://example.test/repo.git" in prompt
-    assert "Continue with your next THOUGHT and ACTION" in prompt
-
-
-def test_next_prompt_omits_setup_task_plan_in_run_task_mode():
-    prompt_builder = make_prompt_builder_with_todo()
-
-    prompt = prompt_builder.build_next_prompt(
-        steps=[],
-        repository_url=None,
-        tool_calling_enabled=True,
-        successful_states={"working_directory": "/workspace/project"},
-        workflow_mode="run_task",
-    )
-
-    assert "Working Directory: /workspace/project" in prompt
-    assert "TASK PLAN" not in prompt
-    assert 'manage_context(action="start_task"' not in prompt
-
-
-def test_next_prompt_uses_run_task_stuck_guidance_without_setup_sequence():
-    engine = make_engine(repository_url="https://example.test/repo.git")
-    engine.steps = [
-        ReActStep(step_type=StepType.THOUGHT, content="thought 1", timestamp="t1"),
-        ReActStep(step_type=StepType.THOUGHT, content="thought 2", timestamp="t2"),
-        ReActStep(step_type=StepType.THOUGHT, content="thought 3", timestamp="t3"),
-    ]
-
-    prompt = engine.prompt_builder.build_next_prompt(
-        steps=engine.steps,
-        repository_url=engine.repository_url,
-        tool_calling_enabled=True,
-        successful_states=engine.successful_states,
-        workflow_mode="run_task",
-    )
-
-    assert "RUN TASK STILL NEEDS ACTION" in prompt
-    assert "The repository URL is already set" not in prompt
-    assert "task_1" not in prompt
-    assert "start_task" not in prompt
-
-
-def test_mode_prompts_preserve_markers_and_base_prompt():
-    engine = make_engine()
-
-    thinking_prompt = engine.prompt_builder.build_mode_prompt(
-        "base prompt", ReactModelMode.THINKING
-    )
-    action_prompt = engine.prompt_builder.build_mode_prompt("base prompt", ReactModelMode.ACTION)
-
-    assert "THINKING MODEL INSTRUCTIONS" in thinking_prompt
-    assert "CURRENT SITUATION TO ANALYZE" in thinking_prompt
-    assert thinking_prompt.endswith("base prompt")
-    assert "ACTION MODEL INSTRUCTIONS" in action_prompt
-    assert "RESPONSE FORMAT (when function calling not supported)" in action_prompt
-    assert action_prompt.endswith("base prompt")
-
-
-def test_mode_prompts_use_run_task_variants():
-    engine = make_engine()
-
-    thinking_prompt = engine.prompt_builder.build_mode_prompt(
-        "base prompt", ReactModelMode.THINKING, workflow_mode="run_task"
-    )
-    action_prompt = engine.prompt_builder.build_mode_prompt(
-        "base prompt", ReactModelMode.ACTION, workflow_mode="run_task"
-    )
-
-    assert "RUN TASK THINKING MODE" in thinking_prompt
-    assert "output only TASK COMPLETE and never include ACTION" in thinking_prompt
-    assert "RUN TASK ACTION MODE" in action_prompt
-    assert "Do not start or complete setup TODO tasks" in action_prompt
-    assert "BUILD SUCCESS cannot override validator findings" in action_prompt
-    assert "partial, conflict, or unknown evidence" in action_prompt
-    assert "read evidence refs or raw output refs" in action_prompt
-    assert "INTELLIGENT SETUP WORKFLOW" not in action_prompt
-    assert "MANDATORY WORKFLOW FOR PROJECT SETUP" not in action_prompt
+# Plan 2 Task 8: old protocol removed

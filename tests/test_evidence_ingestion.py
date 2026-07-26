@@ -1,3 +1,4 @@
+from engine_driver import execute_action_steps, execute_native_like
 import shlex
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from sag.agent.output_storage import OutputStorageManager
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.react_engine import ReActEngine
+from sag.agent.react_llm import NativeToolCall, NativeTurn
 from sag.agent.react_types import ReActStep, StepType
 from sag.agent.tool_orchestration import (
     RecoveryDecision,
@@ -307,7 +309,7 @@ def test_execute_steps_calls_the_single_ingestion_boundary_once(tmp_path):
     _prepare_action_execution(engine)
     step = _action_step("build", {"action": "compile"}, "compile")
 
-    engine._execute_steps([step])
+    execute_action_steps(engine, [step])
 
     assert len(engine.run_evidence_state.tool_observations) == 1
     assert len(engine.run_evidence_state.action_attempts) == 1
@@ -369,7 +371,7 @@ def test_recovery_ingests_original_and_replacement_under_their_actual_scopes(tmp
     _prepare_action_execution(engine)
     step = _action_step("build", {"action": "test"})
 
-    engine._execute_steps([step])
+    execute_action_steps(engine, [step])
 
     assert tool.actions == ["test", "compile"]
     assert step.tool_result.succeeded is True
@@ -460,7 +462,7 @@ def test_backend_test_recovery_keeps_both_attempts_in_test_scope(
     _prepare_action_execution(engine)
     step = _action_step(tool_name, operation_params)
 
-    engine._execute_steps([step])
+    execute_action_steps(engine, [step])
 
     assert len(tool.calls) == 2
     for field, value in operation_params.items():
@@ -539,7 +541,7 @@ def test_guidance_only_recovery_does_not_fabricate_an_execution(tmp_path, monkey
     _prepare_action_execution(engine)
     step = _action_step("build", {"action": "compile"})
 
-    engine._execute_steps([step])
+    execute_action_steps(engine, [step])
 
     assert step.tool_result.error_code == "GUIDANCE_ONLY"
     observations = engine.run_evidence_state.tool_observations
@@ -863,7 +865,7 @@ def test_error_only_failure_uses_one_source_through_construction_and_ingestion(
     _prepare_action_execution(engine)
     step = _action_step("build", {"action": "compile"})
 
-    engine._execute_steps([step])
+    execute_action_steps(engine, [step])
 
     constructed = constructed_results[0]
     recorded = step.tool_result
@@ -1025,7 +1027,7 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
     phase_step = _action_step("phase", {"action": "done", "outcome": "success"})
     early_report = _action_step("report", {"action": "generate"})
 
-    engine._execute_steps([phase_step, early_report])
+    execute_action_steps(engine, [phase_step, early_report])
 
     assert report_calls == []
     assert engine._report_delivered is False
@@ -1034,7 +1036,7 @@ def test_terminal_test_signal_and_report_in_one_response_refuses_early_render(tm
     assert orchestrator.files[VERDICT_PATH]
 
     later_report = _action_step("report", {"action": "generate"})
-    engine._execute_steps([later_report])
+    execute_action_steps(engine, [later_report])
 
     assert len(report_calls) == 1
     assert engine._report_delivered is True
@@ -1069,7 +1071,7 @@ def test_terminal_phase_signal_stops_later_actions_until_policy_routes(tmp_path)
     phase_step = _action_step("phase", {"action": "done", "outcome": "success"})
     stale_action = _action_step("build", {"action": "test"})
 
-    engine._execute_steps([phase_step, stale_action])
+    execute_action_steps(engine, [phase_step, stale_action])
 
     assert calls == ["phase"]
     assert stale_action.tool_result is None
@@ -1108,7 +1110,7 @@ def test_sealed_run_refuses_evidence_tool_before_execution(tmp_path):
     _prepare_action_execution(engine)
     step = _action_step("build", {"action": "test"})
 
-    engine._execute_steps([step])
+    execute_action_steps(engine, [step])
 
     assert calls == []
     assert step.tool_result.operation_outcome is OperationOutcome.SKIPPED
@@ -1311,19 +1313,38 @@ def test_report_construction_persistence_failure_completes_without_mutating_verd
     engine.prompt_builder = _PromptBuilder()
     engine.repository_url = "https://example.test/repo.git"
     engine.repository_ref = None
-    engine.llm_client = _LLMClient(response="render and close report")
-    engine.state_evaluator = SimpleNamespace(completion_mode="previous")
+    engine.llm_client = _LLMClient()
+    # One assistant turn requesting both calls; the dispatcher appends its own
+    # ACTION steps, so hand it the two the assertions below inspect.
+    engine.llm_client.get_native_turn = lambda messages, **kwargs: NativeTurn(
+        text="render and close report",
+        tool_calls=(
+            NativeToolCall(
+                id="call_report",
+                name="report",
+                arguments={"action": "generate"},
+                raw_arguments="{}",
+            ),
+            NativeToolCall(
+                id="call_phase",
+                name="phase",
+                arguments={"action": "done"},
+                raw_arguments="{}",
+            ),
+        ),
+        model_used="test-model",
+    )
+    engine._execute_native_calls = lambda turn: execute_native_like(
+        engine, [report_step, close_step]
+    )
     engine.token_tracker = SimpleNamespace(
         set_iteration=lambda iteration: None,
         update_last_tool_name=lambda tool_name: None,
     )
-    engine.response_parser = SimpleNamespace(
-        parse=lambda response, **kwargs: [report_step, close_step]
-    )
     engine._get_tool_orchestrator = lambda: tool_orchestrator
+    engine._get_timestamp = lambda: "2026-07-17T00:00:00Z"
     engine._phase_intro_step = lambda: SimpleNamespace(content="report phase")
     engine._enforce_phase_floors = lambda: False
-    engine._should_use_thinking_model = lambda: False
     engine._export_token_usage_csv = lambda: None
     engine._add_observation_step = lambda observation: None
     engine.emit = lambda *args, **kwargs: None
@@ -1389,66 +1410,77 @@ def test_normal_report_phase_flow_close_returns_completed_termination(tmp_path):
 
 
 class _PromptBuilder:
-    def invalidate_trunk_cache(self):
-        pass
-
     def build_initial_system_prompt(self, **kwargs):
         return "system prompt"
 
-    def build_mode_prompt(self, prompt, mode, **kwargs):
-        return prompt
-
 
 class _LLMClient:
-    def __init__(self, response="unparseable response", error=None):
-        self.response = response
+    """Scripted native executor: one `NativeTurn` per iteration, or a raise."""
+
+    def __init__(self, error=None):
         self.error = error
+        self.calls = 0
 
     def capabilities_for(self, mode):
-        return SimpleNamespace(supports_function_calling=False, model="test-model")
+        return SimpleNamespace(supports_function_calling=True, model="test-model")
 
-    def get_response(self, prompt, mode):
+    def get_native_turn(self, messages, **kwargs):
+        self.calls += 1
         if self.error is not None:
             raise self.error
-        return self.response
+        return NativeTurn(text="still thinking", tool_calls=(), model_used="test-model")
 
 
-def _loop_engine(tmp_path, *, response="unparseable response", error=None, wall_clock_cap=0):
+def _loop_engine(tmp_path, *, error=None, wall_clock_cap=0):
     engine, orchestrator = _engine(tmp_path)
     engine.max_iterations = 3
     engine.config = SimpleNamespace(max_wall_clock_seconds=wall_clock_cap)
     engine.prompt_builder = _PromptBuilder()
     engine.repository_url = "https://example.test/repo.git"
     engine.repository_ref = None
-    engine.llm_client = _LLMClient(response=response, error=error)
-    engine.state_evaluator = SimpleNamespace(completion_mode="previous")
+    engine.llm_client = _LLMClient(error=error)
     engine.token_tracker = SimpleNamespace(set_iteration=lambda iteration: None)
-    engine.response_parser = SimpleNamespace(parse=lambda response, **kwargs: [])
+    engine._get_timestamp = lambda: "2026-07-26 00:00:00"
     engine._phase_intro_step = lambda: SimpleNamespace(content="phase intro")
     engine._enforce_phase_floors = lambda: False
-    engine._should_use_thinking_model = lambda: True
     engine._export_token_usage_csv = lambda: None
     return engine, orchestrator
 
 
 @pytest.mark.parametrize(
-    ("response", "error", "max_iterations", "expected_reason"),
+    ("error", "max_iterations", "expected_reason"),
     [
-        ("", None, 3, "LLM response unavailable"),
-        ("unparseable response", None, 2, "iteration budget exhausted"),
-        ("unused", RuntimeError("transport failed"), 3, "engine exception: RuntimeError"),
+        # A provider failure is reported as itself: `get_native_turn` raises
+        # rather than returning None, so the abort carries the cause.
+        (RuntimeError("transport failed"), 3, "LLM response unavailable: transport failed"),
+        (None, 2, "iteration budget exhausted"),
     ],
 )
 def test_setup_loop_abort_paths_persist_typed_termination(
-    tmp_path, response, error, max_iterations, expected_reason
+    tmp_path, error, max_iterations, expected_reason
 ):
-    engine, orchestrator = _loop_engine(tmp_path, response=response, error=error)
+    engine, orchestrator = _loop_engine(tmp_path, error=error)
 
     termination = engine.run_setup_loop("set up project", max_iterations=max_iterations)
 
     assert termination.termination is RunTerminationStatus.ABORTED
     assert termination.report_delivery_status is ReportDeliveryStatus.SKIPPED
     assert engine.phase_machine.records[-1].reason == expected_reason
+    assert VERDICT_PATH in orchestrator.files
+
+
+def test_setup_loop_engine_failure_outside_the_request_aborts_as_engine_exception(tmp_path):
+    engine, orchestrator = _loop_engine(tmp_path)
+
+    def explode():
+        raise RuntimeError("floor probe failed")
+
+    engine._enforce_phase_floors = explode
+
+    termination = engine.run_setup_loop("set up project", max_iterations=3)
+
+    assert termination.termination is RunTerminationStatus.ABORTED
+    assert engine.phase_machine.records[-1].reason == "engine exception: RuntimeError"
     assert VERDICT_PATH in orchestrator.files
 
 
@@ -1475,25 +1507,29 @@ def test_setup_keyboard_interrupt_closure_is_cancelled(tmp_path):
 
 
 def test_setup_no_progress_stop_aborts_and_seals(tmp_path):
-    engine, orchestrator = _loop_engine(tmp_path, response="action")
+    engine, orchestrator = _loop_engine(tmp_path)
     completed_task = SimpleNamespace(
         step_type=StepType.ACTION,
         tool_name="manage_context",
         tool_params={"action": "complete_with_results"},
         tool_result=ToolResult.completed_success(output="task complete"),
     )
-    engine.response_parser = SimpleNamespace(parse=lambda response, **kwargs: [completed_task])
-    engine._execute_steps = lambda steps: None
+    engine.llm_client.get_native_turn = lambda messages, **kwargs: NativeTurn(
+        text="",
+        tool_calls=(
+            NativeToolCall(
+                id="call_1",
+                name="manage_context",
+                arguments={"action": "complete_with_results"},
+                raw_arguments="{}",
+            ),
+        ),
+        model_used="test-model",
+    )
+    engine._execute_native_calls = lambda turn: [completed_task]
     engine._handle_phase_signals = lambda steps: None
     engine._maybe_nudge_phase_done = lambda: False
     engine._check_progress_after_task = lambda: True
-    engine.state_evaluator = SimpleNamespace(
-        completion_mode="previous",
-        evaluate=lambda **kwargs: SimpleNamespace(
-            needs_guidance=False,
-            is_task_complete=False,
-        ),
-    )
 
     termination = engine.run_setup_loop("set up project", max_iterations=3)
 
@@ -1502,30 +1538,8 @@ def test_setup_no_progress_stop_aborts_and_seals(tmp_path):
     assert VERDICT_PATH in orchestrator.files
 
 
-def test_setup_evaluator_success_cannot_bypass_phase_lifecycle(tmp_path):
-    engine, orchestrator = _loop_engine(tmp_path, response="thought")
-    thought = SimpleNamespace(step_type=StepType.THOUGHT)
-    engine.response_parser = SimpleNamespace(parse=lambda response, **kwargs: [thought])
-    engine._execute_steps = lambda steps: None
-    engine._handle_phase_signals = lambda steps: None
-    engine._maybe_nudge_phase_done = lambda: False
-    engine.state_evaluator = SimpleNamespace(
-        completion_mode="previous",
-        evaluate=lambda **kwargs: SimpleNamespace(
-            needs_guidance=False,
-            is_task_complete=True,
-        ),
-    )
-
-    termination = engine.run_setup_loop("set up project", max_iterations=2)
-
-    assert termination.termination is RunTerminationStatus.ABORTED
-    assert engine.phase_machine.records[-1].reason == "iteration budget exhausted"
-    assert VERDICT_PATH in orchestrator.files
-
-
 def test_legacy_run_task_keeps_boolean_contract_without_evidence_finalization(tmp_path):
-    engine, orchestrator = _loop_engine(tmp_path, response="")
+    engine, orchestrator = _loop_engine(tmp_path, error=RuntimeError("transport failed"))
     stale_snapshot = '{"run_id":"old-setup","verdict":"success"}'
     orchestrator.files[VERDICT_PATH] = stale_snapshot
 

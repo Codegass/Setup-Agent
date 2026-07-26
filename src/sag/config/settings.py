@@ -88,12 +88,6 @@ class Config(BaseModel):
     # Global wall-clock cap for a whole run (seconds); the ReAct loop ends with
     # a clear "global time cap" status once exceeded. <=0 disables the cap.
     max_wall_clock_seconds: int = Field(default=7200)
-    # Strangler flag for the single-executor native tool-calling loop (spec
-    # §3.1). While False the THINK/ACTION scheduler protocol drives the run;
-    # True routes every loop entry through `_run_native_loop`. The flag is
-    # removed once native becomes the only protocol.
-    native_executor_loop: bool = Field(default=False)
-
     # Minimum iterations RESERVED for each not-yet-started phase. No phase has
     # a quota (build may use everything the easy phases saved); the engine
     # force-blocks the current phase only when continuing would starve these
@@ -166,8 +160,6 @@ class Config(BaseModel):
             context_switch_threshold=int(os.getenv("SAG_CONTEXT_SWITCH_THRESHOLD", "20")),
             reasoning_heartbeat_actions=int(os.getenv("SAG_REASONING_HEARTBEAT_ACTIONS", "5")),
             max_wall_clock_seconds=int(os.getenv("SAG_MAX_WALL_CLOCK_SECONDS", "7200")),
-            native_executor_loop=os.getenv("SAG_NATIVE_EXECUTOR_LOOP", "false").lower()
-            in ("true", "1", "yes"),
             dispatch_soft_timeout_seconds=int(
                 os.getenv("SAG_DISPATCH_SOFT_TIMEOUT_SECONDS", "900")
             ),

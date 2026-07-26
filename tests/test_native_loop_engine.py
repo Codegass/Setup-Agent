@@ -294,23 +294,6 @@ def test_final_window_renders_without_pairing_repair():
     assert messages[3]["tool_call_id"] == "call_5"
 
 
-def test_flag_off_keeps_the_old_protocol_in_charge():
-    """The native loop is a strangler behind `native_executor_loop`."""
-    engine = _engine([_phase_turn(1)])
-    engine.config.native_executor_loop = False
-    engine._run_native_loop = lambda *a, **k: pytest.fail("the flag must gate the native loop")
-    engine.state_evaluator = SimpleNamespace(completion_mode="setup")
-    engine.reasoning_scheduler = None
-    engine.prompt_builder.build_mode_prompt = lambda prompt, mode, **kwargs: prompt
-    engine.llm_client.get_response = lambda prompt, mode: ""
-    engine._should_use_thinking_model = lambda: True
-
-    termination = engine.run_setup_loop("set up the project", max_iterations=1)
-
-    assert termination.termination is RunTerminationStatus.ABORTED
-    assert engine.llm_client.requests == [], "no native request may be issued"
-
-
 def test_toolless_turn_injects_the_continuation_cue_and_the_loop_proceeds():
     toolless = NativeTurn(
         text="I should think about this some more.",

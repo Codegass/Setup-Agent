@@ -165,42 +165,17 @@ def test_build_tools_schema_action_uses_action_model_format(monkeypatch):
     assert "command" in schema[0]["function"]["parameters"]["properties"]
 
 
-def test_get_response_does_not_wrap_mode_prompt_again(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response("THOUGHT: ok")
-
+def _verbose_client(monkeypatch, verbose_logger, agent_logger):
     monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
     monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client()
-
-    response = client.get_response(
-        "ACTION MODEL INSTRUCTIONS\nbase prompt",
-        ReactModelMode.ACTION,
-    )
-
-    assert response == "THOUGHT: ok"
-    assert captured["messages"][0]["content"].count("ACTION MODEL INSTRUCTIONS") == 1
-
-
-def test_get_response_logs_trace_context_and_agent_response_length(monkeypatch):
-    captured_verbose_logger = FakeVerboseLogger()
-    agent_logger = FakeAgentLogger()
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", lambda **params: make_response("THOUGHT: ok"))
     monkeypatch.setattr(
         "sag.agent.react_llm.create_verbose_logger",
-        lambda name: captured_verbose_logger,
+        lambda name: verbose_logger,
     )
 
     from sag.agent.react_llm import ReactLLMClient
 
-    client = ReactLLMClient(
+    return ReactLLMClient(
         config=make_config(
             action_model="gpt-4o",
             action_provider="openai",
@@ -215,238 +190,36 @@ def test_get_response_logs_trace_context_and_agent_response_length(monkeypatch):
         },
     )
 
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
 
-    assert response == "THOUGHT: ok"
-    assert agent_logger.messages == ["LLM Response from gpt-4o: 11 chars"]
+def test_native_turn_logs_trace_context_and_agent_response_length(monkeypatch):
+    captured_verbose_logger = FakeVerboseLogger()
+    agent_logger = FakeAgentLogger()
+    monkeypatch.setattr("litellm.completion", lambda **params: make_response("all good"))
+    client = _verbose_client(monkeypatch, captured_verbose_logger, agent_logger)
+
+    turn = client.get_native_turn([{"role": "user", "content": "go"}])
+
+    assert turn.text == "all good"
+    assert agent_logger.messages == ["LLM Response from gpt-4o: 8 chars"]
     assert '"iteration": 7' in captured_verbose_logger.info_messages[0]
     assert '"timestamp": "2026-06-03 22:15:00"' in captured_verbose_logger.info_messages[0]
 
 
-def test_json_function_call_content_fallback_preserves_tool_command_format(monkeypatch):
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr(
-        "litellm.completion",
-        lambda **params: make_response('{"tool":"example","command":"pwd"}'),
-    )
-    client = make_client()
+def test_native_turn_logs_then_propagates_a_provider_failure(monkeypatch):
+    """The loop turns the raise into a typed abort naming the cause, so the
+    client must not swallow it the way `get_response` used to."""
+    captured_verbose_logger = FakeVerboseLogger()
+    agent_logger = FakeAgentLogger()
 
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
+    def explode(**params):
+        raise RuntimeError("transport failed")
 
-    assert response == 'ACTION: example\nPARAMETERS: {"command": "pwd"}'
+    monkeypatch.setattr("litellm.completion", explode)
+    client = _verbose_client(monkeypatch, captured_verbose_logger, agent_logger)
 
+    with pytest.raises(RuntimeError, match="transport failed"):
+        client.get_native_turn([{"role": "user", "content": "go"}])
 
-def test_prompt_tool_call_format_does_not_attach_native_tools(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response('{"tool":"example","command":"pwd"}')
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(
-        make_config(
-            action_provider="unknown",
-            action_model="opaque-model",
-        )
-    )
-
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
-    capabilities = client.capabilities_for(ReactModelMode.ACTION)
-
-    assert capabilities.tool_call_format == "prompt"
-    assert capabilities.supports_function_calling is False
-    assert "tools" not in captured
-    assert "tool_choice" not in captured
-    assert response == '{"tool":"example","command":"pwd"}'
+    assert any("llm_error" in message for message in captured_verbose_logger.error_messages)
 
 
-def test_openai_tool_call_response_normalizes_to_react_and_strips_functions_prefix(
-    monkeypatch,
-):
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    tool_call = SimpleNamespace(
-        function=SimpleNamespace(name="functions.example", arguments='{"command":"pwd"}')
-    )
-    monkeypatch.setattr(
-        "litellm.completion",
-        lambda **params: make_response("run command", [tool_call]),
-    )
-    client = make_client(
-        make_config(action_model="gpt-5", action_provider="openai"),
-    )
-
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
-
-    assert response == 'THOUGHT: run command\n\nACTION: example\n\nPARAMETERS: {"command": "pwd"}'
-
-
-def test_gpt5_action_tool_call_request_omits_reasoning_effort(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response('ACTION: example\nPARAMETERS: {"command": "pwd"}')
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(
-        make_config(
-            action_model="gpt-5.4-mini",
-            action_provider="openai",
-            action_temperature=1.0,
-            action_max_tokens=10000,
-        )
-    )
-
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
-
-    assert response == 'ACTION: example\nPARAMETERS: {"command": "pwd"}'
-    assert captured["model"] == "gpt-5.4-mini"
-    assert captured["temperature"] == pytest.approx(1.0)
-    assert captured["max_tokens"] == 10000
-    assert captured["drop_params"] is True
-    assert "reasoning_effort" not in captured
-    assert "tools" in captured
-    assert captured["tool_choice"] == "auto"
-
-
-def test_default_config_reaches_action_request_with_zero_temperature(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response('ACTION: example\nPARAMETERS: {"command": "pwd"}')
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(Config())
-
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
-
-    assert response == 'ACTION: example\nPARAMETERS: {"command": "pwd"}'
-    assert captured["temperature"] == pytest.approx(0.0)
-
-
-def test_claude_tool_call_response_normalizes_to_react_text(monkeypatch):
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: True)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    tool_call = {"name": "example", "input": {"command": "pwd"}}
-    monkeypatch.setattr(
-        "litellm.completion",
-        lambda **params: make_response("run command", [tool_call]),
-    )
-    client = make_client()
-
-    response = client.get_response("wrapped prompt", ReactModelMode.ACTION)
-
-    assert response == 'THOUGHT: run command\n\nACTION: example\n\nPARAMETERS: {"command": "pwd"}'
-
-
-def test_gpt5_request_falls_back_to_traditional_params_with_drop_params(monkeypatch):
-    calls = []
-
-    def fake_completion(**params):
-        calls.append(params)
-        if len(calls) == 1:
-            raise RuntimeError("reasoning params rejected")
-        return make_response("THOUGHT: fallback")
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(make_config(thinking_model="gpt-5", thinking_provider="openai"))
-
-    response = client.get_response("wrapped prompt", ReactModelMode.THINKING)
-
-    assert response == "THOUGHT: fallback"
-    assert calls[0]["reasoning_effort"] == "medium"
-    assert calls[0]["drop_params"] is True
-    assert "temperature" not in calls[0]
-    assert calls[1]["temperature"] == pytest.approx(0.1)
-    assert calls[1]["max_tokens"] == 16000
-    assert calls[1]["drop_params"] is True
-
-
-def test_claude_46_thinking_uses_reasoning_effort_not_top_level_budget(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response("THOUGHT: ok")
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(
-        make_config(
-            thinking_provider="anthropic",
-            thinking_model="claude-sonnet-4-6",
-            reasoning_effort="high",
-            thinking_budget_tokens=5000,
-        )
-    )
-
-    response = client.get_response("wrapped prompt", ReactModelMode.THINKING)
-
-    assert response == "THOUGHT: ok"
-    assert captured["model"] == "anthropic/claude-sonnet-4-6"
-    assert captured["reasoning_effort"] == "high"
-    assert "thinking" not in captured
-    assert "type" not in captured
-    assert "budget_tokens" not in captured
-
-
-def test_ollama_action_request_includes_api_base(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response("THOUGHT: ok")
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(
-        make_config(
-            action_provider="ollama",
-            action_model="llama3.1",
-            ollama_base_url="http://ollama.test:11434",
-        )
-    )
-
-    client.get_response("wrapped prompt", ReactModelMode.ACTION)
-
-    assert captured["model"] == "ollama/llama3.1"
-    assert captured["api_base"] == "http://ollama.test:11434"
-
-
-def test_deepseek_reasoner_uses_reasoning_config_without_budget_tokens(monkeypatch):
-    captured = {}
-
-    def fake_completion(**params):
-        captured.update(params)
-        return make_response("THOUGHT: ok")
-
-    monkeypatch.setattr("litellm.supports_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.supports_parallel_function_calling", lambda model: False)
-    monkeypatch.setattr("litellm.completion", fake_completion)
-    client = make_client(
-        make_config(
-            thinking_provider="deepseek",
-            thinking_model="deepseek-reasoner",
-            reasoning_effort="high",
-        )
-    )
-
-    client.get_response("wrapped prompt", ReactModelMode.THINKING)
-
-    assert captured["model"] == "deepseek/deepseek-reasoner"
-    assert captured["reasoning_effort"] == "high"
-    assert "budget_tokens" not in captured

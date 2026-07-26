@@ -275,7 +275,6 @@ class ProjectSetupTool(BaseTool):
         target_directory: Optional[str] = None,
         branch: Optional[str] = None,
         ref: Optional[str] = None,
-        auto_install_deps: bool = True,
         working_directory: str = "/workspace",
         **kwargs,
     ) -> ToolResult:
@@ -288,8 +287,12 @@ class ProjectSetupTool(BaseTool):
             target_directory: Directory to clone into (optional, auto-generated if not provided)
             branch: Legacy branch/ref handle to check out after cloning (optional)
             ref: Git branch, tag, release tag, or commit hash to check out after cloning
-            auto_install_deps: Whether to automatically install dependencies after cloning
             working_directory: Base directory for operations
+
+        `clone` is side-effect free (spec §3.4-1): dependency/toolchain
+        installation is reached only through `install_dependencies` (the
+        `build(action='deps')` path) or `project(action='provision')`. A legacy
+        `auto_install_deps` argument is accepted and ignored via **kwargs.
         """
 
         valid_actions = [
@@ -319,7 +322,6 @@ class ProjectSetupTool(BaseTool):
                     target_directory,
                     branch,
                     ref,
-                    auto_install_deps,
                     working_directory,
                 )
             elif action == "detect_project_type":
@@ -347,10 +349,11 @@ class ProjectSetupTool(BaseTool):
         target_directory: str,
         branch: str,
         ref: Optional[str],
-        auto_install_deps: bool,
         working_directory: str,
     ) -> ToolResult:
-        """Clone a repository with comprehensive error handling."""
+        """Clone a repository with comprehensive error handling.
+
+        Side-effect free: nothing is installed here (spec §3.4-1)."""
 
         if not repository_url:
             raise ToolError(
@@ -474,42 +477,31 @@ class ProjectSetupTool(BaseTool):
         if legacy_branch:
             metadata["branch"] = legacy_branch
 
-        # Auto-install dependencies if requested
-        if auto_install_deps and project_type["type"] != "unknown":
-            output += f"\n🔧 Installing dependencies automatically...\n"
-
-            try:
-                deps_result = self._install_dependencies_for_project_type(
-                    project_type, clone_path, java_version_required
-                )
-                if deps_result["success"]:
-                    output += f"✅ Dependencies installed successfully!\n"
-                    output += f"📦 Installed: {deps_result['installed']}\n"
-                    metadata["dependencies_installed"] = deps_result
-                else:
-                    output += f"⚠️ Dependency installation had issues:\n{deps_result['error']}\n"
-                    output += f"💡 You can install manually using the appropriate tool\n"
-                    metadata["dependencies_error"] = deps_result
-            except Exception as e:
-                output += f"⚠️ Auto-dependency installation failed: {str(e)}\n"
-                output += f"💡 You can install manually using the appropriate tool\n"
-
-        # Suggest next steps
+        # Clone is side-effect free (spec §3.4-1): fetch, submodules, detect,
+        # stop. No venv/pip/apt/JDK rides along — provisioning happens only when
+        # it is asked for by name, so its cost and its failures are attributed to
+        # the call that caused them instead of being buried in a clone warning.
         output += f"\n📝 Suggested next steps:\n"
-        if project_type["type"] == "maven":
-            output += f"• Use build tool: build(action='compile')\n"
-            output += f"• Run tests: build(action='test')\n"
-        elif project_type["type"] == "gradle":
-            output += f"• Use build tool: build(action='compile')\n"
-            output += f"• Run tests: build(action='test')\n"
+        if project_type["type"] in ("maven", "gradle"):
+            if java_version_required:
+                output += (
+                    f"• Install the required JDK: "
+                    f"project(action='provision', java_version='{java_version_required}')\n"
+                )
+            else:
+                output += f"• Install the toolchain: project(action='provision', java_version=...)\n"
+            output += f"• Resolve dependencies: build(action='deps')\n"
+            output += f"• Compile: build(action='compile')\n"
         elif project_type["type"] == "npm":
-            output += f"• Use npm tool: npm(command='install')\n"
-            output += f"• Run build: npm(command='run build')\n"
+            output += f"• Install the toolchain if node is missing: project(action='provision', packages=['nodejs', 'npm'])\n"
+            output += f"• Install dependencies: build(action='deps')\n"
         elif project_type["type"] == "python":
             output += f"• Install dependencies into ./.venv: build(action='deps')\n"
+            output += f"• Install any missing system toolchain: project(action='provision', packages=[...])\n"
             output += f"• Run tests: build(action='test')\n"
         else:
             output += f"• Analyze project structure: project(action='analyze')\n"
+            output += f"• Install anything missing: project(action='provision', ...)\n"
             output += f"• Use bash tool for custom setup commands\n"
 
         return ToolResult.completed_success(output=output, metadata=metadata)
@@ -1906,13 +1898,14 @@ class ProjectSetupTool(BaseTool):
         return """
 Project Setup Tool Usage Examples:
 
-1. Clone a repository (with automatic Java version detection):
+1. Clone a repository (read-only Java version DETECTION; nothing is installed):
    project_setup(action="clone", repository_url="https://github.com/apache/tika.git")
-   # Automatically detects Java 17 requirement and installs openjdk-17-jdk
+   # Reports "Java Version Required: 17" and stops. Install it explicitly with
+   # project(action='provision', java_version='17').
 
 2. Clone with specific options:
-   project_setup(action="clone", repository_url="https://github.com/user/repo.git", 
-                 target_directory="my-project", ref="v1.2.3", auto_install_deps=True)
+   project_setup(action="clone", repository_url="https://github.com/user/repo.git",
+                 target_directory="my-project", ref="v1.2.3")
    # ref may be a branch, tag, release tag, short commit, or full commit hash.
    # branch is still accepted as a legacy alias when ref is absent.
 
@@ -1935,8 +1928,9 @@ Java Version Detection Features:
 - JAVA_HOME environment setup
 
 Common Workflow:
-1. Clone repository
-2. Detect project type and Java version (done automatically after clone)
-3. Install correct Java version and dependencies (done automatically if auto_install_deps=True)
-4. Use language-specific tools (maven, gradle, npm, etc.) with correct Java environment
+1. Clone repository (side-effect free)
+2. Detect project type and Java version (reported by clone; read-only)
+3. Install the toolchain explicitly: project(action='provision', java_version='17')
+4. Install dependencies explicitly: build(action='deps')
+5. Use language-specific tools (maven, gradle, npm, etc.) with the provisioned environment
 """

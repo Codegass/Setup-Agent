@@ -1,4 +1,3 @@
-from sag.agent import agent_state_evaluator
 from sag.agent.react_engine import ReActStep as EngineReActStep
 from sag.agent.react_engine import StepType as EngineStepType
 from sag.agent.react_types import (
@@ -14,9 +13,7 @@ def test_react_engine_reexports_shared_step_types():
     assert EngineStepType is StepType
 
 
-def test_agent_state_evaluator_uses_shared_step_type():
-    assert agent_state_evaluator.StepType is StepType
-
+# Plan 2 Task 8: old protocol removed
 
 def test_react_model_capabilities_are_per_mode():
     capabilities = ReactModelCapabilities(

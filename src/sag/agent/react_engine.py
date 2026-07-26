@@ -13,8 +13,7 @@ from loguru import logger
 from sag.config import create_agent_logger, create_verbose_logger, get_config
 from sag.config.prompt_loader import load_react_engine_prompts
 from sag.config.settings import effective_phase_floor
-from sag.evidence import EvidenceAssessment, InvocationStatus, OperationOutcome
-from sag.reporting import render_condensed_summary
+from sag.evidence import OperationOutcome
 from sag.tools.base import (
     BaseTool,
     OutputPersistenceError,
@@ -25,7 +24,6 @@ from sag.tools.base import (
 )
 from sag.ui.events import EventType, UIEvent, UIEventEmitter
 
-from .agent_state_evaluator import AgentStateEvaluator
 from .attempt_ledger import compact_steps
 from .context_manager import ContextManager, TaskStatus
 from .control_events import (
@@ -35,7 +33,6 @@ from .control_events import (
     compact_control_value,
     forced_action_sha256,
 )
-from .current_plan import CurrentPlan, PlanFault, PlanFaultCode
 from .evidence_state import EvidenceRole, RunEvidenceState, StateScope
 from .loop_memory import LoopDecision, LoopEvent, LoopMemory
 from .native_messages import render_messages
@@ -64,14 +61,7 @@ from .phase_transitions import (
 from .physical_validator import PhysicalValidator
 from .react_llm import ReactLLMClient
 from .react_prompt_builder import ReActPromptBuilder
-from .react_response_parser import ReActResponseParser
-from .react_types import ReactModelMode, ReActStep, StepType
-from .reasoning_scheduler import (
-    ReasoningScheduler,
-    ReasoningTrigger,
-    SchedulerMode,
-    SchedulerTurn,
-)
+from .react_types import ReActStep, StepType
 from .attempt_policy import (
     TestAttemptRequirement,
     TestCandidateResolution,
@@ -342,12 +332,6 @@ class ReActEngine(UIEventEmitter):
         self.context_manager = context_manager
         self.tools = {tool.name: tool for tool in tools}
         self.config = get_config()
-        self.reasoning_scheduler = ReasoningScheduler(
-            available_tools=self.tools,
-            heartbeat_actions=getattr(self.config, "reasoning_heartbeat_actions", 5),
-        )
-        self._scheduler_active = False
-        self._scheduled_turn: SchedulerTurn | None = None
         self.control_event_sink = control_event_sink
         self.orchestrator = orchestrator or getattr(context_manager, "orchestrator", None)
         self._target_repo_sha_callback = target_repo_sha_callback
@@ -401,15 +385,11 @@ class ReActEngine(UIEventEmitter):
         # Tool execution tracking to avoid repetitive calls
         self.recent_tool_executions = []
         self.max_recent_executions = 10
-        self._force_thinking_next = False
 
         # Native tool-call identity for harness-authored calls (forced test
         # attempts); the model's own calls come with provider ids.
         self._forced_call_counter = 0
         self._active_native_tool_call_id = None
-
-        # CRITICAL: Flag to force thinking after successful tool execution
-        self._force_thinking_after_success = False
 
         # State memory for successful operations
         self.successful_states = {
@@ -427,9 +407,6 @@ class ReActEngine(UIEventEmitter):
 
         # Agent logger for detailed traces
         self.agent_logger = create_agent_logger("react_engine")
-
-        # Initialize the centralized state evaluator (will be updated with physical validator after initialization)
-        self.state_evaluator = AgentStateEvaluator(self.context_manager)
 
         # Initialize output storage manager
         from pathlib import Path
@@ -500,14 +477,6 @@ class ReActEngine(UIEventEmitter):
         # progress, so vendored/pre-existing build output can't disarm the guard.
         self._artifact_baseline: Optional[int] = None
 
-        # Update state evaluator with physical validator
-        self.state_evaluator.physical_validator = self.physical_validator
-
-        # In machine-driven setup runs the evaluator never ends the run from
-        # the report tool's completion signal. A validated report-phase claim
-        # closes flow; the sealed snapshot remains the verdict authority.
-        self.state_evaluator.phase_machine_active = self.phase_machine is not None
-
         # Initialize token tracker and LLM client for monitoring model usage
         self.token_tracker = TokenTracker()
         self.llm_client = ReactLLMClient(
@@ -521,10 +490,10 @@ class ReActEngine(UIEventEmitter):
             },
         )
         self.llm_client.setup()
-        self.response_parser = ReActResponseParser(timestamp_factory=self._get_timestamp)
 
         logger.info(
-            "ReAct Engine initialized with dual model support, physical validation, and token tracking"
+            "ReAct Engine initialized with the native executor loop, physical validation, "
+            "and token tracking"
         )
         logger.info(f"Thinking model: {self.config.get_litellm_model_name('thinking')}")
         logger.info(f"Action model: {self.config.get_litellm_model_name('action')}")
@@ -1263,7 +1232,7 @@ class ReActEngine(UIEventEmitter):
             resolution = resolve_survey_test_candidates(getattr(self, "orchestrator", None))
 
         action = requirement.required_action
-        tool, exact_params = self._canonicalize_scheduler_action(
+        tool, exact_params = self._canonicalize_tool_action(
             str(action["tool"]),
             dict(action["params"]),
         )
@@ -1365,12 +1334,6 @@ class ReActEngine(UIEventEmitter):
                 result=result,
                 actual_executions=actual_executions,
             )
-            # Invalidate the model-owned plan before LoopMemory contributes any
-            # additional reason. Replay observes the same deterministic order
-            # from the forced tool_result followed by loop_decision events.
-            # No-op without a scheduler (the native protocol has none); the
-            # call itself is deleted with the old protocol in Task 8.
-            self._request_scheduler_reasoning(ReasoningTrigger.PLAN_EXHAUSTED)
             self._apply_tool_execution_loop_effects(execution)
             self._append_native_observation(forced_call_id, execution.observation_text)
             return True
@@ -1576,7 +1539,6 @@ class ReActEngine(UIEventEmitter):
         machine = self.phase_machine
         self._emit_control_phase_transition(decision, repair_request=repair_request)
         appended = machine.apply(decision)
-        self._request_scheduler_reasoning(ReasoningTrigger.PHASE_CHANGE)
         for applied in appended:
             self._record_phase_audit(applied)
             text = applied.key_results or applied.reason or applied.outcome.value
@@ -1658,7 +1620,6 @@ class ReActEngine(UIEventEmitter):
         self._emit_control_gate(claim, gate)
         if not gate.accepted:
             self.agent_logger.warning(f"Repair source claim rejected: {gate.reason}")
-            self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
             return None
         self._record_gate_facts(request.from_phase, gate)
         record = machine.close_attempt(gate)
@@ -1712,7 +1673,6 @@ class ReActEngine(UIEventEmitter):
             if not gate.accepted:
                 self._emit_control_gate(claim, gate)
                 self.agent_logger.warning("Ignoring a rejected gate result carrying a phase signal")
-                self._request_scheduler_reasoning(ReasoningTrigger.GATE_REJECTION)
                 return None
             required_attempt = self._missing_required_test_attempt()
             if required_attempt is not None:
@@ -1861,7 +1821,13 @@ class ReActEngine(UIEventEmitter):
         """Mid-phase evidence nudge (round-5 vfs lesson): a model deep in a
         rabbit hole may hold green evidence for dozens of iterations without
         claiming done. Every NUDGE_EVERY phase-iterations, check the gate;
-        when it would pass, say so — break loops with evidence, not limits."""
+        when it would pass, report the machine-derived state.
+
+        Spec §3.3: the message states the gate result, the validator's own
+        reason, the refs it rests on, and the one concrete thing this attempt
+        still lacks. It deliberately does NOT spell out the closure call —
+        handing the model the exact `phase(...)` string teaches it to type the
+        words instead of judging the evidence."""
         machine = getattr(self, "phase_machine", None)
         if machine is None or machine.is_complete:
             return False
@@ -1870,17 +1836,28 @@ class ReActEngine(UIEventEmitter):
         gate = self._phase_gate_check(machine.current_phase)
         if not gate.get("ok"):
             return False
+        refs = [str(ref) for ref in (gate.get("evidence_refs") or [])][:3]
+        reason = str(gate.get("reason") or "").strip()
+        lines = [
+            f"EVIDENCE CHECK — phase '{machine.current_phase}': the completion gate "
+            f"passes on physical evidence "
+            f"(validator state {gate.get('validator_state') or 'green'}).",
+        ]
+        if reason:
+            lines.append(f"Validator reason: {reason}")
+        lines.append(
+            f"Evidence it rests on: {', '.join(refs)}"
+            if refs
+            else "Evidence it rests on: no refs were recorded by the probe."
+        )
+        lines.append(
+            f"Missing for attempt {machine.current_attempt_id}: no outcome has been "
+            f"recorded for it, so the phase cannot route."
+        )
         self.steps.append(
             ReActStep(
                 step_type=StepType.SYSTEM_GUIDANCE,
-                content=(
-                    f"EVIDENCE CHECK: the completion gate for phase '{machine.current_phase}' "
-                    f"already passes on physical evidence. If you agree the objective is met, "
-                    f"claim phase(action='done', outcome='success', key_results=..., "
-                    f"evidence=[refs]) now. The engine will route from prerequisites. "
-                    f"If you are pursuing something beyond this phase's objective, consider "
-                    f"whether it belongs to a later phase or a note."
-                ),
+                content="\n".join(lines),
                 timestamp=self._get_timestamp(),
             )
         )
@@ -2032,9 +2009,6 @@ class ReActEngine(UIEventEmitter):
                 cm._save_trunk_context(trunk)
             if getattr(cm, "current_task_id", None) == task_id:
                 cm.current_task_id = None
-            builder = getattr(self, "prompt_builder", None)
-            if builder is not None:
-                builder.invalidate_trunk_cache()
         except Exception as exc:
             logger.warning(f"Failed to persist phase record '{task_id}' ({status}): {exc}")
 
@@ -2059,9 +2033,6 @@ class ReActEngine(UIEventEmitter):
                 task.notes = f"{task.notes.rstrip()}\n{note}".strip() if task.notes else note
                 trunk.update_timestamp()
                 cm._save_trunk_context(trunk)
-                builder = getattr(self, "prompt_builder", None)
-                if builder is not None:
-                    builder.invalidate_trunk_cache()
                 return
             logger.warning(
                 f"Phase note for '{task_id}' not persisted: context manager "
@@ -2148,285 +2119,16 @@ class ReActEngine(UIEventEmitter):
         max_iterations: Optional[int] = None,
         completion_mode: str = "setup",
     ):
-        """Run the main ReAct loop."""
-        if getattr(self.config, "native_executor_loop", False):
-            return self._run_native_loop(
-                initial_prompt,
-                max_iterations=max_iterations,
-                completion_mode=completion_mode,
-            )
+        """Compatibility alias: the native executor loop is the only protocol.
 
-        max_iter = max_iterations or self.max_iterations
-        self._run_max_iterations = max_iter
-
-        self.agent_logger.info(f"Starting ReAct loop with max {max_iter} iterations")
-
-        # Setup-mode phase machine: the engine drives provision→…→report and the
-        # model signals with the phase tool. None (run-task mode) = legacy path.
-        phase_mode = completion_mode == "setup" and self.phase_machine is not None
-        configured_scheduler = getattr(self, "reasoning_scheduler", None)
-        if phase_mode and configured_scheduler is not None:
-            self.reasoning_scheduler = ReasoningScheduler(
-                available_tools=self.tools,
-                heartbeat_actions=getattr(configured_scheduler, "heartbeat_actions", 5),
-            )
-            self._scheduler_active = True
-        else:
-            self._scheduler_active = False
-        self._scheduled_turn = None
-
-        # Initialize with the initial prompt. In phase mode the window opens on
-        # the phase intro digest instead of empty.
-        self.current_iteration = 0
-        self._phase_iterations = 0
-        if phase_mode:
-            self.steps = [self._phase_intro_step()]
-            self._journal_intro_dirty = True
-            self._journal_last_ledger = None
-            self._start_phase_branch()
-        else:
-            self.steps = []
-
-        # PERFORMANCE: Initialize trunk context cache at start
-        self.prompt_builder.invalidate_trunk_cache()  # Ensure fresh start
-
-        # Start with initial thought using thinking model
-        current_prompt = (
-            self.prompt_builder.build_initial_system_prompt(
-                repository_url=self.repository_url,
-                repository_ref=self.repository_ref,
-                tool_calling_enabled=self.llm_client.capabilities_for(
-                    ReactModelMode.ACTION
-                ).supports_function_calling,
-                workflow_mode=completion_mode,
-            )
-            + "\n\n"
-            + initial_prompt
+        Plan 2 Task 8 deleted the THINK/ACTION dual-role loop, the reasoning
+        scheduler, the plan lock, and the text response parser; every caller
+        now runs `_run_native_loop`."""
+        return self._run_native_loop(
+            initial_prompt,
+            max_iterations=max_iterations,
+            completion_mode=completion_mode,
         )
-
-        previous_completion_mode = self.state_evaluator.completion_mode
-        self.state_evaluator.completion_mode = completion_mode
-
-        run_started_at = time.time()
-        wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
-
-        try:
-            while self.current_iteration < max_iter:
-                if wall_clock_exceeded(run_started_at, wall_clock_cap):
-                    elapsed = time.time() - run_started_at
-                    logger.warning(
-                        f"ReAct loop stopped: global wall-clock cap of {wall_clock_cap}s "
-                        f"reached after {elapsed:.0f}s / {self.current_iteration} iterations"
-                    )
-                    self._export_token_usage_csv()
-                    if phase_mode:
-                        return self.abort(reason="wall clock cap exceeded")
-                    return False
-
-                # FLOOR RESERVATIONS (phase mode): force-block the current
-                # phase only when continuing would starve later phases' floors,
-                # guaranteeing the run always reaches report and ends honestly.
-                if phase_mode and self._enforce_phase_floors() and self.phase_machine.is_complete:
-                    self._export_token_usage_csv()
-                    return self._close_flow(RunTerminationStatus.COMPLETED)
-
-                self.current_iteration += 1
-                self._phase_iterations += 1
-                self.agent_logger.info(f"ReAct iteration {self.current_iteration}/{max_iter}")
-
-                # Update token tracker with current iteration
-                self.token_tracker.set_iteration(self.current_iteration)
-
-                # Determine if this should be a thinking step or action step
-                is_thinking_step = self._should_use_thinking_model()
-                mode = ReactModelMode.THINKING if is_thinking_step else ReactModelMode.ACTION
-
-                # Get LLM response
-                wrapped_prompt = self.prompt_builder.build_mode_prompt(
-                    current_prompt,
-                    mode,
-                    workflow_mode=completion_mode,
-                    planned_step=(
-                        self._scheduled_turn.step if self._scheduled_turn is not None else None
-                    ),
-                    reasoning_reasons=(
-                        self._scheduled_turn.reasons if self._scheduled_turn is not None else ()
-                    ),
-                    scheduler_fault=(
-                        str(self._scheduled_turn.fault)
-                        if self._scheduled_turn is not None
-                        and self._scheduled_turn.fault is not None
-                        else None
-                    ),
-                )
-                response = self.llm_client.get_response(wrapped_prompt, mode)
-
-                if not response:
-                    logger.error("Failed to get LLM response")
-                    # Export token usage before early return due to failed LLM response
-                    self._export_token_usage_csv()
-                    if phase_mode:
-                        return self.abort(reason="LLM response unavailable")
-                    return False
-
-                # Parse the response
-                model_used = self.llm_client.capabilities_for(mode).model
-                parsed_steps = self.response_parser.parse(
-                    response,
-                    model_used=model_used,
-                    was_thinking_model=is_thinking_step,
-                )
-
-                scheduler = self._active_reasoning_scheduler()
-                if scheduler is not None and self._scheduled_turn is not None:
-                    parsed_steps = self._prepare_scheduler_steps(
-                        response,
-                        parsed_steps,
-                        self._scheduled_turn,
-                    )
-
-                if not parsed_steps:
-                    logger.warning("No valid steps parsed from LLM response")
-                    logger.warning(f"Raw response was: {repr(response)}")
-                    if scheduler is None:
-                        continue
-
-                # Execute the steps
-                self._execute_steps(parsed_steps)
-
-                # PHASE SIGNALS (phase mode): the engine validates the claim,
-                # applies one policy route, persists its audit records, and
-                # resets the window. Report termination closes control flow;
-                # the already sealed snapshot remains the only run verdict.
-                if phase_mode:
-                    self._handle_phase_signals(parsed_steps)
-                    if self.phase_machine.is_complete:
-                        termination = self.phase_machine.termination_state()
-                        self.agent_logger.info(
-                            f"All phases complete; flow termination: {termination}"
-                        )
-                        self._export_token_usage_csv()
-                        return self._close_flow(RunTerminationStatus.COMPLETED)
-                    # Mid-phase evidence nudge: when the gate already passes,
-                    # tell the model — break rabbit holes with evidence.
-                    self._maybe_nudge_phase_done()
-
-                # CENTRALIZED STATE EVALUATION: Replace all scattered checks
-                state_analysis = self.state_evaluator.evaluate(
-                    steps=self.steps,
-                    current_iteration=self.current_iteration,
-                    recent_tool_executions=self.recent_tool_executions,
-                    steps_since_context_switch=self.steps_since_context_switch,
-                )
-
-                # Handle guidance based on state analysis
-                if state_analysis.needs_guidance:
-                    self._add_system_guidance(
-                        state_analysis.guidance_message, state_analysis.guidance_priority
-                    )
-
-                # Check for task completion
-                if state_analysis.is_task_complete:
-                    if phase_mode:
-                        self.agent_logger.info(
-                            "Ignoring direct evaluator completion until setup flow-close"
-                        )
-                        continue
-                    self.agent_logger.info("Task completed successfully")
-                    # Export token usage before successful completion
-                    self._export_token_usage_csv()
-                    return True
-
-                # NO-PHYSICAL-PROGRESS GUARD: when a task completed this
-                # iteration (a successful complete_with_results) but the run has
-                # produced no build artifacts across several tasks, stop instead
-                # of thrashing to the iteration cap.
-                completed_task_this_iteration = any(
-                    step.step_type == StepType.ACTION
-                    and step.tool_name == "manage_context"
-                    and (step.tool_params or {}).get("action") == "complete_with_results"
-                    and step.tool_result is not None
-                    and step.tool_result.succeeded
-                    for step in parsed_steps
-                )
-                if completed_task_this_iteration and self._check_progress_after_task():
-                    logger.warning(
-                        "ReAct loop stopped: no build progress after repeated completed tasks"
-                    )
-                    # Export token usage before no-progress completion
-                    self._export_token_usage_csv()
-                    if phase_mode:
-                        return self.abort(reason="no physical progress")
-                    return False
-
-                # DEPRECATED: Legacy checks now handled by state_evaluator
-                # Check for context switching guidance
-                # self._check_context_switching_guidance()
-
-                # Check if model needs explicit action guidance
-                # if self._needs_action_guidance():
-                #     self._add_action_guidance()
-
-                # ATTEMPT-LEDGER COMPACTION (phase mode): old steps collapse to
-                # one line each behind the phase intro; exactly one ledger step
-                # exists at a time (position 1, right after the intro).
-                ledger, n_compacted = self._compact_window_if_needed(phase_mode)
-
-                # Build prompt for next iteration
-                current_prompt = self.prompt_builder.build_next_prompt(
-                    steps=self.steps,
-                    repository_url=self.repository_url,
-                    repository_ref=self.repository_ref,
-                    tool_calling_enabled=self.llm_client.capabilities_for(
-                        ReactModelMode.ACTION
-                    ).supports_function_calling,
-                    successful_states=self.successful_states,
-                    workflow_mode=completion_mode,
-                    phase_mode=phase_mode,
-                )
-
-                # CONTEXT JOURNAL (phase mode): one in-container line per
-                # iteration describing the window composition (spec §7).
-                if phase_mode:
-                    self._record_context_journal(
-                        ledger, n_compacted, len(parsed_steps), len(current_prompt)
-                    )
-
-                # Step count is now automatically managed by branch history updates
-                # No manual step increment needed in new design
-
-                # FIX: Only increment counter when actual work (ACTION steps) was done
-                # Don't count pure thinking steps toward context switch threshold
-                if parsed_steps and any(step.step_type == StepType.ACTION for step in parsed_steps):
-                    self.steps_since_context_switch += 1
-                    logger.debug(
-                        f"Incremented steps_since_context_switch to {self.steps_since_context_switch} after ACTION step"
-                    )
-
-            logger.warning(f"ReAct loop completed without success after {max_iter} iterations")
-            # Export token usage before max iterations completion
-            self._export_token_usage_csv()
-            if phase_mode:
-                return self.abort(reason="iteration budget exhausted")
-            return False
-
-        except KeyboardInterrupt:
-            logger.warning("ReAct loop cancelled by keyboard interrupt")
-            self._export_token_usage_csv()
-            if phase_mode:
-                return self.cancel(reason="keyboard interrupt")
-            return False
-        except Exception as e:
-            logger.error(f"ReAct loop failed: {e}", exc_info=True)
-            # Export token usage before exception completion
-            self._export_token_usage_csv()
-            if phase_mode:
-                return self.abort(reason=f"engine exception: {type(e).__name__}")
-            return False
-        finally:
-            self._scheduler_active = False
-            self._scheduled_turn = None
-            self.state_evaluator.completion_mode = previous_completion_mode
 
     @staticmethod
     def _native_message_chars(messages: List[Dict[str, Any]]) -> int:
@@ -2452,18 +2154,14 @@ class ReActEngine(UIEventEmitter):
         dispatched with its id preserved. `self.steps` stays the single source
         of truth, so phase signals, compaction, the archive, the journal, and
         reporting all keep working unchanged. The skeleton (budget, wall clock,
-        floors, token export, exit paths) mirrors `_run_react_loop` minus the
-        scheduler and the dual-role mode selection."""
+        floors, token export, exit paths) is the one the deleted dual-role loop
+        contributed; only the turn body is new."""
         max_iter = max_iterations or self.max_iterations
         self._run_max_iterations = max_iter
 
         self.agent_logger.info(f"Starting native executor loop with max {max_iter} iterations")
 
         phase_mode = completion_mode == "setup" and self.phase_machine is not None
-        # The native protocol has no scheduler; keep the predicate honest for
-        # every helper that still consults it until Task 8 deletes it.
-        self._scheduler_active = False
-        self._scheduled_turn = None
 
         self.current_iteration = 0
         self._phase_iterations = 0
@@ -2475,31 +2173,19 @@ class ReActEngine(UIEventEmitter):
         else:
             self.steps = []
 
-        self.prompt_builder.invalidate_trunk_cache()
-
         # The system prompt is rebuilt once and re-sent on EVERY request — the
         # audit finding in spec §3.1 was that the old loop rendered it once and
         # then overwrote it with a flat text rebuild.
         system_prompt = self.prompt_builder.build_initial_system_prompt(
             repository_url=self.repository_url,
             repository_ref=self.repository_ref,
-            tool_calling_enabled=self.llm_client.capabilities_for(
-                ReactModelMode.ACTION
-            ).supports_function_calling,
             workflow_mode=completion_mode,
         )
         if initial_prompt:
+            # The kickoff text lives in the system message ONLY. Repeating it as
+            # a user turn made a run-task model read its own instructions twice
+            # (Stage B carried the duplication deliberately; Task 8 removes it).
             system_prompt = system_prompt + "\n\n" + initial_prompt
-        if not phase_mode and initial_prompt:
-            # Non-phase runs open with no window at all; the kickoff prompt is
-            # the first user turn so the array is never system-only.
-            self.steps.append(
-                ReActStep(
-                    step_type=StepType.SYSTEM_GUIDANCE,
-                    content=initial_prompt,
-                    timestamp=self._get_timestamp(),
-                )
-            )
 
         run_started_at = time.time()
         wall_clock_cap = getattr(self.config, "max_wall_clock_seconds", 7200)
@@ -2672,41 +2358,6 @@ class ReActEngine(UIEventEmitter):
             logger.warning(f"Control-event emission failed for {kind}: {exc}")
             return None
 
-    def _emit_control_scheduler_decision(self, turn: SchedulerTurn) -> None:
-        self._emit_control_event(
-            "scheduler_decision",
-            {
-                "mode": turn.mode.value,
-                "reasons": [reason.value for reason in turn.reasons],
-                "plan_index": turn.step.plan_index if turn.step is not None else None,
-            },
-        )
-
-    def _emit_control_planner_response(self, plan: CurrentPlan) -> None:
-        plan_payload = compact_control_value(plan.model_dump(mode="json"))
-        scheduler = getattr(self, "reasoning_scheduler", None)
-        ordinal = getattr(scheduler, "thinking_turns", 0)
-        self._emit_control_event(
-            "planner_response",
-            {
-                "plan_id": f"plan-{ordinal:04d}",
-                "plan": plan_payload,
-                "response_sha256": canonical_sha256(plan_payload),
-            },
-        )
-
-    def _emit_control_planner_rejection(self, response: str, code: str) -> None:
-        scheduler = getattr(self, "reasoning_scheduler", None)
-        ordinal = getattr(scheduler, "thinking_turns", 0)
-        self._emit_control_event(
-            "planner_response",
-            {
-                "plan_id": f"rejected-{code}-{ordinal:04d}",
-                "plan": {"rejected": True, "code": code},
-                "response_sha256": canonical_sha256(str(response)),
-            },
-        )
-
     def _emit_control_action_envelope(
         self,
         tool: str,
@@ -2714,34 +2365,27 @@ class ReActEngine(UIEventEmitter):
     ) -> str | None:
         """Key the envelope that every downstream `tool_result` hangs off.
 
-        Identity comes from whichever protocol is driving the call: the
-        scheduler's `plan_index`, or the native turn's `tool_call_id`
-        (`self._active_native_tool_call_id`, else the tool_call id of the
-        ACTION step currently being executed). There is deliberately no
-        scheduler-active gate — `_emit_control_tool_result` drops every event
-        whose envelope id is falsy, so a schedulerless run without this
-        fallback would silently emit no tool results at all.
+        Identity is the native turn's `tool_call_id`:
+        `self._active_native_tool_call_id` when a harness-authored call is
+        executing out of tail order, else the id of the ACTION step currently
+        being executed. `_emit_control_tool_result` drops every event whose
+        envelope id is falsy, so losing the identity silently loses every tool
+        result — replay, the A/B collector and the webui timeline with it.
+        `plan_index` survives only in the hash helper, for transcripts recorded
+        before Plan 2.
         """
         if getattr(self, "_suppress_control_action_envelope", False):
             return None
         sink = getattr(self, "control_event_sink", None)
         if sink is None:
             return None
-        plan_index: int | None = None
-        if self._active_reasoning_scheduler() is not None:
-            turn = getattr(self, "_scheduled_turn", None)
-            step = turn.step if turn is not None else None
-            scheduler = getattr(self, "reasoning_scheduler", None)
-            if step is None and scheduler is not None:
-                step = getattr(scheduler, "active_step", None)
-            plan_index = getattr(step, "plan_index", None)
         tool_call_id = getattr(self, "_active_native_tool_call_id", None)
         if not tool_call_id:
             for step in reversed(getattr(self, "steps", None) or ()):
                 if getattr(step, "step_type", None) is StepType.ACTION:
                     tool_call_id = getattr(step, "tool_call_id", None)
                     break
-        if plan_index is None and not tool_call_id:
+        if not tool_call_id:
             logger.warning("Control envelope omitted because no action identity is active")
             return None
         safe_params = compact_control_value(params)
@@ -2751,16 +2395,12 @@ class ReActEngine(UIEventEmitter):
             "tool": tool,
             "exact_params": safe_params,
             "envelope_sha256": action_envelope_sha256(
-                plan_index=plan_index,
                 tool_call_id=tool_call_id,
                 tool=tool,
                 exact_params=safe_params,
             ),
+            "tool_call_id": str(tool_call_id),
         }
-        if plan_index is not None:
-            payload["plan_index"] = plan_index
-        if tool_call_id:
-            payload["tool_call_id"] = str(tool_call_id)
         emitted = self._emit_control_event("action_envelope", payload)
         if emitted is None:
             return None
@@ -2939,108 +2579,16 @@ class ReActEngine(UIEventEmitter):
             },
         )
 
-    def _active_reasoning_scheduler(self) -> ReasoningScheduler | None:
-        if not getattr(self, "_scheduler_active", False):
-            return None
-        scheduler = getattr(self, "reasoning_scheduler", None)
-        return scheduler if isinstance(scheduler, ReasoningScheduler) else None
-
-    def _request_scheduler_reasoning(
-        self,
-        trigger: ReasoningTrigger | str,
-    ) -> bool:
-        scheduler = self._active_reasoning_scheduler()
-        if scheduler is None:
-            return False
-        scheduler.request_reasoning(trigger)
-        return True
-
-    def _prepare_scheduler_steps(
-        self,
-        response: str,
-        parsed_steps: List[ReActStep],
-        turn: SchedulerTurn,
-    ) -> List[ReActStep]:
-        """Validate a model response against the scheduler before execution."""
-        scheduler = self._active_reasoning_scheduler()
-        if scheduler is None:
-            return parsed_steps
-
-        action_steps = [step for step in parsed_steps if step.step_type is StepType.ACTION]
-        thought_steps = [step for step in parsed_steps if step.step_type is StepType.THOUGHT]
-
-        if turn.mode is SchedulerMode.THINK:
-            if action_steps:
-                scheduler.reject_plan(
-                    PlanFault(
-                        code=PlanFaultCode.MALFORMED_PLAN,
-                        message="thinking response included an ACTION; no tool was executed",
-                    )
-                )
-                self._emit_control_planner_rejection(response, "thinking_included_action")
-            else:
-                try:
-                    plan = CurrentPlan.from_thinking_response(response)
-                    scheduler.accept_plan(self._canonicalize_scheduler_plan(plan))
-                    accepted = True
-                except PlanFault as fault:
-                    scheduler.reject_plan(fault)
-                    accepted = False
-                if accepted and scheduler.current_plan is not None:
-                    self._emit_control_planner_response(scheduler.current_plan)
-                else:
-                    self._emit_control_planner_rejection(response, "malformed_plan")
-            return thought_steps
-
-        if len(action_steps) == 1:
-            candidate = action_steps[0]
-            if candidate.tool_name is not None:
-                tool_name, tool_params = self._canonicalize_scheduler_action(
-                    candidate.tool_name,
-                    candidate.tool_params,
-                )
-                candidate.tool_name = tool_name
-                candidate.tool_params = tool_params
-                if scheduler.validate_actor_action(tool_name, tool_params):
-                    return [candidate]
-            else:
-                scheduler.validate_actor_action(None, candidate.tool_params)
-        else:
-            scheduler.validate_actor_action(None, None)
-
-        self._add_system_guidance(
-            "SCHEDULER FAULT: the actor response did not exactly match the resolved "
-            "CurrentPlan step. No tool was executed; reason again with exact parameters.",
-            priority=9,
-        )
-        return []
-
-    def _canonicalize_scheduler_plan(self, plan: CurrentPlan) -> CurrentPlan:
-        """Normalize planner parameters before they become the exact contract.
-
-        Function-calling schemas canonicalize actor parameters (for example
-        ``path`` to ``project_path`` and structured values to strings).  Doing
-        the same deterministic normalization when accepting the plan keeps the
-        authoritative prompt, strict comparison, emitted envelope, and actual
-        tool invocation on one representation.
-        """
-        normalized_steps = []
-        for step in plan.steps:
-            tool_name, normalized_params = self._canonicalize_scheduler_action(
-                step.tool,
-                dict(step.exact_params),
-            )
-            normalized_steps.append(
-                step.model_copy(update={"tool": tool_name, "exact_params": normalized_params})
-            )
-        return plan.model_copy(update={"steps": tuple(normalized_steps)})
-
-    def _canonicalize_scheduler_action(
+    def _canonicalize_tool_action(
         self,
         tool_name: str,
         params: Mapping[str, Any] | None,
     ) -> tuple[str, dict[str, Any]]:
-        """Put planner and actor actions on the same schema representation."""
+        """Resolve legacy tool aliases and normalize parameters to the schema.
+
+        The only surviving piece of the deleted plan-lock machinery: harness-
+        authored calls (the forced test attempt) must reach the orchestrator on
+        exactly the representation a model-authored call would."""
         raw_params = dict(params or {})
         tools = getattr(self, "tools", None)
         if not isinstance(tools, dict) or not tools:
@@ -3060,75 +2608,6 @@ class ReActEngine(UIEventEmitter):
             raw_params,
         )
         return normalized_tool, normalizer.validate_and_fix(normalized_tool, aliased_params)
-
-    def _should_use_thinking_model(self) -> bool:
-        """Determine if we should use the thinking model for this step - ENFORCE REACT ARCHITECTURE."""
-        scheduler = self._active_reasoning_scheduler()
-        if scheduler is not None:
-            self._scheduled_turn = scheduler.next_turn()
-            self._emit_control_scheduler_decision(self._scheduled_turn)
-            if self._scheduled_turn.mode is SchedulerMode.THINK:
-                logger.info(
-                    "Using thinking model for scheduler triggers: "
-                    + ", ".join(reason.value for reason in self._scheduled_turn.reasons)
-                )
-                return True
-            logger.info(
-                f"Using action model for planned step {self._scheduled_turn.step.plan_index + 1}"
-            )
-            return False
-
-        self._scheduled_turn = None
-        # CRITICAL: Check if thinking model was requested after successful tool execution
-        if self._force_thinking_after_success:
-            self._force_thinking_after_success = False  # Reset the flag
-            logger.info("Using thinking model to analyze successful tool execution results")
-            return True
-
-        # Check if thinking model was explicitly requested due to repetitive execution
-        if self._force_thinking_next:
-            self._force_thinking_next = False  # Reset the flag
-            logger.info("Using thinking model due to repetitive execution detection")
-            return True
-
-        # CRITICAL: ReAct Architecture Enforcement
-        # Thinking model = ANALYSIS and PLANNING (after observations)
-        # Action model = EXECUTION (after thinking)
-
-        # Always start with thinking model for initial analysis
-        if len(self.steps) == 0:
-            logger.info("Using thinking model for initial analysis")
-            return True
-
-        # ENFORCE PROPER REACT SEQUENCE: OBSERVATION → THINKING → ACTION → OBSERVATION
-        last_step = self.steps[-1] if self.steps else None
-
-        if last_step and last_step.step_type == StepType.OBSERVATION:
-            # After observation, always analyze with thinking model
-            logger.info("Using thinking model to analyze observation results")
-            return True
-
-        if last_step and last_step.step_type == StepType.THOUGHT:
-            # After thinking, switch to action model for execution
-            logger.info("Switching to action model for tool execution after analysis")
-            return False
-
-        # Use thinking model when we encounter errors (need analysis)
-        recent_steps = self.steps[-3:] if len(self.steps) >= 3 else self.steps
-        recent_errors = [
-            s
-            for s in recent_steps
-            if s.step_type == StepType.ACTION
-            and s.tool_result
-            and s.tool_result.operation_outcome is OperationOutcome.FAILED
-        ]
-
-        if len(recent_errors) >= 2:  # Lower threshold for quicker analysis
-            logger.info("Using thinking model due to recent errors requiring analysis")
-            return True
-
-        # Default to action model for execution
-        return False
 
     def _get_tool_orchestrator(self) -> ToolOrchestrator:
         """Build the orchestration adapter for delegated tool execution."""
@@ -3500,13 +2979,6 @@ class ReActEngine(UIEventEmitter):
         """Consume orchestrator metadata, then consult engine-owned loop memory."""
         metadata = execution.metadata or {}
 
-        if metadata.get("force_thinking_next"):
-            if not self._request_scheduler_reasoning(ReasoningTrigger.LOOP_BREAKER):
-                self._force_thinking_next = True
-
-        if metadata.get("invalidate_trunk_cache"):
-            self.prompt_builder.invalidate_trunk_cache()
-
         memory = getattr(self, "loop_memory", None)
         if memory is None or execution.call.name in self._NON_EVIDENCE_TOOLS:
             return None
@@ -3522,9 +2994,8 @@ class ReActEngine(UIEventEmitter):
             self._add_system_guidance(self._loop_guidance(decision), priority=priority)
         if decision.decision == "force_break":
             self._record_loop_blocker(decision)
-        if decision.request_thinking:
-            if not self._request_scheduler_reasoning(ReasoningTrigger.LOOP_BREAKER):
-                self._force_thinking_next = True
+        # `decision.request_thinking` is LoopMemory's redirect signal. It has no
+        # consumer in the single-executor loop; Plan 3 wires it to the advisor.
         return decision
 
     def _close_phase_for_loop(
@@ -3599,8 +3070,7 @@ class ReActEngine(UIEventEmitter):
     def _execute_action_step(self, step: ReActStep) -> Optional[str]:
         """Execute one ACTION step that is already appended to `self.steps`.
 
-        Protocol-neutral: the scheduler loop and the native executor loop share
-        it verbatim. Returns the reason the enclosing batch must stop (a phase
+        Called once per tool call by the native dispatcher. Returns the reason the enclosing batch must stop (a phase
         transition is pending, or the loop breaker closed the phase), else
         None. When the step carries a native `tool_call_id`, its observation is
         stamped with the same id so the two render as a tool_use/tool_result
@@ -3670,35 +3140,6 @@ class ReActEngine(UIEventEmitter):
 
         # Add observation step with improved formatting
         self._append_native_observation(native_call_id, execution.observation_text)
-
-        scheduler = self._active_reasoning_scheduler()
-        if scheduler is not None:
-            scheduler.observe_result(result)
-        else:
-            # Legacy run-task cadence: setup phase mode is owned by the
-            # executable-plan scheduler above.
-            evidence_assessment = result.evidence_assessment
-            should_force_thinking = (
-                result.invocation_status is InvocationStatus.PENDING
-                or result.succeeded
-                or evidence_assessment
-                in {
-                    EvidenceAssessment.PARTIAL,
-                    EvidenceAssessment.CONFLICT,
-                    EvidenceAssessment.UNKNOWN,
-                }
-            )
-            if should_force_thinking:
-                self._force_thinking_after_success = True
-                logger.debug(
-                    f"✅ Tool {step.tool_name} requires follow-up thinking on next iteration"
-                )
-            if loop_decision is not None and loop_decision.request_thinking:
-                # LoopMemory owns this reasoning trigger.  Collapse the
-                # generic success trigger so one decision yields exactly
-                # one thinking step, never two consecutive forced turns.
-                self._force_thinking_after_success = False
-                self._force_thinking_next = True
 
         if result.error_code == "TEST_ATTEMPT_REQUIRED":
             required_attempt = self._missing_required_test_attempt()
@@ -3845,48 +3286,6 @@ class ReActEngine(UIEventEmitter):
                 cancelled_reason = batch_break_reason
 
         return executed
-
-    def _execute_steps(self, steps: List[ReActStep]) -> bool:
-        """Execute a list of ReAct steps."""
-        for step in steps:
-            self.steps.append(step)
-
-            if step.step_type == StepType.THOUGHT:
-                self.agent_logger.info(f"💭 THOUGHT ({step.model_used}): {step.content}")
-                logger.info(f"💭 THOUGHT: {step.content}")
-
-                # Emit UI event for thought
-                self.emit(
-                    EventType.AGENT_THOUGHT,
-                    message=step.content[:200]
-                    + ("..." if len(step.content) > 200 else ""),  # Truncate for display
-                    step_num=self.current_iteration,
-                )
-
-                # Detailed logging in verbose mode
-                if self.config.verbose:
-                    self._log_react_step_verbose(step)
-
-                # Log to branch context if we're in one
-                if self.context_manager.current_task_id:
-                    # Add thought to branch history using new context management system
-                    try:
-                        self.context_manager.add_to_branch_history(
-                            self.context_manager.current_task_id,
-                            {
-                                "type": "thought",
-                                "iteration": self.current_iteration,
-                                "content": step.content,
-                            },
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to log thought to branch history: {e}")
-
-            elif step.step_type == StepType.ACTION:
-                if self._execute_action_step(step) is not None:
-                    break
-
-        return True
 
     def _output_refs_from_text(self, value: str) -> List[str]:
         return re.findall(r"\boutput_[A-Za-z0-9_-]+\b", value or "")
@@ -4182,92 +3581,7 @@ class ReActEngine(UIEventEmitter):
             step_num=self.current_iteration,
         )
 
-        # DEPRECATED: Task completion detection now handled by state_evaluator
-        # self._check_task_completion_opportunity(observation)
-
         return obs_step
-
-    def _add_completion_guidance(self, reason: str):
-        """Add guidance to help agent recognize task completion."""
-        guidance_segments: List[str] = []
-
-        snapshot = self.successful_states.get("report_snapshot")
-        if snapshot:
-            try:
-                guidance_segments.append(render_condensed_summary(snapshot))
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.debug(f"Failed to render report snapshot for completion guidance: {exc}")
-
-        guidance_segments.append(
-            f"SYSTEM GUIDANCE: Task completion detected! {reason}. "
-            f"You should now generate a completion report using the report tool "
-            f"with a summary of what was accomplished, then the system will stop."
-        )
-
-        guidance = "\n".join(guidance_segments)
-
-        guidance_step = ReActStep(
-            step_type=StepType.SYSTEM_GUIDANCE,
-            content=guidance,
-            timestamp=self._get_timestamp(),
-        )
-        self.steps.append(guidance_step)
-
-        self.agent_logger.info(f"🏁 COMPLETION GUIDANCE: {guidance}")
-        logger.info(f"🏁 COMPLETION GUIDANCE: Task completion detected - {reason}")
-
-    def _check_completion_suggestion(self) -> str:
-        """Check if we should strongly suggest task completion."""
-        # Check if Maven build and test succeeded but no report generated yet
-        if self.successful_states["maven_success"] and not self._has_report_been_generated():
-
-            # Look for recent Maven test success
-            recent_steps = self.steps[-10:] if len(self.steps) >= 10 else self.steps
-            for step in recent_steps:
-                if (
-                    step.step_type == StepType.ACTION
-                    and step.tool_name == "maven"
-                    and step.tool_result
-                    and step.tool_result.succeeded
-                ):
-
-                    output = step.tool_result.output or ""
-                    if (
-                        "test" in step.tool_params.get("command", "").lower()
-                        and "BUILD SUCCESS" in output
-                        and "Tests run:" in output
-                    ):
-
-                        # Parse test results to confirm no failures
-                        import re
-
-                        test_match = re.search(
-                            r"Tests run: (\d+), Failures: (\d+), Errors: (\d+)", output
-                        )
-                        if test_match:
-                            total, failures, errors = map(int, test_match.groups())
-                            if failures == 0 and errors == 0 and total > 0:
-                                return f"Maven build and test completed successfully ({total} tests passed)"
-
-        # Check if we've been running for many iterations without progress
-        if self.current_iteration >= 25 and not self._has_report_been_generated():
-            # Check if we have any clear successes
-            if self.successful_states["cloned_repos"] or self.successful_states["maven_success"]:
-                return "Task has been running for many iterations with some successes"
-
-        return None
-
-    def _has_report_been_generated(self) -> bool:
-        """Check if a report has already been generated."""
-        for step in self.steps:
-            if (
-                step.step_type == StepType.ACTION
-                and step.tool_name == "report"
-                and step.tool_result
-                and step.tool_result.succeeded
-            ):
-                return True
-        return False
 
     def _get_timestamp(self) -> str:
         """Get current timestamp string."""

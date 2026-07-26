@@ -47,5 +47,8 @@ def test_prompt_config_non_string_value_error_is_clear():
 
 def test_default_prompt_required_key_set_is_explicit():
     assert "initial_system.identity" in REACT_ENGINE_REQUIRED_PROMPT_KEYS
-    assert "mode_prompts.action" in REACT_ENGINE_REQUIRED_PROMPT_KEYS
+    assert "initial_system.response_format" in REACT_ENGINE_REQUIRED_PROMPT_KEYS
+    # Plan 2 Task 8: mode_prompts died with the dual-role protocol.
+    assert not any(key.startswith("mode_prompts.") for key in REACT_ENGINE_REQUIRED_PROMPT_KEYS)
+    assert not any(key.startswith("next_prompt.") for key in REACT_ENGINE_REQUIRED_PROMPT_KEYS)
     assert len(REACT_ENGINE_REQUIRED_PROMPT_KEYS) == len(set(REACT_ENGINE_REQUIRED_PROMPT_KEYS))

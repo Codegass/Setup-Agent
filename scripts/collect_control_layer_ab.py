@@ -238,7 +238,10 @@ def _token_call_counts(path: Path | None) -> tuple[int, int]:
                 was_thinking = str(row.get("was_thinking_model") or "").strip().lower()
                 if kind in {"thinking", "reasoning", "think", "thought"} or was_thinking == "true":
                     thinking += 1
-                elif kind in {"action", "actor", "act"} or was_thinking == "false":
+                elif kind in {"action", "actor", "act", "executor"} or was_thinking == "false":
+                    # "executor" is the Plan 2 label: the native loop makes one
+                    # LLM call per iteration and no longer splits think/act.
+                    # Without it every post-Plan-2 run reports zero calls.
                     action += 1
     except OSError as exc:
         raise CollectionError(f"cannot read token CSV {path}: {exc}") from exc
@@ -1230,7 +1233,7 @@ def build_legacy_run_pin(
         prompt_bundle_sha256=prompt_bundle_sha256,
         feature_flags={
             "control_events": False,
-            "reasoning_scheduler": False,
+            "native_loop": True,
             "phase_machine": False,
         },
         random_seed_or_null=random_seed,

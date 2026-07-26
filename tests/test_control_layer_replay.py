@@ -16,9 +16,7 @@ from sag.agent.control_events import (
     forced_action_sha256,
     sanitize_config,
 )
-from sag.agent.current_plan import CurrentPlan
 from sag.agent.react_engine import ReActEngine
-from sag.agent.reasoning_scheduler import ReasoningScheduler
 from sag.agent.replay import ControlReplayRunner, ReplayValidationError
 from sag.config.logger import SessionLogger
 from sag.config.prompt_loader import PromptConfig
@@ -76,11 +74,15 @@ def test_bigtop_repair_is_dependency_valid_and_append_only():
     assert result.repair_routes[0].accepted is True
 
 
-def test_paramiko_replay_uses_two_plans_for_six_actions():
+def test_paramiko_replay_pairs_six_envelopes_and_counts_historical_rows():
+    """Plan 2: the six envelopes and their six results are the contract; the
+    two `planner_response` rows are historical bookkeeping, not verification."""
     result = ControlReplayRunner.offline().run(FIXTURES / "paramiko.jsonl")
 
-    assert result.planner_response_count == 2
     assert result.executed_envelope_count == 6
+    assert result.paired_envelope_count == 6
+    assert result.planner_response_count == 2
+    assert result.skipped_event_kinds["planner_response"] == 2
     assert result.compatibility_action_model_calls == 0
 
 
@@ -137,7 +139,10 @@ def _write_replay_rows(path, rows):
     )
 
 
-def test_live_shaped_action_scheduler_decisions_do_not_double_advance(tmp_path):
+def test_extra_historical_scheduler_rows_stay_inert(tmp_path):
+    """Live transcripts interleaved a `scheduler_decision` before every
+    envelope. Those rows are skipped now, so a transcript full of them must
+    reach the same verdict as one without any."""
     source = [
         json.loads(line)
         for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
@@ -163,31 +168,8 @@ def test_live_shaped_action_scheduler_decisions_do_not_double_advance(tmp_path):
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
     assert result.executed_envelope_count == 6
-    assert result.snapshot.verdict == "success"
-
-
-def test_live_normalized_envelope_can_add_tool_defaults(tmp_path):
-    source = [
-        json.loads(line)
-        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    planner = next(row for row in source if row.get("kind") == "planner_response")
-    planner["payload"]["plan"]["steps"][0]["exact_params"].pop("timeout")
-    planner["payload"]["response_sha256"] = canonical_sha256(planner["payload"]["plan"])
-    first_envelope = next(row for row in source if row.get("kind") == "action_envelope")
-    source.insert(
-        source.index(first_envelope),
-        {
-            "kind": "scheduler_decision",
-            "payload": {"mode": "action", "reasons": [], "plan_index": 0},
-            "source": first_envelope["source"],
-        },
-    )
-    transcript = tmp_path / "normalized-paramiko.jsonl"
-    _write_replay_rows(transcript, source)
-
-    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
-
+    assert result.paired_envelope_count == 6
+    assert result.skipped_event_kinds["scheduler_decision"] == 8
     assert result.snapshot.verdict == "success"
 
 
@@ -358,7 +340,7 @@ def test_engine_owned_forced_action_replays_without_scheduler_plan(tmp_path):
     assert result.unconsumed_events == ()
 
 
-def test_forced_result_replays_the_live_plan_invalidation(tmp_path):
+def test_forced_result_pairs_and_leaves_trailing_historical_rows_inert(tmp_path):
     source = _forced_bigtop_rows()
     result_index = next(
         index for index, row in enumerate(source) if row.get("kind") == "tool_result"
@@ -400,7 +382,13 @@ def test_forced_result_replays_the_live_plan_invalidation(tmp_path):
 
     result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
-    assert result.planner_response_count == 1
+    # The forced envelope is answered exactly once; the plan rows recorded after
+    # it (a live scheduler invalidating its plan) are skipped, not re-executed.
+    assert result.paired_envelope_count == result.executed_envelope_count == 1
+    assert result.skipped_event_kinds == {
+        "scheduler_decision": 1,
+        "planner_response": 1,
+    }
     assert result.unconsumed_events == ()
 
 
@@ -770,42 +758,6 @@ def test_replay_rejects_candidate_snapshot_outside_recorded_project_root(tmp_pat
         ControlReplayRunner.offline(verify_expected=False).run(transcript)
 
 
-def test_rejected_planner_response_replays_the_scheduler_fault(tmp_path):
-    source = [
-        json.loads(line)
-        for line in (FIXTURES / "paramiko.jsonl").read_text(encoding="utf-8").splitlines()
-    ]
-    first_planner = next(row for row in source if row.get("kind") == "planner_response")
-    insertion = source.index(first_planner)
-    source[insertion:insertion] = [
-        {
-            "kind": "planner_response",
-            "payload": {
-                "plan_id": "rejected-malformed-plan-0001",
-                "plan": {"rejected": True, "code": "malformed_plan"},
-                "response_sha256": "f" * 64,
-            },
-            "source": first_planner["source"],
-        },
-        {
-            "kind": "scheduler_decision",
-            "payload": {
-                "mode": "think",
-                "reasons": ["malformed_plan"],
-                "plan_index": None,
-            },
-            "source": first_planner["source"],
-        },
-    ]
-    transcript = tmp_path / "rejected-plan-paramiko.jsonl"
-    _write_replay_rows(transcript, source)
-
-    result = ControlReplayRunner.offline(verify_expected=False).run(transcript)
-
-    assert result.planner_response_count == 3
-    assert result.snapshot.verdict == "success"
-
-
 def test_session_logger_control_sink_appends_host_and_mirror(tmp_path):
     mirrored = []
     session_logger = object.__new__(SessionLogger)
@@ -827,37 +779,21 @@ def test_session_logger_control_sink_appends_host_and_mirror(tmp_path):
     assert mirrored == [(tmp_path / "control_events.jsonl").read_text(encoding="utf-8")]
 
 
-def test_live_engine_emits_scheduler_envelope_and_redacted_result(tmp_path):
+# Plan 2 Task 8: old protocol removed — the live envelope is keyed by the
+# native tool_call id, not by a scheduler plan index.
+def test_live_engine_emits_native_envelope_and_redacted_result(tmp_path):
     sink = ControlEventSink(
         tmp_path / "control_events.jsonl",
         clock=lambda: "2026-07-17T12:00:00Z",
         id_factory=lambda sequence: f"live-{sequence}",
     )
     params = {"action": "build", "working_directory": "/workspace/demo"}
-    plan = CurrentPlan.model_validate(
-        {
-            "steps": [
-                {
-                    "tool": "build",
-                    "exact_params": params,
-                    "preconditions": [],
-                    "expected_evidence": ["compiled artifacts"],
-                    "success_criteria": ["build succeeds"],
-                }
-            ]
-        }
-    )
     engine = object.__new__(ReActEngine)
     engine.control_event_sink = sink
-    engine.reasoning_scheduler = ReasoningScheduler(available_tools=["build"])
-    engine._scheduler_active = True
-    engine._scheduled_turn = None
     engine.phase_machine = None
+    engine.steps = []
+    engine._active_native_tool_call_id = "call_build_1"
 
-    assert engine._should_use_thinking_model() is True
-    engine.reasoning_scheduler.accept_plan(plan)
-    engine._emit_control_planner_response(plan)
-    assert engine._should_use_thinking_model() is False
     envelope_id = engine._emit_control_action_envelope("build", params)
     result = ToolResult(
         invocation_status=InvocationStatus.COMPLETED,
@@ -880,13 +816,10 @@ def test_live_engine_emits_scheduler_envelope_and_redacted_result(tmp_path):
 
     text = (tmp_path / "control_events.jsonl").read_text(encoding="utf-8")
     events = [ControlEvent.model_validate_json(line) for line in text.splitlines()]
-    assert [event.kind for event in events] == [
-        "scheduler_decision",
-        "planner_response",
-        "scheduler_decision",
-        "action_envelope",
-        "tool_result",
-    ]
+    assert [event.kind for event in events] == ["action_envelope", "tool_result"]
+    assert events[0].payload["tool_call_id"] == "call_build_1"
+    assert "plan_index" not in events[0].payload
+    assert events[-1].payload["envelope_id"] == envelope_id
     assert events[-1].payload["result"]["output"] == "stored as output_live_build"
     assert events[-1].payload["result"]["facts"] == {"compiled_classes": 41}
     assert "secret build output" not in text

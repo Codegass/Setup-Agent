@@ -3,13 +3,13 @@ import shlex
 from types import SimpleNamespace
 
 import pytest
+from engine_driver import execute_action_steps
 from test_evidence_ingestion import _action_step, _engine, _prepare_action_execution
 
 from sag.agent.evidence_state import RunEvidenceState, StateScope
 from sag.agent.phase_gates import ClaimDisposition, GateResult, ValidatorState
 from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.react_engine import ReActEngine
-from sag.agent.reasoning_scheduler import ReasoningScheduler, SchedulerMode
 from sag.agent.attempt_policy import (
     TestCandidateResolution,
     forced_test_refusal_receipts,
@@ -860,8 +860,6 @@ def test_phase_floor_executes_exact_test_action_without_a_model_plan():
     engine.current_iteration = 8
     engine.steps = []
     engine.tools = {}
-    engine.reasoning_scheduler = ReasoningScheduler(available_tools={"build", "search", "phase"})
-    engine._scheduler_active = True
     engine._get_timestamp = lambda: "2026-07-23T00:00:00Z"
     engine.control_event_sink = None
     calls: list[ToolCall] = []
@@ -896,7 +894,6 @@ def test_phase_floor_executes_exact_test_action_without_a_model_plan():
     engine._emit_control_tool_result = lambda **kwargs: None
     engine._apply_tool_execution_loop_effects = lambda execution: None
     engine._add_observation_step = lambda text: None
-    engine._request_scheduler_reasoning = lambda trigger: True
 
     assert engine._enforce_phase_floors() is False
     assert engine.phase_machine.current_phase == "test"
@@ -906,8 +903,6 @@ def test_phase_floor_executes_exact_test_action_without_a_model_plan():
         "action": "test",
         "working_directory": "/workspace/bigtop/bigtop-data-generators",
     }
-    turn = engine.reasoning_scheduler.next_turn()
-    assert turn.mode is SchedulerMode.THINK
 
 
 def test_phase_floor_forced_refusal_runs_once_then_closes_honestly(tmp_path):
@@ -926,7 +921,6 @@ def test_phase_floor_forced_refusal_runs_once_then_closes_honestly(tmp_path):
     )
     engine.current_iteration = 8
     engine.tools = {}
-    engine._scheduler_active = False
     engine.control_event_sink = None
     engine._get_timestamp = lambda: "2026-07-23T00:00:00Z"
     calls: list[ToolCall] = []
@@ -952,7 +946,6 @@ def test_phase_floor_forced_refusal_runs_once_then_closes_honestly(tmp_path):
     engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=execute)
     engine._apply_tool_execution_loop_effects = lambda execution: None
     engine._add_observation_step = lambda text: None
-    engine._request_scheduler_reasoning = lambda trigger: False
     engine._phase_gate_check = lambda phase: {
         "ok": True,
         "validator_state": "green",
@@ -997,7 +990,6 @@ def test_terminal_refusal_immediately_executes_the_harness_owned_test(tmp_path):
     )
     engine.orchestrator = ManifestOrchestrator()
     engine.tools = {}
-    engine._scheduler_active = False
     engine.control_event_sink = None
     engine._get_timestamp = lambda: "2026-07-23T00:00:00Z"
     calls: list[ToolCall] = []
@@ -1032,7 +1024,7 @@ def test_terminal_refusal_immediately_executes_the_harness_owned_test(tmp_path):
     engine._get_tool_orchestrator = lambda: SimpleNamespace(execute=execute)
     _prepare_action_execution(engine)
 
-    engine._execute_steps([_action_step("phase", {"action": "done", "outcome": "failed"})])
+    execute_action_steps(engine, [_action_step("phase", {"action": "done", "outcome": "failed"})])
 
     assert [call.name for call in calls] == ["phase", "build"]
     assert calls[1].raw_params == {
