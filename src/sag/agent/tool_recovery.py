@@ -567,6 +567,30 @@ class ToolRecoveryHandler:
                 recovery_params=recovery_params,
             )
 
+        combined = f"{error_msg}\n{failed_result.output or ''}"
+        if "unzip: command not found" in combined and not self.successful_states.get(
+            "gradle_unzip_installed"
+        ):
+            # Gradle wrapper prerequisite (spec §3.4-5): the wrapper needs
+            # unzip to unpack its distribution. Install the one allowlisted
+            # package and retry the identical invocation once.
+            install = self._execute_workspace_recovery_command(
+                "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y unzip"
+            )
+            if install.get("success"):
+                self.successful_states["gradle_unzip_installed"] = True
+                result = gradle_tool.safe_execute(**params)
+                return self._attempted(
+                    strategy="gradle_install_unzip",
+                    message=(
+                        "Recovered by installing unzip (Gradle wrapper "
+                        "prerequisite) and retrying once"
+                    ),
+                    result=result,
+                    recovery_params=dict(params),
+                )
+
         return self._no_strategy("gradle_no_strategy", "No Gradle recovery strategy applicable")
 
     def _recover_bash_error(
