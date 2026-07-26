@@ -245,7 +245,11 @@ def _phase_step(engine, signal="done", **metadata):
 
 
 def _prepare_action_execution(engine):
-    engine.config = SimpleNamespace(verbose=False)
+    # These suites are about the ingestion boundary, not the advisor: with the
+    # advisor armed, the before-acting guarantee would redirect the first
+    # state-changing build/test call and nothing would ever be ingested. The
+    # redirect itself is covered by tests/test_advisor_guarantees.py.
+    engine.config = SimpleNamespace(verbose=False, advisor_mode="off")
     engine.current_iteration = 1
     engine.token_tracker = SimpleNamespace(update_last_tool_name=lambda tool_name: None)
     engine.emit = lambda *args, **kwargs: None

@@ -271,6 +271,12 @@ initial_system:
     RUN TASK COMPLETION:
     Finish this run only after tool results directly satisfy the requested TASK.
     Then reply with no tool call: TASK COMPLETE: <brief evidence-backed summary>
+  advisor_guidance: |
+    ADVISOR:
+    You have an advisor() tool backed by a reviewer with your full transcript.
+    Consult it before substantive work in a phase, when stuck,
+    and before closing a phase after failures.
+    Weigh its advice seriously; if a step it suggests fails empirically, adapt.
 advisor_system: |
   You are a senior reviewer advising a setup agent. You see its full transcript
   and evidence. Give strategic guidance only — what to do next and why, under

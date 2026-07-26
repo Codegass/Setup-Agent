@@ -15,6 +15,7 @@ REACT_ENGINE_REQUIRED_PROMPT_KEYS = (
     "initial_system.intelligent_setup_workflow",
     "initial_system.maven_pom_recovery",
     "initial_system.maven_multimodule_testing",
+    "initial_system.advisor_guidance",
     "initial_system.response_format",
     "initial_system.repository_url_reminder",
     "initial_system.continuous_cycle_reminder",

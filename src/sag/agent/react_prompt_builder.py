@@ -98,6 +98,11 @@ class ReActPromptBuilder:
             parts.append(self.prompts.get("initial_system.maven_pom_recovery"))
             # Prompt: src/sag/config/prompts/react_engine.yaml:178 initial_system.maven_multimodule_testing
             parts.append(self.prompts.get("initial_system.maven_multimodule_testing"))
+            # When to consult the advisor. The three mechanical guarantees are
+            # the floor, not the ceiling: this block is what lets the model
+            # consult BEFORE a redirect has to make it.
+            # Prompt: src/sag/config/prompts/react_engine.yaml:274 initial_system.advisor_guidance
+            parts.append(self.prompts.get("initial_system.advisor_guidance"))
 
         context_part = f"""
 
