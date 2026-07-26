@@ -975,6 +975,34 @@ untouched).
 
 ### Task 8: Flip the flag; delete the old protocol and Gen 1
 
+> **BINDING NOTES FROM STAGE B (discovered against real code):**
+> 1. The shared ACTION machinery now lives in `_execute_action_step(step)`
+>    (both loops call it). The engine-side deletion inside it is exactly two
+>    blocks: the `_active_reasoning_scheduler()`/`scheduler.observe_result`
+>    block and the legacy `_force_thinking_*` cadence. After the alias
+>    collapse (`_run_react_loop` → `_run_native_loop`, currently a 5-line
+>    guard at the top of `_run_react_loop` :2152), `_execute_steps` loses its
+>    last caller — delete it then.
+> 2. Real names (the plan sketch's were wrong): journal flags are
+>    `_journal_intro_dirty` / `_journal_last_ledger`; `_close_flow` takes
+>    `RunTerminationStatus`; `abort`/`cancel` are keyword-only
+>    (`abort(reason=...)`); `wall_clock_exceeded(run_started_at, cap)` is a
+>    module-level function; `build_initial_system_prompt(repository_url=,
+>    repository_ref=, tool_calling_enabled=, workflow_mode=)`.
+> 3. Run-task migration must de-duplicate the kickoff text: the native loop
+>    currently folds `initial_prompt` into the system prompt AND appends it
+>    as a SYSTEM_GUIDANCE step in non-phase mode (deliberate interim
+>    duplication — remove the step, keep the system-prompt fold).
+> 4. `_request_scheduler_reasoning` already no-ops without a scheduler;
+>    delete it and the `Task 8` marker comments left in place.
+> 5. `tests/test_native_loop_engine.py`'s stub of
+>    `_missing_required_test_attempt` (→ None) is load-bearing: with a
+>    non-surveyable orchestrator the real policy force-executes a
+>    `project(action='analyze')` refresh. Keep the stub or wire a surveyable
+>    orchestrator when extending that harness.
+> 6. Post-Stage-B full-suite baseline: 2,510 passed / 1 skipped (env ±1
+>    skip); measure your own clean baseline before claiming deltas.
+
 The atomic deletion. Work strictly from the anatomy map §2 (coupling
 inventory) and §6 (deletion surface); every line ref there is an anchor.
 
