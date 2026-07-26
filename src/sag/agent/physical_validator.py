@@ -1428,20 +1428,6 @@ class PhysicalValidator:
             files_with_testcases = 0
             total_testcases_found = 0
 
-            # First, identify which test classes are from Groovy sources
-            groovy_test_classes = set()
-            groovy_check_cmd = "find /workspace -path '*/src/test/groovy/*' -name '*.groovy' -exec grep -l '@Test' {} \\; 2>/dev/null | xargs -I{} basename {} .groovy 2>/dev/null"
-            groovy_result = self.docker_orchestrator.execute_command(groovy_check_cmd)
-            if groovy_result.get("exit_code") == 0 and groovy_result.get("output"):
-                groovy_test_classes = set(
-                    line.strip()
-                    for line in groovy_result.get("output", "").split("\n")
-                    if line.strip()
-                )
-                logger.info(
-                    f"📊 Identified {len(groovy_test_classes)} Groovy test classes to exclude"
-                )
-
             observations: List[TestResultObservation] = []
             identity_statuses: Dict[CanonicalTestIdentity, List[str]] = {}
             identity_times: Dict[CanonicalTestIdentity, float] = {}
@@ -1467,9 +1453,7 @@ class PhysicalValidator:
                     xml_content = xml_result.get("output", "")
                     if not xml_content.strip():
                         continue
-                    stats = self._parse_single_test_xml(
-                        xml_content, report_file, groovy_test_classes
-                    )
+                    stats = self._parse_single_test_xml(xml_content, report_file)
                     if not stats:
                         test_result["parsing_errors"].append(
                             f"Failed to parse XML structure in {report_file}"
@@ -1724,12 +1708,11 @@ class PhysicalValidator:
         return parsed
 
     def _parse_single_test_xml(
-        self, xml_content: str, file_path: str, groovy_test_classes: set = None
+        self, xml_content: str, file_path: str
     ) -> Optional[Dict[str, int]]:
         """
         Parse a single test XML file and extract statistics.
         Handles both Maven Surefire and Gradle formats.
-        Excludes Groovy test classes if provided.
         """
         try:
             root = ET.fromstring(xml_content)
@@ -1740,18 +1723,9 @@ class PhysicalValidator:
                 # Collect all testcases first
                 all_testcases = self._collect_testcases_from_suite(root, file_path)
 
-                # Filter out Groovy tests if groovy_test_classes is provided
-                if groovy_test_classes:
-                    testcase_entries = []
-                    for tc in all_testcases:
-                        classname = tc.get("classname", "")
-                        simple_classname = classname.split(".")[-1] if classname else ""
-                        if simple_classname not in groovy_test_classes:
-                            testcase_entries.append(tc)
-                else:
-                    testcase_entries = all_testcases
+                testcase_entries = all_testcases
 
-                # Recalculate statistics based on filtered test cases
+                # Recalculate statistics over every runtime testcase (spec §3.4-4)
                 total = len(testcase_entries)
                 failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
                 errors = sum(1 for tc in testcase_entries if tc.get("status") == "error")
@@ -1774,18 +1748,9 @@ class PhysicalValidator:
                 for testsuite in root.findall("testsuite"):
                     all_testcases.extend(self._collect_testcases_from_suite(testsuite, file_path))
 
-                # Filter out Groovy tests if groovy_test_classes is provided
-                if groovy_test_classes:
-                    testcase_entries = []
-                    for tc in all_testcases:
-                        classname = tc.get("classname", "")
-                        simple_classname = classname.split(".")[-1] if classname else ""
-                        if simple_classname not in groovy_test_classes:
-                            testcase_entries.append(tc)
-                else:
-                    testcase_entries = all_testcases
+                testcase_entries = all_testcases
 
-                # Calculate statistics based on filtered test cases
+                # Calculate statistics over every runtime testcase (spec §3.4-4)
                 total = len(testcase_entries)
                 failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
                 errors = sum(1 for tc in testcase_entries if tc.get("status") == "error")
@@ -1809,19 +1774,10 @@ class PhysicalValidator:
                 for testsuite in testsuites:
                     all_testcases.extend(self._collect_testcases_from_suite(testsuite, file_path))
 
-                # Filter out Groovy tests if groovy_test_classes is provided
-                if groovy_test_classes:
-                    testcase_entries = []
-                    for tc in all_testcases:
-                        classname = tc.get("classname", "")
-                        simple_classname = classname.split(".")[-1] if classname else ""
-                        if simple_classname not in groovy_test_classes:
-                            testcase_entries.append(tc)
-                else:
-                    testcase_entries = all_testcases
+                testcase_entries = all_testcases
 
                 if testcase_entries:
-                    # Calculate statistics based on filtered test cases
+                    # Calculate statistics over every runtime testcase (spec §3.4-4)
                     total = len(testcase_entries)
                     failures = sum(1 for tc in testcase_entries if tc.get("status") == "failed")
                     errors = sum(1 for tc in testcase_entries if tc.get("status") == "error")
