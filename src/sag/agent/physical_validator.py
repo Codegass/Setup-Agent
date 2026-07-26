@@ -4562,7 +4562,15 @@ class PhysicalValidator:
                 history_cmd, "checking command history for test skips"
             )
             if history_result["success"] and history_result.get("output"):
-                hist = history_result["output"]
+                # P0-C (Plan 5 Stage D): -DskipTests / -x test on a PACKAGING
+                # command is the install/package contract (packaging never runs
+                # tests), not a test exclusion — only test-owning commands may
+                # count as excluding tests.
+                hist = "\n".join(
+                    line
+                    for line in history_result["output"].splitlines()
+                    if not re.search(r"\b(install|package|assemble|publishToMavenLocal)\b", line)
+                )
                 if "-DskipTests" in hist or "skipTests=true" in hist:
                     exclusions.append("ALL_TESTS_SKIPPED")
                 if "-x test" in hist or "--exclude-task test" in hist:

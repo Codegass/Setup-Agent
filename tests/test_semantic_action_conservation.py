@@ -482,3 +482,43 @@ def test_maven_compile_verb_gets_no_delta_line():
     )
 
     assert "[build] requested" not in (result.output or "")
+
+
+class _ExclusionHistoryOrch:
+    """Fake command runner: only answers the command-history grep."""
+
+    def __init__(self, history: str) -> None:
+        self.history = history
+
+    def execute_command(self, command: str, **_kwargs):
+        if "command_history" in command:
+            return {"success": True, "output": self.history, "exit_code": 0}
+        return {"success": True, "output": "", "exit_code": 0}
+
+
+def _detect_exclusions(history: str) -> list[str]:
+    from sag.agent.physical_validator import PhysicalValidator
+
+    validator = PhysicalValidator.__new__(PhysicalValidator)
+    validator.docker_orchestrator = _ExclusionHistoryOrch(history)
+    validator._cache = {}
+    validator._cache_timestamps = {}
+    validator._execute_command_with_logging = (
+        lambda cmd, desc="", **kw: validator.docker_orchestrator.execute_command(cmd)
+    )
+    return validator._detect_test_exclusions("/workspace/proj")
+
+
+def test_packaging_skip_flags_are_not_test_exclusions():
+    """P0-C: install/package legitimately carry -DskipTests / -x test."""
+    exclusions = _detect_exclusions(
+        "mvn install -DskipTests\ngradle publishToMavenLocal -x test\n"
+    )
+    assert "ALL_TESTS_SKIPPED" not in exclusions
+    assert "GRADLE_TESTS_EXCLUDED" not in exclusions
+
+
+def test_skip_flags_on_test_commands_still_flagged():
+    exclusions = _detect_exclusions("mvn test -DskipTests\ngradle test -x test\n")
+    assert "ALL_TESTS_SKIPPED" in exclusions
+    assert "GRADLE_TESTS_EXCLUDED" in exclusions
