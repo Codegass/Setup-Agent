@@ -31,6 +31,13 @@ class ReActStep(BaseModel):
     tool_result: Optional[ToolResult] = None
     timestamp: str
     model_used: Optional[str] = None
+    # Native tool-calling provenance (spec §3.1). ACTION steps carry the
+    # provider's tool_call id and the assistant prose that accompanied the
+    # call; the OBSERVATION step answering a call repeats its id so the
+    # renderer can pair them. Both default to None, so every existing
+    # construction site and consumer is unaffected.
+    tool_call_id: Optional[str] = None
+    native_text: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)
