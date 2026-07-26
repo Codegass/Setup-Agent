@@ -50,6 +50,7 @@ def attempt_meta(
     errors=0,
     skipped=0,
     receipt_written=None,
+    skip_reasons=None,
 ):
     """One pytest attempt's ToolResult metadata, in the recorded field shape."""
     meta = {
@@ -67,6 +68,8 @@ def attempt_meta(
     }
     if receipt_written is not None:
         meta["smoke_receipt_written"] = receipt_written
+    if skip_reasons is not None:
+        meta["smoke_skip_reasons"] = skip_reasons
     return meta
 
 
@@ -139,12 +142,25 @@ def test_all_skipped_attempt_that_minted_a_receipt_fails(tmp_path):
 
 
 def test_all_skipped_attempt_without_a_receipt_passes(tmp_path):
-    session = write_session(tmp_path, [attempt_meta(tests=3, skipped=3)])
+    session = write_session(
+        tmp_path,
+        [attempt_meta(tests=3, skipped=3, skip_reasons=["need llvm"])],
+    )
 
     verifier = run_tvm(session)
 
     assert "tvm.attempt1.no_receipt_on_all_skipped" in verifier.passes
+    assert "tvm.attempt1.skip_reasons_projected" in verifier.passes
     assert verifier.failures == []
+
+
+def test_all_skipped_attempt_without_projected_skip_reasons_fails(tmp_path):
+    """Plan 5 Stage E anchor: silent all-skipped labels are a verifier FAIL."""
+    session = write_session(tmp_path, [attempt_meta(tests=3, skipped=3)])
+
+    verifier = run_tvm(session)
+
+    assert any(name.endswith("skip_reasons_projected") for name in verifier.failures)
 
 
 def test_partially_skipped_attempt_is_not_subject_to_the_negative(tmp_path):

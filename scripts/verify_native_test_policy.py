@@ -175,6 +175,14 @@ class Verifier:
                     f"all {meta.get('tests')} selected tests skipped, "
                     "yet smoke_receipt_written is set (capability NOT proven)",
                 )
+                # Plan 5 Stage E anchor: the skip reasons are projected facts,
+                # not silent labels — the model must see WHY nothing ran.
+                reasons = meta.get("smoke_skip_reasons")
+                self.check(
+                    f"tvm.attempt{index}.skip_reasons_projected",
+                    isinstance(reasons, list) and len(reasons) >= 1,
+                    f"smoke_skip_reasons={reasons!r}",
+                )
             # A mint only counts when this attempt's junit counts back it: an
             # all-skipped receipt proves nothing, so it cannot unlock a later
             # full collect.
@@ -210,9 +218,31 @@ class Verifier:
 
     def assert_bigtop(self) -> None:
         verdict = self._verdict()
-        unique = (verdict.get("test_stats") or {}).get("unique") or {}
-        passed = unique.get("passed", (verdict.get("test_stats") or {}).get("passed", 0))
+        stats = verdict.get("test_stats") or {}
+        unique = stats.get("unique") or {}
+        passed = unique.get("passed", stats.get("passed", 0))
         self.check("bigtop.primary.anchor", int(passed or 0) >= 50, f"passed={passed}")
+        # Plan 5 anchors (ground-truth review): the primary count is
+        # receipt-scoped and EXACTLY the data-generators 50 — auxiliary
+        # test-framework passes are quarantined, never merged.
+        self.check(
+            "bigtop.primary.receipt_scoped",
+            stats.get("receipt_scoped") is True,
+            f"receipt_scoped={stats.get('receipt_scoped')!r}",
+        )
+        if stats.get("receipt_scoped"):
+            self.check(
+                "bigtop.primary.exactly_50",
+                int(passed or 0) == 50,
+                f"passed={passed} (auxiliary leaked into the primary count)",
+            )
+        domain_states = (verdict.get("build_evidence") or {}).get("domain_states") or {}
+        blocked = [r for r, s in domain_states.items() if (s or {}).get("state") == "blocked"]
+        self.check(
+            "bigtop.domains.blocked_sealed",
+            len(blocked) >= 1,
+            f"domain_states={ {r: (s or {}).get('state') for r, s in domain_states.items()} }",
+        )
 
     def assert_cli(self) -> None:
         verdict = self._verdict()
