@@ -11,6 +11,7 @@ from sag.agent.phase_machine import PhaseClaim, PhaseMachine, PhaseOutcome
 from sag.agent.react_engine import ReActEngine
 from sag.agent.reasoning_scheduler import ReasoningScheduler, SchedulerMode
 from sag.agent.attempt_policy import (
+    TestCandidateResolution,
     forced_test_refusal_receipts,
     has_test_candidate_refresh_receipt,
     required_test_attempt,
@@ -1133,3 +1134,18 @@ def test_resolution_exposes_the_primary_candidate():
     resolution = resolve_survey_test_candidates(ManifestOrchestrator())
     assert resolution.primary is not None
     assert resolution.primary.root == "/workspace/bigtop/bigtop-data-generators"
+
+
+def test_snapshot_round_trip_preserves_the_primary_coordinate():
+    """Replay verification must enforce the same primary-coordinate policy as
+    the live path (review finding on spec §3.4-6): without `primary` in the
+    snapshot, a rehydrated resolution silently fell back to the legacy
+    any-island discharge set."""
+    resolution = resolve_survey_test_candidates(ManifestOrchestrator())
+    assert resolution.primary is not None
+
+    restored = TestCandidateResolution.from_snapshot(resolution.to_snapshot())
+
+    assert restored.primary is not None
+    assert restored.primary.root == resolution.primary.root
+    assert restored.primary.system == resolution.primary.system

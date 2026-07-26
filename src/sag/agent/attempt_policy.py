@@ -84,6 +84,11 @@ class TestCandidateResolution:
                 {"root": candidate.root, "system": candidate.system}
                 for candidate in self.candidates
             ],
+            "primary": (
+                {"root": self.primary.root, "system": self.primary.system}
+                if self.primary is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -126,11 +131,42 @@ class TestCandidateResolution:
             raise ValueError("available test-candidate snapshot cannot be empty")
         if status != "available" and candidates:
             raise ValueError("failed test-candidate snapshot cannot contain coordinates")
+        # Restore the primary coordinate so replay verification enforces the
+        # same discharge policy as the live path (spec §3.4-6). Pre-primary
+        # snapshots carry no "primary" key and legally rehydrate to None.
+        primary: TestAttemptRequirement | None = None
+        primary_item = value.get("primary")
+        if primary_item is not None:
+            if not isinstance(primary_item, Mapping):
+                raise ValueError("test-candidate snapshot primary must be a mapping")
+            primary_root = _normalized_root(
+                primary_item.get("root"),
+                project_root,
+                workspace_root=workspace_root,
+            )
+            primary_system = _normalized_system(primary_item.get("system"))
+            if primary_root is None or primary_system is None:
+                raise ValueError(
+                    "test-candidate snapshot primary requires valid root and system"
+                )
+            primary = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.root == primary_root and candidate.system == primary_system
+                ),
+                None,
+            )
+            if primary is None:
+                raise ValueError(
+                    "test-candidate snapshot primary must be one of its candidates"
+                )
         return cls(
             status=status,  # type: ignore[arg-type]
             candidates=tuple(candidates),
             project_root=project_root,
             workspace_root=workspace_root,
+            primary=primary,
         )
 
 
