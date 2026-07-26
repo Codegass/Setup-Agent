@@ -13,6 +13,7 @@ from sag.agent.attempt_policy import (
     build_attempt_requirement,
     local_prerequisite_signature,
     required_test_attempt,
+    untried_islands_requirement,
 )
 from sag.agent.phase_transitions import RepairRequest
 
@@ -250,6 +251,25 @@ class PhaseTool(BaseTool):
                     ],
                     metadata={"phase": phase, "prerequisite": prerequisite},
                 )
+
+        # Closure-by-giving-up may not abandon surveyed islands that were
+        # never attempted (spec §3.4 island guarantee, named per §3.3). A
+        # done/success claim is exempt: the physical gate below checks it.
+        islands = untried_islands_requirement(
+            self.run_evidence_state,
+            self.orchestrator,
+            phase=phase,
+            signal=verb,
+            outcome=claimed_outcome.value,
+        )
+        if islands is not None:
+            return ToolResult.completed_failure(
+                output=islands.message(),
+                error="build closure abandons surveyed islands with no attempt receipt",
+                error_code="ISLAND_ATTEMPT_REQUIRED",
+                suggestions=islands.suggestions(),
+                metadata={"phase": phase, **islands.to_metadata()},
+            )
 
         claim = PhaseClaim(
             phase=phase,
