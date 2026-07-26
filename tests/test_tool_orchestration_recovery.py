@@ -693,67 +693,10 @@ def test_maven_no_pom_xml_recovery_targets_detected_pom_before_known_directory()
     assert maven.calls == [{"command": "test"}, expected_params]
 
 
-def test_maven_module_and_test_exclusion_recovery_records_exclusions():
-    successful_states = {}
-    maven = ResultTool(
-        "maven",
-        [
-            ToolResult.completed_failure(
-                output="",
-                error="Module and test failures",
-                error_code="BUILD_FAILED",
-                metadata={
-                    "analysis": {
-                        "failed_modules": [
-                            {"artifact_id": "bad-module"},
-                            {"pom_path": "/workspace/app/other/pom.xml"},
-                        ],
-                        "failed_tests": [
-                            "com.example.FooTest.shouldFail",
-                            "com.example.BarTest#bad",
-                        ],
-                    }
-                },
-            ),
-            ToolResult.completed_success(output="remaining modules ok"),
-        ],
-    )
-    orchestrator = _orchestrator(
-        tools={"maven": maven},
-        successful_states=successful_states,
-    )
-
-    execution = orchestrator.execute(
-        ToolCall(
-            name="maven",
-            raw_params={"command": "test", "properties": ["skipITs=true"]},
-            validated_params={"command": "test", "properties": ["skipITs=true"]},
-        )
-    )
-
-    expected_params = {
-        "command": "test",
-        "properties": [
-            "skipITs=true",
-            "-pl !bad-module,!other",
-            "-am",
-            "test=!com.example.BarTest#bad,!com.example.FooTest#shouldFail",
-        ],
-        "fail_at_end": True,
-    }
-    assert execution.status == "recovered"
-    assert execution.recovery_strategy == "maven_exclude_modules_or_tests"
-    assert execution.executed_params == expected_params
-    assert maven.calls == [
-        {"command": "test", "properties": ["skipITs=true"]},
-        expected_params,
-    ]
-    assert successful_states["excluded_modules"] == {"bad-module", "other"}
-    assert successful_states["excluded_tests"] == {
-        "com.example.BarTest#bad",
-        "com.example.FooTest#shouldFail",
-    }
-    assert execution.metadata["recovery"]["recovery_params"] == expected_params
+# test_maven_module_and_test_exclusion_recovery_records_exclusions was deleted:
+# spec §3.4-3 forbids the harness from converting failed tests/modules into
+# Maven exclusions at all, so the behaviour it pinned no longer exists.
+# tests/test_no_auto_test_exclusion.py now asserts the opposite contract.
 
 
 def test_maven_version_error_returns_env_overlay_guidance_without_retry():
