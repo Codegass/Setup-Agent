@@ -76,3 +76,48 @@ def test_absent_collection_facts_stay_none():
     assert stats.collection_errors is None
     assert stats.collection_errors_skipped is None
     assert stats.collection_error_summary is None
+
+# ---------------------------------------------------------------------------
+# Plan 5 Task B2 follow-up: the receipt-scoped basis, the quarantined
+# auxiliary counts, and the named stale reports must survive INTO the sealed
+# verdict — and a receipt-free run must serialize byte-identically to before.
+
+BIGTOP_SCOPED_STATUS = {
+    "test_stats": {"executed": 50, "passed": 50, "failed": 0, "errors": 0, "skipped": 0},
+    "total_tests": 50,
+    "unique_tests": 50,
+    "error_tests": 0,
+    "has_test_reports": True,
+    "receipt_scoped": True,
+    "auxiliary_test_stats": {"executed": 4, "passed": 4, "failed": 0, "errors": 0, "skipped": 0},
+    "stale_test_reports": ["/workspace/bigtop/old/TEST-Old.xml"],
+}
+
+
+def test_fold_seals_receipt_scoped_basis_and_auxiliary_quarantine():
+    state = RunEvidenceState(run_id="sealed-receipt-scope")
+    rollup = _validated_test_rollup(BIGTOP_SCOPED_STATUS)
+    state.register_fact(StateScope.TEST_RUNTIME, "test.stats", rollup, "gate://test")
+
+    stats, _conflicts = _fold_test_stats(state, test_pass_threshold=0.8)
+
+    assert stats.receipt_scoped is True
+    assert stats.auxiliary_test_stats == {
+        "executed": 4,
+        "passed": 4,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+    }
+    assert stats.stale_test_reports == ["/workspace/bigtop/old/TEST-Old.xml"]
+    assert stats.unique.passed == 50
+
+    dumped = stats.model_dump()
+    assert dumped["receipt_scoped"] is True
+    assert dumped["auxiliary_test_stats"]["passed"] == 4
+
+
+def test_receipt_free_snapshot_serializes_without_the_new_keys():
+    dumped = SnapshotTestStats().model_dump()
+    for key in ("receipt_scoped", "auxiliary_test_stats", "stale_test_reports"):
+        assert key not in dumped

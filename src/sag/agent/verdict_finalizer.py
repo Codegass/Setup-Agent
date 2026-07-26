@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
 from enum import Enum
@@ -73,6 +74,12 @@ class SnapshotTestStats(BaseModel):
     collection_errors: int | None = None
     collection_errors_skipped: int | None = None
     collection_error_summary: str | None = None
+    # Plan 5 Task B2 follow-up: the receipt-scoped basis and its quarantined
+    # neighbors travel into the sealed snapshot with the counts they scoped
+    # (None = the run predates receipts / observed none).
+    receipt_scoped: bool | None = None
+    auxiliary_test_stats: dict[str, int] | None = None
+    stale_test_reports: list[str] | None = None
 
     @model_serializer(mode="wrap")
     def _omit_unobserved_collection_fields(self, handler):
@@ -83,6 +90,9 @@ class SnapshotTestStats(BaseModel):
             "collection_errors",
             "collection_errors_skipped",
             "collection_error_summary",
+            "receipt_scoped",
+            "auxiliary_test_stats",
+            "stale_test_reports",
         ):
             if data.get(key) is None:
                 data.pop(key, None)
@@ -597,6 +607,18 @@ def _fold_test_stats(
                     str(validated_rollup.get("collection_error_summary")).strip() or None
                     if validated_rollup.get("collection_error_summary")
                     else None
+                ),
+                receipt_scoped=True if validated_rollup.get("receipt_scoped") else None,
+                auxiliary_test_stats=(
+                    {
+                        str(name): _nonnegative_int(count) or 0
+                        for name, count in validated_rollup["auxiliary_test_stats"].items()
+                    }
+                    if isinstance(validated_rollup.get("auxiliary_test_stats"), Mapping)
+                    else None
+                ),
+                stale_test_reports=(
+                    [str(item) for item in validated_rollup.get("stale_test_reports") or ()] or None
                 ),
             ),
             conflicts,
