@@ -68,6 +68,7 @@ class GradleTool(BaseTool):
         fail_at_end: bool = False,  # Continue execution after failures
         *,
         _env_preflight: bool = True,
+        _compile_source_languages: Optional[List[str]] = None,
     ) -> ToolResult:
         """
         Execute Gradle commands with comprehensive error handling.
@@ -88,6 +89,12 @@ class GradleTool(BaseTool):
             fail_at_end: IMPORTANT for multi-module projects! Set to True to continue after task failures.
                         For test tasks, automatically adds test.ignoreFailures=true.
                         Essential for running ALL tests in multi-module projects.
+
+            _compile_source_languages: compile languages whose src/main/<lang>
+                        directories the caller PROBED before choosing these
+                        tasks. A gradle build that reports NO-SOURCE for every
+                        compile task it ran cannot be scored as a compile of
+                        those sources (see _compile_coverage_error).
         """
 
         self._pending_invocation_receipt = None
@@ -332,7 +339,12 @@ class GradleTool(BaseTool):
                 )
 
             # Analyze the output
-            analysis = self._analyze_gradle_output(result["output"], result["exit_code"])
+            analysis = self._analyze_gradle_output(
+                result["output"],
+                result["exit_code"],
+                compile_source_languages=_compile_source_languages,
+            )
+            compile_mismatch = analysis.get("compile_source_mismatch")
 
             # Store full output if large. Detached builds hand back a complete
             # `full_output` (untruncated log) next to the bounded inline `output`;
@@ -386,9 +398,14 @@ class GradleTool(BaseTool):
                 evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
                 return self._finalize_main_result(
                     ToolResult.completed(
-                        operation_outcome=("success" if result["exit_code"] == 0 else "failed"),
+                        operation_outcome=(
+                            "success"
+                            if result["exit_code"] == 0 and not compile_mismatch
+                            else "failed"
+                        ),
                         output=result["output"],
                         raw_output=result["output"],
+                        error=compile_mismatch,
                         **evidence_fields,
                         metadata={
                             "command": gradle_cmd,
@@ -403,6 +420,35 @@ class GradleTool(BaseTool):
                 )
 
             evidence_fields = self._gradle_evidence_fields(analysis, ref_id)
+            if result["exit_code"] == 0 and compile_mismatch:
+                # Gradle's own exit code says SUCCESS; the task outcomes say the
+                # compile never touched the sources. The narrower fact wins.
+                return self._finalize_main_result(
+                    ToolResult.completed_failure(
+                        output=self._format_compile_coverage_failure(
+                            analysis, compile_mismatch, ref_id
+                        ),
+                        raw_output=result["output"],
+                        error=compile_mismatch,
+                        error_code="GRADLE_COMPILE_NO_SOURCE_MISMATCH",
+                        suggestions=[
+                            "Confirm which compile tasks the build declares: "
+                            "gradle(tasks='tasks --all')",
+                            "A src/main/<lang> directory with no matching gradle plugin "
+                            "(scala/kotlin/groovy) has no compile task — check the build file",
+                        ],
+                        **evidence_fields,
+                        metadata={
+                            "command": gradle_cmd,
+                            "runner_dispatched": result.get("runner_dispatched") is True,
+                            "exit_code": result["exit_code"],
+                            "analysis": analysis,
+                            "output_ref_id": ref_id,
+                        },
+                    ),
+                    preamble,
+                    jdk_retry_meta,
+                )
             if result["exit_code"] == 0:
                 return self._finalize_main_result(
                     ToolResult.completed_success(
@@ -743,7 +789,42 @@ class GradleTool(BaseTool):
             },
         )
 
-    def _analyze_gradle_output(self, output: str, exit_code: int) -> Dict[str, Any]:
+    @staticmethod
+    def _is_compile_task(task: str) -> bool:
+        """A compile task, whatever project path qualifies it (:sub:compileScala)."""
+        return task.rsplit(":", 1)[-1].startswith("compile")
+
+    def _compile_coverage_error(
+        self, analysis: Dict[str, Any], compile_source_languages: Optional[List[str]]
+    ) -> Optional[str]:
+        """NO-SOURCE cannot close a source-bearing compile (P0-C).
+
+        Live bigtop: bigpetstore-spark's sources are all under src/main/scala, the
+        backend ran compileJava, gradle answered NO-SOURCE, the exit code was 0 —
+        and the harness recorded a green compile of a module it never compiled.
+        A compile whose EVERY executed compile task found nothing to do has not
+        covered sources the caller confirmed on disk.
+        """
+        languages = sorted({str(lang) for lang in (compile_source_languages or []) if lang})
+        if not languages:
+            return None
+        compiled = [t for t in analysis.get("tasks_executed") or [] if self._is_compile_task(t)]
+        if not compiled:
+            return None
+        no_source = [t for t in analysis.get("no_source_tasks") or [] if self._is_compile_task(t)]
+        if set(no_source) != set(compiled):
+            return None
+        return (
+            f"{', '.join(languages)} sources present; executed compile tasks all "
+            "reported NO-SOURCE — the compile did not cover the sources"
+        )
+
+    def _analyze_gradle_output(
+        self,
+        output: str,
+        exit_code: int,
+        compile_source_languages: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """Analyze Gradle output for important information."""
         analysis = {
             "exit_code": exit_code,
@@ -756,6 +837,7 @@ class GradleTool(BaseTool):
             "deprecated_features": [],
             "build_time": None,
             "tasks_executed": [],
+            "no_source_tasks": [],
             "cache_hits": 0,
         }
 
@@ -808,11 +890,15 @@ class GradleTool(BaseTool):
                 if time_match:
                     analysis["build_time"] = time_match.group(1)
 
-            # Track executed tasks
+            # Track executed tasks, and the outcome gradle printed after each —
+            # NO-SOURCE means the task found nothing to do, which is a fact
+            # about coverage, not about success.
             if "> Task :" in line:
-                task_match = re.search(r"> Task :(\S+)", line)
+                task_match = re.search(r"> Task :(\S+)(.*)$", line)
                 if task_match:
                     analysis["tasks_executed"].append(task_match.group(1))
+                    if "NO-SOURCE" in task_match.group(2):
+                        analysis["no_source_tasks"].append(task_match.group(1))
 
             # Check for cache hits (Gradle-specific)
             if "FROM-CACHE" in line or "UP-TO-DATE" in line:
@@ -821,6 +907,11 @@ class GradleTool(BaseTool):
             # Deprecated features warning
             if "deprecated" in line.lower():
                 analysis["deprecated_features"].append(line.strip())
+
+        mismatch = self._compile_coverage_error(analysis, compile_source_languages)
+        if mismatch:
+            analysis["build_successful"] = False
+            analysis["compile_source_mismatch"] = mismatch
 
         return analysis
 
@@ -919,6 +1010,27 @@ class GradleTool(BaseTool):
 
         return output
 
+    def _format_compile_coverage_failure(
+        self, analysis: Dict[str, Any], message: str, ref_id: Optional[str] = None
+    ) -> str:
+        """Report the uncovered compile with the task outcomes that prove it."""
+        output = "❌ Gradle reported success over a compile that covered no sources\n\n"
+        tasks = analysis.get("tasks_executed") or []
+        output += "📍 Tasks executed: "
+        output += ", ".join(tasks) if tasks else "⚠️ NONE DETECTED (possible parsing issue)"
+        no_source = analysis.get("no_source_tasks") or []
+        if no_source:
+            output += f"\n🚫 NO-SOURCE: {', '.join(no_source)}"
+        output += f"\n⚠️ {message}"
+        if analysis.get("build_time"):
+            output += f"\n⏱️ Build time: {analysis['build_time']}"
+        if ref_id:
+            output += f"\n\n📄 Full output reference: {ref_id}"
+            output += (
+                f"\n💡 Use: output_search(action='retrieve', ref_id='{ref_id}') for complete log"
+            )
+        return output
+
     def _gradle_test_stats(self, analysis: Dict[str, Any]) -> Optional[TestStats]:
         results = analysis.get("test_results") or {}
         executed = int(results.get("total") or 0)
@@ -950,6 +1062,11 @@ class GradleTool(BaseTool):
         if has_test_failures and build_claimed_success:
             fields["evidence_assessment"] = EvidenceAssessment.PARTIAL
             fields["conflicts"] = ["gradle_success_vs_test_failures"]
+
+        # Gradle said SUCCESSFUL while every compile task it ran said NO-SOURCE:
+        # two facts from the same log that cannot both be trusted.
+        if analysis.get("compile_source_mismatch"):
+            fields.setdefault("conflicts", []).append("gradle_success_vs_compile_no_source")
 
         if output_ref_id:
             fields["evidence_refs"] = [output_ref_id]

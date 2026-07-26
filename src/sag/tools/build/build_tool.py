@@ -198,6 +198,19 @@ class BuildTool(BaseTool):
                     actual_executions.append(_execute_backend())
                     inner = actual_executions[-1].result
 
+        # Computed last so it lands FIRST: the model must read what actually ran
+        # before it reasons about the result (spec §Stage D contract 4).
+        delta_line = self._semantic_delta_line(
+            backend=backend,
+            requested_verb=verb,
+            effective_verb=effective_verb,
+            params=actual_executions[-1].params,
+            args=args,
+            island_context=island_context,
+        )
+        if delta_line:
+            preamble_lines.insert(0, delta_line)
+
         return self._envelope(
             inner,
             system,
@@ -272,6 +285,36 @@ class BuildTool(BaseTool):
                 return "install", context
             return requested_verb, context
         return requested_verb, {}
+
+    @staticmethod
+    def _semantic_delta_line(
+        *,
+        backend,
+        requested_verb: str,
+        effective_verb: str,
+        params: Dict[str, Any],
+        args: Optional[str],
+        island_context: Optional[Dict[str, str]],
+    ) -> Optional[str]:
+        """`[build] requested X -> executing Y (why)` when the action MUTATED.
+
+        Pure task-name translation stays silent: compile -> compileJava renames
+        the same lifecycle. A promotion, a verb substitution or an added skip flag
+        changes what the build MEANS, and every live failure of that kind started
+        with a mutation the model was never shown (spec §Stage D contract 4).
+        """
+        executed = backend.executed_action(effective_verb, params, args)
+        reasons: List[str] = []
+        if effective_verb != requested_verb:
+            goal = (island_context or {}).get("manifest_goal") or effective_verb
+            reasons.append(f"promoted to {effective_verb} by the surveyed island goal {goal}")
+        reasons.extend(executed.reasons)
+        if not reasons:
+            return None
+        return (
+            f"[build] requested '{requested_verb}' -> executing "
+            f"'{executed.argv_fragment}' ({'; '.join(reasons)})"
+        )
 
     def _envelope(
         self,
