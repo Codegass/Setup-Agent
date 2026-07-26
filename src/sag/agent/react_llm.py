@@ -187,6 +187,44 @@ class ReactLLMClient:
         self._log_agent_response_length(capabilities.model, turn.text)
         return turn
 
+    def get_advisor_response(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        max_tokens: int,
+    ) -> str:
+        """One fresh-context advisor consult: plain completion text out.
+
+        No tools, no thinking config, a hard output cap — the advisor reviews
+        the transcript, it does not act. Provider errors propagate: the ONLY
+        caller (`ReActEngine.consult_advisor`) turns them into a success-shaped
+        "proceed with your best judgment" result, because a broken advisor must
+        degrade to Plan-2 behavior rather than abort the run.
+        """
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": list(messages),
+            "max_tokens": int(max_tokens),
+            # Providers that reject `max_tokens` (or any other field here) drop
+            # it instead of 400-ing the consult.
+            "drop_params": True,
+        }
+        self._add_ollama_api_base(params, model)
+        response = litellm.completion(**params)
+        self._track_advisor_usage(response, model)
+        message = response.choices[0].message
+        return getattr(message, "content", None) or ""
+
+    def _track_advisor_usage(self, response: Any, model: str) -> None:
+        if self.token_tracker is None:
+            return
+
+        try:
+            self.token_tracker.track_token_usage(response, model, "advisor")
+        except Exception as exc:  # pragma: no cover - defensive accounting path
+            self.logger.debug(f"Could not track advisor token usage: {exc}")
+
     def _build_native_request_params(
         self,
         messages: list[dict[str, Any]],

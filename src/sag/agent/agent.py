@@ -83,6 +83,9 @@ class SetupAgent:
         self._run_pin_template = None
         self._run_pin_host_path = None
         self._run_pin_mirror = None
+        # Remembered so the post-loop pin rewrite (which carries the advisor
+        # telemetry) does not drop the SHA the clone already observed.
+        self._observed_target_repo_sha = None
 
         # Create specialized agent logger
         self.agent_logger = create_agent_logger("setup_agent")
@@ -164,6 +167,9 @@ class SetupAgent:
             target_repo_sha_callback=self._record_target_repo_sha,
             orchestrator=self.orchestrator,
         )
+        # The advisor tool is a client stub until the engine that owns the
+        # consult exists; bind it before the first iteration can call it.
+        self._bind_advisor_consult()
         self._initialize_run_pin_template()
 
         # Pass UIManager to ReActEngine if in UI mode
@@ -289,6 +295,21 @@ class SetupAgent:
         # SHA is None here and is filled in the moment it is observed.
         self._write_run_pin(target_repo_sha=None)
 
+    def _bind_advisor_consult(self) -> None:
+        """Point the registered advisor tool at the engine that answers it."""
+        engine = getattr(self, "react_engine", None)
+        consult = getattr(engine, "consult_advisor", None)
+        if consult is None:
+            return
+        for tool in getattr(self, "tools", None) or ():
+            if getattr(tool, "name", "") == "advisor":
+                tool.consult_fn = consult
+
+    def _advisor_telemetry(self) -> dict | None:
+        engine = getattr(self, "react_engine", None)
+        telemetry = getattr(engine, "advisor_telemetry", None)
+        return telemetry if isinstance(telemetry, dict) else None
+
     def _write_run_pin(self, *, target_repo_sha: str | None) -> None:
         template = getattr(self, "_run_pin_template", None)
         host_path = getattr(self, "_run_pin_host_path", None)
@@ -296,7 +317,11 @@ class SetupAgent:
             self.agent_logger.warning("Run pin write attempted before provenance was ready")
             return
         try:
-            pin = RunPin(target_repo_sha=target_repo_sha, **template)
+            pin = RunPin(
+                target_repo_sha=target_repo_sha,
+                advisor=self._advisor_telemetry(),
+                **template,
+            )
             ControlEventSink.write_run_pin(
                 host_path,
                 pin,
@@ -308,7 +333,20 @@ class SetupAgent:
     def _record_target_repo_sha(self, target_repo_sha: str) -> None:
         # Rewrite the pin with the observed SHA (the startup write left it
         # None); the collector's current-run validation requires the real SHA.
+        self._observed_target_repo_sha = target_repo_sha
         self._write_run_pin(target_repo_sha=target_repo_sha)
+
+    def _finalize_run_pin(self) -> None:
+        """Rewrite the pin once the loop is done.
+
+        The SHA-triggered write happens during the clone, when the advisor has
+        been consulted zero times; the telemetry the ablation comparison reads
+        only exists after the run."""
+        if getattr(self, "_run_pin_template", None) is None:
+            # Runs without provenance never had a pin to finalize; warning here
+            # would just repeat the startup warning at every run end.
+            return
+        self._write_run_pin(target_repo_sha=getattr(self, "_observed_target_repo_sha", None))
 
     def _initialize_tools(self, workflow_mode: str = "setup") -> List:
         """Initialize all available tools for the given workflow mode.
@@ -318,6 +356,7 @@ class SetupAgent:
         plan); "run_task" keeps the legacy surface with `manage_context` and
         no `phase` tool.
         """
+        from sag.agent.advisor import AdvisorTool
         from sag.agent.physical_validator import PhysicalValidator
         from sag.tools.bash import BashTool, BashToolConfig
         from sag.tools.build import BuildTool
@@ -443,6 +482,10 @@ class SetupAgent:
                 physical_validator=self.physical_validator,
                 workflow_mode=workflow_mode,
             ),
+            # ALWAYS registered, in every mode: `advisor_mode="off"` is answered
+            # by the engine's consult, so the ablation switch changes behavior
+            # without changing the tool surface the model sees (spec §3.7.6).
+            AdvisorTool(),
         ]
 
         logger.info(f"Initialized {len(tools)} tools: {[tool.name for tool in tools]}")
@@ -1178,6 +1221,7 @@ START by working toward the current phase objective shown in my context.
                 initial_prompt=setup_prompt, max_iterations=self.max_iterations
             )
             self.run_termination = termination
+            self._finalize_run_pin()
             self._emit(
                 EventType.PHASE_COMPLETE,
                 "Setup flow completed",
@@ -1202,6 +1246,7 @@ START by working toward the current phase objective shown in my context.
                 self.run_termination = termination
                 progress.update(task, description="Setup flow completed")
 
+            self._finalize_run_pin()
             return termination
 
     def _close_open_setup_run(self, reason: str, *, cancelled: bool = False) -> RunTermination:

@@ -708,7 +708,9 @@ def test_current_run_pin_requires_exact_host_container_mirrors(tmp_path):
         host_arch=PIN["host_arch"],
     )
 
-    assert pin.model_dump(mode="json") == PIN
+    # A pin written before the advisor existed keeps validating; the field
+    # reads None, which is distinguishable from "advisor ran and consulted 0×".
+    assert pin.model_dump(mode="json") == {**PIN, "advisor": None}
     assert pin.run_order_index == 7
     (setup / "run-pin.json").write_text(canonical + "\n", encoding="utf-8")
     assert (
@@ -720,7 +722,7 @@ def test_current_run_pin_requires_exact_host_container_mirrors(tmp_path):
             dependency_cache_state=PIN["dependency_cache_state"],
             host_arch=PIN["host_arch"],
         ).model_dump(mode="json")
-        == PIN
+        == {**PIN, "advisor": None}
     )
     drifted = {**PIN, "random_seed_or_null": 99}
     (setup / "run-pin.json").write_text(

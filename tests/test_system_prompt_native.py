@@ -84,6 +84,15 @@ def test_setup_prompt_still_names_the_tools_and_the_phase_workflow():
     assert 'phase(action="blocked"' in prompt or "phase(action='blocked'" in prompt
 
 
+def test_setup_prompt_names_the_advisor_and_when_to_consult_it():
+    """The mechanical guarantees are a floor; the prompt is what lets the model
+    consult BEFORE a redirect has to make it (spec §3.2)."""
+    prompt = _prompt("setup")
+    assert "advisor()" in prompt
+    assert "when stuck" in prompt
+    assert "before closing a phase" in prompt
+
+
 def test_setup_prompt_states_that_tool_calls_are_how_work_happens():
     prompt = _prompt("setup")
     assert "USE THE TOOLS" in prompt
