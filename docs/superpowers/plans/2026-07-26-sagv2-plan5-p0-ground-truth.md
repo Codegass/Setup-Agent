@@ -160,15 +160,83 @@ present (byte-compat with replay fixtures, same pattern as Plan 4).
 
 ## Stage C — P0-B(+F): typed build domains and sealed domain outcomes
 
-Survey emits neutral build domains (`produces`/`requires` coordinates,
-role, environment, documented lifecycle with provenance). Independence is
-derived from the coordinate graph — never a directory heuristic; incompatible
-edges (Bigtop producer 3.7 vs consumers 3.5/3.6) are sealed before any
-attempt. Gate/finalizer/report preserve per-domain states via the review's
-truth table: required+blocked forbids global success; gates can no longer
-upgrade a truthful partial; auxiliary failure is never silently erased.
-Matrix rows: "not called independent", "gate cannot refine partial to
-success", "classified blocker is not a green waiver".
+Survey emits neutral build domains; independence is derived from the
+coordinate graph — never a directory heuristic; incompatible edges (Bigtop
+producer 3.7 vs consumers 3.5/3.6) are sealed before any attempt; gates can
+no longer upgrade a truthful partial. Matrix rows: "not called independent",
+"gate cannot refine partial to success", "classified blocker is not a green
+waiver".
+
+### Binding notes (Stage C, bound on `ac64511`)
+
+**Domain schema v1 (cross-lane contract — EXACT).** The analyzer
+recommendation gains two keys next to the existing `build_islands` (which
+stays untouched for byte-compat):
+
+```json
+"build_domains": [
+  {
+    "root": "/workspace/bigtop/bigtop-data-generators",
+    "system": "gradle",
+    "languages": ["java", "groovy"],
+    "produces": [{"group": "org.apache.bigtop", "name": "bigpetstore-data-generator", "version": "3.7.0-SNAPSHOT"}],
+    "requires": [{"group": "...", "name": "...", "version": "3.5.0-SNAPSHOT"}]
+  }
+],
+"domain_edges": [
+  {"consumer": "<root>", "producer": "<root>",
+   "status": "compatible" | "version_incompatible",
+   "detail": "requires org.apache.bigtop:bigpetstore-data-generator 3.5.0-SNAPSHOT; producer builds 3.7.0-SNAPSHOT"}
+]
+```
+
+Unparseable coordinates are simply absent (absent fact = absent key/list);
+an edge exists only when one domain's `requires` names another domain's
+`produces` (group+name match); `version_incompatible` iff the version
+strings differ. **Rollup contract:** the gate seals
+`domain_states: {"<root>": {"state": "success"|"failed"|"blocked"|"untried", "blocker": "<detail>"?}}`
+(absent entirely when no domains were surveyed).
+
+**Task C1 (lane c1): survey coordinates + analyzer graph.**
+Files: `src/sag/agent/physical_survey.py`,
+`src/sag/tools/internal/project_analyzer.py` (+ NEW test file).
+Maven produces/requires from pom.xml (groupId/artifactId/version with
+parent-fallback for group/version; dependencies GAV when literal). Gradle
+produces from `group`/`version` in build.gradle or gradle.properties plus
+subproject names; requires from literal `"g:n:v"` dependency strings
+(recursive over the multi-project's subproject build files). Regex-level
+extraction; anything non-literal is omitted, never guessed. The analyzer
+derives `domain_edges` and stores both keys in the recommendation; the
+model-visible island guidance names incompatible edges BEFORE any attempt
+("producer builds 3.7.0-SNAPSHOT; <root> requires 3.5.0-SNAPSHOT — record
+the mismatch, do not silently alias"). Acceptance: a Bigtop-shaped fixture
+(4 domains, producer 3.7 vs consumers 3.5/3.6) yields exactly 2
+`version_incompatible` edges with those details.
+
+**Task C2 (lane c2): domain truth table at the gate + sealing.**
+Files: `src/sag/agent/attempt_policy.py`, `src/sag/agent/phase_gates.py`,
+`src/sag/agent/verdict_finalizer.py` (+ NEW test file).
+1. `UntriedIslandsRequirement.message` drops the falsified sentence "Each
+   island builds independently, so one island's failure says nothing about
+   the others" — replaced by graph-aware text (independent only when no
+   edges; incompatible edges are named blockers).
+2. `phase_gates` computes `domain_states` (Stage B invocation receipts give
+   per-root attempt outcomes: a receipt whose `working_directory` is
+   at/under a domain root with outcome completed/failed ⇒
+   success/failed; a `version_incompatible` edge ⇒ blocked with the edge
+   detail; no receipt and no blocker ⇒ untried) and seals it into the
+   build/test rollups (absent when no domains).
+3. Truth table (P0-F): the gate may CONFIRM or DOWNGRADE a terminal claim,
+   never upgrade — when the model claims partial/failed and any surveyed
+   domain is failed/blocked/untried, the validated outcome stays at the
+   claim (matrix row: global artifact presence cannot refine a truthful
+   2/4 partial into success). Single-domain projects (cli, tvm) keep
+   today's behavior byte-identically (no `domain_states` key when the
+   survey found no multi-domain decomposition).
+4. `SnapshotTestStats`-style sealing: `domain_states` reaches the sealed
+   verdict via the existing absent-when-None serializer pattern (extend
+   the snapshot model where the build evidence seals — mirror the Stage B
+   follow-up commit `ac64511`).
 
 ## Stage D — P0-C: semantic action conservation
 
